@@ -347,6 +347,29 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | None (Meta signature) | WhatsApp incoming message webhook |
 
+### ZAKI-Agent Integration APIs
+
+These endpoints are available for dedicated ZAKI-agent integration (internal token required):
+
+- `POST /api/v1/chat/stream` (SSE)
+- `POST /api/v1/users/provision`
+- `GET/PATCH /api/v1/users/{id}/config`
+- `GET/PUT/DELETE /api/v1/users/{id}/secrets/{key}`
+- `GET/PUT /api/v1/users/{id}/heartbeat`
+- `GET/POST/PATCH/DELETE /api/v1/users/{id}/cron`
+- `GET/PUT /api/v1/users/{id}/onboarding`
+- `POST /api/v1/users/{id}/channels/telegram/connect`
+- `DELETE /api/v1/users/{id}/channels/telegram/disconnect`
+- `POST /webhook/telegram`
+- `POST /internal/drain`
+- `POST /internal/undrain`
+- `POST /internal/shutdown`
+- `GET /metrics`
+
+Required headers for tenant mode:
+- `X-Internal-Token`
+- `X-Zaki-User-Id` (required on `/api/v1/chat/stream`)
+
 ## Commands
 
 | Command | Description |

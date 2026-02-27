@@ -21,6 +21,7 @@ pub const PairingGuard = struct {
     /// Brute-force protection
     failed_count: u32,
     lockout_time: ?i128, // nanoTimestamp when locked out
+    mutex: std.Thread.Mutex,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, require_pairing: bool, existing_tokens: []const []const u8) !PairingGuard {
@@ -44,6 +45,7 @@ pub const PairingGuard = struct {
             .paired_tokens = tokens,
             .failed_count = 0,
             .lockout_time = null,
+            .mutex = .{},
             .allocator = allocator,
         };
     }
@@ -59,6 +61,8 @@ pub const PairingGuard = struct {
     };
 
     pub fn attemptPair(self: *PairingGuard, pairing_code: ?[]const u8) PairAttemptResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (!self.require_pairing_flag) return .disabled;
         if (self.pairingCode() == null) return .already_paired;
         const code = pairing_code orelse return .missing_code;
@@ -139,6 +143,9 @@ pub const PairingGuard = struct {
 
     /// Check if a bearer token is valid (compares against stored hashes).
     pub fn isAuthenticated(self: *const PairingGuard, token: []const u8) bool {
+        const mutable_self: *PairingGuard = @constCast(self);
+        mutable_self.mutex.lock();
+        defer mutable_self.mutex.unlock();
         if (!self.require_pairing_flag) return true;
 
         var hash_buf: [64]u8 = undefined;
@@ -148,11 +155,17 @@ pub const PairingGuard = struct {
 
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn isPaired(self: *const PairingGuard) bool {
+        const mutable_self: *PairingGuard = @constCast(self);
+        mutable_self.mutex.lock();
+        defer mutable_self.mutex.unlock();
         return self.paired_tokens.count() > 0;
     }
 
     /// Get count of paired tokens
     pub fn tokenCount(self: *const PairingGuard) usize {
+        const mutable_self: *PairingGuard = @constCast(self);
+        mutable_self.mutex.lock();
+        defer mutable_self.mutex.unlock();
         return self.paired_tokens.count();
     }
 };

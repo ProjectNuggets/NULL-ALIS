@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nullclaw-data-rwx
+  namespace: zaki-agent-staging
+  labels:
+    app.kubernetes.io/name: nullclaw
+    app.kubernetes.io/part-of: zaki-agent
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 200Gi
+  # Set to your RWX storage class (NFS/EFS/CephFS/etc)
+  storageClassName: REPLACE_RWX_STORAGE_CLASS

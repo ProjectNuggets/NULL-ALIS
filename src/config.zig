@@ -19,6 +19,7 @@ pub const AgentConfig = config_types.AgentConfig;
 pub const ModelRouteConfig = config_types.ModelRouteConfig;
 pub const HeartbeatConfig = config_types.HeartbeatConfig;
 pub const CronConfig = config_types.CronConfig;
+pub const TelegramReceiveMode = config_types.TelegramReceiveMode;
 pub const TelegramConfig = config_types.TelegramConfig;
 pub const DiscordConfig = config_types.DiscordConfig;
 pub const SlackReceiveMode = config_types.SlackReceiveMode;
@@ -43,6 +44,7 @@ pub const ChannelsConfig = config_types.ChannelsConfig;
 pub const MemoryConfig = config_types.MemoryConfig;
 pub const TunnelConfig = config_types.TunnelConfig;
 pub const GatewayConfig = config_types.GatewayConfig;
+pub const TenantConfig = config_types.TenantConfig;
 pub const ComposioConfig = config_types.ComposioConfig;
 pub const SecretsConfig = config_types.SecretsConfig;
 pub const BrowserComputerUseConfig = config_types.BrowserComputerUseConfig;
@@ -104,6 +106,7 @@ pub const Config = struct {
     memory: MemoryConfig = .{},
     tunnel: TunnelConfig = .{},
     gateway: GatewayConfig = .{},
+    tenant: TenantConfig = .{},
     composio: ComposioConfig = .{},
     secrets: SecretsConfig = .{},
     browser: BrowserConfig = .{},
@@ -604,6 +607,7 @@ pub const Config = struct {
 
         try w.print("  \"memory\": {f},\n", .{std.json.fmt(self.memory, .{})});
         try w.print("  \"gateway\": {f},\n", .{std.json.fmt(self.gateway, .{})});
+        try w.print("  \"tenant\": {f},\n", .{std.json.fmt(self.tenant, .{})});
         try w.print("  \"tunnel\": {f},\n", .{std.json.fmt(self.tunnel, .{})});
         try w.print("  \"composio\": {f},\n", .{std.json.fmt(self.composio, .{})});
         try w.print("  \"secrets\": {f},\n", .{std.json.fmt(self.secrets, .{})});
@@ -777,7 +781,8 @@ test "json parse roundtrip" {
         \\  "models": {"providers": {"anthropic": {"api_key": "sk-test"}}},
         \\  "agents": {"defaults": {"model": {"primary": "anthropic/claude-opus-4"}, "heartbeat": {"every": "15m"}}},
         \\  "memory": {"backend": "markdown", "auto_save": false},
-        \\  "gateway": {"port": 9090, "host": "0.0.0.0"},
+        \\  "gateway": {"port": 9090, "host": "0.0.0.0", "max_workers": 24, "max_queued_requests": 4096},
+        \\  "tenant": {"enabled": true, "data_root": "/data/users", "runtime_cache_max_users": 5000, "runtime_idle_ttl_secs": 900},
         \\  "autonomy": {"level": "full", "workspace_only": false, "max_actions_per_hour": 50},
         \\  "runtime": {"kind": "docker"},
         \\  "cost": {"enabled": true, "daily_limit_usd": 25.0}
@@ -806,6 +811,12 @@ test "json parse roundtrip" {
     try std.testing.expect(!cfg.memory_auto_save);
     try std.testing.expectEqual(@as(u16, 9090), cfg.gateway.port);
     try std.testing.expectEqualStrings("0.0.0.0", cfg.gateway.host);
+    try std.testing.expectEqual(@as(u16, 24), cfg.gateway.max_workers);
+    try std.testing.expectEqual(@as(u32, 4096), cfg.gateway.max_queued_requests);
+    try std.testing.expect(cfg.tenant.enabled);
+    try std.testing.expectEqualStrings("/data/users", cfg.tenant.data_root);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.tenant.runtime_cache_max_users);
+    try std.testing.expectEqual(@as(u32, 900), cfg.tenant.runtime_idle_ttl_secs);
     try std.testing.expectEqual(AutonomyLevel.full, cfg.autonomy.level);
     try std.testing.expect(!cfg.autonomy.workspace_only);
     try std.testing.expect(!cfg.workspace_only);
@@ -825,6 +836,7 @@ test "json parse roundtrip" {
     allocator.free(cfg.providers);
     allocator.free(cfg.memory.backend);
     allocator.free(cfg.gateway.host);
+    allocator.free(cfg.tenant.data_root);
     allocator.free(cfg.runtime.kind);
 }
 
@@ -3013,4 +3025,40 @@ test "session config: all dm_scope values accepted" {
         try cfg.parseJson(json);
         try std.testing.expectEqual(c[1], cfg.session.dm_scope);
     }
+}
+
+test "gateway config parses internal_service_tokens" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"gateway": {"internal_service_tokens": ["svc-1", "svc-2"]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.gateway.internal_service_tokens.len);
+    try std.testing.expectEqualStrings("svc-1", cfg.gateway.internal_service_tokens[0]);
+    try std.testing.expectEqualStrings("svc-2", cfg.gateway.internal_service_tokens[1]);
+    for (cfg.gateway.internal_service_tokens) |t| allocator.free(t);
+    allocator.free(cfg.gateway.internal_service_tokens);
+}
+
+test "tenant config parses enabled and data_root" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"tenant": {"enabled": true, "data_root": "/var/lib/nullclaw/users"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.tenant.enabled);
+    try std.testing.expectEqualStrings("/var/lib/nullclaw/users", cfg.tenant.data_root);
+    allocator.free(cfg.tenant.data_root);
+}
+
+test "session config parses cross_channel_shared_main" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"cross_channel_shared_main": false}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(!cfg.session.cross_channel_shared_main);
 }

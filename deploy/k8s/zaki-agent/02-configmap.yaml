@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nullclaw-runtime-config
+  namespace: zaki-agent-staging
+  labels:
+    app.kubernetes.io/name: nullclaw
+    app.kubernetes.io/part-of: zaki-agent
+data:
+  GATEWAY_HOST: "0.0.0.0"
+  GATEWAY_PORT: "3000"
+
+  # Tenant user data root on mounted RWX volume.
+  TENANT_DATA_ROOT: "/data/users"
+
+  # Dedicated ingress host for agent runtime.
+  PUBLIC_BASE_URL: "https://agent-staging.zaki.com"
+
+  # Set to "*" for initial staging. For production, replace with explicit IDs
+  # or implement per-user mapping enforcement in Nullclaw before tightening.
+  TELEGRAM_ALLOW_FROM: "*"
+
+  # Session unification for app + telegram.
+  SESSION_CROSS_CHANNEL_SHARED_MAIN: "true"
+
+  # Litestream backup target settings.
+  LITESTREAM_S3_BUCKET: "REPLACE_WITH_S3_BUCKET"
+  LITESTREAM_S3_PREFIX: "nullclaw/users"
+  LITESTREAM_SYNC_INTERVAL: "5s"
+  AWS_REGION: "us-east-1"

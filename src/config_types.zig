@@ -158,6 +158,8 @@ pub const CronConfig = struct {
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
+    receive_mode: TelegramReceiveMode = .polling,
+    webhook_secret_token: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
     group_allow_from: []const []const u8 = &.{},
     group_policy: []const u8 = "allowlist",
@@ -165,6 +167,11 @@ pub const TelegramConfig = struct {
     reply_in_private: bool = true,
     /// Optional SOCKS5/HTTP proxy URL for all Telegram API requests (e.g. "socks5://host:port").
     proxy: ?[]const u8 = null,
+};
+
+pub const TelegramReceiveMode = enum {
+    polling,
+    webhook,
 };
 
 pub const DiscordConfig = struct {
@@ -719,10 +726,20 @@ pub const GatewayConfig = struct {
     host: []const u8 = "127.0.0.1",
     require_pairing: bool = true,
     allow_public_bind: bool = false,
+    max_workers: u16 = 16,
+    max_queued_requests: u32 = 2048,
     pair_rate_limit_per_minute: u32 = 10,
     webhook_rate_limit_per_minute: u32 = 60,
     idempotency_ttl_secs: u64 = 300,
     paired_tokens: []const []const u8 = &.{},
+    internal_service_tokens: []const []const u8 = &.{},
+};
+
+pub const TenantConfig = struct {
+    enabled: bool = false,
+    data_root: []const u8 = "/data/users",
+    runtime_cache_max_users: u32 = 2048,
+    runtime_idle_ttl_secs: u32 = 1800,
 };
 
 // ── Composio config ─────────────────────────────────────────────
@@ -915,4 +932,5 @@ pub const SessionConfig = struct {
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
     typing_interval_secs: u32 = 5,
+    cross_channel_shared_main: bool = true,
 };

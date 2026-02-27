@@ -1,0 +1,54 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nullclaw-alerts
+  namespace: zaki-agent-staging
+  labels:
+    app.kubernetes.io/name: nullclaw
+    app.kubernetes.io/part-of: zaki-agent
+spec:
+  groups:
+    - name: nullclaw-gateway
+      rules:
+        - alert: NullclawTenantLockConflictsHigh
+          expr: rate(nullclaw_gateway_tenant_lock_conflicts_total[5m]) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Nullclaw tenant lock conflicts are elevated"
+            description: "Same-user traffic is colliding across pods. Check ingress hash key and pod churn."
+        - alert: NullclawDrainRejectsHigh
+          expr: rate(nullclaw_gateway_drain_rejected_total[5m]) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Nullclaw drain rejections are elevated"
+            description: "Pods are rejecting many requests while draining. Check rollout pacing and readiness behavior."
+        - alert: NullclawTelegramWebhookRejectsHigh
+          expr: rate(nullclaw_gateway_telegram_webhook_rejected_total[5m]) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Nullclaw Telegram webhook rejects are elevated"
+            description: "Webhook secret token or routing/user mapping may be invalid."
+        - alert: NullclawChatStreamErrorRateHigh
+          expr: rate(nullclaw_gateway_chat_stream_errors_total[5m]) / clamp_min(rate(nullclaw_gateway_chat_stream_total[5m]), 0.001) > 0.05
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Nullclaw chat stream error rate is high"
+            description: "More than 5% of chat stream requests are failing."
+    - name: nullclaw-backup
+      rules:
+        - alert: NullclawLitestreamBackupLagHigh
+          expr: max_over_time(litestream_replica_lag_seconds[10m]) > 300
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Litestream backup lag is high"
+            description: "Replica lag exceeded 5 minutes. Check S3/network and litestream sidecar health."

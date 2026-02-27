@@ -120,6 +120,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
         .http_enabled = cfg.http_request.enabled,
         .browser_enabled = cfg.browser.enabled,
+        .composio_api_key = if (cfg.composio.enabled) cfg.composio.api_key else null,
+        .browser_open_domains = if (cfg.browser.allowed_domains.len > 0) cfg.browser.allowed_domains else null,
         .mcp_tools = mcp_tools,
         .agents = cfg.agents,
         .fallback_api_key = resolved_api_key,

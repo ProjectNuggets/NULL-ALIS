@@ -19,6 +19,7 @@ const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const onboard = @import("onboard.zig");
+const tenant_lock = @import("tenant_lock.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -148,6 +149,37 @@ fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []co
     };
 }
 
+fn normalizeGatewayControlHost(host: []const u8) []const u8 {
+    if (std.mem.eql(u8, host, "0.0.0.0")) return "127.0.0.1";
+    if (std.mem.eql(u8, host, "::")) return "::1";
+    return host;
+}
+
+fn sendGatewayControlCommand(host: []const u8, port: u16, path: []const u8, internal_token: ?[]const u8) void {
+    const dial_host = normalizeGatewayControlHost(host);
+    const addr = std.net.Address.resolveIp(dial_host, port) catch return;
+    var stream = std.net.tcpConnectToAddress(addr) catch return;
+    defer stream.close();
+
+    var req_buf: [1024]u8 = undefined;
+    const request = if (internal_token) |token|
+        std.fmt.bufPrint(
+            &req_buf,
+            "POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nX-Internal-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            .{ path, dial_host, port, token },
+        ) catch return
+    else
+        std.fmt.bufPrint(
+            &req_buf,
+            "POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            .{ path, dial_host, port },
+        ) catch return;
+
+    stream.writeAll(request) catch return;
+    var read_buf: [256]u8 = undefined;
+    _ = stream.read(&read_buf) catch {};
+}
+
 /// Heartbeat thread — periodically writes state file and checks health.
 fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState) void {
     const state_path = stateFilePath(allocator, config) catch return;
@@ -171,6 +203,9 @@ const SCHEDULER_INITIAL_BACKOFF_SECS: u64 = 1;
 /// Kept for compatibility with existing tests and supervision semantics.
 const SCHEDULER_MAX_BACKOFF_SECS: u64 = 60;
 
+/// Ownership lock TTL for per-user writer fencing in tenant mode.
+const TENANT_OWNERSHIP_LOCK_LEASE_SECS: u64 = 300;
+
 const SchedulerJobSnapshot = struct {
     next_run_secs: i64,
     last_run_secs: ?i64,
@@ -192,6 +227,41 @@ fn schedulerJobChanged(job: *const cron.CronJob, snapshot: SchedulerJobSnapshot)
     if (job.one_shot != snapshot.one_shot) return true;
     if (!schedulerStatusEquals(job.last_status, snapshot.last_status)) return true;
     return false;
+}
+
+fn runCronAgentTurn(
+    ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    scheduler: *const CronScheduler,
+    job: *const cron.CronJob,
+    prompt: []const u8,
+) ![]const u8 {
+    const cfg_ptr = ctx orelse return error.InvalidArgument;
+    const cfg: *const Config = @ptrCast(@alignCast(cfg_ptr));
+
+    var runtime_cfg = cfg.*;
+    if (scheduler.context_workspace) |workspace| {
+        runtime_cfg.workspace_dir = workspace;
+    }
+    // Ensure prompt/bootstrap files exist for first-run tenant workspaces.
+    onboard.scaffoldWorkspace(allocator, runtime_cfg.workspace_dir, &onboard.ProjectContext{}) catch {};
+
+    var runtime = try channel_loop.ChannelRuntime.init(allocator, &runtime_cfg);
+    defer runtime.deinit();
+
+    var session_buf: [256]u8 = undefined;
+    const session_key = blk: {
+        if (scheduler.context_user_id) |user_id| {
+            if (job.session_target == .main) {
+                break :blk std.fmt.bufPrint(&session_buf, "agent:zaki-agent:user:{s}:main", .{user_id}) catch "agent:zaki-agent:user:unknown:main";
+            }
+            break :blk std.fmt.bufPrint(&session_buf, "agent:zaki-agent:user:{s}:cron:{s}", .{ user_id, job.id }) catch "agent:zaki-agent:user:unknown:cron";
+        }
+        if (job.session_target == .main) break :blk "agent:zaki-agent:main";
+        break :blk "agent:zaki-agent:cron";
+    };
+
+    return runtime.session_mgr.processMessage(session_key, prompt, null);
 }
 
 fn clearSchedulerSnapshot(
@@ -283,18 +353,106 @@ fn mergeSchedulerTickChangesAndSave(
     try cron.saveJobs(&latest);
 }
 
+fn runTenantSchedulerTick(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    event_bus: *bus_mod.Bus,
+    owner_instance_id: []const u8,
+) !void {
+    var users_dir = std.fs.openDirAbsolute(config.tenant.data_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer users_dir.close();
+
+    var iter = users_dir.iterate();
+    const now = std.time.timestamp();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0) continue;
+
+        const user_root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tenant.data_root, entry.name });
+        defer allocator.free(user_root);
+        const cron_path = try std.fmt.allocPrint(allocator, "{s}/cron.json", .{user_root});
+        defer allocator.free(cron_path);
+        const workspace_path = try std.fmt.allocPrint(allocator, "{s}/workspace", .{user_root});
+        defer allocator.free(workspace_path);
+        var ownership_lock = tenant_lock.acquireUserOwnershipLock(
+            allocator,
+            user_root,
+            owner_instance_id,
+            TENANT_OWNERSHIP_LOCK_LEASE_SECS,
+        ) catch |err| switch (err) {
+            error.LockHeld => {
+                log.debug("tenant scheduler ownership lock held for user={s}", .{entry.name});
+                continue;
+            },
+            else => {
+                log.warn("tenant scheduler ownership lock failed for user={s}: {}", .{ entry.name, err });
+                continue;
+            },
+        };
+        defer ownership_lock.deinit();
+
+        var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
+        defer scheduler.deinit();
+        scheduler.setAgentRunner(runCronAgentTurn, @ptrCast(@constCast(config)));
+        scheduler.setExecutionContext(entry.name, user_root, workspace_path) catch continue;
+        cron.loadJobsFromPath(&scheduler, cron_path) catch |err| {
+            log.warn("tenant scheduler load failed for user={s}: {}", .{ entry.name, err });
+            continue;
+        };
+
+        const changed = scheduler.tick(now, event_bus);
+        if (changed) {
+            cron.saveJobsToPath(&scheduler, cron_path) catch |err| {
+                log.warn("tenant scheduler save failed for user={s}: {}", .{ entry.name, err });
+            };
+        }
+    }
+}
+
 /// Scheduler thread — executes due cron jobs and periodically reloads cron.json
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
+    const poll_secs: u64 = @max(@as(u64, 1), config.reliability.scheduler_poll_secs);
+
+    if (config.tenant.enabled) {
+        const owner_instance_id = tenant_lock.resolveOwnerId(allocator) catch null;
+        defer if (owner_instance_id) |oid| allocator.free(oid);
+        if (owner_instance_id == null) {
+            log.warn("tenant scheduler disabled: failed to resolve owner id", .{});
+            state.markError("scheduler", "owner_id_failed");
+            health.markComponentError("scheduler", "owner_id_failed");
+            return;
+        }
+        state.markRunning("scheduler");
+        health.markComponentOk("scheduler");
+        while (!isShutdownRequested()) {
+            runTenantSchedulerTick(allocator, config, event_bus, owner_instance_id.?) catch |err| {
+                log.warn("tenant scheduler tick failed: {}", .{err});
+                state.markError("scheduler", @errorName(err));
+                health.markComponentError("scheduler", @errorName(err));
+            };
+            state.markRunning("scheduler");
+            health.markComponentOk("scheduler");
+
+            var slept_tenant: u64 = 0;
+            while (slept_tenant < poll_secs and !isShutdownRequested()) : (slept_tenant += 1) {
+                std.Thread.sleep(std.time.ns_per_s);
+            }
+        }
+        return;
+    }
+
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
     defer scheduler.deinit();
+    scheduler.setAgentRunner(runCronAgentTurn, @ptrCast(@constCast(config)));
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {
         clearSchedulerSnapshot(allocator, &before_tick);
         before_tick.deinit(allocator);
     }
-
-    const poll_secs: u64 = @max(@as(u64, 1), config.reliability.scheduler_poll_secs);
 
     // Initial load from disk (ignore errors — start empty if file missing/corrupt)
     cron.loadJobs(&scheduler) catch {};
@@ -810,6 +968,13 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     }
 
     try stdout.print("\nShutting down...\n", .{});
+
+    // Ask gateway to enter drain mode and stop accepting requests, then exit.
+    const internal_token = if (config.gateway.internal_service_tokens.len > 0)
+        config.gateway.internal_service_tokens[0]
+    else
+        null;
+    sendGatewayControlCommand(host, port, "/internal/shutdown", internal_token);
 
     // Close bus to signal dispatcher to exit
     event_bus.close();

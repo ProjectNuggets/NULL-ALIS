@@ -1274,6 +1274,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (gw.object.get("allow_public_bind")) |v| {
                 if (v == .bool) self.gateway.allow_public_bind = v.bool;
             }
+            if (gw.object.get("max_workers")) |v| {
+                if (v == .integer) self.gateway.max_workers = @intCast(v.integer);
+            }
+            if (gw.object.get("max_queued_requests")) |v| {
+                if (v == .integer) self.gateway.max_queued_requests = @intCast(v.integer);
+            }
             if (gw.object.get("pair_rate_limit_per_minute")) |v| {
                 if (v == .integer) self.gateway.pair_rate_limit_per_minute = @intCast(v.integer);
             }
@@ -1285,6 +1291,27 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (gw.object.get("paired_tokens")) |v| {
                 if (v == .array) self.gateway.paired_tokens = try parseStringArray(self.allocator, v.array);
+            }
+            if (gw.object.get("internal_service_tokens")) |v| {
+                if (v == .array) self.gateway.internal_service_tokens = try parseStringArray(self.allocator, v.array);
+            }
+        }
+    }
+
+    // Tenant
+    if (root.get("tenant")) |ten| {
+        if (ten == .object) {
+            if (ten.object.get("enabled")) |v| {
+                if (v == .bool) self.tenant.enabled = v.bool;
+            }
+            if (ten.object.get("data_root")) |v| {
+                if (v == .string) self.tenant.data_root = try self.allocator.dupe(u8, v.string);
+            }
+            if (ten.object.get("runtime_cache_max_users")) |v| {
+                if (v == .integer) self.tenant.runtime_cache_max_users = @intCast(v.integer);
+            }
+            if (ten.object.get("runtime_idle_ttl_secs")) |v| {
+                if (v == .integer) self.tenant.runtime_idle_ttl_secs = @intCast(v.integer);
             }
         }
     }
@@ -1590,6 +1617,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             const typing_val = sess.object.get("typing_interval_secs");
             if (typing_val) |v| {
                 if (v == .integer) self.session.typing_interval_secs = @intCast(v.integer);
+            }
+            const shared_main_val = sess.object.get("cross_channel_shared_main");
+            if (shared_main_val) |v| {
+                if (v == .bool) self.session.cross_channel_shared_main = v.bool;
             }
             const links_val = sess.object.get("identity_links");
             if (links_val) |links| {

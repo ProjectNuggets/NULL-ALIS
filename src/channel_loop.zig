@@ -17,6 +17,7 @@ const mcp = @import("mcp.zig");
 const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
+const security = @import("security/policy.zig");
 const subagent_mod = @import("subagent.zig");
 const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
@@ -26,6 +27,141 @@ const matrix = @import("channels/matrix.zig");
 const channels_mod = @import("channels/root.zig");
 
 const log = std.log.scoped(.channel_loop);
+const TELEGRAM_OFFSET_STORE_VERSION: i64 = 1;
+
+fn extractTelegramBotId(bot_token: []const u8) ?[]const u8 {
+    const colon_pos = std.mem.indexOfScalar(u8, bot_token, ':') orelse return null;
+    if (colon_pos == 0) return null;
+    const raw = std.mem.trim(u8, bot_token[0..colon_pos], " \t\r\n");
+    if (raw.len == 0) return null;
+    for (raw) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+    }
+    return raw;
+}
+
+fn normalizeTelegramAccountId(allocator: std.mem.Allocator, account_id: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, account_id, " \t\r\n");
+    const source = if (trimmed.len == 0) "default" else trimmed;
+    var normalized = try allocator.alloc(u8, source.len);
+    for (source, 0..) |c, i| {
+        normalized[i] = if (std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-') c else '_';
+    }
+    return normalized;
+}
+
+fn telegramUpdateOffsetPath(allocator: std.mem.Allocator, config: *const Config, account_id: []const u8) ![]u8 {
+    const config_dir = std.fs.path.dirname(config.config_path) orelse ".";
+    const normalized_account_id = try normalizeTelegramAccountId(allocator, account_id);
+    defer allocator.free(normalized_account_id);
+
+    const file_name = try std.fmt.allocPrint(allocator, "update-offset-{s}.json", .{normalized_account_id});
+    defer allocator.free(file_name);
+
+    return std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+}
+
+pub fn loadTelegramUpdateOffset(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    account_id: []const u8,
+    bot_token: []const u8,
+) ?i64 {
+    const path = telegramUpdateOffsetPath(allocator, config, account_id) catch return null;
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 16 * 1024) catch return null;
+    defer allocator.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+
+    if (obj.get("version")) |version_val| {
+        if (version_val != .integer or version_val.integer != TELEGRAM_OFFSET_STORE_VERSION) return null;
+    }
+
+    const last_update_id_val = obj.get("last_update_id") orelse return null;
+    if (last_update_id_val != .integer) return null;
+
+    const expected_bot_id = extractTelegramBotId(bot_token);
+    if (expected_bot_id) |expected| {
+        const stored_bot_id_val = obj.get("bot_id") orelse return null;
+        if (stored_bot_id_val != .string) return null;
+        if (!std.mem.eql(u8, stored_bot_id_val.string, expected)) return null;
+    } else if (obj.get("bot_id")) |stored_bot_id_val| {
+        if (stored_bot_id_val != .null and stored_bot_id_val != .string) return null;
+    }
+
+    return last_update_id_val.integer;
+}
+
+pub fn saveTelegramUpdateOffset(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    account_id: []const u8,
+    bot_token: []const u8,
+    update_id: i64,
+) !void {
+    const path = try telegramUpdateOffsetPath(allocator, config, account_id);
+    defer allocator.free(path);
+
+    if (std.fs.path.dirname(path)) |dir| {
+        std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => try std.fs.cwd().makePath(dir),
+        };
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\n");
+    try std.fmt.format(buf.writer(allocator), "  \"version\": {d},\n", .{TELEGRAM_OFFSET_STORE_VERSION});
+    try std.fmt.format(buf.writer(allocator), "  \"last_update_id\": {d},\n", .{update_id});
+    if (extractTelegramBotId(bot_token)) |bot_id| {
+        try std.fmt.format(buf.writer(allocator), "  \"bot_id\": \"{s}\"\n", .{bot_id});
+    } else {
+        try buf.appendSlice(allocator, "  \"bot_id\": null\n");
+    }
+    try buf.appendSlice(allocator, "}\n");
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    {
+        var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+        defer tmp_file.close();
+        try tmp_file.writeAll(buf.items);
+    }
+
+    std.fs.renameAbsolute(tmp_path, path) catch {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(buf.items);
+    };
+}
+
+pub fn persistTelegramUpdateOffsetIfAdvanced(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    account_id: []const u8,
+    bot_token: []const u8,
+    persisted_update_id: *i64,
+    candidate_update_id: i64,
+) void {
+    if (candidate_update_id <= persisted_update_id.*) return;
+    saveTelegramUpdateOffset(allocator, config, account_id, bot_token, candidate_update_id) catch |err| {
+        log.warn("failed to persist telegram update offset: {}", .{err});
+        return;
+    };
+    persisted_update_id.* = candidate_update_id;
+}
 
 fn signalGroupPeerId(reply_target: ?[]const u8) []const u8 {
     const target = reply_target orelse "unknown";
@@ -76,6 +212,8 @@ pub const ChannelRuntime = struct {
     mem_rt: ?memory_mod.MemoryRuntime,
     noop_obs: *observability.NoopObserver,
     subagent_manager: ?*subagent_mod.SubagentManager,
+    policy_tracker: *security.RateTracker,
+    security_policy: *security.SecurityPolicy,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
@@ -104,15 +242,37 @@ pub const ChannelRuntime = struct {
             }
         }
 
+        const policy_tracker = try allocator.create(security.RateTracker);
+        errdefer allocator.destroy(policy_tracker);
+        policy_tracker.* = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
+        errdefer policy_tracker.deinit();
+
+        const security_policy = try allocator.create(security.SecurityPolicy);
+        errdefer allocator.destroy(security_policy);
+        security_policy.* = .{
+            .autonomy = config.autonomy.level,
+            .workspace_dir = config.workspace_dir,
+            .workspace_only = config.autonomy.workspace_only,
+            .allowed_commands = if (config.autonomy.allowed_commands.len > 0) config.autonomy.allowed_commands else &security.default_allowed_commands,
+            .max_actions_per_hour = config.autonomy.max_actions_per_hour,
+            .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
+            .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+            .tracker = policy_tracker,
+        };
+
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
             .http_enabled = config.http_request.enabled,
             .browser_enabled = config.browser.enabled,
             .screenshot_enabled = true,
+            .composio_api_key = if (config.composio.enabled) config.composio.api_key else null,
+            .browser_open_domains = if (config.browser.allowed_domains.len > 0) config.browser.allowed_domains else null,
             .mcp_tools = mcp_tools,
             .agents = config.agents,
             .fallback_api_key = resolved_key,
             .tools_config = config.tools,
+            .allowed_paths = config.autonomy.allowed_paths,
+            .policy = security_policy,
             .subagent_manager = subagent_manager,
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
@@ -129,7 +289,8 @@ pub const ChannelRuntime = struct {
         const obs = noop_obs.observer();
 
         // Session manager
-        const session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+        var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+        session_mgr.policy = security_policy;
 
         // Self — heap-allocated so pointers remain stable
         const self = try allocator.create(ChannelRuntime);
@@ -142,6 +303,8 @@ pub const ChannelRuntime = struct {
             .mem_rt = mem_rt,
             .noop_obs = noop_obs,
             .subagent_manager = subagent_manager,
+            .policy_tracker = policy_tracker,
+            .security_policy = security_policy,
         };
         // Wire MemoryRuntime pointer into SessionManager for /doctor diagnostics
         // and into memory tools for retrieval pipeline + vector sync.
@@ -163,6 +326,9 @@ pub const ChannelRuntime = struct {
         }
         if (self.mem_rt) |*rt| rt.deinit();
         self.provider_bundle.deinit();
+        self.policy_tracker.deinit();
+        alloc.destroy(self.security_policy);
+        alloc.destroy(self.policy_tracker);
         alloc.destroy(self.noop_obs);
         alloc.destroy(self);
     }
@@ -202,9 +368,15 @@ pub fn runTelegramLoop(
         tg_ptr.transcriber = wt.transcriber();
     }
 
-    // Register bot commands and skip stale messages
+    if (loadTelegramUpdateOffset(allocator, config, tg_ptr.account_id, tg_ptr.bot_token)) |saved_update_id| {
+        tg_ptr.last_update_id = saved_update_id;
+    }
+
+    tg_ptr.deleteWebhookKeepPending();
+
+    // Register bot commands
     tg_ptr.setMyCommands();
-    tg_ptr.dropPendingUpdates();
+    var persisted_update_id: i64 = tg_ptr.last_update_id;
 
     var evict_counter: u32 = 0;
 
@@ -286,6 +458,17 @@ pub fn runTelegramLoop(
                 msg.deinit(allocator);
             }
             allocator.free(messages);
+        }
+
+        if (tg_ptr.persistableUpdateOffset()) |persistable_update_id| {
+            persistTelegramUpdateOffsetIfAdvanced(
+                allocator,
+                config,
+                tg_ptr.account_id,
+                tg_ptr.bot_token,
+                &persisted_update_id,
+                persistable_update_id,
+            );
         }
 
         // Periodic session eviction

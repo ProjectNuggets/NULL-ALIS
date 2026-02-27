@@ -207,7 +207,14 @@ pub const ChannelManager = struct {
         const account_id = accountIdFromConfig(cfg);
         try self.registry.registerWithAccount(ch, account_id);
 
-        const listener_type = comptime listenerTypeForField(field_name);
+        var listener_type: ListenerType = comptime listenerTypeForField(field_name);
+        if (comptime std.mem.eql(u8, field_name, "telegram")) {
+            if (cfg.receive_mode == .webhook) {
+                listener_type = .webhook_only;
+            } else {
+                listener_type = .polling;
+            }
+        }
         try self.entries.append(self.allocator, .{
             .name = field_name,
             .account_id = account_id,
@@ -693,6 +700,39 @@ test "ChannelManager no channels configured" {
     try mgr.collectConfiguredChannels();
     try std.testing.expectEqual(@as(usize, 0), mgr.count());
     try std.testing.expectEqual(@as(usize, 0), mgr.channelEntries().len);
+}
+
+test "ChannelManager telegram receive_mode webhook uses webhook_only listener" {
+    if (!channel_catalog.isBuildEnabled(.telegram)) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var reg = dispatch.ChannelRegistry.init(allocator);
+    defer reg.deinit();
+
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{
+            .telegram = &[_]@import("config_types.zig").TelegramConfig{
+                .{
+                    .account_id = "main",
+                    .bot_token = "tg-token",
+                    .receive_mode = .webhook,
+                },
+            },
+        },
+    };
+
+    const mgr = try ChannelManager.init(allocator, &config, &reg);
+    defer mgr.deinit();
+    try mgr.collectConfiguredChannels();
+
+    const entries = mgr.channelEntries();
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(ListenerType.webhook_only, entries[0].listener_type);
 }
 
 fn countEntriesByListenerType(entries: []const Entry, listener_type: ListenerType) usize {

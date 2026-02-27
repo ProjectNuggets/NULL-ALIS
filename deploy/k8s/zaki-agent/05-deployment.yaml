@@ -1,0 +1,181 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nullclaw
+  namespace: zaki-agent-staging
+  labels:
+    app.kubernetes.io/name: nullclaw
+    app.kubernetes.io/part-of: zaki-agent
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nullclaw
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nullclaw
+        app.kubernetes.io/part-of: zaki-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: nullclaw
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: nullclaw
+          # Replace with your registry/tag.
+          image: ghcr.io/nullclaw/nullclaw:REPLACE_TAG
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: nullclaw-runtime-config
+            - secretRef:
+                name: nullclaw-runtime-secrets
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              mkdir -p /nullclaw-data/.nullclaw
+              mkdir -p "${TENANT_DATA_ROOT}"
+
+              cat > /nullclaw-data/.nullclaw/config.json <<JSON
+              {
+                "agents": {
+                  "defaults": {
+                    "model": {
+                      "primary": "openrouter/anthropic/claude-sonnet-4"
+                    }
+                  }
+                },
+                "models": {
+                  "providers": {
+                    "openrouter": {
+                      "api_key": "${OPENROUTER_API_KEY}",
+                      "base_url": "https://openrouter.ai/api/v1"
+                    }
+                  }
+                },
+                "gateway": {
+                  "port": ${GATEWAY_PORT},
+                  "host": "${GATEWAY_HOST}",
+                  "require_pairing": false,
+                  "allow_public_bind": true,
+                  "max_workers": 16,
+                  "max_queued_requests": 2048,
+                  "internal_service_tokens": ["${INTERNAL_SERVICE_TOKEN}"]
+                },
+                "tenant": {
+                  "enabled": true,
+                  "data_root": "${TENANT_DATA_ROOT}",
+                  "runtime_cache_max_users": 2048,
+                  "runtime_idle_ttl_secs": 1800
+                },
+                "session": {
+                  "cross_channel_shared_main": true
+                },
+                "channels": {
+                  "telegram": {
+                    "accounts": {
+                      "default": {
+                        "account_id": "default",
+                        "bot_token": "${TELEGRAM_BOT_TOKEN}",
+                        "receive_mode": "webhook",
+                        "webhook_secret_token": "${TELEGRAM_WEBHOOK_SECRET}",
+                        "allow_from": ["${TELEGRAM_ALLOW_FROM}"]
+                      }
+                    }
+                  }
+                }
+              }
+              JSON
+
+              exec nullclaw gateway --host "${GATEWAY_HOST}" --port "${GATEWAY_PORT}"
+          volumeMounts:
+            - name: tenant-data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    curl -sS -X POST "http://127.0.0.1:3000/internal/drain" -H "X-Internal-Token: ${INTERNAL_SERVICE_TOKEN}" || true
+                    sleep 5
+                    curl -sS -X POST "http://127.0.0.1:3000/internal/shutdown" -H "X-Internal-Token: ${INTERNAL_SERVICE_TOKEN}" || true
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+        - name: litestream
+          image: litestream/litestream:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: nullclaw-runtime-config
+            - secretRef:
+                name: nullclaw-runtime-secrets
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              exec litestream replicate -config /etc/litestream/litestream.yml
+          volumeMounts:
+            - name: tenant-data
+              mountPath: /data
+            - name: litestream-config
+              mountPath: /etc/litestream
+              readOnly: true
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: tenant-data
+          persistentVolumeClaim:
+            claimName: nullclaw-data-rwx
+        - name: litestream-config
+          configMap:
+            name: nullclaw-litestream-config

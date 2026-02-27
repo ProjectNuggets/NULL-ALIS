@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nullclaw-litestream-config
+  namespace: zaki-agent-staging
+  labels:
+    app.kubernetes.io/name: nullclaw
+    app.kubernetes.io/part-of: zaki-agent
+data:
+  litestream.yml: |
+    # Dynamic per-tenant SQLite replication for /data/users/{user_id}/memory.db
+    # Uses directory watcher mode to pick up newly provisioned users automatically.
+    dbs:
+      - dir: ${TENANT_DATA_ROOT}
+        pattern: "memory.db"
+        recursive: true
+        watch: true
+        replica:
+          url: s3://${LITESTREAM_S3_BUCKET}/${LITESTREAM_S3_PREFIX}
+          sync-interval: ${LITESTREAM_SYNC_INTERVAL}
