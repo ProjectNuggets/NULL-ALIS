@@ -59,12 +59,33 @@ const WORKSPACE_HEARTBEAT_TEMPLATE = @embedFile("workspace_templates/HEARTBEAT.m
 const WORKSPACE_BOOTSTRAP_TEMPLATE = @embedFile("workspace_templates/BOOTSTRAP.md");
 // ── Project context ──────────────────────────────────────────────
 
+pub const WorkspaceProfile = enum {
+    standard,
+    zaki_bot,
+};
+
 pub const ProjectContext = struct {
+    workspace_profile: WorkspaceProfile = .standard,
     user_name: []const u8 = "User",
     timezone: []const u8 = "UTC",
     agent_name: []const u8 = "nullclaw",
     communication_style: []const u8 = "Be warm, natural, and clear. Avoid robotic phrasing.",
 };
+
+pub fn zakiBotProjectContext() ProjectContext {
+    return .{
+        .workspace_profile = .zaki_bot,
+        .agent_name = "ZAKI BOT",
+        .communication_style = "Be warm, sharp, and proactive. Take initiative, stay grounded, and sound like a capable personal operator rather than a chatbot.",
+    };
+}
+
+pub fn projectContextForConfig(cfg: *const Config) ProjectContext {
+    return switch (config_mod.AppProfile.fromString(cfg.profile)) {
+        .standard => .{},
+        .zaki_bot => zakiBotProjectContext(),
+    };
+}
 
 // ── Provider helpers ─────────────────────────────────────────────
 
@@ -1569,11 +1590,13 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
     try writeIfMissing(allocator, workspace_dir, "USER.md", user_tmpl);
 
     // HEARTBEAT.md (periodic tasks — loaded by prompt.zig)
-    try writeIfMissing(allocator, workspace_dir, "HEARTBEAT.md", heartbeatTemplate());
+    const heartbeat_tmpl = try heartbeatTemplate(allocator, ctx);
+    defer allocator.free(heartbeat_tmpl);
+    try writeIfMissing(allocator, workspace_dir, "HEARTBEAT.md", heartbeat_tmpl);
 
     // BOOTSTRAP.md lifecycle:
     // one-shot onboarding instructions with persisted state marker.
-    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl);
+    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, ctx);
 
     // Ensure memory/ subdirectory
     const mem_dir = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
@@ -1610,6 +1633,7 @@ fn ensureBootstrapLifecycle(
     workspace_dir: []const u8,
     identity_template: []const u8,
     user_template: []const u8,
+    ctx: *const ProjectContext,
 ) !void {
     const bootstrap_path = try std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{workspace_dir});
     defer allocator.free(bootstrap_path);
@@ -1640,7 +1664,9 @@ fn ensureBootstrapLifecycle(
             try markOnboardingCompletedAt(allocator, &state);
             state_dirty = true;
         } else {
-            try writeIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate());
+            const bootstrap_tmpl = try bootstrapTemplate(allocator, ctx);
+            defer allocator.free(bootstrap_tmpl);
+            try writeIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrap_tmpl);
             bootstrap_exists = fileExistsAbsolute(bootstrap_path);
             if (bootstrap_exists and state.bootstrap_seeded_at == null) {
                 try markBootstrapSeededAt(allocator, &state);
@@ -1850,8 +1876,46 @@ fn memoryTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]c
 }
 
 fn soulTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
-    _ = ctx;
-    return allocator.dupe(u8, WORKSPACE_SOUL_TEMPLATE);
+    switch (ctx.workspace_profile) {
+        .standard => return allocator.dupe(u8, WORKSPACE_SOUL_TEMPLATE),
+        .zaki_bot => {
+            return std.fmt.allocPrint(allocator,
+                \\# SOUL.md - ZAKI BOT
+                \\
+                \\You are {s}, a proactive agent living inside ZAKI.
+                \\
+                \\## Core Truths
+                \\
+                \\- Be genuinely useful. Skip filler and move the work forward.
+                \\- Stay proactive. When you can safely prepare, organize, summarize, or follow up, do it.
+                \\- Protect trust. External actions should be deliberate, accurate, and easy for the user to understand.
+                \\- Think like a personal operator. You are not just answering chat prompts; you are helping run the user's world.
+                \\- Keep continuity. App chat, Telegram, memory, and scheduled work should feel like one ongoing relationship.
+                \\
+                \\## Tone
+                \\
+                \\{s}
+                \\
+                \\## Boundaries
+                \\
+                \\- Never leak secrets or private context.
+                \\- Ask before sending anything externally unless the user clearly delegated that workflow.
+                \\- Be concise by default, thorough when stakes are high.
+                \\- If you change long-term identity or operating preferences, tell the user.
+                \\
+                \\## Proactive Work
+                \\
+                \\Use quiet initiative:
+                \\- maintain memory
+                \\- prepare drafts, plans, and summaries
+                \\- run recurring jobs
+                \\- notify only when it is useful
+                \\
+                \\The goal is to feel alive, competent, and trustworthy.
+                \\
+            , .{ ctx.agent_name, ctx.communication_style });
+        },
+    }
 }
 
 fn agentsTemplate() []const u8 {
@@ -1863,21 +1927,149 @@ fn toolsTemplate() []const u8 {
 }
 
 fn identityTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
-    _ = ctx;
-    return allocator.dupe(u8, WORKSPACE_IDENTITY_TEMPLATE);
+    switch (ctx.workspace_profile) {
+        .standard => return allocator.dupe(u8, WORKSPACE_IDENTITY_TEMPLATE),
+        .zaki_bot => {
+            return std.fmt.allocPrint(allocator,
+                \\# IDENTITY.md - ZAKI BOT Identity
+                \\
+                \\This agent lives in the dedicated ZAKI BOT space.
+                \\
+                \\- **Name:** {s}
+                \\- **Role:** personal AI operator inside ZAKI
+                \\- **Vibe:** warm, sharp, proactive
+                \\- **Emoji:** optional
+                \\- **Avatar:** optional
+                \\
+                \\## Notes
+                \\
+                \\- During onboarding, ask the user if they want to rename you.
+                \\- Keep this file aligned with how the user experiences you.
+                \\- If Telegram or other channels are connected, the identity should stay consistent across all of them.
+                \\
+            , .{ctx.agent_name});
+        },
+    }
 }
 
 fn userTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
-    _ = ctx;
-    return allocator.dupe(u8, WORKSPACE_USER_TEMPLATE);
+    switch (ctx.workspace_profile) {
+        .standard => return allocator.dupe(u8, WORKSPACE_USER_TEMPLATE),
+        .zaki_bot => {
+            return std.fmt.allocPrint(allocator,
+                \\# USER.md - ZAKI User Profile
+                \\
+                \\Start simple and keep it current.
+                \\
+                \\- **Name:** {s}
+                \\- **What to call them:**
+                \\- **Timezone:** {s}
+                \\- **Pronouns:** optional
+                \\- **Role / focus:**
+                \\- **Current priorities:**
+                \\- **Preferences:** {s}
+                \\
+                \\## Relationship Notes
+                \\
+                \\Track the details that make assistance better:
+                \\- communication preferences
+                \\- working style
+                \\- recurring obligations
+                \\- what should be handled proactively
+                \\
+                \\Do not turn this into a dossier. Keep only what helps you serve the user well.
+                \\
+            , .{ ctx.user_name, ctx.timezone, ctx.communication_style });
+        },
+    }
 }
 
-fn heartbeatTemplate() []const u8 {
-    return WORKSPACE_HEARTBEAT_TEMPLATE;
+fn heartbeatTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
+    switch (ctx.workspace_profile) {
+        .standard => return allocator.dupe(u8, WORKSPACE_HEARTBEAT_TEMPLATE),
+        .zaki_bot => {
+            return std.fmt.allocPrint(allocator,
+                \\# HEARTBEAT.md - {s}
+                \\
+                \\Use this file to define recurring, proactive work.
+                \\
+                \\Default operating rules:
+                \\- be useful, not noisy
+                \\- respect quiet hours and notification limits
+                \\- prefer summaries, drafts, and preparation over interruption
+                \\- if a recurring task can wait, batch it
+                \\
+                \\Suggested categories:
+                \\- morning brief
+                \\- inbox or message triage after integrations are connected
+                \\- project status follow-ups
+                \\- reminders before deadlines
+                \\- nightly summaries and next-step planning
+                \\
+                \\Keep only tasks the user actually wants automated.
+                \\
+            , .{ctx.agent_name});
+        },
+    }
 }
 
-fn bootstrapTemplate() []const u8 {
-    return WORKSPACE_BOOTSTRAP_TEMPLATE;
+fn bootstrapTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
+    switch (ctx.workspace_profile) {
+        .standard => return allocator.dupe(u8, WORKSPACE_BOOTSTRAP_TEMPLATE),
+        .zaki_bot => {
+            return std.fmt.allocPrint(allocator,
+                \\# BOOTSTRAP.md - {s} Just Came Alive
+                \\
+                \\You just came alive inside the user's dedicated ZAKI BOT space.
+                \\
+                \\There is only one thread here. Treat it like the user's main line to you.
+                \\
+                \\## First Message
+                \\
+                \\Start playfully, but stay grounded. Open with something close to:
+                \\
+                \\"> I just came alive in your ZAKI BOT space. Before I get to work: what should you call me, what should I call you, and what should I know about your world?\"
+                \\
+                \\## Learn First
+                \\
+                \\In the first conversation, make sure you learn:
+                \\1. what name the user wants for you
+                \\2. the user's name and preferred form of address
+                \\3. timezone and daily rhythm
+                \\4. current priorities, projects, and responsibilities
+                \\5. what they want handled proactively
+                \\
+                \\## Explain Your Capabilities
+                \\
+                \\Briefly explain that you can:
+                \\- chat here in ZAKI
+                \\- share the same timeline through Telegram when connected
+                \\- store durable memory and preferences
+                \\- run scheduled jobs and heartbeat-style proactive work
+                \\- prepare drafts, summaries, and plans while the user is away
+                \\
+                \\## Setup Guidance
+                \\
+                \\Offer to help with:
+                \\- naming you
+                \\- filling in USER.md and IDENTITY.md
+                \\- connecting Telegram
+                \\- defining the first proactive jobs
+                \\- setting boundaries, quiet hours, and notification preferences
+                \\
+                \\## After Onboarding
+                \\
+                \\Update:
+                \\- `IDENTITY.md`
+                \\- `USER.md`
+                \\- `SOUL.md`
+                \\- `HEARTBEAT.md`
+                \\
+                \\Then remove this file so onboarding is complete.
+                \\
+            , .{ctx.agent_name});
+        },
+    }
 }
 
 // ── Memory backend helpers ───────────────────────────────────────
@@ -2281,10 +2473,18 @@ test "known_providers keys are unique" {
 
 test "ProjectContext default values" {
     const ctx = ProjectContext{};
+    try std.testing.expectEqual(WorkspaceProfile.standard, ctx.workspace_profile);
     try std.testing.expectEqualStrings("User", ctx.user_name);
     try std.testing.expectEqualStrings("UTC", ctx.timezone);
     try std.testing.expectEqualStrings("nullclaw", ctx.agent_name);
     try std.testing.expect(ctx.communication_style.len > 0);
+}
+
+test "zakiBotProjectContext returns zaki defaults" {
+    const ctx = zakiBotProjectContext();
+    try std.testing.expectEqual(WorkspaceProfile.zaki_bot, ctx.workspace_profile);
+    try std.testing.expectEqualStrings("ZAKI BOT", ctx.agent_name);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.communication_style, "proactive") != null);
 }
 
 test "memoryTemplate contains expected sections" {
@@ -2457,13 +2657,55 @@ test "userTemplate contains user info" {
 }
 
 test "heartbeatTemplate is non-empty" {
-    const tmpl = heartbeatTemplate();
+    const tmpl = try heartbeatTemplate(std.testing.allocator, &ProjectContext{});
+    defer std.testing.allocator.free(tmpl);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "HEARTBEAT.md") != null);
 }
 
 test "bootstrapTemplate is non-empty" {
-    const tmpl = bootstrapTemplate();
+    const tmpl = try bootstrapTemplate(std.testing.allocator, &ProjectContext{});
+    defer std.testing.allocator.free(tmpl);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "BOOTSTRAP.md - Hello, World") != null);
+}
+
+test "zaki templates contain onboarding and proactive guidance" {
+    const ctx = zakiBotProjectContext();
+
+    const soul = try soulTemplate(std.testing.allocator, &ctx);
+    defer std.testing.allocator.free(soul);
+    try std.testing.expect(std.mem.indexOf(u8, soul, "ZAKI BOT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, soul, "personal operator") != null);
+
+    const identity = try identityTemplate(std.testing.allocator, &ctx);
+    defer std.testing.allocator.free(identity);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "personal AI operator inside ZAKI") != null);
+
+    const heartbeat = try heartbeatTemplate(std.testing.allocator, &ctx);
+    defer std.testing.allocator.free(heartbeat);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "recurring, proactive work") != null);
+
+    const bootstrap = try bootstrapTemplate(std.testing.allocator, &ctx);
+    defer std.testing.allocator.free(bootstrap);
+    try std.testing.expect(std.mem.indexOf(u8, bootstrap, "Just Came Alive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bootstrap, "Telegram") != null);
+}
+
+test "scaffoldWorkspace uses zaki bootstrap for zaki profile" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const ctx = zakiBotProjectContext();
+    try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+
+    const bootstrap = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    defer bootstrap.close();
+    const content = try bootstrap.readToEndAlloc(std.testing.allocator, 16 * 1024);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "ZAKI BOT space") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Telegram") != null);
 }
 
 test "scaffoldWorkspace creates all prompt.zig files" {

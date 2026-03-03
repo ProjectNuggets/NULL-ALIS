@@ -2,10 +2,10 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: nullclaw-runtime-config
-  namespace: zaki-agent-staging
+  namespace: zaki-bot-staging
   labels:
     app.kubernetes.io/name: nullclaw
-    app.kubernetes.io/part-of: zaki-agent
+    app.kubernetes.io/part-of: zaki-bot
 data:
   GATEWAY_HOST: "0.0.0.0"
   GATEWAY_PORT: "3000"

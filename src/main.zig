@@ -1707,7 +1707,7 @@ fn runMatrixChannel(
 
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
-    const runtime = yc.channel_loop.ChannelRuntime.init(allocator, config) catch |err| {
+    const runtime = yc.channel_loop.ChannelRuntime.init(allocator, config, null) catch |err| {
         std.debug.print("Runtime init failed: {}\n", .{err});
         std.process.exit(1);
     };

@@ -2,10 +2,10 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: nullclaw
-  namespace: zaki-agent-staging
+  namespace: zaki-bot-staging
   labels:
     app.kubernetes.io/name: nullclaw
-    app.kubernetes.io/part-of: zaki-agent
+    app.kubernetes.io/part-of: zaki-bot
   annotations:
     kubernetes.io/ingress.class: nginx
 

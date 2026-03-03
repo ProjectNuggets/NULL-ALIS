@@ -47,7 +47,7 @@ This matrix reflects the current tool exposure from `src/tools/root.zig::allTool
 
 | Tool name | Status | Why not in allTools() now |
 |---|---|---|
-| message | not_exposed | Needs per-turn channel context + event bus wiring |
+| message | gated (`event_bus`) | Enabled only in bus-backed runtimes; defaults to current channel/account/chat per turn |
 | pushover | not_exposed | Optional notification channel; not universal default |
 | cron_add | not_exposed | Covered by `schedule` unified interface |
 | cron_list | not_exposed | Covered by `schedule` unified interface |
@@ -69,3 +69,23 @@ Specifically wired:
 - `browser_open_domains` from `config.browser.allowed_domains`
 - `tools_config` propagated for consistent limits
 
+## ZAKI BOT profile
+
+Use top-level config:
+
+```json
+{
+  "profile": "zaki_bot"
+}
+```
+
+Current effect:
+- enables `http_request.enabled=true` by default
+- therefore enables `web_fetch` and `web_search` in runtime callers
+- keeps `browser`, `composio`, and `mcp:*` explicitly gated by their own runtime/config requirements
+- switches workspace scaffolding to ZAKI BOT onboarding/persona templates when the profile is used in CLI/daemon flows
+
+Why this profile is intentionally narrow:
+- internet research is core to ZAKI BOT, so it should be on
+- browser automation is infrastructure-dependent, so it should not silently enable and fail
+- MCP and Composio are external trust boundaries, so they stay opt-in

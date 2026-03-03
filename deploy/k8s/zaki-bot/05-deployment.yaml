@@ -2,10 +2,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: nullclaw
-  namespace: zaki-agent-staging
+  namespace: zaki-bot-staging
   labels:
     app.kubernetes.io/name: nullclaw
-    app.kubernetes.io/part-of: zaki-agent
+    app.kubernetes.io/part-of: zaki-bot
 spec:
   replicas: 2
   revisionHistoryLimit: 5
@@ -21,7 +21,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: nullclaw
-        app.kubernetes.io/part-of: zaki-agent
+        app.kubernetes.io/part-of: zaki-bot
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "3000"

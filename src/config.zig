@@ -12,6 +12,7 @@ pub const DiagnosticsConfig = config_types.DiagnosticsConfig;
 pub const AutonomyConfig = config_types.AutonomyConfig;
 pub const DockerRuntimeConfig = config_types.DockerRuntimeConfig;
 pub const RuntimeConfig = config_types.RuntimeConfig;
+pub const AppProfile = config_types.AppProfile;
 pub const ModelFallbackEntry = config_types.ModelFallbackEntry;
 pub const ReliabilityConfig = config_types.ReliabilityConfig;
 pub const SchedulerConfig = config_types.SchedulerConfig;
@@ -78,6 +79,7 @@ pub const Config = struct {
     config_path: []const u8,
 
     // Top-level fields
+    profile: []const u8 = "standard",
     providers: []const ProviderEntry = &.{},
     audio_media: AudioMediaConfig = .{},
     default_provider: []const u8 = "openrouter",
@@ -176,6 +178,20 @@ pub const Config = struct {
         self.gateway_port = self.gateway.port;
         self.workspace_only = self.autonomy.workspace_only;
         self.max_actions_per_hour = self.autonomy.max_actions_per_hour;
+    }
+
+    /// Apply top-level profile defaults after parsing explicit config values.
+    /// Only set values that are still at their default, so direct config always wins.
+    pub fn applyProfileDefaults(self: *Config) void {
+        switch (AppProfile.fromString(self.profile)) {
+            .standard => {},
+            .zaki_bot => {
+                const http_defaults = config_types.HttpRequestConfig{};
+                if (self.http_request.enabled == http_defaults.enabled) {
+                    self.http_request.enabled = true;
+                }
+            },
+        }
     }
 
     pub fn load(backing_allocator: std.mem.Allocator) !Config {
@@ -465,6 +481,7 @@ pub const Config = struct {
         try w.print("{{\n", .{});
 
         // Top-level fields
+        try w.print("  \"profile\": \"{s}\",\n", .{self.profile});
         try w.print("  \"default_temperature\": {d:.1},\n", .{self.default_temperature});
         if (self.reasoning_effort) |value| {
             try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
@@ -3061,4 +3078,69 @@ test "session config parses cross_channel_shared_main" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expect(!cfg.session.cross_channel_shared_main);
+}
+
+test "profile zaki_bot enables http request defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"profile": "zaki_bot"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("zaki_bot", cfg.profile);
+    try std.testing.expect(cfg.http_request.enabled);
+    try std.testing.expect(!cfg.browser.enabled);
+}
+
+test "profile defaults do not override explicit http request disable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"profile": "zaki_bot", "http_request": {"enabled": false}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(!cfg.http_request.enabled);
+}
+
+test "save and parse preserve profile" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg_arena = std.heap.ArenaAllocator.init(allocator);
+    defer cfg_arena.deinit();
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = cfg_arena.allocator(),
+    };
+    try cfg.parseJson("{\"profile\": \"zaki_bot\"}");
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqualStrings("zaki_bot", loaded.profile);
+    try std.testing.expect(loaded.http_request.enabled);
 }

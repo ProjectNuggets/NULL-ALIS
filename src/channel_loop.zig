@@ -21,6 +21,7 @@ const security = @import("security/policy.zig");
 const subagent_mod = @import("subagent.zig");
 const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
+const bus_mod = @import("bus.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -214,9 +215,10 @@ pub const ChannelRuntime = struct {
     subagent_manager: ?*subagent_mod.SubagentManager,
     policy_tracker: *security.RateTracker,
     security_policy: *security.SecurityPolicy,
+    event_bus: ?*bus_mod.Bus,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
-    pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
+    pub fn init(allocator: std.mem.Allocator, config: *const Config, event_bus: ?*bus_mod.Bus) !*ChannelRuntime {
         var runtime_provider = try provider_runtime.RuntimeProviderBundle.init(allocator, config);
         errdefer runtime_provider.deinit();
 
@@ -270,6 +272,7 @@ pub const ChannelRuntime = struct {
             .mcp_tools = mcp_tools,
             .agents = config.agents,
             .fallback_api_key = resolved_key,
+            .event_bus = event_bus,
             .tools_config = config.tools,
             .allowed_paths = config.autonomy.allowed_paths,
             .policy = security_policy,
@@ -305,6 +308,7 @@ pub const ChannelRuntime = struct {
             .subagent_manager = subagent_manager,
             .policy_tracker = policy_tracker,
             .security_policy = security_policy,
+            .event_bus = event_bus,
         };
         // Wire MemoryRuntime pointer into SessionManager for /doctor diagnostics
         // and into memory tools for retrieval pipeline + vector sync.
@@ -433,7 +437,11 @@ pub fn runTelegramLoop(
             tg_ptr.startTyping(typing_target) catch {};
             defer tg_ptr.stopTyping(typing_target) catch {};
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+            const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, null, .{
+                .channel = "telegram",
+                .account_id = tg_ptr.account_id,
+                .chat_id = msg.sender,
+            }) catch |err| {
                 log.err("Agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -573,7 +581,12 @@ pub fn runSignalLoop(
                 .is_group = msg.is_group,
             };
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
+            const signal_target = msg.reply_target orelse msg.sender;
+            const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, conversation_context, .{
+                .channel = "signal",
+                .account_id = sg_ptr.account_id,
+                .chat_id = signal_target,
+            }) catch |err| {
                 log.err("Signal agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -774,7 +787,12 @@ pub fn runMatrixLoop(
             mx_ptr.startTyping(typing_target) catch {};
             defer mx_ptr.stopTyping(typing_target) catch {};
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+            const matrix_target = msg.reply_target orelse msg.sender;
+            const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, null, .{
+                .channel = "matrix",
+                .account_id = mx_ptr.account_id,
+                .chat_id = matrix_target,
+            }) catch |err| {
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",

@@ -1,6 +1,6 @@
 # ZAKI Backend Handoff Spec (Nullclaw Integration)
 
-This document is the implementation contract for ZAKI backend to integrate with Nullclaw for the dedicated `ZAKI-agent` space.
+This document is the implementation contract for ZAKI backend to integrate with Nullclaw for the dedicated `ZAKI BOT` space.
 
 ## 1) Base setup
 
@@ -148,7 +148,7 @@ Nullclaw behavior:
 - Deduplicates by `update_id`.
 - Writes latest chat mapping to tenant `channel_state.json`.
 - Routes inbound Telegram message into same main session key as app:
-  - `agent:zaki-agent:user:{id}:main`
+  - `agent:zaki-bot:user:{id}:main`
 
 ## 8) Local integration checklist
 

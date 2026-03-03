@@ -1,13 +1,13 @@
-# ZAKI Frontend Handoff Spec (ZAKI-agent UX)
+# ZAKI Frontend Handoff Spec (ZAKI BOT UX)
 
-This is the UI contract for the dedicated `ZAKI-agent` space powered by Nullclaw through ZAKI backend.
+This is the UI contract for the dedicated `ZAKI BOT` space powered by Nullclaw through ZAKI backend.
 
 ## 1) Space model
 
-- Add fixed sidebar entry: `ZAKI-agent`.
+- Add fixed sidebar entry: `ZAKI BOT`.
 - This is not a normal workspace.
 - Hardcode identity in frontend state:
-  - `space_id = "zaki-agent"`
+  - `space_id = "zaki-bot"`
   - `thread_id = "main"`
 - Disable thread create/delete/rename in this space.
 
@@ -112,7 +112,7 @@ For stream errors, keep existing typed text and allow resend.
 
 ## 7) Local QA acceptance checklist
 
-1. Sidebar shows fixed `ZAKI-agent` entry.
+1. Sidebar shows fixed `ZAKI BOT` entry.
 2. Only one thread is visible and writable.
 3. Chat renders incremental SSE tokens.
 4. Onboarding appears first time only.

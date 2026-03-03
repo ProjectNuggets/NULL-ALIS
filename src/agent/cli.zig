@@ -48,7 +48,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // Ensure lifecycle parity: seed workspace files on first agent run
     // so prompts always have the expected bootstrap context.
-    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{});
+    const project_ctx = onboard.projectContextForConfig(&cfg);
+    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &project_ctx);
 
     var out_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&out_buf);

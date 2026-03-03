@@ -2,10 +2,10 @@ apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
   name: nullclaw-alerts
-  namespace: zaki-agent-staging
+  namespace: zaki-bot-staging
   labels:
     app.kubernetes.io/name: nullclaw
-    app.kubernetes.io/part-of: zaki-agent
+    app.kubernetes.io/part-of: zaki-bot
 spec:
   groups:
     - name: nullclaw-gateway

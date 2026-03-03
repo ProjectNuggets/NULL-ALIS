@@ -87,6 +87,22 @@ pub const RuntimeConfig = struct {
     docker: DockerRuntimeConfig = .{},
 };
 
+pub const AppProfile = enum {
+    standard,
+    zaki_bot,
+
+    pub fn fromString(raw: []const u8) AppProfile {
+        if (std.mem.eql(u8, raw, "zaki_bot") or
+            std.mem.eql(u8, raw, "zaki-bot") or
+            std.mem.eql(u8, raw, "zaki_agent") or
+            std.mem.eql(u8, raw, "zaki-agent"))
+        {
+            return .zaki_bot;
+        }
+        return .standard;
+    }
+};
+
 pub const ModelFallbackEntry = struct {
     model: []const u8,
     fallbacks: []const []const u8,

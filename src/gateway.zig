@@ -358,6 +358,7 @@ const TenantRuntime = struct {
         allocator: std.mem.Allocator,
         base_config: *const Config,
         user_ctx: *const UserContext,
+        event_bus: ?*bus_mod.Bus,
     ) !*TenantRuntime {
         const runtime = try allocator.create(TenantRuntime);
         errdefer allocator.destroy(runtime);
@@ -392,7 +393,7 @@ const TenantRuntime = struct {
 
         const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
         if (subagent_manager) |mgr| {
-            mgr.* = subagent_mod.SubagentManager.init(allocator, &runtime.config, null, .{});
+            mgr.* = subagent_mod.SubagentManager.init(allocator, &runtime.config, event_bus, .{});
         }
         runtime.subagent_manager = subagent_manager;
         errdefer if (runtime.subagent_manager) |mgr| {
@@ -408,6 +409,7 @@ const TenantRuntime = struct {
             .browser_open_domains = if (runtime.config.browser.allowed_domains.len > 0) runtime.config.browser.allowed_domains else null,
             .agents = runtime.config.agents,
             .fallback_api_key = resolved_api_key,
+            .event_bus = event_bus,
             .tools_config = runtime.config.tools,
             .subagent_manager = runtime.subagent_manager,
         }) catch &.{};
@@ -454,11 +456,16 @@ const TenantRuntime = struct {
         self.allocator.destroy(self);
     }
 
-    fn processMessage(self: *TenantRuntime, session_key: []const u8, message: []const u8) ![]const u8 {
+    fn processMessage(
+        self: *TenantRuntime,
+        session_key: []const u8,
+        message: []const u8,
+        message_turn_context: ?tools_mod.MessageTurnContext,
+    ) ![]const u8 {
         self.lock.lock();
         defer self.lock.unlock();
         self.last_used_s = std.time.timestamp();
-        return self.session_mgr.processMessage(session_key, message, null);
+        return self.session_mgr.processMessageWithToolContext(session_key, message, null, message_turn_context);
     }
 };
 
@@ -527,7 +534,7 @@ fn getTenantRuntime(
         return runtime;
     }
 
-    const runtime = try TenantRuntime.init(state.allocator, config, user_ctx);
+    const runtime = try TenantRuntime.init(state.allocator, config, user_ctx, state.event_bus);
     try state.tenant_runtimes.put(state.allocator, runtime.user_id, runtime);
     return runtime;
 }
@@ -1005,7 +1012,7 @@ fn maybeAcquireTenantOwnershipLock(
 }
 
 fn mainUserSessionKey(buf: []u8, user_id: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "agent:zaki-agent:user:{s}:main", .{user_id}) catch "agent:zaki-agent:user:unknown:main";
+    return std.fmt.bufPrint(buf, "agent:zaki-bot:user:{s}:main", .{user_id}) catch "agent:zaki-bot:user:unknown:main";
 }
 
 /// Returns true when a webhook request should be accepted for the current
@@ -2130,7 +2137,8 @@ fn handleApiRoute(
         ensureUserProvisioned(&user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user provisioning failed\"}" };
         };
-        onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &onboard.ProjectContext{}) catch {};
+        const project_ctx = onboard.zakiBotProjectContext();
+        onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &project_ctx) catch {};
         var ownership_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
                 _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
@@ -2176,7 +2184,7 @@ fn handleApiRoute(
                         .content_type = "text/event-stream; charset=utf-8",
                     };
                 };
-                break :blk tenant_runtime.processMessage(session_key, message) catch {
+                break :blk tenant_runtime.processMessage(session_key, message, null) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                     const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
                     return .{
@@ -2235,7 +2243,8 @@ fn handleApiRoute(
         ensureUserProvisioned(&user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
         };
-        onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &onboard.ProjectContext{}) catch {};
+        const project_ctx = onboard.zakiBotProjectContext();
+        onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &project_ctx) catch {};
         var provision_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
                 _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
@@ -2257,7 +2266,8 @@ fn handleApiRoute(
     ensureUserProvisioned(&user_ctx) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
     };
-    onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &onboard.ProjectContext{}) catch {};
+    const project_ctx = onboard.zakiBotProjectContext();
+    onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &project_ctx) catch {};
     const needs_write_lock = !std.mem.eql(u8, method, "GET");
     var user_write_lock_opt: ?tenant_lock.UserOwnershipLock = null;
     if (needs_write_lock) {
@@ -2843,7 +2853,11 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     ctx.response_body = "{\"error\":\"tenant runtime init failed\"}";
                     return;
                 };
-                const reply: ?[]const u8 = tenant_runtime.processMessage(sk, msg_text.?) catch |err| blk: {
+                const reply: ?[]const u8 = tenant_runtime.processMessage(sk, msg_text.?, .{
+                    .channel = "telegram",
+                    .account_id = tg_account_id,
+                    .chat_id = cid_str,
+                }) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
                         sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
                     }
@@ -4050,6 +4064,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .browser_open_domains = if (cfg.browser.allowed_domains.len > 0) cfg.browser.allowed_domains else null,
                     .agents = cfg.agents,
                     .fallback_api_key = resolved_api_key,
+                    .event_bus = event_bus,
                     .tools_config = cfg.tools,
                     .allowed_paths = cfg.autonomy.allowed_paths,
                     .policy = if (sec_policy_opt) |*policy| policy else null,
@@ -5888,7 +5903,7 @@ test "sseErrorEvent includes code and terminal done event" {
 }
 
 test "sseChatPayload emits token deltas and done metadata" {
-    const sse = try sseChatPayload(std.testing.allocator, "hello world", "agent:zaki-agent:user:user_a:main");
+    const sse = try sseChatPayload(std.testing.allocator, "hello world", "agent:zaki-bot:user:user_a:main");
     defer std.testing.allocator.free(sse);
     try std.testing.expect(std.mem.indexOf(u8, sse, "event: token") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"delta\":\"hello world\"") != null);
@@ -5896,6 +5911,6 @@ test "sseChatPayload emits token deltas and done metadata" {
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"seq\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "event: done") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"status\":\"ok\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sse, "\"session_id\":\"agent:zaki-agent:user:user_a:main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sse, "\"session_id\":\"agent:zaki-bot:user:user_a:main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"message_id\":\"") != null);
 }

@@ -2,10 +2,10 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: nullclaw
-  namespace: zaki-agent-staging
+  namespace: zaki-bot-staging
   labels:
     app.kubernetes.io/name: nullclaw
-    app.kubernetes.io/part-of: zaki-agent
+    app.kubernetes.io/part-of: zaki-bot
 spec:
   minAvailable: 1
   selector:

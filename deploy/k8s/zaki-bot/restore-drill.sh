@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${NAMESPACE:=zaki-agent-staging}"
+: "${NAMESPACE:=zaki-bot-staging}"
 : "${APP_SELECTOR:=app.kubernetes.io/name=nullclaw}"
 : "${LITESTREAM_S3_BUCKET:?set LITESTREAM_S3_BUCKET}"
 : "${LITESTREAM_S3_PREFIX:=nullclaw/users}"

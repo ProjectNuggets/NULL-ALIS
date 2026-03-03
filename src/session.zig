@@ -180,10 +180,23 @@ pub const SessionManager = struct {
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
+        return self.processMessageWithToolContext(session_key, content, conversation_context, null);
+    }
+
+    pub fn processMessageWithToolContext(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+        message_turn_context: ?tools_mod.MessageTurnContext,
+    ) ![]const u8 {
         const session = try self.getOrCreate(session_key);
 
         session.mutex.lock();
         defer session.mutex.unlock();
+
+        tools_mod.setMessageTurnContext(message_turn_context);
+        defer tools_mod.clearMessageTurnContext();
 
         // Set conversation context for this turn (Signal-specific for now)
         session.agent.conversation_context = conversation_context;

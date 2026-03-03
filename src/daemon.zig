@@ -244,21 +244,25 @@ fn runCronAgentTurn(
         runtime_cfg.workspace_dir = workspace;
     }
     // Ensure prompt/bootstrap files exist for first-run tenant workspaces.
-    onboard.scaffoldWorkspace(allocator, runtime_cfg.workspace_dir, &onboard.ProjectContext{}) catch {};
+    const project_ctx = if (scheduler.context_user_id != null)
+        onboard.zakiBotProjectContext()
+    else
+        onboard.projectContextForConfig(&runtime_cfg);
+    onboard.scaffoldWorkspace(allocator, runtime_cfg.workspace_dir, &project_ctx) catch {};
 
-    var runtime = try channel_loop.ChannelRuntime.init(allocator, &runtime_cfg);
+    var runtime = try channel_loop.ChannelRuntime.init(allocator, &runtime_cfg, null);
     defer runtime.deinit();
 
     var session_buf: [256]u8 = undefined;
     const session_key = blk: {
         if (scheduler.context_user_id) |user_id| {
             if (job.session_target == .main) {
-                break :blk std.fmt.bufPrint(&session_buf, "agent:zaki-agent:user:{s}:main", .{user_id}) catch "agent:zaki-agent:user:unknown:main";
+                break :blk std.fmt.bufPrint(&session_buf, "agent:zaki-bot:user:{s}:main", .{user_id}) catch "agent:zaki-bot:user:unknown:main";
             }
-            break :blk std.fmt.bufPrint(&session_buf, "agent:zaki-agent:user:{s}:cron:{s}", .{ user_id, job.id }) catch "agent:zaki-agent:user:unknown:cron";
+            break :blk std.fmt.bufPrint(&session_buf, "agent:zaki-bot:user:{s}:cron:{s}", .{ user_id, job.id }) catch "agent:zaki-bot:user:unknown:cron";
         }
-        if (job.session_target == .main) break :blk "agent:zaki-agent:main";
-        break :blk "agent:zaki-agent:cron";
+        if (job.session_target == .main) break :blk "agent:zaki-bot:main";
+        break :blk "agent:zaki-bot:cron";
     };
 
     return runtime.session_mgr.processMessage(session_key, prompt, null);
@@ -764,7 +768,11 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+        const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, null, .{
+            .channel = msg.channel,
+            .account_id = outbound_account_id,
+            .chat_id = msg.chat_id,
+        }) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 
             // Send user-visible error reply back to the originating channel
@@ -820,7 +828,8 @@ fn inboundDispatcherThread(
 pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
     // Ensure lifecycle parity: workspace bootstrap files must exist
     // even when users skip onboard and start runtime directly.
-    try onboard.scaffoldWorkspace(allocator, config.workspace_dir, &onboard.ProjectContext{});
+    const project_ctx = onboard.projectContextForConfig(config);
+    try onboard.scaffoldWorkspace(allocator, config.workspace_dir, &project_ctx);
 
     health.markComponentOk("daemon");
     shutdown_requested.store(false, .release);
@@ -906,7 +915,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Channel runtime for supervised polling (provider, tools, sessions)
     var channel_rt: ?*channel_loop.ChannelRuntime = null;
     if (has_runtime_dependent_channels) {
-        channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| blk: {
+        channel_rt = channel_loop.ChannelRuntime.init(allocator, config, &event_bus) catch |err| blk: {
             state.markError("channels", @errorName(err));
             health.markComponentError("channels", "runtime init failed");
             stdout.print(

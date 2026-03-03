@@ -349,7 +349,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 
 ### ZAKI-Agent Integration APIs
 
-These endpoints are available for dedicated ZAKI-agent integration (internal token required):
+These endpoints are available for dedicated ZAKI BOT integration (internal token required):
 
 - `POST /api/v1/chat/stream` (SSE)
 - `POST /api/v1/users/provision`

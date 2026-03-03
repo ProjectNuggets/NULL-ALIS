@@ -1,6 +1,6 @@
 # Nullclaw ZAKI-Agent Kubernetes Deployment Pack
 
-This folder is the deployment handoff package for running Nullclaw as the dedicated `ZAKI-agent` backend in a namespace-based K8s cluster.
+This folder is the deployment handoff package for running Nullclaw as the dedicated `ZAKI BOT` backend in a namespace-based K8s cluster.
 
 ## Scope
 This package is for the shared pool model with tenant isolation under `/data/users/{user_id}`.
@@ -36,8 +36,8 @@ It includes:
 
 ## Integration handoff docs
 
-- Backend contract: `deploy/k8s/zaki-agent/ZAKI_BACKEND_HANDOFF.md`
-- Frontend UX contract: `deploy/k8s/zaki-agent/ZAKI_FRONTEND_HANDOFF.md`
+- Backend contract: `deploy/k8s/zaki-bot/ZAKI_BACKEND_HANDOFF.md`
+- Frontend UX contract: `deploy/k8s/zaki-bot/ZAKI_FRONTEND_HANDOFF.md`
 
 ## Prerequisites
 1. RWX storage class exists.
@@ -64,19 +64,19 @@ Update these fields before apply:
 
 ## Apply order
 ```bash
-kubectl apply -k deploy/k8s/zaki-agent
-kubectl -n zaki-agent-staging rollout status deploy/nullclaw
+kubectl apply -k deploy/k8s/zaki-bot
+kubectl -n zaki-bot-staging rollout status deploy/nullclaw
 ```
 
 ## Post-deploy verification
 1. Check pods and probes.
 ```bash
-kubectl -n zaki-agent-staging get pods -l app.kubernetes.io/name=nullclaw
-kubectl -n zaki-agent-staging describe deploy/nullclaw
+kubectl -n zaki-bot-staging get pods -l app.kubernetes.io/name=nullclaw
+kubectl -n zaki-bot-staging describe deploy/nullclaw
 ```
 2. Check metrics.
 ```bash
-kubectl -n zaki-agent-staging port-forward svc/nullclaw 3000:80
+kubectl -n zaki-bot-staging port-forward svc/nullclaw 3000:80
 curl -s http://127.0.0.1:3000/metrics | head -n 40
 ```
 3. Run smoke test.
@@ -87,15 +87,15 @@ USER_ID=test-user-1 \
 TELEGRAM_BOT_TOKEN=... \
 WEBHOOK_BASE_URL=https://agent-staging.zaki.com \
 TELEGRAM_WEBHOOK_SECRET=... \
-./deploy/k8s/zaki-agent/smoke.sh
+./deploy/k8s/zaki-bot/smoke.sh
 ```
 4. Run restore drill for sampled users.
 ```bash
-NAMESPACE=zaki-agent-staging \
+NAMESPACE=zaki-bot-staging \
 LITESTREAM_S3_BUCKET=... \
 LITESTREAM_S3_PREFIX=nullclaw/users \
 USER_IDS=test-user-1,test-user-2 \
-./deploy/k8s/zaki-agent/restore-drill.sh
+./deploy/k8s/zaki-bot/restore-drill.sh
 ```
 
 ## Operational notes
@@ -161,13 +161,13 @@ Build/push ARM64 runtime image:
 docker buildx build \
   --platform linux/arm64 \
   --target release \
-  -t registry.example.com/nullclaw:zaki-agent-arm64 \
+  -t registry.example.com/nullclaw:zaki-bot-arm64 \
   --push .
 ```
 
 ## Rollback
 ```bash
-kubectl -n zaki-agent-staging rollout undo deploy/nullclaw
+kubectl -n zaki-bot-staging rollout undo deploy/nullclaw
 ```
 
 ## Troubleshooting quick checks

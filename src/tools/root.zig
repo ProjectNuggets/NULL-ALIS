@@ -5,6 +5,7 @@
 //! scheduling, delegation, browser, and image tools.
 
 const std = @import("std");
+const bus = @import("../bus.zig");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 
@@ -275,6 +276,7 @@ pub fn allTools(
         fallback_api_key: ?[]const u8 = null,
         delegate_depth: u32 = 0,
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
+        event_bus: ?*bus.Bus = null,
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
@@ -365,6 +367,12 @@ pub fn allTools(
     sp.* = .{ .manager = opts.subagent_manager };
     try list.append(allocator, sp.tool());
 
+    if (opts.event_bus) |event_bus| {
+        const mt = try allocator.create(message.MessageTool);
+        mt.* = .{ .event_bus = event_bus };
+        try list.append(allocator, mt.tool());
+    }
+
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
         ht.* = .{};
@@ -429,6 +437,20 @@ pub fn allTools(
     }
 
     return list.toOwnedSlice(allocator);
+}
+
+pub const MessageTurnContext = message.MessageTool.TurnContext;
+
+pub fn setMessageTurnContext(ctx: ?MessageTurnContext) void {
+    if (ctx) |value| {
+        message.MessageTool.setTurnContext(value);
+    } else {
+        message.MessageTool.clearTurnContext();
+    }
+}
+
+pub fn clearMessageTurnContext() void {
+    message.MessageTool.clearTurnContext();
 }
 
 /// Bind a memory backend to memory tools in a pre-built tool list.
@@ -682,6 +704,27 @@ test "all tools excludes extras when disabled" {
     // shell + file_read + file_write + file_edit + file_append + git + image_info
     // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule + spawn = 14
     try std.testing.expectEqual(@as(usize, 14), tools.len);
+}
+
+test "all tools includes message when event bus is available" {
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .event_bus = &event_bus,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    try std.testing.expectEqual(@as(usize, 15), tools.len);
+
+    var found_message = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "message")) {
+            found_message = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_message);
 }
 
 test "all tools wires subagent manager into spawn tool" {
