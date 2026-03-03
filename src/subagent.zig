@@ -24,6 +24,8 @@ pub const TaskState = struct {
     status: TaskStatus,
     label: []const u8,
     session_key: ?[]const u8 = null,
+    origin_channel: ?[]const u8 = null,
+    origin_chat_id: ?[]const u8 = null,
     result: ?[]const u8 = null,
     error_msg: ?[]const u8 = null,
     started_at: i64,
@@ -98,6 +100,8 @@ pub const SubagentManager = struct {
             if (state.result) |r| self.allocator.free(r);
             if (state.error_msg) |e| self.allocator.free(e);
             if (state.session_key) |sk| self.allocator.free(sk);
+            if (state.origin_channel) |channel| self.allocator.free(channel);
+            if (state.origin_chat_id) |chat| self.allocator.free(chat);
             self.allocator.free(state.label);
             self.allocator.destroy(state);
         }
@@ -127,10 +131,16 @@ pub const SubagentManager = struct {
         errdefer self.allocator.free(state_label);
         const state_session = try self.allocator.dupe(u8, origin_chat_id);
         errdefer self.allocator.free(state_session);
+        const state_channel = try self.allocator.dupe(u8, origin_channel);
+        errdefer self.allocator.free(state_channel);
+        const state_chat = try self.allocator.dupe(u8, origin_chat_id);
+        errdefer self.allocator.free(state_chat);
         state.* = .{
             .status = .running,
             .label = state_label,
             .session_key = state_session,
+            .origin_channel = state_channel,
+            .origin_chat_id = state_chat,
             .started_at = std.time.milliTimestamp(),
         };
 
@@ -203,6 +213,8 @@ pub const SubagentManager = struct {
         const owned_err = if (err_msg) |e| self.allocator.dupe(u8, e) catch null else null;
 
         var label: []const u8 = "subagent";
+        var origin_channel: []const u8 = "system";
+        var origin_chat_id: []const u8 = "agent";
         {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -212,6 +224,8 @@ pub const SubagentManager = struct {
                 state.error_msg = owned_err;
                 state.completed_at = std.time.milliTimestamp();
                 label = state.label;
+                origin_channel = state.origin_channel orelse "system";
+                origin_chat_id = state.origin_chat_id orelse "agent";
             }
         }
 
@@ -226,11 +240,11 @@ pub const SubagentManager = struct {
 
             const msg = bus_mod.makeInbound(
                 self.allocator,
-                "system",
+                origin_channel,
                 "subagent",
-                "agent",
+                origin_chat_id,
                 content,
-                "system:subagent",
+                origin_chat_id,
             ) catch {
                 self.allocator.free(content);
                 return;

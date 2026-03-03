@@ -758,6 +758,25 @@ pub const TenantConfig = struct {
     runtime_idle_ttl_secs: u32 = 1800,
 };
 
+pub const StateSecretsStoreConfig = struct {
+    master_key_env: []const u8 = "NULLCLAW_STATE_MASTER_KEY",
+    aead_algorithm: []const u8 = "chacha20poly1305",
+};
+
+pub const StatePostgresConfig = struct {
+    connection_string: []const u8 = "",
+    schema: []const u8 = "zaki_bot",
+    pool_max: u32 = 16,
+    statement_timeout_ms: u32 = 5000,
+    lock_timeout_ms: u32 = 2000,
+};
+
+pub const StateConfig = struct {
+    backend: []const u8 = "file",
+    postgres: StatePostgresConfig = .{},
+    secrets: StateSecretsStoreConfig = .{},
+};
+
 // ── Composio config ─────────────────────────────────────────────
 
 pub const ComposioConfig = struct {

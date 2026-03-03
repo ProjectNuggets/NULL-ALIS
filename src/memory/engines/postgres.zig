@@ -237,7 +237,7 @@ const PostgresMemoryImpl = struct {
     fn migrate(self: *Self, raw_table: []const u8) !void {
         // raw_table is pre-validated (alphanumeric + underscore only) so safe for index names.
         // Index names must NOT use quoted identifiers, so we use raw_table directly.
-        const ddl = try std.fmt.allocPrintZ(self.allocator,
+        const ddl_plain = try std.fmt.allocPrint(self.allocator,
             \\CREATE TABLE IF NOT EXISTS {s}.{s} (
             \\    id TEXT PRIMARY KEY,
             \\    key TEXT NOT NULL UNIQUE,
@@ -259,11 +259,14 @@ const PostgresMemoryImpl = struct {
             \\);
         , .{
             self.schema_q, self.table_q,
-            raw_table,     self.schema_q, self.table_q,
-            raw_table,     self.schema_q, self.table_q,
-            raw_table,     self.schema_q, self.table_q,
-            self.schema_q,
+            raw_table,     self.schema_q,
+            self.table_q,  raw_table,
+            self.schema_q, self.table_q,
+            raw_table,     self.schema_q,
+            self.table_q,  self.schema_q,
         });
+        defer self.allocator.free(ddl_plain);
+        const ddl = try self.allocator.dupeZ(u8, ddl_plain);
         defer self.allocator.free(ddl);
 
         const result = c.PQexec(self.conn, ddl.ptr);
@@ -407,7 +410,9 @@ const PostgresMemoryImpl = struct {
         if (trimmed.len == 0) return allocator.alloc(MemoryEntry, 0);
 
         // Build ILIKE pattern: %query%
-        const pattern = try std.fmt.allocPrintZ(allocator, "%{s}%", .{trimmed});
+        const pattern_plain = try std.fmt.allocPrint(allocator, "%{s}%", .{trimmed});
+        defer allocator.free(pattern_plain);
+        const pattern = try allocator.dupeZ(u8, pattern_plain);
         defer allocator.free(pattern);
 
         var limit_buf: [20]u8 = undefined;
@@ -418,11 +423,11 @@ const PostgresMemoryImpl = struct {
             const sid_z = try allocator.dupeZ(u8, sid);
             defer allocator.free(sid_z);
             const params = [_]?[*:0]const u8{ pattern.ptr, limit_str.ptr, sid_z };
-            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)), @intCast(sid.len) };
+            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(limit_str.len), @intCast(sid.len) };
             result = try self_.execParams(self_.q_recall_sid, &params, &lengths);
         } else {
             const params = [_]?[*:0]const u8{ pattern.ptr, limit_str.ptr };
-            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)) };
+            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(limit_str.len) };
             result = try self_.execParams(self_.q_recall, &params, &lengths);
         }
         defer c.PQclear(result);

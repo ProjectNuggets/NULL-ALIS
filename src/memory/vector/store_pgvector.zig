@@ -137,13 +137,15 @@ pub const PgvectorVectorStore = struct {
         }
 
         // Create table with vector column
-        const create_sql = try std.fmt.allocPrintZ(self.allocator,
+        const create_sql_plain = try std.fmt.allocPrint(self.allocator,
             \\CREATE TABLE IF NOT EXISTS {s} (
             \\  key TEXT PRIMARY KEY,
             \\  embedding vector({d}),
             \\  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             \\)
         , .{ self.table_name, self.dimensions });
+        defer self.allocator.free(create_sql_plain);
+        const create_sql = try self.allocator.dupeZ(u8, create_sql_plain);
         defer self.allocator.free(create_sql);
 
         {
@@ -192,11 +194,14 @@ pub const PgvectorVectorStore = struct {
         const key_z = try alloc.dupeZ(u8, key);
         defer alloc.free(key_z);
 
-        const sql = try std.fmt.allocPrintZ(alloc,
+        const sql_plain = try std.fmt.allocPrint(
+            alloc,
             "INSERT INTO {s} (key, embedding, updated_at) VALUES ($1, $2, now()) " ++
-            "ON CONFLICT (key) DO UPDATE SET embedding = $2, updated_at = now()",
+                "ON CONFLICT (key) DO UPDATE SET embedding = $2, updated_at = now()",
             .{self.table_name},
         );
+        defer alloc.free(sql_plain);
+        const sql = try alloc.dupeZ(u8, sql_plain);
         defer alloc.free(sql);
 
         const params = [_][*c]const u8{ key_z.ptr, vec_z.ptr };
@@ -222,11 +227,14 @@ pub const PgvectorVectorStore = struct {
         const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
 
         // Use 1 - cosine_distance as similarity score
-        const sql = try std.fmt.allocPrintZ(alloc,
+        const sql_plain = try std.fmt.allocPrint(
+            alloc,
             "SELECT key, 1 - (embedding <=> $1::vector) AS similarity " ++
-            "FROM {s} ORDER BY embedding <=> $1::vector LIMIT $2",
+                "FROM {s} ORDER BY embedding <=> $1::vector LIMIT $2",
             .{self.table_name},
         );
+        defer alloc.free(sql_plain);
+        const sql = try alloc.dupeZ(u8, sql_plain);
         defer alloc.free(sql);
 
         const params = [_][*c]const u8{ vec_z.ptr, limit_str.ptr };
@@ -276,7 +284,9 @@ pub const PgvectorVectorStore = struct {
         const key_z = try alloc.dupeZ(u8, key);
         defer alloc.free(key_z);
 
-        const sql = try std.fmt.allocPrintZ(alloc, "DELETE FROM {s} WHERE key = $1", .{self.table_name});
+        const sql_plain = try std.fmt.allocPrint(alloc, "DELETE FROM {s} WHERE key = $1", .{self.table_name});
+        defer alloc.free(sql_plain);
+        const sql = try alloc.dupeZ(u8, sql_plain);
         defer alloc.free(sql);
 
         const params = [_][*c]const u8{key_z.ptr};
@@ -292,7 +302,9 @@ pub const PgvectorVectorStore = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const conn = self.conn orelse return error.PgNotConnected;
 
-        const sql = try std.fmt.allocPrintZ(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.table_name});
+        const sql_plain = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.table_name});
+        defer self.allocator.free(sql_plain);
+        const sql = try self.allocator.dupeZ(u8, sql_plain);
         defer self.allocator.free(sql);
 
         const result = c.PQexec(conn, sql.ptr);
@@ -351,7 +363,9 @@ pub const PgvectorVectorStore = struct {
 
         // Best-effort count
         const entry_count: ?usize = blk: {
-            const count_sql = try std.fmt.allocPrintZ(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.table_name});
+            const count_sql_plain = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.table_name});
+            defer self.allocator.free(count_sql_plain);
+            const count_sql = try self.allocator.dupeZ(u8, count_sql_plain);
             defer self.allocator.free(count_sql);
 
             const count_result = c.PQexec(conn, count_sql.ptr);

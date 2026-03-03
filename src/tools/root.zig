@@ -7,6 +7,7 @@
 const std = @import("std");
 const bus = @import("../bus.zig");
 const memory_mod = @import("../memory/root.zig");
+const zaki_state = @import("../zaki_state.zig");
 const Memory = memory_mod.Memory;
 
 // ── JSON arg extraction helpers ─────────────────────────────────
@@ -277,6 +278,7 @@ pub fn allTools(
         delegate_depth: u32 = 0,
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
         event_bus: ?*bus.Bus = null,
+        composio_entity_id: ?[]const u8 = null,
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
@@ -401,7 +403,7 @@ pub fn allTools(
 
     if (opts.composio_api_key) |api_key| {
         const ct = try allocator.create(composio.ComposioTool);
-        ct.* = .{ .api_key = api_key, .entity_id = "default" };
+        ct.* = .{ .api_key = api_key, .entity_id = opts.composio_entity_id orelse "default" };
         try list.append(allocator, ct.tool());
     }
 
@@ -440,6 +442,14 @@ pub fn allTools(
 }
 
 pub const MessageTurnContext = message.MessageTool.TurnContext;
+pub const ToolTenantContext = struct {
+    user_id: ?[]const u8 = null,
+    numeric_user_id: ?i64 = null,
+    session_key: ?[]const u8 = null,
+    state_mgr: ?*zaki_state.Manager = null,
+};
+
+threadlocal var current_tenant_context: ToolTenantContext = .{};
 
 pub fn setMessageTurnContext(ctx: ?MessageTurnContext) void {
     if (ctx) |value| {
@@ -451,6 +461,18 @@ pub fn setMessageTurnContext(ctx: ?MessageTurnContext) void {
 
 pub fn clearMessageTurnContext() void {
     message.MessageTool.clearTurnContext();
+}
+
+pub fn setTenantContext(ctx: ?ToolTenantContext) void {
+    current_tenant_context = ctx orelse .{};
+}
+
+pub fn clearTenantContext() void {
+    current_tenant_context = .{};
+}
+
+pub fn getTenantContext() ToolTenantContext {
+    return current_tenant_context;
 }
 
 /// Bind a memory backend to memory tools in a pre-built tool list.

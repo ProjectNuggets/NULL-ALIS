@@ -1,0 +1,85 @@
+const std = @import("std");
+const root = @import("../root.zig");
+const zaki_state = @import("../../zaki_state.zig");
+
+pub const ZakiPostgresMemory = struct {
+    allocator: std.mem.Allocator,
+    manager: *zaki_state.Manager,
+    user_id: i64,
+    owns_self: bool = false,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator, manager: *zaki_state.Manager, user_id: i64) Self {
+        return .{
+            .allocator = allocator,
+            .manager = manager,
+            .user_id = user_id,
+        };
+    }
+
+    pub fn deinit(_: *Self) void {}
+
+    pub fn memory(self: *Self) root.Memory {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    fn implName(_: *anyopaque) []const u8 {
+        return "zaki_postgres";
+    }
+
+    fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: root.MemoryCategory, session_id: ?[]const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.manager.upsertMemory(self.user_id, key, content, category, session_id);
+    }
+
+    fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]root.MemoryEntry {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return try self.manager.recallMemories(allocator, self.user_id, query, limit, session_id);
+    }
+
+    fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?root.MemoryEntry {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return try self.manager.getMemory(allocator, self.user_id, key);
+    }
+
+    fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?root.MemoryCategory, session_id: ?[]const u8) anyerror![]root.MemoryEntry {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return try self.manager.listMemories(allocator, self.user_id, category, session_id);
+    }
+
+    fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return try self.manager.forgetMemory(self.user_id, key);
+    }
+
+    fn implCount(ptr: *anyopaque) anyerror!usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return try self.manager.countMemories(self.user_id);
+    }
+
+    fn implHealthCheck(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn implDeinit(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.deinit();
+        if (self.owns_self) self.allocator.destroy(self);
+    }
+
+    const vtable = root.Memory.VTable{
+        .name = &implName,
+        .store = &implStore,
+        .recall = &implRecall,
+        .get = &implGet,
+        .list = &implList,
+        .forget = &implForget,
+        .count = &implCount,
+        .healthCheck = &implHealthCheck,
+        .deinit = &implDeinit,
+    };
+};

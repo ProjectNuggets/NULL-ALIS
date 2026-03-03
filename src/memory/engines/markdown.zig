@@ -115,11 +115,30 @@ pub const MarkdownMemory = struct {
             else
                 trimmed;
 
-            const id = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ filename, line_idx });
+            var parsed_key: ?[]const u8 = null;
+            var parsed_content: []const u8 = clean;
+            if (std.mem.startsWith(u8, clean, "**")) {
+                if (std.mem.indexOf(u8, clean[2..], "**:")) |end_off| {
+                    const key_slice = std.mem.trim(u8, clean[2 .. 2 + end_off], " \t");
+                    const content_start = 2 + end_off + 3;
+                    if (key_slice.len > 0 and content_start <= clean.len) {
+                        parsed_key = key_slice;
+                        parsed_content = std.mem.trim(u8, clean[content_start..], " \t");
+                    }
+                }
+            }
+
+            const id = if (parsed_key) |key_slice|
+                try allocator.dupe(u8, key_slice)
+            else
+                try std.fmt.allocPrint(allocator, "{s}:{d}", .{ filename, line_idx });
             errdefer allocator.free(id);
-            const key = try allocator.dupe(u8, id);
+            const key = if (parsed_key) |key_slice|
+                try allocator.dupe(u8, key_slice)
+            else
+                try allocator.dupe(u8, id);
             errdefer allocator.free(key);
-            const content_dup = try allocator.dupe(u8, clean);
+            const content_dup = try allocator.dupe(u8, parsed_content);
             errdefer allocator.free(content_dup);
             const timestamp = try allocator.dupe(u8, filename);
             errdefer allocator.free(timestamp);
@@ -418,6 +437,20 @@ test "markdown parseEntries generates sequential ids" {
     try std.testing.expectEqualStrings("myfile:0", entries[0].id);
     try std.testing.expectEqualStrings("myfile:1", entries[1].id);
     try std.testing.expectEqualStrings("myfile:2", entries[2].id);
+}
+
+test "markdown parseEntries preserves structured key entries" {
+    const text = "- **favorite_snack**: pistachios\n- **timezone**: UTC";
+    const entries = try MarkdownMemory.parseEntries(text, "MEMORY", .core, std.testing.allocator);
+    defer {
+        for (entries) |*e| e.deinit(std.testing.allocator);
+        std.testing.allocator.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("favorite_snack", entries[0].key);
+    try std.testing.expectEqualStrings("pistachios", entries[0].content);
+    try std.testing.expectEqualStrings("timezone", entries[1].key);
+    try std.testing.expectEqualStrings("UTC", entries[1].content);
 }
 
 test "markdown parseEntries empty text returns empty" {

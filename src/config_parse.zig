@@ -1319,6 +1319,44 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // State
+    if (root.get("state")) |st| {
+        if (st == .object) {
+            if (st.object.get("backend")) |v| {
+                if (v == .string) self.state.backend = try self.allocator.dupe(u8, v.string);
+            }
+            if (st.object.get("postgres")) |pg| {
+                if (pg == .object) {
+                    if (pg.object.get("connection_string")) |v| {
+                        if (v == .string) self.state.postgres.connection_string = try self.allocator.dupe(u8, v.string);
+                    }
+                    if (pg.object.get("schema")) |v| {
+                        if (v == .string) self.state.postgres.schema = try self.allocator.dupe(u8, v.string);
+                    }
+                    if (pg.object.get("pool_max")) |v| {
+                        if (v == .integer) self.state.postgres.pool_max = @intCast(v.integer);
+                    }
+                    if (pg.object.get("statement_timeout_ms")) |v| {
+                        if (v == .integer) self.state.postgres.statement_timeout_ms = @intCast(v.integer);
+                    }
+                    if (pg.object.get("lock_timeout_ms")) |v| {
+                        if (v == .integer) self.state.postgres.lock_timeout_ms = @intCast(v.integer);
+                    }
+                }
+            }
+            if (st.object.get("secrets")) |sec| {
+                if (sec == .object) {
+                    if (sec.object.get("master_key_env")) |v| {
+                        if (v == .string) self.state.secrets.master_key_env = try self.allocator.dupe(u8, v.string);
+                    }
+                    if (sec.object.get("aead_algorithm")) |v| {
+                        if (v == .string) self.state.secrets.aead_algorithm = try self.allocator.dupe(u8, v.string);
+                    }
+                }
+            }
+        }
+    }
+
     // Cost
     if (root.get("cost")) |co| {
         if (co == .object) {

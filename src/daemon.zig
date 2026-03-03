@@ -20,6 +20,7 @@ const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const onboard = @import("onboard.zig");
 const tenant_lock = @import("tenant_lock.zig");
+const zaki_state = @import("zaki_state.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -416,6 +417,72 @@ fn runTenantSchedulerTick(
     }
 }
 
+fn runTenantSchedulerTickPostgres(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    event_bus: *bus_mod.Bus,
+    owner_instance_id: []const u8,
+    mgr: *zaki_state.Manager,
+) !void {
+    const now = std.time.timestamp();
+    const claimed = mgr.claimDueJobs(allocator, owner_instance_id, now, TENANT_OWNERSHIP_LOCK_LEASE_SECS, config.scheduler.max_tasks) catch |err| {
+        log.warn("postgres tenant scheduler claim failed owner={s} now={d}: {}", .{ owner_instance_id, now, err });
+        return err;
+    };
+    defer {
+        for (claimed) |*job| job.deinit(allocator);
+        allocator.free(claimed);
+    }
+
+    if (claimed.len == 0) return;
+
+    for (claimed) |job| {
+        var scheduler = CronScheduler.init(allocator, 1, config.scheduler.enabled);
+        defer scheduler.deinit();
+        scheduler.setAgentRunner(runCronAgentTurn, @ptrCast(@constCast(config)));
+
+        var user_buf: [32]u8 = undefined;
+        const user_id_text = try std.fmt.bufPrint(&user_buf, "{d}", .{job.user_id});
+        const user_root = std.fs.path.dirname(job.workspace_path) orelse "";
+        try scheduler.setExecutionContext(user_id_text, user_root, job.workspace_path);
+
+        const started_at_s = std.time.timestamp();
+        var finish_status: []const u8 = "error";
+        var finish_output: ?[]const u8 = null;
+        var next_run_secs: ?i64 = null;
+        var raw_job_json: ?[]u8 = null;
+        defer if (raw_job_json) |json| allocator.free(json);
+
+        cron.loadJobFromJsonSlice(&scheduler, job.raw_job_json) catch |err| {
+            log.warn("postgres tenant scheduler parse failed for user={d} job={s}: {}", .{ job.user_id, job.id, err });
+            finish_output = "invalid cron job payload";
+            next_run_secs = started_at_s + 60;
+            raw_job_json = allocator.dupe(u8, job.raw_job_json) catch null;
+            const finished_at_s = std.time.timestamp();
+            mgr.completeClaimedJob(job.user_id, job.id, owner_instance_id, raw_job_json, next_run_secs, finish_status, finish_output, started_at_s, finished_at_s) catch |complete_err| {
+                log.warn("postgres tenant scheduler finalize failed for invalid job={s}: {}", .{ job.id, complete_err });
+            };
+            continue;
+        };
+
+        _ = scheduler.tick(std.time.timestamp(), event_bus);
+        if (scheduler.listJobs().len == 0) {
+            finish_status = "ok";
+        } else {
+            const updated_job = scheduler.listJobs()[0];
+            finish_status = updated_job.last_status orelse "unknown";
+            finish_output = updated_job.last_output;
+            next_run_secs = if (updated_job.one_shot or updated_job.delete_after_run) null else updated_job.next_run_secs;
+            raw_job_json = try cron.jobToJson(allocator, &updated_job);
+        }
+        const finished_at_s = std.time.timestamp();
+        mgr.completeClaimedJob(job.user_id, job.id, owner_instance_id, raw_job_json, next_run_secs, finish_status, finish_output, started_at_s, finished_at_s) catch |err| {
+            log.warn("postgres tenant scheduler finalize failed user={d} job={s}: {}", .{ job.user_id, job.id, err });
+            return err;
+        };
+    }
+}
+
 /// Scheduler thread — executes due cron jobs and periodically reloads cron.json
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
@@ -430,10 +497,36 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             health.markComponentError("scheduler", "owner_id_failed");
             return;
         }
+        var pg_mgr: ?*zaki_state.Manager = null;
+        defer if (pg_mgr) |state_mgr| {
+            state_mgr.deinit();
+            allocator.destroy(state_mgr);
+        };
+        if (std.mem.eql(u8, config.state.backend, "postgres")) {
+            const mgr = allocator.create(zaki_state.Manager) catch |err| {
+                log.warn("tenant postgres scheduler disabled: manager alloc failed: {}", .{err});
+                state.markError("scheduler", "postgres_state_alloc_failed");
+                health.markComponentError("scheduler", "postgres_state_alloc_failed");
+                return;
+            };
+            errdefer allocator.destroy(mgr);
+            mgr.* = zaki_state.Manager.init(allocator, config.state) catch |err| {
+                allocator.destroy(mgr);
+                log.warn("tenant postgres scheduler disabled: state init failed: {}", .{err});
+                state.markError("scheduler", "postgres_state_init_failed");
+                health.markComponentError("scheduler", "postgres_state_init_failed");
+                return;
+            };
+            pg_mgr = mgr;
+        }
         state.markRunning("scheduler");
         health.markComponentOk("scheduler");
         while (!isShutdownRequested()) {
-            runTenantSchedulerTick(allocator, config, event_bus, owner_instance_id.?) catch |err| {
+            const tick_result = if (pg_mgr) |mgr|
+                runTenantSchedulerTickPostgres(allocator, config, event_bus, owner_instance_id.?, mgr)
+            else
+                runTenantSchedulerTick(allocator, config, event_bus, owner_instance_id.?);
+            tick_result catch |err| {
                 log.warn("tenant scheduler tick failed: {}", .{err});
                 state.markError("scheduler", @errorName(err));
                 health.markComponentError("scheduler", @errorName(err));

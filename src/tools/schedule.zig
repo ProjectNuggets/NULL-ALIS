@@ -6,6 +6,136 @@ const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 const loadScheduler = @import("cron_add.zig").loadScheduler;
+const message_tool = @import("message.zig");
+
+fn loadSchedulerForContext(allocator: std.mem.Allocator) !struct {
+    scheduler: CronScheduler,
+    tenant: root.ToolTenantContext,
+} {
+    const tenant = root.getTenantContext();
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    if (tenant.state_mgr) |mgr| {
+        if (tenant.numeric_user_id) |user_id| {
+            const jobs_json = try mgr.getJobsJson(allocator, user_id);
+            defer allocator.free(jobs_json);
+            const trimmed = std.mem.trim(u8, jobs_json, " \t\r\n");
+            if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "[]")) {
+                const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+                defer parsed.deinit();
+                if (parsed.value == .array) {
+                    for (parsed.value.array.items) |item| {
+                        if (item == .object) {
+                            try cron.appendJobFromJsonObject(&scheduler, item.object);
+                        }
+                    }
+                }
+            }
+            return .{ .scheduler = scheduler, .tenant = tenant };
+        }
+    }
+    scheduler = loadScheduler(allocator) catch scheduler;
+    return .{ .scheduler = scheduler, .tenant = tenant };
+}
+
+fn saveSchedulerForContext(scheduler: *CronScheduler, tenant: root.ToolTenantContext) !void {
+    if (tenant.state_mgr) |mgr| {
+        if (tenant.numeric_user_id) |user_id| {
+            const session_key = tenant.session_key orelse "agent:zaki-bot:main";
+            const content = try cron.saveJobsToSlice(scheduler.allocator, scheduler);
+            defer scheduler.allocator.free(content);
+            try mgr.replaceJobsJson(user_id, session_key, content);
+            return;
+        }
+    }
+    try cron.saveJobs(scheduler);
+}
+
+fn parseMessageCommand(command: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "message ")) return null;
+    var content = std.mem.trim(u8, trimmed["message ".len..], " \t\r\n");
+    if (content.len >= 2) {
+        const first = content[0];
+        const last = content[content.len - 1];
+        if ((first == '"' or first == '\'') and first == last) {
+            content = content[1 .. content.len - 1];
+        }
+    }
+    return std.mem.trim(u8, content, " \t\r\n");
+}
+
+fn parseEchoCommand(command: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "echo ")) return null;
+    var content = std.mem.trim(u8, trimmed["echo ".len..], " \t\r\n");
+    if (content.len >= 2) {
+        const first = content[0];
+        const last = content[content.len - 1];
+        if ((first == '"' or first == '\'') and first == last) {
+            content = content[1 .. content.len - 1];
+        }
+    }
+    return std.mem.trim(u8, content, " \t\r\n");
+}
+
+fn applyTenantDefaults(
+    scheduler: *CronScheduler,
+    allocator: std.mem.Allocator,
+    job_id: []const u8,
+    command: []const u8,
+) !void {
+    const tenant = root.getTenantContext();
+    if (tenant.numeric_user_id == null) return;
+    const job = scheduler.getMutableJob(job_id) orelse return;
+    job.session_target = .main;
+
+    const turn = message_tool.MessageTool.getTurnContext();
+    const reminder_text = parseMessageCommand(command) orelse parseEchoCommand(command) orelse return;
+    const reminder_copy = try allocator.dupe(u8, reminder_text);
+    errdefer allocator.free(reminder_copy);
+    const has_live_target = turn.channel != null and turn.chat_id != null;
+
+    if (parseEchoCommand(command) != null and has_live_target) {
+        if (job.delivery_channel_owned) {
+            if (job.delivery.channel) |existing| allocator.free(existing);
+        }
+        if (job.delivery_to_owned) {
+            if (job.delivery.to) |existing| allocator.free(existing);
+        }
+        job.delivery.mode = .always;
+        job.delivery.channel = try allocator.dupe(u8, turn.channel.?);
+        job.delivery_channel_owned = true;
+        job.delivery.to = try allocator.dupe(u8, turn.chat_id.?);
+        job.delivery_to_owned = true;
+        allocator.free(reminder_copy);
+        return;
+    }
+
+    allocator.free(job.command);
+    job.job_type = .agent;
+    job.command = reminder_copy;
+    if (job.prompt_owned) {
+        if (job.prompt) |existing| allocator.free(existing);
+    }
+    job.prompt = try std.fmt.allocPrint(allocator, "Send exactly this reminder text to the user with no extra words: {s}", .{reminder_copy});
+    job.prompt_owned = true;
+
+    if (turn.channel) |channel| {
+        if (job.delivery_channel_owned) {
+            if (job.delivery.channel) |existing| allocator.free(existing);
+        }
+        job.delivery.mode = .always;
+        job.delivery.channel = try allocator.dupe(u8, channel);
+        job.delivery_channel_owned = true;
+    }
+    if (turn.chat_id) |chat_id| {
+        if (job.delivery_to_owned) {
+            if (job.delivery.to) |existing| allocator.free(existing);
+        }
+        job.delivery.to = try allocator.dupe(u8, chat_id);
+        job.delivery_to_owned = true;
+    }
+}
 
 /// Schedule tool — lets the agent manage recurring and one-shot scheduled tasks.
 /// Delegates to the CronScheduler from the cron module for persistent job management.
@@ -30,9 +160,10 @@ pub const ScheduleTool = struct {
             return ToolResult.fail("Missing 'action' parameter");
 
         if (std.mem.eql(u8, action, "list")) {
-            var scheduler = loadScheduler(allocator) catch {
+            const loaded = loadSchedulerForContext(allocator) catch {
                 return ToolResult.ok("No scheduled jobs.");
             };
+            var scheduler = loaded.scheduler;
             defer scheduler.deinit();
 
             const jobs = scheduler.listJobs();
@@ -68,10 +199,11 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for get action");
 
-            var scheduler = loadScheduler(allocator) catch {
+            const loaded = loadSchedulerForContext(allocator) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
+            var scheduler = loaded.scheduler;
             defer scheduler.deinit();
 
             if (scheduler.getJob(id)) |job| {
@@ -102,9 +234,10 @@ pub const ScheduleTool = struct {
             const expression = root.getString(args, "expression") orelse
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
 
-            var scheduler = loadScheduler(allocator) catch {
+            const loaded = loadSchedulerForContext(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
+            var scheduler = loaded.scheduler;
             defer scheduler.deinit();
 
             const job = scheduler.addJob(expression, command) catch |err| {
@@ -112,7 +245,8 @@ pub const ScheduleTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
-            cron.saveJobs(&scheduler) catch {};
+            try applyTenantDefaults(&scheduler, allocator, job.id, command);
+            saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
 
             const msg = try std.fmt.allocPrint(allocator, "Created job {s} | {s} | cmd: {s}", .{
                 job.id,
@@ -128,9 +262,10 @@ pub const ScheduleTool = struct {
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
 
-            var scheduler = loadScheduler(allocator) catch {
+            const loaded = loadSchedulerForContext(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
+            var scheduler = loaded.scheduler;
             defer scheduler.deinit();
 
             const job = scheduler.addOnce(delay, command) catch |err| {
@@ -138,7 +273,8 @@ pub const ScheduleTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
-            cron.saveJobs(&scheduler) catch {};
+            try applyTenantDefaults(&scheduler, allocator, job.id, command);
+            saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
 
             const msg = try std.fmt.allocPrint(allocator, "Created one-shot task {s} | runs at {d} | cmd: {s}", .{
                 job.id,
@@ -152,13 +288,14 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for cancel action");
 
-            var scheduler = loadScheduler(allocator) catch {
+            const loaded = loadSchedulerForContext(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
+            var scheduler = loaded.scheduler;
             defer scheduler.deinit();
 
             if (scheduler.removeJob(id)) {
-                cron.saveJobs(&scheduler) catch {};
+                saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
                 const msg = try std.fmt.allocPrint(allocator, "Cancelled job {s}", .{id});
                 return ToolResult{ .success = true, .output = msg };
             }
@@ -170,16 +307,17 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter");
 
-            var scheduler = loadScheduler(allocator) catch {
+            const loaded = loadSchedulerForContext(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
+            var scheduler = loaded.scheduler;
             defer scheduler.deinit();
 
             const is_pause = std.mem.eql(u8, action, "pause");
             const found = if (is_pause) scheduler.pauseJob(id) else scheduler.resumeJob(id);
 
             if (found) {
-                cron.saveJobs(&scheduler) catch {};
+                saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
                 const verb: []const u8 = if (is_pause) "Paused" else "Resumed";
                 const msg = try std.fmt.allocPrint(allocator, "{s} job {s}", .{ verb, id });
                 return ToolResult{ .success = true, .output = msg };
@@ -409,4 +547,61 @@ test "schedule resume requires id" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
+}
+
+test "schedule tenant defaults normalize message reminder into agent job" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addOnce("30m", "message \"Meeting starts now\"");
+
+    root.setTenantContext(.{
+        .user_id = "15",
+        .numeric_user_id = 15,
+        .session_key = "agent:zaki-bot:user:15:main",
+    });
+    defer root.clearTenantContext();
+
+    message_tool.MessageTool.setTurnContext(.{
+        .channel = "telegram",
+        .chat_id = "chat-15",
+    });
+    defer message_tool.MessageTool.clearTurnContext();
+
+    try applyTenantDefaults(&scheduler, std.testing.allocator, job.id, job.command);
+    const updated = scheduler.getJob(job.id).?;
+    try std.testing.expectEqual(cron.JobType.agent, updated.job_type);
+    try std.testing.expectEqual(cron.DeliveryMode.always, updated.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", updated.delivery.channel.?);
+    try std.testing.expectEqualStrings("chat-15", updated.delivery.to.?);
+    try std.testing.expectEqualStrings("Meeting starts now", updated.command);
+    try std.testing.expect(updated.prompt != null);
+}
+
+test "schedule tenant defaults normalize echo reminder into delivery job" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addOnce("30m", "echo \"Meeting starts now\"");
+
+    root.setTenantContext(.{
+        .user_id = "15",
+        .numeric_user_id = 15,
+        .session_key = "agent:zaki-bot:user:15:main",
+    });
+    defer root.clearTenantContext();
+
+    message_tool.MessageTool.setTurnContext(.{
+        .channel = "telegram",
+        .chat_id = "chat-15",
+    });
+    defer message_tool.MessageTool.clearTurnContext();
+
+    try applyTenantDefaults(&scheduler, std.testing.allocator, job.id, job.command);
+    const updated = scheduler.getJob(job.id).?;
+    try std.testing.expectEqual(cron.JobType.shell, updated.job_type);
+    try std.testing.expectEqual(cron.DeliveryMode.always, updated.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", updated.delivery.channel.?);
+    try std.testing.expectEqualStrings("chat-15", updated.delivery.to.?);
+    try std.testing.expectEqualStrings("echo \"Meeting starts now\"", updated.command);
 }

@@ -3,7 +3,6 @@ const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
-const Config = @import("../config.zig").Config;
 const NamedAgentConfig = @import("../config.zig").NamedAgentConfig;
 const providers = @import("../providers/root.zig");
 
@@ -106,29 +105,12 @@ pub const DelegateTool = struct {
             return ToolResult{ .success = true, .output = response };
         }
 
-        // Fallback: no agent config found — load global config
-        var cfg = Config.load(allocator) catch {
-            return ToolResult.fail("Failed to load config — run `nullclaw onboard` first");
-        };
-        defer cfg.deinit();
-
-        const agent_prompt = std.fmt.allocPrint(
+        const msg = std.fmt.allocPrint(
             allocator,
-            "[System: You are agent '{s}'. Respond concisely and helpfully.]\n\n{s}",
-            .{ trimmed_agent, full_prompt },
-        ) catch return ToolResult.fail("Failed to build agent prompt");
-        defer allocator.free(agent_prompt);
-
-        const response = providers.complete(allocator, &cfg, agent_prompt) catch |err| {
-            const msg = std.fmt.allocPrint(
-                allocator,
-                "Delegation to agent '{s}' failed: {s}",
-                .{ trimmed_agent, @errorName(err) },
-            ) catch return ToolResult.fail("Delegation failed");
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        return ToolResult{ .success = true, .output = response };
+            "Unknown delegate agent '{s}'. Configure it explicitly before use.",
+            .{trimmed_agent},
+        ) catch return ToolResult.fail("Unknown delegate agent");
+        return ToolResult{ .success = false, .output = "", .error_msg = msg };
     }
 
     fn findAgent(self: *DelegateTool, name: []const u8) ?NamedAgentConfig {

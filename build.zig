@@ -1,6 +1,28 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+fn addHomebrewLibpqPaths(step: anytype) void {
+    const lib_candidates = [_][]const u8{
+        "/opt/homebrew/opt/libpq/lib",
+        "/usr/local/opt/libpq/lib",
+    };
+    const include_candidates = [_][]const u8{
+        "/opt/homebrew/opt/libpq/include",
+        "/usr/local/opt/libpq/include",
+    };
+
+    for (lib_candidates) |candidate| {
+        std.fs.accessAbsolute(candidate, .{}) catch continue;
+        step.addLibraryPath(.{ .cwd_relative = candidate });
+        break;
+    }
+    for (include_candidates) |candidate| {
+        std.fs.accessAbsolute(candidate, .{}) catch continue;
+        step.addIncludePath(.{ .cwd_relative = candidate });
+        break;
+    }
+}
+
 const ChannelSelection = struct {
     enable_channel_cli: bool = false,
     enable_channel_telegram: bool = false,
@@ -379,6 +401,8 @@ pub fn build(b: *std.Build) void {
         exe.linkLibrary(lib);
     }
     if (enable_postgres) {
+        addHomebrewLibpqPaths(exe);
+        addHomebrewLibpqPaths(exe.root_module);
         exe.root_module.linkSystemLibrary("pq", .{});
     }
     exe.dead_strip_dylibs = true;
@@ -416,6 +440,8 @@ pub fn build(b: *std.Build) void {
         lib_tests.linkLibrary(lib);
     }
     if (enable_postgres) {
+        addHomebrewLibpqPaths(lib_tests);
+        addHomebrewLibpqPaths(lib_tests.root_module);
         lib_tests.root_module.linkSystemLibrary("pq", .{});
     }
 

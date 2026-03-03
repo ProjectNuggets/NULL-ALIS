@@ -160,13 +160,12 @@ fn contractMarkdown(m: Memory) !void {
     // count should be 1
     try std.testing.expectEqual(@as(usize, 1), try m.count());
 
-    // get by key — markdown stores as "**key**: content", get matches by substring
+    // get by key — markdown preserves the logical key and content from the file
     {
         const entry = try m.get(allocator, "test_key");
         try std.testing.expect(entry != null);
         defer entry.?.deinit(allocator);
-        // Content contains both key and value due to markdown formatting
-        try std.testing.expect(std.mem.indexOf(u8, entry.?.content, "test_key") != null);
+        try std.testing.expectEqualStrings("test_key", entry.?.key);
         try std.testing.expect(std.mem.indexOf(u8, entry.?.content, "test content") != null);
     }
 

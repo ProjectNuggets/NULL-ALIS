@@ -886,189 +886,288 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .best_effort => continue,
             .strict => return error.InvalidCronStoreFormat,
         };
-        const obj = item.object;
-
-        const id = blk: {
-            if (obj.get("id")) |v| {
-                if (v == .string and v.string.len > 0) break :blk v.string;
-            }
-            switch (policy) {
-                .best_effort => continue,
-                .strict => return error.InvalidCronStoreFormat,
-            }
+        appendJobFromJsonObjectWithPolicy(scheduler, item.object, policy) catch |err| switch (policy) {
+            .best_effort => {
+                log.warn("skipping invalid cron job entry: {s}", .{@errorName(err)});
+                continue;
+            },
+            .strict => return err,
         };
-        const expression = blk: {
-            if (obj.get("expression")) |v| {
-                if (v == .string and v.string.len > 0) break :blk v.string;
-            }
-            switch (policy) {
-                .best_effort => continue,
-                .strict => return error.InvalidCronStoreFormat,
-            }
-        };
-        const command = blk: {
-            if (obj.get("command")) |v| {
-                if (v == .string and v.string.len > 0) break :blk v.string;
-            }
-            switch (policy) {
-                .best_effort => continue,
-                .strict => return error.InvalidCronStoreFormat,
-            }
-        };
-
-        const next_run_secs: i64 = blk: {
-            if (obj.get("next_run_secs")) |v| {
-                if (v == .integer) break :blk v.integer;
-            }
-            break :blk std.time.timestamp() + 60;
-        };
-
-        const paused = blk: {
-            if (obj.get("paused")) |v| {
-                if (v == .bool) break :blk v.bool;
-            }
-            break :blk false;
-        };
-
-        const one_shot = blk: {
-            if (obj.get("one_shot")) |v| {
-                if (v == .bool) break :blk v.bool;
-            }
-            break :blk false;
-        };
-        const job_type = blk: {
-            if (obj.get("job_type")) |v| {
-                if (v == .string) break :blk JobType.parse(v.string);
-            }
-            break :blk JobType.shell;
-        };
-        const session_target = blk: {
-            if (obj.get("session_target")) |v| {
-                if (v == .string) break :blk SessionTarget.parse(v.string);
-            }
-            break :blk SessionTarget.isolated;
-        };
-        const enabled = blk: {
-            if (obj.get("enabled")) |v| {
-                if (v == .bool) break :blk v.bool;
-            }
-            break :blk !paused;
-        };
-        const delete_after_run = blk: {
-            if (obj.get("delete_after_run")) |v| {
-                if (v == .bool) break :blk v.bool;
-            }
-            break :blk one_shot;
-        };
-        const created_at_s = blk: {
-            if (obj.get("created_at_s")) |v| {
-                if (v == .integer) break :blk v.integer;
-            }
-            break :blk 0;
-        };
-        const last_run_secs: ?i64 = blk: {
-            if (obj.get("last_run_secs")) |v| {
-                if (v == .integer) break :blk v.integer;
-            }
-            break :blk null;
-        };
-        const last_status: ?[]const u8 = blk: {
-            if (obj.get("last_status")) |v| {
-                if (v == .string) {
-                    if (std.ascii.eqlIgnoreCase(v.string, "ok")) break :blk "ok";
-                    if (std.ascii.eqlIgnoreCase(v.string, "error")) break :blk "error";
-                }
-            }
-            break :blk null;
-        };
-
-        var prompt: ?[]const u8 = null;
-        errdefer if (prompt) |v| scheduler.allocator.free(v);
-        if (obj.get("prompt")) |v| {
-            if (v == .string and v.string.len > 0) {
-                prompt = try scheduler.allocator.dupe(u8, v.string);
-            }
-        }
-        var name: ?[]const u8 = null;
-        errdefer if (name) |v| scheduler.allocator.free(v);
-        if (obj.get("name")) |v| {
-            if (v == .string and v.string.len > 0) {
-                name = try scheduler.allocator.dupe(u8, v.string);
-            }
-        }
-        var model: ?[]const u8 = null;
-        errdefer if (model) |v| scheduler.allocator.free(v);
-        if (obj.get("model")) |v| {
-            if (v == .string and v.string.len > 0) {
-                model = try scheduler.allocator.dupe(u8, v.string);
-            }
-        }
-        var last_output: ?[]const u8 = null;
-        errdefer if (last_output) |v| scheduler.allocator.free(v);
-        if (obj.get("last_output")) |v| {
-            if (v == .string and v.string.len > 0) {
-                last_output = try scheduler.allocator.dupe(u8, v.string);
-            }
-        }
-
-        var delivery_channel: ?[]const u8 = null;
-        errdefer if (delivery_channel) |v| scheduler.allocator.free(v);
-        var delivery_to: ?[]const u8 = null;
-        errdefer if (delivery_to) |v| scheduler.allocator.free(v);
-        var delivery = DeliveryConfig{};
-        if (obj.get("delivery")) |v| {
-            if (v == .object) {
-                if (v.object.get("mode")) |mode_val| {
-                    if (mode_val == .string) delivery.mode = DeliveryMode.parse(mode_val.string);
-                }
-                if (v.object.get("channel")) |channel_val| {
-                    if (channel_val == .string and channel_val.string.len > 0) {
-                        delivery_channel = try scheduler.allocator.dupe(u8, channel_val.string);
-                    }
-                }
-                if (v.object.get("to")) |to_val| {
-                    if (to_val == .string and to_val.string.len > 0) {
-                        delivery_to = try scheduler.allocator.dupe(u8, to_val.string);
-                    }
-                }
-                if (v.object.get("best_effort")) |be_val| {
-                    if (be_val == .bool) delivery.best_effort = be_val.bool;
-                }
-            } else switch (policy) {
-                .best_effort => {},
-                .strict => return error.InvalidCronStoreFormat,
-            }
-        }
-        delivery.channel = delivery_channel;
-        delivery.to = delivery_to;
-
-        try scheduler.jobs.append(scheduler.allocator, .{
-            .id = try scheduler.allocator.dupe(u8, id),
-            .expression = try scheduler.allocator.dupe(u8, expression),
-            .command = try scheduler.allocator.dupe(u8, command),
-            .next_run_secs = next_run_secs,
-            .last_run_secs = last_run_secs,
-            .last_status = last_status,
-            .paused = paused,
-            .one_shot = one_shot,
-            .job_type = job_type,
-            .session_target = session_target,
-            .prompt = prompt,
-            .prompt_owned = prompt != null,
-            .name = name,
-            .name_owned = name != null,
-            .model = model,
-            .model_owned = model != null,
-            .enabled = enabled,
-            .delete_after_run = delete_after_run,
-            .created_at_s = created_at_s,
-            .last_output = last_output,
-            .last_output_owned = last_output != null,
-            .delivery = delivery,
-            .delivery_channel_owned = delivery.channel != null,
-            .delivery_to_owned = delivery.to != null,
-        });
     }
+}
+
+fn appendJobFromJsonObjectWithPolicy(scheduler: *CronScheduler, obj: std.json.ObjectMap, policy: LoadPolicy) !void {
+    const id = blk: {
+        if (obj.get("id")) |v| {
+            if (v == .string and v.string.len > 0) break :blk v.string;
+        }
+        return error.InvalidCronStoreFormat;
+    };
+    const expression = blk: {
+        if (obj.get("expression")) |v| {
+            if (v == .string and v.string.len > 0) break :blk v.string;
+        }
+        return error.InvalidCronStoreFormat;
+    };
+    const command = blk: {
+        if (obj.get("command")) |v| {
+            if (v == .string and v.string.len > 0) break :blk v.string;
+        }
+        return error.InvalidCronStoreFormat;
+    };
+
+    const next_run_secs: i64 = blk: {
+        if (obj.get("next_run_secs")) |v| {
+            if (v == .integer) break :blk v.integer;
+        }
+        break :blk std.time.timestamp() + 60;
+    };
+
+    const paused = blk: {
+        if (obj.get("paused")) |v| {
+            if (v == .bool) break :blk v.bool;
+        }
+        break :blk false;
+    };
+
+    const one_shot = blk: {
+        if (obj.get("one_shot")) |v| {
+            if (v == .bool) break :blk v.bool;
+        }
+        break :blk false;
+    };
+    const job_type = blk: {
+        if (obj.get("job_type")) |v| {
+            if (v == .string) break :blk JobType.parse(v.string);
+        }
+        break :blk JobType.shell;
+    };
+    const session_target = blk: {
+        if (obj.get("session_target")) |v| {
+            if (v == .string) break :blk SessionTarget.parse(v.string);
+        }
+        break :blk SessionTarget.isolated;
+    };
+    const enabled = blk: {
+        if (obj.get("enabled")) |v| {
+            if (v == .bool) break :blk v.bool;
+        }
+        break :blk !paused;
+    };
+    const delete_after_run = blk: {
+        if (obj.get("delete_after_run")) |v| {
+            if (v == .bool) break :blk v.bool;
+        }
+        break :blk one_shot;
+    };
+    const created_at_s = blk: {
+        if (obj.get("created_at_s")) |v| {
+            if (v == .integer) break :blk v.integer;
+        }
+        break :blk 0;
+    };
+    const last_run_secs: ?i64 = blk: {
+        if (obj.get("last_run_secs")) |v| {
+            if (v == .integer) break :blk v.integer;
+        }
+        break :blk null;
+    };
+    const last_status: ?[]const u8 = blk: {
+        if (obj.get("last_status")) |v| {
+            if (v == .string) {
+                if (std.ascii.eqlIgnoreCase(v.string, "ok")) break :blk "ok";
+                if (std.ascii.eqlIgnoreCase(v.string, "error")) break :blk "error";
+            }
+        }
+        break :blk null;
+    };
+
+    var prompt: ?[]const u8 = null;
+    errdefer if (prompt) |v| scheduler.allocator.free(v);
+    if (obj.get("prompt")) |v| {
+        if (v == .string and v.string.len > 0) {
+            prompt = try scheduler.allocator.dupe(u8, v.string);
+        }
+    }
+    var name: ?[]const u8 = null;
+    errdefer if (name) |v| scheduler.allocator.free(v);
+    if (obj.get("name")) |v| {
+        if (v == .string and v.string.len > 0) {
+            name = try scheduler.allocator.dupe(u8, v.string);
+        }
+    }
+    var model: ?[]const u8 = null;
+    errdefer if (model) |v| scheduler.allocator.free(v);
+    if (obj.get("model")) |v| {
+        if (v == .string and v.string.len > 0) {
+            model = try scheduler.allocator.dupe(u8, v.string);
+        }
+    }
+    var last_output: ?[]const u8 = null;
+    errdefer if (last_output) |v| scheduler.allocator.free(v);
+    if (obj.get("last_output")) |v| {
+        if (v == .string and v.string.len > 0) {
+            last_output = try scheduler.allocator.dupe(u8, v.string);
+        }
+    }
+
+    var delivery_channel: ?[]const u8 = null;
+    errdefer if (delivery_channel) |v| scheduler.allocator.free(v);
+    var delivery_to: ?[]const u8 = null;
+    errdefer if (delivery_to) |v| scheduler.allocator.free(v);
+    var delivery = DeliveryConfig{};
+    if (obj.get("delivery")) |v| {
+        if (v == .object) {
+            if (v.object.get("mode")) |mode_val| {
+                if (mode_val == .string) delivery.mode = DeliveryMode.parse(mode_val.string);
+            }
+            if (v.object.get("channel")) |channel_val| {
+                if (channel_val == .string and channel_val.string.len > 0) {
+                    delivery_channel = try scheduler.allocator.dupe(u8, channel_val.string);
+                }
+            }
+            if (v.object.get("to")) |to_val| {
+                if (to_val == .string and to_val.string.len > 0) {
+                    delivery_to = try scheduler.allocator.dupe(u8, to_val.string);
+                }
+            }
+            if (v.object.get("best_effort")) |be_val| {
+                if (be_val == .bool) delivery.best_effort = be_val.bool;
+            }
+        } else switch (policy) {
+            .best_effort => {},
+            .strict => return error.InvalidCronStoreFormat,
+        }
+    }
+    delivery.channel = delivery_channel;
+    delivery.to = delivery_to;
+
+    try scheduler.jobs.append(scheduler.allocator, .{
+        .id = try scheduler.allocator.dupe(u8, id),
+        .expression = try scheduler.allocator.dupe(u8, expression),
+        .command = try scheduler.allocator.dupe(u8, command),
+        .next_run_secs = next_run_secs,
+        .last_run_secs = last_run_secs,
+        .last_status = last_status,
+        .paused = paused,
+        .one_shot = one_shot,
+        .job_type = job_type,
+        .session_target = session_target,
+        .prompt = prompt,
+        .prompt_owned = prompt != null,
+        .name = name,
+        .name_owned = name != null,
+        .model = model,
+        .model_owned = model != null,
+        .enabled = enabled,
+        .delete_after_run = delete_after_run,
+        .created_at_s = created_at_s,
+        .last_output = last_output,
+        .last_output_owned = last_output != null,
+        .delivery = delivery,
+        .delivery_channel_owned = delivery.channel != null,
+        .delivery_to_owned = delivery.to != null,
+    });
+}
+
+pub fn appendJobFromJsonObject(scheduler: *CronScheduler, obj: std.json.ObjectMap) !void {
+    return appendJobFromJsonObjectWithPolicy(scheduler, obj, .strict);
+}
+
+pub fn loadJobFromJsonSlice(scheduler: *CronScheduler, content: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, scheduler.allocator, content, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCronStoreFormat;
+    try appendJobFromJsonObject(scheduler, parsed.value.object);
+}
+
+fn appendJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, job: CronJob) !void {
+    try buf.appendSlice(allocator, "{");
+
+    try json_util.appendJsonKeyValue(buf, allocator, "id", job.id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "expression", job.expression);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "command", job.command);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "next_run_secs", job.next_run_secs);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_run_secs");
+    if (job.last_run_secs) |lrs| {
+        var int_buf: [24]u8 = undefined;
+        const text = std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch unreachable;
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_status");
+    if (job.last_status) |ls| {
+        try json_util.appendJsonString(buf, allocator, ls);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "paused");
+    try buf.appendSlice(allocator, if (job.paused) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "one_shot");
+    try buf.appendSlice(allocator, if (job.one_shot) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "job_type", job.job_type.asStr());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "session_target", job.session_target.asStr());
+    try buf.appendSlice(allocator, ",");
+    try appendNullableJsonStringField(buf, allocator, "prompt", job.prompt);
+    try buf.appendSlice(allocator, ",");
+    try appendNullableJsonStringField(buf, allocator, "name", job.name);
+    try buf.appendSlice(allocator, ",");
+    try appendNullableJsonStringField(buf, allocator, "model", job.model);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "enabled");
+    try buf.appendSlice(allocator, if (job.enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delete_after_run");
+    try buf.appendSlice(allocator, if (job.delete_after_run) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "created_at_s", job.created_at_s);
+    try buf.appendSlice(allocator, ",");
+    try appendNullableJsonStringField(buf, allocator, "last_output", job.last_output);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(buf, allocator, "mode", job.delivery.mode.asStr());
+    try buf.appendSlice(allocator, ",");
+    try appendNullableJsonStringField(buf, allocator, "channel", job.delivery.channel);
+    try buf.appendSlice(allocator, ",");
+    try appendNullableJsonStringField(buf, allocator, "to", job.delivery.to);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "best_effort");
+    try buf.appendSlice(allocator, if (job.delivery.best_effort) "true" else "false");
+    try buf.appendSlice(allocator, "}");
+
+    try buf.appendSlice(allocator, "}");
+}
+
+pub fn jobToJson(allocator: std.mem.Allocator, job: *const CronJob) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try appendJobJson(&buf, allocator, job.*);
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn saveJobsToSlice(allocator: std.mem.Allocator, scheduler: *const CronScheduler) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "[\n");
+    for (scheduler.jobs.items, 0..) |job, i| {
+        if (i > 0) try buf.appendSlice(allocator, ",\n");
+        try buf.appendSlice(allocator, "  ");
+        try appendJobJson(&buf, allocator, job);
+    }
+    try buf.appendSlice(allocator, "\n]\n");
+    return buf.toOwnedSlice(allocator);
 }
 
 // ── Delivery ─────────────────────────────────────────────────────
@@ -1509,82 +1608,9 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
     const path = try cronStorePathForScheduler(scheduler.allocator, scheduler);
     defer scheduler.allocator.free(path);
     try ensureCronDirForPath(path);
-
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(scheduler.allocator);
-
-    try buf.appendSlice(scheduler.allocator, "[\n");
-    for (scheduler.jobs.items, 0..) |job, i| {
-        if (i > 0) try buf.appendSlice(scheduler.allocator, ",\n");
-        try buf.appendSlice(scheduler.allocator, "  {");
-
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "id", job.id);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "expression", job.expression);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "command", job.command);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonInt(&buf, scheduler.allocator, "next_run_secs", job.next_run_secs);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "last_run_secs");
-        if (job.last_run_secs) |lrs| {
-            var int_buf: [24]u8 = undefined;
-            const text = std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch unreachable;
-            try buf.appendSlice(scheduler.allocator, text);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "last_status");
-        if (job.last_status) |ls| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, ls);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "paused");
-        try buf.appendSlice(scheduler.allocator, if (job.paused) "true" else "false");
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "one_shot");
-        try buf.appendSlice(scheduler.allocator, if (job.one_shot) "true" else "false");
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "job_type", job.job_type.asStr());
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "session_target", job.session_target.asStr());
-        try buf.appendSlice(scheduler.allocator, ",");
-        try appendNullableJsonStringField(&buf, scheduler.allocator, "prompt", job.prompt);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try appendNullableJsonStringField(&buf, scheduler.allocator, "name", job.name);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try appendNullableJsonStringField(&buf, scheduler.allocator, "model", job.model);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "enabled");
-        try buf.appendSlice(scheduler.allocator, if (job.enabled) "true" else "false");
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delete_after_run");
-        try buf.appendSlice(scheduler.allocator, if (job.delete_after_run) "true" else "false");
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonInt(&buf, scheduler.allocator, "created_at_s", job.created_at_s);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try appendNullableJsonStringField(&buf, scheduler.allocator, "last_output", job.last_output);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery");
-        try buf.appendSlice(scheduler.allocator, "{");
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "mode", job.delivery.mode.asStr());
-        try buf.appendSlice(scheduler.allocator, ",");
-        try appendNullableJsonStringField(&buf, scheduler.allocator, "channel", job.delivery.channel);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try appendNullableJsonStringField(&buf, scheduler.allocator, "to", job.delivery.to);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "best_effort");
-        try buf.appendSlice(scheduler.allocator, if (job.delivery.best_effort) "true" else "false");
-        try buf.appendSlice(scheduler.allocator, "}");
-
-        try buf.appendSlice(scheduler.allocator, "}");
-    }
-    try buf.appendSlice(scheduler.allocator, "\n]\n");
-
-    try writeFileAtomic(scheduler.allocator, path, buf.items);
+    const content = try saveJobsToSlice(scheduler.allocator, scheduler);
+    defer scheduler.allocator.free(content);
+    try writeFileAtomic(scheduler.allocator, path, content);
 }
 
 pub fn saveJobsToPath(scheduler: *CronScheduler, path: []const u8) !void {
@@ -2491,6 +2517,54 @@ test "tick reschedules recurring job using cron expression" {
 
     _ = scheduler.tick(0, null);
     try std.testing.expectEqual(@as(i64, 600), scheduler.jobs.items[0].next_run_secs);
+}
+
+test "job json roundtrip preserves agent delivery fields" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addOnce("5m", "message \"hello\"");
+    job.job_type = .agent;
+    job.session_target = .main;
+    job.prompt = try allocator.dupe(u8, "remind me");
+    job.prompt_owned = true;
+    job.name = try allocator.dupe(u8, "Reminder");
+    job.name_owned = true;
+    job.model = try allocator.dupe(u8, "openrouter/moonshotai/kimi-k2.5");
+    job.model_owned = true;
+    job.enabled = true;
+    job.delete_after_run = true;
+    job.delivery = .{
+        .mode = .always,
+        .channel = try allocator.dupe(u8, "telegram"),
+        .to = try allocator.dupe(u8, "chat-1"),
+        .best_effort = false,
+    };
+    job.delivery_channel_owned = true;
+    job.delivery_to_owned = true;
+
+    const json = try jobToJson(allocator, job);
+    defer allocator.free(json);
+
+    var loaded = CronScheduler.init(allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobFromJsonSlice(&loaded, json);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.jobs.items.len);
+    const restored = loaded.jobs.items[0];
+    try std.testing.expectEqual(JobType.agent, restored.job_type);
+    try std.testing.expectEqual(SessionTarget.main, restored.session_target);
+    try std.testing.expect(restored.delete_after_run);
+    try std.testing.expect(restored.one_shot);
+    try std.testing.expect(restored.enabled);
+    try std.testing.expectEqual(DeliveryMode.always, restored.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", restored.delivery.channel.?);
+    try std.testing.expectEqualStrings("chat-1", restored.delivery.to.?);
+    try std.testing.expect(!restored.delivery.best_effort);
+    try std.testing.expectEqualStrings("remind me", restored.prompt.?);
+    try std.testing.expectEqualStrings("Reminder", restored.name.?);
+    try std.testing.expectEqualStrings("openrouter/moonshotai/kimi-k2.5", restored.model.?);
 }
 
 test "loadTelegramChatIdFromChannelState reads tenant channel state" {

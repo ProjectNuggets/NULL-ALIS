@@ -19,6 +19,8 @@ const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
 const memory_mod = @import("memory/root.zig");
+const zaki_dual_memory = @import("memory/engines/zaki_dual.zig");
+const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
@@ -26,6 +28,7 @@ const security = @import("security/policy.zig");
 const http_util = @import("http_util.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const onboard = @import("onboard.zig");
+const zaki_state_mod = @import("zaki_state.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -278,6 +281,7 @@ pub const GatewayState = struct {
     shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
+    zaki_state: ?*zaki_state_mod.Manager = null,
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
         return initWithVerifyToken(allocator, "");
@@ -311,6 +315,10 @@ pub const GatewayState = struct {
         }
         if (self.owner_instance_id_owned and self.owner_instance_id.len > 0) {
             self.allocator.free(self.owner_instance_id);
+        }
+        if (self.zaki_state) |mgr| {
+            mgr.deinit();
+            self.allocator.destroy(mgr);
         }
     }
 };
@@ -348,6 +356,8 @@ const TenantRuntime = struct {
     provider_bundle: providers.runtime_bundle.RuntimeProviderBundle,
     tools: []const tools_mod.Tool,
     mem_rt: ?memory_mod.MemoryRuntime,
+    pg_session_store: ?*zaki_state_mod.Manager.UserSessionStore,
+    state_mgr: ?*zaki_state_mod.Manager,
     subagent_manager: ?*subagent_mod.SubagentManager,
     noop_obs: *observability.NoopObserver,
     session_mgr: session_mod.SessionManager,
@@ -359,6 +369,7 @@ const TenantRuntime = struct {
         base_config: *const Config,
         user_ctx: *const UserContext,
         event_bus: ?*bus_mod.Bus,
+        state_mgr: ?*zaki_state_mod.Manager,
     ) !*TenantRuntime {
         const runtime = try allocator.create(TenantRuntime);
         errdefer allocator.destroy(runtime);
@@ -376,12 +387,39 @@ const TenantRuntime = struct {
             .provider_bundle = undefined,
             .tools = &.{},
             .mem_rt = null,
+            .pg_session_store = null,
+            .state_mgr = state_mgr,
             .subagent_manager = null,
             .noop_obs = undefined,
             .session_mgr = undefined,
             .last_used_s = std.time.timestamp(),
         };
         runtime.config.workspace_dir = runtime.workspace_path;
+        if (state_mgr != null) {
+            const numeric_user_id = std.fmt.parseInt(i64, user_ctx.user_id, 10) catch return error.InvalidTenantUserId;
+            const user_config_json = state_mgr.?.getConfigJson(allocator, numeric_user_id) catch null;
+            if (user_config_json) |json| {
+                defer allocator.free(json);
+                const trimmed = std.mem.trim(u8, json, " \t\r\n");
+                if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "{}")) {
+                    runtime.config.parseJson(trimmed) catch |err| {
+                        log.warn("tenant config parse failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
+                    };
+                    runtime.config.applyProfileDefaults() catch {};
+                    runtime.config.memory.applyProfileDefaults();
+                    runtime.config.syncFlatFields();
+                }
+            }
+            if (std.mem.eql(u8, runtime.config.state.backend, "postgres")) {
+                // Use a ZAKI BOT-specific canonical memory backend instead of the generic
+                // Postgres engine, which targets a different table shape.
+                runtime.config.memory.backend = "markdown";
+            }
+            const pg_store = try allocator.create(zaki_state_mod.Manager.UserSessionStore);
+            errdefer allocator.destroy(pg_store);
+            pg_store.* = try zaki_state_mod.Manager.UserSessionStore.init(allocator, state_mgr.?, numeric_user_id);
+            runtime.pg_session_store = pg_store;
+        }
 
         runtime.provider_bundle = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &runtime.config);
         errdefer runtime.provider_bundle.deinit();
@@ -390,6 +428,34 @@ const TenantRuntime = struct {
 
         runtime.mem_rt = memory_mod.initRuntime(allocator, &runtime.config.memory, runtime.config.workspace_dir);
         errdefer if (runtime.mem_rt) |*rt| rt.deinit();
+        if (runtime.mem_rt) |*rt| {
+            if (state_mgr != null and std.mem.eql(u8, runtime.config.state.backend, "postgres")) {
+                const numeric_user_id = std.fmt.parseInt(i64, user_ctx.user_id, 10) catch return error.InvalidTenantUserId;
+                const old_memory = rt.memory;
+                if (rt._engine) |engine| {
+                    engine.deinit();
+                    allocator.destroy(engine);
+                    rt._engine = null;
+                }
+                const primary_impl = try allocator.create(zaki_postgres_memory.ZakiPostgresMemory);
+                errdefer allocator.destroy(primary_impl);
+                primary_impl.* = zaki_postgres_memory.ZakiPostgresMemory.init(allocator, state_mgr.?, numeric_user_id);
+                primary_impl.owns_self = true;
+
+                const dual = try zaki_dual_memory.ZakiDualMemory.init(allocator, primary_impl.memory(), runtime.config.workspace_dir);
+                try dual.syncFromMarkdown(allocator);
+                old_memory.deinit();
+                rt.memory = dual.memory();
+                rt.capabilities = .{
+                    .supports_keyword_rank = true,
+                    .supports_session_store = false,
+                    .supports_transactions = true,
+                    .supports_outbox = false,
+                };
+                rt.resolved.primary_backend = "zaki_dual";
+                try rebuildTenantMemoryEngine(allocator, rt, &runtime.config.memory, runtime.config.workspace_dir);
+            }
+        }
 
         const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
         if (subagent_manager) |mgr| {
@@ -406,6 +472,7 @@ const TenantRuntime = struct {
             .browser_enabled = runtime.config.browser.enabled,
             .screenshot_enabled = true,
             .composio_api_key = if (runtime.config.composio.enabled) runtime.config.composio.api_key else null,
+            .composio_entity_id = user_ctx.user_id,
             .browser_open_domains = if (runtime.config.browser.allowed_domains.len > 0) runtime.config.browser.allowed_domains else null,
             .agents = runtime.config.agents,
             .fallback_api_key = resolved_api_key,
@@ -428,7 +495,7 @@ const TenantRuntime = struct {
             runtime.tools,
             mem_opt,
             runtime.noop_obs.observer(),
-            if (runtime.mem_rt) |rt| rt.session_store else null,
+            if (runtime.pg_session_store) |store| store.sessionStore() else if (runtime.mem_rt) |rt| rt.session_store else null,
             if (runtime.mem_rt) |*rt| rt.response_cache else null,
         );
         errdefer runtime.session_mgr.deinit();
@@ -441,12 +508,65 @@ const TenantRuntime = struct {
         return runtime;
     }
 
+    fn rebuildTenantMemoryEngine(
+        allocator: std.mem.Allocator,
+        rt: *memory_mod.MemoryRuntime,
+        config: *const config_types.MemoryConfig,
+        workspace_dir: []const u8,
+    ) !void {
+        if (rt._engine) |engine| {
+            engine.deinit();
+            allocator.destroy(engine);
+            rt._engine = null;
+        }
+        if (!config.search.enabled) {
+            rt.resolved.retrieval_mode = "disabled";
+            rt.resolved.source_count = 0;
+            return;
+        }
+
+        const eng = try allocator.create(memory_mod.RetrievalEngine);
+        errdefer allocator.destroy(eng);
+        eng.* = memory_mod.RetrievalEngine.init(allocator, config.search.query);
+
+        const primary = try allocator.create(memory_mod.PrimaryAdapter);
+        errdefer allocator.destroy(primary);
+        primary.* = memory_mod.PrimaryAdapter.init(rt.memory);
+        primary.owns_self = true;
+        primary.allocator = allocator;
+        try eng.addSource(primary.adapter());
+
+        var source_count: usize = 1;
+        if (config.qmd.enabled) {
+            const qmd = try allocator.create(memory_mod.QmdAdapter);
+            errdefer allocator.destroy(qmd);
+            qmd.* = memory_mod.QmdAdapter.init(allocator, config.qmd, workspace_dir);
+            qmd.owns_self = true;
+            try eng.addSource(qmd.adapter());
+            source_count += 1;
+        }
+
+        eng.setRetrievalStages(config.retrieval_stages);
+        if (rt._embedding_provider) |provider| {
+            if (rt._vector_store) |store| {
+                eng.setVectorSearch(provider, store, rt._circuit_breaker, config.search.query.hybrid);
+            }
+        }
+        rt._engine = eng;
+        rt.resolved.retrieval_mode = if (rt._vector_store != null and rt._embedding_provider != null) "hybrid" else "keyword";
+        rt.resolved.source_count = source_count;
+    }
+
     fn deinit(self: *TenantRuntime) void {
         self.session_mgr.deinit();
         if (self.tools.len > 0) tools_mod.deinitTools(self.allocator, self.tools);
         if (self.subagent_manager) |mgr| {
             mgr.deinit();
             self.allocator.destroy(mgr);
+        }
+        if (self.pg_session_store) |store| {
+            store.deinit();
+            self.allocator.destroy(store);
         }
         if (self.mem_rt) |*rt| rt.deinit();
         self.provider_bundle.deinit();
@@ -465,6 +585,14 @@ const TenantRuntime = struct {
         self.lock.lock();
         defer self.lock.unlock();
         self.last_used_s = std.time.timestamp();
+        const numeric_user_id = std.fmt.parseInt(i64, self.user_id, 10) catch null;
+        tools_mod.setTenantContext(.{
+            .user_id = self.user_id,
+            .numeric_user_id = numeric_user_id,
+            .session_key = session_key,
+            .state_mgr = self.state_mgr,
+        });
+        defer tools_mod.clearTenantContext();
         return self.session_mgr.processMessageWithToolContext(session_key, message, null, message_turn_context);
     }
 };
@@ -534,7 +662,7 @@ fn getTenantRuntime(
         return runtime;
     }
 
-    const runtime = try TenantRuntime.init(state.allocator, config, user_ctx, state.event_bus);
+    const runtime = try TenantRuntime.init(state.allocator, config, user_ctx, state.event_bus, state.zaki_state);
     try state.tenant_runtimes.put(state.allocator, runtime.user_id, runtime);
     return runtime;
 }
@@ -786,6 +914,14 @@ fn isValidIdentifier(value: []const u8) bool {
     return true;
 }
 
+fn parseNumericUserId(user_id: []const u8) !i64 {
+    return try std.fmt.parseInt(i64, user_id, 10);
+}
+
+fn usesPostgresTenantState(state: *const GatewayState) bool {
+    return state.zaki_state != null;
+}
+
 fn resolveUserContext(allocator: std.mem.Allocator, state: *const GatewayState, user_id: []const u8) !UserContext {
     if (!isValidIdentifier(user_id)) return error.InvalidUserId;
     const user_root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ state.tenant_data_root, user_id });
@@ -822,15 +958,20 @@ fn resolveUserContext(allocator: std.mem.Allocator, state: *const GatewayState, 
     };
 }
 
-fn ensureUserProvisioned(ctx: *const UserContext) !void {
+fn ensureUserProvisioned(state: *GatewayState, ctx: *const UserContext) !void {
     try makeAbsolutePath(ctx.user_root);
     try makeAbsolutePath(ctx.workspace_path);
     try makeAbsolutePath(ctx.secrets_dir);
-    ensureFileWithDefault(ctx.memory_db_path, "") catch {};
-    ensureFileWithDefault(ctx.config_path, "{}\n") catch {};
-    ensureFileWithDefault(ctx.cron_path, "[]\n") catch {};
-    ensureFileWithDefault(ctx.heartbeat_path, "{}\n") catch {};
-    ensureFileWithDefault(ctx.channel_state_path, "{}\n") catch {};
+    if (state.zaki_state) |mgr| {
+        const user_id = try parseNumericUserId(ctx.user_id);
+        try mgr.provisionUser(user_id, ctx.workspace_path);
+    } else {
+        ensureFileWithDefault(ctx.memory_db_path, "") catch {};
+        ensureFileWithDefault(ctx.config_path, "{}\n") catch {};
+        ensureFileWithDefault(ctx.cron_path, "[]\n") catch {};
+        ensureFileWithDefault(ctx.heartbeat_path, "{}\n") catch {};
+        ensureFileWithDefault(ctx.channel_state_path, "{}\n") catch {};
+    }
 }
 
 fn makeAbsolutePath(path: []const u8) !void {
@@ -2142,7 +2283,7 @@ fn handleApiRoute(
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
         };
         defer user_ctx.deinit(req_allocator);
-        ensureUserProvisioned(&user_ctx) catch {
+        ensureUserProvisioned(state, &user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user provisioning failed\"}" };
         };
         const project_ctx = onboard.zakiBotProjectContext();
@@ -2248,7 +2389,7 @@ fn handleApiRoute(
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
         };
         defer user_ctx.deinit(req_allocator);
-        ensureUserProvisioned(&user_ctx) catch {
+        ensureUserProvisioned(state, &user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
         };
         const project_ctx = onboard.zakiBotProjectContext();
@@ -2271,7 +2412,7 @@ fn handleApiRoute(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
     };
     defer user_ctx.deinit(req_allocator);
-    ensureUserProvisioned(&user_ctx) catch {
+    ensureUserProvisioned(state, &user_ctx) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
     };
     const project_ctx = onboard.zakiBotProjectContext();
@@ -2290,17 +2431,19 @@ fn handleApiRoute(
     defer if (user_write_lock_opt) |*lock| lock.deinit();
 
     if (std.mem.eql(u8, parsed.subpath, "onboarding")) {
-        const onboarding_path = onboardingStatePath(req_allocator, user_ctx.user_root) catch {
-            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path failed\"}" };
-        };
-        defer req_allocator.free(onboarding_path);
-
         if (std.mem.eql(u8, method, "GET")) {
-            const content = readFileOrDefault(
-                req_allocator,
-                onboarding_path,
-                "{\"completed\":false,\"completed_at_s\":null}\n",
-            ) catch {
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const content = mgr.getOnboardingJson(req_allocator, user_id) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+                };
+                return .{ .body = content };
+            }
+            const onboarding_path = onboardingStatePath(req_allocator, user_ctx.user_root) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path failed\"}" };
+            };
+            defer req_allocator.free(onboarding_path);
+            const content = readFileOrDefault(req_allocator, onboarding_path, "{\"completed\":false,\"completed_at_s\":null}\n") catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
             };
             return .{ .body = content };
@@ -2357,9 +2500,20 @@ fn handleApiRoute(
                 w.writeAll("null") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
             }
             w.writeAll("}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
-            writeFile(onboarding_path, out.items) catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-            };
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                mgr.putOnboardingJson(user_id, out.items) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            } else {
+                const onboarding_path = onboardingStatePath(req_allocator, user_ctx.user_root) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path failed\"}" };
+                };
+                defer req_allocator.free(onboarding_path);
+                writeFile(onboarding_path, out.items) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            }
             return .{ .body = out.toOwnedSlice(req_allocator) catch "{\"status\":\"updated\"}" };
         }
 
@@ -2368,6 +2522,13 @@ fn handleApiRoute(
 
     if (std.mem.eql(u8, parsed.subpath, "config")) {
         if (std.mem.eql(u8, method, "GET")) {
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const content = mgr.getConfigJson(req_allocator, user_id) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+                };
+                return .{ .body = content };
+            }
             const content = readFileOrDefault(req_allocator, user_ctx.config_path, "{}\n") catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
             };
@@ -2375,9 +2536,16 @@ fn handleApiRoute(
         }
         if (std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "PUT")) {
             const body = extractBody(raw_request) orelse "{}\n";
-            writeFile(user_ctx.config_path, body) catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-            };
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                mgr.putConfigJson(user_id, body) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            } else {
+                writeFile(user_ctx.config_path, body) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            }
             return .{ .body = "{\"status\":\"updated\"}" };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
@@ -2385,6 +2553,13 @@ fn handleApiRoute(
 
     if (std.mem.eql(u8, parsed.subpath, "heartbeat")) {
         if (std.mem.eql(u8, method, "GET")) {
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const content = mgr.getHeartbeatJson(req_allocator, user_id) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+                };
+                return .{ .body = content };
+            }
             const content = readFileOrDefault(req_allocator, user_ctx.heartbeat_path, "{}\n") catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
             };
@@ -2392,9 +2567,16 @@ fn handleApiRoute(
         }
         if (std.mem.eql(u8, method, "PUT")) {
             const body = extractBody(raw_request) orelse "{}\n";
-            writeFile(user_ctx.heartbeat_path, body) catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-            };
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                mgr.putHeartbeatJson(user_id, body) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            } else {
+                writeFile(user_ctx.heartbeat_path, body) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            }
             return .{ .body = "{\"status\":\"updated\"}" };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
@@ -2402,6 +2584,13 @@ fn handleApiRoute(
 
     if (std.mem.eql(u8, parsed.subpath, "cron")) {
         if (std.mem.eql(u8, method, "GET")) {
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const content = mgr.getJobsJson(req_allocator, user_id) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+                };
+                return .{ .body = content };
+            }
             const content = readFileOrDefault(req_allocator, user_ctx.cron_path, "[]\n") catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
             };
@@ -2409,15 +2598,29 @@ fn handleApiRoute(
         }
         if (std.mem.eql(u8, method, "POST") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "PUT")) {
             const body = extractBody(raw_request) orelse "[]\n";
-            writeFile(user_ctx.cron_path, body) catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-            };
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                mgr.replaceJobsJson(user_id, "main", body) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            } else {
+                writeFile(user_ctx.cron_path, body) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            }
             return .{ .body = "{\"status\":\"updated\"}" };
         }
         if (std.mem.eql(u8, method, "DELETE")) {
-            writeFile(user_ctx.cron_path, "[]\n") catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-            };
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                mgr.clearJobs(user_id) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            } else {
+                writeFile(user_ctx.cron_path, "[]\n") catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            }
             return .{ .body = "{\"status\":\"deleted\"}" };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
@@ -2431,31 +2634,55 @@ fn handleApiRoute(
         defer req_allocator.free(secret_path);
 
         if (std.mem.eql(u8, method, "GET")) {
-            const value = readFileOrDefault(req_allocator, secret_path, "") catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+            const value_text: []const u8 = if (state.zaki_state) |mgr| blk: {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const secret_value = mgr.getSecret(req_allocator, user_id, secret_key) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+                };
+                defer if (secret_value) |v| req_allocator.free(v);
+                break :blk secret_value orelse "";
+            } else blk: {
+                break :blk readFileOrDefault(req_allocator, secret_path, "") catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+                };
             };
-            if (value.len == 0) return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" };
+            if (value_text.len == 0) return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" };
             var resp: std.ArrayListUnmanaged(u8) = .empty;
             defer resp.deinit(req_allocator);
             const w = resp.writer(req_allocator);
             w.print("{{\"key\":\"{s}\",\"value\":\"", .{secret_key}) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
-            jsonEscapeInto(w, value) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            jsonEscapeInto(w, value_text) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
             w.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
             return .{ .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"response build failed\"}" };
         }
         if (std.mem.eql(u8, method, "PUT")) {
             const body = extractBody(raw_request) orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
             const value = jsonStringField(body, "value") orelse body;
-            writeFile(secret_path, value) catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-            };
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                mgr.putSecret(user_id, secret_key, value) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            } else {
+                writeFile(secret_path, value) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            }
             return .{ .body = "{\"status\":\"updated\"}" };
         }
         if (std.mem.eql(u8, method, "DELETE")) {
-            std.fs.deleteFileAbsolute(secret_path) catch |err| switch (err) {
-                error.FileNotFound => return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" },
-                else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete failed\"}" },
-            };
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const deleted = mgr.deleteSecret(user_id, secret_key) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete failed\"}" };
+                };
+                if (!deleted) return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" };
+            } else {
+                std.fs.deleteFileAbsolute(secret_path) catch |err| switch (err) {
+                    error.FileNotFound => return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" },
+                    else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete failed\"}" },
+                };
+            }
             return .{ .body = "{\"status\":\"deleted\"}" };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
@@ -2477,13 +2704,29 @@ fn handleApiRoute(
 
         const input_bot_token = jsonStringField(body, "bot_token");
         if (input_bot_token) |tok| {
-            writeFile(secret_path, tok) catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
-            };
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                mgr.putSecret(user_id, "telegram_bot_token", tok) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
+                };
+            } else {
+                writeFile(secret_path, tok) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
+                };
+            }
         }
-        const bot_token_raw = readFileOrDefault(req_allocator, secret_path, "") catch {
-            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
+        const bot_token_raw = if (state.zaki_state) |mgr| blk: {
+            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            const secret_value = mgr.getSecret(req_allocator, user_id, "telegram_bot_token") catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
+            };
+            break :blk secret_value orelse "";
+        } else blk: {
+            break :blk readFileOrDefault(req_allocator, secret_path, "") catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
+            };
         };
+        defer if (state.zaki_state != null and bot_token_raw.len > 0) req_allocator.free(bot_token_raw);
         const bot_token = std.mem.trim(u8, bot_token_raw, " \t\r\n");
         if (bot_token.len == 0) {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing bot_token\"}" };
@@ -2570,9 +2813,16 @@ fn handleApiRoute(
         sw.writeAll("\",\"allow_from\":") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"state build failed\"}" };
         jsonWriteStringArray(sw, allow_from) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"state build failed\"}" };
         sw.print(",\"connected_at\":{d}}}", .{std.time.timestamp()}) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"state build failed\"}" };
-        writeFile(user_ctx.telegram_path, state_payload.items) catch {
-            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-        };
+        if (state.zaki_state) |mgr| {
+            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            mgr.putTelegramStateJson(user_id, state_payload.items) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+            };
+        } else {
+            writeFile(user_ctx.telegram_path, state_payload.items) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+            };
+        }
 
         var resp: std.ArrayListUnmanaged(u8) = .empty;
         defer resp.deinit(req_allocator);
@@ -2593,9 +2843,18 @@ fn handleApiRoute(
         };
         defer req_allocator.free(secret_path);
         const body_bot_token = jsonStringField(body, "bot_token");
-        const stored_bot_token = readFileOrDefault(req_allocator, secret_path, "") catch {
-            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
+        const stored_bot_token = if (state.zaki_state) |mgr| blk: {
+            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            const secret_value = mgr.getSecret(req_allocator, user_id, "telegram_bot_token") catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
+            };
+            break :blk secret_value orelse "";
+        } else blk: {
+            break :blk readFileOrDefault(req_allocator, secret_path, "") catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
+            };
         };
+        defer if (state.zaki_state != null and stored_bot_token.len > 0 and body_bot_token == null) req_allocator.free(stored_bot_token);
         const token_raw = body_bot_token orelse stored_bot_token;
         const bot_token = std.mem.trim(u8, token_raw, " \t\r\n");
         if (bot_token.len > 0) {
@@ -2612,14 +2871,21 @@ fn handleApiRoute(
             }
         }
 
-        std.fs.deleteFileAbsolute(user_ctx.telegram_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" },
-        };
-        std.fs.deleteFileAbsolute(user_ctx.channel_state_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" },
-        };
+        if (state.zaki_state) |mgr| {
+            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            mgr.deleteTelegramState(user_id) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" };
+            };
+        } else {
+            std.fs.deleteFileAbsolute(user_ctx.telegram_path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" },
+            };
+            std.fs.deleteFileAbsolute(user_ctx.channel_state_path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" },
+            };
+        }
         return .{ .body = "{\"status\":\"disconnected\",\"channel\":\"telegram\"}" };
     }
 
@@ -2749,11 +3015,34 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             };
             defer if (user_lock_opt) |*lock| lock.deinit();
 
-            var user_state = loadTelegramUserState(ctx.req_allocator, user_ctx.telegram_path) catch {
-                _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                ctx.response_status = "403 Forbidden";
-                ctx.response_body = "{\"error\":\"telegram user channel not connected\"}";
-                return;
+            var user_state = blk: {
+                if (ctx.state.zaki_state) |mgr| {
+                    const numeric_user_id = parseNumericUserId(user_id) catch {
+                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                        ctx.response_status = "400 Bad Request";
+                        ctx.response_body = "{\"error\":\"invalid user\"}";
+                        return;
+                    };
+                    const raw_state = mgr.getTelegramStateJson(ctx.req_allocator, numeric_user_id) catch {
+                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                        ctx.response_status = "403 Forbidden";
+                        ctx.response_body = "{\"error\":\"telegram user channel not connected\"}";
+                        return;
+                    };
+                    defer ctx.req_allocator.free(raw_state);
+                    break :blk parseTelegramUserState(ctx.req_allocator, raw_state) catch {
+                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                        ctx.response_status = "403 Forbidden";
+                        ctx.response_body = "{\"error\":\"telegram user channel not connected\"}";
+                        return;
+                    };
+                }
+                break :blk loadTelegramUserState(ctx.req_allocator, user_ctx.telegram_path) catch {
+                    _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"telegram user channel not connected\"}";
+                    return;
+                };
             };
             defer user_state.deinit(ctx.req_allocator);
             if (!user_state.connected) {
@@ -2773,20 +3062,37 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 tg_webhook_secret_token = secret;
             }
 
-            const secret_path = resolveSecretPath(ctx.req_allocator, user_ctx.secrets_dir, "telegram_bot_token") catch {
-                _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                ctx.response_status = "500 Internal Server Error";
-                ctx.response_body = "{\"error\":\"secret path failed\"}";
-                return;
+            const tenant_bot_token = blk: {
+                if (ctx.state.zaki_state) |mgr| {
+                    const numeric_user_id = parseNumericUserId(user_id) catch {
+                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                        ctx.response_status = "400 Bad Request";
+                        ctx.response_body = "{\"error\":\"invalid user\"}";
+                        return;
+                    };
+                    const secret_value = mgr.getSecret(ctx.req_allocator, numeric_user_id, "telegram_bot_token") catch {
+                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                        ctx.response_status = "500 Internal Server Error";
+                        ctx.response_body = "{\"error\":\"failed reading bot token\"}";
+                        return;
+                    };
+                    break :blk secret_value orelse "";
+                }
+                const secret_path = resolveSecretPath(ctx.req_allocator, user_ctx.secrets_dir, "telegram_bot_token") catch {
+                    _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                    ctx.response_status = "500 Internal Server Error";
+                    ctx.response_body = "{\"error\":\"secret path failed\"}";
+                    return;
+                };
+                defer ctx.req_allocator.free(secret_path);
+                break :blk readTrimmedSecretFile(ctx.req_allocator, secret_path) catch {
+                    _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                    ctx.response_status = "500 Internal Server Error";
+                    ctx.response_body = "{\"error\":\"failed reading bot token\"}";
+                    return;
+                };
             };
-            defer ctx.req_allocator.free(secret_path);
-
-            const tenant_bot_token = readTrimmedSecretFile(ctx.req_allocator, secret_path) catch {
-                _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                ctx.response_status = "500 Internal Server Error";
-                ctx.response_body = "{\"error\":\"failed reading bot token\"}";
-                return;
-            };
+            defer if (ctx.state.zaki_state != null and tenant_bot_token.len > 0) ctx.req_allocator.free(tenant_bot_token);
             if (tenant_bot_token.len == 0) {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                 ctx.response_status = "403 Forbidden";
@@ -2819,12 +3125,29 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         }
 
         if (jsonIntField(b, "update_id")) |update_id| {
-            var key_buf: [192]u8 = undefined;
-            const dedupe_scope = if (scoped_user_id) |uid| uid else tg_account_id;
-            const key = std.fmt.bufPrint(&key_buf, "telegram:update:{s}:{d}", .{ dedupe_scope, update_id }) catch "telegram:update:invalid";
-            if (!ctx.state.idempotency.recordIfNew(ctx.state.allocator, key)) {
-                ctx.response_body = "{\"status\":\"duplicate\"}";
-                return;
+            if (ctx.state.zaki_state != null and scoped_user_id != null) {
+                const numeric_user_id = parseNumericUserId(scoped_user_id.?) catch {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"invalid user\"}";
+                    return;
+                };
+                const is_new = ctx.state.zaki_state.?.recordTelegramUpdate(numeric_user_id, update_id) catch {
+                    ctx.response_status = "500 Internal Server Error";
+                    ctx.response_body = "{\"error\":\"telegram update dedupe failed\"}";
+                    return;
+                };
+                if (!is_new) {
+                    ctx.response_body = "{\"status\":\"duplicate\"}";
+                    return;
+                }
+            } else {
+                var key_buf: [192]u8 = undefined;
+                const dedupe_scope = if (scoped_user_id) |uid| uid else tg_account_id;
+                const key = std.fmt.bufPrint(&key_buf, "telegram:update:{s}:{d}", .{ dedupe_scope, update_id }) catch "telegram:update:invalid";
+                if (!ctx.state.idempotency.recordIfNew(ctx.state.allocator, key)) {
+                    ctx.response_body = "{\"status\":\"duplicate\"}";
+                    return;
+                }
             }
         }
 
@@ -2838,7 +3161,14 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         }
 
         if (msg_text != null and chat_id != null) {
-            if (tenant_channel_state_path) |state_path| {
+            if (ctx.state.zaki_state != null and scoped_user_id != null) {
+                const numeric_user_id = parseNumericUserId(scoped_user_id.?) catch {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"invalid user\"}";
+                    return;
+                };
+                ctx.state.zaki_state.?.recordTelegramChat(numeric_user_id, tg_account_id, chat_id.?) catch {};
+            } else if (tenant_channel_state_path) |state_path| {
                 writeTelegramChannelState(ctx.req_allocator, state_path, tg_account_id, chat_id.?) catch {};
             }
             var sender_buf: [32]u8 = undefined;
@@ -4021,6 +4351,15 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         state.tenant_data_root = cfg.tenant.data_root;
         state.tenant_runtime_cache_max_users = cfg.tenant.runtime_cache_max_users;
         state.tenant_runtime_idle_ttl_secs = cfg.tenant.runtime_idle_ttl_secs;
+        if (std.mem.eql(u8, cfg.state.backend, "postgres")) init_state: {
+            const mgr = allocator.create(zaki_state_mod.Manager) catch break :init_state;
+            mgr.* = zaki_state_mod.Manager.init(allocator, cfg.state) catch |err| {
+                allocator.destroy(mgr);
+                log.warn("zaki state init failed, falling back to file state: {}", .{err});
+                break :init_state;
+            };
+            state.zaki_state = mgr;
+        }
         if (cfg.tenant.enabled) {
             const owner_id = tenant_lock.resolveOwnerId(allocator) catch null;
             if (owner_id) |oid| {

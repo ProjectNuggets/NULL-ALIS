@@ -46,6 +46,7 @@ pub const MemoryConfig = config_types.MemoryConfig;
 pub const TunnelConfig = config_types.TunnelConfig;
 pub const GatewayConfig = config_types.GatewayConfig;
 pub const TenantConfig = config_types.TenantConfig;
+pub const StateConfig = config_types.StateConfig;
 pub const ComposioConfig = config_types.ComposioConfig;
 pub const SecretsConfig = config_types.SecretsConfig;
 pub const BrowserComputerUseConfig = config_types.BrowserComputerUseConfig;
@@ -109,6 +110,7 @@ pub const Config = struct {
     tunnel: TunnelConfig = .{},
     gateway: GatewayConfig = .{},
     tenant: TenantConfig = .{},
+    state: StateConfig = .{},
     composio: ComposioConfig = .{},
     secrets: SecretsConfig = .{},
     browser: BrowserConfig = .{},
@@ -624,6 +626,7 @@ pub const Config = struct {
         try w.print("  \"memory\": {f},\n", .{std.json.fmt(self.memory, .{})});
         try w.print("  \"gateway\": {f},\n", .{std.json.fmt(self.gateway, .{})});
         try w.print("  \"tenant\": {f},\n", .{std.json.fmt(self.tenant, .{})});
+        try w.print("  \"state\": {f},\n", .{std.json.fmt(self.state, .{})});
         try w.print("  \"tunnel\": {f},\n", .{std.json.fmt(self.tunnel, .{})});
         try w.print("  \"composio\": {f},\n", .{std.json.fmt(self.composio, .{})});
         try w.print("  \"secrets\": {f},\n", .{std.json.fmt(self.secrets, .{})});

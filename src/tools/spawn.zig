@@ -4,6 +4,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const SubagentManager = @import("../subagent.zig").SubagentManager;
+const message_tool = @import("message.zig");
 
 /// Spawn tool — launches a background subagent to work on a task asynchronously.
 /// Returns a task ID immediately. Results are delivered as system messages.
@@ -41,8 +42,9 @@ pub const SpawnTool = struct {
         const manager = self.manager orelse
             return ToolResult.fail("Spawn tool not connected to SubagentManager");
 
-        const channel = self.default_channel orelse "system";
-        const chat_id = self.default_chat_id orelse "agent";
+        const turn = message_tool.MessageTool.getTurnContext();
+        const channel = turn.channel orelse self.default_channel orelse "system";
+        const chat_id = turn.chat_id orelse self.default_chat_id orelse "agent";
 
         const task_id = manager.spawn(trimmed_task, label, channel, chat_id) catch |err| {
             return switch (err) {

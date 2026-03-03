@@ -57,6 +57,10 @@ pub const MessageTool = struct {
         sent_in_round = false;
     }
 
+    pub fn getTurnContext() TurnContext {
+        return current_turn_context;
+    }
+
     /// Check if a message was sent during this round.
     pub fn hasMessageBeenSent(_: *const MessageTool) bool {
         return sent_in_round;

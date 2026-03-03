@@ -1,0 +1,195 @@
+const std = @import("std");
+const root = @import("../root.zig");
+
+pub const ZakiDualMemory = struct {
+    allocator: std.mem.Allocator,
+    primary: root.Memory,
+    markdown_impl: *root.MarkdownMemory,
+
+    const Self = @This();
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        primary: root.Memory,
+        workspace_dir: []const u8,
+    ) !*Self {
+        const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+
+        const markdown_impl = try allocator.create(root.MarkdownMemory);
+        errdefer allocator.destroy(markdown_impl);
+        markdown_impl.* = try root.MarkdownMemory.init(allocator, workspace_dir);
+
+        self.* = .{
+            .allocator = allocator,
+            .primary = primary,
+            .markdown_impl = markdown_impl,
+        };
+        return self;
+    }
+
+    pub fn memory(self: *Self) root.Memory {
+        return .{ .ptr = @ptrCast(self), .vtable = &mem_vtable };
+    }
+
+    pub fn syncFromMarkdown(self: *Self, allocator: std.mem.Allocator) !void {
+        const entries = try self.markdown_impl.memory().list(allocator, null, null);
+        defer root.freeEntries(allocator, entries);
+
+        for (entries) |entry| {
+            if (!shouldSyncEntry(entry)) continue;
+            try self.primary.store(entry.key, entry.content, entry.category, entry.session_id);
+        }
+    }
+
+    fn shouldSyncEntry(entry: root.MemoryEntry) bool {
+        if (std.mem.eql(u8, entry.key, "last_hygiene_at")) return false;
+        if (entry.category == .core and std.mem.startsWith(u8, entry.key, "MEMORY:")) {
+            return false;
+        }
+        return true;
+    }
+
+    fn implName(_: *anyopaque) []const u8 {
+        return "zaki_dual";
+    }
+
+    fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: root.MemoryCategory, session_id: ?[]const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.primary.store(key, content, category, session_id);
+        try self.markdown_impl.memory().store(key, content, category, session_id);
+    }
+
+    fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]root.MemoryEntry {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.syncFromMarkdown(allocator) catch {};
+        return self.primary.recall(allocator, query, limit, session_id);
+    }
+
+    fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?root.MemoryEntry {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.syncFromMarkdown(allocator) catch {};
+        return self.primary.get(allocator, key);
+    }
+
+    fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?root.MemoryCategory, session_id: ?[]const u8) anyerror![]root.MemoryEntry {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.syncFromMarkdown(allocator) catch {};
+        return self.primary.list(allocator, category, session_id);
+    }
+
+    fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.primary.forget(key);
+    }
+
+    fn implCount(ptr: *anyopaque) anyerror!usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.primary.count();
+    }
+
+    fn implHealthCheck(ptr: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.primary.healthCheck();
+    }
+
+    fn implDeinit(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.primary.deinit();
+        self.markdown_impl.deinit();
+        self.allocator.destroy(self.markdown_impl);
+        self.allocator.destroy(self);
+    }
+
+    pub const mem_vtable = root.Memory.VTable{
+        .name = &implName,
+        .store = &implStore,
+        .recall = &implRecall,
+        .get = &implGet,
+        .list = &implList,
+        .forget = &implForget,
+        .count = &implCount,
+        .healthCheck = &implHealthCheck,
+        .deinit = &implDeinit,
+    };
+};
+
+test "zaki dual memory syncs markdown into canonical memory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
+
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    var mem = dual.memory();
+
+    try mem.store("user_name", "Nova", .core, null);
+    const recalled = try mem.recall(allocator, "Nova", 5, null);
+    defer root.freeEntries(allocator, recalled);
+    try std.testing.expect(recalled.len >= 1);
+
+    const memory_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace});
+    defer allocator.free(memory_path);
+    const content = try std.fs.cwd().readFileAlloc(allocator, memory_path, 4096);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "user_name") != null);
+
+    mem.deinit();
+}
+
+test "zaki dual memory ingests manual markdown edits into canonical memory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const memory_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace});
+    defer allocator.free(memory_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = memory_path,
+        .data = "# MEMORY.md - Long-Term Memory\n\n- **favorite_color**: teal\n",
+    });
+
+    var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    var mem = dual.memory();
+
+    const got = (try mem.get(allocator, "favorite_color")).?;
+    defer got.deinit(allocator);
+    try std.testing.expectEqualStrings("teal", got.content);
+
+    mem.deinit();
+}
+
+test "zaki dual memory skips scaffold core lines during sync" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const memory_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace});
+    defer allocator.free(memory_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = memory_path,
+        .data = "# MEMORY.md - Long-Term Memory\n\nThis file stores curated, durable context for main sessions.\n- **favorite_color**: teal\n",
+    });
+
+    var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    var mem = dual.memory();
+
+    try std.testing.expect((try mem.get(allocator, "MEMORY:0")) == null);
+    const got = (try mem.get(allocator, "favorite_color")).?;
+    defer got.deinit(allocator);
+    try std.testing.expectEqualStrings("teal", got.content);
+
+    mem.deinit();
+}
