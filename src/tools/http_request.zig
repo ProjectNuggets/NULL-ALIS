@@ -4,6 +4,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
+const http_util = @import("../root.zig").http_util;
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods with
@@ -102,73 +103,56 @@ pub const HttpRequestTool = struct {
             header_list.deinit(allocator);
         }
 
-        // Execute request using std.http.Client (Zig 0.15 API)
-        var client: std.http.Client = .{ .allocator = allocator };
-        defer client.deinit();
-
-        const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
         const authority_host = stripHostBrackets(host);
-        const connection = client.connectTcpOptions(.{
-            .host = connect_host,
-            .port = resolved_port,
-            .protocol = protocol,
-            .proxied_host = authority_host,
-            .proxied_port = resolved_port,
-        }) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
 
         const body: ?[]const u8 = root.getString(args, "body");
 
-        // Build extra headers
-        var extra_headers_buf: [32]std.http.Header = undefined;
-        var extra_count: usize = 0;
+        // Build curl header strings
+        var extra_headers: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (extra_headers.items) |hdr| allocator.free(hdr);
+            extra_headers.deinit(allocator);
+        }
         for (custom_headers) |h| {
-            if (extra_count >= extra_headers_buf.len) break;
-            extra_headers_buf[extra_count] = .{ .name = h[0], .value = h[1] };
-            extra_count += 1;
+            try extra_headers.append(
+                allocator,
+                try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h[0], h[1] }),
+            );
+        }
+        defer {
+            for (extra_headers.items) |hdr| allocator.free(hdr);
+            extra_headers.deinit(allocator);
         }
 
-        var req = client.request(method, uri, buildRequestOptions(extra_headers_buf[0..extra_count], connection)) catch |err| {
+        const method_name = switch (method) {
+            .GET => "GET",
+            .POST => "POST",
+            .PUT => "PUT",
+            .DELETE => "DELETE",
+            .PATCH => "PATCH",
+            .HEAD => "HEAD",
+            .OPTIONS => "OPTIONS",
+            else => method_str,
+        };
+
+        const response = http_util.curlRequestResolved(
+            allocator,
+            method_name,
+            url,
+            extra_headers.items,
+            body,
+            "30",
+            authority_host,
+            resolved_port,
+            connect_host,
+        ) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
-        defer req.deinit();
+        defer allocator.free(response.body);
 
-        // Send body if present, otherwise send bodiless
-        if (body) |b| {
-            const body_dup = try allocator.dupe(u8, b);
-            defer allocator.free(body_dup);
-            req.sendBodyComplete(body_dup) catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "Failed to send body: {}", .{err});
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
-            };
-        } else {
-            req.sendBodiless() catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "Failed to send request: {}", .{err});
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
-            };
-        }
-
-        // Receive response head
-        var redirect_buf: [4096]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to receive response: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        const status_code = @intFromEnum(response.head.status);
+        const status_code = response.status_code;
         const success = status_code >= 200 and status_code < 300;
-
-        // Read response body (limit to 1MB)
-        var transfer_buf: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
-        const response_body = reader.readAlloc(allocator, 1_048_576) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to read response body: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer allocator.free(response_body);
 
         // Build redacted headers display for custom request headers
         const redacted = redactHeadersForDisplay(allocator, custom_headers) catch "";
@@ -178,13 +162,13 @@ pub const HttpRequestTool = struct {
             try std.fmt.allocPrint(
                 allocator,
                 "Status: {d}\nRequest Headers: {s}\n\nResponse Body:\n{s}",
-                .{ status_code, redacted, response_body },
+                .{ status_code, redacted, response.body },
             )
         else
             try std.fmt.allocPrint(
                 allocator,
                 "Status: {d}\n\nResponse Body:\n{s}",
-                .{ status_code, response_body },
+                .{ status_code, response.body },
             );
 
         if (success) {
@@ -205,18 +189,6 @@ fn validateMethod(method: []const u8) ?std.http.Method {
     if (std.ascii.eqlIgnoreCase(method, "HEAD")) return .HEAD;
     if (std.ascii.eqlIgnoreCase(method, "OPTIONS")) return .OPTIONS;
     return null;
-}
-
-/// Disable auto-follow redirects so every hop can be explicitly validated.
-fn buildRequestOptions(
-    extra_headers: []const std.http.Header,
-    connection: ?*std.http.Client.Connection,
-) std.http.Client.RequestOptions {
-    return .{
-        .extra_headers = extra_headers,
-        .redirect_behavior = .unhandled,
-        .connection = connection,
-    };
 }
 
 fn stripHostBrackets(host: []const u8) []const u8 {
@@ -404,20 +376,6 @@ test "isSensitiveHeader checks" {
     try std.testing.expect(isSensitiveHeader("password-header"));
     try std.testing.expect(!isSensitiveHeader("Content-Type"));
     try std.testing.expect(!isSensitiveHeader("Accept"));
-}
-
-test "http_request disables automatic redirects" {
-    const opts = buildRequestOptions(&.{}, null);
-    try std.testing.expect(opts.redirect_behavior == .unhandled);
-    try std.testing.expect(opts.connection == null);
-}
-
-test "http_request request options keep provided connection" {
-    const fake_ptr_value = @as(usize, @alignOf(std.http.Client.Connection));
-    const fake_connection: *std.http.Client.Connection = @ptrFromInt(fake_ptr_value);
-    const opts = buildRequestOptions(&.{}, fake_connection);
-    try std.testing.expect(opts.connection != null);
-    try std.testing.expectEqual(@intFromPtr(fake_connection), @intFromPtr(opts.connection.?));
 }
 
 // ── execute-level tests ──────────────────────────────────────

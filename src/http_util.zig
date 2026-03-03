@@ -8,6 +8,13 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.http_util);
 
+pub const CurlResponse = struct {
+    status_code: u16,
+    body: []u8,
+};
+
+const STATUS_MARKER = "\n__NULLCLAW_STATUS__:";
+
 /// HTTP POST via curl subprocess with optional proxy and timeout.
 ///
 /// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
@@ -175,6 +182,118 @@ pub fn curlGetWithProxy(
 /// HTTP GET via curl subprocess (no proxy).
 pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u8, timeout_secs: []const u8) ![]u8 {
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
+}
+
+/// Generic HTTP request via curl subprocess with explicit DNS pinning.
+///
+/// `resolve_host`, `resolve_port`, and `connect_host` are used to pass a
+/// `--resolve host:port:ip` rule so TLS/SNI still uses the original host while
+/// the TCP connection is pinned to the validated IP returned by SSRF-safe DNS
+/// resolution.
+pub fn curlRequestResolved(
+    allocator: Allocator,
+    method: []const u8,
+    url: []const u8,
+    headers: []const []const u8,
+    body: ?[]const u8,
+    timeout_secs: []const u8,
+    resolve_host: []const u8,
+    resolve_port: u16,
+    connect_host: []const u8,
+) !CurlResponse {
+    var resolve_target_storage: [512]u8 = undefined;
+    const resolve_target = try std.fmt.bufPrint(
+        &resolve_target_storage,
+        "{s}:{d}:{s}",
+        .{ resolve_host, resolve_port, connect_host },
+    );
+
+    var argv_buf: [64][]const u8 = undefined;
+    var argc: usize = 0;
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-sS";
+    argc += 1;
+    argv_buf[argc] = "--max-time";
+    argc += 1;
+    argv_buf[argc] = timeout_secs;
+    argc += 1;
+    argv_buf[argc] = "--request";
+    argc += 1;
+    argv_buf[argc] = method;
+    argc += 1;
+    argv_buf[argc] = "--resolve";
+    argc += 1;
+    argv_buf[argc] = resolve_target;
+    argc += 1;
+    argv_buf[argc] = "--write-out";
+    argc += 1;
+    argv_buf[argc] = STATUS_MARKER ++ "%{http_code}";
+    argc += 1;
+
+    for (headers) |hdr| {
+        if (argc + 2 > argv_buf.len) break;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = hdr;
+        argc += 1;
+    }
+
+    if (body != null) {
+        argv_buf[argc] = "--data-binary";
+        argc += 1;
+        argv_buf[argc] = "@-";
+        argc += 1;
+    }
+
+    argv_buf[argc] = url;
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = if (body != null) .Pipe else .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    if (body) |request_body| {
+        if (child.stdin) |stdin_file| {
+            stdin_file.writeAll(request_body) catch {
+                stdin_file.close();
+                child.stdin = null;
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                return error.CurlWriteError;
+            };
+            stdin_file.close();
+            child.stdin = null;
+        } else {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        }
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
+    errdefer allocator.free(stdout);
+
+    const term = child.wait() catch return error.CurlWaitError;
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CurlFailed,
+        else => return error.CurlFailed,
+    }
+
+    const marker_index = std.mem.lastIndexOf(u8, stdout, STATUS_MARKER) orelse return error.CurlReadError;
+    const body_slice = stdout[0..marker_index];
+    const status_slice = stdout[marker_index + STATUS_MARKER.len ..];
+    const status_code = std.fmt.parseInt(u16, std.mem.trim(u8, status_slice, " \t\r\n"), 10) catch return error.CurlReadError;
+
+    const body_copy = try allocator.dupe(u8, body_slice);
+    allocator.free(stdout);
+    return .{
+        .status_code = status_code,
+        .body = body_copy,
+    };
 }
 
 /// HTTP GET via curl for SSE (Server-Sent Events).

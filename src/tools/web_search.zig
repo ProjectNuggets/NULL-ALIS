@@ -6,6 +6,8 @@
 const std = @import("std");
 const root = @import("root.zig");
 const platform = @import("../platform.zig");
+const http_util = @import("../root.zig").http_util;
+const net_security = @import("../root.zig").net_security;
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
@@ -61,52 +63,39 @@ pub const WebSearchTool = struct {
         );
         defer allocator.free(url_str);
 
-        // Make HTTP request
-        var client: std.http.Client = .{ .allocator = allocator };
-        defer client.deinit();
+        const headers = [_][]const u8{
+            try std.fmt.allocPrint(allocator, "X-Subscription-Token: {s}", .{api_key}),
+            "Accept: application/json",
+        };
+        defer allocator.free(headers[0]);
 
-        const uri = std.Uri.parse(url_str) catch
-            return ToolResult.fail("Failed to parse search URL");
+        const connect_host = net_security.resolveConnectHost(allocator, "api.search.brave.com", 443) catch
+            return ToolResult.fail("Unable to verify Brave Search host safety");
+        defer allocator.free(connect_host);
 
-        var req = client.request(.GET, uri, .{
-            .extra_headers = &.{
-                .{ .name = "X-Subscription-Token", .value = api_key },
-                .{ .name = "Accept", .value = "application/json" },
-            },
-        }) catch |err| {
+        const response = http_util.curlRequestResolved(
+            allocator,
+            "GET",
+            url_str,
+            &headers,
+            null,
+            "20",
+            "api.search.brave.com",
+            443,
+            connect_host,
+        ) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Search request failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
-        defer req.deinit();
+        defer allocator.free(response.body);
 
-        req.sendBodiless() catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to send search request: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        var redirect_buf: [4096]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to receive response: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        const status_code = @intFromEnum(response.head.status);
-        if (status_code != 200) {
-            const msg = try std.fmt.allocPrint(allocator, "Brave Search API returned HTTP {d}", .{status_code});
+        if (response.status_code != 200) {
+            const msg = try std.fmt.allocPrint(allocator, "Brave Search API returned HTTP {d}", .{response.status_code});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
 
-        // Read response body
-        var transfer_buf: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
-        const body = reader.readAlloc(allocator, 512 * 1024) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to read response: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer allocator.free(body);
-
         // Parse JSON response and format results
-        return formatBraveResults(allocator, body, query);
+        return formatBraveResults(allocator, response.body, query);
     }
 };
 

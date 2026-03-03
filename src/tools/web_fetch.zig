@@ -9,13 +9,10 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
+const http_util = @import("../root.zig").http_util;
 
 /// Default max chars for extracted content.
 const DEFAULT_MAX_CHARS: usize = 50_000;
-const WEB_FETCH_HEADERS = [_]std.http.Header{
-    .{ .name = "User-Agent", .value = "nullclaw/0.1 (web_fetch tool)" },
-    .{ .name = "Accept", .value = "text/html,application/json,text/plain,*/*" },
-};
 
 /// Web fetch tool — fetches URLs and extracts readable content.
 pub const WebFetchTool = struct {
@@ -62,57 +59,34 @@ pub const WebFetchTool = struct {
 
         const max_chars = parseMaxCharsWithDefault(args, self.default_max_chars);
 
-        // Fetch URL
-        var client: std.http.Client = .{ .allocator = allocator };
-        defer client.deinit();
-
-        const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
         const authority_host = stripHostBrackets(host);
-        const connection = client.connectTcpOptions(.{
-            .host = connect_host,
-            .port = resolved_port,
-            .protocol = protocol,
-            .proxied_host = authority_host,
-            .proxied_port = resolved_port,
-        }) catch |err| {
+        var header_strings = [_][]const u8{
+            "User-Agent: nullclaw/0.1 (web_fetch tool)",
+            "Accept: text/html,application/json,text/plain,*/*",
+        };
+        const response = http_util.curlRequestResolved(
+            allocator,
+            "GET",
+            url,
+            &header_strings,
+            null,
+            "30",
+            authority_host,
+            resolved_port,
+            connect_host,
+        ) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
+        defer allocator.free(response.body);
 
-        var req = client.request(.GET, uri, buildRequestOptions(connection)) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer req.deinit();
-
-        req.sendBodiless() catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to send request: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        var redirect_buf: [4096]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to receive response: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        const status_code = @intFromEnum(response.head.status);
-        if (!isSuccessStatus(status_code)) {
-            const msg = try std.fmt.allocPrint(allocator, "HTTP {d}", .{status_code});
+        if (!isSuccessStatus(response.status_code)) {
+            const msg = try std.fmt.allocPrint(allocator, "HTTP {d}", .{response.status_code});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
 
-        // Read body (limit to 2MB)
-        var transfer_buf: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
-        const body = reader.readAlloc(allocator, 2 * 1024 * 1024) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to read response: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer allocator.free(body);
-
         // Extract text from HTML
-        const extracted = try htmlToText(allocator, body);
+        const extracted = try htmlToText(allocator, response.body);
         defer allocator.free(extracted);
 
         // Truncate if needed
@@ -138,14 +112,6 @@ fn parseMaxCharsWithDefault(args: JsonObjectMap, default: usize) usize {
     if (val_i64 < 100) return 100;
     if (val_i64 > 200_000) return 200_000;
     return @intCast(val_i64);
-}
-
-fn buildRequestOptions(connection: ?*std.http.Client.Connection) std.http.Client.RequestOptions {
-    return .{
-        .extra_headers = &WEB_FETCH_HEADERS,
-        .redirect_behavior = .unhandled,
-        .connection = connection,
-    };
 }
 
 fn isSuccessStatus(status_code: u16) bool {
@@ -492,20 +458,6 @@ test "WebFetchTool loopback decimal alias blocked" {
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
     try testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
-}
-
-test "web_fetch disables automatic redirects" {
-    const opts = buildRequestOptions(null);
-    try testing.expect(opts.redirect_behavior == .unhandled);
-    try testing.expect(opts.connection == null);
-}
-
-test "web_fetch request options keep provided connection" {
-    const fake_ptr_value = @as(usize, @alignOf(std.http.Client.Connection));
-    const fake_connection: *std.http.Client.Connection = @ptrFromInt(fake_ptr_value);
-    const opts = buildRequestOptions(fake_connection);
-    try testing.expect(opts.connection != null);
-    try testing.expectEqual(@intFromPtr(fake_connection), @intFromPtr(opts.connection.?));
 }
 
 test "web_fetch treats only 2xx as success" {
