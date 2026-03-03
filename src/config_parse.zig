@@ -309,8 +309,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
-    self.applyProfileDefaults();
-
     // Model routes
     if (root.get("model_routes")) |v| {
         if (v == .array) {
@@ -1663,4 +1661,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
         }
     }
+
+    if (types.AppProfile.fromString(self.profile) == .zaki_bot and root.get("http_request") == null) {
+        self.http_request.enabled = true;
+    }
+
+    try self.applyProfileDefaults();
 }

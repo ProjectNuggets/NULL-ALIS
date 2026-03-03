@@ -56,7 +56,7 @@ spec:
                 "agents": {
                   "defaults": {
                     "model": {
-                      "primary": "openrouter/anthropic/claude-sonnet-4"
+                      "primary": "openrouter/moonshotai/kimi-k2.5"
                     }
                   }
                 },

@@ -182,13 +182,12 @@ pub const Config = struct {
 
     /// Apply top-level profile defaults after parsing explicit config values.
     /// Only set values that are still at their default, so direct config always wins.
-    pub fn applyProfileDefaults(self: *Config) void {
+    pub fn applyProfileDefaults(self: *Config) !void {
         switch (AppProfile.fromString(self.profile)) {
             .standard => {},
             .zaki_bot => {
-                const http_defaults = config_types.HttpRequestConfig{};
-                if (self.http_request.enabled == http_defaults.enabled) {
-                    self.http_request.enabled = true;
+                if (self.default_model == null) {
+                    self.default_model = try self.allocator.dupe(u8, "moonshotai/kimi-k2.5");
                 }
             },
         }
@@ -3092,6 +3091,8 @@ test "profile zaki_bot enables http request defaults" {
     try std.testing.expectEqualStrings("zaki_bot", cfg.profile);
     try std.testing.expect(cfg.http_request.enabled);
     try std.testing.expect(!cfg.browser.enabled);
+    try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k2.5", cfg.default_model.?);
 }
 
 test "profile defaults do not override explicit http request disable" {
@@ -3104,6 +3105,20 @@ test "profile defaults do not override explicit http request disable" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expect(!cfg.http_request.enabled);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k2.5", cfg.default_model.?);
+}
+
+test "profile defaults do not override explicit model primary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"profile": "zaki_bot", "agents": {"defaults": {"model": {"primary": "anthropic/claude-opus-4"}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
+    try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
 }
 
 test "save and parse preserve profile" {

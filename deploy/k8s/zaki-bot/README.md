@@ -1,4 +1,4 @@
-# Nullclaw ZAKI-Agent Kubernetes Deployment Pack
+# Nullclaw ZAKI BOT Kubernetes Deployment Pack
 
 This folder is the deployment handoff package for running Nullclaw as the dedicated `ZAKI BOT` backend in a namespace-based K8s cluster.
 
@@ -33,6 +33,11 @@ It includes:
 - `restore-drill.sh`
 - `ZAKI_BACKEND_HANDOFF.md`
 - `ZAKI_FRONTEND_HANDOFF.md`
+
+## Runtime defaults
+- Profile: `zaki_bot`
+- Default model: `openrouter/moonshotai/kimi-k2.5`
+- Tenant mode: enabled
 
 ## Integration handoff docs
 

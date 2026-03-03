@@ -823,18 +823,9 @@ fn resolveUserContext(allocator: std.mem.Allocator, state: *const GatewayState, 
 }
 
 fn ensureUserProvisioned(ctx: *const UserContext) !void {
-    std.fs.makeDirAbsolute(ctx.user_root) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    std.fs.makeDirAbsolute(ctx.workspace_path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    std.fs.makeDirAbsolute(ctx.secrets_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try makeAbsolutePath(ctx.user_root);
+    try makeAbsolutePath(ctx.workspace_path);
+    try makeAbsolutePath(ctx.secrets_dir);
     ensureFileWithDefault(ctx.memory_db_path, "") catch {};
     ensureFileWithDefault(ctx.config_path, "{}\n") catch {};
     ensureFileWithDefault(ctx.cron_path, "[]\n") catch {};
@@ -842,11 +833,28 @@ fn ensureUserProvisioned(ctx: *const UserContext) !void {
     ensureFileWithDefault(ctx.channel_state_path, "{}\n") catch {};
 }
 
+fn makeAbsolutePath(path: []const u8) !void {
+    std.fs.makeDirAbsolute(path) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
+        error.FileNotFound => {
+            const parent = std.fs.path.dirname(path) orelse return err;
+            if (std.mem.eql(u8, parent, path)) return err;
+            try makeAbsolutePath(parent);
+            try std.fs.makeDirAbsolute(path);
+        },
+        else => return err,
+    };
+}
+
 fn ensureFileWithDefault(path: []const u8, default_content: []const u8) !void {
     if (std.fs.openFileAbsolute(path, .{})) |file| {
         file.close();
         return;
     } else |_| {}
+
+    if (std.fs.path.dirname(path)) |dir| {
+        try makeAbsolutePath(dir);
+    }
 
     const file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();

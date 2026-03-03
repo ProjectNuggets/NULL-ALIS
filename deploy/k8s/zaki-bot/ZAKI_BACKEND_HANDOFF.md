@@ -16,6 +16,11 @@ All backend-to-Nullclaw requests must include:
 
 Browser must never receive `X-Internal-Token`.
 
+Default Nullclaw profile/model for this integration:
+
+- `profile = "zaki_bot"`
+- `agents.defaults.model.primary = "openrouter/moonshotai/kimi-k2.5"`
+
 ## 2) Required backend endpoint
 
 Add ZAKI backend proxy route:
