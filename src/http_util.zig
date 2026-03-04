@@ -407,7 +407,7 @@ pub fn request_with_mode(
     options: RequestOptions,
 ) !CurlResponse {
     switch (transport_config.mode) {
-        .curl_only, .native_preferred => {
+        .curl_only => {
             const timeout_secs = blk: {
                 const clamped_ms = @max(options.timeout_ms, 1000);
                 break :blk try std.fmt.allocPrint(allocator, "{d}", .{clamped_ms / 1000});
@@ -438,7 +438,26 @@ pub fn request_with_mode(
                 timeout_secs,
             );
         },
-        .native_only => return error.NotImplemented,
+        .native_preferred => {
+            if (options.proxy == null and options.subsystem == .tools) {
+                const native_response = http_native.request(allocator, options) catch |err| {
+                    log.warn("native transport fallback for tools request: {s}", .{@errorName(err)});
+                    return request_with_mode(allocator, .{ .mode = .curl_only }, options);
+                };
+                return .{
+                    .status_code = native_response.status_code,
+                    .body = native_response.body,
+                };
+            }
+            return request_with_mode(allocator, .{ .mode = .curl_only }, options);
+        },
+        .native_only => {
+            const native_response = try http_native.request(allocator, options);
+            return .{
+                .status_code = native_response.status_code,
+                .body = native_response.body,
+            };
+        },
     }
 }
 
