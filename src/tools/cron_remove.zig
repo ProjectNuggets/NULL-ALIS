@@ -7,6 +7,27 @@ const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 
+const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
+const TestCronStore = struct {
+    tmp: TestTmpDir,
+    path: []u8,
+
+    fn init() !@This() {
+        var tmp = std.testing.tmpDir(.{});
+        const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        defer std.testing.allocator.free(dir_path);
+        const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "cron.json" });
+        cron.setTestStorePathOverride(path);
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn deinit(self: *@This()) void {
+        cron.setTestStorePathOverride(null);
+        std.testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
 /// CronRemove tool — removes a scheduled cron job by its ID.
 pub const CronRemoveTool = struct {
     pub const tool_name = "cron_remove";
@@ -60,6 +81,8 @@ test "cron_remove_requires_job_id" {
 }
 
 test "cron_remove_not_found" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
     var t = CronRemoveTool{};
     const tool_iface = t.tool();
     const parsed = try root.parseTestArgs("{\"job_id\": \"nonexistent-999\"}");
@@ -71,6 +94,8 @@ test "cron_remove_not_found" {
 }
 
 test "cron_remove_success" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
     // First, create a job via the scheduler directly
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
@@ -88,6 +113,7 @@ test "cron_remove_success" {
     defer parsed.deinit();
     const result = try tool_iface.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Removed") != null);
 }

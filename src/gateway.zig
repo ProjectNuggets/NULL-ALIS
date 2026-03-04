@@ -29,6 +29,7 @@ const http_util = @import("http_util.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const onboard = @import("onboard.zig");
 const zaki_state_mod = @import("zaki_state.zig");
+const zaki_session = @import("zaki_session.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -1036,6 +1037,7 @@ fn writeTelegramChannelState(
     try w.writeAll("{\"telegram\":{\"connected\":true,\"account_id\":\"");
     try jsonEscapeInto(w, account_id);
     try w.print("\",\"chat_id\":{d},\"updated_at_s\":{d}}}", .{ chat_id, std.time.timestamp() });
+    try w.writeAll("}");
     try writeFile(channel_state_path, out.items);
 }
 
@@ -1110,7 +1112,10 @@ fn parseTelegramUserState(allocator: std.mem.Allocator, body: []const u8) !Teleg
     }
     if (parsed.value.object.get("webhook_secret_token")) |secret| {
         if (secret != .string) return error.InvalidTelegramState;
-        state.webhook_secret_token = try allocator.dupe(u8, secret.string);
+        const normalized = normalizeTelegramSecretToken(secret.string);
+        if (normalized.len > 0) {
+            state.webhook_secret_token = try allocator.dupe(u8, normalized);
+        }
     }
     if (parsed.value.object.get("allow_from")) |allow_from| {
         state.allow_from = try cloneJsonStringArrayValue(allocator, allow_from);
@@ -1160,10 +1165,6 @@ fn maybeAcquireTenantOwnershipLock(
     );
 }
 
-fn mainUserSessionKey(buf: []u8, user_id: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "agent:zaki-bot:user:{s}:main", .{user_id}) catch "agent:zaki-bot:user:unknown:main";
-}
-
 /// Returns true when a webhook request should be accepted for the current
 /// pairing state and bearer token. Missing pairing state fails closed.
 pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[]const u8) bool {
@@ -1186,6 +1187,10 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
         if (al != bl) return false;
     }
     return true;
+}
+
+fn normalizeTelegramSecretToken(value: []const u8) []const u8 {
+    return std.mem.trim(u8, value, " \t\r\n\"");
 }
 
 // ── WhatsApp HMAC-SHA256 Signature Verification ─────────────────
@@ -2351,7 +2356,7 @@ fn handleApiRoute(
         const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing message\"}" };
         var session_buf: [256]u8 = undefined;
-        const session_key = mainUserSessionKey(&session_buf, user_id);
+        const session_key = zaki_session.userMainSessionKey(&session_buf, user_id);
         _ = state.chat_stream_total.fetchAdd(1, .monotonic);
 
         const chat_start_ms = std.time.milliTimestamp();
@@ -2813,7 +2818,8 @@ fn handleApiRoute(
 
         const webhook_secret_token = blk: {
             if (jsonStringField(body, "webhook_secret_token")) |provided| {
-                if (provided.len >= 8) break :blk req_allocator.dupe(u8, provided) catch {
+                const normalized = normalizeTelegramSecretToken(provided);
+                if (normalized.len >= 8) break :blk req_allocator.dupe(u8, normalized) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc failed\"}" };
                 };
             }
@@ -3068,7 +3074,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             };
             defer if (user_lock_opt) |*lock| lock.deinit();
 
-            var user_state = blk: {
+            const user_state = blk: {
                 if (ctx.state.zaki_state) |mgr| {
                     const numeric_user_id = parseNumericUserId(user_id) catch {
                         _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
@@ -3097,7 +3103,6 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     return;
                 };
             };
-            defer user_state.deinit(ctx.req_allocator);
             if (!user_state.connected) {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                 ctx.response_status = "403 Forbidden";
@@ -3169,7 +3174,15 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing telegram secret token\"}";
                 return;
             };
-            if (!std.mem.eql(u8, std.mem.trim(u8, header_token, " \t\r\n"), tg_webhook_secret_token)) {
+            const expected_secret = normalizeTelegramSecretToken(tg_webhook_secret_token);
+            const provided_secret = normalizeTelegramSecretToken(header_token);
+            if (expected_secret.len == 0) {
+                _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"missing telegram secret token\"}";
+                return;
+            }
+            if (!std.mem.eql(u8, provided_secret, expected_secret)) {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                 ctx.response_status = "403 Forbidden";
                 ctx.response_body = "{\"error\":\"invalid telegram secret token\"}";
@@ -3233,7 +3246,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
 
             if (use_shared_main and tenant_user_ctx != null) {
                 var kb: [256]u8 = undefined;
-                const sk = mainUserSessionKey(&kb, scoped_user_id.?);
+                const sk = zaki_session.userMainSessionKey(&kb, scoped_user_id.?);
                 const cfg = ctx.config_opt orelse {
                     ctx.response_status = "500 Internal Server Error";
                     ctx.response_body = "{\"error\":\"tenant config missing\"}";
@@ -3273,7 +3286,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 var kb: [256]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
                 const sk = if (use_shared_main)
-                    mainUserSessionKey(&kb, scoped_user_id.?)
+                    zaki_session.userMainSessionKey(&kb, scoped_user_id.?)
                 else
                     telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
                 _ = publishToBus(eb, ctx.state.allocator, "telegram", sender, cid_str, msg_text.?, sk, meta);
@@ -3282,7 +3295,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 var kb: [256]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
                 const sk = if (use_shared_main)
-                    mainUserSessionKey(&kb, scoped_user_id.?)
+                    zaki_session.userMainSessionKey(&kb, scoped_user_id.?)
                 else
                     telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
                 const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, null) catch |err| blk: {
@@ -4841,6 +4854,20 @@ test "parseTelegramUserState parses user-scoped telegram settings" {
     try std.testing.expectEqualStrings("user2", state.allow_from[1]);
 }
 
+test "parseTelegramUserState normalizes webhook secret token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const body =
+        \\{"connected":true,"account_id":"work","webhook_secret_token":"  \"sec-12345\"  "}
+    ;
+    var state = try parseTelegramUserState(allocator, body);
+    defer state.deinit(allocator);
+
+    try std.testing.expect(state.webhook_secret_token != null);
+    try std.testing.expectEqualStrings("sec-12345", state.webhook_secret_token.?);
+}
+
 test "parseTelegramUserState rejects invalid account_id" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4849,6 +4876,11 @@ test "parseTelegramUserState rejects invalid account_id" {
         \\{"connected":true,"account_id":"../../bad","webhook_secret_token":"secret"}
     ;
     try std.testing.expectError(error.InvalidTelegramState, parseTelegramUserState(allocator, body));
+}
+
+test "normalizeTelegramSecretToken trims whitespace and quotes" {
+    try std.testing.expectEqualStrings("abc123", normalizeTelegramSecretToken("  \"abc123\" \r\n"));
+    try std.testing.expectEqualStrings("", normalizeTelegramSecretToken(" \t\r\n\"\""));
 }
 
 test "readTrimmedSecretFile trims trailing whitespace" {
@@ -4866,6 +4898,30 @@ test "readTrimmedSecretFile trims trailing whitespace" {
     const value = try readTrimmedSecretFile(std.testing.allocator, path);
     defer if (value.len > 0) std.testing.allocator.free(value);
     try std.testing.expectEqualStrings("abc123", value);
+}
+
+test "writeTelegramChannelState writes valid nested telegram state json" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = "channel_state.json";
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ root, rel_path });
+    defer std.testing.allocator.free(path);
+
+    try writeTelegramChannelState(std.testing.allocator, path, "main", 123456789);
+
+    const content = try std.fs.cwd().readFileAlloc(std.testing.allocator, path, 1024);
+    defer std.testing.allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, content, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("telegram") != null);
+    try std.testing.expect(parsed.value.object.get("telegram").? == .object);
+    const telegram = parsed.value.object.get("telegram").?.object;
+    try std.testing.expectEqual(@as(i64, 123456789), telegram.get("chat_id").?.integer);
 }
 
 test "GatewayState initWithVerifyToken stores token" {

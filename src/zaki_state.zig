@@ -5,6 +5,7 @@ const memory_root = @import("memory/root.zig");
 const cron_mod = @import("cron.zig");
 const security_secrets = @import("security/secrets.zig");
 const pg_helpers = @import("memory/engines/postgres.zig");
+const zaki_session = @import("zaki_session.zig");
 const log = std.log.scoped(.zaki_state);
 
 const c = if (build_options.enable_postgres) @cImport({
@@ -497,7 +498,7 @@ const ManagerImpl = struct {
         const workspace_z = try self.allocator.dupeZ(u8, workspace_path);
         defer self.allocator.free(workspace_z);
         var key_buf: [128]u8 = undefined;
-        const session_key = try std.fmt.bufPrintZ(&key_buf, "agent:zaki-bot:user:{d}:main", .{user_id});
+        const session_key = zaki_session.userMainSessionKey(&key_buf, user_s);
         try self.execParamsNoResult(
             "INSERT INTO {schema}.users (user_id, workspace_path) VALUES ($1, $2) " ++
                 "ON CONFLICT (user_id) DO UPDATE SET workspace_path = EXCLUDED.workspace_path, updated_at = NOW()",
@@ -708,7 +709,7 @@ const ManagerImpl = struct {
         defer self.allocator.free(insert_q);
         var normalized_session_buf: [160]u8 = undefined;
         const normalized_session = if (std.mem.eql(u8, session_id, "main"))
-            try std.fmt.bufPrint(&normalized_session_buf, "agent:zaki-bot:user:{d}:main", .{user_id})
+            zaki_session.userMainSessionKey(&normalized_session_buf, user_s)
         else
             session_id;
         const session_z = try self.allocator.dupeZ(u8, normalized_session);

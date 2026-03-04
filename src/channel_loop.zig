@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Config = @import("config.zig").Config;
+const config_types = @import("config_types.zig");
 const telegram = @import("channels/telegram.zig");
 const session_mod = @import("session.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
@@ -20,6 +21,7 @@ const daemon = @import("daemon.zig");
 const security = @import("security/policy.zig");
 const subagent_mod = @import("subagent.zig");
 const agent_routing = @import("agent_routing.zig");
+const zaki_session = @import("zaki_session.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
 const bus_mod = @import("bus.zig");
 
@@ -338,6 +340,85 @@ pub const ChannelRuntime = struct {
     }
 };
 
+fn processTelegramMessages(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    session_mgr: *session_mod.SessionManager,
+    tg_ptr: *telegram.TelegramChannel,
+    messages: []const channels_mod.ChannelMessage,
+) void {
+    const model = config.default_model orelse return;
+
+    for (messages) |msg| {
+        handle_one: {
+            const trimmed = std.mem.trim(u8, msg.content, " \t\r\n");
+            if (std.mem.eql(u8, trimmed, "/start")) {
+                var greeting_buf: [512]u8 = undefined;
+                const name = msg.first_name orelse msg.id;
+                const greeting = std.fmt.bufPrint(&greeting_buf, "Hello, {s}! I'm nullALIS.\n\nModel: {s}\nType /help for available commands.", .{ name, model }) catch "Hello! I'm nullALIS. Type /help for commands.";
+                tg_ptr.sendMessageWithReply(msg.sender, greeting, msg.message_id) catch |err| log.err("failed to send /start reply: {}", .{err});
+                break :handle_one;
+            }
+
+            const use_reply_to = msg.is_group or tg_ptr.reply_in_private;
+            const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
+
+            var key_buf: [128]u8 = undefined;
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+            const session_key = blk: {
+                if (telegramTenantMainSessionKey(config, tg_ptr.account_id, &key_buf)) |tenant_session_key| {
+                    break :blk tenant_session_key;
+                }
+                const route = agent_routing.resolveRouteWithSession(allocator, .{
+                    .channel = "telegram",
+                    .account_id = tg_ptr.account_id,
+                    .peer = .{ .kind = if (msg.is_group) .group else .direct, .id = msg.sender },
+                }, config.agent_bindings, config.agents, config.session) catch break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}:{s}", .{ tg_ptr.account_id, msg.sender }) catch msg.sender;
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
+
+            const typing_target = msg.sender;
+            tg_ptr.startTyping(typing_target) catch {};
+            defer tg_ptr.stopTyping(typing_target) catch {};
+
+            const reply = session_mgr.processMessageWithToolContext(session_key, msg.content, null, .{
+                .channel = "telegram",
+                .account_id = tg_ptr.account_id,
+                .chat_id = msg.sender,
+            }) catch |err| {
+                log.err("Agent error: {}", .{err});
+                const err_msg: []const u8 = switch (err) {
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+                    error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+                    error.OutOfMemory => "Out of memory.",
+                    else => "An error occurred. Try again or /new for a fresh session.",
+                };
+                tg_ptr.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
+                break :handle_one;
+            };
+            defer allocator.free(reply);
+
+            tg_ptr.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
+                log.warn("Send error: {}", .{err});
+            };
+        }
+    }
+}
+
+fn telegramTenantMainSessionKey(config: *const Config, account_id: []const u8, buf: []u8) ?[]const u8 {
+    for (config.channels.telegram) |tg_cfg| {
+        if (!std.mem.eql(u8, tg_cfg.account_id, account_id)) continue;
+        const user_id = tg_cfg.tenant_user_id orelse continue;
+        return zaki_session.userMainSessionKey(buf, user_id);
+    }
+    return null;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // runTelegramLoop — polling thread function
 // ════════════════════════════════════════════════════════════════════════════
@@ -384,10 +465,10 @@ pub fn runTelegramLoop(
 
     var evict_counter: u32 = 0;
 
-    const model = config.default_model orelse {
+    if (config.default_model == null) {
         log.err("No default model configured. Set agents.defaults.model.primary in ~/.nullalis/config.json or run `nullalis onboard`.", .{});
         return;
-    };
+    }
 
     // Update activity timestamp at start
     loop_state.last_activity.store(std.time.timestamp(), .release);
@@ -403,63 +484,7 @@ pub fn runTelegramLoop(
         // Update activity after each poll (even if no messages)
         loop_state.last_activity.store(std.time.timestamp(), .release);
 
-        for (messages) |msg| {
-            // Handle /start command
-            const trimmed = std.mem.trim(u8, msg.content, " \t\r\n");
-            if (std.mem.eql(u8, trimmed, "/start")) {
-                var greeting_buf: [512]u8 = undefined;
-                const name = msg.first_name orelse msg.id;
-                const greeting = std.fmt.bufPrint(&greeting_buf, "Hello, {s}! I'm nullALIS.\n\nModel: {s}\nType /help for available commands.", .{ name, model }) catch "Hello! I'm nullALIS. Type /help for commands.";
-                tg_ptr.sendMessageWithReply(msg.sender, greeting, msg.message_id) catch |err| log.err("failed to send /start reply: {}", .{err});
-                continue;
-            }
-
-            // Reply-to logic
-            const use_reply_to = msg.is_group or tg_ptr.reply_in_private;
-            const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
-
-            // Session key — always resolve through agent routing (falls back on errors)
-            var key_buf: [128]u8 = undefined;
-            var routed_session_key: ?[]const u8 = null;
-            defer if (routed_session_key) |key| allocator.free(key);
-            const session_key = blk: {
-                const route = agent_routing.resolveRouteWithSession(allocator, .{
-                    .channel = "telegram",
-                    .account_id = tg_ptr.account_id,
-                    .peer = .{ .kind = if (msg.is_group) .group else .direct, .id = msg.sender },
-                }, config.agent_bindings, config.agents, config.session) catch break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}:{s}", .{ tg_ptr.account_id, msg.sender }) catch msg.sender;
-                allocator.free(route.main_session_key);
-                routed_session_key = route.session_key;
-                break :blk route.session_key;
-            };
-
-            const typing_target = msg.sender;
-            tg_ptr.startTyping(typing_target) catch {};
-            defer tg_ptr.stopTyping(typing_target) catch {};
-
-            const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, null, .{
-                .channel = "telegram",
-                .account_id = tg_ptr.account_id,
-                .chat_id = msg.sender,
-            }) catch |err| {
-                log.err("Agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-                    error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again or /new for a fresh session.",
-                };
-                tg_ptr.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
-                continue;
-            };
-            defer allocator.free(reply);
-
-            tg_ptr.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
-                log.warn("Send error: {}", .{err});
-            };
-        }
+        processTelegramMessages(allocator, config, &runtime.session_mgr, tg_ptr, messages);
 
         if (messages.len > 0) {
             for (messages) |msg| {
@@ -854,6 +879,240 @@ test "TelegramLoopState last_activity update" {
     state.last_activity.store(std.time.timestamp(), .release);
     const after = state.last_activity.load(.acquire);
     try std.testing.expect(after >= before);
+}
+
+const MockTelegramProvider = struct {
+    response: []const u8,
+
+    const vtable = providers.Provider.VTable{
+        .chatWithSystem = mockChatWithSystem,
+        .chat = mockChat,
+        .supportsNativeTools = mockSupportsNativeTools,
+        .getName = mockGetName,
+        .deinit = mockDeinit,
+    };
+
+    fn provider(self: *MockTelegramProvider) providers.Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn mockChatWithSystem(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *MockTelegramProvider = @ptrCast(@alignCast(ptr));
+        return try allocator.dupe(u8, self.response);
+    }
+
+    fn mockChat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *MockTelegramProvider = @ptrCast(@alignCast(ptr));
+        return .{ .content = try allocator.dupe(u8, self.response) };
+    }
+
+    fn mockSupportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn mockGetName(_: *anyopaque) []const u8 {
+        return "mock";
+    }
+
+    fn mockDeinit(_: *anyopaque) void {}
+};
+
+const TelegramRequestRecorder = struct {
+    allocator: std.mem.Allocator,
+    methods: std.ArrayListUnmanaged([]const u8) = .empty,
+    bodies: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *TelegramRequestRecorder) void {
+        for (self.methods.items) |method| self.allocator.free(method);
+        for (self.bodies.items) |body| self.allocator.free(body);
+        self.methods.deinit(self.allocator);
+        self.bodies.deinit(self.allocator);
+    }
+
+    fn handle(
+        ctx: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        body: []const u8,
+        _: u64,
+    ) anyerror![]u8 {
+        const self: *TelegramRequestRecorder = @ptrCast(@alignCast(ctx orelse return error.MissingContext));
+        try self.methods.append(self.allocator, try self.allocator.dupe(u8, method));
+        try self.bodies.append(self.allocator, try self.allocator.dupe(u8, body));
+        return try allocator.dupe(u8, "{\"ok\":true}");
+    }
+};
+
+fn testTelegramConfig() Config {
+    return .{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .default_model = "test/mock-model",
+        .agents = &.{.{
+            .name = "zaki-bot",
+            .provider = "mock",
+            .model = "test/mock-model",
+        }},
+        .session = .{ .dm_scope = .main },
+        .allocator = std.testing.allocator,
+    };
+}
+
+fn testTelegramSessionManager(
+    allocator: std.mem.Allocator,
+    mock: *MockTelegramProvider,
+    cfg: *const Config,
+) session_mod.SessionManager {
+    var noop = observability.NoopObserver{};
+    return session_mod.SessionManager.init(
+        allocator,
+        cfg,
+        mock.provider(),
+        &.{},
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+}
+
+test "processTelegramMessages replies through direct telegram send path" {
+    const allocator = std.testing.allocator;
+    var mock = MockTelegramProvider{ .response = "pong" };
+    const cfg = testTelegramConfig();
+    var session_mgr = testTelegramSessionManager(allocator, &mock, &cfg);
+    defer session_mgr.deinit();
+
+    var recorder = TelegramRequestRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "123:ABC", &.{"*"}, &.{}, "open");
+    defer tg.channel().stop();
+    tg.request_json_override = TelegramRequestRecorder.handle;
+    tg.request_json_ctx = @ptrCast(&recorder);
+
+    const msg = channels_mod.ChannelMessage{
+        .id = try allocator.dupe(u8, "alice"),
+        .sender = try allocator.dupe(u8, "12345"),
+        .content = try allocator.dupe(u8, "ping"),
+        .channel = "telegram",
+        .timestamp = 1,
+        .message_id = 7,
+        .first_name = try allocator.dupe(u8, "Alice"),
+        .is_group = false,
+    };
+    defer msg.deinit(allocator);
+
+    processTelegramMessages(allocator, &cfg, &session_mgr, &tg, &.{msg});
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.methods.items.len);
+    try std.testing.expectEqualStrings("sendMessage", recorder.methods.items[0]);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.bodies.items[0], "\"chat_id\":12345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.bodies.items[0], "\"text\":\"pong\"") != null);
+
+    const session = try session_mgr.getOrCreate("agent:zaki-bot:main");
+    try std.testing.expectEqual(@as(u64, 1), session.turn_count);
+}
+
+test "processTelegramMessages handles start command without creating a session" {
+    const allocator = std.testing.allocator;
+    var mock = MockTelegramProvider{ .response = "ignored" };
+    const cfg = testTelegramConfig();
+    var session_mgr = testTelegramSessionManager(allocator, &mock, &cfg);
+    defer session_mgr.deinit();
+
+    var recorder = TelegramRequestRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "123:ABC", &.{"*"}, &.{}, "open");
+    defer tg.channel().stop();
+    tg.request_json_override = TelegramRequestRecorder.handle;
+    tg.request_json_ctx = @ptrCast(&recorder);
+
+    const msg = channels_mod.ChannelMessage{
+        .id = try allocator.dupe(u8, "alice"),
+        .sender = try allocator.dupe(u8, "12345"),
+        .content = try allocator.dupe(u8, "/start"),
+        .channel = "telegram",
+        .timestamp = 1,
+        .message_id = 99,
+        .first_name = try allocator.dupe(u8, "Alice"),
+        .is_group = false,
+    };
+    defer msg.deinit(allocator);
+
+    processTelegramMessages(allocator, &cfg, &session_mgr, &tg, &.{msg});
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.methods.items.len);
+    try std.testing.expectEqualStrings("sendMessage", recorder.methods.items[0]);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.bodies.items[0], "\"message_id\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.bodies.items[0], "Hello, Alice!") != null);
+    try std.testing.expectEqual(@as(usize, 0), session_mgr.sessionCount());
+}
+
+test "processTelegramMessages uses canonical tenant main session when telegram account is bound" {
+    const allocator = std.testing.allocator;
+    var mock = MockTelegramProvider{ .response = "pong" };
+    const tg_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "123:ABC",
+            .tenant_user_id = "42",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .default_model = "test/mock-model",
+        .agents = &.{.{
+            .name = "zaki-bot",
+            .provider = "mock",
+            .model = "test/mock-model",
+        }},
+        .channels = .{ .telegram = &tg_accounts },
+        .allocator = allocator,
+    };
+    var session_mgr = testTelegramSessionManager(allocator, &mock, &cfg);
+    defer session_mgr.deinit();
+
+    var recorder = TelegramRequestRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "123:ABC", &.{"*"}, &.{}, "open");
+    tg.account_id = "main";
+    defer tg.channel().stop();
+    tg.request_json_override = TelegramRequestRecorder.handle;
+    tg.request_json_ctx = @ptrCast(&recorder);
+
+    const msg = channels_mod.ChannelMessage{
+        .id = try allocator.dupe(u8, "alice"),
+        .sender = try allocator.dupe(u8, "12345"),
+        .content = try allocator.dupe(u8, "ping"),
+        .channel = "telegram",
+        .timestamp = 1,
+        .message_id = 7,
+        .first_name = try allocator.dupe(u8, "Alice"),
+        .is_group = false,
+    };
+    defer msg.deinit(allocator);
+
+    processTelegramMessages(allocator, &cfg, &session_mgr, &tg, &.{msg});
+
+    const session = try session_mgr.getOrCreate("agent:zaki-bot:user:42:main");
+    try std.testing.expectEqual(@as(u64, 1), session.turn_count);
 }
 
 test "ProviderHolder tagged union fields" {

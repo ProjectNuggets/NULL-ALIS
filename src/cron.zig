@@ -1,10 +1,13 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const bus = @import("bus.zig");
+const telegram = @import("channels/telegram.zig");
 const json_util = @import("json_util.zig");
 const http_util = @import("http_util.zig");
 
 const log = std.log.scoped(.cron);
+threadlocal var test_store_path_override: ?[]const u8 = null;
 
 pub const JobType = enum {
     shell,
@@ -1511,40 +1514,34 @@ fn deliverTenantTelegram(
     else
         loadTelegramChatIdFromChannelState(allocator, user_root) orelse return false;
 
-    const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
-    defer allocator.free(url);
+    var tg = telegram.TelegramChannel.init(allocator, bot_token, &.{"*"}, &.{}, "open");
+    sendTelegramMessageWithRetry(&tg, chat_id, output, policy.retry_budget) catch |err| {
+        if (delivery.best_effort) return false;
+        return err;
+    };
+    return true;
+}
 
-    var body: std.ArrayListUnmanaged(u8) = .empty;
-    defer body.deinit(allocator);
-    try body.append(allocator, '{');
-    try json_util.appendJsonInt(&body, allocator, "chat_id", chat_id);
-    try body.append(allocator, ',');
-    try json_util.appendJsonKeyValue(&body, allocator, "text", output);
-    try body.append(allocator, '}');
+fn sendTelegramMessageWithRetry(
+    tg: *telegram.TelegramChannel,
+    chat_id: i64,
+    output: []const u8,
+    retry_budget: u8,
+) !void {
+    var chat_id_buf: [32]u8 = undefined;
+    const chat_id_text = std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id}) catch return error.InvalidChatId;
 
-    const max_attempts: u32 = @as(u32, policy.retry_budget) + 1;
+    const max_attempts: u32 = @as(u32, retry_budget) + 1;
     var attempt: u32 = 0;
     while (attempt < max_attempts) : (attempt += 1) {
-        const response = http_util.curlPostWithProxy(allocator, url, body.items, &.{}, null, "30") catch |err| {
-            if (attempt + 1 >= max_attempts) {
-                if (delivery.best_effort) return false;
-                return err;
-            }
+        tg.sendMessage(chat_id_text, output) catch |err| {
+            if (attempt + 1 >= max_attempts) return err;
             const backoff_ms: u64 = @intCast(@min(@as(u32, 5000), @as(u32, 500) * (attempt + 1)));
             std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
             continue;
         };
-        defer allocator.free(response);
-        const ok = jsonBoolField(response, "ok") orelse false;
-        if (ok) return true;
-        if (attempt + 1 >= max_attempts) {
-            if (delivery.best_effort) return false;
-            return error.DeliveryFailed;
-        }
-        const backoff_ms: u64 = @intCast(@min(@as(u32, 5000), @as(u32, 500) * (attempt + 1)));
-        std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+        return;
     }
-    return false;
 }
 
 fn deliverResultForContext(
@@ -1593,7 +1590,17 @@ fn cronStorePathForScheduler(allocator: std.mem.Allocator, scheduler: *const Cro
     if (scheduler.store_path) |path| {
         return allocator.dupe(u8, path);
     }
+    if (builtin.is_test) {
+        if (test_store_path_override) |path| {
+            return allocator.dupe(u8, path);
+        }
+    }
     return cronJsonPath(allocator);
+}
+
+pub fn setTestStorePathOverride(path: ?[]const u8) void {
+    if (!builtin.is_test) return;
+    test_store_path_override = path;
 }
 
 fn ensureCronDirForPath(path: []const u8) !void {
@@ -2437,6 +2444,73 @@ test "deliverResult best_effort swallows closed bus error" {
     // Should not return error because best_effort is true
     const delivered = try deliverResult(allocator, delivery, "msg", true, &test_bus);
     try std.testing.expect(!delivered);
+}
+
+const TelegramDeliveryRecorder = struct {
+    allocator: std.mem.Allocator,
+    attempts: usize = 0,
+    fail_count: usize = 0,
+    methods: std.ArrayListUnmanaged([]const u8) = .empty,
+    bodies: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *TelegramDeliveryRecorder) void {
+        for (self.methods.items) |method| self.allocator.free(method);
+        for (self.bodies.items) |body| self.allocator.free(body);
+        self.methods.deinit(self.allocator);
+        self.bodies.deinit(self.allocator);
+    }
+
+    fn handle(
+        ctx: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        body: []const u8,
+        _: u64,
+    ) anyerror![]u8 {
+        const self: *TelegramDeliveryRecorder = @ptrCast(@alignCast(ctx orelse return error.MissingContext));
+        self.attempts += 1;
+        try self.methods.append(self.allocator, try self.allocator.dupe(u8, method));
+        try self.bodies.append(self.allocator, try self.allocator.dupe(u8, body));
+        if (self.attempts <= self.fail_count) return error.TransportError;
+        return try allocator.dupe(u8, "{\"ok\":true}");
+    }
+};
+
+test "sendTelegramMessageWithRetry uses telegram direct send path" {
+    const allocator = std.testing.allocator;
+    var recorder = TelegramDeliveryRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "123:ABC", &.{"*"}, &.{}, "open");
+    tg.request_json_override = TelegramDeliveryRecorder.handle;
+    tg.request_json_ctx = @ptrCast(&recorder);
+
+    try sendTelegramMessageWithRetry(&tg, -100777, "cron hello", 0);
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.attempts);
+    try std.testing.expectEqual(@as(usize, 1), recorder.methods.items.len);
+    try std.testing.expectEqualStrings("sendMessage", recorder.methods.items[0]);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.bodies.items[0], "\"chat_id\":-100777") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.bodies.items[0], "\"text\":\"cron hello\"") != null);
+}
+
+test "sendTelegramMessageWithRetry retries before succeeding" {
+    const allocator = std.testing.allocator;
+    var recorder = TelegramDeliveryRecorder{
+        .allocator = allocator,
+        .fail_count = 1,
+    };
+    defer recorder.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "123:ABC", &.{"*"}, &.{}, "open");
+    tg.request_json_override = TelegramDeliveryRecorder.handle;
+    tg.request_json_ctx = @ptrCast(&recorder);
+
+    try sendTelegramMessageWithRetry(&tg, 42, "retry me", 1);
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.attempts);
+    try std.testing.expectEqualStrings("sendMessage", recorder.methods.items[0]);
+    try std.testing.expectEqualStrings("sendMessage", recorder.methods.items[1]);
 }
 
 test "one-shot job deleted after tick execution" {

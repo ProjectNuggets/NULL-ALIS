@@ -403,6 +403,14 @@ pub const SmartSplitIterator = struct {
 /// Telegram channel — uses the Bot API with long-polling (getUpdates).
 /// Splits messages at 4096 chars (Telegram limit).
 pub const TelegramChannel = struct {
+    pub const RequestJsonOverride = *const fn (
+        ctx: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        body: []const u8,
+        timeout_secs: u64,
+    ) anyerror![]u8;
+
     allocator: std.mem.Allocator,
     bot_token: []const u8,
     account_id: []const u8 = "default",
@@ -419,6 +427,8 @@ pub const TelegramChannel = struct {
     pending_media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty,
     pending_media_received_at: std.ArrayListUnmanaged(u64) = .empty,
     polls_since_temp_sweep: u32 = 0,
+    request_json_override: ?RequestJsonOverride = null,
+    request_json_ctx: ?*anyopaque = null,
 
     typing_mu: std.Thread.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
@@ -479,18 +489,22 @@ pub const TelegramChannel = struct {
     }
 
     fn requestJson(self: *const TelegramChannel, allocator: std.mem.Allocator, method: []const u8, body: []const u8, timeout_secs: u64) ![]u8 {
+        if (self.request_json_override) |override| {
+            return override(self.request_json_ctx, allocator, method, body, timeout_secs);
+        }
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
-        const response = try root.http_util.request_with_mode(allocator, .{}, .{
-            .method = "POST",
-            .url = url,
-            .headers = &.{"Content-Type: application/json"},
-            .body = body,
-            .proxy = self.proxy,
-            .timeout_ms = @intCast(@min(timeout_secs * 1000, @as(u64, std.math.maxInt(u32)))),
-            .max_response_bytes = 4 * 1024 * 1024,
-            .subsystem = .channels,
-        });
+        const timeout_text = try std.fmt.allocPrint(allocator, "{d}", .{@max(timeout_secs, 1)});
+        defer allocator.free(timeout_text);
+        const response = try root.http_util.curlRequest(
+            allocator,
+            "POST",
+            url,
+            &.{"Content-Type: application/json"},
+            body,
+            self.proxy,
+            timeout_text,
+        );
         return response.body;
     }
 
@@ -854,7 +868,7 @@ pub const TelegramChannel = struct {
         const content_type = try std.fmt.allocPrint(allocator, "Content-Type: multipart/form-data; boundary={s}", .{boundary});
         defer allocator.free(content_type);
 
-        const response = try root.http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+        const response = try root.http_util.request_with_mode(allocator, .{ .mode = .curl_only }, .{
             .subsystem = .channels,
             .method = "POST",
             .url = url,
@@ -1873,7 +1887,7 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
     root.json_util.appendJsonString(&body_list, allocator, file_id) catch return null;
     body_list.appendSlice(allocator, "}") catch return null;
 
-    const resp = root.http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+    const resp = root.http_util.request_with_mode(allocator, .{ .mode = .curl_only }, .{
         .subsystem = .channels,
         .method = "POST",
         .url = api_url,
@@ -1912,7 +1926,7 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
     dl_fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path }) catch return null;
     const dl_url = dl_fbs.getWritten();
 
-    const data = root.http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+    const data = root.http_util.request_with_mode(allocator, .{ .mode = .curl_only }, .{
         .subsystem = .channels,
         .method = "GET",
         .url = dl_url,
@@ -1968,7 +1982,7 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, fil
     root.json_util.appendJsonString(&body_list, allocator, file_id) catch return null;
     body_list.appendSlice(allocator, "}") catch return null;
 
-    const resp = root.http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+    const resp = root.http_util.request_with_mode(allocator, .{ .mode = .curl_only }, .{
         .subsystem = .channels,
         .method = "POST",
         .url = api_url,
@@ -2007,7 +2021,7 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, fil
     dl_fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path }) catch return null;
     const dl_url = dl_fbs.getWritten();
 
-    const data = root.http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+    const data = root.http_util.request_with_mode(allocator, .{ .mode = .curl_only }, .{
         .subsystem = .channels,
         .method = "GET",
         .url = dl_url,

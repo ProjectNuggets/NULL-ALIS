@@ -12,6 +12,7 @@ const Config = @import("config.zig").Config;
 const CronScheduler = @import("cron.zig").CronScheduler;
 const cron = @import("cron.zig");
 const bus_mod = @import("bus.zig");
+const zaki_session = @import("zaki_session.zig");
 const dispatch = @import("channels/dispatch.zig");
 const channel_loop = @import("channel_loop.zig");
 const channel_manager = @import("channel_manager.zig");
@@ -258,12 +259,12 @@ fn runCronAgentTurn(
     const session_key = blk: {
         if (scheduler.context_user_id) |user_id| {
             if (job.session_target == .main) {
-                break :blk std.fmt.bufPrint(&session_buf, "agent:zaki-bot:user:{s}:main", .{user_id}) catch "agent:zaki-bot:user:unknown:main";
+                break :blk zaki_session.userMainSessionKey(&session_buf, user_id);
             }
-            break :blk std.fmt.bufPrint(&session_buf, "agent:zaki-bot:user:{s}:cron:{s}", .{ user_id, job.id }) catch "agent:zaki-bot:user:unknown:cron";
+            break :blk zaki_session.userCronSessionKey(&session_buf, user_id, job.id);
         }
-        if (job.session_target == .main) break :blk "agent:zaki-bot:main";
-        break :blk "agent:zaki-bot:cron";
+        if (job.session_target == .main) break :blk zaki_session.fallbackMainSessionKey();
+        break :blk zaki_session.fallbackCronSessionKey();
     };
 
     return runtime.session_mgr.processMessage(session_key, prompt, null);
@@ -502,12 +503,12 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             state_mgr.deinit();
             allocator.destroy(state_mgr);
         };
-        if (std.mem.eql(u8, config.state.backend, "postgres")) {
+        if (std.mem.eql(u8, config.state.backend, "postgres")) init_pg: {
             const mgr = allocator.create(zaki_state.Manager) catch |err| {
                 log.warn("tenant postgres scheduler disabled: manager alloc failed: {}", .{err});
                 state.markError("scheduler", "postgres_state_alloc_failed");
                 health.markComponentError("scheduler", "postgres_state_alloc_failed");
-                return;
+                break :init_pg;
             };
             errdefer allocator.destroy(mgr);
             mgr.* = zaki_state.Manager.init(allocator, config.state) catch |err| {
@@ -515,7 +516,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
                 log.warn("tenant postgres scheduler disabled: state init failed: {}", .{err});
                 state.markError("scheduler", "postgres_state_init_failed");
                 health.markComponentError("scheduler", "postgres_state_init_failed");
-                return;
+                break :init_pg;
             };
             pg_mgr = mgr;
         }

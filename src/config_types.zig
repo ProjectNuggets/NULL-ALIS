@@ -183,6 +183,9 @@ pub const CronConfig = struct {
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
+    /// Optional single-user tenant binding for polling mode.
+    /// When set, inbound long-poll messages land in `agent:zaki-bot:user:{id}:main`.
+    tenant_user_id: ?[]const u8 = null,
     receive_mode: TelegramReceiveMode = .polling,
     webhook_secret_token: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},

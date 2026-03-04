@@ -2311,7 +2311,7 @@ test "tools.media.audio disabled" {
 test "parse telegram accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080"}}}}}
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "tenant_user_id": "42", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080"}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2319,12 +2319,14 @@ test "parse telegram accounts" {
     const tg = cfg.channels.telegram[0];
     try std.testing.expectEqualStrings("main", tg.account_id);
     try std.testing.expectEqualStrings("123:ABC", tg.bot_token);
+    try std.testing.expectEqualStrings("42", tg.tenant_user_id.?);
     try std.testing.expectEqual(@as(usize, 1), tg.allow_from.len);
     try std.testing.expectEqualStrings("user1", tg.allow_from[0]);
     try std.testing.expect(!tg.reply_in_private);
     try std.testing.expectEqualStrings("socks5://host:1080", tg.proxy.?);
     allocator.free(tg.account_id);
     allocator.free(tg.bot_token);
+    allocator.free(tg.tenant_user_id.?);
     for (tg.allow_from) |u| allocator.free(u);
     allocator.free(tg.allow_from);
     allocator.free(tg.proxy.?);
