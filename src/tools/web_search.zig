@@ -73,16 +73,19 @@ pub const WebSearchTool = struct {
             return ToolResult.fail("Unable to verify Brave Search host safety");
         defer allocator.free(connect_host);
 
-        const response = http_util.curlRequestResolved(
+        const response = http_util.request_with_mode(
             allocator,
-            "GET",
-            url_str,
-            &headers,
-            null,
-            "20",
-            "api.search.brave.com",
-            443,
-            connect_host,
+            .{},
+            .{
+                .method = "GET",
+                .url = url_str,
+                .headers = &headers,
+                .timeout_ms = 20_000,
+                .subsystem = .tools,
+                .resolve_host = "api.search.brave.com",
+                .resolve_port = 443,
+                .connect_host = connect_host,
+            },
         ) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Search request failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };

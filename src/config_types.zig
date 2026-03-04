@@ -87,6 +87,15 @@ pub const RuntimeConfig = struct {
     docker: DockerRuntimeConfig = .{},
 };
 
+pub const TransportMode = @import("http_native/root.zig").TransportMode;
+pub const PoolConfig = @import("http_native/root.zig").PoolConfig;
+pub const ResolverConfig = @import("http_native/root.zig").ResolverConfig;
+pub const TransportConfig = @import("http_native/root.zig").TransportConfig;
+
+pub const NetworkConfig = struct {
+    transport: TransportConfig = .{},
+};
+
 pub const AppProfile = enum {
     standard,
     zaki_bot,

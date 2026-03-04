@@ -232,14 +232,27 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        const resp_body = if (auth) |a| blk: {
+        const response = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
-            break :blk root.curlPost(allocator, url, body, &.{auth_hdr}) catch return error.CompatibleApiError;
-        } else root.curlPost(allocator, url, body, &.{}) catch return error.CompatibleApiError;
-        defer allocator.free(resp_body);
+            break :blk root.request_with_mode(allocator, .{}, .{
+                .method = "POST",
+                .url = url,
+                .headers = &.{auth_hdr},
+                .body = body,
+                .timeout_ms = 30_000,
+                .subsystem = .providers,
+            }) catch return error.CompatibleApiError;
+        } else root.request_with_mode(allocator, .{}, .{
+            .method = "POST",
+            .url = url,
+            .body = body,
+            .timeout_ms = 30_000,
+            .subsystem = .providers,
+        }) catch return error.CompatibleApiError;
+        defer allocator.free(response.body);
 
-        return extractResponsesText(allocator, resp_body);
+        return extractResponsesText(allocator, response.body);
     }
 
     /// Build a chat request JSON body.
@@ -490,14 +503,27 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        const resp_body = if (auth) |a| blk: {
+        const response = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
-            break :blk root.curlPost(allocator, url, body, &.{auth_hdr}) catch return error.CompatibleApiError;
-        } else root.curlPost(allocator, url, body, &.{}) catch return error.CompatibleApiError;
-        defer allocator.free(resp_body);
+            break :blk root.request_with_mode(allocator, .{}, .{
+                .method = "POST",
+                .url = url,
+                .headers = &.{auth_hdr},
+                .body = body,
+                .timeout_ms = 30_000,
+                .subsystem = .providers,
+            }) catch return error.CompatibleApiError;
+        } else root.request_with_mode(allocator, .{}, .{
+            .method = "POST",
+            .url = url,
+            .body = body,
+            .timeout_ms = 30_000,
+            .subsystem = .providers,
+        }) catch return error.CompatibleApiError;
+        defer allocator.free(response.body);
 
-        return parseTextResponse(allocator, resp_body) catch |err| {
+        return parseTextResponse(allocator, response.body) catch |err| {
             // If chat completions failed and responses fallback is enabled, try the responses API
             if (self.supports_responses_fallback) {
                 return self.chatViaResponses(allocator, eff_system, merged_msg orelse message, effective_model) catch {
@@ -529,14 +555,28 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        const resp_body = if (auth) |a| blk: {
+        const timeout_ms: u32 = if (request.timeout_secs == 0) 30_000 else @intCast(@min(request.timeout_secs * 1000, std.math.maxInt(u32)));
+        const response = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
-            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, request.timeout_secs) catch return error.CompatibleApiError;
-        } else root.curlPostTimed(allocator, url, body, &.{}, request.timeout_secs) catch return error.CompatibleApiError;
-        defer allocator.free(resp_body);
+            break :blk root.request_with_mode(allocator, .{}, .{
+                .method = "POST",
+                .url = url,
+                .headers = &.{auth_hdr},
+                .body = body,
+                .timeout_ms = timeout_ms,
+                .subsystem = .providers,
+            }) catch return error.CompatibleApiError;
+        } else root.request_with_mode(allocator, .{}, .{
+            .method = "POST",
+            .url = url,
+            .body = body,
+            .timeout_ms = timeout_ms,
+            .subsystem = .providers,
+        }) catch return error.CompatibleApiError;
+        defer allocator.free(response.body);
 
-        return parseNativeResponse(allocator, resp_body);
+        return parseNativeResponse(allocator, response.body);
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {

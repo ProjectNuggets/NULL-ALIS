@@ -54,6 +54,9 @@ pub const serializeContentPart = helpers.serializeContentPart;
 pub const convertToolsAnthropic = helpers.convertToolsAnthropic;
 pub const curlPostTimed = helpers.curlPostTimed;
 pub const extractContent = helpers.extractContent;
+pub const RequestOptions = http_util.RequestOptions;
+pub const request_with_mode = http_util.request_with_mode;
+pub const CurlResponse = http_util.CurlResponse;
 
 // Direct re-exports from utility modules
 pub const appendJsonString = json_util.appendJsonString;

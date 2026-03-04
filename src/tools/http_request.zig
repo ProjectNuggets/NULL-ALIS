@@ -135,16 +135,20 @@ pub const HttpRequestTool = struct {
             else => method_str,
         };
 
-        const response = http_util.curlRequestResolved(
+        const response = http_util.request_with_mode(
             allocator,
-            method_name,
-            url,
-            extra_headers.items,
-            body,
-            "30",
-            authority_host,
-            resolved_port,
-            connect_host,
+            .{},
+            .{
+                .method = method_name,
+                .url = url,
+                .headers = extra_headers.items,
+                .body = body,
+                .timeout_ms = 30_000,
+                .subsystem = .tools,
+                .resolve_host = authority_host,
+                .resolve_port = resolved_port,
+                .connect_host = connect_host,
+            },
         ) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };

@@ -64,16 +64,19 @@ pub const WebFetchTool = struct {
             "User-Agent: nullalis/0.1 (web_fetch tool)",
             "Accept: text/html,application/json,text/plain,*/*",
         };
-        const response = http_util.curlRequestResolved(
+        const response = http_util.request_with_mode(
             allocator,
-            "GET",
-            url,
-            &header_strings,
-            null,
-            "30",
-            authority_host,
-            resolved_port,
-            connect_host,
+            .{},
+            .{
+                .method = "GET",
+                .url = url,
+                .headers = &header_strings,
+                .timeout_ms = 30_000,
+                .subsystem = .tools,
+                .resolve_host = authority_host,
+                .resolve_port = resolved_port,
+                .connect_host = connect_host,
+            },
         ) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
