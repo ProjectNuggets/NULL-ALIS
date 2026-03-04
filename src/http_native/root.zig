@@ -96,6 +96,15 @@ pub fn request(allocator: std.mem.Allocator, options: RequestOptions) RequestErr
     return root_request(allocator, options);
 }
 
+pub fn stream_body(
+    allocator: std.mem.Allocator,
+    options: RequestOptions,
+    ctx: anytype,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
+) anyerror!u16 {
+    return root_stream_body(allocator, options, ctx, on_chunk);
+}
+
 fn root_request(allocator: std.mem.Allocator, options: RequestOptions) RequestError!Response {
     if (options.proxy != null) return error.UnsupportedProxy;
 
@@ -120,6 +129,29 @@ fn root_request(allocator: std.mem.Allocator, options: RequestOptions) RequestEr
     return try parse_http_response(allocator, raw_response.items, options.max_response_bytes);
 }
 
+fn root_stream_body(
+    allocator: std.mem.Allocator,
+    options: RequestOptions,
+    ctx: anytype,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
+) anyerror!u16 {
+    if (options.proxy != null) return error.UnsupportedProxy;
+
+    const parsed = try parse_request(allocator, options);
+    defer parsed.deinit(allocator);
+
+    const addr = std.net.Address.resolveIp(parsed.connect_host, parsed.port) catch return error.AddressResolveFailed;
+    const stream = std.net.tcpConnectToAddress(addr) catch return error.TcpConnectFailed;
+    defer stream.close();
+
+    apply_timeouts(stream, options.timeout_ms) catch return error.SocketTimeoutFailed;
+
+    if (parsed.scheme == .https) {
+        return try stream_tls_body(allocator, stream, parsed, options, ctx, on_chunk);
+    }
+    return try stream_plain_body(allocator, stream, parsed, options, ctx, on_chunk);
+}
+
 fn request_plain(
     allocator: std.mem.Allocator,
     raw_response: *std.ArrayListUnmanaged(u8),
@@ -132,6 +164,22 @@ fn request_plain(
 
     stream.writeAll(request_bytes) catch return error.TlsWriteFailed;
     try read_to_eof_plain(allocator, raw_response, stream, options.max_response_bytes);
+}
+
+fn stream_plain_body(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    parsed: ParsedRequest,
+    options: RequestOptions,
+    ctx: anytype,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
+) anyerror!u16 {
+    const request_bytes = try build_request(allocator, parsed, options);
+    defer allocator.free(request_bytes);
+
+    stream.writeAll(request_bytes) catch return error.TlsWriteFailed;
+
+    return try stream_http_body_from_reader(allocator, plain_read_fn, stream, options.max_response_bytes, ctx, on_chunk);
 }
 
 fn request_tls(
@@ -178,6 +226,54 @@ fn request_tls(
 
     tls_client.end() catch {};
     stream_writer.interface.flush() catch {};
+}
+
+fn stream_tls_body(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    parsed: ParsedRequest,
+    options: RequestOptions,
+    ctx: anytype,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
+) anyerror!u16 {
+    const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
+    const read_buf = try allocator.alloc(u8, tls_buf_len);
+    defer allocator.free(read_buf);
+    const write_buf = try allocator.alloc(u8, tls_buf_len);
+    defer allocator.free(write_buf);
+    const tls_read_buf = try allocator.alloc(u8, tls_buf_len);
+    defer allocator.free(tls_read_buf);
+    const tls_write_buf = try allocator.alloc(u8, tls_buf_len);
+    defer allocator.free(tls_write_buf);
+
+    const bundle = try shared_ca_bundle.get();
+
+    var stream_reader = stream.reader(read_buf);
+    var stream_writer = stream.writer(write_buf);
+    var tls_client = std.crypto.tls.Client.init(
+        stream_reader.interface(),
+        &stream_writer.interface,
+        .{
+            .host = .{ .explicit = parsed.tls_host },
+            .ca = .{ .bundle = bundle },
+            .read_buffer = tls_read_buf,
+            .write_buffer = tls_write_buf,
+            .allow_truncation_attacks = true,
+        },
+    ) catch return error.TlsInitializationFailed;
+
+    const request_bytes = try build_request(allocator, parsed, options);
+    defer allocator.free(request_bytes);
+
+    tls_client.writer.writeAll(request_bytes) catch return error.TlsWriteFailed;
+    tls_client.writer.flush() catch return error.TlsWriteFailed;
+    stream_writer.interface.flush() catch return error.TlsWriteFailed;
+
+    const status_code = try stream_http_body_from_reader(allocator, tls_read_fn, &tls_client, options.max_response_bytes, ctx, on_chunk);
+
+    tls_client.end() catch {};
+    stream_writer.interface.flush() catch {};
+    return status_code;
 }
 
 fn build_request(
@@ -414,6 +510,186 @@ fn decode_chunked_body(allocator: std.mem.Allocator, body: []const u8, max_respo
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+fn plain_read_fn(stream: std.net.Stream, buf: []u8) RequestError!usize {
+    return stream.read(buf) catch return error.TlsReadFailed;
+}
+
+fn tls_read_fn(tls_client: *std.crypto.tls.Client, buf: []u8) RequestError!usize {
+    var vecs: [1][]u8 = .{buf};
+    return tls_client.reader.readVec(&vecs) catch |read_err| switch (read_err) {
+        error.EndOfStream => 0,
+        else => return error.TlsReadFailed,
+    };
+}
+
+fn stream_http_body_from_reader(
+    allocator: std.mem.Allocator,
+    comptime read_fn: anytype,
+    reader: anytype,
+    max_response_bytes: usize,
+    ctx: anytype,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
+) anyerror!u16 {
+    var header_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer header_buf.deinit(allocator);
+
+    var tmp: [4096]u8 = undefined;
+    var body_start_index: usize = 0;
+
+    while (std.mem.indexOf(u8, header_buf.items, "\r\n\r\n") == null) {
+        const n = try read_fn(reader, &tmp);
+        if (n == 0) return error.InvalidHttpResponse;
+        if (header_buf.items.len + n > 16 * 1024) return error.HeaderTooLarge;
+        try header_buf.appendSlice(allocator, tmp[0..n]);
+    }
+
+    const header_end = std.mem.indexOf(u8, header_buf.items, "\r\n\r\n").?;
+    body_start_index = header_end + 4;
+    const header_block = header_buf.items[0..header_end];
+    const status_code = try parse_status_code(header_block);
+
+    var transfer_chunked = false;
+    var content_length: ?usize = null;
+    var lines = std.mem.splitSequence(u8, header_block, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") and std.ascii.indexOfIgnoreCase(value, "chunked") != null) {
+            transfer_chunked = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
+            content_length = std.fmt.parseInt(usize, value, 10) catch null;
+        }
+    }
+
+    const initial_body = header_buf.items[body_start_index..];
+    if (transfer_chunked) {
+        try stream_chunked_body(allocator, read_fn, reader, initial_body, max_response_bytes, ctx, on_chunk);
+    } else if (content_length) |len| {
+        try stream_sized_body(allocator, read_fn, reader, initial_body, len, max_response_bytes, ctx, on_chunk);
+    } else {
+        try stream_eof_body(read_fn, reader, initial_body, max_response_bytes, ctx, on_chunk);
+    }
+
+    return status_code;
+}
+
+fn parse_status_code(header_block: []const u8) RequestError!u16 {
+    const line_end = std.mem.indexOf(u8, header_block, "\r\n") orelse header_block.len;
+    const status_line = header_block[0..line_end];
+    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 ") and !std.mem.startsWith(u8, status_line, "HTTP/1.0 ")) {
+        return error.InvalidHttpResponse;
+    }
+    const status_slice = if (status_line.len >= 12) status_line[9..12] else return error.InvalidHttpResponse;
+    return try std.fmt.parseInt(u16, status_slice, 10);
+}
+
+fn stream_sized_body(
+    _: std.mem.Allocator,
+    comptime read_fn: anytype,
+    reader: anytype,
+    initial_body: []const u8,
+    content_length: usize,
+    max_response_bytes: usize,
+    ctx: anytype,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
+) anyerror!void {
+    if (content_length > max_response_bytes) return error.ResponseTooLarge;
+
+    var remaining = content_length;
+    if (initial_body.len > 0) {
+        const first = initial_body[0..@min(initial_body.len, remaining)];
+        if (!(try on_chunk(ctx, first))) return;
+        remaining -= first.len;
+    }
+
+    var tmp: [4096]u8 = undefined;
+    while (remaining > 0) {
+        const to_read = @min(tmp.len, remaining);
+        const n = try read_fn(reader, tmp[0..to_read]);
+        if (n == 0) return error.InvalidHttpResponse;
+        if (!(try on_chunk(ctx, tmp[0..n]))) return;
+        remaining -= n;
+    }
+}
+
+fn stream_eof_body(
+    comptime read_fn: anytype,
+    reader: anytype,
+    initial_body: []const u8,
+    max_response_bytes: usize,
+    ctx: anytype,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
+) anyerror!void {
+    var total: usize = 0;
+    if (initial_body.len > 0) {
+        total += initial_body.len;
+        if (total > max_response_bytes) return error.ResponseTooLarge;
+        if (!(try on_chunk(ctx, initial_body))) return;
+    }
+
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = try read_fn(reader, &tmp);
+        if (n == 0) break;
+        total += n;
+        if (total > max_response_bytes) return error.ResponseTooLarge;
+        if (!(try on_chunk(ctx, tmp[0..n]))) return;
+    }
+}
+
+fn stream_chunked_body(
+    allocator: std.mem.Allocator,
+    comptime read_fn: anytype,
+    reader: anytype,
+    initial_body: []const u8,
+    max_response_bytes: usize,
+    ctx: anytype,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
+) anyerror!void {
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(allocator);
+    try buffer.appendSlice(allocator, initial_body);
+
+    var total: usize = 0;
+    var tmp: [4096]u8 = undefined;
+
+    while (true) {
+        while (true) {
+            const line_end = std.mem.indexOf(u8, buffer.items, "\r\n") orelse break;
+            const size_line = buffer.items[0..line_end];
+            const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
+            const size_str = std.mem.trim(u8, size_line[0..semi], " \t");
+            const chunk_len = std.fmt.parseInt(usize, size_str, 16) catch return error.InvalidChunkedEncoding;
+
+            const frame_len = line_end + 2 + chunk_len + 2;
+            if (buffer.items.len < frame_len) break;
+
+            if (chunk_len == 0) return;
+
+            const chunk_start = line_end + 2;
+            const chunk = buffer.items[chunk_start .. chunk_start + chunk_len];
+            total += chunk.len;
+            if (total > max_response_bytes) return error.ResponseTooLarge;
+            if (!(try on_chunk(ctx, chunk))) return;
+
+            if (!std.mem.eql(u8, buffer.items[chunk_start + chunk_len .. chunk_start + chunk_len + 2], "\r\n")) {
+                return error.InvalidChunkedEncoding;
+            }
+
+            const remaining = buffer.items[frame_len..];
+            std.mem.copyForwards(u8, buffer.items[0..remaining.len], remaining);
+            buffer.shrinkRetainingCapacity(remaining.len);
+        }
+
+        const n = try read_fn(reader, &tmp);
+        if (n == 0) return error.InvalidChunkedEncoding;
+        try buffer.appendSlice(allocator, tmp[0..n]);
+    }
 }
 
 fn serve_once(server: *std.net.Server, response: []const u8) !void {
