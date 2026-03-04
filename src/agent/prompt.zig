@@ -104,7 +104,7 @@ pub fn buildSystemPrompt(
     if (ctx.conversation_context) |cc| {
         try w.writeAll("## Conversation Context\n\n");
         if (cc.channel) |ch| {
-            try std.fmt.format(w, "- Channel: {s}\n", .{ch});
+            try std.fmt.format(w, "- Active channel (authoritative): {s}\n", .{ch});
         }
         if (cc.is_group) |ig| {
             if (ig) {
@@ -124,6 +124,7 @@ pub fn buildSystemPrompt(
         if (cc.sender_uuid) |uuid| {
             try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
         }
+        try w.writeAll("- IMPORTANT: Use this context as the source of truth for this turn. Do not claim a different channel.\n");
         try w.writeAll("\n");
     }
 

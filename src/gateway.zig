@@ -24,6 +24,7 @@ const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
+const agent_prompt = @import("agent/prompt.zig");
 const security = @import("security/policy.zig");
 const http_util = @import("http_util.zig");
 const tenant_lock = @import("tenant_lock.zig");
@@ -652,6 +653,7 @@ const TenantRuntime = struct {
         self: *TenantRuntime,
         session_key: []const u8,
         message: []const u8,
+        conversation_context: ?agent_prompt.ConversationContext,
         message_turn_context: ?tools_mod.MessageTurnContext,
     ) ![]const u8 {
         self.lock.lock();
@@ -665,7 +667,7 @@ const TenantRuntime = struct {
             .state_mgr = self.state_mgr,
         });
         defer tools_mod.clearTenantContext();
-        return self.session_mgr.processMessageWithToolContext(session_key, message, null, message_turn_context);
+        return self.session_mgr.processMessageWithToolContext(session_key, message, conversation_context, message_turn_context);
     }
 };
 
@@ -1298,11 +1300,19 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
     var chat_id_buf: [32]u8 = undefined;
     const chat_id_str = std.fmt.bufPrint(&chat_id_buf, "{d}", .{job.chat_id}) catch "0";
 
-    const reply = tenant_runtime.processMessage(session_key, job.message, .{
-        .channel = "telegram",
-        .account_id = job.account_id,
-        .chat_id = chat_id_str,
-    }) catch |err| {
+    const reply = tenant_runtime.processMessage(
+        session_key,
+        job.message,
+        .{
+            .channel = "telegram",
+            .is_group = job.chat_id < 0,
+        },
+        .{
+            .channel = "telegram",
+            .account_id = job.account_id,
+            .chat_id = chat_id_str,
+        },
+    ) catch |err| {
         if (job.bot_token.len > 0) {
             sendTelegramReply(job.allocator, job.bot_token, job.chat_id, userFacingAgentError(err)) catch {};
         }
@@ -2597,7 +2607,15 @@ fn handleApiRoute(
                         .content_type = "text/event-stream; charset=utf-8",
                     };
                 };
-                break :blk tenant_runtime.processMessage(session_key, message, null) catch {
+                break :blk tenant_runtime.processMessage(
+                    session_key,
+                    message,
+                    .{
+                        .channel = "zaki_app",
+                        .is_group = false,
+                    },
+                    null,
+                ) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                     const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
                     return .{
@@ -3498,11 +3516,19 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     ctx.response_body = "{\"error\":\"tenant runtime init failed\"}";
                     return;
                 };
-                const reply: ?[]const u8 = tenant_runtime.processMessage(sk, msg_text.?, .{
-                    .channel = "telegram",
-                    .account_id = tg_account_id,
-                    .chat_id = cid_str,
-                }) catch |err| blk: {
+                const reply: ?[]const u8 = tenant_runtime.processMessage(
+                    sk,
+                    msg_text.?,
+                    .{
+                        .channel = "telegram",
+                        .is_group = is_group,
+                    },
+                    .{
+                        .channel = "telegram",
+                        .account_id = tg_account_id,
+                        .chat_id = cid_str,
+                    },
+                ) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
                         sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
                     }

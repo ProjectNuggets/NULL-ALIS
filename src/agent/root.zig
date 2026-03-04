@@ -295,6 +295,8 @@ pub const Agent = struct {
     has_system_prompt: bool = false,
     /// Whether the currently injected system prompt contains conversation context.
     system_prompt_has_conversation_context: bool = false,
+    /// Fingerprint of the conversation context baked into the active system prompt.
+    system_prompt_conversation_context_fingerprint: u64 = 0,
     /// Fingerprint of workspace prompt files for the currently injected system prompt.
     workspace_prompt_fingerprint: ?u64 = null,
 
@@ -648,8 +650,9 @@ pub const Agent = struct {
         }
 
         const turn_has_conversation_context = self.conversation_context != null;
+        const conversation_context_fingerprint = conversationContextFingerprint(self.conversation_context);
         const conversation_context_changed = self.has_system_prompt and
-            self.system_prompt_has_conversation_context != turn_has_conversation_context;
+            self.system_prompt_conversation_context_fingerprint != conversation_context_fingerprint;
 
         if (!self.has_system_prompt or conversation_context_changed) {
             var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
@@ -701,6 +704,7 @@ pub const Agent = struct {
             }
             self.has_system_prompt = true;
             self.system_prompt_has_conversation_context = turn_has_conversation_context;
+            self.system_prompt_conversation_context_fingerprint = conversation_context_fingerprint;
             self.workspace_prompt_fingerprint = workspace_fp;
         }
 
@@ -1477,7 +1481,39 @@ pub const Agent = struct {
         self.history.items.len = 0;
         self.has_system_prompt = false;
         self.system_prompt_has_conversation_context = false;
+        self.system_prompt_conversation_context_fingerprint = 0;
         self.workspace_prompt_fingerprint = null;
+    }
+
+    fn conversationContextFingerprint(ctx: ?prompt.ConversationContext) u64 {
+        var hasher = std.hash.Fnv1a_64.init();
+        if (ctx) |cc| {
+            hasher.update("present");
+            if (cc.channel) |channel| {
+                hasher.update("channel:");
+                hasher.update(channel);
+            }
+            if (cc.sender_number) |sender_number| {
+                hasher.update("sender_number:");
+                hasher.update(sender_number);
+            }
+            if (cc.sender_uuid) |sender_uuid| {
+                hasher.update("sender_uuid:");
+                hasher.update(sender_uuid);
+            }
+            if (cc.group_id) |group_id| {
+                hasher.update("group_id:");
+                hasher.update(group_id);
+            }
+            if (cc.is_group) |is_group| {
+                hasher.update("is_group:");
+                const b: u8 = if (is_group) 1 else 0;
+                hasher.update(&[_]u8{b});
+            }
+        } else {
+            hasher.update("absent");
+        }
+        return hasher.final();
     }
 
     /// Get total tokens used.
