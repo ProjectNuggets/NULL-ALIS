@@ -371,7 +371,10 @@ pub fn allTools(
 
     if (opts.event_bus) |event_bus| {
         const mt = try allocator.create(message.MessageTool);
-        mt.* = .{ .event_bus = event_bus };
+        mt.* = .{
+            .event_bus = event_bus,
+            .outbound_allocator = allocator,
+        };
         try list.append(allocator, mt.tool());
     }
 

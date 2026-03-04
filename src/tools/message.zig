@@ -10,10 +10,13 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const bus = @import("../bus.zig");
+const json_util = @import("../json_util.zig");
+const http_util = @import("../http_util.zig");
 
 /// Message tool — sends a message to a specific channel/chat via the bus.
 pub const MessageTool = struct {
     event_bus: ?*bus.Bus = null,
+    outbound_allocator: ?std.mem.Allocator = null,
 
     pub const tool_name = "message";
     pub const tool_description = "Send a message to a channel. If channel/chat_id are omitted, sends to the current conversation. When a channel has multiple configured accounts, account_id defaults to the current account.";
@@ -81,21 +84,28 @@ pub const MessageTool = struct {
 
         const account_id = root.getString(args, "account_id") orelse turn_ctx.account_id;
 
-        const chat_id = root.getString(args, "chat_id") orelse
-            (turn_ctx.chat_id orelse
-                return ToolResult.fail("No chat_id specified and no default chat_id set"));
+        const chat_id_opt = root.getString(args, "chat_id") orelse turn_ctx.chat_id;
+
+        if (self.event_bus == null and std.mem.eql(u8, channel, "telegram")) {
+            return send_telegram_direct(allocator, content, account_id, chat_id_opt);
+        }
+
+        const chat_id = chat_id_opt orelse
+            return ToolResult.fail("No chat_id specified and no default chat_id set");
 
         const event_bus = self.event_bus orelse
             return ToolResult.fail("Message tool not connected to event bus");
 
+        const outbound_allocator = self.outbound_allocator orelse allocator;
+
         const msg = (if (account_id) |aid|
-            bus.makeOutboundWithAccount(allocator, channel, aid, chat_id, content)
+            bus.makeOutboundWithAccount(outbound_allocator, channel, aid, chat_id, content)
         else
-            bus.makeOutbound(allocator, channel, chat_id, content)) catch
+            bus.makeOutbound(outbound_allocator, channel, chat_id, content)) catch
             return ToolResult.fail("Failed to create outbound message");
 
         event_bus.publishOutbound(msg) catch {
-            msg.deinit(allocator);
+            msg.deinit(outbound_allocator);
             return ToolResult.fail("Bus is closed, cannot send message");
         };
 
@@ -117,6 +127,94 @@ pub const MessageTool = struct {
         };
 
         return ToolResult.ok(result);
+    }
+
+    fn send_telegram_direct(
+        allocator: std.mem.Allocator,
+        content: []const u8,
+        _: ?[]const u8,
+        requested_chat_id: ?[]const u8,
+    ) ToolResult {
+        const tenant_ctx = root.getTenantContext();
+        const state_mgr = tenant_ctx.state_mgr orelse
+            return ToolResult.fail("Telegram direct send unavailable: no tenant state");
+        const user_id = tenant_ctx.numeric_user_id orelse
+            return ToolResult.fail("Telegram direct send unavailable: no tenant user");
+
+        const bot_token = state_mgr.getSecret(allocator, user_id, "telegram_bot_token") catch
+            return ToolResult.fail("Failed to load Telegram bot token");
+        defer if (bot_token) |tok| allocator.free(tok);
+        const token = bot_token orelse
+            return ToolResult.fail("Telegram bot token is not configured");
+
+        const resolved_chat_id = if (requested_chat_id) |chat_id| blk: {
+            break :blk allocator.dupe(u8, chat_id) catch
+                return ToolResult.fail("Failed to allocate chat id");
+        } else resolve_telegram_chat_id_from_state(allocator, state_mgr, user_id) catch
+            return ToolResult.fail("Failed to resolve Telegram chat_id from state");
+        defer allocator.free(resolved_chat_id);
+
+        const url = std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{token}) catch
+            return ToolResult.fail("Failed to build Telegram API URL");
+        defer allocator.free(url);
+
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(allocator);
+        body.appendSlice(allocator, "{") catch return ToolResult.fail("Failed to allocate Telegram request");
+        json_util.appendJsonKeyValue(&body, allocator, "chat_id", resolved_chat_id) catch
+            return ToolResult.fail("Failed to encode Telegram chat_id");
+        body.appendSlice(allocator, ",") catch return ToolResult.fail("Failed to encode Telegram request");
+        json_util.appendJsonKeyValue(&body, allocator, "text", content) catch
+            return ToolResult.fail("Failed to encode Telegram text");
+        body.appendSlice(allocator, "}") catch return ToolResult.fail("Failed to finalize Telegram request");
+
+        const response = http_util.request_with_mode(allocator, .{ .mode = .curl_only }, .{
+            .subsystem = .channels,
+            .method = "POST",
+            .url = url,
+            .headers = &.{"Content-Type: application/json"},
+            .body = body.items,
+            .timeout_ms = 30_000,
+            .max_response_bytes = 256 * 1024,
+        }) catch return ToolResult.fail("Telegram send failed");
+        defer allocator.free(response.body);
+
+        if (response.status_code < 200 or response.status_code >= 300) {
+            return ToolResult.fail("Telegram send failed");
+        }
+
+        if (std.fmt.allocPrint(
+            allocator,
+            "Message sent to telegram:{s} ({d} chars)",
+            .{
+                resolved_chat_id,
+                content.len,
+            },
+        )) |msg| {
+            return ToolResult.ok(msg);
+        } else |_| {
+            return ToolResult.ok("Message sent to telegram");
+        }
+    }
+
+    fn resolve_telegram_chat_id_from_state(
+        allocator: std.mem.Allocator,
+        state_mgr: anytype,
+        user_id: i64,
+    ) ![]u8 {
+        const state_json = try state_mgr.getTelegramStateJson(allocator, user_id);
+        defer allocator.free(state_json);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, state_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidTelegramState;
+        const obj = parsed.value.object;
+        const chat_val = obj.get("chat_id") orelse return error.MissingTelegramChatId;
+        return switch (chat_val) {
+            .string => allocator.dupe(u8, chat_val.string),
+            .integer => std.fmt.allocPrint(allocator, "{d}", .{chat_val.integer}),
+            else => error.InvalidTelegramState,
+        };
     }
 };
 
@@ -155,7 +253,7 @@ test "MessageTool execute without content fails" {
     defer resetTestTurnContext();
     var event_bus = bus.Bus.init();
     defer event_bus.close();
-    var mt = MessageTool{ .event_bus = &event_bus };
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
     const parsed = try root.parseTestArgs("{\"channel\":\"tg\",\"chat_id\":\"c1\"}");
     defer parsed.deinit();
     const result = try mt.execute(testing.allocator, parsed.value.object);
@@ -168,7 +266,7 @@ test "MessageTool execute with empty content fails" {
     defer resetTestTurnContext();
     var event_bus = bus.Bus.init();
     defer event_bus.close();
-    var mt = MessageTool{ .event_bus = &event_bus };
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
     const parsed = try root.parseTestArgs("{\"content\":\"  \",\"channel\":\"tg\",\"chat_id\":\"c1\"}");
     defer parsed.deinit();
     const result = try mt.execute(testing.allocator, parsed.value.object);
@@ -181,7 +279,7 @@ test "MessageTool execute without channel uses default" {
     defer resetTestTurnContext();
     var event_bus = bus.Bus.init();
     defer event_bus.close();
-    var mt = MessageTool{ .event_bus = &event_bus };
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
     mt.setContext("telegram", "chat42");
     const parsed = try root.parseTestArgs("{\"content\":\"hello\"}");
     defer parsed.deinit();
@@ -201,7 +299,7 @@ test "MessageTool execute with explicit channel overrides default" {
     defer resetTestTurnContext();
     var event_bus = bus.Bus.init();
     defer event_bus.close();
-    var mt = MessageTool{ .event_bus = &event_bus };
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
     mt.setContext("telegram", "chat42");
     const parsed = try root.parseTestArgs("{\"content\":\"hi\",\"channel\":\"discord\",\"chat_id\":\"room1\"}");
     defer parsed.deinit();
@@ -232,7 +330,7 @@ test "MessageTool sent_in_round is set after successful send" {
     defer resetTestTurnContext();
     var event_bus = bus.Bus.init();
     defer event_bus.close();
-    var mt = MessageTool{ .event_bus = &event_bus };
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
     mt.setContext("tg", "c1");
 
     try testing.expect(!mt.hasMessageBeenSent());
@@ -257,7 +355,7 @@ test "MessageTool no channel and no default fails" {
     defer resetTestTurnContext();
     var event_bus = bus.Bus.init();
     defer event_bus.close();
-    var mt = MessageTool{ .event_bus = &event_bus };
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
     const parsed = try root.parseTestArgs("{\"content\":\"hello\"}");
     defer parsed.deinit();
     const result = try mt.execute(testing.allocator, parsed.value.object);
@@ -270,7 +368,7 @@ test "MessageTool closed bus fails gracefully" {
     defer resetTestTurnContext();
     var event_bus = bus.Bus.init();
     event_bus.close();
-    var mt = MessageTool{ .event_bus = &event_bus };
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
     mt.setContext("tg", "c1");
     const parsed = try root.parseTestArgs("{\"content\":\"hello\"}");
     defer parsed.deinit();
@@ -284,7 +382,7 @@ test "MessageTool execute with default account routes through account-aware outb
     defer resetTestTurnContext();
     var event_bus = bus.Bus.init();
     defer event_bus.close();
-    var mt = MessageTool{ .event_bus = &event_bus };
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
     MessageTool.setTurnContext(.{
         .channel = "telegram",
         .account_id = "personal",
@@ -302,4 +400,30 @@ test "MessageTool execute with default account routes through account-aware outb
     try testing.expectEqualStrings("telegram", outbound.channel);
     try testing.expectEqualStrings("personal", outbound.account_id.?);
     try testing.expectEqualStrings("42", outbound.chat_id);
+}
+
+test "MessageTool bus payload survives request allocator lifetime" {
+    resetTestTurnContext();
+    defer resetTestTurnContext();
+
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+
+    var mt = MessageTool{
+        .event_bus = &event_bus,
+        .outbound_allocator = testing.allocator,
+    };
+
+    var arena_impl = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const parsed = try std.json.parseFromSlice(root.JsonValue, arena, "{\"content\":\"hello\",\"channel\":\"telegram\",\"chat_id\":\"42\"}", .{});
+    const result = try mt.execute(arena, parsed.value.object);
+    try testing.expect(result.success);
+
+    var outbound = event_bus.consumeOutbound() orelse return error.TestUnexpectedResult;
+    defer outbound.deinit(testing.allocator);
+    try testing.expectEqualStrings("42", outbound.chat_id);
+    try testing.expectEqualStrings("hello", outbound.content);
 }
