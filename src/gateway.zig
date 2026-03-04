@@ -2092,6 +2092,7 @@ const RouteResponse = struct {
 };
 
 fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
+    const transport_stats = http_util.transport_stats_snapshot();
     const requests_total = state.requests_total.load(.monotonic);
     const chat_stream_total = state.chat_stream_total.load(.monotonic);
     const chat_stream_errors_total = state.chat_stream_errors_total.load(.monotonic);
@@ -2134,6 +2135,24 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\# HELP nullalis_gateway_shutdown_requested Whether shutdown has been requested.
         \\# TYPE nullalis_gateway_shutdown_requested gauge
         \\nullalis_gateway_shutdown_requested {d}
+        \\# HELP nullalis_http_transport_native_total Native transport successes by subsystem.
+        \\# TYPE nullalis_http_transport_native_total counter
+        \\nullalis_http_transport_native_total{{subsystem="tools"}} {d}
+        \\nullalis_http_transport_native_total{{subsystem="providers"}} {d}
+        \\nullalis_http_transport_native_total{{subsystem="channels"}} {d}
+        \\nullalis_http_transport_native_total{{subsystem="system"}} {d}
+        \\# HELP nullalis_http_transport_curl_total Curl transport uses by subsystem.
+        \\# TYPE nullalis_http_transport_curl_total counter
+        \\nullalis_http_transport_curl_total{{subsystem="tools"}} {d}
+        \\nullalis_http_transport_curl_total{{subsystem="providers"}} {d}
+        \\nullalis_http_transport_curl_total{{subsystem="channels"}} {d}
+        \\nullalis_http_transport_curl_total{{subsystem="system"}} {d}
+        \\# HELP nullalis_http_transport_fallback_total Native transport fallbacks by subsystem.
+        \\# TYPE nullalis_http_transport_fallback_total counter
+        \\nullalis_http_transport_fallback_total{{subsystem="tools"}} {d}
+        \\nullalis_http_transport_fallback_total{{subsystem="providers"}} {d}
+        \\nullalis_http_transport_fallback_total{{subsystem="channels"}} {d}
+        \\nullalis_http_transport_fallback_total{{subsystem="system"}} {d}
         \\
     ,
         .{
@@ -2147,6 +2166,18 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             drain_rejected_total,
             if (draining) @as(u8, 1) else @as(u8, 0),
             if (shutdown_requested) @as(u8, 1) else @as(u8, 0),
+            transport_stats.tools_native_total,
+            transport_stats.providers_native_total,
+            transport_stats.channels_native_total,
+            transport_stats.system_native_total,
+            transport_stats.tools_curl_total,
+            transport_stats.providers_curl_total,
+            transport_stats.channels_curl_total,
+            transport_stats.system_curl_total,
+            transport_stats.tools_fallback_total,
+            transport_stats.providers_fallback_total,
+            transport_stats.channels_fallback_total,
+            transport_stats.system_fallback_total,
         },
     );
 }

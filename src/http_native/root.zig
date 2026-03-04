@@ -111,7 +111,7 @@ fn root_request(allocator: std.mem.Allocator, options: RequestOptions) RequestEr
     const parsed = try parse_request(allocator, options);
     defer parsed.deinit(allocator);
 
-    const addr = std.net.Address.resolveIp(parsed.connect_host, parsed.port) catch return error.AddressResolveFailed;
+    const addr = try resolve_connect_address(allocator, parsed.connect_host, parsed.port);
     const stream = std.net.tcpConnectToAddress(addr) catch return error.TcpConnectFailed;
     defer stream.close();
 
@@ -140,7 +140,7 @@ fn root_stream_body(
     const parsed = try parse_request(allocator, options);
     defer parsed.deinit(allocator);
 
-    const addr = std.net.Address.resolveIp(parsed.connect_host, parsed.port) catch return error.AddressResolveFailed;
+    const addr = try resolve_connect_address(allocator, parsed.connect_host, parsed.port);
     const stream = std.net.tcpConnectToAddress(addr) catch return error.TcpConnectFailed;
     defer stream.close();
 
@@ -164,6 +164,15 @@ fn request_plain(
 
     stream.writeAll(request_bytes) catch return error.TlsWriteFailed;
     try read_to_eof_plain(allocator, raw_response, stream, options.max_response_bytes);
+}
+
+fn resolve_connect_address(allocator: std.mem.Allocator, host: []const u8, port: u16) RequestError!std.net.Address {
+    return std.net.Address.parseIp(host, port) catch {
+        var addrs = std.net.getAddressList(allocator, host, port) catch return error.AddressResolveFailed;
+        defer addrs.deinit();
+        if (addrs.addrs.len == 0) return error.AddressResolveFailed;
+        return addrs.addrs[0];
+    };
 }
 
 fn stream_plain_body(
@@ -765,4 +774,29 @@ test "native http request decodes chunked response" {
 
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try std.testing.expectEqualStrings("hello world", response.body);
+}
+
+test "native http request resolves localhost hostname" {
+    var addrs = try std.net.getAddressList(std.testing.allocator, "localhost", 0);
+    defer addrs.deinit();
+    var server = try addrs.addrs[0].listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const thread = try std.Thread.spawn(.{}, serve_once, .{ &server, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok" });
+    defer thread.join();
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://localhost:{d}/host", .{server.listen_address.getPort()});
+    defer std.testing.allocator.free(url);
+
+    const response = try request(std.testing.allocator, .{
+        .method = "GET",
+        .url = url,
+        .timeout_ms = 5_000,
+        .max_response_bytes = 1024,
+        .subsystem = .tools,
+    });
+    defer std.testing.allocator.free(response.body);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("ok", response.body);
 }

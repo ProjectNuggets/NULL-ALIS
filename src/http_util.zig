@@ -11,6 +11,7 @@ const log = std.log.scoped(.http_util);
 pub const RequestOptions = http_native.RequestOptions;
 pub const TransportConfig = http_native.TransportConfig;
 pub const TransportMode = http_native.TransportMode;
+pub const TransportSubsystem = http_native.TransportSubsystem;
 
 pub const CurlResponse = struct {
     status_code: u16,
@@ -18,6 +19,92 @@ pub const CurlResponse = struct {
 };
 
 const STATUS_MARKER = "\n__NULLCLAW_STATUS__:";
+
+pub const TransportStats = struct {
+    tools_native_total: u64,
+    tools_curl_total: u64,
+    tools_fallback_total: u64,
+    providers_native_total: u64,
+    providers_curl_total: u64,
+    providers_fallback_total: u64,
+    channels_native_total: u64,
+    channels_curl_total: u64,
+    channels_fallback_total: u64,
+    system_native_total: u64,
+    system_curl_total: u64,
+    system_fallback_total: u64,
+};
+
+const transport_counters = struct {
+    var tools_native_total = std.atomic.Value(u64).init(0);
+    var tools_curl_total = std.atomic.Value(u64).init(0);
+    var tools_fallback_total = std.atomic.Value(u64).init(0);
+    var providers_native_total = std.atomic.Value(u64).init(0);
+    var providers_curl_total = std.atomic.Value(u64).init(0);
+    var providers_fallback_total = std.atomic.Value(u64).init(0);
+    var channels_native_total = std.atomic.Value(u64).init(0);
+    var channels_curl_total = std.atomic.Value(u64).init(0);
+    var channels_fallback_total = std.atomic.Value(u64).init(0);
+    var system_native_total = std.atomic.Value(u64).init(0);
+    var system_curl_total = std.atomic.Value(u64).init(0);
+    var system_fallback_total = std.atomic.Value(u64).init(0);
+};
+
+const TransportOutcome = enum {
+    native,
+    curl,
+    fallback,
+};
+
+fn record_transport_outcome(subsystem: TransportSubsystem, outcome: TransportOutcome) void {
+    const counter = switch (subsystem) {
+        .tools => switch (outcome) {
+            .native => &transport_counters.tools_native_total,
+            .curl => &transport_counters.tools_curl_total,
+            .fallback => &transport_counters.tools_fallback_total,
+        },
+        .providers => switch (outcome) {
+            .native => &transport_counters.providers_native_total,
+            .curl => &transport_counters.providers_curl_total,
+            .fallback => &transport_counters.providers_fallback_total,
+        },
+        .channels => switch (outcome) {
+            .native => &transport_counters.channels_native_total,
+            .curl => &transport_counters.channels_curl_total,
+            .fallback => &transport_counters.channels_fallback_total,
+        },
+        .system => switch (outcome) {
+            .native => &transport_counters.system_native_total,
+            .curl => &transport_counters.system_curl_total,
+            .fallback => &transport_counters.system_fallback_total,
+        },
+    };
+    _ = counter.fetchAdd(1, .monotonic);
+}
+
+fn subsystem_supports_native(subsystem: TransportSubsystem) bool {
+    return switch (subsystem) {
+        .tools, .providers, .channels => true,
+        .system => false,
+    };
+}
+
+pub fn transport_stats_snapshot() TransportStats {
+    return .{
+        .tools_native_total = transport_counters.tools_native_total.load(.monotonic),
+        .tools_curl_total = transport_counters.tools_curl_total.load(.monotonic),
+        .tools_fallback_total = transport_counters.tools_fallback_total.load(.monotonic),
+        .providers_native_total = transport_counters.providers_native_total.load(.monotonic),
+        .providers_curl_total = transport_counters.providers_curl_total.load(.monotonic),
+        .providers_fallback_total = transport_counters.providers_fallback_total.load(.monotonic),
+        .channels_native_total = transport_counters.channels_native_total.load(.monotonic),
+        .channels_curl_total = transport_counters.channels_curl_total.load(.monotonic),
+        .channels_fallback_total = transport_counters.channels_fallback_total.load(.monotonic),
+        .system_native_total = transport_counters.system_native_total.load(.monotonic),
+        .system_curl_total = transport_counters.system_curl_total.load(.monotonic),
+        .system_fallback_total = transport_counters.system_fallback_total.load(.monotonic),
+    };
+}
 
 /// HTTP POST via curl subprocess with optional proxy and timeout.
 ///
@@ -408,6 +495,7 @@ pub fn request_with_mode(
 ) !CurlResponse {
     switch (transport_config.mode) {
         .curl_only => {
+            record_transport_outcome(options.subsystem, .curl);
             const timeout_secs = blk: {
                 const clamped_ms = @max(options.timeout_ms, 1000);
                 break :blk try std.fmt.allocPrint(allocator, "{d}", .{clamped_ms / 1000});
@@ -439,14 +527,16 @@ pub fn request_with_mode(
             );
         },
         .native_preferred => {
-            if (options.proxy == null and (options.subsystem == .tools or options.subsystem == .providers)) {
+            if (options.proxy == null and subsystem_supports_native(options.subsystem)) {
                 const native_response = http_native.request(allocator, options) catch |err| {
+                    record_transport_outcome(options.subsystem, .fallback);
                     log.warn("native transport fallback for {s} request: {s}", .{
                         @tagName(options.subsystem),
                         @errorName(err),
                     });
                     return request_with_mode(allocator, .{ .mode = .curl_only }, options);
                 };
+                record_transport_outcome(options.subsystem, .native);
                 return .{
                     .status_code = native_response.status_code,
                     .body = native_response.body,
@@ -456,6 +546,7 @@ pub fn request_with_mode(
         },
         .native_only => {
             const native_response = try http_native.request(allocator, options);
+            record_transport_outcome(options.subsystem, .native);
             return .{
                 .status_code = native_response.status_code,
                 .body = native_response.body,

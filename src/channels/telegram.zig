@@ -478,6 +478,22 @@ pub const TelegramChannel = struct {
         return fbs.getWritten();
     }
 
+    fn requestJson(self: *const TelegramChannel, allocator: std.mem.Allocator, method: []const u8, body: []const u8, timeout_secs: u64) ![]u8 {
+        var url_buf: [512]u8 = undefined;
+        const url = try self.apiUrl(&url_buf, method);
+        const response = try root.http_util.request_with_mode(allocator, .{}, .{
+            .method = "POST",
+            .url = url,
+            .headers = &.{"Content-Type: application/json"},
+            .body = body,
+            .proxy = self.proxy,
+            .timeout_ms = @intCast(@min(timeout_secs * 1000, @as(u64, std.math.maxInt(u32)))),
+            .max_response_bytes = 4 * 1024 * 1024,
+            .subsystem = .channels,
+        });
+        return response.body;
+    }
+
     /// Build a sendMessage JSON body.
     pub fn buildSendBody(
         buf: []u8,
@@ -526,19 +542,14 @@ pub const TelegramChannel = struct {
     }
 
     pub fn healthCheck(self: *TelegramChannel) bool {
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "getMe") catch return false;
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, "10") catch return false;
+        const resp = self.requestJson(self.allocator, "getMe", "{}", 10) catch return false;
         defer self.allocator.free(resp);
         return std.mem.indexOf(u8, resp, "\"ok\":true") != null;
     }
 
     /// Register bot commands with Telegram so they appear in the "/" menu.
     pub fn setMyCommands(self: *TelegramChannel) void {
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "setMyCommands") catch return;
-
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, TELEGRAM_BOT_COMMANDS_JSON, &.{}, self.proxy, "10") catch |err| {
+        const resp = self.requestJson(self.allocator, "setMyCommands", TELEGRAM_BOT_COMMANDS_JSON, 10) catch |err| {
             log.warn("setMyCommands failed: {}", .{err});
             return;
         };
@@ -547,11 +558,8 @@ pub const TelegramChannel = struct {
 
     /// Disable webhook mode before polling, preserving queued updates.
     pub fn deleteWebhookKeepPending(self: *TelegramChannel) void {
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "deleteWebhook") catch return;
-
         const body = "{\"drop_pending_updates\":false}";
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body, &.{}, self.proxy, "10") catch |err| {
+        const resp = self.requestJson(self.allocator, "deleteWebhook", body, 10) catch |err| {
             log.warn("deleteWebhook failed: {}", .{err});
             return;
         };
@@ -561,11 +569,8 @@ pub const TelegramChannel = struct {
     /// Skip all pending updates accumulated while bot was offline.
     /// Fetches with offset=-1 to get only the latest update, then advances past it.
     pub fn dropPendingUpdates(self: *TelegramChannel) void {
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "getUpdates") catch return;
-
         const body = "{\"offset\":-1,\"timeout\":0}";
-        const resp_body = root.http_util.curlPostWithProxy(self.allocator, url, body, &.{}, self.proxy, "10") catch return;
+        const resp_body = self.requestJson(self.allocator, "getUpdates", body, 10) catch return;
         defer self.allocator.free(resp_body);
 
         // Parse to extract the latest update_id and advance past it
@@ -603,9 +608,6 @@ pub const TelegramChannel = struct {
         if (builtin.is_test) return;
         if (chat_id.len == 0) return;
 
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "sendChatAction") catch return;
-
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
 
@@ -613,7 +615,7 @@ pub const TelegramChannel = struct {
         body_list.appendSlice(self.allocator, chat_id) catch return;
         body_list.appendSlice(self.allocator, ",\"action\":\"typing\"}") catch return;
 
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, "10") catch return;
+        const resp = self.requestJson(self.allocator, "sendChatAction", body_list.items, 10) catch return;
         self.allocator.free(resp);
     }
 
@@ -695,9 +697,6 @@ pub const TelegramChannel = struct {
 
     /// Send text with HTML parse_mode (converted from Markdown); on failure, retry as plain text.
     fn sendWithMarkdownFallback(self: *TelegramChannel, chat_id: []const u8, text: []const u8, reply_to: ?i64) !void {
-        var url_buf: [512]u8 = undefined;
-        const url = try self.apiUrl(&url_buf, "sendMessage");
-
         // Convert Markdown → Telegram HTML
         const html_text = markdownToTelegramHtml(self.allocator, text) catch {
             // Conversion failed — send as plain text
@@ -724,7 +723,7 @@ pub const TelegramChannel = struct {
         }
         try html_body.appendSlice(self.allocator, "}");
 
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, html_body.items, &.{}, self.proxy, "30") catch {
+        const resp = self.requestJson(self.allocator, "sendMessage", html_body.items, 30) catch {
             // Network error — fall through to plain send
             try self.sendChunkPlain(chat_id, text, reply_to);
             return;
@@ -740,9 +739,6 @@ pub const TelegramChannel = struct {
     }
 
     fn sendChunkPlain(self: *TelegramChannel, chat_id: []const u8, text: []const u8, reply_to: ?i64) !void {
-        var url_buf: [512]u8 = undefined;
-        const url = try self.apiUrl(&url_buf, "sendMessage");
-
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
 
@@ -759,7 +755,7 @@ pub const TelegramChannel = struct {
         }
         try body_list.appendSlice(self.allocator, "}");
 
-        const resp = try root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, "30");
+        const resp = try self.requestJson(self.allocator, "sendMessage", body_list.items, 30);
         self.allocator.free(resp);
     }
 
@@ -962,10 +958,6 @@ pub const TelegramChannel = struct {
     }
 
     fn sendChunk(self: *TelegramChannel, chat_id: []const u8, text: []const u8) !void {
-        // Build URL
-        var url_buf: [512]u8 = undefined;
-        const url = try self.apiUrl(&url_buf, "sendMessage");
-
         // Build JSON body with escaped text
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
@@ -976,7 +968,7 @@ pub const TelegramChannel = struct {
         try root.json_util.appendJsonString(&body_list, self.allocator, text);
         try body_list.appendSlice(self.allocator, "}");
 
-        const resp = try root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, "30");
+        const resp = try self.requestJson(self.allocator, "sendMessage", body_list.items, 30);
         self.allocator.free(resp);
     }
 
@@ -1136,9 +1128,6 @@ pub const TelegramChannel = struct {
     /// Voice and audio messages are automatically transcribed via Groq Whisper
     /// when a Groq API key is configured (config or GROQ_API_KEY env var).
     pub fn pollUpdates(self: *TelegramChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
-        var url_buf: [512]u8 = undefined;
-        const url = try self.apiUrl(&url_buf, "getUpdates");
-
         self.maybeSweepTempMediaFiles();
 
         // Build body with offset and dynamic timeout.
@@ -1159,9 +1148,7 @@ pub const TelegramChannel = struct {
         try fbs.writer().print("{{\"offset\":{d},\"timeout\":{d},\"allowed_updates\":[\"message\"]}}", .{ self.last_update_id, poll_timeout });
         const body = fbs.getWritten();
 
-        var timeout_buf: [16]u8 = undefined;
-        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{poll_timeout + 15}) catch "45";
-        const resp_body = try root.http_util.curlPostWithProxy(allocator, url, body, &.{}, self.proxy, timeout_str);
+        const resp_body = try self.requestJson(allocator, "getUpdates", body, poll_timeout + 15);
         defer allocator.free(resp_body);
 
         // Parse JSON response to extract messages
@@ -1550,9 +1537,7 @@ pub const TelegramChannel = struct {
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
         // Verify bot token by calling getMe
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "getMe") catch return;
-        if (root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, "10")) |resp| {
+        if (self.requestJson(self.allocator, "getMe", "{}", 10)) |resp| {
             self.allocator.free(resp);
         } else |_| {}
         // Keep slash-command menu in sync when channel is started via manager/daemon.
