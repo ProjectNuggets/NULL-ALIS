@@ -233,6 +233,52 @@ pub const IdempotencyStore = struct {
 
 // ── Gateway server ───────────────────────────────────────────────
 
+const TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY: usize = 256;
+
+const TenantTelegramAsyncJobQueue = struct {
+    buf: [TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY]*anyopaque = undefined,
+    head: usize = 0,
+    tail: usize = 0,
+    len: usize = 0,
+    closed: bool = false,
+    mutex: std.Thread.Mutex = .{},
+    not_empty: std.Thread.Condition = .{},
+
+    fn push(self: *TenantTelegramAsyncJobQueue, job: *anyopaque) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return false;
+        if (self.len == TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY) return false;
+        self.buf[self.tail] = job;
+        self.tail = (self.tail + 1) % TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY;
+        self.len += 1;
+        self.not_empty.signal();
+        return true;
+    }
+
+    fn pop(self: *TenantTelegramAsyncJobQueue) ?*anyopaque {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.len == 0 and !self.closed) {
+            self.not_empty.wait(&self.mutex);
+        }
+        if (self.len == 0) return null;
+
+        const job = self.buf[self.head];
+        self.head = (self.head + 1) % TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY;
+        self.len -= 1;
+        return job;
+    }
+
+    fn close(self: *TenantTelegramAsyncJobQueue) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closed = true;
+        self.not_empty.broadcast();
+    }
+};
+
 /// Gateway server state, shared across request handlers.
 pub const GatewayState = struct {
     allocator: std.mem.Allocator,
@@ -270,6 +316,9 @@ pub const GatewayState = struct {
     owner_instance_id_owned: bool = false,
     tenant_runtime_mutex: std.Thread.Mutex = .{},
     tenant_runtimes: std.StringHashMapUnmanaged(*TenantRuntime) = .empty,
+    tenant_telegram_queue: TenantTelegramAsyncJobQueue = .{},
+    tenant_telegram_worker_mutex: std.Thread.Mutex = .{},
+    tenant_telegram_worker: ?std.Thread = null,
     draining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     requests_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     chat_stream_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -302,6 +351,10 @@ pub const GatewayState = struct {
     }
 
     pub fn deinit(self: *GatewayState) void {
+        self.tenant_telegram_queue.close();
+        if (self.tenant_telegram_worker) |worker| {
+            worker.join();
+        }
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
         self.tenant_runtime_mutex.lock();
@@ -1232,6 +1285,27 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
     };
 }
 
+fn tenantTelegramAsyncWorkerMain(state: *GatewayState) void {
+    while (state.tenant_telegram_queue.pop()) |opaque_job| {
+        const job: *TenantTelegramAsyncJob = @ptrCast(@alignCast(opaque_job));
+        tenantTelegramAsyncWorker(job);
+    }
+}
+
+fn ensureTenantTelegramWorker(state: *GatewayState) bool {
+    state.tenant_telegram_worker_mutex.lock();
+    defer state.tenant_telegram_worker_mutex.unlock();
+    if (state.tenant_telegram_worker != null) return true;
+
+    const worker = std.Thread.spawn(
+        .{ .stack_size = 512 * 1024 },
+        tenantTelegramAsyncWorkerMain,
+        .{state},
+    ) catch return false;
+    state.tenant_telegram_worker = worker;
+    return true;
+}
+
 fn enqueueTenantTelegramAsync(
     state: *GatewayState,
     config: *const Config,
@@ -1265,15 +1339,15 @@ fn enqueueTenantTelegramAsync(
         .chat_id = chat_id,
     };
 
-    const thread = std.Thread.spawn(
-        .{ .stack_size = 512 * 1024 },
-        tenantTelegramAsyncWorker,
-        .{job},
-    ) catch {
+    if (!ensureTenantTelegramWorker(state)) {
         job.deinit();
         return false;
-    };
-    thread.detach();
+    }
+
+    if (!state.tenant_telegram_queue.push(@ptrCast(job))) {
+        job.deinit();
+        return false;
+    }
     return true;
 }
 
