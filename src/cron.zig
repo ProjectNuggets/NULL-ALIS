@@ -2028,9 +2028,23 @@ test "CronScheduler getJob found and missing" {
     try std.testing.expect(scheduler.getJob("nonexistent") == null);
 }
 
+const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
+
+fn testCronStorePath(tmp: *TestTmpDir, allocator: std.mem.Allocator) ![]u8 {
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    return std.fs.path.join(allocator, &.{ dir_path, "cron.json" });
+}
+
 test "save and load roundtrip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testCronStorePath(&tmp, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    try scheduler.setStorePath(path);
 
     _ = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
     _ = try scheduler.addOnce("5m", "echo oneshot");
@@ -2041,6 +2055,7 @@ test "save and load roundtrip" {
     // Load into a new scheduler
     var scheduler2 = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler2.deinit();
+    try scheduler2.setStorePath(path);
     try loadJobs(&scheduler2);
 
     try std.testing.expectEqual(@as(usize, 2), scheduler2.listJobs().len);
@@ -2052,18 +2067,23 @@ test "save and load roundtrip" {
 }
 
 test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testCronStorePath(&tmp, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    try scheduler.setStorePath(path);
     _ = try scheduler.addJob("*/10 * * * *", "echo keep");
     try saveJobs(&scheduler);
 
     var runtime = CronScheduler.init(std.testing.allocator, 10, true);
     defer runtime.deinit();
+    try runtime.setStorePath(path);
     try loadJobs(&runtime);
     try std.testing.expectEqual(@as(usize, 1), runtime.listJobs().len);
 
-    const path = try cronJsonPath(std.testing.allocator);
-    defer std.testing.allocator.free(path);
     const bad_file = try std.fs.createFileAbsolute(path, .{});
     defer bad_file.close();
     try bad_file.writeAll("{bad-json");
@@ -2074,13 +2094,20 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
     // Store should be healed and parseable again.
     var healed = CronScheduler.init(std.testing.allocator, 10, true);
     defer healed.deinit();
+    try healed.setStorePath(path);
     try loadJobsStrict(&healed);
     try std.testing.expectEqual(@as(usize, 1), healed.listJobs().len);
 }
 
 test "save and load roundtrip with JSON-sensitive command characters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testCronStorePath(&tmp, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    try scheduler.setStorePath(path);
 
     const cmd = "printf \"line1\\nline2\" && echo \\\"ok\\\"";
     _ = try scheduler.addJob("*/5 * * * *", cmd);
@@ -2089,14 +2116,21 @@ test "save and load roundtrip with JSON-sensitive command characters" {
 
     var loaded = CronScheduler.init(std.testing.allocator, 10, true);
     defer loaded.deinit();
+    try loaded.setStorePath(path);
     try loadJobsStrict(&loaded);
     try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
     try std.testing.expectEqualStrings(cmd, loaded.listJobs()[0].command);
 }
 
 test "save and load preserves extended cron fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testCronStorePath(&tmp, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    try scheduler.setStorePath(path);
 
     _ = try scheduler.addJob("*/5 * * * *", "echo extended");
     scheduler.jobs.items[0].job_type = .agent;
@@ -2121,6 +2155,7 @@ test "save and load preserves extended cron fields" {
 
     var loaded = CronScheduler.init(std.testing.allocator, 10, true);
     defer loaded.deinit();
+    try loaded.setStorePath(path);
     try loadJobsStrict(&loaded);
     try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
 

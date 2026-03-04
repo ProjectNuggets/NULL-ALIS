@@ -605,3 +605,55 @@ test "schedule tenant defaults normalize echo reminder into delivery job" {
     try std.testing.expectEqualStrings("chat-15", updated.delivery.to.?);
     try std.testing.expectEqualStrings("echo \"Meeting starts now\"", updated.command);
 }
+
+test "schedule tenant defaults convert echo without live target into agent reminder" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addOnce("30m", "echo \"Meeting starts now\"");
+
+    root.setTenantContext(.{
+        .user_id = "15",
+        .numeric_user_id = 15,
+        .session_key = "agent:zaki-bot:user:15:main",
+    });
+    defer root.clearTenantContext();
+
+    message_tool.MessageTool.clearTurnContext();
+
+    try applyTenantDefaults(&scheduler, std.testing.allocator, job.id, job.command);
+    const updated = scheduler.getJob(job.id).?;
+    try std.testing.expectEqual(cron.JobType.agent, updated.job_type);
+    try std.testing.expectEqual(cron.SessionTarget.main, updated.session_target);
+    try std.testing.expectEqual(cron.DeliveryMode.none, updated.delivery.mode);
+    try std.testing.expectEqualStrings("Meeting starts now", updated.command);
+    try std.testing.expect(updated.prompt != null);
+}
+
+test "schedule tenant defaults keep normal shell commands intact" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo-shell-output >/tmp/task.log");
+
+    root.setTenantContext(.{
+        .user_id = "15",
+        .numeric_user_id = 15,
+        .session_key = "agent:zaki-bot:user:15:main",
+    });
+    defer root.clearTenantContext();
+
+    message_tool.MessageTool.setTurnContext(.{
+        .channel = "telegram",
+        .chat_id = "chat-15",
+    });
+    defer message_tool.MessageTool.clearTurnContext();
+
+    try applyTenantDefaults(&scheduler, std.testing.allocator, job.id, job.command);
+    const updated = scheduler.getJob(job.id).?;
+    try std.testing.expectEqual(cron.JobType.shell, updated.job_type);
+    try std.testing.expectEqual(cron.SessionTarget.main, updated.session_target);
+    try std.testing.expectEqual(cron.DeliveryMode.none, updated.delivery.mode);
+    try std.testing.expectEqualStrings("echo-shell-output >/tmp/task.log", updated.command);
+    try std.testing.expect(updated.prompt == null);
+}

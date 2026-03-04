@@ -52,6 +52,13 @@ const ThreadContext = struct {
 // ── SubagentManager ─────────────────────────────────────────────
 
 pub const SubagentManager = struct {
+    pub const CompletionRunnerFn = *const fn (
+        ctx: ?*anyopaque,
+        allocator: Allocator,
+        system_prompt: []const u8,
+        task: []const u8,
+    ) anyerror![]const u8;
+
     allocator: Allocator,
     tasks: std.AutoHashMapUnmanaged(u64, *TaskState),
     next_id: u64,
@@ -66,6 +73,8 @@ pub const SubagentManager = struct {
     workspace_dir: []const u8,
     agents: []const config_mod.NamedAgentConfig,
     http_enabled: bool,
+    completion_runner: ?CompletionRunnerFn = null,
+    completion_runner_ctx: ?*anyopaque = null,
 
     pub fn init(
         allocator: Allocator,
@@ -287,14 +296,27 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         .max_tokens = @as(?u64, null),
     };
 
-    const result = providers.completeWithSystem(
-        cfg_arena.allocator(),
-        &cfg,
-        system_prompt,
-        ctx.task,
-    ) catch |err| {
-        ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
-        return;
+    const result = blk: {
+        if (ctx.manager.completion_runner) |runner| {
+            break :blk runner(
+                ctx.manager.completion_runner_ctx,
+                cfg_arena.allocator(),
+                system_prompt,
+                ctx.task,
+            ) catch |err| {
+                ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
+                return;
+            };
+        }
+        break :blk providers.completeWithSystem(
+            cfg_arena.allocator(),
+            &cfg,
+            system_prompt,
+            ctx.task,
+        ) catch |err| {
+            ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
+            return;
+        };
     };
 
     ctx.manager.completeTask(ctx.task_id, result, null);
@@ -486,4 +508,108 @@ test "SubagentManager spawn rollback removes task on out-of-memory" {
     );
     try std.testing.expectEqual(@as(usize, 0), mgr.tasks.count());
     try std.testing.expectEqual(@as(u32, 0), mgr.getRunningCount());
+}
+
+fn waitForTaskTerminal(mgr: *SubagentManager, task_id: u64, timeout_ms: u64) !void {
+    const start = std.time.milliTimestamp();
+    while (std.time.milliTimestamp() - start < timeout_ms) {
+        const status = mgr.getTaskStatus(task_id) orelse return error.TestUnexpectedResult;
+        if (status != .running) return;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.TestTimeout;
+}
+
+fn immediateCompletionRunner(_: ?*anyopaque, allocator: Allocator, system_prompt: []const u8, task: []const u8) ![]const u8 {
+    try std.testing.expect(system_prompt.len > 0);
+    return std.fmt.allocPrint(allocator, "completed: {s}", .{task});
+}
+
+const BlockingCompletionRunner = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    release: bool = false,
+    active: usize = 0,
+    peak_active: usize = 0,
+
+    fn run(ctx: ?*anyopaque, allocator: Allocator, _: []const u8, task: []const u8) ![]const u8 {
+        const self: *BlockingCompletionRunner = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        self.active += 1;
+        if (self.active > self.peak_active) self.peak_active = self.active;
+        while (!self.release) {
+            self.cond.wait(&self.mutex);
+        }
+        self.active -= 1;
+        self.mutex.unlock();
+        return std.fmt.allocPrint(allocator, "released: {s}", .{task});
+    }
+
+    fn releaseAll(self: *BlockingCompletionRunner) void {
+        self.mutex.lock();
+        self.release = true;
+        self.cond.broadcast();
+        self.mutex.unlock();
+    }
+};
+
+test "SubagentManager spawn e2e completes and publishes bus message" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var bus = bus_mod.Bus.init();
+    defer bus.close();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, &bus, .{});
+    mgr.completion_runner = immediateCompletionRunner;
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawn("summarize this", "e2e", "agent", "session:e2e");
+    try waitForTaskTerminal(&mgr, task_id, 2_000);
+
+    try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(task_id).?);
+    try std.testing.expectEqualStrings("completed: summarize this", mgr.getTaskResult(task_id).?);
+    try std.testing.expect(bus.inboundDepth() > 0);
+
+    var msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("agent", msg.channel);
+    try std.testing.expectEqualStrings("session:e2e", msg.chat_id);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "completed: summarize this") != null);
+}
+
+test "SubagentManager spawn stress enforces live concurrency limit" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var runner = BlockingCompletionRunner{};
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{
+        .max_concurrent = 8,
+    });
+    mgr.completion_runner = BlockingCompletionRunner.run;
+    mgr.completion_runner_ctx = @ptrCast(&runner);
+    defer mgr.deinit();
+
+    var task_ids: [8]u64 = undefined;
+    for (&task_ids, 0..) |*task_id, i| {
+        task_id.* = try mgr.spawn("stress task", "stress", "agent", "session:stress");
+        _ = i;
+    }
+
+    const extra = mgr.spawn("overflow", "stress", "agent", "session:stress");
+    try std.testing.expectError(error.TooManyConcurrentSubagents, extra);
+
+    runner.releaseAll();
+
+    for (task_ids) |task_id| {
+        try waitForTaskTerminal(&mgr, task_id, 2_000);
+        try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(task_id).?);
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), mgr.getRunningCount());
+    try std.testing.expect(runner.peak_active >= 2);
 }
