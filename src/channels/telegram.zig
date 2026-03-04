@@ -818,76 +818,56 @@ pub const TelegramChannel = struct {
         defer resolved_file_path.deinit(allocator);
         const media_path = resolved_file_path.path;
 
-        // Build file form field: field=@path (local files) or field=URL (remote URLs)
-        var file_arg_buf: [1024]u8 = undefined;
-        var file_fbs = std.io.fixedBufferStream(&file_arg_buf);
-        if (std.mem.startsWith(u8, media_path, "http://") or
-            std.mem.startsWith(u8, media_path, "https://"))
-        {
-            try file_fbs.writer().print("{s}={s}", .{ kind.formField(), media_path });
-        } else {
-            try file_fbs.writer().print("{s}=@{s}", .{ kind.formField(), media_path });
-        }
-        const file_arg = file_fbs.getWritten();
+        const boundary = "----nullalis-telegram-boundary";
+        const remote_media = std.mem.startsWith(u8, media_path, "http://") or std.mem.startsWith(u8, media_path, "https://");
+        const file_bytes = if (remote_media)
+            ""
+        else
+            try std.fs.cwd().readFileAlloc(allocator, media_path, 32 * 1024 * 1024);
+        defer if (!remote_media) allocator.free(file_bytes);
 
-        // Build chat_id form field
-        var chatid_arg_buf: [128]u8 = undefined;
-        var chatid_fbs = std.io.fixedBufferStream(&chatid_arg_buf);
-        try chatid_fbs.writer().print("chat_id={s}", .{chat_id});
-        const chatid_arg = chatid_fbs.getWritten();
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(allocator);
+        const writer = body.writer(allocator);
 
-        // Build argv
-        var argv_buf: [24][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "120";
-        argc += 1;
-
-        if (self.proxy) |p| {
-            argv_buf[argc] = "-x";
-            argc += 1;
-            argv_buf[argc] = p;
-            argc += 1;
-        }
-
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = chatid_arg;
-        argc += 1;
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = file_arg;
-        argc += 1;
-
-        // Optional caption
-        var caption_arg_buf: [1024]u8 = undefined;
+        try appendMultipartField(writer, boundary, "chat_id", chat_id);
         if (caption) |cap| {
-            var cap_fbs = std.io.fixedBufferStream(&caption_arg_buf);
-            try cap_fbs.writer().print("caption={s}", .{cap});
-            argv_buf[argc] = "-F";
-            argc += 1;
-            argv_buf[argc] = cap_fbs.getWritten();
-            argc += 1;
+            try appendMultipartField(writer, boundary, "caption", cap);
         }
 
-        argv_buf[argc] = url;
-        argc += 1;
+        if (remote_media) {
+            try appendMultipartField(writer, boundary, kind.formField(), media_path);
+        } else {
+            const file_name = std.fs.path.basename(media_path);
+            try writer.print("--{s}\r\n", .{boundary});
+            try writer.print(
+                "Content-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\n",
+                .{ kind.formField(), file_name },
+            );
+            try writer.writeAll("Content-Type: application/octet-stream\r\n\r\n");
+            try writer.writeAll(file_bytes);
+            try writer.writeAll("\r\n");
+        }
 
-        var child = std.process.Child.init(argv_buf[0..argc], allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
+        try writer.print("--{s}--\r\n", .{boundary});
 
-        _ = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
-        const term = child.wait() catch return error.CurlWaitError;
-        switch (term) {
-            .Exited => |code| if (code != 0) return error.CurlFailed,
-            else => return error.CurlFailed,
+        const content_type = try std.fmt.allocPrint(allocator, "Content-Type: multipart/form-data; boundary={s}", .{boundary});
+        defer allocator.free(content_type);
+
+        const response = try root.http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+            .subsystem = .channels,
+            .method = "POST",
+            .url = url,
+            .headers = &.{content_type},
+            .body = body.items,
+            .proxy = self.proxy,
+            .timeout_ms = 120_000,
+            .max_response_bytes = 1024 * 1024,
+        });
+        defer allocator.free(response.body);
+
+        if (response.status_code < 200 or response.status_code >= 300) {
+            return error.TransportError;
         }
     }
 
@@ -1760,6 +1740,13 @@ pub fn markdownToTelegramHtml(allocator: std.mem.Allocator, md: []const u8) ![]u
     return buf.toOwnedSlice(allocator);
 }
 
+fn appendMultipartField(writer: anytype, boundary: []const u8, name: []const u8, value: []const u8) !void {
+    try writer.print("--{s}\r\n", .{boundary});
+    try writer.print("Content-Disposition: form-data; name=\"{s}\"\r\n\r\n", .{name});
+    try writer.writeAll(value);
+    try writer.writeAll("\r\n");
+}
+
 fn findTripleBacktick(md: []const u8, from: usize) ?usize {
     var pos = from;
     while (pos + 2 < md.len) {
@@ -1886,13 +1873,22 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
     root.json_util.appendJsonString(&body_list, allocator, file_id) catch return null;
     body_list.appendSlice(allocator, "}") catch return null;
 
-    const resp = root.http_util.curlPostWithProxy(allocator, api_url, body_list.items, &.{}, proxy, "15") catch |err| {
+    const resp = root.http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+        .subsystem = .channels,
+        .method = "POST",
+        .url = api_url,
+        .headers = &.{"Content-Type: application/json"},
+        .body = body_list.items,
+        .proxy = proxy,
+        .timeout_ms = 15_000,
+        .max_response_bytes = 1024 * 1024,
+    }) catch |err| {
         log.warn("downloadTelegramPhoto: getFile API failed: {}", .{err});
         return null;
     };
-    defer allocator.free(resp);
+    defer allocator.free(resp.body);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch |err| {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{}) catch |err| {
         log.warn("downloadTelegramPhoto: JSON parse failed: {}", .{err});
         return null;
     };
@@ -1916,11 +1912,18 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
     dl_fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path }) catch return null;
     const dl_url = dl_fbs.getWritten();
 
-    const data = root.http_util.curlGetWithProxy(allocator, dl_url, &.{}, "30", proxy) catch |err| {
+    const data = root.http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+        .subsystem = .channels,
+        .method = "GET",
+        .url = dl_url,
+        .proxy = proxy,
+        .timeout_ms = 30_000,
+        .max_response_bytes = 16 * 1024 * 1024,
+    }) catch |err| {
         log.warn("downloadTelegramPhoto: file download failed: {}", .{err});
         return null;
     };
-    defer allocator.free(data);
+    defer allocator.free(data.body);
 
     // 3. Determine file extension from the Telegram file_path
     const ext = if (std.mem.lastIndexOfScalar(u8, tg_file_path, '.')) |dot|
@@ -1945,7 +1948,7 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
         return null;
     };
     defer file.close();
-    file.writeAll(data) catch return null;
+    file.writeAll(data.body) catch return null;
 
     return allocator.dupe(u8, local_path) catch null;
 }
@@ -1965,13 +1968,22 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, fil
     root.json_util.appendJsonString(&body_list, allocator, file_id) catch return null;
     body_list.appendSlice(allocator, "}") catch return null;
 
-    const resp = root.http_util.curlPostWithProxy(allocator, api_url, body_list.items, &.{}, proxy, "15") catch |err| {
+    const resp = root.http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+        .subsystem = .channels,
+        .method = "POST",
+        .url = api_url,
+        .headers = &.{"Content-Type: application/json"},
+        .body = body_list.items,
+        .proxy = proxy,
+        .timeout_ms = 15_000,
+        .max_response_bytes = 1024 * 1024,
+    }) catch |err| {
         log.warn("downloadTelegramFile: getFile API failed: {}", .{err});
         return null;
     };
-    defer allocator.free(resp);
+    defer allocator.free(resp.body);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch |err| {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{}) catch |err| {
         log.warn("downloadTelegramFile: JSON parse failed: {}", .{err});
         return null;
     };
@@ -1995,11 +2007,18 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, fil
     dl_fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path }) catch return null;
     const dl_url = dl_fbs.getWritten();
 
-    const data = root.http_util.curlGetWithProxy(allocator, dl_url, &.{}, "60", proxy) catch |err| {
+    const data = root.http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+        .subsystem = .channels,
+        .method = "GET",
+        .url = dl_url,
+        .proxy = proxy,
+        .timeout_ms = 60_000,
+        .max_response_bytes = 32 * 1024 * 1024,
+    }) catch |err| {
         log.warn("downloadTelegramFile: file download failed: {}", .{err});
         return null;
     };
-    defer allocator.free(data);
+    defer allocator.free(data.body);
 
     // 3. Determine filename: prefer original file_name, fall back to file_id + extension
     const tmp_dir = platform.getTempDir(allocator) catch return null;
@@ -2034,7 +2053,7 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, fil
         return null;
     };
     defer file.close();
-    file.writeAll(data) catch return null;
+    file.writeAll(data.body) catch return null;
 
     return allocator.dupe(u8, local_path) catch null;
 }
