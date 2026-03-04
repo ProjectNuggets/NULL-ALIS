@@ -2275,7 +2275,16 @@ fn telegramApiCall(
 ) ![]u8 {
     const url = try telegramApiUrl(allocator, bot_token, method);
     defer allocator.free(url);
-    return http_util.curlPostWithProxy(allocator, url, body, &.{}, null, "30");
+    const response = try http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+        .subsystem = .channels,
+        .method = "POST",
+        .url = url,
+        .body = body,
+        .headers = &.{"Content-Type: application/json"},
+        .timeout_ms = 30_000,
+        .max_response_bytes = 1024 * 1024,
+    });
+    return response.body;
 }
 
 fn handleApiRoute(
