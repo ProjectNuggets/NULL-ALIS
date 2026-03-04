@@ -439,9 +439,12 @@ pub fn request_with_mode(
             );
         },
         .native_preferred => {
-            if (options.proxy == null and options.subsystem == .tools) {
+            if (options.proxy == null and (options.subsystem == .tools or options.subsystem == .providers)) {
                 const native_response = http_native.request(allocator, options) catch |err| {
-                    log.warn("native transport fallback for tools request: {s}", .{@errorName(err)});
+                    log.warn("native transport fallback for {s} request: {s}", .{
+                        @tagName(options.subsystem),
+                        @errorName(err),
+                    });
                     return request_with_mode(allocator, .{ .mode = .curl_only }, options);
                 };
                 return .{
