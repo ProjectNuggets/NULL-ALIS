@@ -1,7 +1,7 @@
 //! CLI entry point — single-message and interactive REPL modes.
 //!
 //! Extracted from agent/root.zig. Contains `run()` (the main entry point
-//! for `nullclaw agent`) and the streaming stdout callback.
+//! for `nullalis agent`) and the streaming stdout callback.
 
 const std = @import("std");
 const log = std.log.scoped(.agent);
@@ -33,10 +33,10 @@ fn cliStreamCallback(_: *anyopaque, chunk: providers.StreamChunk) void {
 }
 
 /// Run the agent in single-message or interactive REPL mode.
-/// This is the main entry point called by `nullclaw agent`.
+/// This is the main entry point called by `nullalis agent`.
 pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var cfg = Config.load(allocator) catch {
-        log.err("No config found. Run `nullclaw onboard` first.", .{});
+        log.err("No config found. Run `nullalis onboard` first.", .{});
         return;
     };
     defer cfg.deinit();
@@ -151,7 +151,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const supports_streaming = provider_i.supportsStreaming();
 
-    // Single message mode: nullclaw agent -m "hello"
+    // Single message mode: nullalis agent -m "hello"
     if (message_arg) |message| {
         try w.print("Sending to {s}...\n", .{cfg.default_provider});
         if (session_id) |sid| {
@@ -197,7 +197,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // Interactive REPL mode
     cfg.printModelConfig();
-    try w.print("nullclaw Agent -- Interactive Mode\n", .{});
+    try w.print("nullalis Agent -- Interactive Mode\n", .{});
     try w.print("Provider: {s} | Model: {s}\n", .{
         cfg.default_provider,
         cfg.default_model orelse "(default)",

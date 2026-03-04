@@ -52,7 +52,7 @@ jobs:
       - name: Job summary
         if: always()
         run: |
-          echo "## nullClaw CI — ${{ matrix.target }}" >> $GITHUB_STEP_SUMMARY
+          echo "## nullALIS CI — ${{ matrix.target }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
@@ -64,9 +64,9 @@ jobs:
             echo "| Test MaxRSS | ${RSS:-—} |" >> $GITHUB_STEP_SUMMARY
           fi
 
-          BIN="zig-out/bin/nullclaw"
+          BIN="zig-out/bin/nullalis"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            BIN="zig-out/bin/nullclaw.exe"
+            BIN="zig-out/bin/nullalis.exe"
           fi
           if [ -f "$BIN" ]; then
             SIZE=$(wc -c < "$BIN" | tr -d ' ')
@@ -78,5 +78,5 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: nullclaw-${{ matrix.target }}
-          path: zig-out/bin/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}
+          name: nullalis-${{ matrix.target }}
+          path: zig-out/bin/nullalis${{ runner.os == 'Windows' && '.exe' || '' }}

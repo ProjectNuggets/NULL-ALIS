@@ -367,7 +367,7 @@ pub fn build(b: *std.Build) void {
     const build_options_module = build_options.createModule();
 
     // ---------- library module (importable by consumers) ----------
-    const lib_mod = b.addModule("nullclaw", .{
+    const lib_mod = b.addModule("nullalis", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -383,13 +383,13 @@ pub fn build(b: *std.Build) void {
 
     // ---------- executable ----------
     const exe = b.addExecutable(.{
-        .name = "nullclaw",
+        .name = "nullalis",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "nullclaw", .module = lib_mod },
+                .{ .name = "nullalis", .module = lib_mod },
             },
         }),
     });
@@ -426,7 +426,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---------- run step ----------
-    const run_step = b.step("run", "Run nullclaw");
+    const run_step = b.step("run", "Run nullalis");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());

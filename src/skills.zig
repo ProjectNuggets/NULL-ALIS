@@ -3,7 +3,7 @@ const platform = @import("platform.zig");
 
 // Skills — user-defined capabilities loaded from disk.
 //
-// Each skill lives in ~/.nullclaw/workspace/skills/<name>/ with:
+// Each skill lives in ~/.nullalis/workspace/skills/<name>/ with:
 //   - skill.json  — manifest (name, version, description, author)
 //   - SKILL.md    — optional instruction text
 //
@@ -810,13 +810,13 @@ pub fn freeSyncResult(allocator: std.mem.Allocator, result: *const SyncResult) v
 
 test "parseManifest full JSON" {
     const json =
-        \\{"name": "code-review", "version": "1.2.0", "description": "Automated code review", "author": "nullclaw"}
+        \\{"name": "code-review", "version": "1.2.0", "description": "Automated code review", "author": "nullalis"}
     ;
     const m = try parseManifest(json);
     try std.testing.expectEqualStrings("code-review", m.name);
     try std.testing.expectEqualStrings("1.2.0", m.version);
     try std.testing.expectEqualStrings("Automated code review", m.description);
-    try std.testing.expectEqualStrings("nullclaw", m.author);
+    try std.testing.expectEqualStrings("nullalis", m.author);
 }
 
 test "parseManifest minimal JSON (name only)" {
@@ -923,7 +923,7 @@ test "SkillManifest fields" {
 
 test "listSkills from nonexistent directory" {
     const allocator = std.testing.allocator;
-    const skills = try listSkills(allocator, "/tmp/nullclaw-test-skills-nonexistent-dir");
+    const skills = try listSkills(allocator, "/tmp/nullalis-test-skills-nonexistent-dir");
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 0), skills.len);
 }
@@ -1287,7 +1287,7 @@ test "sync marker read/write roundtrip" {
 
 test "readSyncMarker returns null for nonexistent file" {
     var buf: [256]u8 = undefined;
-    const ts = readSyncMarker("/tmp/nullclaw-nonexistent-marker-file.json", &buf);
+    const ts = readSyncMarker("/tmp/nullalis-nonexistent-marker-file.json", &buf);
     try std.testing.expect(ts == null);
 }
 
@@ -1295,13 +1295,13 @@ test "syncCommunitySkills disabled when env not set" {
     // NULLCLAW_OPEN_SKILLS_ENABLED is not set in test environment,
     // so syncCommunitySkills should return immediately without doing anything
     const allocator = std.testing.allocator;
-    try syncCommunitySkills(allocator, "/tmp/nullclaw-test-sync-disabled");
+    try syncCommunitySkills(allocator, "/tmp/nullalis-test-sync-disabled");
     // No error = success (function returned early)
 }
 
 test "loadCommunitySkills from nonexistent directory" {
     const allocator = std.testing.allocator;
-    const skills = try loadCommunitySkills(allocator, "/tmp/nullclaw-test-community-nonexistent");
+    const skills = try loadCommunitySkills(allocator, "/tmp/nullalis-test-community-nonexistent");
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 0), skills.len);
 }
@@ -1560,7 +1560,7 @@ test "checkBinaryExists finds common binary" {
 
 test "checkBinaryExists returns false for nonexistent binary" {
     const allocator = std.testing.allocator;
-    try std.testing.expect(!checkBinaryExists(allocator, "nullclaw_nonexistent_binary_xyz"));
+    try std.testing.expect(!checkBinaryExists(allocator, "nullalis_nonexistent_binary_xyz"));
 }
 
 test "loadSkill reads always field" {
@@ -1674,7 +1674,7 @@ test "listSkillsMerged workspace overrides builtin" {
 
 test "listSkillsMerged with nonexistent dirs returns empty" {
     const allocator = std.testing.allocator;
-    const skills = try listSkillsMerged(allocator, "/tmp/nullclaw-nonexistent-a", "/tmp/nullclaw-nonexistent-b");
+    const skills = try listSkillsMerged(allocator, "/tmp/nullalis-nonexistent-a", "/tmp/nullalis-nonexistent-b");
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 0), skills.len);
 }
@@ -1682,7 +1682,7 @@ test "listSkillsMerged with nonexistent dirs returns empty" {
 test "checkRequirements detects missing binary" {
     const allocator = std.testing.allocator;
     const bin_arr = try allocator.alloc([]const u8, 1);
-    bin_arr[0] = try allocator.dupe(u8, "nullclaw_nonexistent_xyz_bin");
+    bin_arr[0] = try allocator.dupe(u8, "nullalis_nonexistent_xyz_bin");
     var skill = Skill{
         .name = "needs-bin",
         .requires_bins = bin_arr,
@@ -1692,13 +1692,13 @@ test "checkRequirements detects missing binary" {
     defer freeStringArray(allocator, skill.requires_bins);
 
     try std.testing.expect(!skill.available);
-    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "bin:nullclaw_nonexistent_xyz_bin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "bin:nullalis_nonexistent_xyz_bin") != null);
 }
 
 test "checkRequirements detects both missing bin and env" {
     const allocator = std.testing.allocator;
     const bin_arr = try allocator.alloc([]const u8, 1);
-    bin_arr[0] = try allocator.dupe(u8, "nullclaw_missing_bin_abc");
+    bin_arr[0] = try allocator.dupe(u8, "nullalis_missing_bin_abc");
     const env_arr = try allocator.alloc([]const u8, 1);
     env_arr[0] = try allocator.dupe(u8, "NULLCLAW_MISSING_ENV_ABC");
     var skill = Skill{
@@ -1712,7 +1712,7 @@ test "checkRequirements detects both missing bin and env" {
     defer freeStringArray(allocator, skill.requires_env);
 
     try std.testing.expect(!skill.available);
-    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "bin:nullclaw_missing_bin_abc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "bin:nullalis_missing_bin_abc") != null);
     try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "env:NULLCLAW_MISSING_ENV_ABC") != null);
 }
 
@@ -1733,7 +1733,7 @@ test "listSkillsMerged runs checkRequirements" {
         defer allocator.free(rel);
         const f = try tmp.dir.createFile(rel, .{});
         defer f.close();
-        try f.writeAll("{\"name\": \"needy\", \"description\": \"needs stuff\", \"requires_bins\": [\"nullclaw_fake_bin_zzz\"]}");
+        try f.writeAll("{\"name\": \"needy\", \"description\": \"needs stuff\", \"requires_bins\": [\"nullalis_fake_bin_zzz\"]}");
     }
 
     // Empty workspace
@@ -1752,7 +1752,7 @@ test "listSkillsMerged runs checkRequirements" {
     try std.testing.expectEqual(@as(usize, 1), skills.len);
     // checkRequirements should have been called by listSkillsMerged
     try std.testing.expect(!skills[0].available);
-    try std.testing.expect(std.mem.indexOf(u8, skills[0].missing_deps, "bin:nullclaw_fake_bin_zzz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skills[0].missing_deps, "bin:nullalis_fake_bin_zzz") != null);
 }
 
 // ── SyncResult API Tests ────────────────────────────────────────
@@ -1775,7 +1775,7 @@ test "SyncResult struct fields" {
 test "syncCommunitySkillsResult disabled when env not set" {
     // NULLCLAW_OPEN_SKILLS_ENABLED is not set in test environment
     const allocator = std.testing.allocator;
-    const result = try syncCommunitySkillsResult(allocator, "/tmp/nullclaw-test-sync-result-disabled");
+    const result = try syncCommunitySkillsResult(allocator, "/tmp/nullalis-test-sync-result-disabled");
     defer freeSyncResult(allocator, &result);
 
     try std.testing.expect(!result.synced);
@@ -1784,7 +1784,7 @@ test "syncCommunitySkillsResult disabled when env not set" {
 }
 
 test "countMdFiles returns zero for nonexistent dir" {
-    const count = countMdFiles("/tmp/nullclaw-test-countmd-nonexistent");
+    const count = countMdFiles("/tmp/nullalis-test-countmd-nonexistent");
     try std.testing.expectEqual(@as(u32, 0), count);
 }
 

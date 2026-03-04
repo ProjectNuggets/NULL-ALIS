@@ -124,12 +124,12 @@ pub const DiscordChannel = struct {
     // ── Pure helper functions ─────────────────────────────────────────────
 
     /// Build IDENTIFY JSON payload (op=2).
-    /// Example: {"op":2,"d":{"token":"Bot TOKEN","intents":37377,"properties":{"os":"linux","browser":"nullclaw","device":"nullclaw"}}}
+    /// Example: {"op":2,"d":{"token":"Bot TOKEN","intents":37377,"properties":{"os":"linux","browser":"nullalis","device":"nullalis"}}}
     pub fn buildIdentifyJson(buf: []u8, token: []const u8, intents: u32) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
         try w.print(
-            "{{\"op\":2,\"d\":{{\"token\":\"Bot {s}\",\"intents\":{d},\"properties\":{{\"os\":\"linux\",\"browser\":\"nullclaw\",\"device\":\"nullclaw\"}}}}}}",
+            "{{\"op\":2,\"d\":{{\"token\":\"Bot {s}\",\"intents\":{d},\"properties\":{{\"os\":\"linux\",\"browser\":\"nullalis\",\"device\":\"nullalis\"}}}}}}",
             .{ token, intents },
         );
         return fbs.getWritten();

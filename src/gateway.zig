@@ -1,4 +1,4 @@
-//! HTTP Gateway — lightweight HTTP server for nullclaw.
+//! HTTP Gateway — lightweight HTTP server for nullalis.
 //!
 //! Mirrors ZeroClaw's axum-based gateway with:
 //!   - Sliding-window rate limiting (per-IP)
@@ -1986,12 +1986,12 @@ pub fn extractBody(raw: []const u8) ?[]const u8 {
     return body;
 }
 
-/// Process an incoming message by spawning `nullclaw agent -m "..."`.
+/// Process an incoming message by spawning `nullalis agent -m "..."`.
 /// Returns the agent's response text. Caller owns the returned memory.
 pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
     // Find our own executable path
     var self_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path = std.fs.selfExePath(&self_buf) catch "nullclaw";
+    const self_path = std.fs.selfExePath(&self_buf) catch "nullalis";
 
     var child = std.process.Child.init(
         &[_][]const u8{ self_path, "agent", "-m", message },
@@ -2104,36 +2104,36 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
     const shutdown_requested = state.shutdown_requested.load(.acquire);
     return std.fmt.allocPrint(
         allocator,
-        \\# HELP nullclaw_gateway_requests_total Total HTTP requests handled.
-        \\# TYPE nullclaw_gateway_requests_total counter
-        \\nullclaw_gateway_requests_total {d}
-        \\# HELP nullclaw_gateway_chat_stream_total Total chat stream requests.
-        \\# TYPE nullclaw_gateway_chat_stream_total counter
-        \\nullclaw_gateway_chat_stream_total {d}
-        \\# HELP nullclaw_gateway_chat_stream_errors_total Total chat stream errors.
-        \\# TYPE nullclaw_gateway_chat_stream_errors_total counter
-        \\nullclaw_gateway_chat_stream_errors_total {d}
-        \\# HELP nullclaw_gateway_telegram_webhook_total Total telegram webhook requests.
-        \\# TYPE nullclaw_gateway_telegram_webhook_total counter
-        \\nullclaw_gateway_telegram_webhook_total {d}
-        \\# HELP nullclaw_gateway_telegram_webhook_rejected_total Total rejected telegram webhooks.
-        \\# TYPE nullclaw_gateway_telegram_webhook_rejected_total counter
-        \\nullclaw_gateway_telegram_webhook_rejected_total {d}
-        \\# HELP nullclaw_gateway_tenant_lock_conflicts_total Total tenant ownership-lock conflicts.
-        \\# TYPE nullclaw_gateway_tenant_lock_conflicts_total counter
-        \\nullclaw_gateway_tenant_lock_conflicts_total {d}
-        \\# HELP nullclaw_gateway_in_flight_requests Current in-flight requests.
-        \\# TYPE nullclaw_gateway_in_flight_requests gauge
-        \\nullclaw_gateway_in_flight_requests {d}
-        \\# HELP nullclaw_gateway_drain_rejected_total Total requests rejected while draining.
-        \\# TYPE nullclaw_gateway_drain_rejected_total counter
-        \\nullclaw_gateway_drain_rejected_total {d}
-        \\# HELP nullclaw_gateway_drain_mode Current drain mode status.
-        \\# TYPE nullclaw_gateway_drain_mode gauge
-        \\nullclaw_gateway_drain_mode {d}
-        \\# HELP nullclaw_gateway_shutdown_requested Whether shutdown has been requested.
-        \\# TYPE nullclaw_gateway_shutdown_requested gauge
-        \\nullclaw_gateway_shutdown_requested {d}
+        \\# HELP nullalis_gateway_requests_total Total HTTP requests handled.
+        \\# TYPE nullalis_gateway_requests_total counter
+        \\nullalis_gateway_requests_total {d}
+        \\# HELP nullalis_gateway_chat_stream_total Total chat stream requests.
+        \\# TYPE nullalis_gateway_chat_stream_total counter
+        \\nullalis_gateway_chat_stream_total {d}
+        \\# HELP nullalis_gateway_chat_stream_errors_total Total chat stream errors.
+        \\# TYPE nullalis_gateway_chat_stream_errors_total counter
+        \\nullalis_gateway_chat_stream_errors_total {d}
+        \\# HELP nullalis_gateway_telegram_webhook_total Total telegram webhook requests.
+        \\# TYPE nullalis_gateway_telegram_webhook_total counter
+        \\nullalis_gateway_telegram_webhook_total {d}
+        \\# HELP nullalis_gateway_telegram_webhook_rejected_total Total rejected telegram webhooks.
+        \\# TYPE nullalis_gateway_telegram_webhook_rejected_total counter
+        \\nullalis_gateway_telegram_webhook_rejected_total {d}
+        \\# HELP nullalis_gateway_tenant_lock_conflicts_total Total tenant ownership-lock conflicts.
+        \\# TYPE nullalis_gateway_tenant_lock_conflicts_total counter
+        \\nullalis_gateway_tenant_lock_conflicts_total {d}
+        \\# HELP nullalis_gateway_in_flight_requests Current in-flight requests.
+        \\# TYPE nullalis_gateway_in_flight_requests gauge
+        \\nullalis_gateway_in_flight_requests {d}
+        \\# HELP nullalis_gateway_drain_rejected_total Total requests rejected while draining.
+        \\# TYPE nullalis_gateway_drain_rejected_total counter
+        \\nullalis_gateway_drain_rejected_total {d}
+        \\# HELP nullalis_gateway_drain_mode Current drain mode status.
+        \\# TYPE nullalis_gateway_drain_mode gauge
+        \\nullalis_gateway_drain_mode {d}
+        \\# HELP nullalis_gateway_shutdown_requested Whether shutdown has been requested.
+        \\# TYPE nullalis_gateway_shutdown_requested gauge
+        \\nullalis_gateway_shutdown_requested {d}
         \\
     ,
         .{

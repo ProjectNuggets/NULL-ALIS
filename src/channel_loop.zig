@@ -385,7 +385,7 @@ pub fn runTelegramLoop(
     var evict_counter: u32 = 0;
 
     const model = config.default_model orelse {
-        log.err("No default model configured. Set agents.defaults.model.primary in ~/.nullclaw/config.json or run `nullclaw onboard`.", .{});
+        log.err("No default model configured. Set agents.defaults.model.primary in ~/.nullalis/config.json or run `nullalis onboard`.", .{});
         return;
     };
 
@@ -409,7 +409,7 @@ pub fn runTelegramLoop(
             if (std.mem.eql(u8, trimmed, "/start")) {
                 var greeting_buf: [512]u8 = undefined;
                 const name = msg.first_name orelse msg.id;
-                const greeting = std.fmt.bufPrint(&greeting_buf, "Hello, {s}! I'm nullClaw.\n\nModel: {s}\nType /help for available commands.", .{ name, model }) catch "Hello! I'm nullClaw. Type /help for commands.";
+                const greeting = std.fmt.bufPrint(&greeting_buf, "Hello, {s}! I'm nullALIS.\n\nModel: {s}\nType /help for available commands.", .{ name, model }) catch "Hello! I'm nullALIS. Type /help for commands.";
                 tg_ptr.sendMessageWithReply(msg.sender, greeting, msg.message_id) catch |err| log.err("failed to send /start reply: {}", .{err});
                 continue;
             }

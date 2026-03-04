@@ -914,7 +914,7 @@ fn inboundDispatcherThread(
     }
 }
 
-/// Run the long-lived runtime. This is the main entry point for `nullclaw gateway`.
+/// Run the long-lived runtime. This is the main entry point for `nullalis gateway`.
 /// Spawns threads for gateway, heartbeat, and channels, then loops until
 /// shutdown is requested (Ctrl+C signal or explicit request).
 /// `host` and `port` are CLI-parsed values that override `config.gateway`.
@@ -951,7 +951,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
-    try stdout.print("nullclaw gateway runtime started\n", .{});
+    try stdout.print("nullalis gateway runtime started\n", .{});
     try stdout.print("  Gateway:  http://{s}:{d}\n", .{ state.gateway_host, state.gateway_port });
     try stdout.print("  Components: {d} active\n", .{state.component_count});
     try stdout.flush();
@@ -1093,7 +1093,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     if (hb_thread) |t| t.join();
     gw_thread.join();
 
-    try stdout.print("nullclaw gateway runtime stopped.\n", .{});
+    try stdout.print("nullalis gateway runtime stopped.\n", .{});
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -1831,12 +1831,12 @@ test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" 
 test "stateFilePath derives from config_path" {
     const config = Config{
         .workspace_dir = "/tmp/workspace",
-        .config_path = "/home/user/.nullclaw/config.json",
+        .config_path = "/home/user/.nullalis/config.json",
         .allocator = std.testing.allocator,
     };
     const path = try stateFilePath(std.testing.allocator, &config);
     defer std.testing.allocator.free(path);
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/home/user/.nullclaw", "daemon_state.json" });
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/home/user/.nullalis", "daemon_state.json" });
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, path);
 }

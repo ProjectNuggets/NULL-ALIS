@@ -57,8 +57,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nullclaw-${{ matrix.target }}
-          path: zig-out/bin/nullclaw${{ matrix.ext }}
+          name: nullalis-${{ matrix.target }}
+          path: zig-out/bin/nullalis${{ matrix.ext }}
 
   release:
     needs: build
@@ -71,25 +71,25 @@ jobs:
 
       - name: Rename binaries
         run: |
-          mv nullclaw-linux-x86_64/nullclaw nullclaw-linux-x86_64.bin
-          mv nullclaw-linux-aarch64/nullclaw nullclaw-linux-aarch64.bin
-          mv nullclaw-linux-riscv64/nullclaw nullclaw-linux-riscv64.bin
-          mv nullclaw-macos-aarch64/nullclaw nullclaw-macos-aarch64.bin
-          mv nullclaw-macos-x86_64/nullclaw nullclaw-macos-x86_64.bin
-          mv nullclaw-windows-x86_64/nullclaw.exe nullclaw-windows-x86_64.exe
-          mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-windows-aarch64.exe
+          mv nullalis-linux-x86_64/nullalis nullalis-linux-x86_64.bin
+          mv nullalis-linux-aarch64/nullalis nullalis-linux-aarch64.bin
+          mv nullalis-linux-riscv64/nullalis nullalis-linux-riscv64.bin
+          mv nullalis-macos-aarch64/nullalis nullalis-macos-aarch64.bin
+          mv nullalis-macos-x86_64/nullalis nullalis-macos-x86_64.bin
+          mv nullalis-windows-x86_64/nullalis.exe nullalis-windows-x86_64.exe
+          mv nullalis-windows-aarch64/nullalis.exe nullalis-windows-aarch64.exe
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            nullclaw-linux-x86_64.bin
-            nullclaw-linux-aarch64.bin
-            nullclaw-linux-riscv64.bin
-            nullclaw-macos-aarch64.bin
-            nullclaw-macos-x86_64.bin
-            nullclaw-windows-x86_64.exe
-            nullclaw-windows-aarch64.exe
+            nullalis-linux-x86_64.bin
+            nullalis-linux-aarch64.bin
+            nullalis-linux-riscv64.bin
+            nullalis-macos-aarch64.bin
+            nullalis-macos-x86_64.bin
+            nullalis-windows-x86_64.exe
+            nullalis-windows-aarch64.exe
           generate_release_notes: true
 
   docker:

@@ -182,7 +182,7 @@ pub fn migrateOpenclawWithPolicy(
 
 // ── Config migration ─────────────────────────────────────────────
 
-/// Copy OpenClaw config to nullclaw config with camelCase -> snake_case key
+/// Copy OpenClaw config to nullalis config with camelCase -> snake_case key
 /// normalization.
 fn migrateOpenclawConfig(
     allocator: std.mem.Allocator,
@@ -688,7 +688,7 @@ test "migrateOpenclawConfig copies and normalizes config json" {
     defer tmp.cleanup();
 
     try tmp.dir.makePath(".openclaw/workspace");
-    try tmp.dir.makePath(".nullclaw");
+    try tmp.dir.makePath(".nullalis");
 
     const source_cfg_rel = ".openclaw/config.json";
     const source_cfg = try tmp.dir.createFile(source_cfg_rel, .{});
@@ -699,7 +699,7 @@ test "migrateOpenclawConfig copies and normalizes config json" {
 
     const workspace_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".openclaw/workspace");
     defer std.testing.allocator.free(workspace_abs);
-    const target_cfg_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".nullclaw");
+    const target_cfg_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".nullalis");
     defer std.testing.allocator.free(target_cfg_abs);
     const target_cfg_path = try std.fs.path.join(std.testing.allocator, &.{ target_cfg_abs, "config.json" });
     defer std.testing.allocator.free(target_cfg_path);

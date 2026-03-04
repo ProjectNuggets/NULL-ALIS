@@ -263,13 +263,13 @@ test "configPrimaryModelForSelection keeps explicit configured custom provider p
 }
 
 test "parseSlashCommand strips bot mention from command name" {
-    const parsed = parseSlashCommand("/model@nullclaw_bot openrouter/inception/mercury") orelse return error.TestExpectedEqual;
+    const parsed = parseSlashCommand("/model@nullalis_bot openrouter/inception/mercury") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("model", parsed.name);
     try std.testing.expectEqualStrings("openrouter/inception/mercury", parsed.arg);
 }
 
 test "parseSlashCommand strips bot mention with colon separator" {
-    const parsed = parseSlashCommand("/model@nullclaw_bot: gpt-5.2") orelse return error.TestExpectedEqual;
+    const parsed = parseSlashCommand("/model@nullalis_bot: gpt-5.2") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("model", parsed.name);
     try std.testing.expectEqualStrings("gpt-5.2", parsed.arg);
 }

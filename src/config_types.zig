@@ -612,7 +612,7 @@ pub const MemoryVectorStoreConfig = struct {
     sidecar_path: []const u8 = "",
     qdrant_url: []const u8 = "",
     qdrant_api_key: []const u8 = "",
-    qdrant_collection: []const u8 = "nullclaw_memories",
+    qdrant_collection: []const u8 = "nullalis_memories",
     pgvector_table: []const u8 = "memory_embeddings",
 };
 
@@ -701,7 +701,7 @@ pub const MemoryRedisConfig = struct {
     port: u16 = 6379,
     password: []const u8 = "",
     db_index: u8 = 0,
-    key_prefix: []const u8 = "nullclaw",
+    key_prefix: []const u8 = "nullalis",
     ttl_seconds: u32 = 0, // 0 = no expiry
 };
 
@@ -825,7 +825,7 @@ pub const HttpRequestConfig = struct {
 // ── Identity config ─────────────────────────────────────────────
 
 pub const IdentityConfig = struct {
-    format: []const u8 = "nullclaw",
+    format: []const u8 = "nullalis",
     aieos_path: ?[]const u8 = null,
     aieos_inline: ?[]const u8 = null,
 };

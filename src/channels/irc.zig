@@ -407,7 +407,7 @@ pub const IrcChannel = struct {
         if (self.stream) |stream| {
             // Try to send QUIT gracefully (only for plain TCP; TLS already sent close_notify)
             if (self.tls_state == null) {
-                stream.writeAll("QUIT :nullclaw shutting down\r\n") catch |err| log.err("QUIT send failed: {}", .{err});
+                stream.writeAll("QUIT :nullalis shutting down\r\n") catch |err| log.err("QUIT send failed: {}", .{err});
             }
             stream.close();
             self.stream = null;

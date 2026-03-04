@@ -248,7 +248,7 @@ pub const SecretStore = struct {
 test "encrypt then decrypt roundtrip" {
     const key = [_]u8{0x42} ** 32;
     const nonce = [_]u8{0x01} ** 12;
-    const plaintext = "hello nullclaw";
+    const plaintext = "hello nullalis";
 
     var enc_buf: [256]u8 = undefined;
     const encrypted = try encrypt(key, nonce, plaintext, &enc_buf);

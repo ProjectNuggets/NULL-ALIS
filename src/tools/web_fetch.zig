@@ -61,7 +61,7 @@ pub const WebFetchTool = struct {
 
         const authority_host = stripHostBrackets(host);
         var header_strings = [_][]const u8{
-            "User-Agent: nullclaw/0.1 (web_fetch tool)",
+            "User-Agent: nullalis/0.1 (web_fetch tool)",
             "Accept: text/html,application/json,text/plain,*/*",
         };
         const response = http_util.curlRequestResolved(

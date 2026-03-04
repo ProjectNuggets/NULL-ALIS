@@ -376,7 +376,7 @@ test "schedule create with expression" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    // Succeeds if HOME/.nullclaw is writable, otherwise may fail gracefully
+    // Succeeds if HOME/.nullalis is writable, otherwise may fail gracefully
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
     }

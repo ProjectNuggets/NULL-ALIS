@@ -1,4 +1,4 @@
-//! Event Bus — inter-component message bus for nullClaw.
+//! Event Bus — inter-component message bus for nullALIS.
 //!
 //! Two blocking queues (inbound: channels→agent, outbound: agent→channels)
 //! on a ring buffer with Mutex+Condition. Foundation for Session Manager,

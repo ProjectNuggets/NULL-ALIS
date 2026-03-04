@@ -207,7 +207,7 @@ pub const Config = struct {
 
         const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
 
-        const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+        const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullalis" });
         const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
         const workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
 
@@ -760,7 +760,7 @@ pub const Config = struct {
                 .{},
             ),
             ValidationError.NoDefaultModel => std.debug.print(
-                "No default model configured. Set agents.defaults.model.primary in ~/.nullclaw/config.json or run `nullclaw onboard`.\n",
+                "No default model configured. Set agents.defaults.model.primary in ~/.nullalis/config.json or run `nullalis onboard`.\n",
                 .{},
             ),
             ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
@@ -3063,12 +3063,12 @@ test "gateway config parses internal_service_tokens" {
 test "tenant config parses enabled and data_root" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"tenant": {"enabled": true, "data_root": "/var/lib/nullclaw/users"}}
+        \\{"tenant": {"enabled": true, "data_root": "/var/lib/nullalis/users"}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expect(cfg.tenant.enabled);
-    try std.testing.expectEqualStrings("/var/lib/nullclaw/users", cfg.tenant.data_root);
+    try std.testing.expectEqualStrings("/var/lib/nullalis/users", cfg.tenant.data_root);
     allocator.free(cfg.tenant.data_root);
 }
 

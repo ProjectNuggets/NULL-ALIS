@@ -1,485 +1,209 @@
-<p align="center">
-  <img src="nullclaw.png" alt="nullclaw" width="200" />
-</p>
+# nullALIS
 
-<h1 align="center">NullClaw</h1>
+`nullALIS` is a Zig-first autonomous agent runtime for persistent digital twins, multitenant agent products, and local-first operator workflows.
 
-<p align="center">
-  <strong>Null overhead. Null compromise. 100% Zig. 100% Agnostic.</strong><br>
-  <strong>678 KB binary. ~1 MB RAM. Boots in <2 ms. Runs on anything with a CPU.</strong>
-</p>
+It is the engine behind `ZAKI BOT`: one persistent conversation, durable memory, proactive jobs, channel integrations, and a workspace the agent can actually use.
 
-<p align="center">
-  <a href="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml"><img src="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="https://nullclaw.github.io"><img src="https://img.shields.io/badge/docs-nullclaw.github.io-informational" alt="Documentation" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
-</p>
+## Runtime Naming
 
-The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
+The product brand is `nullALIS`.
 
-```
-678 KB binary · <2 ms startup · 3,230+ tests · 22+ providers · 17 channels · Pluggable everything
-```
+The current runtime identity uses lowercase `nullalis` for:
+- executable name: `nullalis`
+- default config path: `~/.nullalis/`
+- service and artifact names
 
-### Features
+That split is intentional: branded product name in docs, lowercase runtime names in commands and filesystems.
 
-- **Impossibly Small:** 678 KB static binary — no runtime, no VM, no framework overhead.
-- **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
-- **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
-- **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 22+ providers, 17 channels, 18+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+## What nullALIS Does
 
-### Why nullclaw
+`nullALIS` is built to run a serious agent, not a toy chat surface.
 
-- **Lean by default:** Zig compiles to a tiny static binary. No allocator overhead, no garbage collector, no runtime.
-- **Secure by design:** pairing, strict sandboxing (landlock, firejail, bubblewrap, docker), explicit allowlists, workspace scoping, encrypted secrets.
-- **Fully swappable:** core systems are vtable interfaces (providers, channels, tools, memory, tunnels, peripherals, observers, runtimes).
-- **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
+Core capabilities:
+- persistent chat sessions
+- durable memory with markdown workspace files and Postgres-backed tenant state
+- proactive jobs, reminders, heartbeat behavior, and scheduler execution
+- agent tools for files, shell, git, web, browser, memory, delegation, and integrations
+- channel support including Telegram and app-backed chat
+- SSE chat streaming for app integrations
+- multitenant runtime model for products like `ZAKI BOT`
+- Kubernetes-friendly deployment model
 
-## Benchmark Snapshot
+## Current Product Direction
 
-Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge hardware.
+The current repository is being shaped around three requirements:
+- `nullALIS` as the runtime and backend engine
+- `ZAKI BOT` as the user-facing digital twin inside ZAKI
+- a scalable multitenant architecture with Postgres as canonical tenant state and workspace files kept live on disk
 
-| | [OpenClaw](https://github.com/openclaw/openclaw) | [NanoBot](https://github.com/HKUDS/nanobot) | [PicoClaw](https://github.com/sipeed/picoclaw) | [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) | **[🦞 NullClaw](https://github.com/nullclaw/nullclaw)** |
-|---|---|---|---|---|---|
-| **Language** | TypeScript | Python | Go | Rust | **Zig** |
-| **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
-| **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
-| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | 3.4 MB | **678 KB** |
-| **Tests** | — | — | — | 1,017 | **3,230+** |
-| **Source Files** | ~400+ | — | — | ~120 | **~110** |
-| **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
+That means the system is designed around:
+- one persistent main session per user
+- per-user memory, config, secrets, jobs, and channel state
+- workspace files such as `BOOTSTRAP.md`, `IDENTITY.md`, `USER.md`, `SOUL.md`, `HEARTBEAT.md`, `MEMORY.md`, and daily memory notes
 
-> Measured with `/usr/bin/time -l` on ReleaseSmall builds. nullclaw is a static binary with zero runtime dependencies.
+## Key Features
 
-Reproduce locally:
+### Persistent Digital Twin
+- one long-lived conversation
+- remembers across sessions
+- can store and recall facts, preferences, plans, and work context
+- keeps a readable workspace, not just database state
 
-```bash
-zig build -Doptimize=ReleaseSmall
-ls -lh zig-out/bin/nullclaw
+### Real Workspace
+The agent can work with:
+- files
+- repos
+- shell commands
+- git
+- screenshots and images
+- browser and web tools
+- markdown memory files
 
-/usr/bin/time -l zig-out/bin/nullclaw --help
-/usr/bin/time -l zig-out/bin/nullclaw status
-```
+### Proactive Behavior
+- scheduled reminders
+- recurring jobs
+- heartbeat/proactive follow-up patterns
+- channel-aware delivery paths
+
+### Multitenant Runtime
+For product integrations such as `ZAKI BOT`, the runtime supports:
+- per-user session isolation
+- per-user config and secrets
+- per-user channel state
+- shared app + Telegram timeline model
+- SSE chat streaming behind a trusted backend
+
+## ZAKI BOT Integration Model
+
+The current integration model assumes:
+- ZAKI frontend talks to ZAKI backend
+- ZAKI backend proxies authenticated requests to `nullALIS`
+- `nullALIS` resolves a canonical `user_id`
+- app and Telegram share one main session timeline per user
+
+Canonical main session pattern:
+- `agent:zaki-bot:user:{user_id}:main`
+
+Tenant runtime state is moving toward:
+- canonical Postgres state for runtime correctness
+- live workspace files on disk for usability and continuity
 
 ## Quick Start
 
-> **Prerequisite:** use **Zig 0.15.2** (exact version).
-> `0.16.0-dev` and other Zig versions are currently unsupported and may fail to build.
-> Verify before building: `zig version` should print `0.15.2`.
+### Build
 
 ```bash
-git clone https://github.com/nullclaw/nullclaw.git
-cd nullclaw
+zig build
+```
+
+### Run Tests
+
+```bash
+zig build test --summary all
+```
+
+### Run the Gateway Locally
+
+```bash
+./zig-out/bin/nullalis gateway --host 127.0.0.1 --port 3000
+```
+
+### Health Check
+
+```bash
+curl http://127.0.0.1:3000/health
+```
+
+## Local Config
+
+Current config location:
+
+```text
+~/.nullalis/config.json
+```
+
+Example config file:
+- [config.example.json](/Users/nova/Desktop/nullclaw/config.example.json)
+
+A typical local setup for ZAKI integration needs:
+- model provider credentials
+- Brave API key if web search is enabled
+- gateway config
+- tenant config
+- state backend config when using Postgres tenant state
+
+## Build Targets
+
+Development build:
+
+```bash
+zig build
+```
+
+Release build:
+
+```bash
 zig build -Doptimize=ReleaseSmall
-
-# Quick setup
-nullclaw onboard --api-key sk-... --provider openrouter
-
-# Or interactive wizard
-nullclaw onboard --interactive
-
-# Chat
-nullclaw agent -m "Hello, nullclaw!"
-
-# Interactive mode
-nullclaw agent
-
-# Start gateway runtime (gateway + all configured channels/accounts + heartbeat + scheduler)
-nullclaw gateway                # default: 127.0.0.1:3000
-nullclaw gateway --port 8080    # custom port
-
-# Check status
-nullclaw status
-
-# Run system diagnostics
-nullclaw doctor
-
-# Check channel health
-nullclaw channel status
-
-# Start specific channels
-nullclaw channel start telegram
-nullclaw channel start discord
-nullclaw channel start signal
-
-# Manage background service
-nullclaw service install
-nullclaw service status
-
-# Migrate memory from OpenClaw
-nullclaw migrate openclaw --dry-run
-nullclaw migrate openclaw
 ```
 
-### Sentry Error Tracking (Optional)
-
-nullclaw now supports native Sentry-Zig integration via environment variables.
+Postgres + markdown memory build example:
 
 ```bash
-export NULLCLAW_SENTRY_DSN="https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID"
-export NULLCLAW_SENTRY_ENVIRONMENT="production"
-export NULLCLAW_SENTRY_RELEASE="nullclaw@2026.2.25"
-export NULLCLAW_SENTRY_SAMPLE_RATE="1.0"
-export NULLCLAW_SENTRY_TRACES_SAMPLE_RATE="0.1"
-
-nullclaw gateway
+zig build -Dengines=sqlite,postgres,markdown
 ```
-
-Supported variables:
-- `NULLCLAW_SENTRY_DSN` (required to enable Sentry)
-- `NULLCLAW_SENTRY_ENVIRONMENT`
-- `NULLCLAW_SENTRY_RELEASE`
-- `NULLCLAW_SENTRY_SAMPLE_RATE`
-- `NULLCLAW_SENTRY_TRACES_SAMPLE_RATE`
-- `NULLCLAW_SENTRY_DEBUG` (`true/false`)
-- `NULLCLAW_SENTRY_AUTO_SESSION` (`true/false`)
-- `NULLCLAW_SENTRY_INSTALL_SIGNAL_HANDLERS` (`true/false`)
-- `NULLCLAW_SENTRY_STARTUP_EVENT` (`true/false`)
-
-> **Dev fallback (no global install):** prefix commands with `zig-out/bin/` (example: `zig-out/bin/nullclaw status`).
 
 ## Architecture
 
-Every subsystem is a **vtable interface** — swap implementations with a config change, zero code changes.
+`nullALIS` is a vtable-driven Zig codebase.
 
-| Subsystem | Interface | Ships with | Extend |
-|-----------|-----------|------------|--------|
-| **AI Models** | `Provider` | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
-| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, WhatsApp, Line, Lark/Feishu, OneBot, QQ, Matrix, IRC, iMessage, Email, DingTalk, MaixCam, Webhook | Any messaging API |
-| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown | Any persistence backend |
-| **Tools** | `Tool` | shell, file_read, file_write, file_edit, memory_store, memory_recall, memory_forget, browser_open, screenshot, composio, http_request, hardware_info, hardware_memory, and more | Any capability |
-| **Observability** | `Observer` | Noop, Log, File, Multi | Prometheus, OTel |
-| **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed), WASM (wasmtime) | Any runtime |
-| **Security** | `Sandbox` | Landlock, Firejail, Bubblewrap, Docker, auto-detect | Any sandbox backend |
-| **Identity** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Any identity format |
-| **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
-| **Heartbeat** | Engine | HEARTBEAT.md periodic tasks | — |
-| **Skills** | Loader | TOML manifests + SKILL.md instructions | Community skill packs |
-| **Peripherals** | `Peripheral` | Serial, Arduino, Raspberry Pi GPIO, STM32/Nucleo | Any hardware interface |
-| **Cron** | Scheduler | Cron expressions + one-shot timers with JSON persistence | — |
+Primary extension points:
+- providers
+- channels
+- tools
+- memory backends
+- observability backends
+- runtime adapters
+- peripherals
 
-### Memory System
+Important top-level modules:
+- [src/main.zig](/Users/nova/Desktop/nullclaw/src/main.zig)
+- [src/gateway.zig](/Users/nova/Desktop/nullclaw/src/gateway.zig)
+- [src/agent.zig](/Users/nova/Desktop/nullclaw/src/agent.zig)
+- [src/config.zig](/Users/nova/Desktop/nullclaw/src/config.zig)
+- [src/tools/root.zig](/Users/nova/Desktop/nullclaw/src/tools/root.zig)
+- [src/memory/root.zig](/Users/nova/Desktop/nullclaw/src/memory/root.zig)
+- [src/providers/root.zig](/Users/nova/Desktop/nullclaw/src/providers/root.zig)
+- [src/channels/root.zig](/Users/nova/Desktop/nullclaw/src/channels/root.zig)
 
-All custom, zero external dependencies:
+The design goal is small binaries, low runtime overhead, explicit interfaces, and secure defaults.
 
-| Layer | Implementation |
-|-------|---------------|
-| **Vector DB** | Embeddings stored as BLOB in SQLite, cosine similarity search |
-| **Keyword Search** | FTS5 virtual tables with BM25 scoring |
-| **Hybrid Merge** | Weighted merge (configurable vector/keyword weights) |
-| **Embeddings** | `EmbeddingProvider` vtable — OpenAI, custom URL, or noop |
-| **Hygiene** | Automatic archival + purge of stale memories |
-| **Snapshots** | Export/import full memory state for migration |
+## Repository Status
 
-```json
-{
-  "memory": {
-    "backend": "sqlite",
-    "auto_save": true,
-    "embedding_provider": "openai",
-    "vector_weight": 0.7,
-    "keyword_weight": 0.3,
-    "hygiene_enabled": true,
-    "snapshot_enabled": false
-  }
-}
-```
+The repository is currently in an active transition across four fronts:
+- runtime rename from legacy `nullclaw` naming to `nullalis`
+- `ZAKI BOT` product integration
+- Postgres-backed multitenant runtime state
+- native outbound transport work to replace `curl` in production hot paths
 
-## Security
+That means some names in the codebase still reflect the old product name while the product direction and documentation move to `nullALIS`.
 
-nullclaw enforces security at **every layer**.
+## Development Notes
 
-| # | Item | Status | How |
-|---|------|--------|-----|
-| 1 | **Gateway not publicly exposed** | Done | Binds `127.0.0.1` by default. Refuses `0.0.0.0` without tunnel or explicit `allow_public_bind`. |
-| 2 | **Pairing required** | Done | 6-digit one-time code on startup. Exchange via `POST /pair` for bearer token. |
-| 3 | **Filesystem scoped** | Done | `workspace_only = true` by default. Null byte injection blocked. Symlink escape detection. |
-| 4 | **Access via tunnel only** | Done | Gateway refuses public bind without active tunnel. Supports Tailscale, Cloudflare, ngrok, or custom. |
-| 5 | **Sandbox isolation** | Done | Auto-detects best backend: Landlock, Firejail, Bubblewrap, or Docker. |
-| 6 | **Encrypted secrets** | Done | API keys encrypted with ChaCha20-Poly1305 using local key file. |
-| 7 | **Resource limits** | Done | Configurable memory, CPU, disk, and subprocess limits. |
-| 8 | **Audit logging** | Done | Signed event trail with configurable retention. |
-
-### Channel Allowlists
-
-- Empty allowlist = **deny all inbound messages**
-- `"*"` = **allow all** (explicit opt-in)
-- Otherwise = exact-match allowlist
-
-## Configuration
-
-Config: `~/.nullclaw/config.json` (created by `onboard`)
-
-> **OpenClaw compatible:** nullclaw uses the same config structure as [OpenClaw](https://github.com/openclaw/openclaw) (snake_case). Providers live under `models.providers`, the default model under `agents.defaults.model.primary`, and channels use `accounts` wrappers.
-> Top-level `default_provider` / `default_model` keys are not supported.
-
-```json
-{
-  "default_temperature": 0.7,
-
-  "models": {
-    "providers": {
-      "openrouter": { "api_key": "sk-or-..." },
-      "groq": { "api_key": "gsk_..." },
-      "anthropic": { "api_key": "sk-ant-...", "base_url": "https://api.anthropic.com" }
-    }
-  },
-
-  "agents": {
-    "defaults": {
-      "model": { "primary": "openrouter/anthropic/claude-sonnet-4" },
-      "heartbeat": { "every": "30m" }
-    },
-    "list": [
-      { "id": "researcher", "model": { "primary": "openrouter/anthropic/claude-opus-4" }, "system_prompt": "..." }
-    ]
-  },
-
-  "channels": {
-    "telegram": {
-      "accounts": {
-        "main": {
-          "bot_token": "123:ABC",
-          "allow_from": ["user1"],
-          "reply_in_private": true,
-          "proxy": "socks5://..."
-        }
-      }
-    },
-    "discord": {
-      "accounts": {
-        "main": {
-          "token": "disc-token",
-          "guild_id": "12345",
-          "allow_from": ["user1"],
-          "allow_bots": false
-        }
-      }
-    },
-    "irc": {
-      "accounts": {
-        "main": {
-          "host": "irc.libera.chat",
-          "port": 6697,
-          "nick": "nullclaw",
-          "channel": "#nullclaw",
-          "tls": true,
-          "allow_from": ["user1"]
-        }
-      }
-    },
-    "slack": {
-      "accounts": {
-        "main": {
-          "bot_token": "xoxb-...",
-          "app_token": "xapp-...",
-          "allow_from": ["user1"]
-        }
-      }
-    }
-  },
-
-  "tools": {
-    "media": {
-      "audio": {
-        "enabled": true,
-        "language": "ru",
-        "models": [{ "provider": "groq", "model": "whisper-large-v3" }]
-      }
-    }
-  },
-
-  "mcp_servers": {
-    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"] }
-  },
-
-  "memory": {
-    "backend": "sqlite",
-    "auto_save": true,
-    "embedding_provider": "openai",
-    "vector_weight": 0.7,
-    "keyword_weight": 0.3
-  },
-
-  "gateway": {
-    "port": 3000,
-    "require_pairing": true,
-    "allow_public_bind": false
-  },
-
-  "autonomy": {
-    "level": "supervised",
-    "workspace_only": true,
-    "max_actions_per_hour": 20
-  },
-
-  "runtime": {
-    "kind": "native",
-    "docker": {
-      "image": "alpine:3.20",
-      "network": "none",
-      "memory_limit_mb": 512,
-      "read_only_rootfs": true
-    }
-  },
-
-
-  "tunnel": { "provider": "none" },
-  "secrets": { "encrypt": true },
-  "identity": { "format": "openclaw" },
-
-  "security": {
-    "sandbox": { "backend": "auto" },
-    "resources": { "max_memory_mb": 512, "max_cpu_percent": 80 },
-    "audit": { "enabled": true, "retention_days": 90 }
-  }
-}
-```
-
-## Gateway API
-
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/health` | GET | None | Health check (always public) |
-| `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
-| `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
-| `/whatsapp` | GET | Query params | Meta webhook verification |
-| `/whatsapp` | POST | None (Meta signature) | WhatsApp incoming message webhook |
-
-### ZAKI-Agent Integration APIs
-
-These endpoints are available for dedicated ZAKI BOT integration (internal token required):
-
-- `POST /api/v1/chat/stream` (SSE)
-- `POST /api/v1/users/provision`
-- `GET/PATCH /api/v1/users/{id}/config`
-- `GET/PUT/DELETE /api/v1/users/{id}/secrets/{key}`
-- `GET/PUT /api/v1/users/{id}/heartbeat`
-- `GET/POST/PATCH/DELETE /api/v1/users/{id}/cron`
-- `GET/PUT /api/v1/users/{id}/onboarding`
-- `POST /api/v1/users/{id}/channels/telegram/connect`
-- `DELETE /api/v1/users/{id}/channels/telegram/disconnect`
-- `POST /webhook/telegram`
-- `POST /internal/drain`
-- `POST /internal/undrain`
-- `POST /internal/shutdown`
-- `GET /metrics`
-
-Required headers for tenant mode:
-- `X-Internal-Token`
-- `X-Zaki-User-Id` (required on `/api/v1/chat/stream`)
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `onboard --api-key sk-... --provider openrouter` | Quick setup with API key and provider |
-| `onboard --interactive` | Full interactive wizard |
-| `onboard --channels-only` | Reconfigure channels/allowlists only |
-| `agent -m "..."` | Single message mode |
-| `agent` | Interactive chat mode |
-| `gateway` | Start long-running runtime (default: `127.0.0.1:3000`) |
-| `service install\|start\|stop\|status\|uninstall` | Manage background service |
-| `doctor` | Diagnose system health |
-| `status` | Show full system status |
-| `channel status` | Show channel health/status |
-| `cron list\|add\|remove\|pause\|resume\|run` | Manage scheduled tasks |
-| `skills list\|install\|remove\|info` | Manage skill packs |
-| `hardware scan\|flash\|monitor` | Hardware device management |
-| `models list\|info\|benchmark` | Model catalog |
-| `migrate openclaw [--dry-run] [--source PATH]` | Import memory + migrate config from OpenClaw |
-
-## Development
-
-Build and tests are pinned to **Zig 0.15.2**.
+Activate repo hooks once per clone:
 
 ```bash
-zig build                          # Dev build
-zig build -Doptimize=ReleaseSmall  # Release build (678 KB)
-zig build test --summary all       # 3,230+ tests
+git config core.hooksPath .githooks
 ```
 
-### Channel Flow Coverage
+Useful commands:
 
-Channel CJM coverage (ingress parsing/filtering, session key routing, account propagation, bus handoff) is validated by tests in:
-
-- `src/channel_manager.zig` (runtime channel registration/start semantics + listener mode wiring)
-- `src/config.zig` (OpenClaw-compatible `channels.*.accounts` parsing, multi-account selection/ordering, aliases)
-- `src/gateway.zig` (Telegram/WhatsApp/LINE/Lark routed session keys from webhook payloads)
-- `src/daemon.zig` (gateway-loop inbound route resolution for Discord/QQ/OneBot/Mattermost/MaixCam)
-- `src/channels/discord.zig`, `src/channels/mattermost.zig`, `src/channels/qq.zig`, `src/channels/onebot.zig`, `src/channels/signal.zig`, `src/channels/line.zig`, `src/channels/whatsapp.zig` (per-channel inbound/outbound contracts)
-
-### Project Stats
-
+```bash
+zig build
+zig build test --summary all
+zig build -Doptimize=ReleaseSmall
+zig fmt src/**/*.zig
 ```
-Language:     Zig 0.15.2
-Source files: ~110
-Lines of code: ~45,000
-Tests:        3,230+
-Binary:       678 KB (ReleaseSmall)
-Peak RSS:     ~1 MB
-Startup:      <2 ms (Apple Silicon)
-Dependencies: 0 (besides libc + optional SQLite)
-```
-
-### Source Layout
-
-```
-src/
-  main.zig              CLI entry point + argument parsing
-  root.zig              Module hierarchy (public API)
-  config.zig            JSON config loader + 30 sub-config structs
-  agent.zig             Agent loop, auto-compaction, tool dispatch
-  daemon.zig            Daemon supervisor with exponential backoff
-  gateway.zig           HTTP gateway (rate limiting, idempotency, pairing)
-  channels/             18 channel implementations (telegram, signal, matrix, mattermost, discord, slack, whatsapp, line, lark, onebot, qq, ...)
-  providers/            22+ AI provider implementations
-  memory/               SQLite backend, embeddings, vector search, hygiene, snapshots
-  tools/                18 tool implementations
-  security/             Secrets (ChaCha20), sandbox backends (landlock, firejail, ...)
-  cron.zig              Cron scheduler with JSON persistence
-  health.zig            Component health registry
-  tunnel.zig            Tunnel vtable (cloudflare, ngrok, tailscale, custom)
-  peripherals.zig       Hardware peripheral vtable (serial, Arduino, RPi, Nucleo)
-  runtime.zig           Runtime vtable (native, docker, WASM)
-  skillforge.zig        Skill discovery (GitHub), evaluation, integration
-  ...
-```
-
-## Versioning
-
-nullclaw uses **CalVer** (`YYYY.M.D`) for releases — e.g. `v2026.2.20`.
-
-- **Tag format:** `vYYYY.M.D` (one release per day max; patch suffix `vYYYY.M.D.N` if needed)
-- **No stability guarantees yet** — the project is pre-1.0, config and CLI may change between releases
-- **`nullclaw --version`** prints the current version
-
-## Contributing
-
-Implement a vtable interface, submit a PR:
-
-- New `Provider` -> `src/providers/`
-- New `Channel` -> `src/channels/`
-- New `Tool` -> `src/tools/`
-- New `Memory` backend -> `src/memory/`
-- New `Tunnel` -> `src/tunnel.zig`
-- New `Sandbox` backend -> `src/security/`
-- New `Peripheral` -> `src/peripherals.zig`
-- New `Skill` -> `~/.nullclaw/workspace/skills/<name>/`
-
-## Disclaimer
-
-nullclaw is a pure open-source software project. It has **no token, no cryptocurrency, no blockchain component, and no financial instrument** of any kind. This project is not affiliated with any token or financial product.
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
-
----
-
-**nullclaw** — Null overhead. Null compromise. Deploy anywhere. Swap anything.
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=nullclaw/nullclaw&type=date&legend=top-left)](https://www.star-history.com/#nullclaw/nullclaw&type=date&legend=top-left)
+MIT. See [LICENSE](/Users/nova/Desktop/nullclaw/LICENSE).

@@ -18,7 +18,7 @@ const net_security = @import("../../net_security.zig");
 pub const QdrantConfig = struct {
     url: []const u8, // e.g. "http://localhost:6333"
     api_key: ?[]const u8, // optional
-    collection_name: []const u8, // e.g. "nullclaw_memories"
+    collection_name: []const u8, // e.g. "nullalis_memories"
     dimensions: u32, // must match embedding provider
 };
 
@@ -484,7 +484,7 @@ test "QdrantVectorStore init without api_key" {
     const q = try QdrantVectorStore.init(std.testing.allocator, .{
         .url = "http://localhost:6333",
         .api_key = null,
-        .collection_name = "nullclaw",
+        .collection_name = "nullalis",
         .dimensions = 1536,
     });
     try std.testing.expectEqual(@as(?[]const u8, null), q.api_key);

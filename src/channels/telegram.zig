@@ -265,8 +265,8 @@ fn sweepTempMediaFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) 
     var iter = dir.iterate();
     while (iter.next() catch null) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.startsWith(u8, entry.name, "nullclaw_doc_") and
-            !std.mem.startsWith(u8, entry.name, "nullclaw_photo_"))
+        if (!std.mem.startsWith(u8, entry.name, "nullalis_doc_") and
+            !std.mem.startsWith(u8, entry.name, "nullalis_photo_"))
             continue;
 
         const stat = dir.statFile(entry.name) catch continue;
@@ -1951,7 +1951,7 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
     var name_buf: [256]u8 = undefined;
     const safe_name = sanitizeFilenameComponent(&name_buf, file_id, 200);
     const tmp_base = trimTrailingPathSeparators(tmp_dir);
-    path_fbs.writer().print("{s}{s}nullclaw_photo_{s}{s}", .{ tmp_base, pathSeparator(tmp_base), safe_name, ext }) catch return null;
+    path_fbs.writer().print("{s}{s}nullalis_photo_{s}{s}", .{ tmp_base, pathSeparator(tmp_base), safe_name, ext }) catch return null;
     const local_path = path_fbs.getWritten();
 
     // Write file
@@ -2029,7 +2029,7 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, fil
         var safe_id: [12]u8 = undefined;
         const safe_id_part = sanitizeFilenameComponent(&safe_id, file_id, 12);
         const tmp_base = trimTrailingPathSeparators(tmp_dir);
-        path_fbs.writer().print("{s}{s}nullclaw_doc_{s}_{s}", .{ tmp_base, pathSeparator(tmp_base), safe_id_part, safe_name }) catch return null;
+        path_fbs.writer().print("{s}{s}nullalis_doc_{s}_{s}", .{ tmp_base, pathSeparator(tmp_base), safe_id_part, safe_name }) catch return null;
     } else {
         // Fall back to file_id with extension from tg_file_path
         const ext = if (std.mem.lastIndexOfScalar(u8, tg_file_path, '.')) |dot|
@@ -2039,7 +2039,7 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, fil
         var name_buf: [256]u8 = undefined;
         const safe_name = sanitizeFilenameComponent(&name_buf, file_id, 200);
         const tmp_base = trimTrailingPathSeparators(tmp_dir);
-        path_fbs.writer().print("{s}{s}nullclaw_doc_{s}{s}", .{ tmp_base, pathSeparator(tmp_base), safe_name, ext }) catch return null;
+        path_fbs.writer().print("{s}{s}nullalis_doc_{s}{s}", .{ tmp_base, pathSeparator(tmp_base), safe_name, ext }) catch return null;
     }
     const local_path = path_fbs.getWritten();
 
@@ -2608,13 +2608,13 @@ test "telegram pathSeparator avoids duplicate slash" {
 test "telegram parseAttachmentMarkers FILE with caption" {
     const parsed = try parseAttachmentMarkers(
         std.testing.allocator,
-        "[FILE:/tmp/nullclaw_doc_report.docx] Вот документ",
+        "[FILE:/tmp/nullalis_doc_report.docx] Вот документ",
     );
     defer parsed.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), parsed.attachments.len);
     try std.testing.expectEqual(AttachmentKind.document, parsed.attachments[0].kind);
-    try std.testing.expectEqualStrings("/tmp/nullclaw_doc_report.docx", parsed.attachments[0].target);
+    try std.testing.expectEqualStrings("/tmp/nullalis_doc_report.docx", parsed.attachments[0].target);
 }
 
 test "telegram parseAttachmentMarkers multiple FILE markers" {
@@ -2698,12 +2698,12 @@ test "telegram media group content merging preserves caption" {
 test "telegram parseAttachmentMarkers FILE with cyrillic filename" {
     const parsed = try parseAttachmentMarkers(
         std.testing.allocator,
-        "[FILE:/tmp/nullclaw_doc_Справка_в_школы.docx]",
+        "[FILE:/tmp/nullalis_doc_Справка_в_школы.docx]",
     );
     defer parsed.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), parsed.attachments.len);
-    try std.testing.expectEqualStrings("/tmp/nullclaw_doc_Справка_в_школы.docx", parsed.attachments[0].target);
+    try std.testing.expectEqualStrings("/tmp/nullalis_doc_Справка_в_школы.docx", parsed.attachments[0].target);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2986,12 +2986,12 @@ test "telegram nextPendingMediaDeadline returns earliest group deadline" {
     try std.testing.expectEqual(@as(u64, 10), deadline.?); // group-b latest=7 => 7+3
 }
 
-test "telegram sweepTempMediaFilesInDir removes only stale nullclaw temp media files" {
+test "telegram sweepTempMediaFilesInDir removes only stale nullalis temp media files" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "nullclaw_doc_old.txt", .data = "doc" });
-    try tmp_dir.dir.writeFile(.{ .sub_path = "nullclaw_photo_old.jpg", .data = "photo" });
+    try tmp_dir.dir.writeFile(.{ .sub_path = "nullalis_doc_old.txt", .data = "doc" });
+    try tmp_dir.dir.writeFile(.{ .sub_path = "nullalis_photo_old.jpg", .data = "photo" });
     try tmp_dir.dir.writeFile(.{ .sub_path = "keep.txt", .data = "keep" });
 
     const abs_tmp = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
@@ -3003,10 +3003,10 @@ test "telegram sweepTempMediaFilesInDir removes only stale nullclaw temp media f
     const keep_stat = try tmp_dir.dir.statFile("keep.txt");
     try std.testing.expect(keep_stat.size > 0);
 
-    const doc_stat = tmp_dir.dir.statFile("nullclaw_doc_old.txt");
+    const doc_stat = tmp_dir.dir.statFile("nullalis_doc_old.txt");
     try std.testing.expectError(error.FileNotFound, doc_stat);
 
-    const photo_stat = tmp_dir.dir.statFile("nullclaw_photo_old.jpg");
+    const photo_stat = tmp_dir.dir.statFile("nullalis_photo_old.jpg");
     try std.testing.expectError(error.FileNotFound, photo_stat);
 }
 

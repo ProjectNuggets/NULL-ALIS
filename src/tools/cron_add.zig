@@ -87,7 +87,7 @@ pub const CronAddTool = struct {
     }
 };
 
-/// Load the CronScheduler from persisted state (~/.nullclaw/cron.json).
+/// Load the CronScheduler from persisted state (~/.nullalis/cron.json).
 /// Shared by cron_add, cron_list, cron_remove, and schedule tools.
 pub fn loadScheduler(allocator: std.mem.Allocator) !CronScheduler {
     var scheduler = CronScheduler.init(allocator, 1024, true);

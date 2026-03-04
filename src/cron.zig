@@ -1567,11 +1567,11 @@ const JsonCronJob = struct {
     one_shot: bool,
 };
 
-/// Get the default cron.json path: ~/.nullclaw/cron.json
+/// Get the default cron.json path: ~/.nullalis/cron.json
 fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.json" });
+    return std.fs.path.join(allocator, &.{ home, ".nullalis", "cron.json" });
 }
 
 fn cronStorePathForScheduler(allocator: std.mem.Allocator, scheduler: *const CronScheduler) ![]const u8 {
@@ -1603,7 +1603,7 @@ fn appendNullableJsonStringField(
     }
 }
 
-/// Save scheduler jobs to ~/.nullclaw/cron.json.
+/// Save scheduler jobs to ~/.nullalis/cron.json.
 pub fn saveJobs(scheduler: *const CronScheduler) !void {
     const path = try cronStorePathForScheduler(scheduler.allocator, scheduler);
     defer scheduler.allocator.free(path);
@@ -1618,12 +1618,12 @@ pub fn saveJobsToPath(scheduler: *CronScheduler, path: []const u8) !void {
     try saveJobs(scheduler);
 }
 
-/// Load jobs from ~/.nullclaw/cron.json into the scheduler.
+/// Load jobs from ~/.nullalis/cron.json into the scheduler.
 pub fn loadJobs(scheduler: *CronScheduler) !void {
     try loadJobsWithPolicy(scheduler, .best_effort);
 }
 
-/// Load jobs from ~/.nullclaw/cron.json; unlike loadJobs, this returns
+/// Load jobs from ~/.nullalis/cron.json; unlike loadJobs, this returns
 /// parse/read errors (except missing file/path).
 pub fn loadJobsStrict(scheduler: *CronScheduler) !void {
     try loadJobsWithPolicy(scheduler, .strict);
@@ -1697,8 +1697,8 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
     if (jobs.len == 0) {
         log.info("No scheduled tasks yet.", .{});
         log.info("Usage:", .{});
-        log.info("  nullclaw cron add '*/10 * * * *' 'echo hello'", .{});
-        log.info("  nullclaw cron once 30m 'echo reminder'", .{});
+        log.info("  nullalis cron add '*/10 * * * *' 'echo hello'", .{});
+        log.info("  nullalis cron once 30m 'echo reminder'", .{});
         return;
     }
 

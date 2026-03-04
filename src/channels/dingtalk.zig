@@ -52,11 +52,11 @@ pub const DingTalkChannel = struct {
     /// Send a message via DingTalk session webhook URL.
     /// The target is expected to be the per-session webhook URL provided by the DingTalk Stream API.
     pub fn sendMessage(self: *DingTalkChannel, webhook_url: []const u8, text: []const u8) !void {
-        // Build JSON body: {"msgtype":"markdown","markdown":{"title":"nullclaw","text":"..."}}
+        // Build JSON body: {"msgtype":"markdown","markdown":{"title":"nullalis","text":"..."}}
         var body_buf: [8192]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&body_buf);
         const w = fbs.writer();
-        try w.writeAll("{\"msgtype\":\"markdown\",\"markdown\":{\"title\":\"nullclaw\",\"text\":");
+        try w.writeAll("{\"msgtype\":\"markdown\",\"markdown\":{\"title\":\"nullalis\",\"text\":");
         try root.appendJsonStringW(w, text);
         try w.writeAll("}}");
         const body = fbs.getWritten();

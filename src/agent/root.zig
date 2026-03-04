@@ -2371,7 +2371,7 @@ test "slash /model with telegram bot mention switches model" {
     defer agent.deinit();
     agent.max_tokens = 111;
 
-    const response = (try agent.handleSlashCommand("/model@nullclaw_bot qianfan/custom-model")).?;
+    const response = (try agent.handleSlashCommand("/model@nullalis_bot qianfan/custom-model")).?;
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);

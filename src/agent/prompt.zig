@@ -214,11 +214,11 @@ fn appendSkillsSection(
     w: anytype,
     workspace_dir: []const u8,
 ) !void {
-    // Two-source loading: workspace skills + ~/.nullclaw/skills/community/
+    // Two-source loading: workspace skills + ~/.nullalis/skills/community/
     const home_dir = platform.getHomeDir(allocator) catch null;
     defer if (home_dir) |h| allocator.free(h);
     const community_base = if (home_dir) |h|
-        std.fs.path.join(allocator, &.{ h, ".nullclaw", "skills" }) catch null
+        std.fs.path.join(allocator, &.{ h, ".nullalis", "skills" }) catch null
     else
         null;
     defer if (community_base) |cb| allocator.free(cb);
@@ -550,7 +550,7 @@ test "appendSkillsSection with no skills produces nothing" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, "/tmp/nullclaw-prompt-test-no-skills");
+    try appendSkillsSection(allocator, w, "/tmp/nullalis-prompt-test-no-skills");
 
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
@@ -686,7 +686,7 @@ test "appendSkillsSection renders unavailable skill with missing deps" {
     {
         const f = try tmp.dir.createFile("skills/docker-deploy/skill.json", .{});
         defer f.close();
-        try f.writeAll("{\"name\": \"docker-deploy\", \"description\": \"Deploy with docker\", \"requires_bins\": [\"nullclaw_fake_docker_xyz\"], \"requires_env\": [\"NULLCLAW_FAKE_TOKEN_XYZ\"]}");
+        try f.writeAll("{\"name\": \"docker-deploy\", \"description\": \"Deploy with docker\", \"requires_bins\": [\"nullalis_fake_docker_xyz\"], \"requires_env\": [\"NULLCLAW_FAKE_TOKEN_XYZ\"]}");
     }
 
     const base = try tmp.dir.realpathAlloc(allocator, ".");
@@ -719,7 +719,7 @@ test "appendSkillsSection unavailable always=true skill renders in XML not full"
     {
         const f = try tmp.dir.createFile("skills/broken-always/skill.json", .{});
         defer f.close();
-        try f.writeAll("{\"name\": \"broken-always\", \"description\": \"Broken always skill\", \"always\": true, \"requires_bins\": [\"nullclaw_nonexistent_xyz_aaa\"]}");
+        try f.writeAll("{\"name\": \"broken-always\", \"description\": \"Broken always skill\", \"always\": true, \"requires_bins\": [\"nullalis_nonexistent_xyz_aaa\"]}");
     }
     {
         const f = try tmp.dir.createFile("skills/broken-always/SKILL.md", .{});

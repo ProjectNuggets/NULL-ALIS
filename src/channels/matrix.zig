@@ -118,7 +118,7 @@ pub const MatrixChannel = struct {
 
     fn nextTxnId(self: *MatrixChannel, buf: []u8) ![]const u8 {
         self.txn_counter += 1;
-        return std.fmt.bufPrint(buf, "nullclaw-{s}-{d}-{d}", .{
+        return std.fmt.bufPrint(buf, "nullalis-{s}-{d}-{d}", .{
             self.account_id,
             std.time.timestamp(),
             self.txn_counter,

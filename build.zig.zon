@@ -1,7 +1,7 @@
 .{
-    .name = .nullclaw,
+    .name = .nullalis,
     .version = "2026.2.25",
-    .fingerprint = 0xe73e13d1c95956c2,
+    .fingerprint = 0x8283954b34429182,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .sqlite3 = .{

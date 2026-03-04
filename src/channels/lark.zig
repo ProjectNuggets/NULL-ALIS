@@ -540,7 +540,7 @@ test "lark parse valid text message" {
     const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
-        \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_testuser123"}},"message":{"message_type":"text","content":"{\"text\":\"Hello nullclaw!\"}","chat_id":"oc_chat123","create_time":"1699999999000"}}}
+        \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_testuser123"}},"message":{"message_type":"text","content":"{\"text\":\"Hello nullalis!\"}","chat_id":"oc_chat123","create_time":"1699999999000"}}}
     ;
 
     const msgs = try ch.parseEventPayload(allocator, payload);
@@ -553,7 +553,7 @@ test "lark parse valid text message" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), msgs.len);
-    try std.testing.expectEqualStrings("Hello nullclaw!", msgs[0].content);
+    try std.testing.expectEqualStrings("Hello nullalis!", msgs[0].content);
     try std.testing.expectEqualStrings("oc_chat123", msgs[0].sender);
     try std.testing.expectEqual(@as(u64, 1_699_999_999), msgs[0].timestamp);
     try std.testing.expect(!msgs[0].is_group);

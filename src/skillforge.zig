@@ -66,8 +66,8 @@ pub const SkillCandidate = struct {
 
 // ── Scout ────────────────────────────────────────────────────────
 
-/// Scout: search GitHub for nullclaw-compatible skill repositories.
-/// Uses api.github.com/search/repositories?q=QUERY+topic:nullclaw
+/// Scout: search GitHub for nullalis-compatible skill repositories.
+/// Uses api.github.com/search/repositories?q=QUERY+topic:nullalis
 pub fn scout(allocator: std.mem.Allocator, query: []const u8) !std.ArrayList(SkillCandidate) {
     var candidates: std.ArrayList(SkillCandidate) = .empty;
     errdefer candidates.deinit(allocator);
@@ -78,7 +78,7 @@ pub fn scout(allocator: std.mem.Allocator, query: []const u8) !std.ArrayList(Ski
 
     const url = try std.fmt.allocPrint(
         allocator,
-        "https://api.github.com/search/repositories?q={s}+topic:nullclaw&sort=stars&order=desc&per_page=30",
+        "https://api.github.com/search/repositories?q={s}+topic:nullalis&sort=stars&order=desc&per_page=30",
         .{encoded_query},
     );
     defer allocator.free(url);
@@ -94,7 +94,7 @@ pub fn scout(allocator: std.mem.Allocator, query: []const u8) !std.ArrayList(Ski
         .location = .{ .url = url },
         .method = .GET,
         .extra_headers = &.{
-            .{ .name = "User-Agent", .value = "nullclaw/0.1" },
+            .{ .name = "User-Agent", .value = "nullalis/0.1" },
             .{ .name = "Accept", .value = "application/vnd.github.v3+json" },
         },
         .response_writer = &aw.writer,
@@ -239,7 +239,7 @@ pub fn buildGitHubSearchUrl(allocator: std.mem.Allocator, query: []const u8) ![]
 
     return std.fmt.allocPrint(
         allocator,
-        "https://api.github.com/search/repositories?q={s}+topic:nullclaw&sort=stars&order=desc&per_page=30",
+        "https://api.github.com/search/repositories?q={s}+topic:nullalis&sort=stars&order=desc&per_page=30",
         .{encoded},
     );
 }
@@ -567,7 +567,7 @@ pub fn forge(allocator: std.mem.Allocator, cfg: SkillForgeConfig) !ForgeReport {
     }
 
     // Scout phase
-    var candidates = try scout(allocator, "nullclaw skill");
+    var candidates = try scout(allocator, "nullalis skill");
     defer candidates.deinit(allocator);
 
     var report = ForgeReport{};
@@ -919,11 +919,11 @@ test "unknown language gets low compatibility" {
 
 test "buildGitHubSearchUrl encodes query" {
     const allocator = std.testing.allocator;
-    const url = try buildGitHubSearchUrl(allocator, "nullclaw skill");
+    const url = try buildGitHubSearchUrl(allocator, "nullalis skill");
     defer allocator.free(url);
-    try std.testing.expect(std.mem.indexOf(u8, url, "nullclaw+skill") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "nullalis+skill") != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "api.github.com") != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "topic:nullclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "topic:nullalis") != null);
 }
 
 test "buildGitHubSearchUrl handles special chars" {

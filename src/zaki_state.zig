@@ -1559,7 +1559,7 @@ test "postgres claimed job one-shot completion preserves run history and hides j
     }
     try mgr.migrate();
 
-    try mgr.provisionUser(2, "/tmp/nullclaw-zaki-bot-test-user-2/workspace");
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
     try mgr.replaceJobsJson(2, "agent:zaki-bot:user:2:main", "[{\"id\":\"once-reminder\",\"expression\":\"@once:1m\",\"command\":\"message \\\"hello\\\"\",\"next_run_secs\":1,\"one_shot\":true,\"job_type\":\"agent\",\"session_target\":\"main\",\"prompt\":\"say hello\",\"delivery\":{\"mode\":\"always\",\"channel\":\"telegram\",\"to\":\"chat-2\",\"best_effort\":false}}]");
 
     const claimed = try mgr.claimDueJobs(allocator, "test-owner", 5, 60, 10);
@@ -1628,7 +1628,7 @@ test "postgres claimed recurring job reschedules and records run" {
     }
     try mgr.migrate();
 
-    try mgr.provisionUser(2, "/tmp/nullclaw-zaki-bot-test-user-2/workspace");
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
 
     var scheduler = cron_mod.CronScheduler.init(allocator, 1, true);
     defer scheduler.deinit();
@@ -1663,7 +1663,7 @@ test "postgres claimed recurring job reschedules and records run" {
 
     var runtime_scheduler = cron_mod.CronScheduler.init(allocator, 1, true);
     defer runtime_scheduler.deinit();
-    try runtime_scheduler.setExecutionContext("2", "/tmp/nullclaw-zaki-bot-test-user-2", "/tmp/nullclaw-zaki-bot-test-user-2/workspace");
+    try runtime_scheduler.setExecutionContext("2", "/tmp/nullalis-zaki-bot-test-user-2", "/tmp/nullalis-zaki-bot-test-user-2/workspace");
     try cron_mod.loadJobFromJsonSlice(&runtime_scheduler, claimed[0].raw_job_json);
     _ = runtime_scheduler.tick(10, null);
     try std.testing.expectEqual(@as(usize, 1), runtime_scheduler.listJobs().len);
@@ -1719,8 +1719,8 @@ test "postgres memory upsert recall list and forget stay user-scoped" {
     }
     try mgr.migrate();
 
-    try mgr.provisionUser(2, "/tmp/nullclaw-zaki-bot-test-user-2/workspace");
-    try mgr.provisionUser(3, "/tmp/nullclaw-zaki-bot-test-user-3/workspace");
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+    try mgr.provisionUser(3, "/tmp/nullalis-zaki-bot-test-user-3/workspace");
 
     try mgr.upsertMemory(2, "favorite_snack", "pistachios", .core, "agent:zaki-bot:user:2:main");
     try mgr.upsertMemory(3, "favorite_snack", "olives", .core, "agent:zaki-bot:user:3:main");
