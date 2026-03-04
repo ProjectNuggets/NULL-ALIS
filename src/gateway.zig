@@ -2302,6 +2302,7 @@ fn handleApiRoute(
     }
 
     if (std.mem.eql(u8, base_path, "/api/v1/chat/stream")) {
+        const request_start_ms = std.time.milliTimestamp();
         if (!std.mem.eql(u8, method, "POST")) {
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         }
@@ -2353,6 +2354,7 @@ fn handleApiRoute(
         const session_key = mainUserSessionKey(&session_buf, user_id);
         _ = state.chat_stream_total.fetchAdd(1, .monotonic);
 
+        const chat_start_ms = std.time.milliTimestamp();
         const reply = blk: {
             if (state.tenant_enabled) {
                 const cfg = config_opt orelse {
@@ -2404,11 +2406,22 @@ fn handleApiRoute(
                 };
             };
         };
+        const chat_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - chat_start_ms));
         defer root_allocator.free(reply);
         const payload_text = if (reply.len > 0) reply else "received";
+        const sse_start_ms = std.time.milliTimestamp();
         const sse = sseChatPayload(req_allocator, payload_text, session_key) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build sse\"}" };
         };
+        const sse_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - sse_start_ms));
+        const request_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - request_start_ms));
+        log.info("chat.stream.complete user={s} session={s} chat_ms={d} sse_ms={d} total_ms={d}", .{
+            user_id,
+            session_key,
+            chat_duration_ms,
+            sse_duration_ms,
+            request_duration_ms,
+        });
         return .{
             .status = "200 OK",
             .body = sse,

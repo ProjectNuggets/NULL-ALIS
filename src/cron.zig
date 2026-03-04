@@ -478,6 +478,24 @@ pub const CronScheduler = struct {
         self.agent_runner_ctx = runner_ctx;
     }
 
+    fn hasJobId(self: *const CronScheduler, id: []const u8) bool {
+        for (self.jobs.items) |job| {
+            if (std.mem.eql(u8, job.id, id)) return true;
+        }
+        return false;
+    }
+
+    fn generateJobId(self: *const CronScheduler, allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
+        const now_ns: u128 = @bitCast(std.time.nanoTimestamp());
+        var attempt: u32 = 0;
+        while (attempt < 1024) : (attempt += 1) {
+            const candidate = try std.fmt.allocPrint(allocator, "{s}-{d}-{d}", .{ prefix, now_ns, attempt });
+            errdefer allocator.free(candidate);
+            if (!self.hasJobId(candidate)) return candidate;
+        }
+        return error.OutOfMemory;
+    }
+
     /// Add a recurring cron job.
     pub fn addJob(self: *CronScheduler, expression: []const u8, command: []const u8) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
@@ -487,12 +505,10 @@ pub const CronScheduler = struct {
         const now = std.time.timestamp();
         const next_run_secs = try nextRunForCronExpression(expression, now);
 
-        // Generate a simple numeric ID
-        var id_buf: [32]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buf, "job-{d}", .{self.jobs.items.len + 1}) catch "job-?";
+        const id = try self.generateJobId(self.allocator, "job");
 
         try self.jobs.append(self.allocator, .{
-            .id = try self.allocator.dupe(u8, id),
+            .id = id,
             .expression = try self.allocator.dupe(u8, expression),
             .command = try self.allocator.dupe(u8, command),
             .next_run_secs = next_run_secs,
@@ -509,14 +525,13 @@ pub const CronScheduler = struct {
         const delay_secs = try parseDuration(delay);
         const now = std.time.timestamp();
 
-        var id_buf: [32]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buf, "once-{d}", .{self.jobs.items.len + 1}) catch "once-?";
+        const id = try self.generateJobId(self.allocator, "once");
 
         var expr_buf: [64]u8 = undefined;
         const expr = std.fmt.bufPrint(&expr_buf, "@once:{s}", .{delay}) catch "@once";
 
         try self.jobs.append(self.allocator, .{
-            .id = try self.allocator.dupe(u8, id),
+            .id = id,
             .expression = try self.allocator.dupe(u8, expr),
             .command = try self.allocator.dupe(u8, command),
             .next_run_secs = now + delay_secs,
@@ -1955,6 +1970,25 @@ test "CronScheduler addOnce creates one-shot" {
 
     const job = try scheduler.addOnce("30m", "echo once");
     try std.testing.expect(job.one_shot);
+}
+
+test "CronScheduler generated ids are unique" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const recurring = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+    const recurring_id = try std.testing.allocator.dupe(u8, recurring.id);
+    defer std.testing.allocator.free(recurring_id);
+    const one_shot = try scheduler.addOnce("30m", "echo once");
+    const one_shot_id = try std.testing.allocator.dupe(u8, one_shot.id);
+    defer std.testing.allocator.free(one_shot_id);
+    const recurring_two = try scheduler.addJob("0 * * * *", "echo hourly");
+    const recurring_two_id = try std.testing.allocator.dupe(u8, recurring_two.id);
+    defer std.testing.allocator.free(recurring_two_id);
+
+    try std.testing.expect(!std.mem.eql(u8, recurring_id, one_shot_id));
+    try std.testing.expect(!std.mem.eql(u8, recurring_id, recurring_two_id));
+    try std.testing.expect(!std.mem.eql(u8, one_shot_id, recurring_two_id));
 }
 
 test "CronScheduler remove" {

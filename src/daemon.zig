@@ -1870,14 +1870,23 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     const cmd_runtime = "echo merge_runtime_keep_7d1c";
     const cmd_external = "echo merge_external_add_9a42";
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cron_path = try std.fmt.allocPrint(allocator, "{s}/cron.json", .{tmp_root});
+    defer allocator.free(cron_path);
+
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();
+    try runtime.setStorePath(cron_path);
     _ = try runtime.addJob("* * * * *", cmd_runtime);
     runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
     try cron.saveJobs(&runtime);
 
     var loaded = CronScheduler.init(allocator, 32, true);
     defer loaded.deinit();
+    try loaded.setStorePath(cron_path);
     try cron.loadJobs(&loaded);
 
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
@@ -1890,6 +1899,7 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     // Simulate concurrent writer adding a new job after scheduler reload.
     var external = CronScheduler.init(allocator, 32, true);
     defer external.deinit();
+    try external.setStorePath(cron_path);
     try cron.loadJobs(&external);
     _ = try external.addJob("*/5 * * * *", cmd_external);
     try cron.saveJobs(&external);
@@ -1899,6 +1909,7 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
 
     var merged = CronScheduler.init(allocator, 64, true);
     defer merged.deinit();
+    try merged.setStorePath(cron_path);
     try cron.loadJobs(&merged);
 
     var found_runtime = false;

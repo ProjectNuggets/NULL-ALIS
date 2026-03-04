@@ -22,6 +22,7 @@ const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
+const log = std.log.scoped(.session);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Session
@@ -190,6 +191,7 @@ pub const SessionManager = struct {
         conversation_context: ?ConversationContext,
         message_turn_context: ?tools_mod.MessageTurnContext,
     ) ![]const u8 {
+        const total_start_ms = std.time.milliTimestamp();
         const session = try self.getOrCreate(session_key);
 
         session.mutex.lock();
@@ -202,7 +204,9 @@ pub const SessionManager = struct {
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
 
+        const agent_start_ms = std.time.milliTimestamp();
         const response = try session.agent.turn(content);
+        const agent_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - agent_start_ms));
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
 
@@ -212,6 +216,7 @@ pub const SessionManager = struct {
         }
 
         // Persist messages via session store
+        const persist_start_ms = std.time.milliTimestamp();
         if (self.session_store) |store| {
             const trimmed = std.mem.trim(u8, content, " \t\r\n");
             if (slashClearsSession(trimmed)) {
@@ -225,6 +230,14 @@ pub const SessionManager = struct {
                 store.saveMessage(session_key, "assistant", response) catch {};
             }
         }
+        const persist_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - persist_start_ms));
+        const total_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - total_start_ms));
+        log.info("message.process session={s} agent_ms={d} persist_ms={d} total_ms={d}", .{
+            session_key,
+            agent_duration_ms,
+            persist_duration_ms,
+            total_duration_ms,
+        });
 
         return response;
     }

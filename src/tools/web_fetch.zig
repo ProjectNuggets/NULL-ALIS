@@ -66,7 +66,7 @@ pub const WebFetchTool = struct {
         };
         const response = http_util.request_with_mode(
             allocator,
-            .{},
+            .{ .mode = .curl_only },
             .{
                 .method = "GET",
                 .url = url,

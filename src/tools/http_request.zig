@@ -137,7 +137,7 @@ pub const HttpRequestTool = struct {
 
         const response = http_util.request_with_mode(
             allocator,
-            .{},
+            .{ .mode = .curl_only },
             .{
                 .method = method_name,
                 .url = url,

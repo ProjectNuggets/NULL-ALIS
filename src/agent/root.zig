@@ -632,6 +632,7 @@ pub const Agent = struct {
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+        const turn_start_ms = std.time.milliTimestamp();
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
@@ -722,10 +723,13 @@ pub const Agent = struct {
 
         // Enrich message with memory context (always returns owned slice; ownership → history)
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
+        const enrich_start_ms = std.time.milliTimestamp();
         const enriched = if (self.mem) |mem|
             try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, user_message, self.memory_session_id)
         else
             try self.allocator.dupe(u8, user_message);
+        const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
+        log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
         errdefer self.allocator.free(enriched);
 
         try self.history.append(self.allocator, .{
@@ -772,7 +776,14 @@ pub const Agent = struct {
             const arena = iter_arena.allocator();
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
+            const build_messages_start_ms = std.time.milliTimestamp();
             const messages = try self.buildProviderMessages(arena);
+            const build_messages_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - build_messages_start_ms));
+            log.info("turn.stage stage=build_provider_messages iteration={d} duration_ms={d} history_messages={d}", .{
+                iteration,
+                build_messages_duration_ms,
+                self.history.items.len,
+            });
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
@@ -946,6 +957,7 @@ pub const Agent = struct {
             }
 
             if (use_native) {
+                const parse_start_ms = std.time.milliTimestamp();
                 // Provider returned structured tool_calls — convert them
                 parsed_calls = try dispatcher.parseStructuredToolCalls(self.allocator, response.tool_calls);
                 free_parsed_calls = true;
@@ -969,7 +981,14 @@ pub const Agent = struct {
                     parsed_calls,
                 );
                 free_assistant_history = true;
+                const parse_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - parse_start_ms));
+                log.info("turn.stage stage=parse_provider_response iteration={d} duration_ms={d} tool_calls={d}", .{
+                    iteration,
+                    parse_duration_ms,
+                    parsed_calls.len,
+                });
             } else {
+                const parse_start_ms = std.time.milliTimestamp();
                 // No native tool calls — parse response text for XML tool calls
                 const xml_parsed = try dispatcher.parseToolCalls(self.allocator, response_text);
                 parsed_calls = xml_parsed.calls;
@@ -978,6 +997,12 @@ pub const Agent = struct {
                 free_parsed_text = true;
                 // For XML path, store the raw response text as history
                 assistant_history_content = response_text;
+                const parse_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - parse_start_ms));
+                log.info("turn.stage stage=parse_provider_response iteration={d} duration_ms={d} tool_calls={d}", .{
+                    iteration,
+                    parse_duration_ms,
+                    parsed_calls.len,
+                });
             }
 
             // Determine display text
@@ -1009,13 +1034,17 @@ pub const Agent = struct {
                 }
 
                 // No tool calls — final response
+                const finalize_start_ms = std.time.milliTimestamp();
                 const base_text = if (self.context_was_compacted) blk: {
                     self.context_was_compacted = false;
                     break :blk try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{display_text});
                 } else try self.allocator.dupe(u8, display_text);
                 errdefer self.allocator.free(base_text);
 
+                const compose_start_ms = std.time.milliTimestamp();
                 const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
+                const compose_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compose_start_ms));
+                log.info("turn.stage stage=compose_final_reply iteration={d} duration_ms={d}", .{ iteration, compose_duration_ms });
                 errdefer self.allocator.free(final_text);
 
                 // Dupe from display_text directly (not from final_text) to avoid double-dupe
@@ -1024,11 +1053,20 @@ pub const Agent = struct {
                     .content = try self.allocator.dupe(u8, display_text),
                 });
 
-                // Auto-compaction before hard trimming to preserve context
-                self.last_turn_compacted = self.autoCompactHistory() catch false;
+                // Keep interactive turns fast: trim history here, but defer
+                // expensive provider-backed compaction to explicit/overflow paths.
+                const compact_start_ms = std.time.milliTimestamp();
+                self.last_turn_compacted = false;
                 self.trimHistory();
+                const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
+                log.info("turn.stage stage=compact_trim iteration={d} duration_ms={d} compacted={}", .{
+                    iteration,
+                    compact_duration_ms,
+                    self.last_turn_compacted,
+                });
 
                 // Auto-save assistant response
+                const autosave_start_ms = std.time.milliTimestamp();
                 if (self.auto_save) {
                     if (self.mem) |mem| {
                         // Truncate to ~100 bytes on a valid UTF-8 boundary
@@ -1050,11 +1088,16 @@ pub const Agent = struct {
                         }
                     }
                 }
+                const autosave_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - autosave_start_ms));
+                log.info("turn.stage stage=autosave_assistant iteration={d} duration_ms={d}", .{ iteration, autosave_duration_ms });
 
                 // Drain durable outbox after turn completion (best-effort)
+                const outbox_start_ms = std.time.milliTimestamp();
                 if (self.mem_rt) |rt| {
                     _ = rt.drainOutbox(self.allocator);
                 }
+                const outbox_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - outbox_start_ms));
+                log.info("turn.stage stage=drain_outbox iteration={d} duration_ms={d}", .{ iteration, outbox_duration_ms });
 
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
@@ -1066,6 +1109,7 @@ pub const Agent = struct {
 
                 // ── Cache store (only for direct responses, no tool calls) ──
                 if (self.response_cache) |rc| {
+                    const cache_start_ms = std.time.milliTimestamp();
                     var store_key_buf: [16]u8 = undefined;
                     const sys_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
                         self.history.items[0].content
@@ -1074,7 +1118,17 @@ pub const Agent = struct {
                     const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, user_message);
                     const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
                     rc.put(self.allocator, store_key_hex, self.model_name, final_text, token_count) catch {};
+                    const cache_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - cache_start_ms));
+                    log.info("turn.stage stage=response_cache_put iteration={d} duration_ms={d}", .{ iteration, cache_duration_ms });
                 }
+
+                const finalize_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - finalize_start_ms));
+                const total_turn_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - turn_start_ms));
+                log.info("turn.stage stage=finalize_no_tools iteration={d} duration_ms={d} total_turn_ms={d}", .{
+                    iteration,
+                    finalize_duration_ms,
+                    total_turn_ms,
+                });
 
                 return final_text;
             }
@@ -1129,6 +1183,7 @@ pub const Agent = struct {
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
+            const reflect_start_ms = std.time.milliTimestamp();
             const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
             const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
             const with_reflection = try std.fmt.allocPrint(
@@ -1142,8 +1197,17 @@ pub const Agent = struct {
                 .role = .user,
                 .content = try self.allocator.dupe(u8, with_reflection),
             });
+            const reflect_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - reflect_start_ms));
+            log.info("turn.stage stage=tool_reflection iteration={d} duration_ms={d} results={d}", .{
+                iteration,
+                reflect_duration_ms,
+                results_buf.items.len,
+            });
 
+            const trim_start_ms = std.time.milliTimestamp();
             self.trimHistory();
+            const trim_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - trim_start_ms));
+            log.info("turn.stage stage=trim_history_after_tools iteration={d} duration_ms={d}", .{ iteration, trim_duration_ms });
 
             // Free provider response fields now that all borrows are consumed.
             self.freeResponseFields(&response);
