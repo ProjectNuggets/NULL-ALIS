@@ -359,7 +359,7 @@ const TenantRuntime = struct {
     pg_session_store: ?*zaki_state_mod.Manager.UserSessionStore,
     state_mgr: ?*zaki_state_mod.Manager,
     subagent_manager: ?*subagent_mod.SubagentManager,
-    noop_obs: *observability.NoopObserver,
+    log_obs: *observability.LogObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: i64,
     lock: std.Thread.Mutex = .{},
@@ -390,7 +390,7 @@ const TenantRuntime = struct {
             .pg_session_store = null,
             .state_mgr = state_mgr,
             .subagent_manager = null,
-            .noop_obs = undefined,
+            .log_obs = undefined,
             .session_mgr = undefined,
             .last_used_s = std.time.timestamp(),
         };
@@ -482,10 +482,10 @@ const TenantRuntime = struct {
         }) catch &.{};
         errdefer if (runtime.tools.len > 0) tools_mod.deinitTools(allocator, runtime.tools);
 
-        const noop_obs = try allocator.create(observability.NoopObserver);
-        errdefer allocator.destroy(noop_obs);
-        noop_obs.* = .{};
-        runtime.noop_obs = noop_obs;
+        const log_obs = try allocator.create(observability.LogObserver);
+        errdefer allocator.destroy(log_obs);
+        log_obs.* = .{};
+        runtime.log_obs = log_obs;
 
         const mem_opt: ?memory_mod.Memory = if (runtime.mem_rt) |rt| rt.memory else null;
         runtime.session_mgr = session_mod.SessionManager.init(
@@ -494,7 +494,7 @@ const TenantRuntime = struct {
             provider_i,
             runtime.tools,
             mem_opt,
-            runtime.noop_obs.observer(),
+            runtime.log_obs.observer(),
             if (runtime.pg_session_store) |store| store.sessionStore() else if (runtime.mem_rt) |rt| rt.session_store else null,
             if (runtime.mem_rt) |*rt| rt.response_cache else null,
         );
@@ -570,7 +570,7 @@ const TenantRuntime = struct {
         }
         if (self.mem_rt) |*rt| rt.deinit();
         self.provider_bundle.deinit();
-        self.allocator.destroy(self.noop_obs);
+        self.allocator.destroy(self.log_obs);
         self.allocator.free(self.workspace_path);
         self.allocator.free(self.user_id);
         self.allocator.destroy(self);
@@ -4342,7 +4342,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
-    var noop_obs_gateway = observability.NoopObserver{};
+    var log_obs_gateway = observability.LogObserver{};
     const needs_local_agent = event_bus == null;
 
     if (config_opt) |cfg_ptr| {
@@ -4459,7 +4459,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 }) catch &.{};
 
                 const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
-                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, noop_obs_gateway.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, log_obs_gateway.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
                 }
