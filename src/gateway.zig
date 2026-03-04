@@ -1165,6 +1165,118 @@ fn maybeAcquireTenantOwnershipLock(
     );
 }
 
+const TenantTelegramAsyncJob = struct {
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    config: *const Config,
+    user_id: []u8,
+    account_id: []u8,
+    bot_token: []u8,
+    message: []u8,
+    chat_id: i64,
+
+    fn deinit(self: *TenantTelegramAsyncJob) void {
+        self.allocator.free(self.user_id);
+        self.allocator.free(self.account_id);
+        self.allocator.free(self.bot_token);
+        self.allocator.free(self.message);
+        self.allocator.destroy(self);
+    }
+};
+
+fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
+    defer job.deinit();
+
+    var user_ctx = resolveUserContext(job.allocator, job.state, job.user_id) catch |err| {
+        log.warn("tenant telegram async resolveUserContext failed: {}", .{err});
+        return;
+    };
+    defer user_ctx.deinit(job.allocator);
+
+    var user_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(
+        job.allocator,
+        job.state,
+        user_ctx.user_root,
+    ) catch |err| {
+        log.warn("tenant telegram async ownership lock failed: {}", .{err});
+        return;
+    };
+    defer if (user_lock_opt) |*lock| lock.deinit();
+
+    const tenant_runtime = getTenantRuntime(job.state, job.config, &user_ctx) catch |err| {
+        log.warn("tenant telegram async runtime init failed: {}", .{err});
+        return;
+    };
+
+    var session_key_buf: [256]u8 = undefined;
+    const session_key = zaki_session.userMainSessionKey(&session_key_buf, job.user_id);
+
+    var chat_id_buf: [32]u8 = undefined;
+    const chat_id_str = std.fmt.bufPrint(&chat_id_buf, "{d}", .{job.chat_id}) catch "0";
+
+    const reply = tenant_runtime.processMessage(session_key, job.message, .{
+        .channel = "telegram",
+        .account_id = job.account_id,
+        .chat_id = chat_id_str,
+    }) catch |err| {
+        if (job.bot_token.len > 0) {
+            sendTelegramReply(job.allocator, job.bot_token, job.chat_id, userFacingAgentError(err)) catch {};
+        }
+        return;
+    };
+    defer job.allocator.free(reply);
+
+    if (job.bot_token.len == 0) return;
+    sendTelegramReply(job.allocator, job.bot_token, job.chat_id, reply) catch |err| {
+        log.warn("tenant telegram async send failed: {}", .{err});
+    };
+}
+
+fn enqueueTenantTelegramAsync(
+    state: *GatewayState,
+    config: *const Config,
+    user_id: []const u8,
+    account_id: []const u8,
+    bot_token: []const u8,
+    chat_id: i64,
+    message: []const u8,
+) bool {
+    const allocator = state.allocator;
+    const job = allocator.create(TenantTelegramAsyncJob) catch return false;
+    errdefer allocator.destroy(job);
+
+    const user_id_dup = allocator.dupe(u8, user_id) catch return false;
+    errdefer allocator.free(user_id_dup);
+    const account_id_dup = allocator.dupe(u8, account_id) catch return false;
+    errdefer allocator.free(account_id_dup);
+    const bot_token_dup = allocator.dupe(u8, bot_token) catch return false;
+    errdefer allocator.free(bot_token_dup);
+    const message_dup = allocator.dupe(u8, message) catch return false;
+    errdefer allocator.free(message_dup);
+
+    job.* = .{
+        .allocator = allocator,
+        .state = state,
+        .config = config,
+        .user_id = user_id_dup,
+        .account_id = account_id_dup,
+        .bot_token = bot_token_dup,
+        .message = message_dup,
+        .chat_id = chat_id,
+    };
+
+    const thread = std.Thread.spawn(
+        .{ .stack_size = 512 * 1024 },
+        tenantTelegramAsyncWorker,
+        .{job},
+    ) catch {
+        job.deinit();
+        return false;
+    };
+    thread.detach();
+    return true;
+}
+
 /// Returns true when a webhook request should be accepted for the current
 /// pairing state and bearer token. Missing pairing state fails closed.
 pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[]const u8) bool {
@@ -3245,13 +3357,27 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             const peer_kind = if (is_group) "group" else "direct";
 
             if (use_shared_main and tenant_user_ctx != null) {
-                var kb: [256]u8 = undefined;
-                const sk = zaki_session.userMainSessionKey(&kb, scoped_user_id.?);
                 const cfg = ctx.config_opt orelse {
                     ctx.response_status = "500 Internal Server Error";
                     ctx.response_body = "{\"error\":\"tenant config missing\"}";
                     return;
                 };
+                if (enqueueTenantTelegramAsync(
+                    ctx.state,
+                    cfg,
+                    scoped_user_id.?,
+                    tg_account_id,
+                    tg_bot_token,
+                    chat_id.?,
+                    msg_text.?,
+                )) {
+                    ctx.response_body = "{\"status\":\"accepted\"}";
+                    return;
+                }
+                log.warn("tenant telegram async enqueue failed; falling back to synchronous processing", .{});
+
+                var kb: [256]u8 = undefined;
+                const sk = zaki_session.userMainSessionKey(&kb, scoped_user_id.?);
                 const tenant_runtime = getTenantRuntime(ctx.state, cfg, &tenant_user_ctx.?) catch {
                     ctx.response_status = "500 Internal Server Error";
                     ctx.response_body = "{\"error\":\"tenant runtime init failed\"}";
