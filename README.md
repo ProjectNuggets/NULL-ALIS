@@ -1,8 +1,4 @@
-<p align="center">
-  <img src="nullclaw.png" alt="nullclaw" width="200" />
-</p>
-
-<h1 align="center">NullClaw</h1>
+<h1 align="center">NullALIS</h1>
 
 <p align="center">
   <strong>Null overhead. Null compromise. 100% Zig. 100% Agnostic.</strong><br>
