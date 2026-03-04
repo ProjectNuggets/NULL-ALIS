@@ -12,6 +12,59 @@ pub const TransportConfig = types.TransportConfig;
 
 const Certificate = std.crypto.Certificate;
 const RequestScheme = enum { http, https };
+const HTTP_HEAD_BUFFER_LEN = 16 * 1024;
+const HTTP_WRITE_BUFFER_LEN = 16 * 1024;
+
+const TlsIoState = struct {
+    stream_reader: std.net.Stream.Reader,
+    stream_writer: std.net.Stream.Writer,
+    tls_client: std.crypto.tls.Client,
+    tls_read_buf: []u8,
+    tls_write_buf: []u8,
+    socket_write_buf: []u8,
+    socket_read_buf: []u8,
+
+    fn init(allocator: std.mem.Allocator, stream: std.net.Stream, host: []const u8, bundle: Certificate.Bundle) RequestError!*TlsIoState {
+        const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
+        const tls_read_buf = try allocator.alloc(u8, tls_buf_len + HTTP_HEAD_BUFFER_LEN);
+        errdefer allocator.free(tls_read_buf);
+        const tls_write_buf = try allocator.alloc(u8, tls_buf_len);
+        errdefer allocator.free(tls_write_buf);
+        const socket_write_buf = try allocator.alloc(u8, HTTP_WRITE_BUFFER_LEN);
+        errdefer allocator.free(socket_write_buf);
+        const socket_read_buf = try allocator.alloc(u8, tls_buf_len);
+        errdefer allocator.free(socket_read_buf);
+
+        const state = try allocator.create(TlsIoState);
+        errdefer allocator.destroy(state);
+        state.tls_read_buf = tls_read_buf;
+        state.tls_write_buf = tls_write_buf;
+        state.socket_write_buf = socket_write_buf;
+        state.socket_read_buf = socket_read_buf;
+        state.stream_reader = stream.reader(socket_read_buf);
+        state.stream_writer = stream.writer(tls_write_buf);
+        state.tls_client = std.crypto.tls.Client.init(
+            state.stream_reader.interface(),
+            &state.stream_writer.interface,
+            .{
+                .host = .{ .explicit = host },
+                .ca = .{ .bundle = bundle },
+                .read_buffer = tls_read_buf,
+                .write_buffer = socket_write_buf,
+                .allow_truncation_attacks = true,
+            },
+        ) catch return error.TlsInitializationFailed;
+        return state;
+    }
+
+    fn deinit(self: *TlsIoState, allocator: std.mem.Allocator) void {
+        allocator.free(self.tls_read_buf);
+        allocator.free(self.tls_write_buf);
+        allocator.free(self.socket_write_buf);
+        allocator.free(self.socket_read_buf);
+        allocator.destroy(self);
+    }
+};
 
 const shared_ca_bundle = struct {
     var mutex: std.Thread.Mutex = .{};
@@ -198,43 +251,21 @@ fn request_tls(
     parsed: ParsedRequest,
     options: RequestOptions,
 ) RequestError!void {
-    const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
-    const read_buf = try allocator.alloc(u8, tls_buf_len);
-    defer allocator.free(read_buf);
-    const write_buf = try allocator.alloc(u8, tls_buf_len);
-    defer allocator.free(write_buf);
-    const tls_read_buf = try allocator.alloc(u8, tls_buf_len);
-    defer allocator.free(tls_read_buf);
-    const tls_write_buf = try allocator.alloc(u8, tls_buf_len);
-    defer allocator.free(tls_write_buf);
-
     const bundle = try shared_ca_bundle.get();
-
-    var stream_reader = stream.reader(read_buf);
-    var stream_writer = stream.writer(write_buf);
-    var tls_client = std.crypto.tls.Client.init(
-        stream_reader.interface(),
-        &stream_writer.interface,
-        .{
-            .host = .{ .explicit = parsed.tls_host },
-            .ca = .{ .bundle = bundle },
-            .read_buffer = tls_read_buf,
-            .write_buffer = tls_write_buf,
-            .allow_truncation_attacks = true,
-        },
-    ) catch return error.TlsInitializationFailed;
+    const tls = try TlsIoState.init(allocator, stream, parsed.tls_host, bundle);
+    defer tls.deinit(allocator);
 
     const request_bytes = try build_request(allocator, parsed, options);
     defer allocator.free(request_bytes);
 
-    tls_client.writer.writeAll(request_bytes) catch return error.TlsWriteFailed;
-    tls_client.writer.flush() catch return error.TlsWriteFailed;
-    stream_writer.interface.flush() catch return error.TlsWriteFailed;
+    tls.tls_client.writer.writeAll(request_bytes) catch return error.TlsWriteFailed;
+    tls.tls_client.writer.flush() catch return error.TlsWriteFailed;
+    tls.stream_writer.interface.flush() catch return error.TlsWriteFailed;
 
-    try read_to_eof_tls(allocator, raw_response, &tls_client, options.max_response_bytes);
+    try read_to_eof_tls(allocator, raw_response, &tls.tls_client, options.max_response_bytes);
 
-    tls_client.end() catch {};
-    stream_writer.interface.flush() catch {};
+    tls.tls_client.end() catch {};
+    tls.stream_writer.interface.flush() catch {};
 }
 
 fn stream_tls_body(
@@ -245,43 +276,21 @@ fn stream_tls_body(
     ctx: anytype,
     comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
 ) anyerror!u16 {
-    const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
-    const read_buf = try allocator.alloc(u8, tls_buf_len);
-    defer allocator.free(read_buf);
-    const write_buf = try allocator.alloc(u8, tls_buf_len);
-    defer allocator.free(write_buf);
-    const tls_read_buf = try allocator.alloc(u8, tls_buf_len);
-    defer allocator.free(tls_read_buf);
-    const tls_write_buf = try allocator.alloc(u8, tls_buf_len);
-    defer allocator.free(tls_write_buf);
-
     const bundle = try shared_ca_bundle.get();
-
-    var stream_reader = stream.reader(read_buf);
-    var stream_writer = stream.writer(write_buf);
-    var tls_client = std.crypto.tls.Client.init(
-        stream_reader.interface(),
-        &stream_writer.interface,
-        .{
-            .host = .{ .explicit = parsed.tls_host },
-            .ca = .{ .bundle = bundle },
-            .read_buffer = tls_read_buf,
-            .write_buffer = tls_write_buf,
-            .allow_truncation_attacks = true,
-        },
-    ) catch return error.TlsInitializationFailed;
+    const tls = try TlsIoState.init(allocator, stream, parsed.tls_host, bundle);
+    defer tls.deinit(allocator);
 
     const request_bytes = try build_request(allocator, parsed, options);
     defer allocator.free(request_bytes);
 
-    tls_client.writer.writeAll(request_bytes) catch return error.TlsWriteFailed;
-    tls_client.writer.flush() catch return error.TlsWriteFailed;
-    stream_writer.interface.flush() catch return error.TlsWriteFailed;
+    tls.tls_client.writer.writeAll(request_bytes) catch return error.TlsWriteFailed;
+    tls.tls_client.writer.flush() catch return error.TlsWriteFailed;
+    tls.stream_writer.interface.flush() catch return error.TlsWriteFailed;
 
-    const status_code = try stream_http_body_from_reader(allocator, tls_read_fn, &tls_client, options.max_response_bytes, ctx, on_chunk);
+    const status_code = try stream_http_body_from_reader(allocator, tls_read_fn, &tls.tls_client, options.max_response_bytes, ctx, on_chunk);
 
-    tls_client.end() catch {};
-    stream_writer.interface.flush() catch {};
+    tls.tls_client.end() catch {};
+    tls.stream_writer.interface.flush() catch {};
     return status_code;
 }
 
@@ -428,11 +437,7 @@ fn read_to_eof_tls(
 ) RequestError!void {
     var buf: [4096]u8 = undefined;
     while (true) {
-        var vecs: [1][]u8 = .{buf[0..]};
-        const n = tls_client.reader.readVec(&vecs) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => return error.TlsReadFailed,
-        };
+        const n = try tls_read_fn(tls_client, &buf);
         if (n == 0) break;
         if (out.items.len + n > max_response_bytes + 16 * 1024) return error.ResponseTooLarge;
         try out.appendSlice(allocator, buf[0..n]);
@@ -526,11 +531,34 @@ fn plain_read_fn(stream: std.net.Stream, buf: []u8) RequestError!usize {
 }
 
 fn tls_read_fn(tls_client: *std.crypto.tls.Client, buf: []u8) RequestError!usize {
-    var vecs: [1][]u8 = .{buf};
-    return tls_client.reader.readVec(&vecs) catch |read_err| switch (read_err) {
-        error.EndOfStream => 0,
-        else => return error.TlsReadFailed,
-    };
+    if (buf.len == 0) return 0;
+
+    var total: usize = 0;
+
+    if (tls_client.reader.bufferedLen() == 0) {
+        const first = tls_client.reader.take(1) catch |read_err| switch (read_err) {
+            error.EndOfStream => return 0,
+            else => return error.TlsReadFailed,
+        };
+        if (first.len == 0) return 0;
+        buf[0] = first[0];
+        total = 1;
+    }
+
+    while (total < buf.len) {
+        const buffered = tls_client.reader.bufferedLen();
+        if (buffered == 0) break;
+        const to_copy = @min(buffered, buf.len - total);
+        const chunk = tls_client.reader.take(to_copy) catch |read_err| switch (read_err) {
+            error.EndOfStream => break,
+            else => return error.TlsReadFailed,
+        };
+        if (chunk.len == 0) break;
+        @memcpy(buf[total .. total + chunk.len], chunk);
+        total += chunk.len;
+    }
+
+    return total;
 }
 
 fn stream_http_body_from_reader(
