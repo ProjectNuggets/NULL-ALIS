@@ -13,6 +13,30 @@ pub const TransportConfig = types.TransportConfig;
 const Certificate = std.crypto.Certificate;
 const RequestScheme = enum { http, https };
 
+const shared_ca_bundle = struct {
+    var mutex: std.Thread.Mutex = .{};
+    var state: enum { uninitialized, ready, failed } = .uninitialized;
+    var bundle: Certificate.Bundle = .{};
+
+    fn get() RequestError!Certificate.Bundle {
+        mutex.lock();
+        defer mutex.unlock();
+
+        switch (state) {
+            .ready => return bundle,
+            .failed => return error.CaBundleLoadFailed,
+            .uninitialized => {
+                bundle.rescan(std.heap.page_allocator) catch {
+                    state = .failed;
+                    return error.CaBundleLoadFailed;
+                };
+                state = .ready;
+                return bundle;
+            },
+        }
+    }
+};
+
 pub const RequestError = error{
     UnsupportedScheme,
     MissingHost,
@@ -127,9 +151,7 @@ fn request_tls(
     const tls_write_buf = try allocator.alloc(u8, tls_buf_len);
     defer allocator.free(tls_write_buf);
 
-    var bundle: Certificate.Bundle = .{};
-    defer bundle.deinit(allocator);
-    bundle.rescan(allocator) catch return error.CaBundleLoadFailed;
+    const bundle = try shared_ca_bundle.get();
 
     var stream_reader = stream.reader(read_buf);
     var stream_writer = stream.writer(write_buf);
