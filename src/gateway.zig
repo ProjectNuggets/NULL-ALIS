@@ -1,7 +1,7 @@
 //! HTTP Gateway — lightweight HTTP server for nullalis.
 //!
 //! Mirrors ZeroClaw's axum-based gateway with:
-//!   - Sliding-window rate limiting (per-IP)
+//!   - Sliding-window rate limiting (per-key)
 //!   - Idempotency store (deduplicates webhook requests)
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
@@ -82,6 +82,7 @@ pub const SlidingWindowRateLimiter = struct {
         defer self.mutex.unlock();
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
+            allocator.free(@constCast(entry.key_ptr.*));
             entry.value_ptr.deinit(allocator);
         }
         self.entries.deinit(allocator);
@@ -102,13 +103,19 @@ pub const SlidingWindowRateLimiter = struct {
             self.last_sweep = now;
         }
 
-        const gop = self.entries.getOrPut(allocator, key) catch return true;
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .empty;
+        var timestamps_ptr = self.entries.getPtr(key);
+        if (timestamps_ptr == null) {
+            const key_copy = allocator.dupe(u8, key) catch return true;
+            self.entries.put(allocator, key_copy, .empty) catch {
+                allocator.free(key_copy);
+                return true;
+            };
+            timestamps_ptr = self.entries.getPtr(key_copy);
+            if (timestamps_ptr == null) return true;
         }
 
         // Remove expired entries
-        var timestamps = gop.value_ptr;
+        var timestamps = timestamps_ptr.?;
         var i: usize = 0;
         while (i < timestamps.items.len) {
             if (timestamps.items[i] <= cutoff) {
@@ -146,6 +153,7 @@ pub const SlidingWindowRateLimiter = struct {
 
         for (to_remove.items) |key| {
             if (self.entries.fetchRemove(key)) |kv| {
+                allocator.free(@constCast(kv.key));
                 var list = kv.value;
                 list.deinit(allocator);
             }
@@ -198,6 +206,10 @@ pub const IdempotencyStore = struct {
     pub fn deinit(self: *IdempotencyStore, allocator: std.mem.Allocator) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        var it = self.keys.iterator();
+        while (it.next()) |entry| {
+            allocator.free(@constCast(entry.key_ptr.*));
+        }
         self.keys.deinit(allocator);
     }
 
@@ -219,14 +231,20 @@ pub const IdempotencyStore = struct {
             }
         }
         for (to_remove.items) |k| {
-            _ = self.keys.remove(k);
+            if (self.keys.fetchRemove(k)) |removed| {
+                allocator.free(@constCast(removed.key));
+            }
         }
 
         // Check if already present
         if (self.keys.get(key)) |_| return false;
 
         // Record new key
-        self.keys.put(allocator, key, now) catch return true;
+        const key_copy = allocator.dupe(u8, key) catch return true;
+        self.keys.put(allocator, key_copy, now) catch {
+            allocator.free(key_copy);
+            return true;
+        };
         return true;
     }
 };
@@ -1210,12 +1228,25 @@ fn maybeAcquireTenantOwnershipLock(
     if (!state.tenant_enabled) return null;
     if (!state.ownership_lock_enabled) return null;
     if (state.owner_instance_id.len == 0) return null;
-    return try tenant_lock.acquireUserOwnershipLock(
-        allocator,
-        user_root,
-        state.owner_instance_id,
-        state.ownership_lock_lease_secs,
-    );
+
+    var attempts: u8 = 0;
+    while (attempts < 3) : (attempts += 1) {
+        return tenant_lock.acquireUserOwnershipLock(
+            allocator,
+            user_root,
+            state.owner_instance_id,
+            state.ownership_lock_lease_secs,
+        ) catch |err| switch (err) {
+            error.LockHeld => {
+                if (attempts + 1 >= 3) return err;
+                std.Thread.sleep(20 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+    }
+
+    return error.LockHeld;
 }
 
 const TenantTelegramAsyncJob = struct {
@@ -3187,7 +3218,17 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         return;
     }
 
-    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "telegram")) {
+    var webhook_key_buf: [160]u8 = undefined;
+    var webhook_rate_key: []const u8 = "telegram";
+    if (ctx.state.tenant_enabled) {
+        if (parseQueryParam(ctx.target, "user_id")) |user_id| {
+            if (isValidIdentifier(user_id)) {
+                webhook_rate_key = std.fmt.bufPrint(&webhook_key_buf, "telegram:{s}", .{user_id}) catch "telegram";
+            }
+        }
+    }
+
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, webhook_rate_key)) {
         ctx.response_status = "429 Too Many Requests";
         ctx.response_body = "{\"error\":\"rate limited\"}";
         return;
@@ -4955,6 +4996,31 @@ test "idempotency store duplicate after many inserts" {
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "third"));
     // First key should still be duplicate
     try std.testing.expect(!store.recordIfNew(std.testing.allocator, "first"));
+}
+
+test "idempotency store copies transient key memory" {
+    var store = IdempotencyStore.init(300);
+    defer store.deinit(std.testing.allocator);
+
+    var key_buf: [32]u8 = undefined;
+    const transient_key = try std.fmt.bufPrint(&key_buf, "req-{d}", .{123});
+    try std.testing.expect(store.recordIfNew(std.testing.allocator, transient_key));
+
+    @memset(&key_buf, 'x');
+    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-123"));
+}
+
+test "rate limiter copies transient key memory" {
+    var limiter = SlidingWindowRateLimiter.init(2, 60);
+    defer limiter.deinit(std.testing.allocator);
+
+    var key_buf: [48]u8 = undefined;
+    const transient_key = try std.fmt.bufPrint(&key_buf, "tenant-{d}", .{42});
+    try std.testing.expect(limiter.allow(std.testing.allocator, transient_key));
+
+    @memset(&key_buf, 'x');
+    try std.testing.expect(limiter.allow(std.testing.allocator, "tenant-42"));
+    try std.testing.expect(!limiter.allow(std.testing.allocator, "tenant-42"));
 }
 
 test "rate limiter window_ns calculation" {

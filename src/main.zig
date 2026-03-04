@@ -6,16 +6,18 @@ const yc = @import("nullalis");
 var sentry_runtime: ?*yc.sentry_runtime.Runtime = null;
 
 pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
-    _ = error_return_trace;
-    _ = ret_addr;
     if (sentry_runtime) |runtime| {
         runtime.capturePanic(msg);
         runtime.flush(1500);
     }
-    std.fs.File.stderr().writeAll("panic: ") catch {};
-    std.fs.File.stderr().writeAll(msg) catch {};
-    std.fs.File.stderr().writeAll("\n") catch {};
-    std.process.exit(1);
+    if (ret_addr) |addr| {
+        std.debug.print("panic ret_addr=0x{x}\n", .{addr});
+    }
+    if (error_return_trace) |trace| {
+        std.debug.print("panic error return trace:\n", .{});
+        std.debug.dumpStackTrace(trace.*);
+    }
+    std.debug.defaultPanic(msg, ret_addr);
 }
 
 const log = std.log.scoped(.main);
