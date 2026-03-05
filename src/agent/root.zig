@@ -509,6 +509,11 @@ pub const Agent = struct {
         return false;
     }
 
+    fn startsWithToolCallMarkup(text: []const u8) bool {
+        const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+        return std.mem.startsWith(u8, trimmed, "<tool_call>");
+    }
+
     fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0 or haystack.len < needle.len) return false;
         var i: usize = 0;
@@ -1014,23 +1019,30 @@ pub const Agent = struct {
             const display_text = if (parsed_text.len > 0) parsed_text else response_text;
 
             if (parsed_calls.len == 0) {
+                const malformed_tool_markup = startsWithToolCallMarkup(display_text);
                 // Guardrail: if the model promises "I'll try/check now" but emits no
                 // tool call, force one follow-up completion to either act now or
                 // explicitly state the limitation without deferred promises.
                 if (!is_streaming and
                     forced_follow_through_count < 2 and
                     iteration + 1 < self.max_tool_iterations and
-                    shouldForceActionFollowThrough(display_text))
+                    (shouldForceActionFollowThrough(display_text) or malformed_tool_markup))
                 {
+                    const follow_up_instruction = if (malformed_tool_markup)
+                        "SYSTEM: Your previous response started with <tool_call> markup but no valid tool call was executed. " ++
+                            "Emit valid, closed <tool_call>...</tool_call> tags now for each tool action. " ++
+                            "If no tool is needed, answer in plain text with no <tool_call> tags."
+                    else
+                        "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
+                            "Do it in this turn by issuing the appropriate tool call(s). " ++
+                            "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.";
                     try self.history.append(self.allocator, .{
                         .role = .assistant,
                         .content = try self.allocator.dupe(u8, display_text),
                     });
                     try self.history.append(self.allocator, .{
                         .role = .user,
-                        .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
-                            "Do it in this turn by issuing the appropriate tool call(s). " ++
-                            "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt."),
+                        .content = try self.allocator.dupe(u8, follow_up_instruction),
                     });
                     self.trimHistory();
                     self.freeResponseFields(&response);
@@ -1039,11 +1051,15 @@ pub const Agent = struct {
                 }
 
                 // No tool calls — final response
+                const safe_display_text = if (malformed_tool_markup)
+                    "I hit an internal tool-call formatting error before execution. Please retry."
+                else
+                    display_text;
                 const finalize_start_ms = std.time.milliTimestamp();
                 const base_text = if (self.context_was_compacted) blk: {
                     self.context_was_compacted = false;
-                    break :blk try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{display_text});
-                } else try self.allocator.dupe(u8, display_text);
+                    break :blk try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{safe_display_text});
+                } else try self.allocator.dupe(u8, safe_display_text);
                 errdefer self.allocator.free(base_text);
 
                 const compose_start_ms = std.time.milliTimestamp();
@@ -1055,7 +1071,7 @@ pub const Agent = struct {
                 // Dupe from display_text directly (not from final_text) to avoid double-dupe
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
-                    .content = try self.allocator.dupe(u8, display_text),
+                    .content = try self.allocator.dupe(u8, safe_display_text),
                 });
 
                 // Keep interactive turns fast: trim history here, but defer
@@ -3456,4 +3472,14 @@ test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("Вот результат: файл успешно отправлен."));
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
+}
+
+test "Agent startsWithToolCallMarkup detects malformed tool output" {
+    try std.testing.expect(Agent.startsWithToolCallMarkup("<tool_call>\n{\"name\":\"shell\",\"arguments\":{}}"));
+    try std.testing.expect(Agent.startsWithToolCallMarkup(" \n\t<tool_call>\n{\"name\":\"shell\",\"arguments\":{}}"));
+}
+
+test "Agent startsWithToolCallMarkup ignores normal text" {
+    try std.testing.expect(!Agent.startsWithToolCallMarkup("Here is the result."));
+    try std.testing.expect(!Agent.startsWithToolCallMarkup("Use <tool_call> tags like this in docs."));
 }

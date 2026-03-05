@@ -26,13 +26,17 @@ const BUSY_TIMEOUT_MS: c_int = 5000;
 pub const SqliteMemory = struct {
     db: ?*c.sqlite3,
     allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
     owns_self: bool = false,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, db_path: [*:0]const u8) !Self {
         var db: ?*c.sqlite3 = null;
-        const rc = c.sqlite3_open(db_path, &db);
+        // Use FULLMUTEX so a single connection remains safe when shared across
+        // concurrent session threads (e.g. sqlite memory tests / gateway runtime).
+        const flags: c_int = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX;
+        const rc = c.sqlite3_open_v2(db_path, &db, flags, null);
         if (rc != c.SQLITE_OK) {
             if (db) |d| _ = c.sqlite3_close(d);
             return error.SqliteOpenFailed;
@@ -215,6 +219,8 @@ pub const SqliteMemory = struct {
 
     fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        self_.mutex.lock();
+        defer self_.mutex.unlock();
 
         const now = getNowTimestamp(self_.allocator) catch return error.StepFailed;
         defer self_.allocator.free(now);
@@ -255,6 +261,8 @@ pub const SqliteMemory = struct {
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        self_.mutex.lock();
+        defer self_.mutex.unlock();
 
         const trimmed = std.mem.trim(u8, query, " \t\n\r");
         if (trimmed.len == 0) return allocator.alloc(MemoryEntry, 0);
@@ -268,6 +276,8 @@ pub const SqliteMemory = struct {
 
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        self_.mutex.lock();
+        defer self_.mutex.unlock();
 
         const sql = "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -286,6 +296,8 @@ pub const SqliteMemory = struct {
 
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        self_.mutex.lock();
+        defer self_.mutex.unlock();
 
         var entries: std.ArrayList(MemoryEntry) = .empty;
         errdefer {
@@ -344,6 +356,8 @@ pub const SqliteMemory = struct {
 
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        self_.mutex.lock();
+        defer self_.mutex.unlock();
 
         const sql = "DELETE FROM memories WHERE key = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -361,6 +375,8 @@ pub const SqliteMemory = struct {
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        self_.mutex.lock();
+        defer self_.mutex.unlock();
 
         const sql = "SELECT COUNT(*) FROM memories";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -414,6 +430,9 @@ pub const SqliteMemory = struct {
     // ── Legacy helpers ─────────────────────────────────────────────
 
     pub fn saveMessage(self: *Self, session_id: []const u8, role_str: []const u8, content: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const sql = "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
@@ -433,6 +452,9 @@ pub const SqliteMemory = struct {
     /// Load all messages for a session, ordered by creation time.
     /// Caller owns the returned slice and all strings within it.
     pub fn loadMessages(self: *Self, allocator: std.mem.Allocator, session_id: []const u8) ![]MessageEntry {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const sql = "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
@@ -469,6 +491,9 @@ pub const SqliteMemory = struct {
 
     /// Delete all messages for a session.
     pub fn clearMessages(self: *Self, session_id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const sql = "DELETE FROM messages WHERE session_id = ?";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
@@ -483,6 +508,9 @@ pub const SqliteMemory = struct {
     /// If `session_id` is provided, only entries for that session are removed.
     /// If `session_id` is null, entries are removed globally.
     pub fn clearAutoSaved(self: *Self, session_id: ?[]const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const sql_scoped = "DELETE FROM memories WHERE key LIKE 'autosave_%' AND session_id = ?1";
         const sql_global = "DELETE FROM memories WHERE key LIKE 'autosave_%'";
         const sql = if (session_id != null) sql_scoped else sql_global;

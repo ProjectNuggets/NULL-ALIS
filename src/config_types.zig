@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// Default context token budget used by agent compaction/context management.
 /// Runtime fallback (`DEFAULT_CONTEXT_TOKENS`).
-pub const DEFAULT_AGENT_TOKEN_LIMIT: u64 = 200_000;
+pub const DEFAULT_AGENT_TOKEN_LIMIT: u64 = 12_000;
 /// Default generation cap when model/provider metadata does not define max output.
 /// Runtime fallback (`DEFAULT_MODEL_MAX_TOKENS`).
 pub const DEFAULT_MODEL_MAX_TOKENS: u32 = 8192;
