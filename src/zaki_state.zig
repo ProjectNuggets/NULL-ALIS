@@ -499,6 +499,8 @@ const ManagerImpl = struct {
         defer self.allocator.free(workspace_z);
         var key_buf: [128]u8 = undefined;
         const session_key = zaki_session.userMainSessionKey(&key_buf, user_s);
+        const session_key_z = try self.allocator.dupeZ(u8, session_key);
+        defer self.allocator.free(session_key_z);
         try self.execParamsNoResult(
             "INSERT INTO {schema}.users (user_id, workspace_path) VALUES ($1, $2) " ++
                 "ON CONFLICT (user_id) DO UPDATE SET workspace_path = EXCLUDED.workspace_path, updated_at = NOW()",
@@ -527,7 +529,7 @@ const ManagerImpl = struct {
         );
         try self.execParamsNoResult(
             "INSERT INTO {schema}.sessions (id, user_id, session_key, kind, title) VALUES ($1, $2, $1, 'main', 'Main') ON CONFLICT (session_key) DO NOTHING",
-            &.{ session_key.ptr, user_s.ptr },
+            &.{ session_key_z, user_s.ptr },
             &.{ @as(c_int, @intCast(session_key.len)), @as(c_int, @intCast(user_s.len)) },
         );
     }
