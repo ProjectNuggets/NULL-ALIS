@@ -2474,9 +2474,81 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
     }
     try w.writeAll("\"}");
 
-    const resp = try telegramApiCall(allocator, bot_token, "sendMessage", body_buf.items);
+    const resp = telegramApiCall(allocator, bot_token, "sendMessage", body_buf.items) catch |err| {
+        log.warn("telegramApiCall sendMessage failed: {}", .{err});
+        return sendTelegramReplyViaCurlFallback(allocator, bot_token, body_buf.items);
+    };
     defer allocator.free(resp);
-    if (!(jsonBoolField(resp, "ok") orelse false)) return error.TelegramSendFailed;
+    if (!(jsonBoolField(resp, "ok") orelse false)) {
+        log.warn("telegram sendMessage api returned non-ok; retrying via curl fallback", .{});
+        return sendTelegramReplyViaCurlFallback(allocator, bot_token, body_buf.items);
+    }
+}
+
+fn sendTelegramReplyViaCurlFallback(allocator: std.mem.Allocator, bot_token: []const u8, body: []const u8) !void {
+    const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
+    defer allocator.free(url);
+
+    var child = std.process.Child.init(
+        &[_][]const u8{
+            "curl",
+            "-sS",
+            "--max-time",
+            "30",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+            url,
+        },
+        allocator,
+    );
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    if (child.stdin) |stdin_file| {
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        };
+        stdin_file.close();
+        child.stdin = null;
+    } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlWriteError;
+    }
+
+    const stdout_bytes = if (child.stdout) |stdout_file|
+        stdout_file.readToEndAlloc(allocator, 1024 * 1024) catch &.{}
+    else
+        &.{};
+    defer if (stdout_bytes.len > 0) allocator.free(stdout_bytes);
+
+    const stderr_bytes = if (child.stderr) |stderr_file|
+        stderr_file.readToEndAlloc(allocator, 256 * 1024) catch &.{}
+    else
+        &.{};
+    defer if (stderr_bytes.len > 0) allocator.free(stderr_bytes);
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            if (stderr_bytes.len > 0) {
+                log.warn("telegram curl fallback failed code={d} stderr={s}", .{ code, stderr_bytes });
+            }
+            return error.CurlFailed;
+        },
+        else => return error.CurlFailed,
+    }
 }
 
 fn userFacingAgentError(err: anyerror) []const u8 {
