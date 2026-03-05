@@ -409,6 +409,7 @@ pub const Agent = struct {
             .max_source_chars = self.compaction_max_source_chars,
             .token_limit = self.token_limit,
             .max_history_messages = self.max_history_messages,
+            .workspace_dir = self.workspace_dir,
         });
     }
 
