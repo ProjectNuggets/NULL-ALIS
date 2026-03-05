@@ -472,6 +472,31 @@ fn isHeartbeatAck(reply: []const u8) bool {
     return found_token;
 }
 
+fn isHeartbeatActionableText(content: []const u8) bool {
+    for (content) |c| {
+        if (c < 128 and std.ascii.isAlphanumeric(c)) return true;
+    }
+    return false;
+}
+
+fn heartbeatActionableReplySlice(reply: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, reply, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (isHeartbeatAck(trimmed)) return null;
+    if (!isHeartbeatActionableText(trimmed)) return null;
+    return trimmed;
+}
+
+fn makeHeartbeatDedupeKey(
+    allocator: std.mem.Allocator,
+    user_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+) ![]u8 {
+    const hash = std.hash.Wyhash.hash(0, content);
+    return std.fmt.allocPrint(allocator, "heartbeat:{s}:{s}:{x}", .{ user_id, chat_id, hash });
+}
+
 fn resolveHeartbeatTelegramTarget(
     allocator: std.mem.Allocator,
     user_root: []const u8,
@@ -609,10 +634,10 @@ fn runTenantHeartbeatForUser(
     };
     defer allocator.free(reply);
 
-    if (isHeartbeatAck(reply)) {
+    const actionable_reply = heartbeatActionableReplySlice(reply) orelse {
         saveHeartbeatRuntimeState(allocator, user_root, now_s, "ok_ack", reason);
         return;
-    }
+    };
 
     var target = resolveHeartbeatTelegramTarget(allocator, user_root) catch |err| {
         saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_target", @errorName(err));
@@ -641,7 +666,9 @@ fn runTenantHeartbeatForUser(
 
     var chat_buf: [32]u8 = undefined;
     const chat_id_text = std.fmt.bufPrint(&chat_buf, "{d}", .{target.chat_id}) catch "0";
-    const decision = ops_guard.allowProactive("heartbeat", user_id, "telegram", chat_id_text, reply, null, now_s);
+    const dedupe_key = makeHeartbeatDedupeKey(allocator, user_id, chat_id_text, actionable_reply) catch null;
+    defer if (dedupe_key) |key| allocator.free(key);
+    const decision = ops_guard.allowProactive("heartbeat", user_id, "telegram", chat_id_text, actionable_reply, dedupe_key, now_s);
     switch (decision) {
         .allow => {},
         .blocked_rate => {
@@ -654,7 +681,7 @@ fn runTenantHeartbeatForUser(
         },
     }
 
-    sendHeartbeatTelegramMessage(allocator, token, target.chat_id, reply) catch |err| {
+    sendHeartbeatTelegramMessage(allocator, token, target.chat_id, actionable_reply) catch |err| {
         ops_guard.recordProactiveSendError("heartbeat", user_id, "telegram", chat_id_text, @errorName(err), std.time.timestamp());
         saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_send", @errorName(err));
         return;
@@ -2640,6 +2667,28 @@ test "isHeartbeatAck recognizes ack-only variants" {
     try std.testing.expect(isHeartbeatAck("<b>HEARTBEAT_OK</b> 🦞"));
     try std.testing.expect(!isHeartbeatAck("HEARTBEAT_OK send a detailed report"));
     try std.testing.expect(!isHeartbeatAck("Morning brief delivered"));
+}
+
+test "heartbeatActionableReplySlice suppresses ack-only output" {
+    try std.testing.expect(heartbeatActionableReplySlice("HEARTBEAT_OK") == null);
+    try std.testing.expect(heartbeatActionableReplySlice("<b>HEARTBEAT_OK</b> ✅") == null);
+}
+
+test "heartbeatActionableReplySlice keeps actionable output" {
+    const slice = heartbeatActionableReplySlice("  Morning brief delivered  ") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Morning brief delivered", slice);
+}
+
+test "heartbeatActionableReplySlice drops non-actionable punctuation" {
+    try std.testing.expect(heartbeatActionableReplySlice("  ... !!!  ") == null);
+}
+
+test "makeHeartbeatDedupeKey stable for same payload" {
+    const key_a = try makeHeartbeatDedupeKey(std.testing.allocator, "1", "1110331014", "Morning brief delivered");
+    defer std.testing.allocator.free(key_a);
+    const key_b = try makeHeartbeatDedupeKey(std.testing.allocator, "1", "1110331014", "Morning brief delivered");
+    defer std.testing.allocator.free(key_b);
+    try std.testing.expectEqualStrings(key_a, key_b);
 }
 
 test "channelSupervisorThread respects shutdown" {
