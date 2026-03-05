@@ -1,9 +1,13 @@
-# Nullclaw ZAKI BOT Kubernetes Deployment Pack
+# nullALIS ZAKI BOT Kubernetes Deployment Pack
 
-This folder is the deployment handoff package for running Nullclaw as the dedicated `ZAKI BOT` backend in a namespace-based K8s cluster.
+This folder is the deployment handoff package for running `nullALIS` as the dedicated `ZAKI BOT` backend in a namespace-based K8s cluster.
 
 ## Scope
 This package is for the shared pool model with tenant isolation under `/data/users/{user_id}`.
+
+Compatibility note:
+- This deployment pack still uses `nullclaw` resource names, labels, lock-file names, and metric prefixes.
+- Keep those names unless you also migrate the manifest objects and dashboards together.
 
 It includes:
 - Namespace, Secret template, ConfigMap, RWX PVC
@@ -48,7 +52,7 @@ It includes:
 1. RWX storage class exists.
 2. Ingress controller supports `nginx.ingress.kubernetes.io/upstream-hash-by`.
 3. TLS secret exists for `agent-staging.zaki.com`.
-4. ZAKI backend can call Nullclaw internal APIs with `X-Internal-Token`.
+4. ZAKI backend can call nullALIS internal APIs with `X-Internal-Token`.
 5. ZAKI backend sends canonical `X-Zaki-User-Id` for app chat calls.
 
 ## Required value replacement
@@ -151,7 +155,7 @@ Current status: **ready for staging integration and production rollout after env
 
 ## Next step in the plan
 1. ZAKI backend integration sprint:
-- Wire UI controls to new Nullclaw APIs.
+- Wire UI controls to new nullALIS APIs.
 - Pass `X-Zaki-User-Id` and `X-Internal-Token` on all `/api/v1/*` calls.
 - Use `/api/v1/chat/stream` SSE proxy end to end.
 

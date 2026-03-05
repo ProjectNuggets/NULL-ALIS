@@ -123,7 +123,7 @@ Current config location:
 ```
 
 Example config file:
-- [config.example.json](/Users/nova/Desktop/nullclaw/config.example.json)
+- [config.example.json](config.example.json)
 
 A typical local setup for ZAKI integration needs:
 - model provider credentials
@@ -166,14 +166,14 @@ Primary extension points:
 - peripherals
 
 Important top-level modules:
-- [src/main.zig](/Users/nova/Desktop/nullclaw/src/main.zig)
-- [src/gateway.zig](/Users/nova/Desktop/nullclaw/src/gateway.zig)
-- [src/agent.zig](/Users/nova/Desktop/nullclaw/src/agent.zig)
-- [src/config.zig](/Users/nova/Desktop/nullclaw/src/config.zig)
-- [src/tools/root.zig](/Users/nova/Desktop/nullclaw/src/tools/root.zig)
-- [src/memory/root.zig](/Users/nova/Desktop/nullclaw/src/memory/root.zig)
-- [src/providers/root.zig](/Users/nova/Desktop/nullclaw/src/providers/root.zig)
-- [src/channels/root.zig](/Users/nova/Desktop/nullclaw/src/channels/root.zig)
+- [src/main.zig](src/main.zig)
+- [src/gateway.zig](src/gateway.zig)
+- [src/agent.zig](src/agent.zig)
+- [src/config.zig](src/config.zig)
+- [src/tools/root.zig](src/tools/root.zig)
+- [src/memory/root.zig](src/memory/root.zig)
+- [src/providers/root.zig](src/providers/root.zig)
+- [src/channels/root.zig](src/channels/root.zig)
 
 The design goal is small binaries, low runtime overhead, explicit interfaces, and secure defaults.
 
@@ -206,4 +206,4 @@ zig fmt src/**/*.zig
 
 ## License
 
-MIT. See [LICENSE](/Users/nova/Desktop/nullclaw/LICENSE).
+MIT. See [LICENSE](LICENSE).
