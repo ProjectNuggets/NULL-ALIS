@@ -436,6 +436,7 @@ pub const TelegramChannel = struct {
     pub const MAX_MESSAGE_LEN: usize = 4096;
     const TYPING_INTERVAL_NS: u64 = 4 * std.time.ns_per_s;
     const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
+    const TYPING_THREAD_STACK_SIZE: usize = 512 * 1024;
 
     const TypingTask = struct {
         channel: *TelegramChannel,
@@ -647,7 +648,7 @@ pub const TelegramChannel = struct {
             .chat_id = key_copy,
         };
 
-        task.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{task});
+        task.thread = try std.Thread.spawn(.{ .stack_size = TYPING_THREAD_STACK_SIZE }, typingLoop, .{task});
         errdefer {
             task.stop_requested.store(true, .release);
             if (task.thread) |t| t.join();
