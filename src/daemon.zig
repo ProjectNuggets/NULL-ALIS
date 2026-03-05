@@ -250,17 +250,46 @@ fn applyHeartbeatConfigObject(cfg: *UserHeartbeatConfig, allocator: std.mem.Allo
     }
 }
 
+fn applyHeartbeatConfigJson(cfg: *UserHeartbeatConfig, allocator: std.mem.Allocator, raw: []const u8) !bool {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "{}")) return false;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return error.InvalidConfigJson;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidConfigJson;
+
+    applyHeartbeatConfigObject(cfg, allocator, parsed.value.object);
+    if (parsed.value.object.get("heartbeat")) |nested| {
+        if (nested == .object) {
+            applyHeartbeatConfigObject(cfg, allocator, nested.object);
+        }
+    }
+    return true;
+}
+
 fn loadUserHeartbeatConfig(
     allocator: std.mem.Allocator,
     user_root: []const u8,
     default_enabled: bool,
     default_interval_minutes: u32,
+    state_json: ?[]const u8,
 ) UserHeartbeatConfig {
     var cfg = UserHeartbeatConfig{
         .enabled = default_enabled,
         .interval_minutes = @max(@as(u32, 1), default_interval_minutes),
         .prompt = HEARTBEAT_PROMPT_DEFAULT,
     };
+
+    if (state_json) |raw| {
+        const applied = applyHeartbeatConfigJson(&cfg, allocator, raw) catch |err| blk: {
+            log.warn("heartbeat state config parse failed: {}", .{err});
+            break :blk false;
+        };
+        if (applied) {
+            cfg.interval_minutes = @max(@as(u32, 1), cfg.interval_minutes);
+            return cfg;
+        }
+    }
 
     const path = std.fmt.allocPrint(allocator, "{s}/heartbeat.json", .{user_root}) catch return cfg;
     defer allocator.free(path);
@@ -269,18 +298,28 @@ fn loadUserHeartbeatConfig(
     const raw = file.readToEndAlloc(allocator, 128 * 1024) catch return cfg;
     defer allocator.free(raw);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return cfg;
-    defer parsed.deinit();
-    if (parsed.value != .object) return cfg;
-
-    applyHeartbeatConfigObject(&cfg, allocator, parsed.value.object);
-    if (parsed.value.object.get("heartbeat")) |nested| {
-        if (nested == .object) {
-            applyHeartbeatConfigObject(&cfg, allocator, nested.object);
-        }
-    }
+    _ = applyHeartbeatConfigJson(&cfg, allocator, raw) catch |err| {
+        log.warn("heartbeat file config parse failed: {}", .{err});
+    };
     cfg.interval_minutes = @max(@as(u32, 1), cfg.interval_minutes);
     return cfg;
+}
+
+fn loadHeartbeatStateJson(
+    allocator: std.mem.Allocator,
+    user_id_opt: ?i64,
+    state_mgr_opt: ?*zaki_state.Manager,
+) ?[]u8 {
+    const state_mgr = state_mgr_opt orelse return null;
+    const user_id = user_id_opt orelse return null;
+    return state_mgr.getHeartbeatJson(allocator, user_id) catch |err| {
+        log.warn("heartbeat state read failed for user={d}: {}", .{ user_id, err });
+        return null;
+    };
+}
+
+fn parseNumericUserIdFromDirName(name: []const u8) ?i64 {
+    return std.fmt.parseInt(i64, name, 10) catch null;
 }
 
 fn heartbeatRuntimePath(allocator: std.mem.Allocator, user_root: []const u8) ![]u8 {
@@ -502,13 +541,23 @@ fn runTenantHeartbeatForUser(
     allocator: std.mem.Allocator,
     config: *const Config,
     user_id: []const u8,
+    user_id_numeric: ?i64,
     user_root: []const u8,
     workspace_path: []const u8,
     forced: bool,
     reason: []const u8,
+    state_mgr: ?*zaki_state.Manager,
 ) void {
     const now_s = std.time.timestamp();
-    var hb_cfg = loadUserHeartbeatConfig(allocator, user_root, config.heartbeat.enabled, config.heartbeat.interval_minutes);
+    const state_json = loadHeartbeatStateJson(allocator, user_id_numeric, state_mgr);
+    defer if (state_json) |raw| allocator.free(raw);
+    var hb_cfg = loadUserHeartbeatConfig(
+        allocator,
+        user_root,
+        config.heartbeat.enabled,
+        config.heartbeat.interval_minutes,
+        state_json,
+    );
     defer hb_cfg.deinit(allocator);
 
     if (!forced and !hb_cfg.enabled) return;
@@ -598,6 +647,7 @@ fn runTenantHeartbeatSweep(
     forced_user_id: ?[]const u8,
     reason: []const u8,
     forced: bool,
+    state_mgr: ?*zaki_state.Manager,
 ) void {
     var users_dir = std.fs.openDirAbsolute(config.tenant.data_root, .{ .iterate = true }) catch return;
     defer users_dir.close();
@@ -614,6 +664,7 @@ fn runTenantHeartbeatSweep(
         defer allocator.free(user_root);
         const workspace_path = std.fmt.allocPrint(allocator, "{s}/workspace", .{user_root}) catch continue;
         defer allocator.free(workspace_path);
+        const numeric_user_id = parseNumericUserIdFromDirName(entry.name);
 
         var ownership_lock = tenant_lock.acquireUserOwnershipLock(
             allocator,
@@ -629,7 +680,17 @@ fn runTenantHeartbeatSweep(
         };
         defer ownership_lock.deinit();
 
-        runTenantHeartbeatForUser(allocator, config, entry.name, user_root, workspace_path, forced, reason);
+        runTenantHeartbeatForUser(
+            allocator,
+            config,
+            entry.name,
+            numeric_user_id,
+            user_root,
+            workspace_path,
+            forced,
+            reason,
+            state_mgr,
+        );
     }
 }
 
@@ -643,6 +704,24 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     else
         null;
     defer if (owner_instance_id) |oid| allocator.free(oid);
+    var pg_mgr: ?*zaki_state.Manager = null;
+    defer if (pg_mgr) |state_mgr| {
+        state_mgr.deinit();
+        allocator.destroy(state_mgr);
+    };
+    if (config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres")) init_pg: {
+        const mgr = allocator.create(zaki_state.Manager) catch |err| {
+            log.warn("heartbeat postgres state disabled: manager alloc failed: {}", .{err});
+            break :init_pg;
+        };
+        errdefer allocator.destroy(mgr);
+        mgr.* = zaki_state.Manager.init(allocator, config.state) catch |err| {
+            allocator.destroy(mgr);
+            log.warn("heartbeat postgres state disabled: state init failed: {}", .{err});
+            break :init_pg;
+        };
+        pg_mgr = mgr;
+    }
 
     var last_flush_s: i64 = 0;
     var last_sweep_s: i64 = 0;
@@ -661,13 +740,13 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
             }
             if (!config.tenant.enabled) continue;
             const owner_id = owner_instance_id orelse continue;
-            runTenantHeartbeatSweep(allocator, config, owner_id, req.user_id, req.reason, true);
+            runTenantHeartbeatSweep(allocator, config, owner_id, req.user_id, req.reason, true, pg_mgr);
         }
 
         if (config.tenant.enabled and owner_instance_id != null) {
             if (now_s - last_sweep_s >= HEARTBEAT_SWEEP_INTERVAL_SECS or now_s < last_sweep_s) {
                 last_sweep_s = now_s;
-                runTenantHeartbeatSweep(allocator, config, owner_instance_id.?, null, "interval", false);
+                runTenantHeartbeatSweep(allocator, config, owner_instance_id.?, null, "interval", false, pg_mgr);
             }
         }
 
@@ -2409,6 +2488,62 @@ test "parseHeartbeatEveryToMinutes parses common units" {
     try std.testing.expectEqual(@as(?u32, 120), parseHeartbeatEveryToMinutes("2h"));
     try std.testing.expectEqual(@as(?u32, 1), parseHeartbeatEveryToMinutes("45s"));
     try std.testing.expectEqual(@as(?u32, null), parseHeartbeatEveryToMinutes("invalid"));
+}
+
+test "loadUserHeartbeatConfig state json overrides file config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    const hb_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{root});
+    defer std.testing.allocator.free(hb_path);
+
+    const file = try std.fs.createFileAbsolute(hb_path, .{});
+    defer file.close();
+    try file.writeAll("{\"enabled\":false,\"interval_minutes\":5,\"prompt\":\"file prompt\"}\n");
+
+    var cfg = loadUserHeartbeatConfig(
+        std.testing.allocator,
+        root,
+        false,
+        30,
+        "{\"enabled\":true,\"interval_minutes\":45,\"prompt\":\"state prompt\"}",
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.enabled);
+    try std.testing.expectEqual(@as(u32, 45), cfg.interval_minutes);
+    try std.testing.expectEqualStrings("state prompt", cfg.prompt);
+}
+
+test "loadUserHeartbeatConfig falls back to file when state json is empty object" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    const hb_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{root});
+    defer std.testing.allocator.free(hb_path);
+
+    const file = try std.fs.createFileAbsolute(hb_path, .{});
+    defer file.close();
+    try file.writeAll("{\"enabled\":true,\"interval_minutes\":7,\"prompt\":\"file prompt\"}\n");
+
+    var cfg = loadUserHeartbeatConfig(
+        std.testing.allocator,
+        root,
+        false,
+        30,
+        "{}",
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.enabled);
+    try std.testing.expectEqual(@as(u32, 7), cfg.interval_minutes);
+    try std.testing.expectEqualStrings("file prompt", cfg.prompt);
 }
 
 test "isHeartbeatContentEffectivelyEmpty handles comments and placeholders" {
