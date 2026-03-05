@@ -8,14 +8,19 @@ const CronScheduler = cron.CronScheduler;
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 const message_tool = @import("message.zig");
 
+const DEFAULT_MAX_ACTIVE_JOBS: usize = 1024;
+const MAX_ACTIVE_JOBS_PER_USER: usize = 64;
+const MIN_ONCE_DELAY_SECS: i64 = 60;
+
 fn loadSchedulerForContext(allocator: std.mem.Allocator) !struct {
     scheduler: CronScheduler,
     tenant: root.ToolTenantContext,
 } {
     const tenant = root.getTenantContext();
-    var scheduler = CronScheduler.init(allocator, 1024, true);
+    var scheduler = CronScheduler.init(allocator, DEFAULT_MAX_ACTIVE_JOBS, true);
     if (tenant.state_mgr) |mgr| {
         if (tenant.numeric_user_id) |user_id| {
+            scheduler.max_tasks = MAX_ACTIVE_JOBS_PER_USER;
             const jobs_json = try mgr.getJobsJson(allocator, user_id);
             defer allocator.free(jobs_json);
             const trimmed = std.mem.trim(u8, jobs_json, " \t\r\n");
@@ -35,6 +40,11 @@ fn loadSchedulerForContext(allocator: std.mem.Allocator) !struct {
     }
     scheduler = loadScheduler(allocator) catch scheduler;
     return .{ .scheduler = scheduler, .tenant = tenant };
+}
+
+fn validateOnceDelay(delay: []const u8) !void {
+    const delay_secs = try cron.parseDuration(delay);
+    if (delay_secs < MIN_ONCE_DELAY_SECS) return error.DelayTooShort;
 }
 
 fn saveSchedulerForContext(scheduler: *CronScheduler, tenant: root.ToolTenantContext) !void {
@@ -261,6 +271,9 @@ pub const ScheduleTool = struct {
                 return ToolResult.fail("Missing 'command' parameter");
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
+            validateOnceDelay(delay) catch {
+                return ToolResult.fail("Delay too short; minimum is 60s");
+            };
 
             const loaded = loadSchedulerForContext(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
@@ -344,6 +357,11 @@ test "schedule schema has action" {
     const t = st.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "action") != null);
+}
+
+test "schedule validateOnceDelay enforces minimum" {
+    try std.testing.expectError(error.DelayTooShort, validateOnceDelay("10s"));
+    try validateOnceDelay("60s");
 }
 
 test "schedule list returns success" {

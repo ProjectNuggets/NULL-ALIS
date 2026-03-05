@@ -97,11 +97,34 @@ pub const MessageTool = struct {
             return ToolResult.fail("Message tool not connected to event bus");
 
         const outbound_allocator = self.outbound_allocator orelse allocator;
+        const tenant_ctx = root.getTenantContext();
+        var user_id_buf: [32]u8 = undefined;
+        const user_id_opt: ?[]const u8 = if (tenant_ctx.numeric_user_id) |user_id|
+            std.fmt.bufPrint(&user_id_buf, "{d}", .{user_id}) catch null
+        else
+            null;
 
         const msg = (if (account_id) |aid|
-            bus.makeOutboundWithAccount(outbound_allocator, channel, aid, chat_id, content)
+            bus.makeOutboundWithAccountAnnotated(
+                outbound_allocator,
+                channel,
+                aid,
+                chat_id,
+                content,
+                "tool",
+                user_id_opt,
+                null,
+            )
         else
-            bus.makeOutbound(outbound_allocator, channel, chat_id, content)) catch
+            bus.makeOutboundAnnotated(
+                outbound_allocator,
+                channel,
+                chat_id,
+                content,
+                "tool",
+                user_id_opt,
+                null,
+            )) catch
             return ToolResult.fail("Failed to create outbound message");
 
         event_bus.publishOutbound(msg) catch {

@@ -27,10 +27,12 @@ const agent_routing = @import("agent_routing.zig");
 const agent_prompt = @import("agent/prompt.zig");
 const security = @import("security/policy.zig");
 const http_util = @import("http_util.zig");
+const json_util = @import("json_util.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const onboard = @import("onboard.zig");
 const zaki_state_mod = @import("zaki_state.zig");
 const zaki_session = @import("zaki_session.zig");
+const ops_guard = @import("ops_guard.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -349,6 +351,19 @@ pub const GatewayState = struct {
     in_flight_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     drain_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    state_backend_configured: []const u8 = "file",
+    state_backend_effective: []const u8 = "file",
+    scheduler_backend: []const u8 = "file",
+    webhook_mode: []const u8 = "none",
+    postgres_port: u16 = 0,
+    postgres_host_buf: [64]u8 = [_]u8{0} ** 64,
+    postgres_host_len: usize = 0,
+    postgres_schema_buf: [64]u8 = [_]u8{0} ** 64,
+    postgres_schema_len: usize = 0,
+    state_degraded: bool = false,
+    state_degraded_reason_buf: [64]u8 = [_]u8{0} ** 64,
+    state_degraded_reason_len: usize = 0,
+    last_degraded_warn_s: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
     zaki_state: ?*zaki_state_mod.Manager = null,
@@ -394,6 +409,18 @@ pub const GatewayState = struct {
             mgr.deinit();
             self.allocator.destroy(mgr);
         }
+    }
+
+    fn postgresHost(self: *const GatewayState) []const u8 {
+        return self.postgres_host_buf[0..self.postgres_host_len];
+    }
+
+    fn postgresSchema(self: *const GatewayState) []const u8 {
+        return self.postgres_schema_buf[0..self.postgres_schema_len];
+    }
+
+    fn degradedReason(self: *const GatewayState) []const u8 {
+        return self.state_degraded_reason_buf[0..self.state_degraded_reason_len];
     }
 };
 
@@ -1454,6 +1481,126 @@ fn normalizeTelegramSecretToken(value: []const u8) []const u8 {
     return std.mem.trim(u8, value, " \t\r\n\"");
 }
 
+fn copyIntoBuf(buf: []u8, value: []const u8) usize {
+    const n = @min(buf.len, value.len);
+    if (n > 0) @memcpy(buf[0..n], value[0..n]);
+    if (n < buf.len) @memset(buf[n..], 0);
+    return n;
+}
+
+fn parsePostgresHostPort(connection_string: []const u8) struct { host: []const u8, port: u16 } {
+    const scheme_split = std.mem.indexOf(u8, connection_string, "://") orelse return .{ .host = "", .port = 0 };
+    var tail = connection_string[scheme_split + 3 ..];
+    if (std.mem.indexOfScalar(u8, tail, '@')) |at_idx| {
+        tail = tail[at_idx + 1 ..];
+    }
+
+    if (tail.len == 0) return .{ .host = "", .port = 0 };
+    if (tail[0] == '[') {
+        const close_idx = std.mem.indexOfScalar(u8, tail, ']') orelse return .{ .host = "", .port = 0 };
+        const host = tail[1..close_idx];
+        var port: u16 = 5432;
+        if (close_idx + 1 < tail.len and tail[close_idx + 1] == ':') {
+            const after = tail[close_idx + 2 ..];
+            const end = std.mem.indexOfAny(u8, after, "/?") orelse after.len;
+            port = std.fmt.parseInt(u16, after[0..end], 10) catch 5432;
+        }
+        return .{ .host = host, .port = port };
+    }
+
+    const host_end = std.mem.indexOfAny(u8, tail, ":/?") orelse tail.len;
+    const host = tail[0..host_end];
+    var port: u16 = 5432;
+    if (host_end < tail.len and tail[host_end] == ':') {
+        const after = tail[host_end + 1 ..];
+        const end = std.mem.indexOfAny(u8, after, "/?") orelse after.len;
+        port = std.fmt.parseInt(u16, after[0..end], 10) catch 5432;
+    }
+    return .{ .host = host, .port = port };
+}
+
+fn detectWebhookMode(cfg: *const Config) []const u8 {
+    var enabled_count: u8 = 0;
+    var only: []const u8 = "none";
+
+    if (cfg.channels.telegram.len > 0) {
+        enabled_count += 1;
+        only = "telegram";
+    }
+    if (cfg.channels.whatsapp.len > 0) {
+        enabled_count += 1;
+        only = "whatsapp";
+    }
+    if (cfg.channels.line.len > 0) {
+        enabled_count += 1;
+        only = "line";
+    }
+    if (cfg.channels.lark.len > 0) {
+        enabled_count += 1;
+        only = "lark";
+    }
+    if (enabled_count == 0) return "none";
+    if (enabled_count == 1) return only;
+    return "multi";
+}
+
+fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init_error: ?anyerror) void {
+    state.state_backend_configured = cfg.state.backend;
+    state.state_backend_effective = if (state.zaki_state != null) "postgres" else "file";
+    state.scheduler_backend = if (state.zaki_state != null and cfg.tenant.enabled) "postgres" else "file";
+    state.webhook_mode = detectWebhookMode(cfg);
+    state.postgres_host_len = 0;
+    state.postgres_port = 0;
+    state.postgres_schema_len = copyIntoBuf(&state.postgres_schema_buf, cfg.state.postgres.schema);
+    if (std.mem.eql(u8, cfg.state.backend, "postgres")) {
+        const parsed = parsePostgresHostPort(cfg.state.postgres.connection_string);
+        state.postgres_host_len = copyIntoBuf(&state.postgres_host_buf, parsed.host);
+        state.postgres_port = parsed.port;
+    }
+
+    state.state_degraded = std.mem.eql(u8, cfg.state.backend, "postgres") and state.zaki_state == null;
+    if (state.state_degraded) {
+        const reason = if (postgres_init_error) |err| @errorName(err) else "postgres_init_failed";
+        state.state_degraded_reason_len = copyIntoBuf(&state.state_degraded_reason_buf, reason);
+    } else {
+        state.state_degraded_reason_len = 0;
+    }
+}
+
+fn logStartupSelfCheck(state: *const GatewayState) void {
+    log.info(
+        "startup.self_check state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} webhook_mode={s}",
+        .{
+            state.state_backend_configured,
+            state.state_backend_effective,
+            if (state.state_degraded) "true" else "false",
+            state.postgresHost(),
+            state.postgres_port,
+            state.postgresSchema(),
+            state.scheduler_backend,
+            state.webhook_mode,
+        },
+    );
+    if (state.state_degraded) {
+        log.warn(
+            "gateway running in degraded state: configured backend={s}, effective backend={s}, reason={s}",
+            .{ state.state_backend_configured, state.state_backend_effective, state.degradedReason() },
+        );
+    }
+}
+
+fn maybeLogDegradedStateWarning(state: *GatewayState) void {
+    if (!state.state_degraded) return;
+    const now = std.time.timestamp();
+    const last = state.last_degraded_warn_s.load(.acquire);
+    if (now - last < 300 and now >= last) return;
+    state.last_degraded_warn_s.store(now, .release);
+    log.warn(
+        "gateway degraded state persists: configured backend={s}, effective backend={s}, reason={s}",
+        .{ state.state_backend_configured, state.state_backend_effective, state.degradedReason() },
+    );
+}
+
 // ── WhatsApp HMAC-SHA256 Signature Verification ─────────────────
 
 /// Verify a WhatsApp webhook HMAC-SHA256 signature.
@@ -2446,6 +2593,51 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             transport_stats.system_fallback_total,
         },
     );
+}
+
+fn internalDiagnosticsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
+    const ops_json = try ops_guard.diagnosticsJson(allocator);
+    defer allocator.free(ops_json);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKey(&buf, allocator, "gateway");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "requests_total", @intCast(state.requests_total.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "in_flight_requests", @intCast(state.in_flight_requests.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "draining");
+    try buf.appendSlice(allocator, if (state.draining.load(.acquire)) "true" else "false");
+    try buf.appendSlice(allocator, "},");
+
+    try json_util.appendJsonKey(&buf, allocator, "startup_self_check");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_configured", state.state_backend_configured);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_effective", state.state_backend_effective);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "degraded");
+    try buf.appendSlice(allocator, if (state.state_degraded) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "degraded_reason", state.degradedReason());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "postgres_host", state.postgresHost());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "postgres_port", state.postgres_port);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "postgres_schema", state.postgresSchema());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "scheduler_backend", state.scheduler_backend);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "webhook_mode", state.webhook_mode);
+    try buf.appendSlice(allocator, "},");
+
+    try json_util.appendJsonKey(&buf, allocator, "ops");
+    try buf.appendSlice(allocator, ops_json);
+    try buf.appendSlice(allocator, "}");
+    return buf.toOwnedSlice(allocator);
 }
 
 fn sseErrorEvent(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) ![]u8 {
@@ -4556,6 +4748,7 @@ fn handleAcceptedConnection(
         return;
     };
     _ = state.requests_total.fetchAdd(1, .monotonic);
+    maybeLogDegradedStateWarning(state);
 
     // Parse first line: "METHOD /path HTTP/1.1\r\n"
     const first_line_end = std.mem.indexOf(u8, raw, "\r\n") orelse {
@@ -4576,13 +4769,14 @@ fn handleAcceptedConnection(
     defer _ = state.in_flight_requests.fetchSub(1, .acq_rel);
 
     // Simple routing — control endpoints + descriptor-driven channel webhooks + ZAKI API.
-    const ControlRoute = enum { health, ready, webhook, pair, metrics, drain, undrain, shutdown };
+    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, drain, undrain, shutdown };
     const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
         .{ "/health", .health },
         .{ "/ready", .ready },
         .{ "/webhook", .webhook },
         .{ "/pair", .pair },
         .{ "/metrics", .metrics },
+        .{ "/internal/diagnostics", .diagnostics },
         .{ "/internal/drain", .drain },
         .{ "/internal/undrain", .undrain },
         .{ "/internal/shutdown", .shutdown },
@@ -4799,6 +4993,17 @@ fn handleAcceptedConnection(
                 response_content_type = "text/plain; version=0.0.4";
             }
         },
+        .diagnostics => {
+            if (!std.mem.eql(u8, method_str, "GET")) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (!validateInternalServiceToken(raw, state.internal_service_tokens)) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                response_body = internalDiagnosticsPayload(req_allocator, state) catch "{\"error\":\"diagnostics unavailable\"}";
+            }
+        },
         .drain => {
             if (!std.mem.eql(u8, method_str, "POST")) {
                 response_status = "405 Method Not Allowed";
@@ -4951,6 +5156,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
+        var postgres_init_error: ?anyerror = null;
         state.rate_limiter = GatewayRateLimiter.init(
             cfg.gateway.pair_rate_limit_per_minute,
             cfg.gateway.webhook_rate_limit_per_minute,
@@ -4999,6 +5205,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             const mgr = allocator.create(zaki_state_mod.Manager) catch break :init_state;
             mgr.* = zaki_state_mod.Manager.init(allocator, cfg.state) catch |err| {
                 allocator.destroy(mgr);
+                postgres_init_error = err;
                 log.warn("zaki state init failed, falling back to file state: {}", .{err});
                 break :init_state;
             };
@@ -5074,6 +5281,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 session_mgr_opt = sm;
             }
         }
+
+        applyStartupSelfCheck(&state, cfg, postgres_init_error);
+        logStartupSelfCheck(&state);
     }
     if (state.pairing_guard == null) {
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
