@@ -2449,15 +2449,69 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
 }
 
 fn sseErrorEvent(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) ![]u8 {
+    const error_frame = try sseErrorFrame(allocator, code, msg);
+    defer allocator.free(error_frame);
+    const done_frame = try sseDoneFrame(allocator, null, null);
+    defer allocator.free(done_frame);
+
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try w.writeAll("event: error\ndata: {\"code\":\"");
+    try w.writeAll(error_frame);
+    try w.writeAll(done_frame);
+    return buf.toOwnedSlice(allocator);
+}
+
+const SSE_TOKEN_CHUNK_SIZE: usize = 96;
+
+fn sseStatusFrame(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: status\ndata: {\"type\":\"statusResponse\",\"content\":\"");
+    try jsonEscapeInto(w, content);
+    try w.writeAll("\"}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn sseErrorFrame(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: error\ndata: {\"type\":\"error\",\"code\":\"");
     try jsonEscapeInto(w, code);
     try w.writeAll("\",\"message\":\"");
     try jsonEscapeInto(w, msg);
     try w.writeAll("\"}\n\n");
-    try w.writeAll("event: done\ndata: {\"status\":\"error\"}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn sseTokenFrame(allocator: std.mem.Allocator, delta: []const u8, seq: usize) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: token\ndata: {\"delta\":\"");
+    try jsonEscapeInto(w, delta);
+    try w.writeAll("\",\"content\":\"");
+    try jsonEscapeInto(w, delta);
+    try w.print("\",\"seq\":{d}}}\n\n", .{seq});
+    return buf.toOwnedSlice(allocator);
+}
+
+fn sseDoneFrame(allocator: std.mem.Allocator, session_id: ?[]const u8, message_id: ?i64) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: done\ndata: {\"type\":\"done\"");
+    if (session_id) |sid| {
+        try w.writeAll(",\"session_id\":\"");
+        try jsonEscapeInto(w, sid);
+        try w.writeAll("\"");
+    }
+    if (message_id) |mid| {
+        try w.print(",\"message_id\":\"{d}\"", .{mid});
+    }
+    try w.writeAll("}\n\n");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -2468,21 +2522,223 @@ fn sseChatPayload(allocator: std.mem.Allocator, text: []const u8, session_id: []
     const message_id = std.time.milliTimestamp();
 
     var start: usize = 0;
-    const CHUNK_SIZE: usize = 96;
     var seq: usize = 0;
-    while (start < text.len) : (start += CHUNK_SIZE) {
-        const end = @min(start + CHUNK_SIZE, text.len);
-        try w.writeAll("event: token\ndata: {\"delta\":\"");
-        try jsonEscapeInto(w, text[start..end]);
-        try w.writeAll("\",\"content\":\"");
-        try jsonEscapeInto(w, text[start..end]);
-        try w.print("\",\"seq\":{d}}}\n\n", .{seq});
+    while (start < text.len) : (start += SSE_TOKEN_CHUNK_SIZE) {
+        const end = @min(start + SSE_TOKEN_CHUNK_SIZE, text.len);
+        const token_frame = try sseTokenFrame(allocator, text[start..end], seq);
+        defer allocator.free(token_frame);
+        try w.writeAll(token_frame);
         seq += 1;
     }
-    try w.writeAll("event: done\ndata: {\"status\":\"ok\",\"session_id\":\"");
-    try jsonEscapeInto(w, session_id);
-    try w.print("\",\"message_id\":\"{d}\"}}\n\n", .{message_id});
+    const done_frame = try sseDoneFrame(allocator, session_id, message_id);
+    defer allocator.free(done_frame);
+    try w.writeAll(done_frame);
     return buf.toOwnedSlice(allocator);
+}
+
+fn sendChunkedSseHeader(stream: anytype, status: []const u8) !void {
+    var header_buf: [512]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {s}\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nX-Accel-Buffering: no\r\n\r\n",
+        .{status},
+    );
+    try stream.writeAll(header);
+}
+
+fn sendChunkedSseFrame(stream: anytype, frame: []const u8) !void {
+    var prefix_buf: [32]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "{x}\r\n", .{frame.len});
+    try stream.writeAll(prefix);
+    try stream.writeAll(frame);
+    try stream.writeAll("\r\n");
+}
+
+fn finishChunkedSse(stream: anytype) !void {
+    try stream.writeAll("0\r\n\r\n");
+}
+
+fn sendSseErrorResponse(stream: anytype, allocator: std.mem.Allocator, status: []const u8, code: []const u8, msg: []const u8) void {
+    sendChunkedSseHeader(stream, status) catch return;
+    sendSseErrorFrames(stream, allocator, code, msg);
+}
+
+fn sendSseErrorFrames(stream: anytype, allocator: std.mem.Allocator, code: []const u8, msg: []const u8) void {
+    const error_fallback = "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
+    const error_owned = sseErrorFrame(allocator, code, msg) catch null;
+    defer if (error_owned) |frame| allocator.free(frame);
+    const error_frame: []const u8 = if (error_owned) |frame| frame else error_fallback;
+    sendChunkedSseFrame(stream, error_frame) catch return;
+
+    const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
+    const done_owned = sseDoneFrame(allocator, null, null) catch null;
+    defer if (done_owned) |frame| allocator.free(frame);
+    const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
+    sendChunkedSseFrame(stream, done_frame) catch return;
+
+    finishChunkedSse(stream) catch {};
+}
+
+fn handleApiChatStreamSseConnection(
+    root_allocator: std.mem.Allocator,
+    req_allocator: std.mem.Allocator,
+    stream: anytype,
+    raw_request: []const u8,
+    method: []const u8,
+    base_path: []const u8,
+    state: *GatewayState,
+    config_opt: ?*const Config,
+    session_mgr_opt: ?*session_mod.SessionManager,
+) bool {
+    if (!std.mem.eql(u8, base_path, "/api/v1/chat/stream")) return false;
+
+    const request_start_ms = std.time.milliTimestamp();
+    if (!validateInternalServiceToken(raw_request, state.internal_service_tokens)) {
+        sendSseErrorResponse(stream, req_allocator, "401 Unauthorized", "unauthorized", "unauthorized");
+        return true;
+    }
+    if (!std.mem.eql(u8, method, "POST")) {
+        sendSseErrorResponse(stream, req_allocator, "405 Method Not Allowed", "method_not_allowed", "method not allowed");
+        return true;
+    }
+    if (state.draining.load(.acquire)) {
+        sendSseErrorResponse(stream, req_allocator, "503 Service Unavailable", "gateway_draining", "gateway draining, retry shortly");
+        return true;
+    }
+
+    const body = extractBody(raw_request) orelse {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_body", "missing body");
+        return true;
+    };
+    const header_user_id = extractZakiUserId(raw_request);
+    if (state.tenant_enabled and header_user_id == null) {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_user_id", "missing X-Zaki-User-Id");
+        return true;
+    }
+    const user_id = header_user_id orelse jsonStringField(body, "user_id") orelse {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_user_id", "missing X-Zaki-User-Id");
+        return true;
+    };
+
+    var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "invalid_user", "invalid user");
+        return true;
+    };
+    defer user_ctx.deinit(req_allocator);
+
+    ensureUserProvisioned(state, &user_ctx) catch {
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
+        return true;
+    };
+    const project_ctx = onboard.zakiBotProjectContext();
+    onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &project_ctx) catch {};
+
+    var ownership_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
+        error.LockHeld => {
+            _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
+            sendSseErrorResponse(stream, req_allocator, "409 Conflict", "ownership_lock_conflict", "user is active on another node, retry shortly");
+            return true;
+        },
+        else => {
+            sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "tenant_lock_failed", "tenant ownership lock failed");
+            return true;
+        },
+    };
+    defer if (ownership_lock_opt) |*lock| lock.deinit();
+
+    const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_message", "missing message");
+        return true;
+    };
+
+    var session_buf: [256]u8 = undefined;
+    const session_key = zaki_session.userMainSessionKey(&session_buf, user_id);
+    _ = state.chat_stream_total.fetchAdd(1, .monotonic);
+    sendChunkedSseHeader(stream, "200 OK") catch return true;
+
+    const status_fallback = "event: status\ndata: {\"type\":\"statusResponse\",\"content\":\"Processing request\"}\n\n";
+    const status_owned = sseStatusFrame(req_allocator, "Processing request") catch null;
+    defer if (status_owned) |frame| req_allocator.free(frame);
+    const status_frame: []const u8 = if (status_owned) |frame| frame else status_fallback;
+    sendChunkedSseFrame(stream, status_frame) catch return true;
+
+    const chat_start_ms = std.time.milliTimestamp();
+    const reply = blk: {
+        if (state.tenant_enabled) {
+            const cfg = config_opt orelse {
+                _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
+                sendSseErrorFrames(stream, req_allocator, "tenant_config_missing", "tenant runtime unavailable");
+                return true;
+            };
+            const tenant_runtime = getTenantRuntime(state, cfg, &user_ctx) catch {
+                _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
+                sendSseErrorFrames(stream, req_allocator, "tenant_runtime_failed", "tenant runtime init failed");
+                return true;
+            };
+            break :blk tenant_runtime.processMessage(
+                session_key,
+                message,
+                .{
+                    .channel = "zaki_app",
+                    .is_group = false,
+                },
+                null,
+            ) catch {
+                _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
+                sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
+                return true;
+            };
+        }
+        if (session_mgr_opt) |sm| {
+            break :blk sm.processMessage(session_key, message, null) catch {
+                _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
+                sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
+                return true;
+            };
+        }
+        break :blk processIncomingMessage(root_allocator, message) catch {
+            _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
+            sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
+            return true;
+        };
+    };
+    defer root_allocator.free(reply);
+
+    const payload_text = if (reply.len > 0) reply else "received";
+    var start: usize = 0;
+    var seq: usize = 0;
+    while (start < payload_text.len) : (start += SSE_TOKEN_CHUNK_SIZE) {
+        const end = @min(start + SSE_TOKEN_CHUNK_SIZE, payload_text.len);
+        const token_owned = sseTokenFrame(req_allocator, payload_text[start..end], seq) catch {
+            sendSseErrorFrames(stream, req_allocator, "stream_encode_failed", "failed to encode token frame");
+            return true;
+        };
+        defer req_allocator.free(token_owned);
+        sendChunkedSseFrame(stream, token_owned) catch return true;
+        seq += 1;
+    }
+
+    const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
+    const done_owned = sseDoneFrame(req_allocator, session_key, std.time.milliTimestamp()) catch null;
+    defer if (done_owned) |frame| req_allocator.free(frame);
+    const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
+    sendChunkedSseFrame(stream, done_frame) catch {
+        sendSseErrorFrames(stream, req_allocator, "stream_done_failed", "failed to emit done frame");
+        return true;
+    };
+    finishChunkedSse(stream) catch return true;
+
+    const chat_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - chat_start_ms));
+    const request_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - request_start_ms));
+    log.info("chat.stream.complete user={s} session={s} chat_ms={d} sse_ms={d} total_ms={d}", .{
+        user_id,
+        session_key,
+        chat_duration_ms,
+        @as(u64, 0),
+        request_duration_ms,
+    });
+
+    return true;
 }
 
 fn parseUserPath(base_path: []const u8) ?struct { user_id: []const u8, subpath: []const u8 } {
@@ -2573,7 +2829,7 @@ fn handleApiRoute(
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         }
         if (state.draining.load(.acquire)) {
-            const body = sseErrorEvent(req_allocator, "gateway_draining", "gateway draining, retry shortly") catch "event: error\ndata: {\"code\":\"gateway_draining\",\"message\":\"gateway draining\"}\n\n";
+            const body = sseErrorEvent(req_allocator, "gateway_draining", "gateway draining, retry shortly") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"gateway_draining\",\"message\":\"gateway draining\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
             return .{ .status = "503 Service Unavailable", .body = body, .content_type = "text/event-stream; charset=utf-8" };
         }
 
@@ -2598,7 +2854,7 @@ fn handleApiRoute(
         var ownership_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
                 _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
-                const body_locked = sseErrorEvent(req_allocator, "ownership_lock_conflict", "user is active on another node, retry shortly") catch "event: error\ndata: {\"code\":\"ownership_lock_conflict\",\"message\":\"ownership lock conflict\"}\n\n";
+                const body_locked = sseErrorEvent(req_allocator, "ownership_lock_conflict", "user is active on another node, retry shortly") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"ownership lock conflict\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                 return .{
                     .status = "409 Conflict",
                     .body = body_locked,
@@ -2625,7 +2881,7 @@ fn handleApiRoute(
             if (state.tenant_enabled) {
                 const cfg = config_opt orelse {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                    const err_sse = sseErrorEvent(req_allocator, "tenant_config_missing", "tenant runtime unavailable") catch "event: error\ndata: {\"code\":\"tenant_config_missing\",\"message\":\"tenant runtime unavailable\"}\n\n";
+                    const err_sse = sseErrorEvent(req_allocator, "tenant_config_missing", "tenant runtime unavailable") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"tenant_config_missing\",\"message\":\"tenant runtime unavailable\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                     return .{
                         .status = "500 Internal Server Error",
                         .body = err_sse,
@@ -2634,7 +2890,7 @@ fn handleApiRoute(
                 };
                 const tenant_runtime = getTenantRuntime(state, cfg, &user_ctx) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                    const err_sse = sseErrorEvent(req_allocator, "tenant_runtime_failed", "tenant runtime init failed") catch "event: error\ndata: {\"code\":\"tenant_runtime_failed\",\"message\":\"tenant runtime init failed\"}\n\n";
+                    const err_sse = sseErrorEvent(req_allocator, "tenant_runtime_failed", "tenant runtime init failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"tenant_runtime_failed\",\"message\":\"tenant runtime init failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                     return .{
                         .status = "500 Internal Server Error",
                         .body = err_sse,
@@ -2651,7 +2907,7 @@ fn handleApiRoute(
                     null,
                 ) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                    const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
+                    const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                     return .{
                         .status = "500 Internal Server Error",
                         .body = err_sse,
@@ -2662,7 +2918,7 @@ fn handleApiRoute(
             if (session_mgr_opt) |sm| {
                 break :blk sm.processMessage(session_key, message, null) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                    const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
+                    const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                     return .{
                         .status = "500 Internal Server Error",
                         .body = err_sse,
@@ -2672,7 +2928,7 @@ fn handleApiRoute(
             }
             break :blk processIncomingMessage(root_allocator, message) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
+                const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                 return .{
                     .status = "500 Internal Server Error",
                     .body = err_sse,
@@ -4332,6 +4588,7 @@ fn handleAcceptedConnection(
         .{ "/internal/shutdown", .shutdown },
     });
     const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
+    const is_chat_stream_path = std.mem.eql(u8, base_path, "/api/v1/chat/stream");
     const is_post = std.mem.eql(u8, method_str, "POST");
     var response_status: []const u8 = "200 OK";
     var response_body: []const u8 = "";
@@ -4342,6 +4599,7 @@ fn handleAcceptedConnection(
     const is_ops_path = std.mem.eql(u8, base_path, "/health") or
         std.mem.eql(u8, base_path, "/ready") or
         std.mem.eql(u8, base_path, "/metrics") or
+        is_chat_stream_path or
         is_internal_path;
     if (state.draining.load(.acquire) and !is_ops_path) {
         _ = state.drain_rejected_total.fetchAdd(1, .monotonic);
@@ -4354,7 +4612,20 @@ fn handleAcceptedConnection(
         return;
     }
 
-    if (std.mem.startsWith(u8, base_path, "/api/v1/")) {
+    if (is_chat_stream_path) {
+        _ = handleApiChatStreamSseConnection(
+            allocator,
+            req_allocator,
+            conn.stream,
+            raw,
+            method_str,
+            base_path,
+            state,
+            config_opt,
+            session_mgr_opt,
+        );
+        return;
+    } else if (std.mem.startsWith(u8, base_path, "/api/v1/")) {
         const api_resp = handleApiRoute(
             allocator,
             req_allocator,
@@ -6788,10 +7059,11 @@ test "sseErrorEvent includes code and terminal done event" {
     const sse = try sseErrorEvent(std.testing.allocator, "chat_failed", "chat failed");
     defer std.testing.allocator.free(sse);
     try std.testing.expect(std.mem.indexOf(u8, sse, "event: error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sse, "\"type\":\"error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"code\":\"chat_failed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"message\":\"chat failed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "event: done") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sse, "\"status\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sse, "\"type\":\"done\"") != null);
 }
 
 test "sseChatPayload emits token deltas and done metadata" {
@@ -6802,7 +7074,7 @@ test "sseChatPayload emits token deltas and done metadata" {
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"content\":\"hello world\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"seq\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "event: done") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sse, "\"status\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sse, "\"type\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"session_id\":\"agent:zaki-bot:user:user_a:main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"message_id\":\"") != null);
 }
