@@ -2960,14 +2960,14 @@ test "session config: parse per-account-channel-peer scope" {
     try std.testing.expectEqual(config_types.DmScope.per_account_channel_peer, cfg.session.dm_scope);
 }
 
-test "session config: default dm_scope is per_channel_peer" {
+test "session config: default dm_scope is main" {
     const allocator = std.testing.allocator;
     const json =
         \\{}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqual(config_types.DmScope.per_channel_peer, cfg.session.dm_scope);
+    try std.testing.expectEqual(config_types.DmScope.main, cfg.session.dm_scope);
 }
 
 test "session config: parse idle_minutes" {
@@ -3030,7 +3030,7 @@ test "session config: empty session block uses defaults" {
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqual(config_types.DmScope.per_channel_peer, cfg.session.dm_scope);
+    try std.testing.expectEqual(config_types.DmScope.main, cfg.session.dm_scope);
     try std.testing.expectEqual(@as(u32, 60), cfg.session.idle_minutes);
     try std.testing.expectEqual(@as(usize, 0), cfg.session.identity_links.len);
 }

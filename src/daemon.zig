@@ -1174,7 +1174,7 @@ test "resolveInboundRouteSessionKey falls back to configured account_id" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:onebot-agent:onebot:direct:12345", routed.?);
+    try std.testing.expectEqualStrings("agent:onebot-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes onebot group messages by group id" {
@@ -1258,7 +1258,7 @@ test "resolveInboundRouteSessionKey prefers metadata account_id override" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:onebot-backup-agent:onebot:direct:12345", routed.?);
+    try std.testing.expectEqualStrings("agent:onebot-backup-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey supports custom maixcam channel name" {
@@ -1296,7 +1296,7 @@ test "resolveInboundRouteSessionKey supports custom maixcam channel name" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:camera-agent:vision-cam:direct:device-1", routed.?);
+    try std.testing.expectEqualStrings("agent:camera-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey matches non-primary maixcam account by channel name" {
@@ -1334,7 +1334,7 @@ test "resolveInboundRouteSessionKey matches non-primary maixcam account by chann
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:lab-camera-agent:vision-lab:direct:device-2", routed.?);
+    try std.testing.expectEqualStrings("agent:lab-camera-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes discord channel messages by chat_id" {
@@ -1410,7 +1410,7 @@ test "resolveInboundRouteSessionKey routes discord direct messages by sender" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:discord-dm-agent:discord:direct:user-42", routed.?);
+    try std.testing.expectEqualStrings("agent:discord-dm-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey applies session dm_scope for direct messages" {
@@ -1564,7 +1564,7 @@ test "resolveInboundRouteSessionKey routes slack direct messages by sender" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:slack-dm-agent:slack:direct:U777", routed.?);
+    try std.testing.expectEqualStrings("agent:slack-dm-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes qq dm messages by sender id" {
@@ -1601,7 +1601,7 @@ test "resolveInboundRouteSessionKey routes qq dm messages by sender id" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:qq-dm-agent:qq:direct:qq-user-1", routed.?);
+    try std.testing.expectEqualStrings("agent:qq-dm-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes irc channel messages by chat id" {
@@ -1677,7 +1677,7 @@ test "resolveInboundRouteSessionKey routes irc direct messages by sender" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:irc-dm-agent:irc:direct:alice", routed.?);
+    try std.testing.expectEqualStrings("agent:irc-dm-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes mattermost by channel id and team" {
@@ -1795,7 +1795,7 @@ test "resolveInboundRouteSessionKey supports standardized peer metadata for unkn
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:custom-agent:custom:direct:user-7", routed.?);
+    try std.testing.expectEqualStrings("agent:custom-agent:main", routed.?);
 }
 
 test "parseInboundMetadata extracts message_id and thread_id" {

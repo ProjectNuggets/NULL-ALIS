@@ -963,7 +963,7 @@ pub const DmScope = enum {
     main,
     /// One session per peer across all channels.
     per_peer,
-    /// One session per (channel, peer) pair (default).
+    /// One session per (channel, peer) pair.
     per_channel_peer,
     /// One session per (account, channel, peer) triple.
     per_account_channel_peer,
@@ -975,7 +975,7 @@ pub const IdentityLink = struct {
 };
 
 pub const SessionConfig = struct {
-    dm_scope: DmScope = .per_channel_peer,
+    dm_scope: DmScope = .main,
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
     typing_interval_secs: u32 = 5,

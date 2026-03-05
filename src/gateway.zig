@@ -5816,7 +5816,7 @@ test "telegramSessionKeyRouted uses direct peer for private chats" {
     };
 
     const key = telegramSessionKeyRouted(allocator, &key_buf, 4242, body, &cfg, "tg-main");
-    try std.testing.expectEqualStrings("agent:tg-dm-agent:telegram:direct:4242", key);
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:main", key);
 }
 
 test "telegramSessionKeyRouted applies session dm_scope for direct chats" {
