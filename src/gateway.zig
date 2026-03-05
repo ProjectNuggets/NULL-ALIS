@@ -1385,7 +1385,9 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
         },
     ) catch |err| {
         if (job.bot_token.len > 0) {
-            sendTelegramReply(job.allocator, job.bot_token, job.chat_id, userFacingAgentError(err)) catch {};
+            sendTelegramReply(job.allocator, job.bot_token, job.chat_id, userFacingAgentError(err)) catch |send_err| {
+                log.warn("tenant telegram async error-reply send failed: {}", .{send_err});
+            };
         }
         return;
     };
@@ -2456,11 +2458,6 @@ pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8)
 
 /// Send a reply to a Telegram chat using the Bot API.
 pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, chat_id: i64, text: []const u8) !void {
-    // Build the curl command to call the Telegram API
-    const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
-    defer allocator.free(url);
-
-    // JSON-escape the text for the body
     var body_buf: std.ArrayList(u8) = .empty;
     defer body_buf.deinit(allocator);
     const w = body_buf.writer(allocator);
@@ -2477,21 +2474,9 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
     }
     try w.writeAll("\"}");
 
-    const body = body_buf.items;
-
-    var curl_child = std.process.Child.init(
-        &[_][]const u8{
-            "curl", "-s",                             "-X", "POST",
-            "-H",   "Content-Type: application/json", "-d", body,
-            url,
-        },
-        allocator,
-    );
-    curl_child.stdout_behavior = .Pipe;
-    curl_child.stderr_behavior = .Pipe;
-
-    curl_child.spawn() catch return;
-    _ = curl_child.wait() catch {};
+    const resp = try telegramApiCall(allocator, bot_token, "sendMessage", body_buf.items);
+    defer allocator.free(resp);
+    if (!(jsonBoolField(resp, "ok") orelse false)) return error.TelegramSendFailed;
 }
 
 fn userFacingAgentError(err: anyerror) []const u8 {
@@ -4238,14 +4223,18 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     },
                 ) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch |send_err| {
+                            log.warn("telegram webhook error-reply send failed: {}", .{send_err});
+                        };
                     }
                     break :blk null;
                 };
                 if (reply) |r| {
                     defer ctx.root_allocator.free(r);
                     if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch {};
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch |send_err| {
+                            log.warn("telegram webhook reply send failed: {}", .{send_err});
+                        };
                     }
                     ctx.response_body = "{\"status\":\"ok\"}";
                 } else {
@@ -4275,14 +4264,18 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
                 const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, null) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch |send_err| {
+                            log.warn("telegram webhook sync error-reply send failed: {}", .{send_err});
+                        };
                     }
                     break :blk null;
                 };
                 if (reply) |r| {
                     defer ctx.root_allocator.free(r);
                     if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch {};
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch |send_err| {
+                            log.warn("telegram webhook sync reply send failed: {}", .{send_err});
+                        };
                     }
                     ctx.response_body = "{\"status\":\"ok\"}";
                 } else {
