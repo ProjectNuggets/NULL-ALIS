@@ -3793,6 +3793,8 @@ fn handleApiRoute(
                 mgr.putSecret(user_id, "telegram_bot_token", tok) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
                 };
+                // Keep file secret in sync for local tenant runtime fallback.
+                writeFile(secret_path, tok) catch {};
             } else {
                 writeFile(secret_path, tok) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
@@ -3801,18 +3803,24 @@ fn handleApiRoute(
         }
         const bot_token_raw = if (state.zaki_state) |mgr| blk: {
             const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            const file_value = readTrimmedSecretFile(req_allocator, secret_path) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
+            };
+            if (isLikelyTelegramBotToken(file_value)) {
+                mgr.putSecret(user_id, "telegram_bot_token", file_value) catch {};
+                break :blk file_value;
+            }
+
             const secret_value = mgr.getSecret(req_allocator, user_id, "telegram_bot_token") catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
             };
             if (secret_value) |value| {
-                if (isLikelyTelegramBotToken(value)) break :blk value;
+                if (isLikelyTelegramBotToken(value)) {
+                    writeFile(secret_path, value) catch {};
+                    break :blk value;
+                }
                 req_allocator.free(value);
             }
-            const file_value = readTrimmedSecretFile(req_allocator, secret_path) catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
-            };
-            // Best-effort self-heal when DB secret is invalid but file token is valid.
-            if (file_value.len > 0) mgr.putSecret(user_id, "telegram_bot_token", file_value) catch {};
             break :blk file_value;
         } else blk: {
             break :blk readFileOrDefault(req_allocator, secret_path, "") catch {
@@ -4173,16 +4181,6 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         ctx.response_body = "{\"error\":\"invalid user\"}";
                         return;
                     };
-                    const secret_value = mgr.getSecret(ctx.req_allocator, numeric_user_id, "telegram_bot_token") catch {
-                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                        ctx.response_status = "500 Internal Server Error";
-                        ctx.response_body = "{\"error\":\"failed reading bot token\"}";
-                        return;
-                    };
-                    if (secret_value) |value| {
-                        if (isLikelyTelegramBotToken(value)) break :blk value;
-                        ctx.req_allocator.free(value);
-                    }
                     const secret_path = resolveSecretPath(ctx.req_allocator, user_ctx.secrets_dir, "telegram_bot_token") catch {
                         _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                         ctx.response_status = "500 Internal Server Error";
@@ -4196,6 +4194,23 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         ctx.response_body = "{\"error\":\"failed reading bot token\"}";
                         return;
                     };
+                    if (isLikelyTelegramBotToken(file_value)) {
+                        mgr.putSecret(numeric_user_id, "telegram_bot_token", file_value) catch {};
+                        break :blk file_value;
+                    }
+                    const secret_value = mgr.getSecret(ctx.req_allocator, numeric_user_id, "telegram_bot_token") catch {
+                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                        ctx.response_status = "500 Internal Server Error";
+                        ctx.response_body = "{\"error\":\"failed reading bot token\"}";
+                        return;
+                    };
+                    if (secret_value) |value| {
+                        if (isLikelyTelegramBotToken(value)) {
+                            writeFile(secret_path, value) catch {};
+                            break :blk value;
+                        }
+                        ctx.req_allocator.free(value);
+                    }
                     if (file_value.len > 0) mgr.putSecret(numeric_user_id, "telegram_bot_token", file_value) catch {};
                     break :blk file_value;
                 }
