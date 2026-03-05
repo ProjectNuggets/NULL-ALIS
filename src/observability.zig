@@ -364,7 +364,7 @@ pub const OtelObserver = struct {
         return .{
             .allocator = allocator,
             .endpoint = endpoint orelse "http://localhost:4318",
-            .service_name = service_name orelse "nullclaw",
+            .service_name = service_name orelse "nullalis",
             .spans = .empty,
             .mutex = .{},
             .current_trace_id = .{0} ** 32,
@@ -738,13 +738,13 @@ test "createObserver factory" {
 }
 
 test "FileObserver name" {
-    var file_obs = FileObserver{ .path = "/tmp/nullclaw_test_obs.jsonl" };
+    var file_obs = FileObserver{ .path = "/tmp/nullalis_test_obs.jsonl" };
     const obs = file_obs.observer();
     try std.testing.expectEqualStrings("file", obs.getName());
 }
 
 test "FileObserver does not panic on events" {
-    var file_obs = FileObserver{ .path = "/tmp/nullclaw_test_obs.jsonl" };
+    var file_obs = FileObserver{ .path = "/tmp/nullalis_test_obs.jsonl" };
     const obs = file_obs.observer();
     const event = ObserverEvent{ .heartbeat_tick = {} };
     obs.recordEvent(&event);
@@ -754,7 +754,7 @@ test "FileObserver does not panic on events" {
 }
 
 test "FileObserver handles all event types" {
-    var file_obs = FileObserver{ .path = "/tmp/nullclaw_test_obs2.jsonl" };
+    var file_obs = FileObserver{ .path = "/tmp/nullalis_test_obs2.jsonl" };
     const obs = file_obs.observer();
     const events = [_]ObserverEvent{
         .{ .agent_start = .{ .provider = "test", .model = "test" } },
@@ -936,7 +936,7 @@ test "Observer interface dispatches correctly" {
     var noop = NoopObserver{};
     var log_obs = LogObserver{};
     var verbose = VerboseObserver{};
-    var file_obs = FileObserver{ .path = "/tmp/nullclaw_dispatch_test.jsonl" };
+    var file_obs = FileObserver{ .path = "/tmp/nullalis_dispatch_test.jsonl" };
 
     const observers = [_]Observer{ noop.observer(), log_obs.observer(), verbose.observer(), file_obs.observer() };
     const expected_names = [_][]const u8{ "noop", "log", "verbose", "file" };
@@ -959,7 +959,7 @@ test "OtelObserver init defaults" {
     var otel = OtelObserver.init(std.testing.allocator, null, null);
     defer otel.deinit();
     try std.testing.expectEqualStrings("http://localhost:4318", otel.endpoint);
-    try std.testing.expectEqualStrings("nullclaw", otel.service_name);
+    try std.testing.expectEqualStrings("nullalis", otel.service_name);
     try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
 }
 

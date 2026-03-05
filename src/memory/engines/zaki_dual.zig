@@ -43,7 +43,7 @@ pub const ZakiDualMemory = struct {
     }
 
     fn shouldSyncEntry(entry: root.MemoryEntry) bool {
-        if (std.mem.eql(u8, entry.key, "last_hygiene_at")) return false;
+        if (root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) return false;
         if (entry.category == .core and std.mem.startsWith(u8, entry.key, "MEMORY:")) {
             return false;
         }
@@ -190,6 +190,39 @@ test "zaki dual memory skips scaffold core lines during sync" {
     const got = (try mem.get(allocator, "favorite_color")).?;
     defer got.deinit(allocator);
     try std.testing.expectEqualStrings("teal", got.content);
+
+    mem.deinit();
+}
+
+test "zaki dual memory ignores internal markdown entries during sync" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const memory_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace});
+    defer allocator.free(memory_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = memory_path,
+        .data = "# MEMORY.md - Long-Term Memory\n\n" ++
+            "- **favorite_color**: teal\n" ++
+            "- **autosave_user_123**: internal turn\n" ++
+            "- **__bootstrap.prompt.SOUL.md**: internal persona\n" ++
+            "- **last_hygiene_at**: 1700000000\n",
+    });
+
+    var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    var mem = dual.memory();
+
+    const favorite = (try mem.get(allocator, "favorite_color")).?;
+    defer favorite.deinit(allocator);
+    try std.testing.expectEqualStrings("teal", favorite.content);
+    try std.testing.expect((try mem.get(allocator, "autosave_user_123")) == null);
+    try std.testing.expect((try mem.get(allocator, "__bootstrap.prompt.SOUL.md")) == null);
+    try std.testing.expect((try mem.get(allocator, "last_hygiene_at")) == null);
 
     mem.deinit();
 }

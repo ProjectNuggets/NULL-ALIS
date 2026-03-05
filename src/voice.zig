@@ -100,7 +100,7 @@ pub fn transcribeFile(
     defer allocator.free(tmp_dir);
     var tmp_path_buf: [256]u8 = undefined;
     var tmp_fbs = std.io.fixedBufferStream(&tmp_path_buf);
-    tmp_fbs.writer().print("{s}/nullclaw_voice_{d}.bin", .{ tmp_dir, getPid() }) catch
+    tmp_fbs.writer().print("{s}/nullalis_voice_{d}.bin", .{ tmp_dir, getPid() }) catch
         return error.FileReadFailed;
     const tmp_path_len = tmp_fbs.pos;
     tmp_path_buf[tmp_path_len] = 0;
@@ -404,7 +404,7 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, tg_
     const pid = getPid();
     var path_buf: [256]u8 = undefined;
     var path_fbs = std.io.fixedBufferStream(&path_buf);
-    try path_fbs.writer().print("{s}/nullclaw_tg_voice_{d}.ogg", .{ tmp_dir, pid });
+    try path_fbs.writer().print("{s}/nullalis_tg_voice_{d}.ogg", .{ tmp_dir, pid });
     const local_path = path_fbs.getWritten();
 
     var z_buf: [256]u8 = undefined;

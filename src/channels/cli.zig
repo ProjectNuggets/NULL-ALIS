@@ -90,7 +90,7 @@ pub const CliChannel = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// History — persistent REPL command history (~/.nullclaw_history)
+// History — persistent REPL command history (~/.nullalis_history)
 // ═══════════════════════════════════════════════════════════════════════════
 
 const MAX_HISTORY_LINES: usize = 500;
@@ -185,12 +185,12 @@ pub fn saveHistory(history: []const []const u8, path: []const u8) !void {
     }
 }
 
-/// Resolve the default history file path (~/.nullclaw_history).
+/// Resolve the default history file path (~/.nullalis_history).
 /// Caller owns the returned string.
 pub fn defaultHistoryPath(allocator: std.mem.Allocator) ![]const u8 {
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw_history" });
+    return std.fs.path.join(allocator, &.{ home, ".nullalis_history" });
 }
 
 // ════════════════════════════════════════════════════════════════════════════

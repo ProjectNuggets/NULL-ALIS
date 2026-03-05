@@ -12,6 +12,7 @@ const Config = @import("config.zig").Config;
 const CronScheduler = @import("cron.zig").CronScheduler;
 const cron = @import("cron.zig");
 const bus_mod = @import("bus.zig");
+const zaki_session = @import("zaki_session.zig");
 const dispatch = @import("channels/dispatch.zig");
 const channel_loop = @import("channel_loop.zig");
 const channel_manager = @import("channel_manager.zig");
@@ -258,12 +259,12 @@ fn runCronAgentTurn(
     const session_key = blk: {
         if (scheduler.context_user_id) |user_id| {
             if (job.session_target == .main) {
-                break :blk std.fmt.bufPrint(&session_buf, "agent:zaki-bot:user:{s}:main", .{user_id}) catch "agent:zaki-bot:user:unknown:main";
+                break :blk zaki_session.userMainSessionKey(&session_buf, user_id);
             }
-            break :blk std.fmt.bufPrint(&session_buf, "agent:zaki-bot:user:{s}:cron:{s}", .{ user_id, job.id }) catch "agent:zaki-bot:user:unknown:cron";
+            break :blk zaki_session.userCronSessionKey(&session_buf, user_id, job.id);
         }
-        if (job.session_target == .main) break :blk "agent:zaki-bot:main";
-        break :blk "agent:zaki-bot:cron";
+        if (job.session_target == .main) break :blk zaki_session.fallbackMainSessionKey();
+        break :blk zaki_session.fallbackCronSessionKey();
     };
 
     return runtime.session_mgr.processMessage(session_key, prompt, null);
@@ -502,12 +503,12 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             state_mgr.deinit();
             allocator.destroy(state_mgr);
         };
-        if (std.mem.eql(u8, config.state.backend, "postgres")) {
+        if (std.mem.eql(u8, config.state.backend, "postgres")) init_pg: {
             const mgr = allocator.create(zaki_state.Manager) catch |err| {
                 log.warn("tenant postgres scheduler disabled: manager alloc failed: {}", .{err});
                 state.markError("scheduler", "postgres_state_alloc_failed");
                 health.markComponentError("scheduler", "postgres_state_alloc_failed");
-                return;
+                break :init_pg;
             };
             errdefer allocator.destroy(mgr);
             mgr.* = zaki_state.Manager.init(allocator, config.state) catch |err| {
@@ -515,7 +516,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
                 log.warn("tenant postgres scheduler disabled: state init failed: {}", .{err});
                 state.markError("scheduler", "postgres_state_init_failed");
                 health.markComponentError("scheduler", "postgres_state_init_failed");
-                return;
+                break :init_pg;
             };
             pg_mgr = mgr;
         }
@@ -914,7 +915,7 @@ fn inboundDispatcherThread(
     }
 }
 
-/// Run the long-lived runtime. This is the main entry point for `nullclaw gateway`.
+/// Run the long-lived runtime. This is the main entry point for `nullalis gateway`.
 /// Spawns threads for gateway, heartbeat, and channels, then loops until
 /// shutdown is requested (Ctrl+C signal or explicit request).
 /// `host` and `port` are CLI-parsed values that override `config.gateway`.
@@ -951,7 +952,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
-    try stdout.print("nullclaw gateway runtime started\n", .{});
+    try stdout.print("nullalis gateway runtime started\n", .{});
     try stdout.print("  Gateway:  http://{s}:{d}\n", .{ state.gateway_host, state.gateway_port });
     try stdout.print("  Components: {d} active\n", .{state.component_count});
     try stdout.flush();
@@ -1093,7 +1094,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     if (hb_thread) |t| t.join();
     gw_thread.join();
 
-    try stdout.print("nullclaw gateway runtime stopped.\n", .{});
+    try stdout.print("nullalis gateway runtime stopped.\n", .{});
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -1173,7 +1174,7 @@ test "resolveInboundRouteSessionKey falls back to configured account_id" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:onebot-agent:onebot:direct:12345", routed.?);
+    try std.testing.expectEqualStrings("agent:onebot-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes onebot group messages by group id" {
@@ -1257,7 +1258,7 @@ test "resolveInboundRouteSessionKey prefers metadata account_id override" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:onebot-backup-agent:onebot:direct:12345", routed.?);
+    try std.testing.expectEqualStrings("agent:onebot-backup-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey supports custom maixcam channel name" {
@@ -1295,7 +1296,7 @@ test "resolveInboundRouteSessionKey supports custom maixcam channel name" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:camera-agent:vision-cam:direct:device-1", routed.?);
+    try std.testing.expectEqualStrings("agent:camera-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey matches non-primary maixcam account by channel name" {
@@ -1333,7 +1334,7 @@ test "resolveInboundRouteSessionKey matches non-primary maixcam account by chann
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:lab-camera-agent:vision-lab:direct:device-2", routed.?);
+    try std.testing.expectEqualStrings("agent:lab-camera-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes discord channel messages by chat_id" {
@@ -1409,7 +1410,7 @@ test "resolveInboundRouteSessionKey routes discord direct messages by sender" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:discord-dm-agent:discord:direct:user-42", routed.?);
+    try std.testing.expectEqualStrings("agent:discord-dm-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey applies session dm_scope for direct messages" {
@@ -1563,7 +1564,7 @@ test "resolveInboundRouteSessionKey routes slack direct messages by sender" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:slack-dm-agent:slack:direct:U777", routed.?);
+    try std.testing.expectEqualStrings("agent:slack-dm-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes qq dm messages by sender id" {
@@ -1600,7 +1601,7 @@ test "resolveInboundRouteSessionKey routes qq dm messages by sender id" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:qq-dm-agent:qq:direct:qq-user-1", routed.?);
+    try std.testing.expectEqualStrings("agent:qq-dm-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes irc channel messages by chat id" {
@@ -1676,7 +1677,7 @@ test "resolveInboundRouteSessionKey routes irc direct messages by sender" {
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:irc-dm-agent:irc:direct:alice", routed.?);
+    try std.testing.expectEqualStrings("agent:irc-dm-agent:main", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes mattermost by channel id and team" {
@@ -1794,7 +1795,7 @@ test "resolveInboundRouteSessionKey supports standardized peer metadata for unkn
     const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
-    try std.testing.expectEqualStrings("agent:custom-agent:custom:direct:user-7", routed.?);
+    try std.testing.expectEqualStrings("agent:custom-agent:main", routed.?);
 }
 
 test "parseInboundMetadata extracts message_id and thread_id" {
@@ -1831,12 +1832,12 @@ test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" 
 test "stateFilePath derives from config_path" {
     const config = Config{
         .workspace_dir = "/tmp/workspace",
-        .config_path = "/home/user/.nullclaw/config.json",
+        .config_path = "/home/user/.nullalis/config.json",
         .allocator = std.testing.allocator,
     };
     const path = try stateFilePath(std.testing.allocator, &config);
     defer std.testing.allocator.free(path);
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/home/user/.nullclaw", "daemon_state.json" });
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/home/user/.nullalis", "daemon_state.json" });
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, path);
 }
@@ -1870,14 +1871,23 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     const cmd_runtime = "echo merge_runtime_keep_7d1c";
     const cmd_external = "echo merge_external_add_9a42";
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cron_path = try std.fmt.allocPrint(allocator, "{s}/cron.json", .{tmp_root});
+    defer allocator.free(cron_path);
+
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();
+    try runtime.setStorePath(cron_path);
     _ = try runtime.addJob("* * * * *", cmd_runtime);
     runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
     try cron.saveJobs(&runtime);
 
     var loaded = CronScheduler.init(allocator, 32, true);
     defer loaded.deinit();
+    try loaded.setStorePath(cron_path);
     try cron.loadJobs(&loaded);
 
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
@@ -1890,6 +1900,7 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     // Simulate concurrent writer adding a new job after scheduler reload.
     var external = CronScheduler.init(allocator, 32, true);
     defer external.deinit();
+    try external.setStorePath(cron_path);
     try cron.loadJobs(&external);
     _ = try external.addJob("*/5 * * * *", cmd_external);
     try cron.saveJobs(&external);
@@ -1899,6 +1910,7 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
 
     var merged = CronScheduler.init(allocator, 64, true);
     defer merged.deinit();
+    try merged.setStorePath(cron_path);
     try cron.loadJobs(&merged);
 
     var found_runtime = false;

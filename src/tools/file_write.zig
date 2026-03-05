@@ -154,7 +154,7 @@ pub const FileWriteTool = struct {
         while (attempt < 32) : (attempt += 1) {
             const tmp_name = std.fmt.bufPrint(
                 &tmp_name_buf,
-                ".nullclaw-write-{d}-{d}.tmp",
+                ".nullalis-write-{d}-{d}.tmp",
                 .{ std.time.nanoTimestamp(), attempt },
             ) catch unreachable;
             tmp_file = parent_dir.createFile(tmp_name, .{ .exclusive = true }) catch |err| switch (err) {

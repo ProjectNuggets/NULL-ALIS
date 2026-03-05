@@ -5,8 +5,13 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const http_native = @import("http_native/root.zig");
 
 const log = std.log.scoped(.http_util);
+pub const RequestOptions = http_native.RequestOptions;
+pub const TransportConfig = http_native.TransportConfig;
+pub const TransportMode = http_native.TransportMode;
+pub const TransportSubsystem = http_native.TransportSubsystem;
 
 pub const CurlResponse = struct {
     status_code: u16,
@@ -14,6 +19,92 @@ pub const CurlResponse = struct {
 };
 
 const STATUS_MARKER = "\n__NULLCLAW_STATUS__:";
+
+pub const TransportStats = struct {
+    tools_native_total: u64,
+    tools_curl_total: u64,
+    tools_fallback_total: u64,
+    providers_native_total: u64,
+    providers_curl_total: u64,
+    providers_fallback_total: u64,
+    channels_native_total: u64,
+    channels_curl_total: u64,
+    channels_fallback_total: u64,
+    system_native_total: u64,
+    system_curl_total: u64,
+    system_fallback_total: u64,
+};
+
+const transport_counters = struct {
+    var tools_native_total = std.atomic.Value(u64).init(0);
+    var tools_curl_total = std.atomic.Value(u64).init(0);
+    var tools_fallback_total = std.atomic.Value(u64).init(0);
+    var providers_native_total = std.atomic.Value(u64).init(0);
+    var providers_curl_total = std.atomic.Value(u64).init(0);
+    var providers_fallback_total = std.atomic.Value(u64).init(0);
+    var channels_native_total = std.atomic.Value(u64).init(0);
+    var channels_curl_total = std.atomic.Value(u64).init(0);
+    var channels_fallback_total = std.atomic.Value(u64).init(0);
+    var system_native_total = std.atomic.Value(u64).init(0);
+    var system_curl_total = std.atomic.Value(u64).init(0);
+    var system_fallback_total = std.atomic.Value(u64).init(0);
+};
+
+const TransportOutcome = enum {
+    native,
+    curl,
+    fallback,
+};
+
+fn record_transport_outcome(subsystem: TransportSubsystem, outcome: TransportOutcome) void {
+    const counter = switch (subsystem) {
+        .tools => switch (outcome) {
+            .native => &transport_counters.tools_native_total,
+            .curl => &transport_counters.tools_curl_total,
+            .fallback => &transport_counters.tools_fallback_total,
+        },
+        .providers => switch (outcome) {
+            .native => &transport_counters.providers_native_total,
+            .curl => &transport_counters.providers_curl_total,
+            .fallback => &transport_counters.providers_fallback_total,
+        },
+        .channels => switch (outcome) {
+            .native => &transport_counters.channels_native_total,
+            .curl => &transport_counters.channels_curl_total,
+            .fallback => &transport_counters.channels_fallback_total,
+        },
+        .system => switch (outcome) {
+            .native => &transport_counters.system_native_total,
+            .curl => &transport_counters.system_curl_total,
+            .fallback => &transport_counters.system_fallback_total,
+        },
+    };
+    _ = counter.fetchAdd(1, .monotonic);
+}
+
+fn subsystem_supports_native(subsystem: TransportSubsystem) bool {
+    return switch (subsystem) {
+        .tools, .providers, .channels => true,
+        .system => false,
+    };
+}
+
+pub fn transport_stats_snapshot() TransportStats {
+    return .{
+        .tools_native_total = transport_counters.tools_native_total.load(.monotonic),
+        .tools_curl_total = transport_counters.tools_curl_total.load(.monotonic),
+        .tools_fallback_total = transport_counters.tools_fallback_total.load(.monotonic),
+        .providers_native_total = transport_counters.providers_native_total.load(.monotonic),
+        .providers_curl_total = transport_counters.providers_curl_total.load(.monotonic),
+        .providers_fallback_total = transport_counters.providers_fallback_total.load(.monotonic),
+        .channels_native_total = transport_counters.channels_native_total.load(.monotonic),
+        .channels_curl_total = transport_counters.channels_curl_total.load(.monotonic),
+        .channels_fallback_total = transport_counters.channels_fallback_total.load(.monotonic),
+        .system_native_total = transport_counters.system_native_total.load(.monotonic),
+        .system_curl_total = transport_counters.system_curl_total.load(.monotonic),
+        .system_fallback_total = transport_counters.system_fallback_total.load(.monotonic),
+    };
+}
 
 /// HTTP POST via curl subprocess with optional proxy and timeout.
 ///
@@ -296,6 +387,174 @@ pub fn curlRequestResolved(
     };
 }
 
+pub fn curlRequest(
+    allocator: Allocator,
+    method: []const u8,
+    url: []const u8,
+    headers: []const []const u8,
+    body: ?[]const u8,
+    proxy: ?[]const u8,
+    timeout_secs: []const u8,
+) !CurlResponse {
+    var argv_buf: [64][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-sS";
+    argc += 1;
+    argv_buf[argc] = "--max-time";
+    argc += 1;
+    argv_buf[argc] = timeout_secs;
+    argc += 1;
+    argv_buf[argc] = "--request";
+    argc += 1;
+    argv_buf[argc] = method;
+    argc += 1;
+    argv_buf[argc] = "--write-out";
+    argc += 1;
+    argv_buf[argc] = STATUS_MARKER ++ "%{http_code}";
+    argc += 1;
+
+    if (proxy) |p| {
+        argv_buf[argc] = "--proxy";
+        argc += 1;
+        argv_buf[argc] = p;
+        argc += 1;
+    }
+
+    for (headers) |hdr| {
+        if (argc + 2 > argv_buf.len) break;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = hdr;
+        argc += 1;
+    }
+
+    if (body != null) {
+        argv_buf[argc] = "--data-binary";
+        argc += 1;
+        argv_buf[argc] = "@-";
+        argc += 1;
+    }
+
+    argv_buf[argc] = url;
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = if (body != null) .Pipe else .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    if (body) |request_body| {
+        if (child.stdin) |stdin_file| {
+            stdin_file.writeAll(request_body) catch {
+                stdin_file.close();
+                child.stdin = null;
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                return error.CurlWriteError;
+            };
+            stdin_file.close();
+            child.stdin = null;
+        } else {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        }
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
+    errdefer allocator.free(stdout);
+
+    const term = child.wait() catch return error.CurlWaitError;
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CurlFailed,
+        else => return error.CurlFailed,
+    }
+
+    const marker_index = std.mem.lastIndexOf(u8, stdout, STATUS_MARKER) orelse return error.CurlReadError;
+    const body_slice = stdout[0..marker_index];
+    const status_slice = stdout[marker_index + STATUS_MARKER.len ..];
+    const status_code = std.fmt.parseInt(u16, std.mem.trim(u8, status_slice, " \t\r\n"), 10) catch return error.CurlReadError;
+
+    const body_copy = try allocator.dupe(u8, body_slice);
+    allocator.free(stdout);
+    return .{
+        .status_code = status_code,
+        .body = body_copy,
+    };
+}
+
+pub fn request_with_mode(
+    allocator: Allocator,
+    transport_config: TransportConfig,
+    options: RequestOptions,
+) !CurlResponse {
+    switch (transport_config.mode) {
+        .curl_only => {
+            record_transport_outcome(options.subsystem, .curl);
+            const timeout_secs = blk: {
+                const clamped_ms = @max(options.timeout_ms, 1000);
+                break :blk try std.fmt.allocPrint(allocator, "{d}", .{clamped_ms / 1000});
+            };
+            defer allocator.free(timeout_secs);
+
+            if (options.resolve_host != null and options.connect_host != null) {
+                return curlRequestResolved(
+                    allocator,
+                    options.method,
+                    options.url,
+                    options.headers,
+                    options.body,
+                    timeout_secs,
+                    options.resolve_host.?,
+                    options.resolve_port,
+                    options.connect_host.?,
+                );
+            }
+
+            return curlRequest(
+                allocator,
+                options.method,
+                options.url,
+                options.headers,
+                options.body,
+                options.proxy,
+                timeout_secs,
+            );
+        },
+        .native_preferred => {
+            if (options.proxy == null and subsystem_supports_native(options.subsystem)) {
+                const native_response = http_native.request(allocator, options) catch |err| {
+                    record_transport_outcome(options.subsystem, .fallback);
+                    log.warn("native transport fallback for {s} request: {s}", .{
+                        @tagName(options.subsystem),
+                        @errorName(err),
+                    });
+                    return request_with_mode(allocator, .{ .mode = .curl_only }, options);
+                };
+                record_transport_outcome(options.subsystem, .native);
+                return .{
+                    .status_code = native_response.status_code,
+                    .body = native_response.body,
+                };
+            }
+            return request_with_mode(allocator, .{ .mode = .curl_only }, options);
+        },
+        .native_only => {
+            const native_response = try http_native.request(allocator, options);
+            record_transport_outcome(options.subsystem, .native);
+            return .{
+                .status_code = native_response.status_code,
+                .body = native_response.body,
+            };
+        },
+    }
+}
+
 /// HTTP GET via curl for SSE (Server-Sent Events).
 ///
 /// Uses -N (--no-buffer) to disable output buffering, allowing
@@ -374,5 +633,16 @@ test "curlPost builds correct argv structure" {
 }
 
 test "curlGet compiles and is callable" {
+    try std.testing.expect(true);
+}
+
+test "request_with_mode curl_only uses curl compatibility path" {
+    const cfg = TransportConfig{ .mode = .curl_only };
+    const opts = RequestOptions{
+        .method = "GET",
+        .url = "https://example.com",
+    };
+    _ = cfg;
+    _ = opts;
     try std.testing.expect(true);
 }

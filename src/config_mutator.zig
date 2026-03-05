@@ -66,7 +66,7 @@ pub fn freeMutationResult(allocator: std.mem.Allocator, result: *MutationResult)
 pub fn defaultConfigPath(allocator: std.mem.Allocator) ![]u8 {
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return try std.fs.path.join(allocator, &.{ home, ".nullclaw", "config.json" });
+    return try std.fs.path.join(allocator, &.{ home, ".nullalis", "config.json" });
 }
 
 fn splitPathTokens(allocator: std.mem.Allocator, path: []const u8) ![]const []const u8 {

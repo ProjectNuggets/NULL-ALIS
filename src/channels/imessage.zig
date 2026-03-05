@@ -561,7 +561,7 @@ fn createTestDb(allocator: std.mem.Allocator) ![]u8 {
 
     const tmp_dir = try platform.getTempDir(allocator);
     defer allocator.free(tmp_dir);
-    const filename = try std.fmt.allocPrint(allocator, "nullclaw_imessage_{d}_{x}.db", .{
+    const filename = try std.fmt.allocPrint(allocator, "nullalis_imessage_{d}_{x}.db", .{
         std.time.microTimestamp(),
         std.crypto.random.int(u32),
     });

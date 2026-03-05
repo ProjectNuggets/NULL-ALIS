@@ -46,7 +46,7 @@
         "sidecar_path": "",
         "qdrant_url": "",
         "qdrant_api_key": "",
-        "qdrant_collection": "nullclaw_memories",
+        "qdrant_collection": "nullalis_memories",
         "pgvector_table": "memory_embeddings"
       },
       "chunking": {
@@ -130,7 +130,7 @@
     },
 
     "postgres": {
-      "url": "postgresql://user:pass@localhost:5432/nullclaw",
+      "url": "postgresql://user:pass@localhost:5432/nullalis",
       "schema": "public",
       "table": "memories",
       "connect_timeout_secs": 30
@@ -141,7 +141,7 @@
       "port": 6379,
       "password": "",
       "db_index": 0,
-      "key_prefix": "nullclaw",
+      "key_prefix": "nullalis",
       "ttl_seconds": 0
     },
 

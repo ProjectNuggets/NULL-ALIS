@@ -7,6 +7,27 @@ const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 
+const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
+const TestCronStore = struct {
+    tmp: TestTmpDir,
+    path: []u8,
+
+    fn init() !@This() {
+        var tmp = std.testing.tmpDir(.{});
+        const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        defer std.testing.allocator.free(dir_path);
+        const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "cron.json" });
+        cron.setTestStorePathOverride(path);
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn deinit(self: *@This()) void {
+        cron.setTestStorePathOverride(null);
+        std.testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
 /// CronList tool — lists all scheduled cron jobs with their status and next run time.
 pub const CronListTool = struct {
     pub const tool_name = "cron_list";
@@ -127,6 +148,8 @@ test "cron_list tool parameters" {
 }
 
 test "cron_list execute returns success" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
     var cl = CronListTool{};
     const t = cl.tool();
     const parsed = try root.parseTestArgs("{}");

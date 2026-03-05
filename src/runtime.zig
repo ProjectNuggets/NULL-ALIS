@@ -73,7 +73,7 @@ pub const NativeRuntime = struct {
     }
 
     fn nativeStorage(_: *anyopaque) []const u8 {
-        return ".nullclaw";
+        return ".nullalis";
     }
 
     fn nativeLongRunning(_: *anyopaque) bool {
@@ -137,9 +137,9 @@ pub const DockerRuntime = struct {
 
     fn dockerStorage(ptr: *anyopaque) []const u8 {
         if (resolve(ptr).mount_workspace) {
-            return "/workspace/.nullclaw";
+            return "/workspace/.nullalis";
         } else {
-            return "/tmp/.nullclaw";
+            return "/tmp/.nullalis";
         }
     }
 
@@ -226,7 +226,7 @@ pub const WasmRuntime = struct {
     }
 
     fn wasmStorage(_: *anyopaque) []const u8 {
-        return ".nullclaw/wasm";
+        return ".nullalis/wasm";
     }
 
     fn wasmLongRunning(_: *anyopaque) bool {
@@ -437,10 +437,10 @@ test "NativeRuntime memory budget unlimited" {
     try std.testing.expectEqual(@as(u64, 0), rt.memoryBudget());
 }
 
-test "NativeRuntime storage path contains nullclaw" {
+test "NativeRuntime storage path contains nullalis" {
     var native = NativeRuntime{};
     const rt = native.adapter();
-    try std.testing.expect(std.mem.indexOf(u8, rt.storagePath(), "nullclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rt.storagePath(), "nullalis") != null);
 }
 
 test "DockerRuntime name" {
@@ -471,14 +471,14 @@ test "DockerRuntime filesystem with mount" {
     var docker = DockerRuntime.init("alpine:3.20", "none", null, true);
     const rt = docker.adapter();
     try std.testing.expect(rt.hasFilesystemAccess());
-    try std.testing.expectEqualStrings("/workspace/.nullclaw", rt.storagePath());
+    try std.testing.expectEqualStrings("/workspace/.nullalis", rt.storagePath());
 }
 
 test "DockerRuntime filesystem without mount" {
     var docker = DockerRuntime.init("alpine:3.20", "none", null, false);
     const rt = docker.adapter();
     try std.testing.expect(!rt.hasFilesystemAccess());
-    try std.testing.expectEqualStrings("/tmp/.nullclaw", rt.storagePath());
+    try std.testing.expectEqualStrings("/tmp/.nullalis", rt.storagePath());
 }
 
 test "DockerRuntime does not support long running" {
@@ -548,7 +548,7 @@ test "createRuntime tab whitespace" {
 test "NativeRuntime storage path" {
     var native = NativeRuntime{};
     const rt = native.adapter();
-    try std.testing.expectEqualStrings(".nullclaw", rt.storagePath());
+    try std.testing.expectEqualStrings(".nullalis", rt.storagePath());
 }
 
 test "NativeRuntime memory budget is zero (unlimited)" {
@@ -725,7 +725,7 @@ test "WasmRuntime memory budget custom" {
 test "WasmRuntime storage path" {
     var wasm = WasmRuntime.init(.{});
     const rt = wasm.adapter();
-    try std.testing.expect(std.mem.indexOf(u8, rt.storagePath(), "nullclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rt.storagePath(), "nullalis") != null);
 }
 
 test "WasmRuntime validate rejects zero memory" {

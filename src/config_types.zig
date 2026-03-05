@@ -87,6 +87,15 @@ pub const RuntimeConfig = struct {
     docker: DockerRuntimeConfig = .{},
 };
 
+pub const TransportMode = @import("http_native/root.zig").TransportMode;
+pub const PoolConfig = @import("http_native/root.zig").PoolConfig;
+pub const ResolverConfig = @import("http_native/root.zig").ResolverConfig;
+pub const TransportConfig = @import("http_native/root.zig").TransportConfig;
+
+pub const NetworkConfig = struct {
+    transport: TransportConfig = .{},
+};
+
 pub const AppProfile = enum {
     standard,
     zaki_bot,
@@ -174,6 +183,9 @@ pub const CronConfig = struct {
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
+    /// Optional single-user tenant binding for polling mode.
+    /// When set, inbound long-poll messages land in `agent:zaki-bot:user:{id}:main`.
+    tenant_user_id: ?[]const u8 = null,
     receive_mode: TelegramReceiveMode = .polling,
     webhook_secret_token: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
@@ -612,7 +624,7 @@ pub const MemoryVectorStoreConfig = struct {
     sidecar_path: []const u8 = "",
     qdrant_url: []const u8 = "",
     qdrant_api_key: []const u8 = "",
-    qdrant_collection: []const u8 = "nullclaw_memories",
+    qdrant_collection: []const u8 = "nullalis_memories",
     pgvector_table: []const u8 = "memory_embeddings",
 };
 
@@ -701,7 +713,7 @@ pub const MemoryRedisConfig = struct {
     port: u16 = 6379,
     password: []const u8 = "",
     db_index: u8 = 0,
-    key_prefix: []const u8 = "nullclaw",
+    key_prefix: []const u8 = "nullalis",
     ttl_seconds: u32 = 0, // 0 = no expiry
 };
 
@@ -825,7 +837,7 @@ pub const HttpRequestConfig = struct {
 // ── Identity config ─────────────────────────────────────────────
 
 pub const IdentityConfig = struct {
-    format: []const u8 = "nullclaw",
+    format: []const u8 = "nullalis",
     aieos_path: ?[]const u8 = null,
     aieos_inline: ?[]const u8 = null,
 };
@@ -951,7 +963,7 @@ pub const DmScope = enum {
     main,
     /// One session per peer across all channels.
     per_peer,
-    /// One session per (channel, peer) pair (default).
+    /// One session per (channel, peer) pair.
     per_channel_peer,
     /// One session per (account, channel, peer) triple.
     per_account_channel_peer,
@@ -963,7 +975,7 @@ pub const IdentityLink = struct {
 };
 
 pub const SessionConfig = struct {
-    dm_scope: DmScope = .per_channel_peer,
+    dm_scope: DmScope = .main,
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
     typing_interval_secs: u32 = 5,

@@ -17,6 +17,12 @@ fn resolveApiKeyFromCfg(cfg: anytype) ?[]const u8 {
     return null;
 }
 
+fn timeout_ms_from_secs(timeout_secs: u64) u32 {
+    if (timeout_secs == 0) return 30_000;
+    const timeout_ms = timeout_secs * 1000;
+    return @intCast(@min(timeout_ms, std.math.maxInt(u32)));
+}
+
 /// High-level complete function that routes to the right provider via HTTP.
 /// Used by agent.zig for backward compatibility.
 pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) ![]const u8 {
@@ -29,26 +35,21 @@ pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) 
     var auth_buf: [512]u8 = undefined;
     const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.NoApiKey;
 
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body_str,
-        .extra_headers = &.{
-            .{ .name = "Authorization", .value = auth_val },
-            .{ .name = "Content-Type", .value = "application/json" },
+    const response = try http_util.request_with_mode(allocator, .{}, .{
+        .method = "POST",
+        .url = url,
+        .headers = &.{
+            auth_val,
+            "Content-Type: application/json",
         },
-        .response_writer = &aw.writer,
+        .body = body_str,
+        .timeout_ms = 30_000,
+        .subsystem = .providers,
     });
+    defer allocator.free(response.body);
+    if (response.status_code < 200 or response.status_code >= 300) return error.ProviderError;
 
-    if (result.status != .ok) return error.ProviderError;
-
-    const response_body = aw.writer.buffer[0..aw.writer.end];
+    const response_body = response.body;
     return try extractContent(allocator, response_body);
 }
 
@@ -64,26 +65,21 @@ pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: anytype, system_pro
     var auth_buf: [512]u8 = undefined;
     const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.NoApiKey;
 
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body_str,
-        .extra_headers = &.{
-            .{ .name = "Authorization", .value = auth_val },
-            .{ .name = "Content-Type", .value = "application/json" },
+    const response = try http_util.request_with_mode(allocator, .{}, .{
+        .method = "POST",
+        .url = url,
+        .headers = &.{
+            auth_val,
+            "Content-Type: application/json",
         },
-        .response_writer = &aw.writer,
+        .body = body_str,
+        .timeout_ms = 30_000,
+        .subsystem = .providers,
     });
+    defer allocator.free(response.body);
+    if (response.status_code < 200 or response.status_code >= 300) return error.ProviderError;
 
-    if (result.status != .ok) return error.ProviderError;
-
-    const response_body = aw.writer.buffer[0..aw.writer.end];
+    const response_body = response.body;
     return try extractContent(allocator, response_body);
 }
 
@@ -286,13 +282,19 @@ pub fn convertToolsAnthropic(buf: *std.ArrayListUnmanaged(u8), allocator: std.me
 
 /// HTTP POST with optional LLM timeout (seconds). 0 = no limit.
 pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
-    if (timeout_secs > 0) {
-        var timeout_buf: [16]u8 = undefined;
-        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch
-            return http_util.curlPost(allocator, url, body, headers);
-        return http_util.curlPostWithProxy(allocator, url, body, headers, null, timeout_str);
+    const response = try http_util.request_with_mode(allocator, .{}, .{
+        .method = "POST",
+        .url = url,
+        .headers = headers,
+        .body = body,
+        .timeout_ms = timeout_ms_from_secs(timeout_secs),
+        .subsystem = .providers,
+    });
+    if (response.status_code < 200 or response.status_code >= 300) {
+        allocator.free(response.body);
+        return error.CurlFailed;
     }
-    return http_util.curlPost(allocator, url, body, headers);
+    return response.body;
 }
 
 /// Extract text content from a provider JSON response.

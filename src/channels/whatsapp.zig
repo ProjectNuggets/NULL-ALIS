@@ -392,7 +392,7 @@ test "whatsapp parse valid text message" {
     const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
 
     const payload =
-        \\{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","timestamp":"1699999999","type":"text","text":{"body":"Hello nullclaw!"}}]}}]}]}
+        \\{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","timestamp":"1699999999","type":"text","text":{"body":"Hello nullalis!"}}]}}]}]}
     ;
 
     const msgs = try ch.parseWebhookPayload(allocator, payload);
@@ -406,7 +406,7 @@ test "whatsapp parse valid text message" {
 
     try std.testing.expectEqual(@as(usize, 1), msgs.len);
     try std.testing.expectEqualStrings("+1234567890", msgs[0].sender);
-    try std.testing.expectEqualStrings("Hello nullclaw!", msgs[0].content);
+    try std.testing.expectEqualStrings("Hello nullalis!", msgs[0].content);
     try std.testing.expectEqual(@as(u64, 1_699_999_999), msgs[0].timestamp);
 }
 

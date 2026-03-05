@@ -7,9 +7,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
 
-const SERVICE_LABEL = "com.nullclaw.daemon";
-const WINDOWS_SERVICE_NAME = "nullclaw";
-const WINDOWS_SERVICE_DISPLAY_NAME = "nullclaw gateway runtime";
+const SERVICE_LABEL = "com.nullalis.daemon";
+const WINDOWS_SERVICE_NAME = "nullalis";
+const WINDOWS_SERVICE_DISPLAY_NAME = "nullalis gateway runtime";
 
 pub const ServiceCommand = enum {
     install,
@@ -64,7 +64,7 @@ fn startService(allocator: std.mem.Allocator) !void {
     } else if (comptime builtin.os.tag == .linux) {
         try assertLinuxSystemdUserAvailable(allocator);
         try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
-        try runChecked(allocator, &.{ "systemctl", "--user", "start", "nullclaw.service" });
+        try runChecked(allocator, &.{ "systemctl", "--user", "start", "nullalis.service" });
     } else if (comptime builtin.os.tag == .windows) {
         try runChecked(allocator, &.{ "sc.exe", "start", WINDOWS_SERVICE_NAME });
     } else {
@@ -80,7 +80,7 @@ fn stopService(allocator: std.mem.Allocator) !void {
         runChecked(allocator, &.{ "launchctl", "unload", "-w", plist }) catch {};
     } else if (comptime builtin.os.tag == .linux) {
         try assertLinuxSystemdUserAvailable(allocator);
-        try runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
+        try runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullalis.service" });
     } else if (comptime builtin.os.tag == .windows) {
         try runChecked(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
     } else {
@@ -104,7 +104,7 @@ fn serviceStatus(allocator: std.mem.Allocator) !void {
         try w.flush();
     } else if (comptime builtin.os.tag == .linux) {
         try assertLinuxSystemdUserAvailable(allocator);
-        const output = runCapture(allocator, &.{ "systemctl", "--user", "is-active", "nullclaw.service" }) catch try allocator.dupe(u8, "unknown");
+        const output = runCapture(allocator, &.{ "systemctl", "--user", "is-active", "nullalis.service" }) catch try allocator.dupe(u8, "unknown");
         defer allocator.free(output);
         try w.print("Service state: {s}\n", .{std.mem.trim(u8, output, " \t\n\r")});
         const unit = try linuxServiceFile(allocator);
@@ -174,7 +174,7 @@ fn installMacos(allocator: std.mem.Allocator, _: []const u8) !void {
 
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
-    const logs_dir = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/logs", .{home});
+    const logs_dir = try std.fmt.allocPrint(allocator, "{s}/.nullalis/logs", .{home});
     defer allocator.free(logs_dir);
     std.fs.makeDirAbsolute(logs_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -231,7 +231,7 @@ fn installLinux(allocator: std.mem.Allocator) !void {
 
     const content = try std.fmt.allocPrint(allocator,
         \\[Unit]
-        \\Description=nullclaw gateway runtime
+        \\Description=nullalis gateway runtime
         \\After=network.target
         \\
         \\[Service]
@@ -250,7 +250,7 @@ fn installLinux(allocator: std.mem.Allocator) !void {
     try file.writeAll(content);
 
     try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
-    try runChecked(allocator, &.{ "systemctl", "--user", "enable", "nullclaw.service" });
+    try runChecked(allocator, &.{ "systemctl", "--user", "enable", "nullalis.service" });
 }
 
 fn installWindows(allocator: std.mem.Allocator) !void {
@@ -326,7 +326,7 @@ fn macosServiceFile(allocator: std.mem.Allocator) ![]const u8 {
 fn linuxServiceFile(allocator: std.mem.Allocator) ![]const u8 {
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".config", "systemd", "user", "nullclaw.service" });
+    return std.fs.path.join(allocator, &.{ home, ".config", "systemd", "user", "nullalis.service" });
 }
 
 // ── Process helpers ──────────────────────────────────────────────
@@ -481,7 +481,7 @@ fn xmlEscape(input: []const u8) []const u8 {
 
 test "service label is set" {
     try std.testing.expect(SERVICE_LABEL.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, SERVICE_LABEL, "nullclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, SERVICE_LABEL, "nullalis") != null);
 }
 
 test "macosServiceFile contains label" {
@@ -494,11 +494,11 @@ test "macosServiceFile contains label" {
 test "linuxServiceFile contains service suffix" {
     const path = linuxServiceFile(std.testing.allocator) catch return;
     defer std.testing.allocator.free(path);
-    try std.testing.expect(std.mem.endsWith(u8, path, "nullclaw.service"));
+    try std.testing.expect(std.mem.endsWith(u8, path, "nullalis.service"));
 }
 
 test "xmlEscape returns input for safe strings" {
-    const input = "/usr/local/bin/nullclaw";
+    const input = "/usr/local/bin/nullalis";
     try std.testing.expectEqualStrings(input, xmlEscape(input));
 }
 
@@ -523,7 +523,7 @@ test "isSystemdUnavailableDetail detects common unavailable errors" {
     try std.testing.expect(isSystemdUnavailableDetail("Failed to connect to bus: No medium found"));
     try std.testing.expect(isSystemdUnavailableDetail("System has not been booted with systemd as init system"));
     try std.testing.expect(isSystemdUnavailableDetail("No such file or directory"));
-    try std.testing.expect(!isSystemdUnavailableDetail("unit nullclaw.service not found"));
+    try std.testing.expect(!isSystemdUnavailableDetail("unit nullalis.service not found"));
     try std.testing.expect(!isSystemdUnavailableDetail("permission denied"));
 }
 

@@ -23,8 +23,8 @@ pub const OpenRouterProvider = struct {
 
     const BASE_URL = "https://openrouter.ai/api/v1/chat/completions";
     const WARMUP_URL = "https://openrouter.ai/api/v1/auth/key";
-    const REFERER = "https://github.com/nullclaw/nullclaw";
-    const TITLE = "nullclaw";
+    const REFERER = "https://github.com/NovaZucker/nullALIS-origions";
+    const TITLE = "nullALIS";
 
     pub fn init(allocator: std.mem.Allocator, api_key: ?[]const u8) OpenRouterProvider {
         return .{
@@ -169,8 +169,14 @@ pub const OpenRouterProvider = struct {
         const api_key = self.api_key orelse return;
         var auth_hdr_buf: [512]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return;
-        const resp = curlGet(self.allocator, WARMUP_URL, auth_hdr) catch return;
-        self.allocator.free(resp);
+        const response = root.request_with_mode(self.allocator, .{}, .{
+            .method = "GET",
+            .url = WARMUP_URL,
+            .headers = &.{auth_hdr},
+            .timeout_ms = 10_000,
+            .subsystem = .providers,
+        }) catch return;
+        self.allocator.free(response.body);
     }
 
     /// Convert ChatMessages to a JSON array string for the API.
@@ -264,10 +270,17 @@ pub const OpenRouterProvider = struct {
         var title_hdr_buf: [128]u8 = undefined;
         const title_hdr = std.fmt.bufPrint(&title_hdr_buf, "X-Title: {s}", .{TITLE}) catch return error.OpenRouterApiError;
 
-        const resp_body = root.curlPost(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }) catch return error.OpenRouterApiError;
-        defer allocator.free(resp_body);
+        const response = root.request_with_mode(allocator, .{}, .{
+            .method = "POST",
+            .url = BASE_URL,
+            .headers = &.{ auth_hdr, referer_hdr, title_hdr },
+            .body = body,
+            .timeout_ms = 30_000,
+            .subsystem = .providers,
+        }) catch return error.OpenRouterApiError;
+        defer allocator.free(response.body);
 
-        return parseTextResponse(allocator, resp_body);
+        return parseTextResponse(allocator, response.body);
     }
 
     /// Create a Provider interface from this OpenRouterProvider.
@@ -318,10 +331,17 @@ pub const OpenRouterProvider = struct {
         var title_hdr_buf: [128]u8 = undefined;
         const title_hdr = std.fmt.bufPrint(&title_hdr_buf, "X-Title: {s}", .{TITLE}) catch return error.OpenRouterApiError;
 
-        const resp_body = root.curlPost(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }) catch return error.OpenRouterApiError;
-        defer allocator.free(resp_body);
+        const response = root.request_with_mode(allocator, .{}, .{
+            .method = "POST",
+            .url = BASE_URL,
+            .headers = &.{ auth_hdr, referer_hdr, title_hdr },
+            .body = body,
+            .timeout_ms = 30_000,
+            .subsystem = .providers,
+        }) catch return error.OpenRouterApiError;
+        defer allocator.free(response.body);
 
-        return parseTextResponse(allocator, resp_body);
+        return parseTextResponse(allocator, response.body);
     }
 
     fn chatImpl(
@@ -346,10 +366,18 @@ pub const OpenRouterProvider = struct {
         var title_hdr_buf: [128]u8 = undefined;
         const title_hdr = std.fmt.bufPrint(&title_hdr_buf, "X-Title: {s}", .{TITLE}) catch return error.OpenRouterApiError;
 
-        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }, request.timeout_secs) catch return error.OpenRouterApiError;
-        defer allocator.free(resp_body);
+        const timeout_ms: u32 = if (request.timeout_secs == 0) 30_000 else @intCast(@min(request.timeout_secs * 1000, std.math.maxInt(u32)));
+        const response = root.request_with_mode(allocator, .{}, .{
+            .method = "POST",
+            .url = BASE_URL,
+            .headers = &.{ auth_hdr, referer_hdr, title_hdr },
+            .body = body,
+            .timeout_ms = timeout_ms,
+            .subsystem = .providers,
+        }) catch return error.OpenRouterApiError;
+        defer allocator.free(response.body);
 
-        return parseNativeResponse(allocator, resp_body);
+        return parseNativeResponse(allocator, response.body);
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
@@ -481,33 +509,6 @@ pub const OpenRouterProvider = struct {
         return try buf.toOwnedSlice(allocator);
     }
 };
-
-/// HTTP GET via curl subprocess with auth header.
-fn curlGet(allocator: std.mem.Allocator, url: []const u8, auth_hdr: []const u8) ![]u8 {
-    var child = std.process.Child.init(&.{
-        "curl", "-s", "-H", auth_hdr, url,
-    }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-    }
-
-    return stdout;
-}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Tests

@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const LOCK_FILE_NAME = ".nullclaw-owner.lock";
+const LOCK_FILE_NAME = ".nullalis-owner.lock";
 const LOCK_FILE_MAX_BYTES: usize = 1024;
 
 const LockRecord = struct {

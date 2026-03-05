@@ -5,6 +5,7 @@ const memory_root = @import("memory/root.zig");
 const cron_mod = @import("cron.zig");
 const security_secrets = @import("security/secrets.zig");
 const pg_helpers = @import("memory/engines/postgres.zig");
+const zaki_session = @import("zaki_session.zig");
 const log = std.log.scoped(.zaki_state);
 
 const c = if (build_options.enable_postgres) @cImport({
@@ -497,7 +498,7 @@ const ManagerImpl = struct {
         const workspace_z = try self.allocator.dupeZ(u8, workspace_path);
         defer self.allocator.free(workspace_z);
         var key_buf: [128]u8 = undefined;
-        const session_key = try std.fmt.bufPrintZ(&key_buf, "agent:zaki-bot:user:{d}:main", .{user_id});
+        const session_key = zaki_session.userMainSessionKey(&key_buf, user_s);
         try self.execParamsNoResult(
             "INSERT INTO {schema}.users (user_id, workspace_path) VALUES ($1, $2) " ++
                 "ON CONFLICT (user_id) DO UPDATE SET workspace_path = EXCLUDED.workspace_path, updated_at = NOW()",
@@ -708,7 +709,7 @@ const ManagerImpl = struct {
         defer self.allocator.free(insert_q);
         var normalized_session_buf: [160]u8 = undefined;
         const normalized_session = if (std.mem.eql(u8, session_id, "main"))
-            try std.fmt.bufPrint(&normalized_session_buf, "agent:zaki-bot:user:{d}:main", .{user_id})
+            zaki_session.userMainSessionKey(&normalized_session_buf, user_s)
         else
             session_id;
         const session_z = try self.allocator.dupeZ(u8, normalized_session);
@@ -1559,7 +1560,7 @@ test "postgres claimed job one-shot completion preserves run history and hides j
     }
     try mgr.migrate();
 
-    try mgr.provisionUser(2, "/tmp/nullclaw-zaki-bot-test-user-2/workspace");
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
     try mgr.replaceJobsJson(2, "agent:zaki-bot:user:2:main", "[{\"id\":\"once-reminder\",\"expression\":\"@once:1m\",\"command\":\"message \\\"hello\\\"\",\"next_run_secs\":1,\"one_shot\":true,\"job_type\":\"agent\",\"session_target\":\"main\",\"prompt\":\"say hello\",\"delivery\":{\"mode\":\"always\",\"channel\":\"telegram\",\"to\":\"chat-2\",\"best_effort\":false}}]");
 
     const claimed = try mgr.claimDueJobs(allocator, "test-owner", 5, 60, 10);
@@ -1628,7 +1629,7 @@ test "postgres claimed recurring job reschedules and records run" {
     }
     try mgr.migrate();
 
-    try mgr.provisionUser(2, "/tmp/nullclaw-zaki-bot-test-user-2/workspace");
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
 
     var scheduler = cron_mod.CronScheduler.init(allocator, 1, true);
     defer scheduler.deinit();
@@ -1663,7 +1664,7 @@ test "postgres claimed recurring job reschedules and records run" {
 
     var runtime_scheduler = cron_mod.CronScheduler.init(allocator, 1, true);
     defer runtime_scheduler.deinit();
-    try runtime_scheduler.setExecutionContext("2", "/tmp/nullclaw-zaki-bot-test-user-2", "/tmp/nullclaw-zaki-bot-test-user-2/workspace");
+    try runtime_scheduler.setExecutionContext("2", "/tmp/nullalis-zaki-bot-test-user-2", "/tmp/nullalis-zaki-bot-test-user-2/workspace");
     try cron_mod.loadJobFromJsonSlice(&runtime_scheduler, claimed[0].raw_job_json);
     _ = runtime_scheduler.tick(10, null);
     try std.testing.expectEqual(@as(usize, 1), runtime_scheduler.listJobs().len);
@@ -1719,8 +1720,8 @@ test "postgres memory upsert recall list and forget stay user-scoped" {
     }
     try mgr.migrate();
 
-    try mgr.provisionUser(2, "/tmp/nullclaw-zaki-bot-test-user-2/workspace");
-    try mgr.provisionUser(3, "/tmp/nullclaw-zaki-bot-test-user-3/workspace");
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+    try mgr.provisionUser(3, "/tmp/nullalis-zaki-bot-test-user-3/workspace");
 
     try mgr.upsertMemory(2, "favorite_snack", "pistachios", .core, "agent:zaki-bot:user:2:main");
     try mgr.upsertMemory(3, "favorite_snack", "olives", .core, "agent:zaki-bot:user:3:main");

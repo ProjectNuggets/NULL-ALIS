@@ -1,4 +1,4 @@
-//! nullclaw — The smallest AI assistant. Zig-powered.
+//! nullalis — The smallest AI assistant. Zig-powered.
 //!
 //! Module hierarchy mirrors ZeroClaw's Rust architecture:
 //!   agent, channels, config, cron, daemon, doctor, gateway,
@@ -8,6 +8,7 @@
 // Shared utilities
 pub const json_util = @import("json_util.zig");
 pub const http_util = @import("http_util.zig");
+pub const http_native = @import("http_native/root.zig");
 pub const net_security = @import("net_security.zig");
 pub const websocket = @import("websocket.zig");
 
@@ -38,6 +39,7 @@ pub const agent = @import("agent.zig");
 pub const session = @import("session.zig");
 pub const providers = @import("providers/root.zig");
 pub const memory = @import("memory/root.zig");
+pub const bootstrap = @import("bootstrap/root.zig");
 
 // Phase 3: Networking
 pub const gateway = @import("gateway.zig");

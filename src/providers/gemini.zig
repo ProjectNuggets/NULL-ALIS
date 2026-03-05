@@ -583,16 +583,29 @@ pub const GeminiProvider = struct {
         const body = try buildRequestBody(allocator, system_prompt, message, temperature);
         defer allocator.free(body);
 
-        const resp_body = if (auth.isApiKey())
-            root.curlPost(allocator, url, body, &.{}) catch return error.GeminiApiError
+        const response = if (auth.isApiKey())
+            root.request_with_mode(allocator, .{}, .{
+                .method = "POST",
+                .url = url,
+                .body = body,
+                .timeout_ms = 30_000,
+                .subsystem = .providers,
+            }) catch return error.GeminiApiError
         else blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{auth.credential()}) catch return error.GeminiApiError;
-            break :blk root.curlPost(allocator, url, body, &.{auth_hdr}) catch return error.GeminiApiError;
+            break :blk root.request_with_mode(allocator, .{}, .{
+                .method = "POST",
+                .url = url,
+                .headers = &.{auth_hdr},
+                .body = body,
+                .timeout_ms = 30_000,
+                .subsystem = .providers,
+            }) catch return error.GeminiApiError;
         };
-        defer allocator.free(resp_body);
+        defer allocator.free(response.body);
 
-        return parseResponse(allocator, resp_body);
+        return parseResponse(allocator, response.body);
     }
 
     fn chatImpl(
@@ -611,16 +624,30 @@ pub const GeminiProvider = struct {
         const body = try buildChatRequestBody(allocator, request, temperature);
         defer allocator.free(body);
 
-        const resp_body = if (auth.isApiKey())
-            root.curlPostTimed(allocator, url, body, &.{}, request.timeout_secs) catch return error.GeminiApiError
+        const timeout_ms: u32 = if (request.timeout_secs == 0) 30_000 else @intCast(@min(request.timeout_secs * 1000, std.math.maxInt(u32)));
+        const response = if (auth.isApiKey())
+            root.request_with_mode(allocator, .{}, .{
+                .method = "POST",
+                .url = url,
+                .body = body,
+                .timeout_ms = timeout_ms,
+                .subsystem = .providers,
+            }) catch return error.GeminiApiError
         else blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{auth.credential()}) catch return error.GeminiApiError;
-            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, request.timeout_secs) catch return error.GeminiApiError;
+            break :blk root.request_with_mode(allocator, .{}, .{
+                .method = "POST",
+                .url = url,
+                .headers = &.{auth_hdr},
+                .body = body,
+                .timeout_ms = timeout_ms,
+                .subsystem = .providers,
+            }) catch return error.GeminiApiError;
         };
-        defer allocator.free(resp_body);
+        defer allocator.free(response.body);
 
-        const text = try parseResponse(allocator, resp_body);
+        const text = try parseResponse(allocator, response.body);
         return ChatResponse{ .content = text };
     }
 

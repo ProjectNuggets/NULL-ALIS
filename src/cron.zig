@@ -1,10 +1,13 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const bus = @import("bus.zig");
+const telegram = @import("channels/telegram.zig");
 const json_util = @import("json_util.zig");
 const http_util = @import("http_util.zig");
 
 const log = std.log.scoped(.cron);
+threadlocal var test_store_path_override: ?[]const u8 = null;
 
 pub const JobType = enum {
     shell,
@@ -478,6 +481,24 @@ pub const CronScheduler = struct {
         self.agent_runner_ctx = runner_ctx;
     }
 
+    fn hasJobId(self: *const CronScheduler, id: []const u8) bool {
+        for (self.jobs.items) |job| {
+            if (std.mem.eql(u8, job.id, id)) return true;
+        }
+        return false;
+    }
+
+    fn generateJobId(self: *const CronScheduler, allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
+        const now_ns: u128 = @bitCast(std.time.nanoTimestamp());
+        var attempt: u32 = 0;
+        while (attempt < 1024) : (attempt += 1) {
+            const candidate = try std.fmt.allocPrint(allocator, "{s}-{d}-{d}", .{ prefix, now_ns, attempt });
+            errdefer allocator.free(candidate);
+            if (!self.hasJobId(candidate)) return candidate;
+        }
+        return error.OutOfMemory;
+    }
+
     /// Add a recurring cron job.
     pub fn addJob(self: *CronScheduler, expression: []const u8, command: []const u8) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
@@ -487,12 +508,10 @@ pub const CronScheduler = struct {
         const now = std.time.timestamp();
         const next_run_secs = try nextRunForCronExpression(expression, now);
 
-        // Generate a simple numeric ID
-        var id_buf: [32]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buf, "job-{d}", .{self.jobs.items.len + 1}) catch "job-?";
+        const id = try self.generateJobId(self.allocator, "job");
 
         try self.jobs.append(self.allocator, .{
-            .id = try self.allocator.dupe(u8, id),
+            .id = id,
             .expression = try self.allocator.dupe(u8, expression),
             .command = try self.allocator.dupe(u8, command),
             .next_run_secs = next_run_secs,
@@ -509,14 +528,13 @@ pub const CronScheduler = struct {
         const delay_secs = try parseDuration(delay);
         const now = std.time.timestamp();
 
-        var id_buf: [32]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buf, "once-{d}", .{self.jobs.items.len + 1}) catch "once-?";
+        const id = try self.generateJobId(self.allocator, "once");
 
         var expr_buf: [64]u8 = undefined;
         const expr = std.fmt.bufPrint(&expr_buf, "@once:{s}", .{delay}) catch "@once";
 
         try self.jobs.append(self.allocator, .{
-            .id = try self.allocator.dupe(u8, id),
+            .id = id,
             .expression = try self.allocator.dupe(u8, expr),
             .command = try self.allocator.dupe(u8, command),
             .next_run_secs = now + delay_secs,
@@ -1496,40 +1514,34 @@ fn deliverTenantTelegram(
     else
         loadTelegramChatIdFromChannelState(allocator, user_root) orelse return false;
 
-    const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
-    defer allocator.free(url);
+    var tg = telegram.TelegramChannel.init(allocator, bot_token, &.{"*"}, &.{}, "open");
+    sendTelegramMessageWithRetry(&tg, chat_id, output, policy.retry_budget) catch |err| {
+        if (delivery.best_effort) return false;
+        return err;
+    };
+    return true;
+}
 
-    var body: std.ArrayListUnmanaged(u8) = .empty;
-    defer body.deinit(allocator);
-    try body.append(allocator, '{');
-    try json_util.appendJsonInt(&body, allocator, "chat_id", chat_id);
-    try body.append(allocator, ',');
-    try json_util.appendJsonKeyValue(&body, allocator, "text", output);
-    try body.append(allocator, '}');
+fn sendTelegramMessageWithRetry(
+    tg: *telegram.TelegramChannel,
+    chat_id: i64,
+    output: []const u8,
+    retry_budget: u8,
+) !void {
+    var chat_id_buf: [32]u8 = undefined;
+    const chat_id_text = std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id}) catch return error.InvalidChatId;
 
-    const max_attempts: u32 = @as(u32, policy.retry_budget) + 1;
+    const max_attempts: u32 = @as(u32, retry_budget) + 1;
     var attempt: u32 = 0;
     while (attempt < max_attempts) : (attempt += 1) {
-        const response = http_util.curlPostWithProxy(allocator, url, body.items, &.{}, null, "30") catch |err| {
-            if (attempt + 1 >= max_attempts) {
-                if (delivery.best_effort) return false;
-                return err;
-            }
+        tg.sendMessage(chat_id_text, output) catch |err| {
+            if (attempt + 1 >= max_attempts) return err;
             const backoff_ms: u64 = @intCast(@min(@as(u32, 5000), @as(u32, 500) * (attempt + 1)));
             std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
             continue;
         };
-        defer allocator.free(response);
-        const ok = jsonBoolField(response, "ok") orelse false;
-        if (ok) return true;
-        if (attempt + 1 >= max_attempts) {
-            if (delivery.best_effort) return false;
-            return error.DeliveryFailed;
-        }
-        const backoff_ms: u64 = @intCast(@min(@as(u32, 5000), @as(u32, 500) * (attempt + 1)));
-        std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+        return;
     }
-    return false;
 }
 
 fn deliverResultForContext(
@@ -1567,18 +1579,28 @@ const JsonCronJob = struct {
     one_shot: bool,
 };
 
-/// Get the default cron.json path: ~/.nullclaw/cron.json
+/// Get the default cron.json path: ~/.nullalis/cron.json
 fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.json" });
+    return std.fs.path.join(allocator, &.{ home, ".nullalis", "cron.json" });
 }
 
 fn cronStorePathForScheduler(allocator: std.mem.Allocator, scheduler: *const CronScheduler) ![]const u8 {
     if (scheduler.store_path) |path| {
         return allocator.dupe(u8, path);
     }
+    if (builtin.is_test) {
+        if (test_store_path_override) |path| {
+            return allocator.dupe(u8, path);
+        }
+    }
     return cronJsonPath(allocator);
+}
+
+pub fn setTestStorePathOverride(path: ?[]const u8) void {
+    if (!builtin.is_test) return;
+    test_store_path_override = path;
 }
 
 fn ensureCronDirForPath(path: []const u8) !void {
@@ -1603,7 +1625,7 @@ fn appendNullableJsonStringField(
     }
 }
 
-/// Save scheduler jobs to ~/.nullclaw/cron.json.
+/// Save scheduler jobs to ~/.nullalis/cron.json.
 pub fn saveJobs(scheduler: *const CronScheduler) !void {
     const path = try cronStorePathForScheduler(scheduler.allocator, scheduler);
     defer scheduler.allocator.free(path);
@@ -1618,12 +1640,12 @@ pub fn saveJobsToPath(scheduler: *CronScheduler, path: []const u8) !void {
     try saveJobs(scheduler);
 }
 
-/// Load jobs from ~/.nullclaw/cron.json into the scheduler.
+/// Load jobs from ~/.nullalis/cron.json into the scheduler.
 pub fn loadJobs(scheduler: *CronScheduler) !void {
     try loadJobsWithPolicy(scheduler, .best_effort);
 }
 
-/// Load jobs from ~/.nullclaw/cron.json; unlike loadJobs, this returns
+/// Load jobs from ~/.nullalis/cron.json; unlike loadJobs, this returns
 /// parse/read errors (except missing file/path).
 pub fn loadJobsStrict(scheduler: *CronScheduler) !void {
     try loadJobsWithPolicy(scheduler, .strict);
@@ -1697,8 +1719,8 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
     if (jobs.len == 0) {
         log.info("No scheduled tasks yet.", .{});
         log.info("Usage:", .{});
-        log.info("  nullclaw cron add '*/10 * * * *' 'echo hello'", .{});
-        log.info("  nullclaw cron once 30m 'echo reminder'", .{});
+        log.info("  nullalis cron add '*/10 * * * *' 'echo hello'", .{});
+        log.info("  nullalis cron once 30m 'echo reminder'", .{});
         return;
     }
 
@@ -1957,6 +1979,25 @@ test "CronScheduler addOnce creates one-shot" {
     try std.testing.expect(job.one_shot);
 }
 
+test "CronScheduler generated ids are unique" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const recurring = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+    const recurring_id = try std.testing.allocator.dupe(u8, recurring.id);
+    defer std.testing.allocator.free(recurring_id);
+    const one_shot = try scheduler.addOnce("30m", "echo once");
+    const one_shot_id = try std.testing.allocator.dupe(u8, one_shot.id);
+    defer std.testing.allocator.free(one_shot_id);
+    const recurring_two = try scheduler.addJob("0 * * * *", "echo hourly");
+    const recurring_two_id = try std.testing.allocator.dupe(u8, recurring_two.id);
+    defer std.testing.allocator.free(recurring_two_id);
+
+    try std.testing.expect(!std.mem.eql(u8, recurring_id, one_shot_id));
+    try std.testing.expect(!std.mem.eql(u8, recurring_id, recurring_two_id));
+    try std.testing.expect(!std.mem.eql(u8, one_shot_id, recurring_two_id));
+}
+
 test "CronScheduler remove" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
@@ -1994,9 +2035,23 @@ test "CronScheduler getJob found and missing" {
     try std.testing.expect(scheduler.getJob("nonexistent") == null);
 }
 
+const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
+
+fn testCronStorePath(tmp: *TestTmpDir, allocator: std.mem.Allocator) ![]u8 {
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    return std.fs.path.join(allocator, &.{ dir_path, "cron.json" });
+}
+
 test "save and load roundtrip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testCronStorePath(&tmp, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    try scheduler.setStorePath(path);
 
     _ = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
     _ = try scheduler.addOnce("5m", "echo oneshot");
@@ -2007,6 +2062,7 @@ test "save and load roundtrip" {
     // Load into a new scheduler
     var scheduler2 = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler2.deinit();
+    try scheduler2.setStorePath(path);
     try loadJobs(&scheduler2);
 
     try std.testing.expectEqual(@as(usize, 2), scheduler2.listJobs().len);
@@ -2018,18 +2074,23 @@ test "save and load roundtrip" {
 }
 
 test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testCronStorePath(&tmp, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    try scheduler.setStorePath(path);
     _ = try scheduler.addJob("*/10 * * * *", "echo keep");
     try saveJobs(&scheduler);
 
     var runtime = CronScheduler.init(std.testing.allocator, 10, true);
     defer runtime.deinit();
+    try runtime.setStorePath(path);
     try loadJobs(&runtime);
     try std.testing.expectEqual(@as(usize, 1), runtime.listJobs().len);
 
-    const path = try cronJsonPath(std.testing.allocator);
-    defer std.testing.allocator.free(path);
     const bad_file = try std.fs.createFileAbsolute(path, .{});
     defer bad_file.close();
     try bad_file.writeAll("{bad-json");
@@ -2040,13 +2101,20 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
     // Store should be healed and parseable again.
     var healed = CronScheduler.init(std.testing.allocator, 10, true);
     defer healed.deinit();
+    try healed.setStorePath(path);
     try loadJobsStrict(&healed);
     try std.testing.expectEqual(@as(usize, 1), healed.listJobs().len);
 }
 
 test "save and load roundtrip with JSON-sensitive command characters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testCronStorePath(&tmp, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    try scheduler.setStorePath(path);
 
     const cmd = "printf \"line1\\nline2\" && echo \\\"ok\\\"";
     _ = try scheduler.addJob("*/5 * * * *", cmd);
@@ -2055,14 +2123,21 @@ test "save and load roundtrip with JSON-sensitive command characters" {
 
     var loaded = CronScheduler.init(std.testing.allocator, 10, true);
     defer loaded.deinit();
+    try loaded.setStorePath(path);
     try loadJobsStrict(&loaded);
     try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
     try std.testing.expectEqualStrings(cmd, loaded.listJobs()[0].command);
 }
 
 test "save and load preserves extended cron fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testCronStorePath(&tmp, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    try scheduler.setStorePath(path);
 
     _ = try scheduler.addJob("*/5 * * * *", "echo extended");
     scheduler.jobs.items[0].job_type = .agent;
@@ -2087,6 +2162,7 @@ test "save and load preserves extended cron fields" {
 
     var loaded = CronScheduler.init(std.testing.allocator, 10, true);
     defer loaded.deinit();
+    try loaded.setStorePath(path);
     try loadJobsStrict(&loaded);
     try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
 
@@ -2368,6 +2444,73 @@ test "deliverResult best_effort swallows closed bus error" {
     // Should not return error because best_effort is true
     const delivered = try deliverResult(allocator, delivery, "msg", true, &test_bus);
     try std.testing.expect(!delivered);
+}
+
+const TelegramDeliveryRecorder = struct {
+    allocator: std.mem.Allocator,
+    attempts: usize = 0,
+    fail_count: usize = 0,
+    methods: std.ArrayListUnmanaged([]const u8) = .empty,
+    bodies: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *TelegramDeliveryRecorder) void {
+        for (self.methods.items) |method| self.allocator.free(method);
+        for (self.bodies.items) |body| self.allocator.free(body);
+        self.methods.deinit(self.allocator);
+        self.bodies.deinit(self.allocator);
+    }
+
+    fn handle(
+        ctx: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        body: []const u8,
+        _: u64,
+    ) anyerror![]u8 {
+        const self: *TelegramDeliveryRecorder = @ptrCast(@alignCast(ctx orelse return error.MissingContext));
+        self.attempts += 1;
+        try self.methods.append(self.allocator, try self.allocator.dupe(u8, method));
+        try self.bodies.append(self.allocator, try self.allocator.dupe(u8, body));
+        if (self.attempts <= self.fail_count) return error.TransportError;
+        return try allocator.dupe(u8, "{\"ok\":true}");
+    }
+};
+
+test "sendTelegramMessageWithRetry uses telegram direct send path" {
+    const allocator = std.testing.allocator;
+    var recorder = TelegramDeliveryRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "123:ABC", &.{"*"}, &.{}, "open");
+    tg.request_json_override = TelegramDeliveryRecorder.handle;
+    tg.request_json_ctx = @ptrCast(&recorder);
+
+    try sendTelegramMessageWithRetry(&tg, -100777, "cron hello", 0);
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.attempts);
+    try std.testing.expectEqual(@as(usize, 1), recorder.methods.items.len);
+    try std.testing.expectEqualStrings("sendMessage", recorder.methods.items[0]);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.bodies.items[0], "\"chat_id\":-100777") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.bodies.items[0], "\"text\":\"cron hello\"") != null);
+}
+
+test "sendTelegramMessageWithRetry retries before succeeding" {
+    const allocator = std.testing.allocator;
+    var recorder = TelegramDeliveryRecorder{
+        .allocator = allocator,
+        .fail_count = 1,
+    };
+    defer recorder.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "123:ABC", &.{"*"}, &.{}, "open");
+    tg.request_json_override = TelegramDeliveryRecorder.handle;
+    tg.request_json_ctx = @ptrCast(&recorder);
+
+    try sendTelegramMessageWithRetry(&tg, 42, "retry me", 1);
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.attempts);
+    try std.testing.expectEqualStrings("sendMessage", recorder.methods.items[0]);
+    try std.testing.expectEqualStrings("sendMessage", recorder.methods.items[1]);
 }
 
 test "one-shot job deleted after tick execution" {

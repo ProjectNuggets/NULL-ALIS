@@ -1,4 +1,4 @@
-//! Self-update command for nullclaw.
+//! Self-update command for nullalis.
 //!
 //! Checks GitHub releases for updates and provides an automated
 //! update path for binary installations.
@@ -113,7 +113,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
     try downloadAndInstall(allocator, download_url, exe_path, asset_name);
 
     std.debug.print("\nUpdated: {s} → {s}\n", .{ current_version, latest.tag_name });
-    std.debug.print("Restart nullclaw to use the new version.\n", .{});
+    std.debug.print("Restart nullalis to use the new version.\n", .{});
 }
 
 // ── Install Detection ─────────────────────────────────────────────────
@@ -144,7 +144,7 @@ pub fn detectInstallMethod() !InstallMethod {
     }
 
     // Check for docker
-    if (std.mem.eql(u8, exe_path, "/nullclaw")) {
+    if (std.mem.eql(u8, exe_path, "/nullalis")) {
         return .docker;
     }
 
@@ -165,9 +165,9 @@ fn printPackageManagerUpdate(method: InstallMethod) !void {
     };
 
     const cmd = switch (method) {
-        .nix => "nix-channel --update && nix-env -iA nixpkgs.nullclaw",
-        .homebrew => "brew upgrade nullclaw",
-        .docker => "docker pull ghcr.io/nullclaw/nullclaw:latest",
+        .nix => "nix-channel --update && nix-env -iA nixpkgs.nullalis",
+        .homebrew => "brew upgrade nullalis",
+        .docker => "docker pull ghcr.io/novazucker/nullalis-origions:latest",
         else => unreachable,
     };
 
@@ -192,7 +192,7 @@ pub const ReleaseInfo = struct {
 };
 
 pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
-    const url = "https://api.github.com/repos/nullclaw/nullclaw/releases/latest";
+    const url = "https://api.github.com/repos/NovaZucker/nullALIS-origions/releases/latest";
 
     // Use curl subprocess approach (from http_util pattern)
     const result = std.process.Child.run(.{
@@ -256,11 +256,11 @@ pub const PlatformTarget = enum {
 
     pub fn assetName(self: PlatformTarget) []const u8 {
         return switch (self) {
-            .linux_x86_64 => "nullclaw-linux-x86_64.bin",
-            .linux_aarch64 => "nullclaw-linux-aarch64.bin",
-            .macos_aarch64 => "nullclaw-macos-aarch64.bin",
-            .macos_x86_64 => "nullclaw-macos-x86_64.bin",
-            .windows_x86_64 => "nullclaw-windows-x86_64.exe",
+            .linux_x86_64 => "nullalis-linux-x86_64.bin",
+            .linux_aarch64 => "nullalis-linux-aarch64.bin",
+            .macos_aarch64 => "nullalis-macos-aarch64.bin",
+            .macos_x86_64 => "nullalis-macos-x86_64.bin",
+            .windows_x86_64 => "nullalis-windows-x86_64.exe",
         };
     }
 };
@@ -286,7 +286,7 @@ pub fn getCurrentPlatform() ?PlatformTarget {
 
 fn findAssetUrl(allocator: std.mem.Allocator, asset_name: []const u8) ?[]const u8 {
     // Construct the download URL directly
-    const base_url = "https://github.com/nullclaw/nullclaw/releases/latest/download/";
+    const base_url = "https://github.com/NovaZucker/nullALIS-origions/releases/latest/download/";
 
     var buf: [256]u8 = undefined;
     const url = std.fmt.bufPrint(&buf, "{s}{s}", .{ base_url, asset_name }) catch return null;
@@ -425,11 +425,11 @@ test "stripV" {
 }
 
 test "PlatformTarget.assetName covers all release assets" {
-    try std.testing.expectEqualStrings("nullclaw-linux-x86_64.bin", PlatformTarget.linux_x86_64.assetName());
-    try std.testing.expectEqualStrings("nullclaw-linux-aarch64.bin", PlatformTarget.linux_aarch64.assetName());
-    try std.testing.expectEqualStrings("nullclaw-macos-aarch64.bin", PlatformTarget.macos_aarch64.assetName());
-    try std.testing.expectEqualStrings("nullclaw-macos-x86_64.bin", PlatformTarget.macos_x86_64.assetName());
-    try std.testing.expectEqualStrings("nullclaw-windows-x86_64.exe", PlatformTarget.windows_x86_64.assetName());
+    try std.testing.expectEqualStrings("nullalis-linux-x86_64.bin", PlatformTarget.linux_x86_64.assetName());
+    try std.testing.expectEqualStrings("nullalis-linux-aarch64.bin", PlatformTarget.linux_aarch64.assetName());
+    try std.testing.expectEqualStrings("nullalis-macos-aarch64.bin", PlatformTarget.macos_aarch64.assetName());
+    try std.testing.expectEqualStrings("nullalis-macos-x86_64.bin", PlatformTarget.macos_x86_64.assetName());
+    try std.testing.expectEqualStrings("nullalis-windows-x86_64.exe", PlatformTarget.windows_x86_64.assetName());
 }
 
 test "platformFromParts maps supported and unsupported targets" {

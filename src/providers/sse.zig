@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const http_native = @import("../http_native/root.zig");
 
 /// Result of parsing a single SSE line.
 pub const SseLineResult = union(enum) {
@@ -64,6 +65,20 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
 /// For each SSE delta, calls `callback(ctx, chunk)`.
 /// Returns accumulated result after stream completes.
 pub fn curlStream(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    auth_header: ?[]const u8,
+    extra_headers: []const []const u8,
+    timeout_secs: u64,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !root.StreamChatResult {
+    return native_stream(allocator, url, body, auth_header, extra_headers, timeout_secs, callback, ctx) catch
+        return curl_stream_fallback(allocator, url, body, auth_header, extra_headers, timeout_secs, callback, ctx);
+}
+
+fn curl_stream_fallback(
     allocator: std.mem.Allocator,
     url: []const u8,
     body: []const u8,
@@ -215,6 +230,114 @@ pub fn curlStream(
     };
 }
 
+const OpenAiStreamCtx = struct {
+    allocator: std.mem.Allocator,
+    callback: root.StreamCallback,
+    callback_ctx: *anyopaque,
+    accumulated: std.ArrayListUnmanaged(u8) = .empty,
+    line_buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *OpenAiStreamCtx) void {
+        self.accumulated.deinit(self.allocator);
+        self.line_buf.deinit(self.allocator);
+    }
+};
+
+fn native_openai_chunk(ctx: *OpenAiStreamCtx, bytes: []const u8) anyerror!bool {
+    for (bytes) |byte| {
+        if (byte == '\n') {
+            const result = parseSseLine(ctx.allocator, ctx.line_buf.items) catch {
+                ctx.line_buf.clearRetainingCapacity();
+                continue;
+            };
+            ctx.line_buf.clearRetainingCapacity();
+            switch (result) {
+                .delta => |text| {
+                    defer ctx.allocator.free(text);
+                    try ctx.accumulated.appendSlice(ctx.allocator, text);
+                    ctx.callback(ctx.callback_ctx, root.StreamChunk.textDelta(text));
+                },
+                .done => return false,
+                .skip => {},
+            }
+        } else {
+            try ctx.line_buf.append(ctx.allocator, byte);
+        }
+    }
+    return true;
+}
+
+fn native_stream(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    auth_header: ?[]const u8,
+    extra_headers: []const []const u8,
+    timeout_secs: u64,
+    callback: root.StreamCallback,
+    callback_ctx: *anyopaque,
+) !root.StreamChatResult {
+    var headers_buf: [8][]const u8 = undefined;
+    var header_count: usize = 0;
+    headers_buf[header_count] = "Accept: text/event-stream";
+    header_count += 1;
+    headers_buf[header_count] = "Content-Type: application/json";
+    header_count += 1;
+    if (auth_header) |auth| {
+        headers_buf[header_count] = auth;
+        header_count += 1;
+    }
+    for (extra_headers) |hdr| {
+        headers_buf[header_count] = hdr;
+        header_count += 1;
+    }
+
+    var stream_ctx = OpenAiStreamCtx{
+        .allocator = allocator,
+        .callback = callback,
+        .callback_ctx = callback_ctx,
+    };
+    defer stream_ctx.deinit();
+
+    const timeout_ms: u32 = if (timeout_secs == 0) 30_000 else @intCast(@min(timeout_secs * 1000, std.math.maxInt(u32)));
+    const status_code = try http_native.stream_body(
+        allocator,
+        .{
+            .method = "POST",
+            .url = url,
+            .headers = headers_buf[0..header_count],
+            .body = body,
+            .timeout_ms = timeout_ms,
+            .max_response_bytes = 8 * 1024 * 1024,
+            .subsystem = .providers,
+        },
+        &stream_ctx,
+        native_openai_chunk,
+    );
+
+    if (status_code < 200 or status_code >= 300) return error.CurlFailed;
+
+    if (stream_ctx.line_buf.items.len > 0) {
+        const trailing = parseSseLine(allocator, stream_ctx.line_buf.items) catch null;
+        stream_ctx.line_buf.clearRetainingCapacity();
+        if (trailing) |result| switch (result) {
+            .delta => |text| {
+                defer allocator.free(text);
+                try stream_ctx.accumulated.appendSlice(allocator, text);
+                callback(callback_ctx, root.StreamChunk.textDelta(text));
+            },
+            .done, .skip => {},
+        };
+    }
+
+    callback(callback_ctx, root.StreamChunk.finalChunk());
+    return .{
+        .content = if (stream_ctx.accumulated.items.len > 0) try allocator.dupe(u8, stream_ctx.accumulated.items) else null,
+        .usage = .{ .completion_tokens = @intCast((stream_ctx.accumulated.items.len + 3) / 4) },
+        .model = "",
+    };
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Anthropic SSE Parsing
 // ════════════════════════════════════════════════════════════════════════════
@@ -324,6 +447,18 @@ pub fn extractAnthropicUsage(json_str: []const u8) !?u32 {
 /// Similar to `curlStream()` but uses stateful Anthropic SSE parsing.
 /// `headers` is a slice of pre-formatted header strings (e.g. "x-api-key: sk-...").
 pub fn curlStreamAnthropic(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !root.StreamChatResult {
+    return native_stream_anthropic(allocator, url, body, headers, callback, ctx) catch
+        return curl_stream_anthropic_fallback(allocator, url, body, headers, callback, ctx);
+}
+
+fn curl_stream_anthropic_fallback(
     allocator: std.mem.Allocator,
     url: []const u8,
     body: []const u8,
@@ -449,6 +584,110 @@ pub fn curlStreamAnthropic(
 
     return .{
         .content = content,
+        .usage = .{ .completion_tokens = completion_tokens },
+        .model = "",
+    };
+}
+
+const AnthropicStreamCtx = struct {
+    allocator: std.mem.Allocator,
+    callback: root.StreamCallback,
+    callback_ctx: *anyopaque,
+    accumulated: std.ArrayListUnmanaged(u8) = .empty,
+    line_buf: std.ArrayListUnmanaged(u8) = .empty,
+    current_event: []const u8 = "",
+    output_tokens: u32 = 0,
+
+    fn deinit(self: *AnthropicStreamCtx) void {
+        if (self.current_event.len > 0) self.allocator.free(@constCast(self.current_event));
+        self.accumulated.deinit(self.allocator);
+        self.line_buf.deinit(self.allocator);
+    }
+};
+
+fn native_anthropic_chunk(ctx: *AnthropicStreamCtx, bytes: []const u8) anyerror!bool {
+    for (bytes) |byte| {
+        if (byte == '\n') {
+            const result = parseAnthropicSseLine(ctx.allocator, ctx.line_buf.items, ctx.current_event) catch {
+                ctx.line_buf.clearRetainingCapacity();
+                continue;
+            };
+            switch (result) {
+                .event => |ev| {
+                    if (ctx.current_event.len > 0) ctx.allocator.free(@constCast(ctx.current_event));
+                    ctx.current_event = ctx.allocator.dupe(u8, ev) catch "";
+                },
+                .delta => |text| {
+                    defer ctx.allocator.free(text);
+                    try ctx.accumulated.appendSlice(ctx.allocator, text);
+                    ctx.callback(ctx.callback_ctx, root.StreamChunk.textDelta(text));
+                },
+                .usage => |tokens| ctx.output_tokens = tokens,
+                .done => {
+                    ctx.line_buf.clearRetainingCapacity();
+                    return false;
+                },
+                .skip => {},
+            }
+            ctx.line_buf.clearRetainingCapacity();
+        } else {
+            try ctx.line_buf.append(ctx.allocator, byte);
+        }
+    }
+    return true;
+}
+
+fn native_stream_anthropic(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    callback: root.StreamCallback,
+    callback_ctx: *anyopaque,
+) !root.StreamChatResult {
+    var headers_buf: [8][]const u8 = undefined;
+    var header_count: usize = 0;
+    headers_buf[header_count] = "Accept: text/event-stream";
+    header_count += 1;
+    headers_buf[header_count] = "Content-Type: application/json";
+    header_count += 1;
+    for (headers) |hdr| {
+        headers_buf[header_count] = hdr;
+        header_count += 1;
+    }
+
+    var stream_ctx = AnthropicStreamCtx{
+        .allocator = allocator,
+        .callback = callback,
+        .callback_ctx = callback_ctx,
+    };
+    defer stream_ctx.deinit();
+
+    const status_code = try http_native.stream_body(
+        allocator,
+        .{
+            .method = "POST",
+            .url = url,
+            .headers = headers_buf[0..header_count],
+            .body = body,
+            .timeout_ms = 30_000,
+            .max_response_bytes = 8 * 1024 * 1024,
+            .subsystem = .providers,
+        },
+        &stream_ctx,
+        native_anthropic_chunk,
+    );
+
+    if (status_code < 200 or status_code >= 300) return error.CurlFailed;
+
+    callback(callback_ctx, root.StreamChunk.finalChunk());
+    const completion_tokens = if (stream_ctx.output_tokens > 0)
+        stream_ctx.output_tokens
+    else
+        @as(u32, @intCast((stream_ctx.accumulated.items.len + 3) / 4));
+
+    return .{
+        .content = if (stream_ctx.accumulated.items.len > 0) try allocator.dupe(u8, stream_ctx.accumulated.items) else null,
         .usage = .{ .completion_tokens = completion_tokens },
         .model = "",
     };

@@ -62,29 +62,6 @@ fn parsePositiveUsize(raw: []const u8) ?usize {
     return n;
 }
 
-fn isInternalMemoryKey(key: []const u8) bool {
-    return std.mem.startsWith(u8, key, "autosave_user_") or
-        std.mem.startsWith(u8, key, "autosave_assistant_") or
-        std.mem.eql(u8, key, "last_hygiene_at");
-}
-
-fn extractMarkdownMemoryKey(content: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trim(u8, content, " \t");
-    if (!std.mem.startsWith(u8, trimmed, "**")) return null;
-    const rest = trimmed[2..];
-    const suffix = std.mem.indexOf(u8, rest, "**:") orelse return null;
-    if (suffix == 0) return null;
-    return rest[0..suffix];
-}
-
-fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
-    if (isInternalMemoryKey(key)) return true;
-    if (extractMarkdownMemoryKey(content)) |extracted| {
-        if (isInternalMemoryKey(extracted)) return true;
-    }
-    return false;
-}
-
 fn memoryRuntimePtr(self: anytype) ?*memory_mod.MemoryRuntime {
     return if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
 }
@@ -263,13 +240,13 @@ test "configPrimaryModelForSelection keeps explicit configured custom provider p
 }
 
 test "parseSlashCommand strips bot mention from command name" {
-    const parsed = parseSlashCommand("/model@nullclaw_bot openrouter/inception/mercury") orelse return error.TestExpectedEqual;
+    const parsed = parseSlashCommand("/model@nullalis_bot openrouter/inception/mercury") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("model", parsed.name);
     try std.testing.expectEqualStrings("openrouter/inception/mercury", parsed.arg);
 }
 
 test "parseSlashCommand strips bot mention with colon separator" {
-    const parsed = parseSlashCommand("/model@nullclaw_bot: gpt-5.2") orelse return error.TestExpectedEqual;
+    const parsed = parseSlashCommand("/model@nullalis_bot: gpt-5.2") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("model", parsed.name);
     try std.testing.expectEqualStrings("gpt-5.2", parsed.arg);
 }
@@ -2404,7 +2381,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         var filtered_total: usize = 0;
         for (entries) |entry| {
-            if (!include_internal and isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            if (!include_internal and memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
             filtered_total += 1;
         }
 
@@ -2419,7 +2396,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         try w.print("Memory entries: showing {d}/{d}\n", .{ shown, filtered_total });
         var written: usize = 0;
         for (entries) |e| {
-            if (!include_internal and isInternalMemoryEntryKeyOrContent(e.key, e.content)) continue;
+            if (!include_internal and memory_mod.isInternalMemoryEntryKeyOrContent(e.key, e.content)) continue;
             if (written >= shown) break;
             const preview_len = @min(@as(usize, 120), e.content.len);
             const preview = e.content[0..preview_len];

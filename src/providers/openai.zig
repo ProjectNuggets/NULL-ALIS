@@ -221,10 +221,17 @@ pub const OpenAiProvider = struct {
         var auth_hdr_buf: [512]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenAiApiError;
 
-        const resp_body = root.curlPost(allocator, BASE_URL, body, &.{auth_hdr}) catch return error.OpenAiApiError;
-        defer allocator.free(resp_body);
+        const response = root.request_with_mode(allocator, .{}, .{
+            .method = "POST",
+            .url = BASE_URL,
+            .headers = &.{auth_hdr},
+            .body = body,
+            .timeout_ms = 30_000,
+            .subsystem = .providers,
+        }) catch return error.OpenAiApiError;
+        defer allocator.free(response.body);
 
-        return parseTextResponse(allocator, resp_body);
+        return parseTextResponse(allocator, response.body);
     }
 
     fn chatImpl(
@@ -243,10 +250,18 @@ pub const OpenAiProvider = struct {
         var auth_hdr_buf: [512]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenAiApiError;
 
-        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, &.{auth_hdr}, request.timeout_secs) catch return error.OpenAiApiError;
-        defer allocator.free(resp_body);
+        const timeout_ms: u32 = if (request.timeout_secs == 0) 30_000 else @intCast(@min(request.timeout_secs * 1000, std.math.maxInt(u32)));
+        const response = root.request_with_mode(allocator, .{}, .{
+            .method = "POST",
+            .url = BASE_URL,
+            .headers = &.{auth_hdr},
+            .body = body,
+            .timeout_ms = timeout_ms,
+            .subsystem = .providers,
+        }) catch return error.OpenAiApiError;
+        defer allocator.free(response.body);
 
-        return parseNativeResponse(allocator, resp_body);
+        return parseNativeResponse(allocator, response.body);
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {

@@ -1,7 +1,7 @@
-//! HTTP Gateway — lightweight HTTP server for nullclaw.
+//! HTTP Gateway — lightweight HTTP server for nullalis.
 //!
 //! Mirrors ZeroClaw's axum-based gateway with:
-//!   - Sliding-window rate limiting (per-IP)
+//!   - Sliding-window rate limiting (per-key)
 //!   - Idempotency store (deduplicates webhook requests)
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
@@ -24,11 +24,13 @@ const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
+const agent_prompt = @import("agent/prompt.zig");
 const security = @import("security/policy.zig");
 const http_util = @import("http_util.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const onboard = @import("onboard.zig");
 const zaki_state_mod = @import("zaki_state.zig");
+const zaki_session = @import("zaki_session.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -47,7 +49,8 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300;
 
 /// Hard cap for full HTTP request bytes (headers + body).
-const MAX_HTTP_REQUEST_SIZE: usize = 16_384 + MAX_BODY_SIZE;
+const MAX_HEADER_SIZE: usize = 16_384;
+const MAX_HTTP_REQUEST_SIZE: usize = MAX_HEADER_SIZE + MAX_BODY_SIZE;
 
 /// Default per-user data root for tenant mode.
 const DEFAULT_TENANT_DATA_ROOT: []const u8 = "/data/users";
@@ -81,6 +84,7 @@ pub const SlidingWindowRateLimiter = struct {
         defer self.mutex.unlock();
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
+            allocator.free(@constCast(entry.key_ptr.*));
             entry.value_ptr.deinit(allocator);
         }
         self.entries.deinit(allocator);
@@ -101,13 +105,19 @@ pub const SlidingWindowRateLimiter = struct {
             self.last_sweep = now;
         }
 
-        const gop = self.entries.getOrPut(allocator, key) catch return true;
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .empty;
+        var timestamps_ptr = self.entries.getPtr(key);
+        if (timestamps_ptr == null) {
+            const key_copy = allocator.dupe(u8, key) catch return true;
+            self.entries.put(allocator, key_copy, .empty) catch {
+                allocator.free(key_copy);
+                return true;
+            };
+            timestamps_ptr = self.entries.getPtr(key_copy);
+            if (timestamps_ptr == null) return true;
         }
 
         // Remove expired entries
-        var timestamps = gop.value_ptr;
+        var timestamps = timestamps_ptr.?;
         var i: usize = 0;
         while (i < timestamps.items.len) {
             if (timestamps.items[i] <= cutoff) {
@@ -145,6 +155,7 @@ pub const SlidingWindowRateLimiter = struct {
 
         for (to_remove.items) |key| {
             if (self.entries.fetchRemove(key)) |kv| {
+                allocator.free(@constCast(kv.key));
                 var list = kv.value;
                 list.deinit(allocator);
             }
@@ -197,6 +208,10 @@ pub const IdempotencyStore = struct {
     pub fn deinit(self: *IdempotencyStore, allocator: std.mem.Allocator) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        var it = self.keys.iterator();
+        while (it.next()) |entry| {
+            allocator.free(@constCast(entry.key_ptr.*));
+        }
         self.keys.deinit(allocator);
     }
 
@@ -218,19 +233,71 @@ pub const IdempotencyStore = struct {
             }
         }
         for (to_remove.items) |k| {
-            _ = self.keys.remove(k);
+            if (self.keys.fetchRemove(k)) |removed| {
+                allocator.free(@constCast(removed.key));
+            }
         }
 
         // Check if already present
         if (self.keys.get(key)) |_| return false;
 
         // Record new key
-        self.keys.put(allocator, key, now) catch return true;
+        const key_copy = allocator.dupe(u8, key) catch return true;
+        self.keys.put(allocator, key_copy, now) catch {
+            allocator.free(key_copy);
+            return true;
+        };
         return true;
     }
 };
 
 // ── Gateway server ───────────────────────────────────────────────
+
+const TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY: usize = 256;
+
+const TenantTelegramAsyncJobQueue = struct {
+    buf: [TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY]*anyopaque = undefined,
+    head: usize = 0,
+    tail: usize = 0,
+    len: usize = 0,
+    closed: bool = false,
+    mutex: std.Thread.Mutex = .{},
+    not_empty: std.Thread.Condition = .{},
+
+    fn push(self: *TenantTelegramAsyncJobQueue, job: *anyopaque) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return false;
+        if (self.len == TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY) return false;
+        self.buf[self.tail] = job;
+        self.tail = (self.tail + 1) % TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY;
+        self.len += 1;
+        self.not_empty.signal();
+        return true;
+    }
+
+    fn pop(self: *TenantTelegramAsyncJobQueue) ?*anyopaque {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.len == 0 and !self.closed) {
+            self.not_empty.wait(&self.mutex);
+        }
+        if (self.len == 0) return null;
+
+        const job = self.buf[self.head];
+        self.head = (self.head + 1) % TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY;
+        self.len -= 1;
+        return job;
+    }
+
+    fn close(self: *TenantTelegramAsyncJobQueue) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closed = true;
+        self.not_empty.broadcast();
+    }
+};
 
 /// Gateway server state, shared across request handlers.
 pub const GatewayState = struct {
@@ -269,6 +336,9 @@ pub const GatewayState = struct {
     owner_instance_id_owned: bool = false,
     tenant_runtime_mutex: std.Thread.Mutex = .{},
     tenant_runtimes: std.StringHashMapUnmanaged(*TenantRuntime) = .empty,
+    tenant_telegram_queue: TenantTelegramAsyncJobQueue = .{},
+    tenant_telegram_worker_mutex: std.Thread.Mutex = .{},
+    tenant_telegram_worker: ?std.Thread = null,
     draining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     requests_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     chat_stream_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -301,6 +371,10 @@ pub const GatewayState = struct {
     }
 
     pub fn deinit(self: *GatewayState) void {
+        self.tenant_telegram_queue.close();
+        if (self.tenant_telegram_worker) |worker| {
+            worker.join();
+        }
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
         self.tenant_runtime_mutex.lock();
@@ -359,7 +433,7 @@ const TenantRuntime = struct {
     pg_session_store: ?*zaki_state_mod.Manager.UserSessionStore,
     state_mgr: ?*zaki_state_mod.Manager,
     subagent_manager: ?*subagent_mod.SubagentManager,
-    noop_obs: *observability.NoopObserver,
+    log_obs: *observability.LogObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: i64,
     lock: std.Thread.Mutex = .{},
@@ -390,7 +464,7 @@ const TenantRuntime = struct {
             .pg_session_store = null,
             .state_mgr = state_mgr,
             .subagent_manager = null,
-            .noop_obs = undefined,
+            .log_obs = undefined,
             .session_mgr = undefined,
             .last_used_s = std.time.timestamp(),
         };
@@ -482,10 +556,10 @@ const TenantRuntime = struct {
         }) catch &.{};
         errdefer if (runtime.tools.len > 0) tools_mod.deinitTools(allocator, runtime.tools);
 
-        const noop_obs = try allocator.create(observability.NoopObserver);
-        errdefer allocator.destroy(noop_obs);
-        noop_obs.* = .{};
-        runtime.noop_obs = noop_obs;
+        const log_obs = try allocator.create(observability.LogObserver);
+        errdefer allocator.destroy(log_obs);
+        log_obs.* = .{};
+        runtime.log_obs = log_obs;
 
         const mem_opt: ?memory_mod.Memory = if (runtime.mem_rt) |rt| rt.memory else null;
         runtime.session_mgr = session_mod.SessionManager.init(
@@ -494,7 +568,7 @@ const TenantRuntime = struct {
             provider_i,
             runtime.tools,
             mem_opt,
-            runtime.noop_obs.observer(),
+            runtime.log_obs.observer(),
             if (runtime.pg_session_store) |store| store.sessionStore() else if (runtime.mem_rt) |rt| rt.session_store else null,
             if (runtime.mem_rt) |*rt| rt.response_cache else null,
         );
@@ -570,7 +644,7 @@ const TenantRuntime = struct {
         }
         if (self.mem_rt) |*rt| rt.deinit();
         self.provider_bundle.deinit();
-        self.allocator.destroy(self.noop_obs);
+        self.allocator.destroy(self.log_obs);
         self.allocator.free(self.workspace_path);
         self.allocator.free(self.user_id);
         self.allocator.destroy(self);
@@ -580,6 +654,7 @@ const TenantRuntime = struct {
         self: *TenantRuntime,
         session_key: []const u8,
         message: []const u8,
+        conversation_context: ?agent_prompt.ConversationContext,
         message_turn_context: ?tools_mod.MessageTurnContext,
     ) ![]const u8 {
         self.lock.lock();
@@ -593,7 +668,7 @@ const TenantRuntime = struct {
             .state_mgr = self.state_mgr,
         });
         defer tools_mod.clearTenantContext();
-        return self.session_mgr.processMessageWithToolContext(session_key, message, null, message_turn_context);
+        return self.session_mgr.processMessageWithToolContext(session_key, message, conversation_context, message_turn_context);
     }
 };
 
@@ -833,47 +908,80 @@ pub fn extractBearerToken(auth_header: []const u8) ?[]const u8 {
     return null;
 }
 
-fn parseContentLength(raw: []const u8) usize {
-    const cl = extractHeader(raw, "Content-Length") orelse return 0;
-    return std.fmt.parseInt(usize, std.mem.trim(u8, cl, " \t\r\n"), 10) catch 0;
+fn headerEndOffset(raw: []const u8) ?usize {
+    const separator = "\r\n\r\n";
+    const pos = std.mem.indexOf(u8, raw, separator) orelse return null;
+    return pos + separator.len;
+}
+
+fn expectedHttpRequestSize(raw: []const u8) !?usize {
+    const header_end = headerEndOffset(raw) orelse {
+        if (raw.len > MAX_HEADER_SIZE) return error.RequestTooLarge;
+        return null;
+    };
+    if (header_end > MAX_HEADER_SIZE) return error.RequestTooLarge;
+
+    const header_slice = raw[0..header_end];
+    const content_length_raw = extractHeader(header_slice, "Content-Length") orelse return header_end;
+    const trimmed = std.mem.trim(u8, content_length_raw, " \t");
+    if (trimmed.len == 0) return error.InvalidContentLength;
+
+    const content_length = std.fmt.parseInt(usize, trimmed, 10) catch return error.InvalidContentLength;
+    if (content_length > MAX_BODY_SIZE) return error.RequestTooLarge;
+
+    const total = std.math.add(usize, header_end, content_length) catch return error.RequestTooLarge;
+    if (total > MAX_HTTP_REQUEST_SIZE) return error.RequestTooLarge;
+    return total;
+}
+
+fn configureRequestReadTimeout(stream: std.net.Stream) void {
+    if (!@hasDecl(std.posix.SO, "RCVTIMEO")) return;
+
+    const timeout = std.posix.timeval{
+        .sec = @intCast(REQUEST_TIMEOUT_SECS),
+        .usec = 0,
+    };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        &std.mem.toBytes(timeout),
+    ) catch {};
+}
+
+fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype) ![]u8 {
+    var request_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer request_buf.deinit(allocator);
+
+    var expected_total: ?usize = null;
+    var chunk: [2048]u8 = undefined;
+
+    while (true) {
+        const n = reader.read(&chunk) catch |err| switch (err) {
+            error.WouldBlock, error.ConnectionTimedOut => return error.RequestTimeout,
+            else => return err,
+        };
+        if (n == 0) return error.IncompleteRequest;
+
+        try request_buf.appendSlice(allocator, chunk[0..n]);
+        if (request_buf.items.len > MAX_HTTP_REQUEST_SIZE) return error.RequestTooLarge;
+
+        if (expected_total == null) {
+            expected_total = try expectedHttpRequestSize(request_buf.items);
+        }
+
+        if (expected_total) |total| {
+            if (request_buf.items.len >= total) {
+                request_buf.items.len = total;
+                return request_buf.toOwnedSlice(allocator);
+            }
+        }
+    }
 }
 
 /// Read a full HTTP request (headers + body) from stream.
 fn readHttpRequest(allocator: std.mem.Allocator, stream: anytype) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-
-    var tmp: [2048]u8 = undefined;
-    var headers_end: ?usize = null;
-    var expected_total: usize = 0;
-
-    while (true) {
-        const n = try stream.read(&tmp);
-        if (n == 0) break;
-        try buf.appendSlice(allocator, tmp[0..n]);
-
-        if (buf.items.len > MAX_HTTP_REQUEST_SIZE) return error.RequestTooLarge;
-
-        if (headers_end == null) {
-            if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |pos| {
-                headers_end = pos + 4;
-                const content_length = parseContentLength(buf.items[0..headers_end.?]);
-                if (content_length > MAX_BODY_SIZE) return error.RequestBodyTooLarge;
-                expected_total = headers_end.? + content_length;
-            }
-        }
-
-        if (headers_end != null and buf.items.len >= expected_total) break;
-    }
-
-    if (buf.items.len == 0) return error.EmptyRequest;
-    if (headers_end == null) return error.InvalidRequest;
-    if (buf.items.len < expected_total) return error.IncompleteRequest;
-
-    if (buf.items.len > expected_total and expected_total > 0) {
-        buf.shrinkRetainingCapacity(expected_total);
-    }
-    return buf.toOwnedSlice(allocator);
+    return readHttpRequestFromReader(allocator, stream);
 }
 
 fn extractInternalServiceToken(raw: []const u8) ?[]const u8 {
@@ -1036,6 +1144,7 @@ fn writeTelegramChannelState(
     try w.writeAll("{\"telegram\":{\"connected\":true,\"account_id\":\"");
     try jsonEscapeInto(w, account_id);
     try w.print("\",\"chat_id\":{d},\"updated_at_s\":{d}}}", .{ chat_id, std.time.timestamp() });
+    try w.writeAll("}");
     try writeFile(channel_state_path, out.items);
 }
 
@@ -1110,7 +1219,10 @@ fn parseTelegramUserState(allocator: std.mem.Allocator, body: []const u8) !Teleg
     }
     if (parsed.value.object.get("webhook_secret_token")) |secret| {
         if (secret != .string) return error.InvalidTelegramState;
-        state.webhook_secret_token = try allocator.dupe(u8, secret.string);
+        const normalized = normalizeTelegramSecretToken(secret.string);
+        if (normalized.len > 0) {
+            state.webhook_secret_token = try allocator.dupe(u8, normalized);
+        }
     }
     if (parsed.value.object.get("allow_from")) |allow_from| {
         state.allow_from = try cloneJsonStringArrayValue(allocator, allow_from);
@@ -1152,16 +1264,166 @@ fn maybeAcquireTenantOwnershipLock(
     if (!state.tenant_enabled) return null;
     if (!state.ownership_lock_enabled) return null;
     if (state.owner_instance_id.len == 0) return null;
-    return try tenant_lock.acquireUserOwnershipLock(
-        allocator,
-        user_root,
-        state.owner_instance_id,
-        state.ownership_lock_lease_secs,
-    );
+
+    var attempts: u8 = 0;
+    while (attempts < 3) : (attempts += 1) {
+        return tenant_lock.acquireUserOwnershipLock(
+            allocator,
+            user_root,
+            state.owner_instance_id,
+            state.ownership_lock_lease_secs,
+        ) catch |err| switch (err) {
+            error.LockHeld => {
+                if (attempts + 1 >= 3) return err;
+                std.Thread.sleep(20 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+    }
+
+    return error.LockHeld;
 }
 
-fn mainUserSessionKey(buf: []u8, user_id: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "agent:zaki-bot:user:{s}:main", .{user_id}) catch "agent:zaki-bot:user:unknown:main";
+const TenantTelegramAsyncJob = struct {
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    config: *const Config,
+    user_id: []u8,
+    account_id: []u8,
+    bot_token: []u8,
+    message: []u8,
+    chat_id: i64,
+
+    fn deinit(self: *TenantTelegramAsyncJob) void {
+        self.allocator.free(self.user_id);
+        self.allocator.free(self.account_id);
+        self.allocator.free(self.bot_token);
+        self.allocator.free(self.message);
+        self.allocator.destroy(self);
+    }
+};
+
+fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
+    defer job.deinit();
+
+    var user_ctx = resolveUserContext(job.allocator, job.state, job.user_id) catch |err| {
+        log.warn("tenant telegram async resolveUserContext failed: {}", .{err});
+        return;
+    };
+    defer user_ctx.deinit(job.allocator);
+
+    var user_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(
+        job.allocator,
+        job.state,
+        user_ctx.user_root,
+    ) catch |err| {
+        log.warn("tenant telegram async ownership lock failed: {}", .{err});
+        return;
+    };
+    defer if (user_lock_opt) |*lock| lock.deinit();
+
+    const tenant_runtime = getTenantRuntime(job.state, job.config, &user_ctx) catch |err| {
+        log.warn("tenant telegram async runtime init failed: {}", .{err});
+        return;
+    };
+
+    var session_key_buf: [256]u8 = undefined;
+    const session_key = zaki_session.userMainSessionKey(&session_key_buf, job.user_id);
+
+    var chat_id_buf: [32]u8 = undefined;
+    const chat_id_str = std.fmt.bufPrint(&chat_id_buf, "{d}", .{job.chat_id}) catch "0";
+
+    const reply = tenant_runtime.processMessage(
+        session_key,
+        job.message,
+        .{
+            .channel = "telegram",
+            .is_group = job.chat_id < 0,
+        },
+        .{
+            .channel = "telegram",
+            .account_id = job.account_id,
+            .chat_id = chat_id_str,
+        },
+    ) catch |err| {
+        if (job.bot_token.len > 0) {
+            sendTelegramReply(job.allocator, job.bot_token, job.chat_id, userFacingAgentError(err)) catch {};
+        }
+        return;
+    };
+    defer job.allocator.free(reply);
+
+    if (job.bot_token.len == 0) return;
+    sendTelegramReply(job.allocator, job.bot_token, job.chat_id, reply) catch |err| {
+        log.warn("tenant telegram async send failed: {}", .{err});
+    };
+}
+
+fn tenantTelegramAsyncWorkerMain(state: *GatewayState) void {
+    while (state.tenant_telegram_queue.pop()) |opaque_job| {
+        const job: *TenantTelegramAsyncJob = @ptrCast(@alignCast(opaque_job));
+        tenantTelegramAsyncWorker(job);
+    }
+}
+
+fn ensureTenantTelegramWorker(state: *GatewayState) bool {
+    state.tenant_telegram_worker_mutex.lock();
+    defer state.tenant_telegram_worker_mutex.unlock();
+    if (state.tenant_telegram_worker != null) return true;
+
+    const worker = std.Thread.spawn(
+        .{ .stack_size = 512 * 1024 },
+        tenantTelegramAsyncWorkerMain,
+        .{state},
+    ) catch return false;
+    state.tenant_telegram_worker = worker;
+    return true;
+}
+
+fn enqueueTenantTelegramAsync(
+    state: *GatewayState,
+    config: *const Config,
+    user_id: []const u8,
+    account_id: []const u8,
+    bot_token: []const u8,
+    chat_id: i64,
+    message: []const u8,
+) bool {
+    const allocator = state.allocator;
+    const job = allocator.create(TenantTelegramAsyncJob) catch return false;
+    errdefer allocator.destroy(job);
+
+    const user_id_dup = allocator.dupe(u8, user_id) catch return false;
+    errdefer allocator.free(user_id_dup);
+    const account_id_dup = allocator.dupe(u8, account_id) catch return false;
+    errdefer allocator.free(account_id_dup);
+    const bot_token_dup = allocator.dupe(u8, bot_token) catch return false;
+    errdefer allocator.free(bot_token_dup);
+    const message_dup = allocator.dupe(u8, message) catch return false;
+    errdefer allocator.free(message_dup);
+
+    job.* = .{
+        .allocator = allocator,
+        .state = state,
+        .config = config,
+        .user_id = user_id_dup,
+        .account_id = account_id_dup,
+        .bot_token = bot_token_dup,
+        .message = message_dup,
+        .chat_id = chat_id,
+    };
+
+    if (!ensureTenantTelegramWorker(state)) {
+        job.deinit();
+        return false;
+    }
+
+    if (!state.tenant_telegram_queue.push(@ptrCast(job))) {
+        job.deinit();
+        return false;
+    }
+    return true;
 }
 
 /// Returns true when a webhook request should be accepted for the current
@@ -1186,6 +1448,10 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
         if (al != bl) return false;
     }
     return true;
+}
+
+fn normalizeTelegramSecretToken(value: []const u8) []const u8 {
+    return std.mem.trim(u8, value, " \t\r\n\"");
 }
 
 // ── WhatsApp HMAC-SHA256 Signature Verification ─────────────────
@@ -1986,12 +2252,12 @@ pub fn extractBody(raw: []const u8) ?[]const u8 {
     return body;
 }
 
-/// Process an incoming message by spawning `nullclaw agent -m "..."`.
+/// Process an incoming message by spawning `nullalis agent -m "..."`.
 /// Returns the agent's response text. Caller owns the returned memory.
 pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
     // Find our own executable path
     var self_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path = std.fs.selfExePath(&self_buf) catch "nullclaw";
+    const self_path = std.fs.selfExePath(&self_buf) catch "nullalis";
 
     var child = std.process.Child.init(
         &[_][]const u8{ self_path, "agent", "-m", message },
@@ -2092,6 +2358,7 @@ const RouteResponse = struct {
 };
 
 fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
+    const transport_stats = http_util.transport_stats_snapshot();
     const requests_total = state.requests_total.load(.monotonic);
     const chat_stream_total = state.chat_stream_total.load(.monotonic);
     const chat_stream_errors_total = state.chat_stream_errors_total.load(.monotonic);
@@ -2104,36 +2371,54 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
     const shutdown_requested = state.shutdown_requested.load(.acquire);
     return std.fmt.allocPrint(
         allocator,
-        \\# HELP nullclaw_gateway_requests_total Total HTTP requests handled.
-        \\# TYPE nullclaw_gateway_requests_total counter
-        \\nullclaw_gateway_requests_total {d}
-        \\# HELP nullclaw_gateway_chat_stream_total Total chat stream requests.
-        \\# TYPE nullclaw_gateway_chat_stream_total counter
-        \\nullclaw_gateway_chat_stream_total {d}
-        \\# HELP nullclaw_gateway_chat_stream_errors_total Total chat stream errors.
-        \\# TYPE nullclaw_gateway_chat_stream_errors_total counter
-        \\nullclaw_gateway_chat_stream_errors_total {d}
-        \\# HELP nullclaw_gateway_telegram_webhook_total Total telegram webhook requests.
-        \\# TYPE nullclaw_gateway_telegram_webhook_total counter
-        \\nullclaw_gateway_telegram_webhook_total {d}
-        \\# HELP nullclaw_gateway_telegram_webhook_rejected_total Total rejected telegram webhooks.
-        \\# TYPE nullclaw_gateway_telegram_webhook_rejected_total counter
-        \\nullclaw_gateway_telegram_webhook_rejected_total {d}
-        \\# HELP nullclaw_gateway_tenant_lock_conflicts_total Total tenant ownership-lock conflicts.
-        \\# TYPE nullclaw_gateway_tenant_lock_conflicts_total counter
-        \\nullclaw_gateway_tenant_lock_conflicts_total {d}
-        \\# HELP nullclaw_gateway_in_flight_requests Current in-flight requests.
-        \\# TYPE nullclaw_gateway_in_flight_requests gauge
-        \\nullclaw_gateway_in_flight_requests {d}
-        \\# HELP nullclaw_gateway_drain_rejected_total Total requests rejected while draining.
-        \\# TYPE nullclaw_gateway_drain_rejected_total counter
-        \\nullclaw_gateway_drain_rejected_total {d}
-        \\# HELP nullclaw_gateway_drain_mode Current drain mode status.
-        \\# TYPE nullclaw_gateway_drain_mode gauge
-        \\nullclaw_gateway_drain_mode {d}
-        \\# HELP nullclaw_gateway_shutdown_requested Whether shutdown has been requested.
-        \\# TYPE nullclaw_gateway_shutdown_requested gauge
-        \\nullclaw_gateway_shutdown_requested {d}
+        \\# HELP nullalis_gateway_requests_total Total HTTP requests handled.
+        \\# TYPE nullalis_gateway_requests_total counter
+        \\nullalis_gateway_requests_total {d}
+        \\# HELP nullalis_gateway_chat_stream_total Total chat stream requests.
+        \\# TYPE nullalis_gateway_chat_stream_total counter
+        \\nullalis_gateway_chat_stream_total {d}
+        \\# HELP nullalis_gateway_chat_stream_errors_total Total chat stream errors.
+        \\# TYPE nullalis_gateway_chat_stream_errors_total counter
+        \\nullalis_gateway_chat_stream_errors_total {d}
+        \\# HELP nullalis_gateway_telegram_webhook_total Total telegram webhook requests.
+        \\# TYPE nullalis_gateway_telegram_webhook_total counter
+        \\nullalis_gateway_telegram_webhook_total {d}
+        \\# HELP nullalis_gateway_telegram_webhook_rejected_total Total rejected telegram webhooks.
+        \\# TYPE nullalis_gateway_telegram_webhook_rejected_total counter
+        \\nullalis_gateway_telegram_webhook_rejected_total {d}
+        \\# HELP nullalis_gateway_tenant_lock_conflicts_total Total tenant ownership-lock conflicts.
+        \\# TYPE nullalis_gateway_tenant_lock_conflicts_total counter
+        \\nullalis_gateway_tenant_lock_conflicts_total {d}
+        \\# HELP nullalis_gateway_in_flight_requests Current in-flight requests.
+        \\# TYPE nullalis_gateway_in_flight_requests gauge
+        \\nullalis_gateway_in_flight_requests {d}
+        \\# HELP nullalis_gateway_drain_rejected_total Total requests rejected while draining.
+        \\# TYPE nullalis_gateway_drain_rejected_total counter
+        \\nullalis_gateway_drain_rejected_total {d}
+        \\# HELP nullalis_gateway_drain_mode Current drain mode status.
+        \\# TYPE nullalis_gateway_drain_mode gauge
+        \\nullalis_gateway_drain_mode {d}
+        \\# HELP nullalis_gateway_shutdown_requested Whether shutdown has been requested.
+        \\# TYPE nullalis_gateway_shutdown_requested gauge
+        \\nullalis_gateway_shutdown_requested {d}
+        \\# HELP nullalis_http_transport_native_total Native transport successes by subsystem.
+        \\# TYPE nullalis_http_transport_native_total counter
+        \\nullalis_http_transport_native_total{{subsystem="tools"}} {d}
+        \\nullalis_http_transport_native_total{{subsystem="providers"}} {d}
+        \\nullalis_http_transport_native_total{{subsystem="channels"}} {d}
+        \\nullalis_http_transport_native_total{{subsystem="system"}} {d}
+        \\# HELP nullalis_http_transport_curl_total Curl transport uses by subsystem.
+        \\# TYPE nullalis_http_transport_curl_total counter
+        \\nullalis_http_transport_curl_total{{subsystem="tools"}} {d}
+        \\nullalis_http_transport_curl_total{{subsystem="providers"}} {d}
+        \\nullalis_http_transport_curl_total{{subsystem="channels"}} {d}
+        \\nullalis_http_transport_curl_total{{subsystem="system"}} {d}
+        \\# HELP nullalis_http_transport_fallback_total Native transport fallbacks by subsystem.
+        \\# TYPE nullalis_http_transport_fallback_total counter
+        \\nullalis_http_transport_fallback_total{{subsystem="tools"}} {d}
+        \\nullalis_http_transport_fallback_total{{subsystem="providers"}} {d}
+        \\nullalis_http_transport_fallback_total{{subsystem="channels"}} {d}
+        \\nullalis_http_transport_fallback_total{{subsystem="system"}} {d}
         \\
     ,
         .{
@@ -2147,6 +2432,18 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             drain_rejected_total,
             if (draining) @as(u8, 1) else @as(u8, 0),
             if (shutdown_requested) @as(u8, 1) else @as(u8, 0),
+            transport_stats.tools_native_total,
+            transport_stats.providers_native_total,
+            transport_stats.channels_native_total,
+            transport_stats.system_native_total,
+            transport_stats.tools_curl_total,
+            transport_stats.providers_curl_total,
+            transport_stats.channels_curl_total,
+            transport_stats.system_curl_total,
+            transport_stats.tools_fallback_total,
+            transport_stats.providers_fallback_total,
+            transport_stats.channels_fallback_total,
+            transport_stats.system_fallback_total,
         },
     );
 }
@@ -2244,7 +2541,16 @@ fn telegramApiCall(
 ) ![]u8 {
     const url = try telegramApiUrl(allocator, bot_token, method);
     defer allocator.free(url);
-    return http_util.curlPostWithProxy(allocator, url, body, &.{}, null, "30");
+    const response = try http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
+        .subsystem = .channels,
+        .method = "POST",
+        .url = url,
+        .body = body,
+        .headers = &.{"Content-Type: application/json"},
+        .timeout_ms = 30_000,
+        .max_response_bytes = 1024 * 1024,
+    });
+    return response.body;
 }
 
 fn handleApiRoute(
@@ -2262,6 +2568,7 @@ fn handleApiRoute(
     }
 
     if (std.mem.eql(u8, base_path, "/api/v1/chat/stream")) {
+        const request_start_ms = std.time.milliTimestamp();
         if (!std.mem.eql(u8, method, "POST")) {
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         }
@@ -2310,9 +2617,10 @@ fn handleApiRoute(
         const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing message\"}" };
         var session_buf: [256]u8 = undefined;
-        const session_key = mainUserSessionKey(&session_buf, user_id);
+        const session_key = zaki_session.userMainSessionKey(&session_buf, user_id);
         _ = state.chat_stream_total.fetchAdd(1, .monotonic);
 
+        const chat_start_ms = std.time.milliTimestamp();
         const reply = blk: {
             if (state.tenant_enabled) {
                 const cfg = config_opt orelse {
@@ -2333,7 +2641,15 @@ fn handleApiRoute(
                         .content_type = "text/event-stream; charset=utf-8",
                     };
                 };
-                break :blk tenant_runtime.processMessage(session_key, message, null) catch {
+                break :blk tenant_runtime.processMessage(
+                    session_key,
+                    message,
+                    .{
+                        .channel = "zaki_app",
+                        .is_group = false,
+                    },
+                    null,
+                ) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                     const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
                     return .{
@@ -2364,11 +2680,22 @@ fn handleApiRoute(
                 };
             };
         };
+        const chat_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - chat_start_ms));
         defer root_allocator.free(reply);
         const payload_text = if (reply.len > 0) reply else "received";
+        const sse_start_ms = std.time.milliTimestamp();
         const sse = sseChatPayload(req_allocator, payload_text, session_key) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build sse\"}" };
         };
+        const sse_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - sse_start_ms));
+        const request_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - request_start_ms));
+        log.info("chat.stream.complete user={s} session={s} chat_ms={d} sse_ms={d} total_ms={d}", .{
+            user_id,
+            session_key,
+            chat_duration_ms,
+            sse_duration_ms,
+            request_duration_ms,
+        });
         return .{
             .status = "200 OK",
             .body = sse,
@@ -2760,7 +3087,8 @@ fn handleApiRoute(
 
         const webhook_secret_token = blk: {
             if (jsonStringField(body, "webhook_secret_token")) |provided| {
-                if (provided.len >= 8) break :blk req_allocator.dupe(u8, provided) catch {
+                const normalized = normalizeTelegramSecretToken(provided);
+                if (normalized.len >= 8) break :blk req_allocator.dupe(u8, normalized) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc failed\"}" };
                 };
             }
@@ -2942,7 +3270,17 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         return;
     }
 
-    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "telegram")) {
+    var webhook_key_buf: [160]u8 = undefined;
+    var webhook_rate_key: []const u8 = "telegram";
+    if (ctx.state.tenant_enabled) {
+        if (parseQueryParam(ctx.target, "user_id")) |user_id| {
+            if (isValidIdentifier(user_id)) {
+                webhook_rate_key = std.fmt.bufPrint(&webhook_key_buf, "telegram:{s}", .{user_id}) catch "telegram";
+            }
+        }
+    }
+
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, webhook_rate_key)) {
         ctx.response_status = "429 Too Many Requests";
         ctx.response_body = "{\"error\":\"rate limited\"}";
         return;
@@ -3015,7 +3353,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             };
             defer if (user_lock_opt) |*lock| lock.deinit();
 
-            var user_state = blk: {
+            const user_state = blk: {
                 if (ctx.state.zaki_state) |mgr| {
                     const numeric_user_id = parseNumericUserId(user_id) catch {
                         _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
@@ -3044,7 +3382,6 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     return;
                 };
             };
-            defer user_state.deinit(ctx.req_allocator);
             if (!user_state.connected) {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                 ctx.response_status = "403 Forbidden";
@@ -3116,7 +3453,15 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing telegram secret token\"}";
                 return;
             };
-            if (!std.mem.eql(u8, std.mem.trim(u8, header_token, " \t\r\n"), tg_webhook_secret_token)) {
+            const expected_secret = normalizeTelegramSecretToken(tg_webhook_secret_token);
+            const provided_secret = normalizeTelegramSecretToken(header_token);
+            if (expected_secret.len == 0) {
+                _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"missing telegram secret token\"}";
+                return;
+            }
+            if (!std.mem.eql(u8, provided_secret, expected_secret)) {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                 ctx.response_status = "403 Forbidden";
                 ctx.response_body = "{\"error\":\"invalid telegram secret token\"}";
@@ -3179,23 +3524,45 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             const peer_kind = if (is_group) "group" else "direct";
 
             if (use_shared_main and tenant_user_ctx != null) {
-                var kb: [256]u8 = undefined;
-                const sk = mainUserSessionKey(&kb, scoped_user_id.?);
                 const cfg = ctx.config_opt orelse {
                     ctx.response_status = "500 Internal Server Error";
                     ctx.response_body = "{\"error\":\"tenant config missing\"}";
                     return;
                 };
+                if (enqueueTenantTelegramAsync(
+                    ctx.state,
+                    cfg,
+                    scoped_user_id.?,
+                    tg_account_id,
+                    tg_bot_token,
+                    chat_id.?,
+                    msg_text.?,
+                )) {
+                    ctx.response_body = "{\"status\":\"accepted\"}";
+                    return;
+                }
+                log.warn("tenant telegram async enqueue failed; falling back to synchronous processing", .{});
+
+                var kb: [256]u8 = undefined;
+                const sk = zaki_session.userMainSessionKey(&kb, scoped_user_id.?);
                 const tenant_runtime = getTenantRuntime(ctx.state, cfg, &tenant_user_ctx.?) catch {
                     ctx.response_status = "500 Internal Server Error";
                     ctx.response_body = "{\"error\":\"tenant runtime init failed\"}";
                     return;
                 };
-                const reply: ?[]const u8 = tenant_runtime.processMessage(sk, msg_text.?, .{
-                    .channel = "telegram",
-                    .account_id = tg_account_id,
-                    .chat_id = cid_str,
-                }) catch |err| blk: {
+                const reply: ?[]const u8 = tenant_runtime.processMessage(
+                    sk,
+                    msg_text.?,
+                    .{
+                        .channel = "telegram",
+                        .is_group = is_group,
+                    },
+                    .{
+                        .channel = "telegram",
+                        .account_id = tg_account_id,
+                        .chat_id = cid_str,
+                    },
+                ) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
                         sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
                     }
@@ -3220,7 +3587,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 var kb: [256]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
                 const sk = if (use_shared_main)
-                    mainUserSessionKey(&kb, scoped_user_id.?)
+                    zaki_session.userMainSessionKey(&kb, scoped_user_id.?)
                 else
                     telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
                 _ = publishToBus(eb, ctx.state.allocator, "telegram", sender, cid_str, msg_text.?, sk, meta);
@@ -3229,7 +3596,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 var kb: [256]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
                 const sk = if (use_shared_main)
-                    mainUserSessionKey(&kb, scoped_user_id.?)
+                    zaki_session.userMainSessionKey(&kb, scoped_user_id.?)
                 else
                     telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
                 const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, null) catch |err| blk: {
@@ -3916,14 +4283,20 @@ fn handleAcceptedConnection(
     conn: std.net.Server.Connection,
 ) void {
     defer conn.stream.close();
+    configureRequestReadTimeout(conn.stream);
 
     // Per-request arena — all request-scoped allocations freed in one shot
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const req_allocator = arena.allocator();
 
-    const raw = readHttpRequest(req_allocator, conn.stream) catch {
-        sendHttpResponse(conn.stream, "400 Bad Request", "application/json", "{\"error\":\"invalid request\"}") catch {};
+    const raw = readHttpRequest(req_allocator, conn.stream) catch |err| {
+        switch (err) {
+            error.RequestTooLarge => sendHttpResponse(conn.stream, "413 Payload Too Large", "application/json", "{\"error\":\"request too large\"}") catch {},
+            error.InvalidContentLength => sendHttpResponse(conn.stream, "400 Bad Request", "application/json", "{\"error\":\"invalid content-length\"}") catch {},
+            error.RequestTimeout => sendHttpResponse(conn.stream, "408 Request Timeout", "application/json", "{\"error\":\"request timeout\"}") catch {},
+            else => sendHttpResponse(conn.stream, "400 Bad Request", "application/json", "{\"error\":\"invalid request\"}") catch {},
+        }
         return;
     };
     _ = state.requests_total.fetchAdd(1, .monotonic);
@@ -4302,7 +4675,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
-    var noop_obs_gateway = observability.NoopObserver{};
+    var log_obs_gateway = observability.LogObserver{};
     const needs_local_agent = event_bus == null;
 
     if (config_opt) |cfg_ptr| {
@@ -4419,7 +4792,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 }) catch &.{};
 
                 const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
-                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, noop_obs_gateway.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, log_obs_gateway.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
                 }
@@ -4691,6 +5064,31 @@ test "idempotency store duplicate after many inserts" {
     try std.testing.expect(!store.recordIfNew(std.testing.allocator, "first"));
 }
 
+test "idempotency store copies transient key memory" {
+    var store = IdempotencyStore.init(300);
+    defer store.deinit(std.testing.allocator);
+
+    var key_buf: [32]u8 = undefined;
+    const transient_key = try std.fmt.bufPrint(&key_buf, "req-{d}", .{123});
+    try std.testing.expect(store.recordIfNew(std.testing.allocator, transient_key));
+
+    @memset(&key_buf, 'x');
+    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-123"));
+}
+
+test "rate limiter copies transient key memory" {
+    var limiter = SlidingWindowRateLimiter.init(2, 60);
+    defer limiter.deinit(std.testing.allocator);
+
+    var key_buf: [48]u8 = undefined;
+    const transient_key = try std.fmt.bufPrint(&key_buf, "tenant-{d}", .{42});
+    try std.testing.expect(limiter.allow(std.testing.allocator, transient_key));
+
+    @memset(&key_buf, 'x');
+    try std.testing.expect(limiter.allow(std.testing.allocator, "tenant-42"));
+    try std.testing.expect(!limiter.allow(std.testing.allocator, "tenant-42"));
+}
+
 test "rate limiter window_ns calculation" {
     const limiter = SlidingWindowRateLimiter.init(10, 120);
     try std.testing.expectEqual(@as(i128, 120_000_000_000), limiter.window_ns);
@@ -4788,6 +5186,20 @@ test "parseTelegramUserState parses user-scoped telegram settings" {
     try std.testing.expectEqualStrings("user2", state.allow_from[1]);
 }
 
+test "parseTelegramUserState normalizes webhook secret token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const body =
+        \\{"connected":true,"account_id":"work","webhook_secret_token":"  \"sec-12345\"  "}
+    ;
+    var state = try parseTelegramUserState(allocator, body);
+    defer state.deinit(allocator);
+
+    try std.testing.expect(state.webhook_secret_token != null);
+    try std.testing.expectEqualStrings("sec-12345", state.webhook_secret_token.?);
+}
+
 test "parseTelegramUserState rejects invalid account_id" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4796,6 +5208,11 @@ test "parseTelegramUserState rejects invalid account_id" {
         \\{"connected":true,"account_id":"../../bad","webhook_secret_token":"secret"}
     ;
     try std.testing.expectError(error.InvalidTelegramState, parseTelegramUserState(allocator, body));
+}
+
+test "normalizeTelegramSecretToken trims whitespace and quotes" {
+    try std.testing.expectEqualStrings("abc123", normalizeTelegramSecretToken("  \"abc123\" \r\n"));
+    try std.testing.expectEqualStrings("", normalizeTelegramSecretToken(" \t\r\n\"\""));
 }
 
 test "readTrimmedSecretFile trims trailing whitespace" {
@@ -4813,6 +5230,30 @@ test "readTrimmedSecretFile trims trailing whitespace" {
     const value = try readTrimmedSecretFile(std.testing.allocator, path);
     defer if (value.len > 0) std.testing.allocator.free(value);
     try std.testing.expectEqualStrings("abc123", value);
+}
+
+test "writeTelegramChannelState writes valid nested telegram state json" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = "channel_state.json";
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ root, rel_path });
+    defer std.testing.allocator.free(path);
+
+    try writeTelegramChannelState(std.testing.allocator, path, "main", 123456789);
+
+    const content = try std.fs.cwd().readFileAlloc(std.testing.allocator, path, 1024);
+    defer std.testing.allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, content, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("telegram") != null);
+    try std.testing.expect(parsed.value.object.get("telegram").? == .object);
+    const telegram = parsed.value.object.get("telegram").?.object;
+    try std.testing.expectEqual(@as(i64, 123456789), telegram.get("chat_id").?.integer);
 }
 
 test "GatewayState initWithVerifyToken stores token" {
@@ -5415,7 +5856,7 @@ test "telegramSessionKeyRouted uses direct peer for private chats" {
     };
 
     const key = telegramSessionKeyRouted(allocator, &key_buf, 4242, body, &cfg, "tg-main");
-    try std.testing.expectEqualStrings("agent:tg-dm-agent:telegram:direct:4242", key);
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:main", key);
 }
 
 test "telegramSessionKeyRouted applies session dm_scope for direct chats" {
@@ -5608,6 +6049,110 @@ test "extractBody returns null for no body" {
 test "extractBody returns null for no separator" {
     const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
     try std.testing.expect(extractBody(raw) == null);
+}
+
+test "expectedHttpRequestSize rejects oversized incomplete headers" {
+    const raw = try std.testing.allocator.alloc(u8, MAX_HEADER_SIZE + 1);
+    defer std.testing.allocator.free(raw);
+    for (raw) |*byte| byte.* = 'a';
+    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw));
+}
+
+test "expectedHttpRequestSize returns header length for requests without body" {
+    const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw)).?);
+}
+
+test "expectedHttpRequestSize includes content length payload" {
+    const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw)).?);
+}
+
+test "expectedHttpRequestSize rejects invalid content length" {
+    const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\nhello";
+    try std.testing.expectError(error.InvalidContentLength, expectedHttpRequestSize(raw));
+}
+
+test "expectedHttpRequestSize rejects oversized content length" {
+    const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999\r\n\r\n";
+    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw));
+}
+
+test "readHttpRequestFromReader assembles fragmented request" {
+    const ChunkedReader = struct {
+        chunks: []const []const u8,
+        chunk_idx: usize = 0,
+        offset_in_chunk: usize = 0,
+
+        fn read(self: *@This(), out: []u8) !usize {
+            while (self.chunk_idx < self.chunks.len and self.offset_in_chunk >= self.chunks[self.chunk_idx].len) {
+                self.chunk_idx += 1;
+                self.offset_in_chunk = 0;
+            }
+            if (self.chunk_idx >= self.chunks.len) return 0;
+
+            const chunk = self.chunks[self.chunk_idx];
+            const remaining = chunk[self.offset_in_chunk..];
+            const n = @min(out.len, remaining.len);
+            std.mem.copyForwards(u8, out[0..n], remaining[0..n]);
+            self.offset_in_chunk += n;
+            return n;
+        }
+    };
+
+    const expected = "POST /pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world";
+    const chunks = [_][]const u8{
+        "POST /pair HTTP/1.1\r\nHo",
+        "st: localhost\r\nContent-Length: 11\r\n\r\nhel",
+        "lo world",
+    };
+    var reader = ChunkedReader{ .chunks = chunks[0..] };
+
+    const raw = try readHttpRequestFromReader(std.testing.allocator, &reader);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqualStrings(expected, raw);
+}
+
+test "readHttpRequestFromReader returns IncompleteRequest for truncated body" {
+    const ChunkedReader = struct {
+        chunks: []const []const u8,
+        chunk_idx: usize = 0,
+        offset_in_chunk: usize = 0,
+
+        fn read(self: *@This(), out: []u8) !usize {
+            while (self.chunk_idx < self.chunks.len and self.offset_in_chunk >= self.chunks[self.chunk_idx].len) {
+                self.chunk_idx += 1;
+                self.offset_in_chunk = 0;
+            }
+            if (self.chunk_idx >= self.chunks.len) return 0;
+
+            const chunk = self.chunks[self.chunk_idx];
+            const remaining = chunk[self.offset_in_chunk..];
+            const n = @min(out.len, remaining.len);
+            std.mem.copyForwards(u8, out[0..n], remaining[0..n]);
+            self.offset_in_chunk += n;
+            return n;
+        }
+    };
+
+    const chunks = [_][]const u8{
+        "POST /pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\nabc",
+    };
+    var reader = ChunkedReader{ .chunks = chunks[0..] };
+    try std.testing.expectError(error.IncompleteRequest, readHttpRequestFromReader(std.testing.allocator, &reader));
+}
+
+test "readHttpRequestFromReader maps WouldBlock to RequestTimeout" {
+    const TimeoutReader = struct {
+        const ReadError = error{ WouldBlock, ConnectionTimedOut };
+
+        fn read(_: *@This(), _: []u8) ReadError!usize {
+            return error.WouldBlock;
+        }
+    };
+
+    var reader = TimeoutReader{};
+    try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader));
 }
 
 test "userFacingAgentError maps ProviderDoesNotSupportVision" {

@@ -1149,14 +1149,14 @@ test "ToolExecutionResult default tool_call_id is null" {
 
 test "parseFunctionTagCall single parameter" {
     const allocator = std.testing.allocator;
-    const inner = "<function=shell><parameter=command>ps aux | grep nullclaw</parameter></function>";
+    const inner = "<function=shell><parameter=command>ps aux | grep nullalis</parameter></function>";
     const call = try parseFunctionTagCall(allocator, inner);
     defer {
         allocator.free(call.name);
         allocator.free(call.arguments_json);
     }
     try std.testing.expectEqualStrings("shell", call.name);
-    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "ps aux | grep nullclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "ps aux | grep nullalis") != null);
     try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "command") != null);
 }
 
@@ -1203,7 +1203,7 @@ test "parseToolCalls handles function-tag format inside tool_call" {
     const response =
         \\<tool_call>
         \\<function=shell>
-        \\<parameter=command>ps aux | grep nullclaw | grep -v grep</parameter>
+        \\<parameter=command>ps aux | grep nullalis | grep -v grep</parameter>
         \\</function>
         \\</tool_call>
     ;

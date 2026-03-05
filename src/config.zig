@@ -12,6 +12,11 @@ pub const DiagnosticsConfig = config_types.DiagnosticsConfig;
 pub const AutonomyConfig = config_types.AutonomyConfig;
 pub const DockerRuntimeConfig = config_types.DockerRuntimeConfig;
 pub const RuntimeConfig = config_types.RuntimeConfig;
+pub const TransportMode = config_types.TransportMode;
+pub const PoolConfig = config_types.PoolConfig;
+pub const ResolverConfig = config_types.ResolverConfig;
+pub const TransportConfig = config_types.TransportConfig;
+pub const NetworkConfig = config_types.NetworkConfig;
 pub const AppProfile = config_types.AppProfile;
 pub const ModelFallbackEntry = config_types.ModelFallbackEntry;
 pub const ReliabilityConfig = config_types.ReliabilityConfig;
@@ -100,6 +105,7 @@ pub const Config = struct {
     diagnostics: DiagnosticsConfig = .{},
     autonomy: AutonomyConfig = .{},
     runtime: RuntimeConfig = .{},
+    network: NetworkConfig = .{},
     reliability: ReliabilityConfig = .{},
     scheduler: SchedulerConfig = .{},
     agent: AgentConfig = .{},
@@ -207,7 +213,7 @@ pub const Config = struct {
 
         const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
 
-        const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+        const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullalis" });
         const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
         const workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
 
@@ -760,7 +766,7 @@ pub const Config = struct {
                 .{},
             ),
             ValidationError.NoDefaultModel => std.debug.print(
-                "No default model configured. Set agents.defaults.model.primary in ~/.nullclaw/config.json or run `nullclaw onboard`.\n",
+                "No default model configured. Set agents.defaults.model.primary in ~/.nullalis/config.json or run `nullalis onboard`.\n",
                 .{},
             ),
             ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
@@ -2305,7 +2311,7 @@ test "tools.media.audio disabled" {
 test "parse telegram accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080"}}}}}
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "tenant_user_id": "42", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080"}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2313,12 +2319,14 @@ test "parse telegram accounts" {
     const tg = cfg.channels.telegram[0];
     try std.testing.expectEqualStrings("main", tg.account_id);
     try std.testing.expectEqualStrings("123:ABC", tg.bot_token);
+    try std.testing.expectEqualStrings("42", tg.tenant_user_id.?);
     try std.testing.expectEqual(@as(usize, 1), tg.allow_from.len);
     try std.testing.expectEqualStrings("user1", tg.allow_from[0]);
     try std.testing.expect(!tg.reply_in_private);
     try std.testing.expectEqualStrings("socks5://host:1080", tg.proxy.?);
     allocator.free(tg.account_id);
     allocator.free(tg.bot_token);
+    allocator.free(tg.tenant_user_id.?);
     for (tg.allow_from) |u| allocator.free(u);
     allocator.free(tg.allow_from);
     allocator.free(tg.proxy.?);
@@ -2952,14 +2960,14 @@ test "session config: parse per-account-channel-peer scope" {
     try std.testing.expectEqual(config_types.DmScope.per_account_channel_peer, cfg.session.dm_scope);
 }
 
-test "session config: default dm_scope is per_channel_peer" {
+test "session config: default dm_scope is main" {
     const allocator = std.testing.allocator;
     const json =
         \\{}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqual(config_types.DmScope.per_channel_peer, cfg.session.dm_scope);
+    try std.testing.expectEqual(config_types.DmScope.main, cfg.session.dm_scope);
 }
 
 test "session config: parse idle_minutes" {
@@ -3022,7 +3030,7 @@ test "session config: empty session block uses defaults" {
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqual(config_types.DmScope.per_channel_peer, cfg.session.dm_scope);
+    try std.testing.expectEqual(config_types.DmScope.main, cfg.session.dm_scope);
     try std.testing.expectEqual(@as(u32, 60), cfg.session.idle_minutes);
     try std.testing.expectEqual(@as(usize, 0), cfg.session.identity_links.len);
 }
@@ -3063,12 +3071,12 @@ test "gateway config parses internal_service_tokens" {
 test "tenant config parses enabled and data_root" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"tenant": {"enabled": true, "data_root": "/var/lib/nullclaw/users"}}
+        \\{"tenant": {"enabled": true, "data_root": "/var/lib/nullalis/users"}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expect(cfg.tenant.enabled);
-    try std.testing.expectEqualStrings("/var/lib/nullclaw/users", cfg.tenant.data_root);
+    try std.testing.expectEqualStrings("/var/lib/nullalis/users", cfg.tenant.data_root);
     allocator.free(cfg.tenant.data_root);
 }
 

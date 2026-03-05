@@ -336,10 +336,10 @@ test "health report empty is not healthy" {
 
 test "build system prompt" {
     const allocator = std.testing.allocator;
-    const prompt = try buildSystemPrompt(allocator, "Be helpful.", "telegram", "nullclaw");
+    const prompt = try buildSystemPrompt(allocator, "Be helpful.", "telegram", "nullalis");
     defer allocator.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Be helpful.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "nullclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "nullalis") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "telegram") != null);
 }
 

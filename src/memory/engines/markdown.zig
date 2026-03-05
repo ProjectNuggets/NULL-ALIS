@@ -379,7 +379,7 @@ pub const MarkdownMemory = struct {
 // ── Tests ──────────────────────────────────────────────────────────
 
 test "markdown forget always returns false" {
-    var mem = try MarkdownMemory.init(std.testing.allocator, "/tmp/nullclaw-test-md-forget");
+    var mem = try MarkdownMemory.init(std.testing.allocator, "/tmp/nullalis-test-md-forget");
     defer mem.deinit();
     const m = mem.memory();
 

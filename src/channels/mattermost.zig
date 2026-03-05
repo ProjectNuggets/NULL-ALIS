@@ -718,7 +718,7 @@ pub const MattermostChannel = struct {
         const counter = self.tmp_counter.fetchAdd(1, .monotonic) + 1;
         const path = std.fmt.allocPrint(
             self.allocator,
-            "{s}/nullclaw_mattermost_{d}_{d}.bin",
+            "{s}/nullalis_mattermost_{d}_{d}.bin",
             .{ tmp_dir, std.time.timestamp(), counter },
         ) catch return null;
         errdefer self.allocator.free(path);
@@ -1080,7 +1080,7 @@ test "mattermost chatmode oncall requires mention in non-direct chats" {
     });
     ch.setBus(&eb);
 
-    ch.bot_username = try alloc.dupe(u8, "nullclaw");
+    ch.bot_username = try alloc.dupe(u8, "nullalis");
     defer {
         if (ch.bot_username) |u| alloc.free(u);
         ch.bot_username = null;

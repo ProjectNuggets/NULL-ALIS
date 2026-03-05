@@ -1,7 +1,7 @@
 //! Redis-backed persistent memory via RESP (REdis Serialization Protocol) over TCP.
 //!
 //! No C dependency — implements a minimal RESP v2 client directly.
-//! Designed for distributed memory sharing across multiple nullclaw instances.
+//! Designed for distributed memory sharing across multiple nullalis instances.
 
 const std = @import("std");
 const root = @import("../root.zig");
@@ -139,7 +139,7 @@ pub const RedisConfig = struct {
     port: u16 = 6379,
     password: ?[]const u8 = null,
     db_index: u8 = 0,
-    key_prefix: []const u8 = "nullclaw",
+    key_prefix: []const u8 = "nullalis",
     ttl_seconds: ?u32 = null,
 };
 
@@ -346,10 +346,10 @@ pub const RedisMemory = struct {
         // HSET {entry_key} id {id} content {content} category {cat} session_id {sid} created_at {ts} updated_at {ts}
         const sid = session_id orelse "";
         var resp = try self_.sendCommand(&.{
-            "HSET",     entry_key,
-            "id",       id,
-            "content",  content,
-            "category", cat_str,
+            "HSET",       entry_key,
+            "id",         id,
+            "content",    content,
+            "category",   cat_str,
             "session_id", sid,
             "created_at", now,
             "updated_at", now,
@@ -984,7 +984,7 @@ test "integration: redis store and get" {
     if (!canConnectToRedis()) return;
 
     var mem = try RedisMemory.init(std.testing.allocator, .{
-        .key_prefix = "nullclaw_test",
+        .key_prefix = "nullalis_test",
     });
     defer mem.deinit();
 
@@ -1011,7 +1011,7 @@ test "integration: redis count" {
     if (!canConnectToRedis()) return;
 
     var mem = try RedisMemory.init(std.testing.allocator, .{
-        .key_prefix = "nullclaw_test_count",
+        .key_prefix = "nullalis_test_count",
     });
     defer mem.deinit();
 
@@ -1033,7 +1033,7 @@ test "integration: redis recall substring" {
     if (!canConnectToRedis()) return;
 
     var mem = try RedisMemory.init(std.testing.allocator, .{
-        .key_prefix = "nullclaw_test_recall",
+        .key_prefix = "nullalis_test_recall",
     });
     defer mem.deinit();
 
@@ -1057,7 +1057,7 @@ test "integration: redis forget" {
     if (!canConnectToRedis()) return;
 
     var mem = try RedisMemory.init(std.testing.allocator, .{
-        .key_prefix = "nullclaw_test_forget",
+        .key_prefix = "nullalis_test_forget",
     });
     defer mem.deinit();
 
@@ -1075,7 +1075,7 @@ test "integration: redis health check" {
     if (!canConnectToRedis()) return;
 
     var mem = try RedisMemory.init(std.testing.allocator, .{
-        .key_prefix = "nullclaw_test_health",
+        .key_prefix = "nullalis_test_health",
     });
     defer mem.deinit();
 

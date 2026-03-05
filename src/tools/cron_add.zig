@@ -6,6 +6,27 @@ const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 
+const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
+const TestCronStore = struct {
+    tmp: TestTmpDir,
+    path: []u8,
+
+    fn init() !@This() {
+        var tmp = std.testing.tmpDir(.{});
+        const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        defer std.testing.allocator.free(dir_path);
+        const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "cron.json" });
+        cron.setTestStorePathOverride(path);
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn deinit(self: *@This()) void {
+        cron.setTestStorePathOverride(null);
+        std.testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
 /// CronAdd tool — creates a new cron job with either a cron expression or a delay.
 pub const CronAddTool = struct {
     pub const tool_name = "cron_add";
@@ -87,7 +108,7 @@ pub const CronAddTool = struct {
     }
 };
 
-/// Load the CronScheduler from persisted state (~/.nullclaw/cron.json).
+/// Load the CronScheduler from persisted state (~/.nullalis/cron.json).
 /// Shared by cron_add, cron_list, cron_remove, and schedule tools.
 pub fn loadScheduler(allocator: std.mem.Allocator) !CronScheduler {
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -119,6 +140,8 @@ test "cron_add_requires_schedule" {
 }
 
 test "cron_add_with_expression" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
     var cat = CronAddTool{};
     const t = cat.tool();
     const parsed = try root.parseTestArgs("{\"expression\": \"*/5 * * * *\", \"command\": \"echo hello\"}");
@@ -131,6 +154,8 @@ test "cron_add_with_expression" {
 }
 
 test "cron_add_with_delay" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
     var cat = CronAddTool{};
     const t = cat.tool();
     const parsed = try root.parseTestArgs("{\"delay\": \"30m\", \"command\": \"echo later\"}");

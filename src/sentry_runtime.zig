@@ -66,7 +66,7 @@ pub const Runtime = struct {
         if (try getEnvVarOwned(self.allocator, "NULLCLAW_SENTRY_RELEASE")) |release| {
             self.release = release;
         } else {
-            self.release = try std.fmt.allocPrint(self.allocator, "nullclaw@{s}", .{version.string});
+            self.release = try std.fmt.allocPrint(self.allocator, "nullalis@{s}", .{version.string});
         }
 
         const sample_rate = readEnvF64(self.allocator, "NULLCLAW_SENTRY_SAMPLE_RATE", 1.0);
@@ -87,7 +87,7 @@ pub const Runtime = struct {
         });
 
         if (readEnvBool(self.allocator, "NULLCLAW_SENTRY_STARTUP_EVENT", false)) {
-            self.captureMessage("nullclaw startup", .info);
+            self.captureMessage("nullalis startup", .info);
         }
     }
 

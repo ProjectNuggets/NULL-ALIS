@@ -2,7 +2,7 @@
 //!
 //! Provides reusable OAuth primitives for all providers:
 //! - PKCE challenge generation (RFC 7636)
-//! - Token storage with filesystem-based credential store (~/.nullclaw/auth.json)
+//! - Token storage with filesystem-based credential store (~/.nullalis/auth.json)
 //! - Device Authorization Grant flow (RFC 8628)
 
 const std = @import("std");
@@ -80,10 +80,10 @@ pub const OAuthToken = struct {
 
 // ── Credential Store ───────────────────────────────────────────────────
 
-const CRED_DIR = ".nullclaw";
+const CRED_DIR = ".nullalis";
 const CRED_FILE = "auth.json";
 
-/// Save a credential for the given provider to ~/.nullclaw/auth.json.
+/// Save a credential for the given provider to ~/.nullalis/auth.json.
 /// Merges with existing credentials (other providers are preserved).
 /// File permissions are set to 0o600.
 pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token: OAuthToken) !void {
@@ -174,7 +174,7 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
     }
 }
 
-/// Load a credential for the given provider from ~/.nullclaw/auth.json.
+/// Load a credential for the given provider from ~/.nullalis/auth.json.
 /// Returns null if the file is missing, the provider is not found, or the token is expired.
 pub fn loadCredential(allocator: std.mem.Allocator, provider: []const u8) !?OAuthToken {
     const home = platform.getHomeDir(allocator) catch return null;
@@ -354,7 +354,7 @@ pub fn refreshAccessToken(
         .payload = payload,
         .extra_headers = &.{
             .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
-            .{ .name = "User-Agent", .value = "nullClaw/1.0" },
+            .{ .name = "User-Agent", .value = "nullalis/1.0" },
         },
         .response_writer = &aw.writer,
     });
@@ -374,7 +374,7 @@ pub fn refreshAccessToken(
 
 // ── Credential Deletion ───────────────────────────────────────────────
 
-/// Delete a credential for the given provider from ~/.nullclaw/auth.json.
+/// Delete a credential for the given provider from ~/.nullalis/auth.json.
 /// Returns true if the credential was found and removed.
 pub fn deleteCredential(allocator: std.mem.Allocator, provider: []const u8) !bool {
     const home = platform.getHomeDir(allocator) catch return error.HomeNotSet;
@@ -482,7 +482,7 @@ pub fn startDeviceCodeFlow(
         .payload = payload,
         .extra_headers = &.{
             .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
-            .{ .name = "User-Agent", .value = "nullClaw/1.0" },
+            .{ .name = "User-Agent", .value = "nullalis/1.0" },
         },
         .response_writer = &aw.writer,
     });
@@ -575,7 +575,7 @@ pub fn pollDeviceCode(
             .payload = payload,
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
-                .{ .name = "User-Agent", .value = "nullClaw/1.0" },
+                .{ .name = "User-Agent", .value = "nullalis/1.0" },
             },
             .response_writer = &aw.writer,
         }) catch continue;

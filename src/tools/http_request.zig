@@ -135,18 +135,22 @@ pub const HttpRequestTool = struct {
             else => method_str,
         };
 
-        const response = http_util.curlRequestResolved(
+        const response = http_util.request_with_mode(
             allocator,
-            method_name,
-            url,
-            extra_headers.items,
-            body,
-            "30",
-            authority_host,
-            resolved_port,
-            connect_host,
+            .{ .mode = .curl_only },
+            .{
+                .method = method_name,
+                .url = url,
+                .headers = extra_headers.items,
+                .body = body,
+                .timeout_ms = 30_000,
+                .subsystem = .tools,
+                .resolve_host = authority_host,
+                .resolve_port = resolved_port,
+                .connect_host = connect_host,
+            },
         ) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
+            const msg = try buildHttpRequestErrorMessage(allocator, "HTTP request failed", err);
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(response.body);
@@ -179,6 +183,23 @@ pub const HttpRequestTool = struct {
         }
     }
 };
+
+fn isTlsSetupError(err: anyerror) bool {
+    return err == error.TlsInitializationFailed or
+        err == error.CaBundleLoadFailed or
+        err == error.CertificateBundleLoadFailure;
+}
+
+fn buildHttpRequestErrorMessage(allocator: std.mem.Allocator, prefix: []const u8, err: anyerror) ![]u8 {
+    if (isTlsSetupError(err)) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}: {s}. Ensure system CA certificates are available in the runtime, or use an endpoint with a publicly trusted certificate chain.",
+            .{ prefix, @errorName(err) },
+        );
+    }
+    return std.fmt.allocPrint(allocator, "{s}: {}", .{ prefix, err });
+}
 
 fn validateMethod(method: []const u8) ?std.http.Method {
     if (std.ascii.eqlIgnoreCase(method, "GET")) return .GET;
@@ -516,6 +537,18 @@ test "validateMethod rejects empty string" {
 test "validateMethod rejects CONNECT TRACE" {
     try std.testing.expect(validateMethod("CONNECT") == null);
     try std.testing.expect(validateMethod("TRACE") == null);
+}
+
+test "isTlsSetupError detects TLS setup failures" {
+    try std.testing.expect(isTlsSetupError(error.TlsInitializationFailed));
+    try std.testing.expect(isTlsSetupError(error.CaBundleLoadFailed));
+    try std.testing.expect(!isTlsSetupError(error.EndOfStream));
+}
+
+test "buildHttpRequestErrorMessage includes TLS hint" {
+    const msg = try buildHttpRequestErrorMessage(std.testing.allocator, "HTTP request failed", error.TlsInitializationFailed);
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "system CA certificates") != null);
 }
 
 // ── parseHeaders tests ──────────────────────────────────────

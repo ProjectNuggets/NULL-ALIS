@@ -4,7 +4,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
-const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullclaw_workspace_unavailable__";
+const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullalis_workspace_unavailable__";
 
 /// Git operations tool for structured repository management.
 pub const GitTool = struct {

@@ -1822,13 +1822,13 @@ test "prepare outgoing content keeps unresolved relative attachment path" {
         true,
     );
 
-    const marker_text = "[IMAGE:nullclaw_nonexistent_attachment_123456789.png]";
+    const marker_text = "[IMAGE:nullalis_nonexistent_attachment_123456789.png]";
     const prepared = try ch.prepareOutgoingContent(marker_text, &.{});
     defer prepared.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("", prepared.message_text);
     try std.testing.expectEqual(@as(usize, 1), prepared.attachments.len);
-    try std.testing.expectEqualStrings("nullclaw_nonexistent_attachment_123456789.png", prepared.attachments[0]);
+    try std.testing.expectEqualStrings("nullalis_nonexistent_attachment_123456789.png", prepared.attachments[0]);
 }
 
 test "plan outgoing payloads sends attachment payloads without text" {

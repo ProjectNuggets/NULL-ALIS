@@ -61,19 +61,22 @@ pub const WebFetchTool = struct {
 
         const authority_host = stripHostBrackets(host);
         var header_strings = [_][]const u8{
-            "User-Agent: nullclaw/0.1 (web_fetch tool)",
+            "User-Agent: nullalis/0.1 (web_fetch tool)",
             "Accept: text/html,application/json,text/plain,*/*",
         };
-        const response = http_util.curlRequestResolved(
+        const response = http_util.request_with_mode(
             allocator,
-            "GET",
-            url,
-            &header_strings,
-            null,
-            "30",
-            authority_host,
-            resolved_port,
-            connect_host,
+            .{ .mode = .curl_only },
+            .{
+                .method = "GET",
+                .url = url,
+                .headers = &header_strings,
+                .timeout_ms = 30_000,
+                .subsystem = .tools,
+                .resolve_host = authority_host,
+                .resolve_port = resolved_port,
+                .connect_host = connect_host,
+            },
         ) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
