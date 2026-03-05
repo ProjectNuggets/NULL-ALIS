@@ -3198,6 +3198,22 @@ fn buildWebhookUrlForUser(allocator: std.mem.Allocator, base_url: []const u8, us
     return std.fmt.allocPrint(allocator, "{s}/webhook/telegram?user_id={s}", .{ normalized, user_id });
 }
 
+fn isLikelyTelegramBotToken(token: []const u8) bool {
+    const trimmed = std.mem.trim(u8, token, " \t\r\n");
+    if (trimmed.len < 16) return false;
+    const colon_idx = std.mem.indexOfScalar(u8, trimmed, ':') orelse return false;
+    if (colon_idx == 0 or colon_idx + 1 >= trimmed.len) return false;
+
+    for (trimmed[0..colon_idx]) |ch| {
+        if (ch < '0' or ch > '9') return false;
+    }
+    for (trimmed[colon_idx + 1 ..]) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 fn telegramApiUrl(allocator: std.mem.Allocator, bot_token: []const u8, method: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/{s}", .{ bot_token, method });
 }
@@ -3716,7 +3732,16 @@ fn handleApiRoute(
             const secret_value = mgr.getSecret(req_allocator, user_id, "telegram_bot_token") catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
             };
-            break :blk secret_value orelse "";
+            if (secret_value) |value| {
+                if (isLikelyTelegramBotToken(value)) break :blk value;
+                req_allocator.free(value);
+            }
+            const file_value = readTrimmedSecretFile(req_allocator, secret_path) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
+            };
+            // Best-effort self-heal when DB secret is invalid but file token is valid.
+            if (file_value.len > 0) mgr.putSecret(user_id, "telegram_bot_token", file_value) catch {};
+            break :blk file_value;
         } else blk: {
             break :blk readFileOrDefault(req_allocator, secret_path, "") catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
@@ -4082,7 +4107,25 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         ctx.response_body = "{\"error\":\"failed reading bot token\"}";
                         return;
                     };
-                    break :blk secret_value orelse "";
+                    if (secret_value) |value| {
+                        if (isLikelyTelegramBotToken(value)) break :blk value;
+                        ctx.req_allocator.free(value);
+                    }
+                    const secret_path = resolveSecretPath(ctx.req_allocator, user_ctx.secrets_dir, "telegram_bot_token") catch {
+                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                        ctx.response_status = "500 Internal Server Error";
+                        ctx.response_body = "{\"error\":\"secret path failed\"}";
+                        return;
+                    };
+                    defer ctx.req_allocator.free(secret_path);
+                    const file_value = readTrimmedSecretFile(ctx.req_allocator, secret_path) catch {
+                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                        ctx.response_status = "500 Internal Server Error";
+                        ctx.response_body = "{\"error\":\"failed reading bot token\"}";
+                        return;
+                    };
+                    if (file_value.len > 0) mgr.putSecret(numeric_user_id, "telegram_bot_token", file_value) catch {};
+                    break :blk file_value;
                 }
                 const secret_path = resolveSecretPath(ctx.req_allocator, user_ctx.secrets_dir, "telegram_bot_token") catch {
                     _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);

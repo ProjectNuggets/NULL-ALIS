@@ -600,8 +600,8 @@ const ManagerImpl = struct {
 
     pub fn recordTelegramChat(self: *Self, user_id: i64, account_id: []const u8, chat_id: i64) !void {
         const q = try self.buildQuery(
-            "INSERT INTO {schema}.channel_state (user_id, telegram, updated_at) VALUES ($1, jsonb_build_object('connected', true, 'account_id', $2, 'chat_id', $3, 'updated_at_s', EXTRACT(EPOCH FROM NOW())::bigint), NOW()) " ++
-                "ON CONFLICT (user_id) DO UPDATE SET telegram = COALESCE({schema}.channel_state.telegram, '{}'::jsonb) || jsonb_build_object('chat_id', $3, 'account_id', $2, 'updated_at_s', EXTRACT(EPOCH FROM NOW())::bigint), updated_at = NOW()",
+            "INSERT INTO {schema}.channel_state (user_id, telegram, updated_at) VALUES ($1, jsonb_build_object('connected', true, 'account_id', $2::text, 'chat_id', $3::bigint, 'updated_at_s', EXTRACT(EPOCH FROM NOW())::bigint), NOW()) " ++
+                "ON CONFLICT (user_id) DO UPDATE SET telegram = COALESCE({schema}.channel_state.telegram, '{}'::jsonb) || jsonb_build_object('chat_id', $3::bigint, 'account_id', $2::text, 'updated_at_s', EXTRACT(EPOCH FROM NOW())::bigint), updated_at = NOW()",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
