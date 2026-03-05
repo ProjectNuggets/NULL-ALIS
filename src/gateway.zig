@@ -1293,6 +1293,23 @@ fn readTrimmedSecretFile(allocator: std.mem.Allocator, path: []const u8) ![]cons
     return out;
 }
 
+fn resolveTenantTelegramBotTokenForSend(allocator: std.mem.Allocator, user_ctx: *const UserContext) ![]const u8 {
+    const secret_path = try resolveSecretPath(allocator, user_ctx.secrets_dir, "telegram_bot_token");
+    defer allocator.free(secret_path);
+
+    const raw = try readTrimmedSecretFile(allocator, secret_path);
+    const normalized = normalizeTelegramBotToken(raw);
+    if (!isLikelyTelegramBotToken(normalized)) {
+        if (raw.len > 0) allocator.free(raw);
+        return error.CurlFailed;
+    }
+    if (normalized.ptr == raw.ptr and normalized.len == raw.len) return raw;
+
+    const out = try allocator.dupe(u8, normalized);
+    if (raw.len > 0) allocator.free(raw);
+    return out;
+}
+
 fn maybeAcquireTenantOwnershipLock(
     allocator: std.mem.Allocator,
     state: *const GatewayState,
@@ -1491,6 +1508,67 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
 
 fn normalizeTelegramSecretToken(value: []const u8) []const u8 {
     return std.mem.trim(u8, value, " \t\r\n\"");
+}
+
+fn isTelegramBotTokenChar(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
+}
+
+fn isTelegramBotTokenShape(value: []const u8) bool {
+    if (value.len < 16) return false;
+    const colon_idx = std.mem.indexOfScalar(u8, value, ':') orelse return false;
+    if (colon_idx == 0 or colon_idx + 1 >= value.len) return false;
+
+    for (value[0..colon_idx]) |ch| {
+        if (ch < '0' or ch > '9') return false;
+    }
+    for (value[colon_idx + 1 ..]) |ch| {
+        if (!isTelegramBotTokenChar(ch)) return false;
+    }
+    return true;
+}
+
+fn findTelegramBotTokenCandidate(value: []const u8) ?[]const u8 {
+    var idx: usize = 0;
+    while (idx < value.len) : (idx += 1) {
+        if (value[idx] != ':') continue;
+        if (idx == 0 or idx + 1 >= value.len) continue;
+
+        var left_start = idx;
+        while (left_start > 0) {
+            const ch = value[left_start - 1];
+            if (ch < '0' or ch > '9') break;
+            left_start -= 1;
+        }
+
+        const left_len = idx - left_start;
+        if (left_len < 5) continue;
+
+        var right_end = idx + 1;
+        while (right_end < value.len and isTelegramBotTokenChar(value[right_end])) {
+            right_end += 1;
+        }
+        const right_len = right_end - (idx + 1);
+        if (right_len < 10) continue;
+
+        const candidate = value[left_start..right_end];
+        if (isTelegramBotTokenShape(candidate)) return candidate;
+    }
+    return null;
+}
+
+fn normalizeTelegramBotToken(value: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len >= 2) {
+        const first = trimmed[0];
+        const last = trimmed[trimmed.len - 1];
+        if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
+            trimmed = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+        }
+    }
+    if (isTelegramBotTokenShape(trimmed)) return trimmed;
+    if (findTelegramBotTokenCandidate(trimmed)) |candidate| return candidate;
+    return trimmed;
 }
 
 fn copyIntoBuf(buf: []u8, value: []const u8) usize {
@@ -2458,6 +2536,14 @@ pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8)
 
 /// Send a reply to a Telegram chat using the Bot API.
 pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, chat_id: i64, text: []const u8) !void {
+    const normalized_bot_token = normalizeTelegramBotToken(bot_token);
+    if (!isLikelyTelegramBotToken(normalized_bot_token)) {
+        const colon_idx = std.mem.indexOfScalar(u8, normalized_bot_token, ':');
+        const colon_pos: i64 = if (colon_idx) |idx| @intCast(idx) else -1;
+        log.warn("telegram send skipped: invalid bot token shape chat_id={d} len={d} colon_pos={d}", .{ chat_id, normalized_bot_token.len, colon_pos });
+        return error.CurlFailed;
+    }
+
     var body_buf: std.ArrayList(u8) = .empty;
     defer body_buf.deinit(allocator);
     const w = body_buf.writer(allocator);
@@ -2474,15 +2560,16 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
     }
     try w.writeAll("\"}");
 
-    const resp = telegramApiCall(allocator, bot_token, "sendMessage", body_buf.items) catch |err| {
+    const resp = telegramApiCall(allocator, normalized_bot_token, "sendMessage", body_buf.items) catch |err| {
         log.warn("telegramApiCall sendMessage failed: {}", .{err});
-        return sendTelegramReplyViaCurlFallback(allocator, bot_token, body_buf.items);
+        return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
     };
     defer allocator.free(resp);
     if (!(jsonBoolField(resp, "ok") orelse false)) {
         log.warn("telegram sendMessage api returned non-ok; retrying via curl fallback", .{});
-        return sendTelegramReplyViaCurlFallback(allocator, bot_token, body_buf.items);
+        return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
     }
+    log.info("telegram send ok chat_id={d} text_len={d}", .{ chat_id, text.len });
 }
 
 fn sendTelegramReplyViaCurlFallback(allocator: std.mem.Allocator, bot_token: []const u8, body: []const u8) !void {
@@ -3271,19 +3358,8 @@ fn buildWebhookUrlForUser(allocator: std.mem.Allocator, base_url: []const u8, us
 }
 
 fn isLikelyTelegramBotToken(token: []const u8) bool {
-    const trimmed = std.mem.trim(u8, token, " \t\r\n");
-    if (trimmed.len < 16) return false;
-    const colon_idx = std.mem.indexOfScalar(u8, trimmed, ':') orelse return false;
-    if (colon_idx == 0 or colon_idx + 1 >= trimmed.len) return false;
-
-    for (trimmed[0..colon_idx]) |ch| {
-        if (ch < '0' or ch > '9') return false;
-    }
-    for (trimmed[colon_idx + 1 ..]) |ch| {
-        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
-        if (!ok) return false;
-    }
-    return true;
+    const trimmed = normalizeTelegramBotToken(token);
+    return isTelegramBotTokenShape(trimmed);
 }
 
 fn telegramApiUrl(allocator: std.mem.Allocator, bot_token: []const u8, method: []const u8) ![]u8 {
@@ -3801,36 +3877,16 @@ fn handleApiRoute(
                 };
             }
         }
-        const bot_token_raw = if (state.zaki_state) |mgr| blk: {
-            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-            const file_value = readTrimmedSecretFile(req_allocator, secret_path) catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
-            };
-            if (isLikelyTelegramBotToken(file_value)) {
-                mgr.putSecret(user_id, "telegram_bot_token", file_value) catch {};
-                break :blk file_value;
-            }
-
-            const secret_value = mgr.getSecret(req_allocator, user_id, "telegram_bot_token") catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
-            };
-            if (secret_value) |value| {
-                if (isLikelyTelegramBotToken(value)) {
-                    writeFile(secret_path, value) catch {};
-                    break :blk value;
-                }
-                req_allocator.free(value);
-            }
-            break :blk file_value;
-        } else blk: {
-            break :blk readFileOrDefault(req_allocator, secret_path, "") catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
-            };
+        const bot_token_raw = readTrimmedSecretFile(req_allocator, secret_path) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
         };
         defer if (state.zaki_state != null and bot_token_raw.len > 0) req_allocator.free(bot_token_raw);
-        const bot_token = std.mem.trim(u8, bot_token_raw, " \t\r\n");
+        const bot_token = normalizeTelegramBotToken(bot_token_raw);
         if (bot_token.len == 0) {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing bot_token\"}" };
+        }
+        if (!isLikelyTelegramBotToken(bot_token)) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid bot_token\"}" };
         }
         const account_id = jsonStringField(body, "account_id") orelse state.telegram_account_id;
         if (!isValidIdentifier(account_id)) {
@@ -4174,46 +4230,6 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             }
 
             const tenant_bot_token = blk: {
-                if (ctx.state.zaki_state) |mgr| {
-                    const numeric_user_id = parseNumericUserId(user_id) catch {
-                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                        ctx.response_status = "400 Bad Request";
-                        ctx.response_body = "{\"error\":\"invalid user\"}";
-                        return;
-                    };
-                    const secret_path = resolveSecretPath(ctx.req_allocator, user_ctx.secrets_dir, "telegram_bot_token") catch {
-                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                        ctx.response_status = "500 Internal Server Error";
-                        ctx.response_body = "{\"error\":\"secret path failed\"}";
-                        return;
-                    };
-                    defer ctx.req_allocator.free(secret_path);
-                    const file_value = readTrimmedSecretFile(ctx.req_allocator, secret_path) catch {
-                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                        ctx.response_status = "500 Internal Server Error";
-                        ctx.response_body = "{\"error\":\"failed reading bot token\"}";
-                        return;
-                    };
-                    if (isLikelyTelegramBotToken(file_value)) {
-                        mgr.putSecret(numeric_user_id, "telegram_bot_token", file_value) catch {};
-                        break :blk file_value;
-                    }
-                    const secret_value = mgr.getSecret(ctx.req_allocator, numeric_user_id, "telegram_bot_token") catch {
-                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                        ctx.response_status = "500 Internal Server Error";
-                        ctx.response_body = "{\"error\":\"failed reading bot token\"}";
-                        return;
-                    };
-                    if (secret_value) |value| {
-                        if (isLikelyTelegramBotToken(value)) {
-                            writeFile(secret_path, value) catch {};
-                            break :blk value;
-                        }
-                        ctx.req_allocator.free(value);
-                    }
-                    if (file_value.len > 0) mgr.putSecret(numeric_user_id, "telegram_bot_token", file_value) catch {};
-                    break :blk file_value;
-                }
                 const secret_path = resolveSecretPath(ctx.req_allocator, user_ctx.secrets_dir, "telegram_bot_token") catch {
                     _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                     ctx.response_status = "500 Internal Server Error";
@@ -4221,12 +4237,16 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     return;
                 };
                 defer ctx.req_allocator.free(secret_path);
-                break :blk readTrimmedSecretFile(ctx.req_allocator, secret_path) catch {
+                const file_token = readTrimmedSecretFile(ctx.req_allocator, secret_path) catch {
                     _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                     ctx.response_status = "500 Internal Server Error";
                     ctx.response_body = "{\"error\":\"failed reading bot token\"}";
                     return;
                 };
+                const raw_colon_idx = std.mem.indexOfScalar(u8, file_token, ':');
+                const raw_colon_pos: i64 = if (raw_colon_idx) |idx| @intCast(idx) else -1;
+                log.info("telegram token source=file path={s} len={d} colon_pos={d}", .{ secret_path, file_token.len, raw_colon_pos });
+                break :blk file_token;
             };
             defer if (ctx.state.zaki_state != null and tenant_bot_token.len > 0) ctx.req_allocator.free(tenant_bot_token);
             if (tenant_bot_token.len == 0) {
@@ -4235,7 +4255,14 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing telegram bot token\"}";
                 return;
             }
-            tg_bot_token = tenant_bot_token;
+            const normalized_tenant_bot_token = normalizeTelegramBotToken(tenant_bot_token);
+            if (!isLikelyTelegramBotToken(normalized_tenant_bot_token)) {
+                _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"invalid telegram bot token\"}";
+                return;
+            }
+            tg_bot_token = normalized_tenant_bot_token;
 
             if (tg_webhook_secret_token.len == 0) {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
@@ -4297,6 +4324,13 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
 
         const msg_text = jsonStringField(b, "text");
         const chat_id = telegramChatId(ctx.req_allocator, b);
+        if (chat_id) |cid| {
+            log.info("telegram inbound received user={s} chat_id={d} text_present={s}", .{
+                if (scoped_user_id) |uid| uid else "unknown",
+                cid,
+                if (msg_text != null) "true" else "false",
+            });
+        }
         const tg_authorized = telegramSenderAllowed(ctx.req_allocator, tg_allow_from, b);
         if (!tg_authorized) {
             _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
@@ -4352,8 +4386,21 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         .chat_id = cid_str,
                     },
                 ) catch |err| blk: {
-                    if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch |send_err| {
+                    if (tenant_user_ctx) |*send_user_ctx| {
+                        const send_token = resolveTenantTelegramBotTokenForSend(ctx.req_allocator, send_user_ctx) catch |token_err| {
+                            log.warn("telegram tenant token resolve before error-reply failed: {}", .{token_err});
+                            break :blk null;
+                        };
+                        defer if (send_token.len > 0) ctx.req_allocator.free(send_token);
+                        const tg_colon_idx = std.mem.indexOfScalar(u8, send_token, ':');
+                        const tg_colon_pos: i64 = if (tg_colon_idx) |idx| @intCast(idx) else -1;
+                        log.info("telegram reply attempt user={s} chat_id={d} token_len={d} token_colon_pos={d}", .{
+                            scoped_user_id.?,
+                            chat_id.?,
+                            send_token.len,
+                            tg_colon_pos,
+                        });
+                        sendTelegramReply(ctx.req_allocator, send_token, chat_id.?, userFacingAgentError(err)) catch |send_err| {
                             log.warn("telegram webhook error-reply send failed: {}", .{send_err});
                         };
                     }
@@ -4361,10 +4408,30 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 };
                 if (reply) |r| {
                     defer ctx.root_allocator.free(r);
-                    if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch |send_err| {
-                            log.warn("telegram webhook reply send failed: {}", .{send_err});
+                    if (tenant_user_ctx) |*send_user_ctx| {
+                        const send_token_opt: ?[]const u8 = blk: {
+                            const send_token = resolveTenantTelegramBotTokenForSend(ctx.req_allocator, send_user_ctx) catch |token_err| {
+                                log.warn("telegram tenant token resolve before reply failed: {}", .{token_err});
+                                break :blk null;
+                            };
+                            break :blk send_token;
                         };
+                        if (send_token_opt) |send_token| {
+                            defer if (send_token.len > 0) ctx.req_allocator.free(send_token);
+                            const tg_colon_idx = std.mem.indexOfScalar(u8, send_token, ':');
+                            const tg_colon_pos: i64 = if (tg_colon_idx) |idx| @intCast(idx) else -1;
+                            log.info("telegram reply attempt user={s} chat_id={d} token_len={d} token_colon_pos={d}", .{
+                                scoped_user_id.?,
+                                chat_id.?,
+                                send_token.len,
+                                tg_colon_pos,
+                            });
+                            sendTelegramReply(ctx.req_allocator, send_token, chat_id.?, r) catch |send_err| {
+                                log.warn("telegram webhook reply send failed: {}", .{send_err});
+                            };
+                        } else {
+                            ctx.response_body = "{\"status\":\"received\"}";
+                        }
                     }
                     ctx.response_body = "{\"status\":\"ok\"}";
                 } else {
@@ -6082,6 +6149,22 @@ test "parseTelegramUserState rejects invalid account_id" {
 test "normalizeTelegramSecretToken trims whitespace and quotes" {
     try std.testing.expectEqualStrings("abc123", normalizeTelegramSecretToken("  \"abc123\" \r\n"));
     try std.testing.expectEqualStrings("", normalizeTelegramSecretToken(" \t\r\n\"\""));
+}
+
+test "normalizeTelegramBotToken trims wrapping quotes" {
+    try std.testing.expectEqualStrings("123:ABC_def-ghi", normalizeTelegramBotToken("  \"123:ABC_def-ghi\"  "));
+    try std.testing.expectEqualStrings("123:ABC_def-ghi", normalizeTelegramBotToken("  '123:ABC_def-ghi'  "));
+}
+
+test "isLikelyTelegramBotToken accepts quoted valid token and rejects json blob" {
+    try std.testing.expect(isLikelyTelegramBotToken(" \"123456789:AAABBBccc___---\" "));
+    try std.testing.expect(!isLikelyTelegramBotToken("{\"key\":\"telegram_bot_token\",\"value\":\"123:ABC\"}"));
+}
+
+test "normalizeTelegramBotToken extracts valid token from wrapped blob" {
+    const wrapped = "{\"key\":\"telegram_bot_token\",\"value\":\"123456789:AAABBBccc___---\"}";
+    try std.testing.expectEqualStrings("123456789:AAABBBccc___---", normalizeTelegramBotToken(wrapped));
+    try std.testing.expect(isLikelyTelegramBotToken(wrapped));
 }
 
 test "readTrimmedSecretFile trims trailing whitespace" {
