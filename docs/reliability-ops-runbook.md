@@ -68,6 +68,27 @@ Expected:
 - high-rate bursts blocked (`blocked_rate`)
 - counters and events visible in `/internal/diagnostics`
 
+### 5. Validate heartbeat bridge + wake hook
+Queue an immediate heartbeat run:
+```bash
+curl -s -X POST \
+  -H "X-Internal-Token: <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"1","reason":"manual_dev_check"}' \
+  http://127.0.0.1:3000/internal/wake-heartbeat | jq .
+```
+
+Check diagnostics:
+```bash
+curl -s \
+  -H "X-Internal-Token: <TOKEN>" \
+  http://127.0.0.1:3000/internal/diagnostics | jq '.heartbeat_wake, .ops.recent_events[0:10]'
+```
+
+Expected:
+- `heartbeat_wake.pending` drains back to `0`
+- recent ops events include `source="heartbeat"` with `sent` or explicit block/error reason
+
 ## Prod Checks
 
 ### 1. Health + readiness

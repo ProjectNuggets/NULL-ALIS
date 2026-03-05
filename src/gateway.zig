@@ -33,6 +33,7 @@ const onboard = @import("onboard.zig");
 const zaki_state_mod = @import("zaki_state.zig");
 const zaki_session = @import("zaki_session.zig");
 const ops_guard = @import("ops_guard.zig");
+const heartbeat_wake = @import("heartbeat_wake.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -2634,6 +2635,13 @@ fn internalDiagnosticsPayload(allocator: std.mem.Allocator, state: *const Gatewa
     try json_util.appendJsonKeyValue(&buf, allocator, "webhook_mode", state.webhook_mode);
     try buf.appendSlice(allocator, "},");
 
+    try json_util.appendJsonKey(&buf, allocator, "heartbeat_wake");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "pending", @intCast(heartbeat_wake.pendingCount()));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "dropped_total", @intCast(heartbeat_wake.droppedCount()));
+    try buf.appendSlice(allocator, "},");
+
     try json_util.appendJsonKey(&buf, allocator, "ops");
     try buf.appendSlice(allocator, ops_json);
     try buf.appendSlice(allocator, "}");
@@ -4769,7 +4777,7 @@ fn handleAcceptedConnection(
     defer _ = state.in_flight_requests.fetchSub(1, .acq_rel);
 
     // Simple routing — control endpoints + descriptor-driven channel webhooks + ZAKI API.
-    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, drain, undrain, shutdown };
+    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, drain, undrain, shutdown };
     const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
         .{ "/health", .health },
         .{ "/ready", .ready },
@@ -4777,6 +4785,7 @@ fn handleAcceptedConnection(
         .{ "/pair", .pair },
         .{ "/metrics", .metrics },
         .{ "/internal/diagnostics", .diagnostics },
+        .{ "/internal/wake-heartbeat", .wake_heartbeat },
         .{ "/internal/drain", .drain },
         .{ "/internal/undrain", .undrain },
         .{ "/internal/shutdown", .shutdown },
@@ -5002,6 +5011,43 @@ fn handleAcceptedConnection(
                 response_body = "{\"error\":\"unauthorized\"}";
             } else {
                 response_body = internalDiagnosticsPayload(req_allocator, state) catch "{\"error\":\"diagnostics unavailable\"}";
+            }
+        },
+        .wake_heartbeat => {
+            if (!std.mem.eql(u8, method_str, "POST")) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (!validateInternalServiceToken(raw, state.internal_service_tokens)) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                const body = extractBody(raw);
+                const user_id_from_header = extractHeader(raw, "X-Zaki-User-Id");
+                var user_id_owned: ?[]u8 = null;
+                defer if (user_id_owned) |value| req_allocator.free(value);
+                const user_id = blk: {
+                    if (body) |b| {
+                        if (jsonStringField(b, "user_id")) |value| break :blk value;
+                        if (jsonIntField(b, "user_id")) |value| {
+                            user_id_owned = std.fmt.allocPrint(req_allocator, "{d}", .{value}) catch null;
+                            break :blk user_id_owned;
+                        }
+                    }
+                    break :blk user_id_from_header;
+                };
+
+                const reason = if (body) |b| jsonStringField(b, "reason") orelse "internal_wake_hook" else "internal_wake_hook";
+                heartbeat_wake.enqueue(user_id, reason) catch {
+                    response_status = "500 Internal Server Error";
+                    response_body = "{\"error\":\"wake enqueue failed\"}";
+                    sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+                    return;
+                };
+
+                response_body = if (user_id) |uid|
+                    std.fmt.allocPrint(req_allocator, "{{\"status\":\"queued\",\"user_id\":\"{s}\"}}", .{uid}) catch "{\"status\":\"queued\"}"
+                else
+                    "{\"status\":\"queued\",\"scope\":\"all\"}";
             }
         },
         .drain => {
