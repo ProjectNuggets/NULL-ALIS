@@ -2569,7 +2569,6 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
         log.warn("telegram sendMessage api returned non-ok; retrying via curl fallback", .{});
         return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
     }
-    log.info("telegram send ok chat_id={d} text_len={d}", .{ chat_id, text.len });
 }
 
 fn sendTelegramReplyViaCurlFallback(allocator: std.mem.Allocator, bot_token: []const u8, body: []const u8) !void {
@@ -4237,16 +4236,12 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     return;
                 };
                 defer ctx.req_allocator.free(secret_path);
-                const file_token = readTrimmedSecretFile(ctx.req_allocator, secret_path) catch {
+                break :blk readTrimmedSecretFile(ctx.req_allocator, secret_path) catch {
                     _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                     ctx.response_status = "500 Internal Server Error";
                     ctx.response_body = "{\"error\":\"failed reading bot token\"}";
                     return;
                 };
-                const raw_colon_idx = std.mem.indexOfScalar(u8, file_token, ':');
-                const raw_colon_pos: i64 = if (raw_colon_idx) |idx| @intCast(idx) else -1;
-                log.info("telegram token source=file path={s} len={d} colon_pos={d}", .{ secret_path, file_token.len, raw_colon_pos });
-                break :blk file_token;
             };
             defer if (ctx.state.zaki_state != null and tenant_bot_token.len > 0) ctx.req_allocator.free(tenant_bot_token);
             if (tenant_bot_token.len == 0) {
@@ -4324,13 +4319,6 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
 
         const msg_text = jsonStringField(b, "text");
         const chat_id = telegramChatId(ctx.req_allocator, b);
-        if (chat_id) |cid| {
-            log.info("telegram inbound received user={s} chat_id={d} text_present={s}", .{
-                if (scoped_user_id) |uid| uid else "unknown",
-                cid,
-                if (msg_text != null) "true" else "false",
-            });
-        }
         const tg_authorized = telegramSenderAllowed(ctx.req_allocator, tg_allow_from, b);
         if (!tg_authorized) {
             _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
@@ -4392,14 +4380,6 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                             break :blk null;
                         };
                         defer if (send_token.len > 0) ctx.req_allocator.free(send_token);
-                        const tg_colon_idx = std.mem.indexOfScalar(u8, send_token, ':');
-                        const tg_colon_pos: i64 = if (tg_colon_idx) |idx| @intCast(idx) else -1;
-                        log.info("telegram reply attempt user={s} chat_id={d} token_len={d} token_colon_pos={d}", .{
-                            scoped_user_id.?,
-                            chat_id.?,
-                            send_token.len,
-                            tg_colon_pos,
-                        });
                         sendTelegramReply(ctx.req_allocator, send_token, chat_id.?, userFacingAgentError(err)) catch |send_err| {
                             log.warn("telegram webhook error-reply send failed: {}", .{send_err});
                         };
@@ -4418,14 +4398,6 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         };
                         if (send_token_opt) |send_token| {
                             defer if (send_token.len > 0) ctx.req_allocator.free(send_token);
-                            const tg_colon_idx = std.mem.indexOfScalar(u8, send_token, ':');
-                            const tg_colon_pos: i64 = if (tg_colon_idx) |idx| @intCast(idx) else -1;
-                            log.info("telegram reply attempt user={s} chat_id={d} token_len={d} token_colon_pos={d}", .{
-                                scoped_user_id.?,
-                                chat_id.?,
-                                send_token.len,
-                                tg_colon_pos,
-                            });
                             sendTelegramReply(ctx.req_allocator, send_token, chat_id.?, r) catch |send_err| {
                                 log.warn("telegram webhook reply send failed: {}", .{send_err});
                             };
