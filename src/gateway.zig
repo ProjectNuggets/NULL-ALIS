@@ -4213,19 +4213,9 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     ctx.response_body = "{\"error\":\"tenant config missing\"}";
                     return;
                 };
-                if (enqueueTenantTelegramAsync(
-                    ctx.state,
-                    cfg,
-                    scoped_user_id.?,
-                    tg_account_id,
-                    tg_bot_token,
-                    chat_id.?,
-                    msg_text.?,
-                )) {
-                    ctx.response_body = "{\"status\":\"accepted\"}";
-                    return;
-                }
-                log.warn("tenant telegram async enqueue failed; falling back to synchronous processing", .{});
+                // Keep tenant Telegram webhook handling synchronous for deterministic
+                // delivery. Async queueing can acknowledge webhooks while worker-side
+                // failures silently drop replies.
 
                 var kb: [256]u8 = undefined;
                 const sk = zaki_session.userMainSessionKey(&kb, scoped_user_id.?);
