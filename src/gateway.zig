@@ -356,11 +356,16 @@ pub const GatewayState = struct {
     state_backend_effective: []const u8 = "file",
     scheduler_backend: []const u8 = "file",
     webhook_mode: []const u8 = "none",
+    heartbeat_enabled: bool = false,
+    heartbeat_interval_minutes: u32 = 0,
+    tenant_enabled_configured: bool = false,
     postgres_port: u16 = 0,
     postgres_host_buf: [64]u8 = [_]u8{0} ** 64,
     postgres_host_len: usize = 0,
     postgres_schema_buf: [64]u8 = [_]u8{0} ** 64,
     postgres_schema_len: usize = 0,
+    config_path_buf: [160]u8 = [_]u8{0} ** 160,
+    config_path_len: usize = 0,
     state_degraded: bool = false,
     state_degraded_reason_buf: [64]u8 = [_]u8{0} ** 64,
     state_degraded_reason_len: usize = 0,
@@ -422,6 +427,10 @@ pub const GatewayState = struct {
 
     fn degradedReason(self: *const GatewayState) []const u8 {
         return self.state_degraded_reason_buf[0..self.state_degraded_reason_len];
+    }
+
+    fn configPath(self: *const GatewayState) []const u8 {
+        return self.config_path_buf[0..self.config_path_len];
     }
 };
 
@@ -1550,6 +1559,10 @@ fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init
     state.state_backend_effective = if (state.zaki_state != null) "postgres" else "file";
     state.scheduler_backend = if (state.zaki_state != null and cfg.tenant.enabled) "postgres" else "file";
     state.webhook_mode = detectWebhookMode(cfg);
+    state.heartbeat_enabled = cfg.heartbeat.enabled;
+    state.heartbeat_interval_minutes = cfg.heartbeat.interval_minutes;
+    state.tenant_enabled_configured = cfg.tenant.enabled;
+    state.config_path_len = copyIntoBuf(&state.config_path_buf, cfg.config_path);
     state.postgres_host_len = 0;
     state.postgres_port = 0;
     state.postgres_schema_len = copyIntoBuf(&state.postgres_schema_buf, cfg.state.postgres.schema);
@@ -1570,8 +1583,12 @@ fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init
 
 fn logStartupSelfCheck(state: *const GatewayState) void {
     log.info(
-        "startup.self_check state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} webhook_mode={s}",
+        "startup.self_check config_path={s} tenant_enabled={s} heartbeat_enabled={s} heartbeat_interval_minutes={d} state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} webhook_mode={s}",
         .{
+            state.configPath(),
+            if (state.tenant_enabled_configured) "true" else "false",
+            if (state.heartbeat_enabled) "true" else "false",
+            state.heartbeat_interval_minutes,
             state.state_backend_configured,
             state.state_backend_effective,
             if (state.state_degraded) "true" else "false",
@@ -2615,9 +2632,19 @@ fn internalDiagnosticsPayload(allocator: std.mem.Allocator, state: *const Gatewa
 
     try json_util.appendJsonKey(&buf, allocator, "startup_self_check");
     try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(&buf, allocator, "config_path", state.configPath());
+    try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_configured", state.state_backend_configured);
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_effective", state.state_backend_effective);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "heartbeat_enabled");
+    try buf.appendSlice(allocator, if (state.heartbeat_enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "heartbeat_interval_minutes", state.heartbeat_interval_minutes);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "tenant_enabled");
+    try buf.appendSlice(allocator, if (state.tenant_enabled_configured) "true" else "false");
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(&buf, allocator, "degraded");
     try buf.appendSlice(allocator, if (state.state_degraded) "true" else "false");
@@ -2640,6 +2667,8 @@ fn internalDiagnosticsPayload(allocator: std.mem.Allocator, state: *const Gatewa
     try json_util.appendJsonInt(&buf, allocator, "pending", @intCast(heartbeat_wake.pendingCount()));
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "dropped_total", @intCast(heartbeat_wake.droppedCount()));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "coalesced_total", @intCast(heartbeat_wake.coalescedCount()));
     try buf.appendSlice(allocator, "},");
 
     try json_util.appendJsonKey(&buf, allocator, "ops");

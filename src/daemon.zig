@@ -189,7 +189,9 @@ fn sendGatewayControlCommand(host: []const u8, port: u16, path: []const u8, inte
 const HEARTBEAT_PROMPT_DEFAULT =
     "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.";
 const HEARTBEAT_RUNTIME_FILENAME = "heartbeat_runtime.json";
+const CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX = "cron.next_heartbeat:";
 const HEARTBEAT_SWEEP_INTERVAL_SECS: i64 = 30;
+const HEARTBEAT_WAKE_MAX_DRAIN_PER_TICK: usize = 4;
 
 const UserHeartbeatConfig = struct {
     enabled: bool,
@@ -320,6 +322,27 @@ fn loadHeartbeatStateJson(
 
 fn parseNumericUserIdFromDirName(name: []const u8) ?i64 {
     return std.fmt.parseInt(i64, name, 10) catch null;
+}
+
+fn countEnabledUserHeartbeatConfigsByFile(
+    allocator: std.mem.Allocator,
+    tenant_data_root: []const u8,
+) usize {
+    var users_dir = std.fs.openDirAbsolute(tenant_data_root, .{ .iterate = true }) catch return 0;
+    defer users_dir.close();
+
+    var enabled_count: usize = 0;
+    var iter = users_dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .directory or entry.name.len == 0) continue;
+        const user_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tenant_data_root, entry.name }) catch continue;
+        defer allocator.free(user_root);
+
+        var hb_cfg = loadUserHeartbeatConfig(allocator, user_root, false, 30, null);
+        defer hb_cfg.deinit(allocator);
+        if (hb_cfg.enabled) enabled_count += 1;
+    }
+    return enabled_count;
 }
 
 fn heartbeatRuntimePath(allocator: std.mem.Allocator, user_root: []const u8) ![]u8 {
@@ -733,14 +756,21 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
             health.markComponentOk("heartbeat");
         }
 
-        while (heartbeat_wake.dequeue()) |req| {
+        var wake_processed: usize = 0;
+        while (wake_processed < HEARTBEAT_WAKE_MAX_DRAIN_PER_TICK) : (wake_processed += 1) {
+            const req = heartbeat_wake.dequeue() orelse break;
             defer {
                 var mut_req = req;
                 mut_req.deinit();
             }
             if (!config.tenant.enabled) continue;
             const owner_id = owner_instance_id orelse continue;
-            runTenantHeartbeatSweep(allocator, config, owner_id, req.user_id, req.reason, true, pg_mgr);
+            const forced = !std.mem.startsWith(u8, req.reason, CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX);
+            runTenantHeartbeatSweep(allocator, config, owner_id, req.user_id, req.reason, forced, pg_mgr);
+        }
+        const wake_pending = heartbeat_wake.pendingCount();
+        if (wake_pending > 0) {
+            log.debug("heartbeat wake backlog pending={d} processed_this_tick={d}", .{ wake_pending, wake_processed });
         }
 
         if (config.tenant.enabled and owner_instance_id != null) {
@@ -814,6 +844,19 @@ fn runCronAgentTurn(
 
     var runtime = try channel_loop.ChannelRuntime.init(allocator, &runtime_cfg, null);
     defer runtime.deinit();
+
+    if (job.session_target == .main and job.wake_mode == .next_heartbeat) {
+        if (scheduler.context_user_id) |user_id| {
+            const reason = try std.fmt.allocPrint(
+                allocator,
+                "{s}{s}",
+                .{ CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX, job.id },
+            );
+            defer allocator.free(reason);
+            try heartbeat_wake.enqueue(user_id, reason);
+            return allocator.dupe(u8, "");
+        }
+    }
 
     var session_buf: [256]u8 = undefined;
     const session_key = blk: {
@@ -1505,6 +1548,14 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     if (config.heartbeat.enabled) {
         state.addComponent("heartbeat");
+    } else if (config.tenant.enabled) {
+        const enabled_user_heartbeat_configs = countEnabledUserHeartbeatConfigsByFile(allocator, config.tenant.data_root);
+        if (enabled_user_heartbeat_configs > 0) {
+            log.warn(
+                "heartbeat disabled globally (agents.defaults.heartbeat.enabled=false); detected {d} user heartbeat configs enabled; no heartbeat polling will run until global heartbeat is enabled",
+                .{enabled_user_heartbeat_configs},
+            );
+        }
     }
 
     state.addComponent("scheduler");
@@ -2488,6 +2539,39 @@ test "parseHeartbeatEveryToMinutes parses common units" {
     try std.testing.expectEqual(@as(?u32, 120), parseHeartbeatEveryToMinutes("2h"));
     try std.testing.expectEqual(@as(?u32, 1), parseHeartbeatEveryToMinutes("45s"));
     try std.testing.expectEqual(@as(?u32, null), parseHeartbeatEveryToMinutes("invalid"));
+}
+
+test "countEnabledUserHeartbeatConfigsByFile counts enabled per-user heartbeat files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("1");
+    try tmp.dir.makePath("2");
+    try tmp.dir.makePath("3");
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    const user1_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/1/heartbeat.json", .{root});
+    defer std.testing.allocator.free(user1_path);
+    const user1_file = try std.fs.createFileAbsolute(user1_path, .{});
+    defer user1_file.close();
+    try user1_file.writeAll("{\"enabled\":true,\"every\":\"30m\"}\n");
+
+    const user2_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/2/heartbeat.json", .{root});
+    defer std.testing.allocator.free(user2_path);
+    const user2_file = try std.fs.createFileAbsolute(user2_path, .{});
+    defer user2_file.close();
+    try user2_file.writeAll("{\"enabled\":false,\"every\":\"30m\"}\n");
+
+    const user3_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/3/heartbeat.json", .{root});
+    defer std.testing.allocator.free(user3_path);
+    const user3_file = try std.fs.createFileAbsolute(user3_path, .{});
+    defer user3_file.close();
+    try user3_file.writeAll("{}\n");
+
+    const enabled_count = countEnabledUserHeartbeatConfigsByFile(std.testing.allocator, root);
+    try std.testing.expectEqual(@as(usize, 1), enabled_count);
 }
 
 test "loadUserHeartbeatConfig state json overrides file config" {

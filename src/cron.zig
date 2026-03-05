@@ -50,6 +50,23 @@ pub const SessionTarget = enum {
     }
 };
 
+pub const WakeMode = enum {
+    now,
+    next_heartbeat,
+
+    pub fn asStr(self: WakeMode) []const u8 {
+        return switch (self) {
+            .now => "now",
+            .next_heartbeat => "next_heartbeat",
+        };
+    }
+
+    pub fn parse(raw: []const u8) WakeMode {
+        if (std.ascii.eqlIgnoreCase(raw, "next_heartbeat")) return .next_heartbeat;
+        return .now;
+    }
+};
+
 pub const ScheduleKind = enum { cron, at, every };
 
 pub const Schedule = union(ScheduleKind) {
@@ -120,6 +137,7 @@ pub const CronJob = struct {
     one_shot: bool = false,
     job_type: JobType = .shell,
     session_target: SessionTarget = .isolated,
+    wake_mode: WakeMode = .now,
     prompt: ?[]const u8 = null,
     prompt_owned: bool = false,
     name: ?[]const u8 = null,
@@ -1048,6 +1066,12 @@ fn appendJobFromJsonObjectWithPolicy(scheduler: *CronScheduler, obj: std.json.Ob
         }
         break :blk SessionTarget.isolated;
     };
+    const wake_mode = blk: {
+        if (obj.get("wake_mode")) |v| {
+            if (v == .string) break :blk WakeMode.parse(v.string);
+        }
+        break :blk WakeMode.now;
+    };
     const enabled = blk: {
         if (obj.get("enabled")) |v| {
             if (v == .bool) break :blk v.bool;
@@ -1185,6 +1209,7 @@ fn appendJobFromJsonObjectWithPolicy(scheduler: *CronScheduler, obj: std.json.Ob
         .one_shot = one_shot,
         .job_type = job_type,
         .session_target = session_target,
+        .wake_mode = wake_mode,
         .prompt = prompt,
         .prompt_owned = prompt != null,
         .name = name,
@@ -1253,6 +1278,8 @@ fn appendJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator,
     try json_util.appendJsonKeyValue(buf, allocator, "job_type", job.job_type.asStr());
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(buf, allocator, "session_target", job.session_target.asStr());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "wake_mode", job.wake_mode.asStr());
     try buf.appendSlice(allocator, ",");
     try appendNullableJsonStringField(buf, allocator, "prompt", job.prompt);
     try buf.appendSlice(allocator, ",");
@@ -2310,6 +2337,7 @@ test "save and load preserves extended cron fields" {
     _ = try scheduler.addJob("*/5 * * * *", "echo extended");
     scheduler.jobs.items[0].job_type = .agent;
     scheduler.jobs.items[0].session_target = .main;
+    scheduler.jobs.items[0].wake_mode = .next_heartbeat;
     scheduler.jobs.items[0].prompt = try std.testing.allocator.dupe(u8, "daily summary");
     scheduler.jobs.items[0].prompt_owned = true;
     scheduler.jobs.items[0].name = try std.testing.allocator.dupe(u8, "Daily Summary");
@@ -2337,6 +2365,7 @@ test "save and load preserves extended cron fields" {
     const job = loaded.listJobs()[0];
     try std.testing.expectEqual(JobType.agent, job.job_type);
     try std.testing.expectEqual(SessionTarget.main, job.session_target);
+    try std.testing.expectEqual(WakeMode.next_heartbeat, job.wake_mode);
     try std.testing.expectEqualStrings("daily summary", job.prompt.?);
     try std.testing.expectEqualStrings("Daily Summary", job.name.?);
     try std.testing.expectEqualStrings("openai/gpt-4.1", job.model.?);
@@ -2390,12 +2419,14 @@ test "CronJob has new fields" {
         .command = "echo hi",
         .job_type = .agent,
         .session_target = .main,
+        .wake_mode = .next_heartbeat,
         .enabled = true,
         .delete_after_run = false,
         .created_at_s = 1000000,
     };
     try std.testing.expectEqual(JobType.agent, job.job_type);
     try std.testing.expectEqual(SessionTarget.main, job.session_target);
+    try std.testing.expectEqual(WakeMode.next_heartbeat, job.wake_mode);
     try std.testing.expect(job.enabled);
     try std.testing.expectEqual(@as(i64, 1000000), job.created_at_s);
 }
@@ -2907,6 +2938,7 @@ test "job json roundtrip preserves agent delivery fields" {
     const job = try scheduler.addOnce("5m", "message \"hello\"");
     job.job_type = .agent;
     job.session_target = .main;
+    job.wake_mode = .next_heartbeat;
     job.prompt = try allocator.dupe(u8, "remind me");
     job.prompt_owned = true;
     job.name = try allocator.dupe(u8, "Reminder");
@@ -2935,6 +2967,7 @@ test "job json roundtrip preserves agent delivery fields" {
     const restored = loaded.jobs.items[0];
     try std.testing.expectEqual(JobType.agent, restored.job_type);
     try std.testing.expectEqual(SessionTarget.main, restored.session_target);
+    try std.testing.expectEqual(WakeMode.next_heartbeat, restored.wake_mode);
     try std.testing.expect(restored.delete_after_run);
     try std.testing.expect(restored.one_shot);
     try std.testing.expect(restored.enabled);
@@ -2945,6 +2978,14 @@ test "job json roundtrip preserves agent delivery fields" {
     try std.testing.expectEqualStrings("remind me", restored.prompt.?);
     try std.testing.expectEqualStrings("Reminder", restored.name.?);
     try std.testing.expectEqualStrings("openrouter/moonshotai/kimi-k2.5", restored.model.?);
+}
+
+test "WakeMode parse and asStr" {
+    try std.testing.expectEqual(WakeMode.now, WakeMode.parse("now"));
+    try std.testing.expectEqual(WakeMode.next_heartbeat, WakeMode.parse("next_heartbeat"));
+    try std.testing.expectEqual(WakeMode.next_heartbeat, WakeMode.parse("NEXT_HEARTBEAT"));
+    try std.testing.expectEqualStrings("now", WakeMode.now.asStr());
+    try std.testing.expectEqualStrings("next_heartbeat", WakeMode.next_heartbeat.asStr());
 }
 
 test "loadTelegramChatIdFromChannelState reads tenant channel state" {

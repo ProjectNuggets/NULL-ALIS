@@ -22,6 +22,7 @@ const WakeQueue = struct {
     head: usize = 0,
     len: usize = 0,
     dropped_total: u64 = 0,
+    coalesced_total: u64 = 0,
     items: [MAX_QUEUE]WakeRequest = [_]WakeRequest{.{
         .reason = "",
         .requested_at_s = 0,
@@ -48,6 +49,12 @@ fn dropOldestLocked() void {
     g_queue.dropped_total += 1;
 }
 
+fn wakeTargetsEqual(a: WakeRequest, b_user_id: ?[]const u8) bool {
+    if (a.user_id == null and b_user_id == null) return true;
+    if (a.user_id == null or b_user_id == null) return false;
+    return std.mem.eql(u8, a.user_id.?, b_user_id.?);
+}
+
 pub fn enqueue(user_id_opt: ?[]const u8, reason: []const u8) !void {
     const reason_owned = try std.heap.c_allocator.dupe(u8, reason);
     errdefer std.heap.c_allocator.free(reason_owned);
@@ -59,6 +66,18 @@ pub fn enqueue(user_id_opt: ?[]const u8, reason: []const u8) !void {
 
     g_queue.mutex.lock();
     defer g_queue.mutex.unlock();
+
+    var i: usize = 0;
+    while (i < g_queue.len) : (i += 1) {
+        const idx = queueIndex(i);
+        if (!wakeTargetsEqual(g_queue.items[idx], user_id_owned)) continue;
+        std.heap.c_allocator.free(g_queue.items[idx].reason);
+        g_queue.items[idx].reason = reason_owned;
+        g_queue.items[idx].requested_at_s = std.time.timestamp();
+        if (user_id_owned) |value| std.heap.c_allocator.free(value);
+        g_queue.coalesced_total += 1;
+        return;
+    }
 
     if (g_queue.len >= MAX_QUEUE) {
         dropOldestLocked();
@@ -102,12 +121,24 @@ pub fn droppedCount() u64 {
     return g_queue.dropped_total;
 }
 
+pub fn coalescedCount() u64 {
+    g_queue.mutex.lock();
+    defer g_queue.mutex.unlock();
+    return g_queue.coalesced_total;
+}
+
 pub fn clearForTest() void {
     if (!@import("builtin").is_test) return;
     while (dequeue()) |req| {
         var mutable_req = req;
         mutable_req.deinit();
     }
+    g_queue.mutex.lock();
+    defer g_queue.mutex.unlock();
+    g_queue.head = 0;
+    g_queue.len = 0;
+    g_queue.dropped_total = 0;
+    g_queue.coalesced_total = 0;
 }
 
 test "heartbeat wake queue enqueue and dequeue preserves order" {
@@ -133,4 +164,28 @@ test "heartbeat wake queue supports broadcast wake request" {
     defer req.deinit();
     try std.testing.expect(req.user_id == null);
     try std.testing.expectEqualStrings("wake-all", req.reason);
+}
+
+test "heartbeat wake queue coalesces duplicate user wake requests" {
+    clearForTest();
+    try enqueue("42", "first");
+    try enqueue("42", "second");
+    try std.testing.expectEqual(@as(usize, 1), pendingCount());
+    try std.testing.expectEqual(@as(u64, 1), coalescedCount());
+    var req = dequeue().?;
+    defer req.deinit();
+    try std.testing.expectEqualStrings("42", req.user_id.?);
+    try std.testing.expectEqualStrings("second", req.reason);
+}
+
+test "heartbeat wake queue coalesces duplicate broadcast wake requests" {
+    clearForTest();
+    try enqueue(null, "wake-a");
+    try enqueue(null, "wake-b");
+    try std.testing.expectEqual(@as(usize, 1), pendingCount());
+    try std.testing.expectEqual(@as(u64, 1), coalescedCount());
+    var req = dequeue().?;
+    defer req.deinit();
+    try std.testing.expect(req.user_id == null);
+    try std.testing.expectEqualStrings("wake-b", req.reason);
 }
