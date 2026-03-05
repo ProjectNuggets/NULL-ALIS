@@ -858,6 +858,19 @@ fn runCronAgentTurn(
     const cfg_ptr = ctx orelse return error.InvalidArgument;
     const cfg: *const Config = @ptrCast(@alignCast(cfg_ptr));
 
+    if (job.session_target == .main and job.wake_mode == .next_heartbeat) {
+        if (scheduler.context_user_id) |user_id| {
+            const reason = try std.fmt.allocPrint(
+                allocator,
+                "{s}{s}",
+                .{ CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX, job.id },
+            );
+            defer allocator.free(reason);
+            try heartbeat_wake.enqueue(user_id, reason);
+            return allocator.dupe(u8, "");
+        }
+    }
+
     var runtime_cfg = cfg.*;
     if (scheduler.context_workspace) |workspace| {
         runtime_cfg.workspace_dir = workspace;
@@ -871,19 +884,6 @@ fn runCronAgentTurn(
 
     var runtime = try channel_loop.ChannelRuntime.init(allocator, &runtime_cfg, null);
     defer runtime.deinit();
-
-    if (job.session_target == .main and job.wake_mode == .next_heartbeat) {
-        if (scheduler.context_user_id) |user_id| {
-            const reason = try std.fmt.allocPrint(
-                allocator,
-                "{s}{s}",
-                .{ CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX, job.id },
-            );
-            defer allocator.free(reason);
-            try heartbeat_wake.enqueue(user_id, reason);
-            return allocator.dupe(u8, "");
-        }
-    }
 
     var session_buf: [256]u8 = undefined;
     const session_key = blk: {
@@ -2667,6 +2667,40 @@ test "isHeartbeatAck recognizes ack-only variants" {
     try std.testing.expect(isHeartbeatAck("<b>HEARTBEAT_OK</b> 🦞"));
     try std.testing.expect(!isHeartbeatAck("HEARTBEAT_OK send a detailed report"));
     try std.testing.expect(!isHeartbeatAck("Morning brief delivered"));
+}
+
+test "runCronAgentTurn defers main session next_heartbeat jobs" {
+    heartbeat_wake.clearForTest();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 4, true);
+    defer scheduler.deinit();
+    try scheduler.setExecutionContext("77", null, "/tmp");
+
+    const job = cron.CronJob{
+        .id = "job-heartbeat",
+        .expression = "* * * * *",
+        .command = "noop",
+        .job_type = .agent,
+        .session_target = .main,
+        .wake_mode = .next_heartbeat,
+    };
+
+    const output = try runCronAgentTurn(@ptrCast(@constCast(&cfg)), std.testing.allocator, &scheduler, &job, "ignored");
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("", output);
+    try std.testing.expectEqual(@as(usize, 1), heartbeat_wake.pendingCount());
+
+    var req = heartbeat_wake.dequeue() orelse return error.TestUnexpectedResult;
+    defer req.deinit();
+    try std.testing.expect(req.user_id != null);
+    try std.testing.expectEqualStrings("77", req.user_id.?);
+    try std.testing.expect(std.mem.startsWith(u8, req.reason, CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX));
 }
 
 test "heartbeatActionableReplySlice suppresses ack-only output" {
