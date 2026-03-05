@@ -304,7 +304,7 @@ const ManagerImpl = struct {
             "CREATE EXTENSION IF NOT EXISTS pgcrypto",
             "CREATE EXTENSION IF NOT EXISTS vector",
             \\CREATE TABLE IF NOT EXISTS {schema}.users (
-            \\    user_id BIGINT PRIMARY KEY REFERENCES public.zaki_users(id) ON DELETE CASCADE,
+            \\    user_id BIGINT PRIMARY KEY,
             \\    workspace_path TEXT NOT NULL,
             \\    agent_name TEXT,
             \\    onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE,
@@ -314,6 +314,7 @@ const ManagerImpl = struct {
             \\    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             \\)
             ,
+            "ALTER TABLE {schema}.users ADD CONSTRAINT users_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.zaki_users(id) ON DELETE CASCADE",
             \\CREATE TABLE IF NOT EXISTS {schema}.user_config (
             \\    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
             \\    config JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -483,12 +484,8 @@ const ManagerImpl = struct {
         for (statements) |template| {
             const query = try self.buildQuery(template);
             defer self.allocator.free(query);
-            const conn = try self.currentConn();
-            const result = self.exec(query) catch |err| {
-                if (canIgnoreMigrateError(template, c.PQerrorMessage(conn))) continue;
-                return err;
-            };
-            c.PQclear(result);
+            const result = try self.execMigrateStatement(template, query);
+            if (result) |pg_result| c.PQclear(pg_result);
         }
     }
 
@@ -1377,6 +1374,26 @@ const ManagerImpl = struct {
         return result;
     }
 
+    fn execMigrateStatement(self: *Self, template: []const u8, query: []const u8) !?*c.PGresult {
+        const conn = try self.currentConn();
+        const query_z = try self.allocator.dupeZ(u8, query);
+        defer self.allocator.free(query_z);
+        const result = c.PQexec(conn, query_z) orelse return error.ExecFailed;
+        const status = c.PQresultStatus(result);
+        if (status == c.PGRES_COMMAND_OK or status == c.PGRES_TUPLES_OK) {
+            return result;
+        }
+
+        if (canIgnoreMigrateError(template, c.PQerrorMessage(conn))) {
+            c.PQclear(result);
+            return null;
+        }
+
+        log.err("postgres exec failed: {s}", .{c.PQerrorMessage(conn)});
+        c.PQclear(result);
+        return error.ExecFailed;
+    }
+
     fn execParams(self: *Self, query: []const u8, params: []const ?[*:0]const u8, lengths: []const c_int) !*c.PGresult {
         const conn = try self.currentConn();
         const query_z = try self.allocator.dupeZ(u8, query);
@@ -1511,11 +1528,29 @@ fn canIgnoreMigrateError(template: []const u8, raw_err: [*c]const u8) bool {
             std.mem.indexOf(u8, err_text, "already exists") != null;
     }
     if (std.mem.startsWith(u8, template, "CREATE EXTENSION IF NOT EXISTS")) {
-        return std.mem.indexOf(u8, err_text, "already exists") != null;
+        return std.mem.indexOf(u8, err_text, "already exists") != null or
+            std.mem.indexOf(u8, err_text, "pg_extension_name_index") != null or
+            std.mem.indexOf(u8, err_text, "duplicate key value violates unique constraint") != null;
     }
     if (std.mem.startsWith(u8, template, "CREATE INDEX IF NOT EXISTS")) {
         return std.mem.indexOf(u8, err_text, "already exists") != null or
             std.mem.indexOf(u8, err_text, "pg_class_relname_nsp_index") != null;
+    }
+    if (std.mem.startsWith(u8, template, "CREATE UNIQUE INDEX IF NOT EXISTS")) {
+        return std.mem.indexOf(u8, err_text, "already exists") != null or
+            std.mem.indexOf(u8, err_text, "pg_class_relname_nsp_index") != null;
+    }
+    if (std.mem.startsWith(u8, template, "CREATE TABLE IF NOT EXISTS")) {
+        return std.mem.indexOf(u8, err_text, "already exists") != null or
+            std.mem.indexOf(u8, err_text, "pg_type_typname_nsp_index") != null or
+            std.mem.indexOf(u8, err_text, "pg_class_relname_nsp_index") != null or
+            std.mem.indexOf(u8, err_text, "duplicate key value violates unique constraint") != null;
+    }
+    if (std.mem.startsWith(u8, template, "ALTER TABLE") and std.mem.indexOf(u8, template, "ADD CONSTRAINT users_user_id_fkey") != null) {
+        return std.mem.indexOf(u8, err_text, "already exists") != null or
+            std.mem.indexOf(u8, err_text, "duplicate_object") != null or
+            std.mem.indexOf(u8, err_text, "permission denied for table zaki_users") != null or
+            std.mem.indexOf(u8, err_text, "relation \"zaki_users\" does not exist") != null;
     }
     if (std.mem.startsWith(u8, template, "ALTER TABLE") and std.mem.indexOf(u8, template, "DROP CONSTRAINT IF EXISTS") != null) {
         return std.mem.indexOf(u8, err_text, "does not exist") != null;
@@ -1532,6 +1567,30 @@ fn loadMasterKey(allocator: std.mem.Allocator, env_name: []const u8) !?[security
     var digest: [security_secrets.KEY_LEN]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
     return digest;
+}
+
+test "canIgnoreMigrateError tolerates extension duplicate key race" {
+    const tpl = "CREATE EXTENSION IF NOT EXISTS pgcrypto";
+    const err_text: [:0]const u8 = "ERROR:  duplicate key value violates unique constraint \"pg_extension_name_index\"";
+    try std.testing.expect(canIgnoreMigrateError(tpl, err_text.ptr));
+}
+
+test "canIgnoreMigrateError tolerates users fk permission denial" {
+    const tpl = "ALTER TABLE {schema}.users ADD CONSTRAINT users_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.zaki_users(id) ON DELETE CASCADE";
+    const err_text: [:0]const u8 = "ERROR:  permission denied for table zaki_users";
+    try std.testing.expect(canIgnoreMigrateError(tpl, err_text.ptr));
+}
+
+test "canIgnoreMigrateError tolerates create table duplicate typname race" {
+    const tpl = "CREATE TABLE IF NOT EXISTS {schema}.users (...)";
+    const err_text: [:0]const u8 = "ERROR:  duplicate key value violates unique constraint \"pg_type_typname_nsp_index\"";
+    try std.testing.expect(canIgnoreMigrateError(tpl, err_text.ptr));
+}
+
+test "canIgnoreMigrateError tolerates create unique index duplicate race" {
+    const tpl = "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_user_key ON {schema}.memories(user_id, key)";
+    const err_text: [:0]const u8 = "ERROR:  duplicate key value violates unique constraint \"pg_class_relname_nsp_index\"";
+    try std.testing.expect(canIgnoreMigrateError(tpl, err_text.ptr));
 }
 
 test "postgres claimed job one-shot completion preserves run history and hides job" {
