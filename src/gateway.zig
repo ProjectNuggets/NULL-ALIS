@@ -2613,9 +2613,168 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
     );
 }
 
-fn internalDiagnosticsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
+fn appendHeartbeatRuntimeSummaryJson(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id_opt: ?[]const u8,
+) !void {
+    try json_util.appendJsonKey(buf, allocator, "heartbeat_runtime");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKey(buf, allocator, "user_id");
+    if (user_id_opt) |user_id| {
+        try json_util.appendJsonString(buf, allocator, user_id);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "available");
+
+    if (!state.tenant_enabled or user_id_opt == null) {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    }
+
+    const user_id = user_id_opt.?;
+    const path = std.fmt.allocPrint(allocator, "{s}/{s}/heartbeat_runtime.json", .{ state.tenant_data_root, user_id }) catch {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    };
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    };
+    defer file.close();
+
+    const raw = file.readToEndAlloc(allocator, 64 * 1024) catch {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    };
+    defer allocator.free(raw);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    }
+
+    const obj = parsed.value.object;
+    const last_run_s = if (obj.get("last_run_s")) |v|
+        if (v == .integer) @as(?i64, v.integer) else null
+    else
+        null;
+    const last_status = if (obj.get("last_status")) |v|
+        if (v == .string) @as(?[]const u8, v.string) else null
+    else
+        null;
+    const last_reason = if (obj.get("last_reason")) |v|
+        if (v == .string) @as(?[]const u8, v.string) else null
+    else
+        null;
+
+    try buf.appendSlice(allocator, "true,");
+    try json_util.appendJsonKey(buf, allocator, "last_run_s");
+    if (last_run_s) |value| {
+        var int_buf: [24]u8 = undefined;
+        const text = std.fmt.bufPrint(&int_buf, "{d}", .{value}) catch "0";
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_status");
+    if (last_status) |value| {
+        try json_util.appendJsonString(buf, allocator, value);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_reason");
+    if (last_reason) |value| {
+        try json_util.appendJsonString(buf, allocator, value);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, "}");
+}
+
+fn internalDiagnosticsPayload(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id_opt: ?[]const u8,
+) ![]u8 {
     const ops_json = try ops_guard.diagnosticsJson(allocator);
     defer allocator.free(ops_json);
+
+    var last_trigger_ts_s: ?i64 = null;
+    var last_trigger_source: ?[]const u8 = null;
+    var last_trigger_action: ?[]const u8 = null;
+    var last_trigger_reason: ?[]const u8 = null;
+    const parsed_ops = std.json.parseFromSlice(std.json.Value, allocator, ops_json, .{}) catch null;
+    defer if (parsed_ops) |*p| p.deinit();
+    if (parsed_ops) |p| {
+        if (p.value == .object) {
+            if (p.value.object.get("last_event")) |last| {
+                if (last == .object) {
+                    if (last.object.get("ts_s")) |v| {
+                        if (v == .integer) last_trigger_ts_s = v.integer;
+                    }
+                    if (last.object.get("source")) |v| {
+                        if (v == .string and v.string.len > 0) last_trigger_source = v.string;
+                    }
+                    if (last.object.get("action")) |v| {
+                        if (v == .string and v.string.len > 0) last_trigger_action = v.string;
+                    }
+                    if (last.object.get("reason")) |v| {
+                        if (v == .string and v.string.len > 0) last_trigger_reason = v.string;
+                    }
+                }
+            }
+        }
+    }
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
@@ -2670,6 +2829,46 @@ fn internalDiagnosticsPayload(allocator: std.mem.Allocator, state: *const Gatewa
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "coalesced_total", @intCast(heartbeat_wake.coalescedCount()));
     try buf.appendSlice(allocator, "},");
+
+    try json_util.appendJsonKey(&buf, allocator, "last_trigger");
+    if (last_trigger_source == null and last_trigger_action == null and last_trigger_reason == null and last_trigger_ts_s == null) {
+        try buf.appendSlice(allocator, "null,");
+    } else {
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKey(&buf, allocator, "ts_s");
+        if (last_trigger_ts_s) |value| {
+            var int_buf: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&int_buf, "{d}", .{value}) catch "0";
+            try buf.appendSlice(allocator, text);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "source");
+        if (last_trigger_source) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "action");
+        if (last_trigger_action) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "reason");
+        if (last_trigger_reason) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, "},");
+    }
+
+    try appendHeartbeatRuntimeSummaryJson(&buf, allocator, state, user_id_opt);
+    try buf.appendSlice(allocator, ",");
 
     try json_util.appendJsonKey(&buf, allocator, "ops");
     try buf.appendSlice(allocator, ops_json);
@@ -5039,7 +5238,8 @@ fn handleAcceptedConnection(
                 response_status = "401 Unauthorized";
                 response_body = "{\"error\":\"unauthorized\"}";
             } else {
-                response_body = internalDiagnosticsPayload(req_allocator, state) catch "{\"error\":\"diagnostics unavailable\"}";
+                const user_id = extractHeader(raw, "X-Zaki-User-Id");
+                response_body = internalDiagnosticsPayload(req_allocator, state, user_id) catch "{\"error\":\"diagnostics unavailable\"}";
             }
         },
         .wake_heartbeat => {

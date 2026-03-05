@@ -244,6 +244,29 @@ pub fn diagnosticsJson(allocator: std.mem.Allocator) ![]u8 {
     try json_util.appendJsonInt(&buf, allocator, "scheduler_blocked_burst_total", @intCast(g_state.scheduler_blocked_burst_total));
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "scheduler_blocked_cooldown_total", @intCast(g_state.scheduler_blocked_cooldown_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "last_event");
+    if (g_state.event_len == 0) {
+        try buf.appendSlice(allocator, "null");
+    } else {
+        const last_idx = (g_state.event_head + MAX_EVENTS - 1) % MAX_EVENTS;
+        const last = g_state.events[last_idx];
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonInt(&buf, allocator, "ts_s", last.ts_s);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "action", actionName(last.action));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "source", last.source[0..last.source_len]);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "user", last.user[0..last.user_len]);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "channel", last.channel[0..last.channel_len]);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "chat", last.chat[0..last.chat_len]);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "reason", last.reason[0..last.reason_len]);
+        try buf.appendSlice(allocator, "}");
+    }
     try buf.appendSlice(allocator, ",\"recent_events\":[");
 
     var idx: usize = if (g_state.event_len == MAX_EVENTS) g_state.event_head else 0;
@@ -289,4 +312,22 @@ test "ops guard blocks proactive message on rate limit" {
         try std.testing.expectEqual(ProactiveDecision.allow, allowProactive("cron", "2", "telegram", "200", key, key, base));
     }
     try std.testing.expectEqual(ProactiveDecision.blocked_rate, allowProactive("cron", "2", "telegram", "200", "overflow", "overflow", base));
+}
+
+test "diagnosticsJson includes last_event summary" {
+    const now_s = std.time.timestamp();
+    const decision = allowProactive("heartbeat", "diag-user", "telegram", "diag-chat", "diag-content", "diag-key", now_s);
+    try std.testing.expectEqual(ProactiveDecision.allow, decision);
+    recordProactiveSent("heartbeat", "diag-user", "telegram", "diag-chat", now_s);
+
+    const payload = try diagnosticsJson(std.testing.allocator);
+    defer std.testing.allocator.free(payload);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const last_event = obj.get("last_event") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(last_event == .object);
+    try std.testing.expectEqualStrings("heartbeat", last_event.object.get("source").?.string);
+    try std.testing.expectEqualStrings("sent", last_event.object.get("action").?.string);
+    try std.testing.expectEqualStrings("telegram", last_event.object.get("channel").?.string);
 }
