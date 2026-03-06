@@ -4,7 +4,7 @@
 
 **Project**: nullalis — Zig 0.15.2 vtable-driven autonomous agent runtime. 205 source files, ~146K LOC, 4,263+ tests.
 
-**Branch**: Work on `transport-native-v1` (branch from `dogfood-stable`).
+**Branch**: Work on `transport-native-v1` (branch from `main`). There is no `dogfood-stable` branch. After Agent A merges Phase 1, rebase onto updated `main` before touching `gateway.zig`.
 
 **Constraints**: Read `AGENTS.md`. All tests must pass. No breaking changes to `http_util.zig` public API — it remains the only transport facade. The `http_util.request_with_mode()` function is the sole entry point for all HTTP calls.
 
@@ -45,6 +45,13 @@
 | `src/tools/message.zig` | 194 | Telegram send API | Yes — well-known HTTPS API |
 
 ## Steps
+
+## Pitfalls to Avoid
+
+1. Do not route arbitrary user-supplied URL tools (`web_fetch`, `http_request`) through native pooled transport in this phase.
+2. Do not change `http_util.request_with_mode()` contract; keep facade stable and migrate call sites behind it.
+3. Ensure pooled connections are never reused after streaming responses that do not fully drain/close cleanly.
+4. Keep SSRF and host safety behavior unchanged from current `http_util` checks.
 
 ### Step B1: Implement Connection Pool
 
@@ -177,23 +184,24 @@ pub const ConnectionPool = struct {
 
 ### Step B5: Transport Observability
 
-**Goal**: Clear metrics for native vs curl usage per subsystem.
+**Goal**: Clear metrics for native vs curl usage per subsystem, plus pool stats.
 
-**Files to modify**: `src/gateway.zig` — `/metrics` endpoint (around line 2570-2610)
+**Files to modify**: `src/gateway.zig` — `metricsPayload()` (line ~2668) and `internalDiagnosticsPayload()` (line ~2887)
+
+**Shared file note**: `gateway.zig` is also touched by Agent A (bus diagnostics). **Do this step AFTER Agent A has merged Phase 1 into main. Rebase first.**
 
 **Actions**:
-1. Read existing metrics. It already exports `nullalis_http_transport_curl_total` per subsystem.
-2. Add native and fallback counters:
-   - `nullalis_http_transport_native_total{subsystem="tools"}` etc.
-   - `nullalis_http_transport_fallback_total{subsystem="tools"}` etc.
-3. Add pool metrics:
+1. Rebase `transport-native-v1` onto updated `main` (which now includes Agent A's gateway changes).
+2. Read existing `metricsPayload()`. It already exports `nullalis_http_transport_native_total`, `nullalis_http_transport_curl_total`, and `nullalis_http_transport_fallback_total` per subsystem (lines 2712-2729).
+3. Add pool metrics to `metricsPayload()`:
    - `nullalis_http_pool_hits_total`
    - `nullalis_http_pool_misses_total`
    - `nullalis_http_pool_idle_connections`
-4. Source from `http_util.transport_stats_snapshot()` (has native/curl/fallback) and pool stats.
-5. Add to `/internal/diagnostics` JSON as well.
+4. Add a `"transport"` section to `internalDiagnosticsPayload()`:
+   - Include pool stats (hits, misses, idle count) and per-subsystem native/curl/fallback counts
+5. Source pool stats from `ConnectionPool` (add a `stats()` method if needed).
 
-**Acceptance**: Prometheus-compatible metrics. Pool utilization visible. `zig build test --summary all` passes.
+**Acceptance**: Prometheus-compatible metrics including pool stats. Diagnostics shows transport breakdown. `zig build test --summary all` passes.
 
 ---
 

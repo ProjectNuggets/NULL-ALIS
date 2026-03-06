@@ -4,7 +4,7 @@
 
 **Project**: nullalis — Zig 0.15.2 vtable-driven autonomous agent runtime. 205 source files, ~146K LOC, 4,263+ tests.
 
-**Branch**: Work on feature branch from `dogfood-stable`.
+**Branch**: Work on feature branch from `main` (after `heartbeat-config-source` merges). There is no `dogfood-stable` branch.
 
 **Constraints**: Read `AGENTS.md` at repo root. All changes must pass `zig build test --summary all` with zero leaks. No breaking changes to ZAKI integration API. Follow vtable + factory patterns.
 
@@ -66,23 +66,26 @@ You are unifying all channels onto the bus path, then making the dispatcher para
 
 ---
 
-### Step A2: Add Scale Diagnostics
+### Step A2: Add Scale Diagnostics to Gateway
 
-**Goal**: Extend `/internal/diagnostics` with bus and transport metrics.
+**Goal**: Extend `/internal/diagnostics` with bus queue depth metrics.
 
-**Files to modify**: `src/gateway.zig` — find the diagnostics endpoint handler (search for `/internal/diagnostics`)
+**Files to modify**: `src/gateway.zig` — `internalDiagnosticsPayload` function (line ~2887)
+
+**Shared file note**: `gateway.zig` is also touched by Agent B (transport metrics). Agent A merges first. Agent B rebases after.
 
 **Actions**:
-1. Read the existing diagnostics handler in `src/gateway.zig`.
-2. Add these fields to the JSON response:
-   - `"bus_inbound_len"` — call `event_bus.inboundLen()` (if bus pointer available) or `0`
-   - `"bus_outbound_len"` — call `event_bus.outboundLen()` (if bus pointer available) or `0`
-   - `"transport"` object with `native_total`, `curl_total`, `fallback_total` from `http_util.transport_stats_snapshot()` (already imported — check existing usage around line 2570-2610)
-   - `"runtime_mode": "threaded"`
-3. The `GatewayState` struct (line ~340) needs access to the bus pointer. Check if it already has one — if not, add `event_bus: ?*bus_mod.Bus = null` and wire it during init.
-4. Add a test verifying the diagnostics JSON contains the new fields.
+1. Read `internalDiagnosticsPayload()` in `src/gateway.zig` (line ~2887). It builds a JSON response with gateway stats, startup self-check, heartbeat_wake, last_trigger, etc.
+2. Add a new `"bus"` section to the JSON:
+   - `"bus_inbound_len"` — from `event_bus.inboundLen()` (Step A1)
+   - `"bus_outbound_len"` — from `event_bus.outboundLen()` (Step A1)
+   - `"bus_capacity"` — from a bus accessor (do not duplicate `QUEUE_CAPACITY` in gateway code)
+3. The `GatewayState` struct (line ~340) needs access to the bus pointer. Check if it already has one — if not, add `event_bus: ?*bus_mod.Bus = null` and wire it during gateway init in `gateway.run()`.
+4. Add `"runtime_mode": "threaded"` to the diagnostics JSON (top-level field).
+5. Do NOT add transport metrics here — that is Agent B's responsibility.
+6. Add a test verifying the diagnostics JSON contains the new bus fields.
 
-**Acceptance**: `zig build test --summary all` passes. Diagnostics endpoint returns new fields.
+**Acceptance**: `zig build test --summary all` passes. Diagnostics returns bus queue depths and runtime_mode.
 
 ---
 
@@ -127,7 +130,18 @@ processTelegramMessages() calls:
 - Session key format must match what `inboundDispatcherThread` expects (read daemon.zig:1490-1515).
 - `account_id` on `OutboundMessage` must match Telegram's registration so outbound dispatcher finds the right channel instance.
 
-**Acceptance**: Telegram messages flow through the bus. No inline `processMessageWithToolContext` in polling loop. `zig build test --summary all` passes. Manual test: send Telegram message, receive reply.
+**Metadata Preservation Checklist** (MUST verify for Telegram, Signal, and Matrix):
+- [ ] Session key format matches exactly (compare polling loop construction vs dispatcher construction)
+- [ ] `account_id` propagates correctly through InboundMessage -> dispatcher -> OutboundMessage
+- [ ] Typing indicators: `startTyping()` called before bus publish, `stopTyping()` called after send
+- [ ] Typing failure cleanup: if bus publish fails or reply times out, typing indicator is explicitly cleared
+- [ ] Media/attachments: Use `makeInboundFull` if the polling loop passes media URLs or file paths
+- [ ] Reply-to semantics: If channel uses reply threading (e.g., Telegram `reply_to_message_id`), verify this metadata survives the bus round-trip via `metadata_json`
+- [ ] Multi-chunk messages: Telegram splits long messages into chunks with 100ms delays. Verify the outbound path preserves this behavior (check `channel.send()` implementation)
+- [ ] Error handling: If bus publish fails (queue full), the polling loop must not silently drop the message. Log and retry or return error to user.
+- [ ] Conversation context: Signal passes `conversation_context` to processMessage. Store in `InboundMessage.metadata_json` and extract in dispatcher.
+
+**Acceptance**: Telegram messages flow through the bus. No inline `processMessageWithToolContext` in polling loop. `zig build test --summary all` passes. Manual test: send Telegram message, receive reply. Verify: typing indicator appears, media works, long messages split correctly.
 
 ---
 
@@ -190,6 +204,7 @@ processTelegramMessages() calls:
        ) catch null;
    }
    ```
+   Prefer allocator-backed dynamic thread list over fixed-size `[16]` arrays when possible. If a fixed cap is kept, enforce it at config parse time and surface effective worker count in diagnostics.
 4. Update shutdown/join logic to join all worker threads.
 5. `BoundedQueue.consume()` is already thread-safe. Multiple consumers each get unique items.
 6. Session serialization still works: `Session.mutex` ensures one turn per session. Parallel workers block on session mutex for same session. Different sessions run fully parallel.

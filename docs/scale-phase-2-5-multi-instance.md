@@ -16,6 +16,7 @@ What needs fixing:
 - Cron and heartbeat sweep ALL user directories regardless of ownership
 - No instance_id in diagnostics
 - No deployment documentation
+- **Critical**: File-based tenant locks only coordinate instances that share the same filesystem. If Kubernetes pods use separate local disks (emptyDir, local PVC), each instance's lock files are invisible to others. This must be addressed before multi-instance is viable.
 
 ## Multi-Instance Architecture
 
@@ -31,6 +32,27 @@ Each instance: ~3MB binary, ~500MB RAM for 500 users
 ```
 
 ## Steps
+
+### Step M0: Resolve Tenant Lock Storage
+
+**Goal**: Ensure tenant locks work across multiple instances.
+
+**Problem**: `tenant_lock.zig` uses file-based lease locks (`.nullalis-owner.lock` per user directory). This only coordinates instances that share the same filesystem. Kubernetes pods with separate local disks will NOT see each other's locks.
+
+**Options**:
+- **(a) Require shared filesystem** (NFS, EFS, GlusterFS): Simplest. All instances mount the same `tenant.data_root`. File locks work as-is. Downside: shared filesystem is a dependency and potential bottleneck.
+- **(b) Migrate locks to Postgres**: Add a `tenant_locks` table to `zaki_state.zig`. Use `INSERT ... ON CONFLICT` with TTL column for lease semantics. All instances share the database already. Downside: more code, Postgres becomes a hard dependency for multi-instance.
+- **(c) External coordination** (Redis, etcd, Consul): Overkill for this stage. Defer.
+
+**Recommendation**: Option (a) for initial multi-instance. Option (b) as follow-up when Postgres is already canonical state backend.
+
+**Actions**:
+1. Document the shared filesystem requirement in deployment docs.
+2. If Postgres lock migration is chosen: add `tenant_locks` table with columns `(user_id, owner_id, lock_token, expires_at)`. Implement `acquireUserOwnershipLock()` and `release()` as SQL operations. Keep file-based lock as fallback for single-instance mode.
+
+**Acceptance**: Lock strategy documented. If Postgres: lock table created and tested.
+
+---
 
 ### Step M1: Cron Respects Tenant Lock
 
