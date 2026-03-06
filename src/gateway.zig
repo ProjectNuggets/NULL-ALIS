@@ -3705,6 +3705,8 @@ fn handleApiRoute(
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
             }
+            // Ensure next turn picks up updated tenant config/tool settings immediately.
+            removeTenantRuntime(state, parsed.user_id);
             return .{ .body = "{\"status\":\"updated\"}" };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };

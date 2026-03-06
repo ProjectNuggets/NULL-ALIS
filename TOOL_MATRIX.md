@@ -32,7 +32,7 @@ This matrix reflects the current tool exposure from `src/tools/root.zig::allTool
 |---|---|---|---|
 | http_request | gated | `http_request.enabled=true` | Network/API calls |
 | web_fetch | gated | `http_request.enabled=true` | Web page fetch + extraction |
-| web_search | gated | `http_request.enabled=true` | Internet search (Brave API) |
+| web_search | gated | `http_request.enabled=true` | Internet search (Exa/Brave via env provider selection) |
 | browser | gated | `browser.enabled=true` | Browser automation |
 | screenshot | gated | runtime sets `screenshot_enabled=true` | UI/image capture |
 | composio | gated | `composio.enabled=true` and API key present | Long-tail SaaS integrations |

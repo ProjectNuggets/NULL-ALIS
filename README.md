@@ -127,10 +127,38 @@ Example config file:
 
 A typical local setup for ZAKI integration needs:
 - model provider credentials
-- Brave API key if web search is enabled
+- web search provider API key(s) if `web_search` is enabled:
+  - `EXA_API_KEY` (Exa)
+  - `BRAVE_API_KEY` (Brave)
+  - `WEB_SEARCH_PROVIDER=auto|exa|brave` (default: `auto`)
 - gateway config
 - tenant config
 - state backend config when using Postgres tenant state
+
+### Web Search Provider Selection
+
+`web_search` provider is selected from environment:
+
+- `WEB_SEARCH_PROVIDER=auto` (default): Exa first when `EXA_API_KEY` is set, fallback to Brave when transient Exa failures occur and `BRAVE_API_KEY` is available
+- `WEB_SEARCH_PROVIDER=exa`: Exa only
+- `WEB_SEARCH_PROVIDER=brave`: Brave only
+
+Local verification examples:
+
+```bash
+# Exa only
+export WEB_SEARCH_PROVIDER=exa
+export EXA_API_KEY=...
+
+# Brave only
+export WEB_SEARCH_PROVIDER=brave
+export BRAVE_API_KEY=...
+
+# Auto mode with fallback
+export WEB_SEARCH_PROVIDER=auto
+export EXA_API_KEY=...
+export BRAVE_API_KEY=...
+```
 
 ## Build Targets
 
