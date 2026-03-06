@@ -809,7 +809,7 @@ test "json parse roundtrip" {
         \\  "models": {"providers": {"anthropic": {"api_key": "sk-test"}}},
         \\  "agents": {"defaults": {"model": {"primary": "anthropic/claude-opus-4"}, "heartbeat": {"every": "15m"}}},
         \\  "memory": {"backend": "markdown", "auto_save": false},
-        \\  "gateway": {"port": 9090, "host": "0.0.0.0", "max_workers": 24, "max_queued_requests": 4096},
+        \\  "gateway": {"port": 9090, "host": "0.0.0.0", "max_workers": 24, "max_queued_requests": 4096, "inbound_workers": 6, "outbound_workers": 3},
         \\  "tenant": {"enabled": true, "data_root": "/data/users", "runtime_cache_max_users": 5000, "runtime_idle_ttl_secs": 900},
         \\  "autonomy": {"level": "full", "workspace_only": false, "max_actions_per_hour": 50},
         \\  "runtime": {"kind": "docker"},
@@ -841,6 +841,8 @@ test "json parse roundtrip" {
     try std.testing.expectEqualStrings("0.0.0.0", cfg.gateway.host);
     try std.testing.expectEqual(@as(u16, 24), cfg.gateway.max_workers);
     try std.testing.expectEqual(@as(u32, 4096), cfg.gateway.max_queued_requests);
+    try std.testing.expectEqual(@as(u32, 6), cfg.gateway.inbound_workers);
+    try std.testing.expectEqual(@as(u32, 3), cfg.gateway.outbound_workers);
     try std.testing.expect(cfg.tenant.enabled);
     try std.testing.expectEqualStrings("/data/users", cfg.tenant.data_root);
     try std.testing.expectEqual(@as(u32, 5000), cfg.tenant.runtime_cache_max_users);

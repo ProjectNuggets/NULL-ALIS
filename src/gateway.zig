@@ -2919,6 +2919,10 @@ fn internalDiagnosticsPayload(
         }
     }
 
+    const bus_inbound_len: usize = if (state.event_bus) |eb| eb.inboundLen() else 0;
+    const bus_outbound_len: usize = if (state.event_bus) |eb| eb.outboundLen() else 0;
+    const bus_capacity: usize = if (state.event_bus) |eb| eb.queueCapacity() else bus_mod.QUEUE_CAPACITY;
+
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, "{");
@@ -2930,6 +2934,18 @@ fn internalDiagnosticsPayload(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(&buf, allocator, "draining");
     try buf.appendSlice(allocator, if (state.draining.load(.acquire)) "true" else "false");
+    try buf.appendSlice(allocator, "},");
+
+    try json_util.appendJsonKeyValue(&buf, allocator, "runtime_mode", "threaded");
+    try buf.appendSlice(allocator, ",");
+
+    try json_util.appendJsonKey(&buf, allocator, "bus");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "inbound_len", @intCast(bus_inbound_len));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "outbound_len", @intCast(bus_outbound_len));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "capacity", @intCast(bus_capacity));
     try buf.appendSlice(allocator, "},");
 
     try json_util.appendJsonKey(&buf, allocator, "startup_self_check");
@@ -7572,6 +7588,24 @@ test "GatewayState event_bus defaults to null" {
     var gs = GatewayState.init(std.testing.allocator);
     defer gs.deinit();
     try std.testing.expect(gs.event_bus == null);
+}
+
+test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+    gs.event_bus = &eb;
+
+    const payload = try internalDiagnosticsPayload(allocator, &gs, null);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"runtime_mode\":\"threaded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"bus\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"inbound_len\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"outbound_len\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"capacity\":1024") != null);
 }
 
 // ── jsonEscapeInto tests ────────────────────────────────────────

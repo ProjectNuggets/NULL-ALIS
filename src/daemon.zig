@@ -26,6 +26,7 @@ const telegram = @import("channels/telegram.zig");
 const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
 const json_util = @import("json_util.zig");
+const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 
 const log = std.log.scoped(.daemon);
 
@@ -34,6 +35,7 @@ const STATUS_FLUSH_SECONDS: u64 = 5;
 
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
+const MAX_DISPATCHER_WORKERS: u32 = 64;
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -1341,6 +1343,15 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("is_group")) |v| {
             if (v == .bool) parsed.fields.is_group = v.bool;
         }
+        if (pm.value.object.get("sender_number")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.sender_number = v.string;
+        }
+        if (pm.value.object.get("sender_uuid")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.sender_uuid = v.string;
+        }
+        if (pm.value.object.get("group_id")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.group_id = v.string;
+        }
     }
     return parsed;
 }
@@ -1427,11 +1438,35 @@ fn resolveTypingRecipient(
         return std.fmt.allocPrint(allocator, "{s}:{s}", .{ slack_target.channel_id, slack_target.thread_ts }) catch null;
     }
 
-    if (!std.mem.eql(u8, channel_name, "discord") and !std.mem.eql(u8, channel_name, "mattermost")) {
+    const supports_default_typing_target = std.mem.eql(u8, channel_name, "discord") or
+        std.mem.eql(u8, channel_name, "mattermost") or
+        std.mem.eql(u8, channel_name, "telegram") or
+        std.mem.eql(u8, channel_name, "signal") or
+        std.mem.eql(u8, channel_name, "matrix");
+    if (!supports_default_typing_target) {
         return null;
     }
     if (chat_id.len == 0) return null;
     return allocator.dupe(u8, chat_id) catch null;
+}
+
+fn inboundConversationContext(msg: *const bus_mod.InboundMessage, meta: channel_adapters.InboundMetadata) ?ConversationContext {
+    if (!std.mem.eql(u8, msg.channel, "signal")) return null;
+
+    const sender_number = if (meta.sender_number) |value|
+        value
+    else if (msg.sender_id.len > 0 and msg.sender_id[0] == '+')
+        msg.sender_id
+    else
+        null;
+
+    return .{
+        .channel = "signal",
+        .sender_number = sender_number,
+        .sender_uuid = meta.sender_uuid,
+        .group_id = meta.group_id,
+        .is_group = meta.is_group,
+    };
 }
 
 fn sendInboundProcessingIndicator(
@@ -1514,7 +1549,8 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, null, .{
+        const conversation_context = inboundConversationContext(&msg, parsed_meta.fields);
+        const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, conversation_context, .{
             .channel = msg.channel,
             .account_id = outbound_account_id,
             .chat_id = msg.chat_id,
@@ -1694,18 +1730,38 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
         }
     }
 
-    var inbound_thread: ?std.Thread = null;
+    var inbound_threads: std.ArrayListUnmanaged(std.Thread) = .empty;
+    defer inbound_threads.deinit(allocator);
     if (channel_rt) |rt| {
         state.addComponent("inbound_dispatcher");
-        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, inboundDispatcherThread, .{
-            allocator, &event_bus, &channel_registry, rt, &state,
-        })) |thread| {
-            inbound_thread = thread;
+        const requested_inbound_workers: u32 = if (config.gateway.inbound_workers == 0) 1 else config.gateway.inbound_workers;
+        const bounded_inbound_workers: u32 = @min(requested_inbound_workers, MAX_DISPATCHER_WORKERS);
+        if (requested_inbound_workers > MAX_DISPATCHER_WORKERS) {
+            log.warn("gateway.inbound_workers={d} exceeds cap={d}; using {d}", .{
+                requested_inbound_workers,
+                MAX_DISPATCHER_WORKERS,
+                bounded_inbound_workers,
+            });
+        }
+
+        var worker_idx: u32 = 0;
+        while (worker_idx < bounded_inbound_workers) : (worker_idx += 1) {
+            if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, inboundDispatcherThread, .{
+                allocator, &event_bus, &channel_registry, rt, &state,
+            })) |thread| {
+                inbound_threads.append(allocator, thread) catch {
+                    thread.join();
+                };
+            } else |err| {
+                log.warn("inbound dispatcher worker spawn failed index={d}: {}", .{ worker_idx, err });
+            }
+        }
+        if (inbound_threads.items.len > 0) {
             state.markRunning("inbound_dispatcher");
             health.markComponentOk("inbound_dispatcher");
-        } else |err| {
-            state.markError("inbound_dispatcher", @errorName(err));
-            stdout.print("Warning: inbound dispatcher thread failed: {}\n", .{err}) catch {};
+        } else {
+            state.markError("inbound_dispatcher", "spawn_failed");
+            stdout.print("Warning: inbound dispatcher workers failed to start.\n", .{}) catch {};
         }
     }
 
@@ -1713,16 +1769,35 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     state.addComponent("outbound_dispatcher");
 
-    var dispatcher_thread: ?std.Thread = null;
-    if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, dispatch.runOutboundDispatcher, .{
-        allocator, &event_bus, &channel_registry, &dispatch_stats,
-    })) |thread| {
-        dispatcher_thread = thread;
+    var outbound_threads: std.ArrayListUnmanaged(std.Thread) = .empty;
+    defer outbound_threads.deinit(allocator);
+    const requested_outbound_workers: u32 = if (config.gateway.outbound_workers == 0) 1 else config.gateway.outbound_workers;
+    const bounded_outbound_workers: u32 = @min(requested_outbound_workers, MAX_DISPATCHER_WORKERS);
+    if (requested_outbound_workers > MAX_DISPATCHER_WORKERS) {
+        log.warn("gateway.outbound_workers={d} exceeds cap={d}; using {d}", .{
+            requested_outbound_workers,
+            MAX_DISPATCHER_WORKERS,
+            bounded_outbound_workers,
+        });
+    }
+    var outbound_idx: u32 = 0;
+    while (outbound_idx < bounded_outbound_workers) : (outbound_idx += 1) {
+        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, dispatch.runOutboundDispatcher, .{
+            allocator, &event_bus, &channel_registry, &dispatch_stats,
+        })) |thread| {
+            outbound_threads.append(allocator, thread) catch {
+                thread.join();
+            };
+        } else |err| {
+            log.warn("outbound dispatcher worker spawn failed index={d}: {}", .{ outbound_idx, err });
+        }
+    }
+    if (outbound_threads.items.len > 0) {
         state.markRunning("outbound_dispatcher");
         health.markComponentOk("outbound_dispatcher");
-    } else |err| {
-        state.markError("outbound_dispatcher", @errorName(err));
-        stdout.print("Warning: outbound dispatcher thread failed: {}\n", .{err}) catch {};
+    } else {
+        state.markError("outbound_dispatcher", "spawn_failed");
+        stdout.print("Warning: outbound dispatcher workers failed to start.\n", .{}) catch {};
     }
 
     // Main thread: wait for shutdown signal (poll-based)
@@ -1747,8 +1822,8 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     writeStateFile(allocator, state_path, &state) catch {};
 
     // Wait for threads
-    if (inbound_thread) |t| t.join();
-    if (dispatcher_thread) |t| t.join();
+    for (inbound_threads.items) |t| t.join();
+    for (outbound_threads.items) |t| t.join();
     if (chan_thread) |t| t.join();
     if (sched_thread) |t| t.join();
     if (hb_thread) |t| t.join();

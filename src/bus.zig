@@ -328,7 +328,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
 // Bus — top-level structure
 // ---------------------------------------------------------------------------
 
-pub const QUEUE_CAPACITY: usize = 100;
+pub const QUEUE_CAPACITY: usize = 1024;
 
 pub const Bus = struct {
     inbound: BoundedQueue(InboundMessage, QUEUE_CAPACITY) = .{},
@@ -373,6 +373,18 @@ pub const Bus = struct {
 
     pub fn outboundDepth(self: *Bus) usize {
         return self.outbound.depth();
+    }
+
+    pub fn inboundLen(self: *Bus) usize {
+        return self.inbound.depth();
+    }
+
+    pub fn outboundLen(self: *Bus) usize {
+        return self.outbound.depth();
+    }
+
+    pub fn queueCapacity(_: *const Bus) usize {
+        return QUEUE_CAPACITY;
     }
 };
 
@@ -499,6 +511,37 @@ test "queue depth reflects current length" {
     try testing.expectEqual(@as(usize, 2), q.depth());
     _ = q.consume();
     try testing.expectEqual(@as(usize, 1), q.depth());
+}
+
+test "bus len accessors mirror depth" {
+    const alloc = testing.allocator;
+    var bus = Bus.init();
+    defer bus.close();
+
+    const in_msg = try makeInbound(alloc, "telegram", "user", "chat", "hi", "telegram:chat");
+    try bus.publishInbound(in_msg);
+    try testing.expectEqual(@as(usize, 1), bus.inboundLen());
+    try testing.expectEqual(@as(usize, 1), bus.inboundDepth());
+
+    var popped = bus.consumeInbound().?;
+    popped.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), bus.inboundLen());
+    try testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+
+    const out_msg = try makeOutbound(alloc, "telegram", "chat", "pong");
+    try bus.publishOutbound(out_msg);
+    try testing.expectEqual(@as(usize, 1), bus.outboundLen());
+    try testing.expectEqual(@as(usize, 1), bus.outboundDepth());
+
+    var out_popped = bus.consumeOutbound().?;
+    out_popped.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), bus.outboundLen());
+    try testing.expectEqual(@as(usize, 0), bus.outboundDepth());
+}
+
+test "bus queueCapacity reports compile-time capacity" {
+    var bus = Bus.init();
+    try testing.expectEqual(QUEUE_CAPACITY, bus.queueCapacity());
 }
 
 // ---------------------------------------------------------------------------

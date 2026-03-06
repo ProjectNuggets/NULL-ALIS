@@ -24,6 +24,7 @@ const agent_routing = @import("agent_routing.zig");
 const zaki_session = @import("zaki_session.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
 const bus_mod = @import("bus.zig");
+const appendJsonEscaped = @import("util.zig").appendJsonEscaped;
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -340,10 +341,134 @@ pub const ChannelRuntime = struct {
     }
 };
 
+fn buildTelegramInboundMetadata(
+    allocator: std.mem.Allocator,
+    account_id: []const u8,
+    msg: channels_mod.ChannelMessage,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"account_id\":\"");
+    try appendJsonEscaped(&buf, allocator, account_id);
+    try buf.appendSlice(allocator, "\",\"peer_kind\":\"");
+    try buf.appendSlice(allocator, if (msg.is_group) "group" else "direct");
+    try buf.appendSlice(allocator, "\",\"peer_id\":\"");
+    try appendJsonEscaped(&buf, allocator, msg.sender);
+    try buf.appendSlice(allocator, "\",\"is_group\":");
+    try buf.appendSlice(allocator, if (msg.is_group) "true" else "false");
+    try buf.appendSlice(allocator, ",\"is_dm\":");
+    try buf.appendSlice(allocator, if (msg.is_group) "false" else "true");
+    if (msg.message_id) |message_id| {
+        try buf.appendSlice(allocator, ",\"message_id\":\"");
+        try std.fmt.format(buf.writer(allocator), "{d}", .{message_id});
+        try buf.appendSlice(allocator, "\"");
+    }
+    try buf.appendSlice(allocator, "}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn buildSignalInboundMetadata(
+    allocator: std.mem.Allocator,
+    account_id: []const u8,
+    peer_id: []const u8,
+    is_group: bool,
+    sender_number: ?[]const u8,
+    sender_uuid: ?[]const u8,
+    group_id: ?[]const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"account_id\":\"");
+    try appendJsonEscaped(&buf, allocator, account_id);
+    try buf.appendSlice(allocator, "\",\"peer_kind\":\"");
+    try buf.appendSlice(allocator, if (is_group) "group" else "direct");
+    try buf.appendSlice(allocator, "\",\"peer_id\":\"");
+    try appendJsonEscaped(&buf, allocator, peer_id);
+    try buf.appendSlice(allocator, "\",\"is_group\":");
+    try buf.appendSlice(allocator, if (is_group) "true" else "false");
+    try buf.appendSlice(allocator, ",\"is_dm\":");
+    try buf.appendSlice(allocator, if (is_group) "false" else "true");
+    if (sender_number) |value| {
+        try buf.appendSlice(allocator, ",\"sender_number\":\"");
+        try appendJsonEscaped(&buf, allocator, value);
+        try buf.appendSlice(allocator, "\"");
+    }
+    if (sender_uuid) |value| {
+        try buf.appendSlice(allocator, ",\"sender_uuid\":\"");
+        try appendJsonEscaped(&buf, allocator, value);
+        try buf.appendSlice(allocator, "\"");
+    }
+    if (group_id) |value| {
+        try buf.appendSlice(allocator, ",\"group_id\":\"");
+        try appendJsonEscaped(&buf, allocator, value);
+        try buf.appendSlice(allocator, "\"");
+    }
+    try buf.appendSlice(allocator, "}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn buildMatrixInboundMetadata(
+    allocator: std.mem.Allocator,
+    account_id: []const u8,
+    peer_id: []const u8,
+    is_group: bool,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"account_id\":\"");
+    try appendJsonEscaped(&buf, allocator, account_id);
+    try buf.appendSlice(allocator, "\",\"peer_kind\":\"");
+    try buf.appendSlice(allocator, if (is_group) "group" else "direct");
+    try buf.appendSlice(allocator, "\",\"peer_id\":\"");
+    try appendJsonEscaped(&buf, allocator, peer_id);
+    try buf.appendSlice(allocator, "\",\"is_group\":");
+    try buf.appendSlice(allocator, if (is_group) "true" else "false");
+    try buf.appendSlice(allocator, ",\"is_dm\":");
+    try buf.appendSlice(allocator, if (is_group) "false" else "true");
+    try buf.appendSlice(allocator, "}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn publishInboundFromPolling(
+    allocator: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    channel: []const u8,
+    sender_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    session_key: []const u8,
+    metadata_json: ?[]const u8,
+) bool {
+    const inbound = bus_mod.makeInboundFull(
+        allocator,
+        channel,
+        sender_id,
+        chat_id,
+        content,
+        session_key,
+        &.{},
+        metadata_json,
+    ) catch |err| {
+        log.warn("{s} inbound build failed: {}", .{ channel, err });
+        return false;
+    };
+
+    event_bus.publishInbound(inbound) catch |err| {
+        log.warn("{s} inbound publish failed: {}", .{ channel, err });
+        inbound.deinit(allocator);
+        return false;
+    };
+    return true;
+}
+
 fn processTelegramMessages(
     allocator: std.mem.Allocator,
     config: *const Config,
     session_mgr: *session_mod.SessionManager,
+    event_bus_opt: ?*bus_mod.Bus,
     tg_ptr: *telegram.TelegramChannel,
     messages: []const channels_mod.ChannelMessage,
 ) void {
@@ -379,6 +504,26 @@ fn processTelegramMessages(
                 routed_session_key = route.session_key;
                 break :blk route.session_key;
             };
+
+            if (event_bus_opt) |event_bus| {
+                const metadata_json = buildTelegramInboundMetadata(allocator, tg_ptr.account_id, msg) catch |err| {
+                    log.warn("telegram metadata build failed: {}", .{err});
+                    break :handle_one;
+                };
+                defer allocator.free(metadata_json);
+
+                _ = publishInboundFromPolling(
+                    allocator,
+                    event_bus,
+                    "telegram",
+                    msg.id,
+                    msg.sender,
+                    msg.content,
+                    session_key,
+                    metadata_json,
+                );
+                break :handle_one;
+            }
 
             const typing_target = msg.sender;
             tg_ptr.startTyping(typing_target) catch {};
@@ -484,7 +629,7 @@ pub fn runTelegramLoop(
         // Update activity after each poll (even if no messages)
         loop_state.last_activity.store(std.time.timestamp(), .release);
 
-        processTelegramMessages(allocator, config, &runtime.session_mgr, tg_ptr, messages);
+        processTelegramMessages(allocator, config, &runtime.session_mgr, runtime.event_bus, tg_ptr, messages);
 
         if (messages.len > 0) {
             for (messages) |msg| {
@@ -593,6 +738,37 @@ pub fn runSignalLoop(
                 break :blk route.session_key;
             };
 
+            const signal_target = msg.reply_target orelse msg.sender;
+            if (runtime.event_bus) |event_bus| {
+                const peer_id = if (msg.is_group) group_peer_id else msg.sender;
+                const sender_number: ?[]const u8 = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null;
+                const metadata_json = buildSignalInboundMetadata(
+                    allocator,
+                    sg_ptr.account_id,
+                    peer_id,
+                    msg.is_group,
+                    sender_number,
+                    msg.sender_uuid,
+                    msg.group_id,
+                ) catch |err| {
+                    log.warn("signal metadata build failed: {}", .{err});
+                    continue;
+                };
+                defer allocator.free(metadata_json);
+
+                _ = publishInboundFromPolling(
+                    allocator,
+                    event_bus,
+                    "signal",
+                    msg.sender,
+                    signal_target,
+                    msg.content,
+                    session_key,
+                    metadata_json,
+                );
+                continue;
+            }
+
             const typing_target = msg.reply_target;
             if (typing_target) |target| sg_ptr.startTyping(target) catch {};
             defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
@@ -606,7 +782,6 @@ pub fn runSignalLoop(
                 .is_group = msg.is_group,
             };
 
-            const signal_target = msg.reply_target orelse msg.sender;
             const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, conversation_context, .{
                 .channel = "signal",
                 .account_id = sg_ptr.account_id,
@@ -808,11 +983,37 @@ pub fn runMatrixLoop(
                 break :blk route.session_key;
             };
 
-            const typing_target = msg.reply_target orelse msg.sender;
+            const matrix_target = msg.reply_target orelse msg.sender;
+            if (runtime.event_bus) |event_bus| {
+                const peer_id = if (msg.is_group) room_peer_id else msg.sender;
+                const metadata_json = buildMatrixInboundMetadata(
+                    allocator,
+                    mx_ptr.account_id,
+                    peer_id,
+                    msg.is_group,
+                ) catch |err| {
+                    log.warn("matrix metadata build failed: {}", .{err});
+                    continue;
+                };
+                defer allocator.free(metadata_json);
+
+                _ = publishInboundFromPolling(
+                    allocator,
+                    event_bus,
+                    "matrix",
+                    msg.sender,
+                    matrix_target,
+                    msg.content,
+                    session_key,
+                    metadata_json,
+                );
+                continue;
+            }
+
+            const typing_target = matrix_target;
             mx_ptr.startTyping(typing_target) catch {};
             defer mx_ptr.stopTyping(typing_target) catch {};
 
-            const matrix_target = msg.reply_target orelse msg.sender;
             const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, null, .{
                 .channel = "matrix",
                 .account_id = mx_ptr.account_id,
@@ -1016,7 +1217,7 @@ test "processTelegramMessages replies through direct telegram send path" {
     };
     defer msg.deinit(allocator);
 
-    processTelegramMessages(allocator, &cfg, &session_mgr, &tg, &.{msg});
+    processTelegramMessages(allocator, &cfg, &session_mgr, null, &tg, &.{msg});
 
     try std.testing.expectEqual(@as(usize, 1), recorder.methods.items.len);
     try std.testing.expectEqualStrings("sendMessage", recorder.methods.items[0]);
@@ -1054,7 +1255,7 @@ test "processTelegramMessages handles start command without creating a session" 
     };
     defer msg.deinit(allocator);
 
-    processTelegramMessages(allocator, &cfg, &session_mgr, &tg, &.{msg});
+    processTelegramMessages(allocator, &cfg, &session_mgr, null, &tg, &.{msg});
 
     try std.testing.expectEqual(@as(usize, 1), recorder.methods.items.len);
     try std.testing.expectEqualStrings("sendMessage", recorder.methods.items[0]);
@@ -1109,7 +1310,7 @@ test "processTelegramMessages uses canonical tenant main session when telegram a
     };
     defer msg.deinit(allocator);
 
-    processTelegramMessages(allocator, &cfg, &session_mgr, &tg, &.{msg});
+    processTelegramMessages(allocator, &cfg, &session_mgr, null, &tg, &.{msg});
 
     const session = try session_mgr.getOrCreate("agent:zaki-bot:user:42:main");
     try std.testing.expectEqual(@as(u64, 1), session.turn_count);

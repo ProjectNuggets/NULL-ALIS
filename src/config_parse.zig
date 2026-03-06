@@ -1286,6 +1286,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (gw.object.get("max_queued_requests")) |v| {
                 if (v == .integer) self.gateway.max_queued_requests = @intCast(v.integer);
             }
+            if (gw.object.get("inbound_workers")) |v| {
+                if (v == .integer) self.gateway.inbound_workers = @intCast(v.integer);
+            }
+            if (gw.object.get("outbound_workers")) |v| {
+                if (v == .integer) self.gateway.outbound_workers = @intCast(v.integer);
+            }
             if (gw.object.get("pair_rate_limit_per_minute")) |v| {
                 if (v == .integer) self.gateway.pair_rate_limit_per_minute = @intCast(v.integer);
             }
