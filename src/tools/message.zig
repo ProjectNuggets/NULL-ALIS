@@ -191,7 +191,7 @@ pub const MessageTool = struct {
             return ToolResult.fail("Failed to encode Telegram text");
         body.appendSlice(allocator, "}") catch return ToolResult.fail("Failed to finalize Telegram request");
 
-        const response = http_util.request_with_mode(allocator, .{ .mode = .curl_only }, .{
+        const response = http_util.request_with_mode(allocator, .{ .mode = .native_preferred }, .{
             .subsystem = .channels,
             .method = "POST",
             .url = url,

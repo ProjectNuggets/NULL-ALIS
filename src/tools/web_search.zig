@@ -234,7 +234,7 @@ fn executeBraveSearchWithKey(
 
     const response = http_util.request_with_mode(
         allocator,
-        .{ .mode = .curl_only },
+        .{ .mode = .native_preferred },
         .{
             .method = "GET",
             .url = url_str,
@@ -299,7 +299,7 @@ fn tryExaSearch(
 
     const response = http_util.request_with_mode(
         allocator,
-        .{ .mode = .curl_only },
+        .{ .mode = .native_preferred },
         .{
             .method = "POST",
             .url = EXA_BASE_URL,

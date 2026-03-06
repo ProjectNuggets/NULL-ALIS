@@ -1228,6 +1228,52 @@ test "processTelegramMessages replies through direct telegram send path" {
     try std.testing.expectEqual(@as(u64, 1), session.turn_count);
 }
 
+test "processTelegramMessages publishes inbound on bus when event bus is present" {
+    const allocator = std.testing.allocator;
+    var mock = MockTelegramProvider{ .response = "pong" };
+    const cfg = testTelegramConfig();
+    var session_mgr = testTelegramSessionManager(allocator, &mock, &cfg);
+    defer session_mgr.deinit();
+
+    var recorder = TelegramRequestRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    var tg = telegram.TelegramChannel.init(allocator, "123:ABC", &.{"*"}, &.{}, "open");
+    defer tg.channel().stop();
+    tg.request_json_override = TelegramRequestRecorder.handle;
+    tg.request_json_ctx = @ptrCast(&recorder);
+
+    const msg = channels_mod.ChannelMessage{
+        .id = try allocator.dupe(u8, "alice"),
+        .sender = try allocator.dupe(u8, "12345"),
+        .content = try allocator.dupe(u8, "ping"),
+        .channel = "telegram",
+        .timestamp = 1,
+        .message_id = 7,
+        .first_name = try allocator.dupe(u8, "Alice"),
+        .is_group = false,
+    };
+    defer msg.deinit(allocator);
+
+    processTelegramMessages(allocator, &cfg, &session_mgr, &eb, &tg, &.{msg});
+
+    // No immediate direct send on polling thread path when bus is configured.
+    try std.testing.expectEqual(@as(usize, 0), recorder.methods.items.len);
+
+    const inbound = eb.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer inbound.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", inbound.channel);
+    try std.testing.expectEqualStrings("alice", inbound.sender_id);
+    try std.testing.expectEqualStrings("12345", inbound.chat_id);
+    try std.testing.expectEqualStrings("ping", inbound.content);
+    try std.testing.expect(inbound.metadata_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, inbound.metadata_json.?, "\"account_id\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inbound.metadata_json.?, "\"peer_kind\":\"direct\"") != null);
+}
+
 test "processTelegramMessages handles start command without creating a session" {
     const allocator = std.testing.allocator;
     var mock = MockTelegramProvider{ .response = "ignored" };

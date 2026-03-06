@@ -2546,6 +2546,42 @@ test "parseInboundMetadata extracts message_id and thread_id" {
     try std.testing.expectEqualStrings("1700.0", parsed.fields.thread_id.?);
 }
 
+test "parseInboundMetadata extracts signal context fields" {
+    var parsed = parseInboundMetadata(
+        std.testing.allocator,
+        "{\"account_id\":\"sig-main\",\"sender_number\":\"+491234\",\"sender_uuid\":\"uuid-1\",\"group_id\":\"group-1\",\"is_group\":true}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("sig-main", parsed.fields.account_id.?);
+    try std.testing.expectEqualStrings("+491234", parsed.fields.sender_number.?);
+    try std.testing.expectEqualStrings("uuid-1", parsed.fields.sender_uuid.?);
+    try std.testing.expectEqualStrings("group-1", parsed.fields.group_id.?);
+    try std.testing.expect(parsed.fields.is_group.?);
+}
+
+test "inboundConversationContext builds signal context" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "signal",
+        .sender_id = "+491111",
+        .chat_id = "+491111",
+        .content = "ping",
+        .session_key = "signal:test",
+    };
+    const meta = channel_adapters.InboundMetadata{
+        .sender_uuid = "uuid-2",
+        .group_id = "group-2",
+        .is_group = true,
+    };
+    const cc = inboundConversationContext(&msg, meta);
+    try std.testing.expect(cc != null);
+    try std.testing.expectEqualStrings("signal", cc.?.channel.?);
+    try std.testing.expectEqualStrings("+491111", cc.?.sender_number.?);
+    try std.testing.expectEqualStrings("uuid-2", cc.?.sender_uuid.?);
+    try std.testing.expectEqualStrings("group-2", cc.?.group_id.?);
+    try std.testing.expect(cc.?.is_group.?);
+}
+
 test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {
     const with_thread = resolveSlackStatusTarget(.{
         .channel_id = "C123",

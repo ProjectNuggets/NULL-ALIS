@@ -1,6 +1,7 @@
 const std = @import("std");
 const net_security = @import("../net_security.zig");
 pub const types = @import("types.zig");
+const pool_mod = @import("pool.zig");
 
 pub const TransportMode = types.TransportMode;
 pub const TransportSubsystem = types.TransportSubsystem;
@@ -15,7 +16,7 @@ const RequestScheme = enum { http, https };
 const HTTP_HEAD_BUFFER_LEN = 16 * 1024;
 const HTTP_WRITE_BUFFER_LEN = 16 * 1024;
 
-const TlsIoState = struct {
+pub const TlsIoState = struct {
     stream_reader: std.net.Stream.Reader,
     stream_writer: std.net.Stream.Writer,
     tls_client: std.crypto.tls.Client,
@@ -24,7 +25,7 @@ const TlsIoState = struct {
     socket_write_buf: []u8,
     socket_read_buf: []u8,
 
-    fn init(allocator: std.mem.Allocator, stream: std.net.Stream, host: []const u8, bundle: Certificate.Bundle) RequestError!*TlsIoState {
+    pub fn init(allocator: std.mem.Allocator, stream: std.net.Stream, host: []const u8, bundle: Certificate.Bundle) RequestError!*TlsIoState {
         const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
         const tls_read_buf = try allocator.alloc(u8, tls_buf_len + HTTP_HEAD_BUFFER_LEN);
         errdefer allocator.free(tls_read_buf);
@@ -57,7 +58,7 @@ const TlsIoState = struct {
         return state;
     }
 
-    fn deinit(self: *TlsIoState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *TlsIoState, allocator: std.mem.Allocator) void {
         allocator.free(self.tls_read_buf);
         allocator.free(self.tls_write_buf);
         allocator.free(self.socket_write_buf);
@@ -164,22 +165,94 @@ fn root_request(allocator: std.mem.Allocator, options: RequestOptions) RequestEr
     const parsed = try parse_request(allocator, options);
     defer parsed.deinit(allocator);
 
-    const addr = try resolve_connect_address(allocator, parsed.connect_host, parsed.port);
-    const stream = std.net.tcpConnectToAddress(addr) catch return error.TcpConnectFailed;
-    defer stream.close();
+    // Try to get connection from pool
+    const is_tls = parsed.scheme == .https;
+    var pooled_conn: ?pool_mod.PooledConnection = null;
+    var stream: std.net.Stream = undefined;
+    var tls_state: ?*TlsIoState = null;
+    var reused = false;
+
+    // Check if we should use pooling (default yes for most requests)
+    const use_pool = true; // Could make this configurable
+
+    if (use_pool) {
+        const pool = pool_mod.globalPool(allocator, .{
+            .max_connections = 8,
+            .max_idle_time_ms = 30_000,
+            .max_requests_per_conn = 100,
+        });
+        pooled_conn = pool.acquire(parsed.connect_host, parsed.port, is_tls);
+    }
+
+    if (pooled_conn) |conn| {
+        // Reuse pooled connection
+        stream = conn.stream;
+        tls_state = conn.tls_state;
+        reused = true;
+    } else {
+        // Create new connection
+        const addr = try resolve_connect_address(allocator, parsed.connect_host, parsed.port);
+        stream = std.net.tcpConnectToAddress(addr) catch return error.TcpConnectFailed;
+
+        if (is_tls) {
+            const bundle = try shared_ca_bundle.get();
+            tls_state = try TlsIoState.init(allocator, stream, parsed.tls_host, bundle);
+        }
+    }
+
+    // Ensure cleanup on error (but not on success, since we might pool it)
+    var connection_ok = false;
+    defer {
+        if (!connection_ok) {
+            if (tls_state) |tls| {
+                tls.deinit(allocator);
+            }
+            stream.close();
+        }
+    }
 
     apply_timeouts(stream, options.timeout_ms) catch return error.SocketTimeoutFailed;
 
     var raw_response = std.ArrayListUnmanaged(u8).empty;
     defer raw_response.deinit(allocator);
 
-    if (parsed.scheme == .https) {
-        try request_tls(allocator, &raw_response, stream, parsed, options);
+    if (tls_state) |tls| {
+        try request_tls_pooled(allocator, &raw_response, stream, tls, parsed, options);
     } else {
         try request_plain(allocator, &raw_response, stream, parsed, options);
     }
 
-    return try parse_http_response(allocator, raw_response.items, options.max_response_bytes);
+    var response = try parse_http_response(allocator, raw_response.items, options.max_response_bytes);
+    response.reused_connection = reused;
+
+    // Increment request count and mark connection as OK
+    connection_ok = true;
+
+    // Return connection to pool if appropriate
+    if (use_pool) {
+        const pool = pool_mod.globalPool(allocator, .{
+            .max_connections = 8,
+            .max_idle_time_ms = 30_000,
+            .max_requests_per_conn = 100,
+        });
+
+        const conn_to_release = pool_mod.PooledConnection{
+            .stream = stream,
+            .tls_state = tls_state,
+            .created_at = if (pooled_conn) |pc| pc.created_at else std.time.timestamp(),
+            .requests_served = if (pooled_conn) |pc| pc.requests_served + 1 else 1,
+        };
+
+        pool.release(parsed.connect_host, parsed.port, is_tls, conn_to_release);
+    } else {
+        // Not using pool, clean up
+        if (tls_state) |tls| {
+            tls.deinit(allocator);
+        }
+        stream.close();
+    }
+
+    return response;
 }
 
 fn root_stream_body(
@@ -268,6 +341,29 @@ fn request_tls(
     tls.stream_writer.interface.flush() catch {};
 }
 
+/// Version of request_tls that uses an existing TLS state (for connection pooling)
+fn request_tls_pooled(
+    allocator: std.mem.Allocator,
+    raw_response: *std.ArrayListUnmanaged(u8),
+    stream: std.net.Stream,
+    tls: *TlsIoState,
+    parsed: ParsedRequest,
+    options: RequestOptions,
+) RequestError!void {
+    _ = stream; // Stream is already wrapped in tls
+
+    const request_bytes = try build_request(allocator, parsed, options);
+    defer allocator.free(request_bytes);
+
+    tls.tls_client.writer.writeAll(request_bytes) catch return error.TlsWriteFailed;
+    tls.tls_client.writer.flush() catch return error.TlsWriteFailed;
+    tls.stream_writer.interface.flush() catch return error.TlsWriteFailed;
+
+    try read_to_eof_tls(allocator, raw_response, &tls.tls_client, options.max_response_bytes);
+
+    // Don't call tls.tls_client.end() or deinit here - connection is being pooled
+}
+
 fn stream_tls_body(
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
@@ -305,7 +401,7 @@ fn build_request(
 
     try writer.print("{s} {s} HTTP/1.1\r\n", .{ options.method, parsed.request_target });
     try writer.print("Host: {s}\r\n", .{parsed.host_header});
-    try writer.writeAll("Connection: close\r\n");
+    try writer.writeAll("Connection: keep-alive\r\n");
     try writer.writeAll("User-Agent: nullalis-native/0.1\r\n");
 
     for (options.headers) |header| {
@@ -460,6 +556,7 @@ fn parse_http_response(allocator: std.mem.Allocator, raw: []const u8, max_respon
 
     var transfer_chunked = false;
     var content_length: ?usize = null;
+    var connection_close = false; // Track if server wants to close
 
     var lines = std.mem.splitSequence(u8, header_block, "\r\n");
     _ = lines.next();
@@ -472,6 +569,11 @@ fn parse_http_response(allocator: std.mem.Allocator, raw: []const u8, max_respon
             transfer_chunked = true;
         } else if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
             content_length = std.fmt.parseInt(usize, value, 10) catch null;
+        } else if (std.ascii.eqlIgnoreCase(name, "Connection")) {
+            // Server explicitly wants to close
+            if (std.ascii.eqlIgnoreCase(value, "close")) {
+                connection_close = true;
+            }
         }
     }
 
