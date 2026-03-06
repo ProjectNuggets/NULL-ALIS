@@ -1,6 +1,9 @@
 const std = @import("std");
 const net_security = @import("../net_security.zig");
 pub const types = @import("types.zig");
+pub const pool_mod = @import("pool.zig");
+
+pub const PooledConn = pool_mod.PooledConn;
 
 pub const TransportMode = types.TransportMode;
 pub const TransportSubsystem = types.TransportSubsystem;
@@ -15,7 +18,7 @@ const RequestScheme = enum { http, https };
 const HTTP_HEAD_BUFFER_LEN = 16 * 1024;
 const HTTP_WRITE_BUFFER_LEN = 16 * 1024;
 
-const TlsIoState = struct {
+pub const TlsIoState = struct {
     stream_reader: std.net.Stream.Reader,
     stream_writer: std.net.Stream.Writer,
     tls_client: std.crypto.tls.Client,
@@ -24,7 +27,7 @@ const TlsIoState = struct {
     socket_write_buf: []u8,
     socket_read_buf: []u8,
 
-    fn init(allocator: std.mem.Allocator, stream: std.net.Stream, host: []const u8, bundle: Certificate.Bundle) RequestError!*TlsIoState {
+    pub fn init(allocator: std.mem.Allocator, stream: std.net.Stream, host: []const u8, bundle: Certificate.Bundle) RequestError!*TlsIoState {
         const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
         const tls_read_buf = try allocator.alloc(u8, tls_buf_len + HTTP_HEAD_BUFFER_LEN);
         errdefer allocator.free(tls_read_buf);
@@ -57,7 +60,7 @@ const TlsIoState = struct {
         return state;
     }
 
-    fn deinit(self: *TlsIoState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *TlsIoState, allocator: std.mem.Allocator) void {
         allocator.free(self.tls_read_buf);
         allocator.free(self.tls_write_buf);
         allocator.free(self.socket_write_buf);
@@ -65,6 +68,35 @@ const TlsIoState = struct {
         allocator.destroy(self);
     }
 };
+
+// ── Pool integration ──────────────────────────────────────────────────────────
+
+/// Called by the pool to close a PooledConn (plain or TLS).
+fn closePooledConn(conn: pool_mod.PooledConn) void {
+    if (conn.tls_state) |opaque_tls| {
+        const tls: *TlsIoState = @ptrCast(@alignCast(opaque_tls));
+        // We can't pass an allocator here (pool uses page_allocator);
+        // TlsIoState was allocated with page_allocator when pooled.
+        tls.deinit(std.heap.page_allocator);
+    }
+    conn.stream.close();
+}
+
+/// The TransportConfig used for pooling — pulled from process-level config
+/// when available, falls back to reasonable defaults.
+const POOL_CONFIG = @import("types.zig").PoolConfig{
+    .max_connections = 8,
+    .max_idle_time_ms = 30_000,
+    .max_requests_per_conn = 100,
+};
+
+fn getPool() *pool_mod.ConnectionPool {
+    return pool_mod.globalPool(POOL_CONFIG, closePooledConn);
+}
+
+/// Public alias so gateway.zig can reference the close function without
+/// triggering a circular import.
+pub const closePooledConnForGateway = closePooledConn;
 
 const shared_ca_bundle = struct {
     var mutex: std.Thread.Mutex = .{};
@@ -164,22 +196,74 @@ fn root_request(allocator: std.mem.Allocator, options: RequestOptions) RequestEr
     const parsed = try parse_request(allocator, options);
     defer parsed.deinit(allocator);
 
-    const addr = try resolve_connect_address(allocator, parsed.connect_host, parsed.port);
-    const stream = std.net.tcpConnectToAddress(addr) catch return error.TcpConnectFailed;
-    defer stream.close();
+    const is_tls = parsed.scheme == .https;
+    const pool = getPool();
+
+    // ── Try to acquire a pooled connection ───────────────────────────────────
+    const pooled = pool.acquire(parsed.connect_host, parsed.port, is_tls);
+    const reused = pooled != null;
+
+    // ── Open a fresh connection if pool missed ───────────────────────────────
+    var stream: std.net.Stream = undefined;
+    var tls_state: ?*TlsIoState = null;
+
+    if (pooled) |pc| {
+        stream = pc.stream;
+        if (pc.tls_state) |op| tls_state = @ptrCast(@alignCast(op));
+    } else {
+        const addr = try resolve_connect_address(allocator, parsed.connect_host, parsed.port);
+        stream = std.net.tcpConnectToAddress(addr) catch return error.TcpConnectFailed;
+        if (is_tls) {
+            const bundle = try shared_ca_bundle.get();
+            tls_state = TlsIoState.init(allocator, stream, parsed.tls_host, bundle) catch |err| {
+                stream.close();
+                return err;
+            };
+        }
+    }
+
+    // On any error: if we opened a fresh connection, close it.
+    // If we reused a pooled one, also close (stale connection).
+    errdefer {
+        if (tls_state) |tls| tls.deinit(allocator);
+        stream.close();
+    }
 
     apply_timeouts(stream, options.timeout_ms) catch return error.SocketTimeoutFailed;
 
     var raw_response = std.ArrayListUnmanaged(u8).empty;
     defer raw_response.deinit(allocator);
 
-    if (parsed.scheme == .https) {
-        try request_tls(allocator, &raw_response, stream, parsed, options);
+    if (is_tls) {
+        try request_tls_with_state(allocator, &raw_response, tls_state.?, parsed, options);
     } else {
         try request_plain(allocator, &raw_response, stream, parsed, options);
     }
 
-    return try parse_http_response(allocator, raw_response.items, options.max_response_bytes);
+    // ── Parse response and decide pooling ────────────────────────────────────
+    var parsed_resp = try parse_http_response_poolable(allocator, raw_response.items, options.max_response_bytes);
+    parsed_resp.response.reused_connection = reused;
+
+    // Only pool if:
+    //  1. Response had explicit body boundary (Content-Length or chunked)
+    //  2. Server did not send Connection: close
+    if (parsed_resp.poolable and !parsed_resp.server_close) {
+        const served: u32 = if (pooled) |pc| pc.requests_served + 1 else 1;
+        const created: i64 = if (pooled) |pc| pc.created_at_s else std.time.timestamp();
+        pool.release(parsed.connect_host, parsed.port, is_tls, .{
+            .stream = stream,
+            .tls_state = if (tls_state) |tls| @ptrCast(tls) else null,
+            .created_at_s = created,
+            .requests_served = served,
+            .is_tls = is_tls,
+        });
+    } else {
+        // Close (either not poolable or server wants close).
+        if (tls_state) |tls| tls.deinit(allocator);
+        stream.close();
+    }
+
+    return parsed_resp.response;
 }
 
 fn root_stream_body(
@@ -266,6 +350,26 @@ fn request_tls(
 
     tls.tls_client.end() catch {};
     tls.stream_writer.interface.flush() catch {};
+}
+
+/// Like request_tls but reuses an existing TlsIoState (from pool).
+/// Does NOT call tls.deinit — caller owns the TlsIoState.
+fn request_tls_with_state(
+    allocator: std.mem.Allocator,
+    raw_response: *std.ArrayListUnmanaged(u8),
+    tls: *TlsIoState,
+    parsed: ParsedRequest,
+    options: RequestOptions,
+) RequestError!void {
+    const request_bytes = try build_request(allocator, parsed, options);
+    defer allocator.free(request_bytes);
+
+    tls.tls_client.writer.writeAll(request_bytes) catch return error.TlsWriteFailed;
+    tls.tls_client.writer.flush() catch return error.TlsWriteFailed;
+    tls.stream_writer.interface.flush() catch return error.TlsWriteFailed;
+
+    // Use EOF reading here — the raw bytes will be parsed by parse_http_response_poolable.
+    try read_to_eof_tls(allocator, raw_response, &tls.tls_client, options.max_response_bytes);
 }
 
 fn stream_tls_body(
@@ -490,6 +594,79 @@ fn parse_http_response(allocator: std.mem.Allocator, raw: []const u8, max_respon
         .status_code = status_code,
         .body = response_body,
         .reused_connection = false,
+    };
+}
+
+/// Result from parse_http_response_poolable.
+const ParsedResponse = struct {
+    response: Response,
+    /// True if the body boundary is explicit (Content-Length or chunked).
+    /// Only poolable responses consumed exactly the right bytes.
+    poolable: bool,
+    /// True if the server sent Connection: close.
+    server_close: bool,
+};
+
+/// Extended parser that also returns pooling metadata.
+fn parse_http_response_poolable(allocator: std.mem.Allocator, raw: []const u8, max_response_bytes: usize) RequestError!ParsedResponse {
+    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpResponse;
+    const header_block = raw[0..header_end];
+    const body_block = raw[header_end + 4 ..];
+
+    const line_end = std.mem.indexOf(u8, header_block, "\r\n") orelse header_block.len;
+    const status_line = header_block[0..line_end];
+    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 ") and !std.mem.startsWith(u8, status_line, "HTTP/1.0 ")) {
+        return error.InvalidHttpResponse;
+    }
+
+    const status_slice = if (status_line.len >= 12) status_line[9..12] else return error.InvalidHttpResponse;
+    const status_code = try std.fmt.parseInt(u16, status_slice, 10);
+
+    var transfer_chunked = false;
+    var content_length: ?usize = null;
+    var server_close = false;
+
+    var lines = std.mem.splitSequence(u8, header_block, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") and std.ascii.indexOfIgnoreCase(value, "chunked") != null) {
+            transfer_chunked = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
+            content_length = std.fmt.parseInt(usize, value, 10) catch null;
+        } else if (std.ascii.eqlIgnoreCase(name, "Connection")) {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "close")) {
+                server_close = true;
+            }
+        }
+    }
+
+    // poolable only if we have an explicit boundary
+    const poolable = transfer_chunked or content_length != null;
+
+    const response_body = if (transfer_chunked)
+        try decode_chunked_body(allocator, body_block, max_response_bytes)
+    else if (content_length) |len| blk: {
+        if (len > max_response_bytes) return error.ResponseTooLarge;
+        if (body_block.len < len) return error.InvalidHttpResponse;
+        break :blk try allocator.dupe(u8, body_block[0..len]);
+    } else blk: {
+        // EOF-terminated: body not explicitly bounded, cannot pool.
+        if (body_block.len > max_response_bytes) return error.ResponseTooLarge;
+        break :blk try allocator.dupe(u8, body_block);
+    };
+
+    return .{
+        .response = .{
+            .status_code = status_code,
+            .body = response_body,
+            .reused_connection = false,
+        },
+        .poolable = poolable,
+        .server_close = server_close,
     };
 }
 

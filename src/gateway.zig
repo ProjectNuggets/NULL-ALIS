@@ -27,6 +27,7 @@ const agent_routing = @import("agent_routing.zig");
 const agent_prompt = @import("agent/prompt.zig");
 const security = @import("security/policy.zig");
 const http_util = @import("http_util.zig");
+const http_native = @import("http_native/root.zig");
 const json_util = @import("json_util.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const onboard = @import("onboard.zig");
@@ -2727,6 +2728,15 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\nullalis_http_transport_fallback_total{{subsystem="providers"}} {d}
         \\nullalis_http_transport_fallback_total{{subsystem="channels"}} {d}
         \\nullalis_http_transport_fallback_total{{subsystem="system"}} {d}
+        \\# HELP nullalis_http_pool_hits_total Connection pool hits (reused connection).
+        \\# TYPE nullalis_http_pool_hits_total counter
+        \\nullalis_http_pool_hits_total {d}
+        \\# HELP nullalis_http_pool_misses_total Connection pool misses (new connection opened).
+        \\# TYPE nullalis_http_pool_misses_total counter
+        \\nullalis_http_pool_misses_total {d}
+        \\# HELP nullalis_http_pool_idle_connections Current idle connections in pool.
+        \\# TYPE nullalis_http_pool_idle_connections gauge
+        \\nullalis_http_pool_idle_connections {d}
         \\
     ,
         .{
@@ -2752,6 +2762,27 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             transport_stats.providers_fallback_total,
             transport_stats.channels_fallback_total,
             transport_stats.system_fallback_total,
+            blk: {
+                const p = http_native.pool_mod.globalPool(
+                    .{},
+                    http_native.closePooledConnForGateway,
+                );
+                break :blk p.hits.load(.monotonic);
+            },
+            blk: {
+                const p = http_native.pool_mod.globalPool(
+                    .{},
+                    http_native.closePooledConnForGateway,
+                );
+                break :blk p.misses.load(.monotonic);
+            },
+            blk: {
+                const p = http_native.pool_mod.globalPool(
+                    .{},
+                    http_native.closePooledConnForGateway,
+                );
+                break :blk p.idleCount();
+            },
         },
     );
 }
@@ -2947,6 +2978,19 @@ fn internalDiagnosticsPayload(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "capacity", @intCast(bus_capacity));
     try buf.appendSlice(allocator, "},");
+
+    // Pool stats section
+    {
+        const pool = http_native.pool_mod.globalPool(.{}, http_native.closePooledConnForGateway);
+        try json_util.appendJsonKey(&buf, allocator, "pool");
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonInt(&buf, allocator, "hits", @intCast(pool.hits.load(.monotonic)));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "misses", @intCast(pool.misses.load(.monotonic)));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "idle", @intCast(pool.idleCount()));
+        try buf.appendSlice(allocator, "},");
+    }
 
     try json_util.appendJsonKey(&buf, allocator, "startup_self_check");
     try buf.appendSlice(allocator, "{");
