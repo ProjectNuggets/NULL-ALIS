@@ -1270,7 +1270,7 @@ test "processTelegramMessages publishes inbound on bus when event bus is present
     try std.testing.expectEqualStrings("12345", inbound.chat_id);
     try std.testing.expectEqualStrings("ping", inbound.content);
     try std.testing.expect(inbound.metadata_json != null);
-    try std.testing.expect(std.mem.indexOf(u8, inbound.metadata_json.?, "\"account_id\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inbound.metadata_json.?, "\"account_id\":\"default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, inbound.metadata_json.?, "\"peer_kind\":\"direct\"") != null);
 }
 
