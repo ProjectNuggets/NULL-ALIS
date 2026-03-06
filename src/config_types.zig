@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// Default context token budget used by agent compaction/context management.
 /// Runtime fallback (`DEFAULT_CONTEXT_TOKENS`).
-pub const DEFAULT_AGENT_TOKEN_LIMIT: u64 = 200_000;
+pub const DEFAULT_AGENT_TOKEN_LIMIT: u64 = 12_000;
 /// Default generation cap when model/provider metadata does not define max output.
 /// Runtime fallback (`DEFAULT_MODEL_MAX_TOKENS`).
 pub const DEFAULT_MODEL_MAX_TOKENS: u32 = 8192;
@@ -158,6 +158,9 @@ pub const ToolsConfig = struct {
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
     web_fetch_max_chars: u32 = 50_000,
+    /// Optional explicit provider override for web_search tool.
+    /// Empty string means "use WEB_SEARCH_PROVIDER env behavior".
+    web_search_provider: []const u8 = "",
 };
 
 pub const ModelRouteConfig = struct {

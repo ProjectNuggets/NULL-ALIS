@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const root = @import("root.zig");
 const bus = @import("../bus.zig");
+const ops_guard = @import("../ops_guard.zig");
 
 /// Message dispatch — routes incoming ChannelMessages to the agent,
 /// routes agent responses back to the originating channel.
@@ -168,6 +169,24 @@ pub fn runOutboundDispatcher(
     while (event_bus.consumeOutbound()) |msg| {
         defer msg.deinit(allocator);
 
+        const source = msg.source orelse "";
+        const proactive = ops_guard.isProactiveSource(msg.source);
+        if (proactive) {
+            const decision = ops_guard.allowProactive(
+                source,
+                msg.user_id,
+                msg.channel,
+                msg.chat_id,
+                msg.content,
+                msg.dedupe_key,
+                std.time.timestamp(),
+            );
+            switch (decision) {
+                .allow => {},
+                .blocked_rate, .blocked_dedupe => continue,
+            }
+        }
+
         const channel_opt = if (msg.account_id) |aid|
             registry.findByNameAccount(msg.channel, aid)
         else
@@ -176,11 +195,20 @@ pub fn runOutboundDispatcher(
         if (channel_opt) |channel| {
             channel.send(msg.chat_id, msg.content, msg.media) catch {
                 _ = stats.errors.fetchAdd(1, .monotonic);
+                if (proactive) {
+                    ops_guard.recordProactiveSendError(source, msg.user_id, msg.channel, msg.chat_id, "channel_send_failed", std.time.timestamp());
+                }
                 continue;
             };
             _ = stats.dispatched.fetchAdd(1, .monotonic);
+            if (proactive) {
+                ops_guard.recordProactiveSent(source, msg.user_id, msg.channel, msg.chat_id, std.time.timestamp());
+            }
         } else {
             _ = stats.channel_not_found.fetchAdd(1, .monotonic);
+            if (proactive) {
+                ops_guard.recordProactiveSendError(source, msg.user_id, msg.channel, msg.chat_id, "channel_not_found", std.time.timestamp());
+            }
         }
     }
 }

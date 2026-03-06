@@ -22,6 +22,10 @@ const channel_adapters = @import("channel_adapters.zig");
 const onboard = @import("onboard.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const zaki_state = @import("zaki_state.zig");
+const telegram = @import("channels/telegram.zig");
+const ops_guard = @import("ops_guard.zig");
+const heartbeat_wake = @import("heartbeat_wake.zig");
+const json_util = @import("json_util.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -182,15 +186,650 @@ fn sendGatewayControlCommand(host: []const u8, port: u16, path: []const u8, inte
     _ = stream.read(&read_buf) catch {};
 }
 
-/// Heartbeat thread — periodically writes state file and checks health.
+const HEARTBEAT_PROMPT_DEFAULT =
+    "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.";
+const HEARTBEAT_RUNTIME_FILENAME = "heartbeat_runtime.json";
+const CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX = "cron.next_heartbeat:";
+const HEARTBEAT_SWEEP_INTERVAL_SECS: i64 = 30;
+const HEARTBEAT_WAKE_MAX_DRAIN_PER_TICK: usize = 4;
+
+const UserHeartbeatConfig = struct {
+    enabled: bool,
+    interval_minutes: u32,
+    prompt: []const u8,
+    prompt_owned: bool = false,
+
+    fn deinit(self: *UserHeartbeatConfig, allocator: std.mem.Allocator) void {
+        if (self.prompt_owned) allocator.free(self.prompt);
+    }
+};
+
+const HeartbeatTelegramTarget = struct {
+    chat_id: i64,
+    account_id: []const u8 = "main",
+    account_id_owned: bool = false,
+
+    fn deinit(self: *HeartbeatTelegramTarget, allocator: std.mem.Allocator) void {
+        if (self.account_id_owned) allocator.free(self.account_id);
+    }
+};
+
+fn parseHeartbeatEveryToMinutes(raw: []const u8) ?u32 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const secs = cron.parseDuration(trimmed) catch return null;
+    if (secs <= 0) return null;
+    const mins_i64 = @max(@as(i64, 1), @divFloor(secs + 59, 60));
+    const clamped = @min(mins_i64, @as(i64, std.math.maxInt(u32)));
+    return @intCast(clamped);
+}
+
+fn parseHeartbeatSecondsToMinutes(value: i64) ?u32 {
+    if (value <= 0) return null;
+    const mins_i64 = @max(@as(i64, 1), @divFloor(value + 59, 60));
+    const clamped = @min(mins_i64, @as(i64, std.math.maxInt(u32)));
+    return @intCast(clamped);
+}
+
+fn applyHeartbeatConfigObject(cfg: *UserHeartbeatConfig, allocator: std.mem.Allocator, object: std.json.ObjectMap) void {
+    if (object.get("enabled")) |v| {
+        if (v == .bool) cfg.enabled = v.bool;
+    }
+    if (object.get("interval_minutes")) |v| {
+        if (v == .integer and v.integer > 0) {
+            const clamped = @min(v.integer, @as(i64, std.math.maxInt(u32)));
+            cfg.interval_minutes = @intCast(clamped);
+        }
+    }
+    if (object.get("intervalSec")) |v| {
+        if (v == .integer) {
+            if (parseHeartbeatSecondsToMinutes(v.integer)) |mins| cfg.interval_minutes = mins;
+        }
+    }
+    if (object.get("interval_seconds")) |v| {
+        if (v == .integer) {
+            if (parseHeartbeatSecondsToMinutes(v.integer)) |mins| cfg.interval_minutes = mins;
+        }
+    }
+    if (object.get("interval_sec")) |v| {
+        if (v == .integer) {
+            if (parseHeartbeatSecondsToMinutes(v.integer)) |mins| cfg.interval_minutes = mins;
+        }
+    }
+    if (object.get("every")) |v| {
+        if (v == .string) {
+            if (parseHeartbeatEveryToMinutes(v.string)) |mins| cfg.interval_minutes = mins;
+        }
+    }
+    if (object.get("prompt")) |v| {
+        if (v == .string) {
+            const trimmed = std.mem.trim(u8, v.string, " \t\r\n");
+            if (trimmed.len > 0) {
+                const owned = allocator.dupe(u8, trimmed) catch return;
+                if (cfg.prompt_owned) allocator.free(cfg.prompt);
+                cfg.prompt = owned;
+                cfg.prompt_owned = true;
+            }
+        }
+    }
+}
+
+fn applyHeartbeatConfigJson(cfg: *UserHeartbeatConfig, allocator: std.mem.Allocator, raw: []const u8) !bool {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "{}")) return false;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return error.InvalidConfigJson;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidConfigJson;
+
+    applyHeartbeatConfigObject(cfg, allocator, parsed.value.object);
+    if (parsed.value.object.get("heartbeat")) |nested| {
+        if (nested == .object) {
+            applyHeartbeatConfigObject(cfg, allocator, nested.object);
+        }
+    }
+    return true;
+}
+
+fn loadUserHeartbeatConfig(
+    allocator: std.mem.Allocator,
+    user_root: []const u8,
+    default_enabled: bool,
+    default_interval_minutes: u32,
+    state_json: ?[]const u8,
+) UserHeartbeatConfig {
+    var cfg = UserHeartbeatConfig{
+        .enabled = default_enabled,
+        .interval_minutes = @max(@as(u32, 1), default_interval_minutes),
+        .prompt = HEARTBEAT_PROMPT_DEFAULT,
+    };
+
+    if (state_json) |raw| {
+        const applied = applyHeartbeatConfigJson(&cfg, allocator, raw) catch |err| blk: {
+            log.warn("heartbeat state config parse failed: {}", .{err});
+            break :blk false;
+        };
+        if (applied) {
+            cfg.interval_minutes = @max(@as(u32, 1), cfg.interval_minutes);
+            return cfg;
+        }
+    }
+
+    const path = std.fmt.allocPrint(allocator, "{s}/heartbeat.json", .{user_root}) catch return cfg;
+    defer allocator.free(path);
+    const file = std.fs.openFileAbsolute(path, .{}) catch return cfg;
+    defer file.close();
+    const raw = file.readToEndAlloc(allocator, 128 * 1024) catch return cfg;
+    defer allocator.free(raw);
+
+    _ = applyHeartbeatConfigJson(&cfg, allocator, raw) catch |err| {
+        log.warn("heartbeat file config parse failed: {}", .{err});
+    };
+    cfg.interval_minutes = @max(@as(u32, 1), cfg.interval_minutes);
+    return cfg;
+}
+
+fn loadHeartbeatStateJson(
+    allocator: std.mem.Allocator,
+    user_id_opt: ?i64,
+    state_mgr_opt: ?*zaki_state.Manager,
+) ?[]u8 {
+    const state_mgr = state_mgr_opt orelse return null;
+    const user_id = user_id_opt orelse return null;
+    return state_mgr.getHeartbeatJson(allocator, user_id) catch |err| {
+        log.warn("heartbeat state read failed for user={d}: {}", .{ user_id, err });
+        return null;
+    };
+}
+
+fn parseNumericUserIdFromDirName(name: []const u8) ?i64 {
+    return std.fmt.parseInt(i64, name, 10) catch null;
+}
+
+fn countEnabledUserHeartbeatConfigsByFile(
+    allocator: std.mem.Allocator,
+    tenant_data_root: []const u8,
+) usize {
+    var users_dir = std.fs.openDirAbsolute(tenant_data_root, .{ .iterate = true }) catch return 0;
+    defer users_dir.close();
+
+    var enabled_count: usize = 0;
+    var iter = users_dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .directory or entry.name.len == 0) continue;
+        const user_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tenant_data_root, entry.name }) catch continue;
+        defer allocator.free(user_root);
+
+        var hb_cfg = loadUserHeartbeatConfig(allocator, user_root, false, 30, null);
+        defer hb_cfg.deinit(allocator);
+        if (hb_cfg.enabled) enabled_count += 1;
+    }
+    return enabled_count;
+}
+
+fn heartbeatRuntimePath(allocator: std.mem.Allocator, user_root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ user_root, HEARTBEAT_RUNTIME_FILENAME });
+}
+
+fn loadHeartbeatLastRunS(allocator: std.mem.Allocator, user_root: []const u8) i64 {
+    const path = heartbeatRuntimePath(allocator, user_root) catch return 0;
+    defer allocator.free(path);
+    const file = std.fs.openFileAbsolute(path, .{}) catch return 0;
+    defer file.close();
+    const raw = file.readToEndAlloc(allocator, 64 * 1024) catch return 0;
+    defer allocator.free(raw);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return 0;
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+    const last = parsed.value.object.get("last_run_s") orelse return 0;
+    if (last != .integer) return 0;
+    return last.integer;
+}
+
+fn saveHeartbeatRuntimeState(
+    allocator: std.mem.Allocator,
+    user_root: []const u8,
+    last_run_s: i64,
+    status: []const u8,
+    reason: []const u8,
+) void {
+    const path = heartbeatRuntimePath(allocator, user_root) catch return;
+    defer allocator.free(path);
+
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    body.append(allocator, '{') catch return;
+    json_util.appendJsonInt(&body, allocator, "last_run_s", last_run_s) catch return;
+    body.append(allocator, ',') catch return;
+    json_util.appendJsonKeyValue(&body, allocator, "last_status", status) catch return;
+    body.append(allocator, ',') catch return;
+    json_util.appendJsonKeyValue(&body, allocator, "last_reason", reason) catch return;
+    body.append(allocator, '}') catch return;
+    body.append(allocator, '\n') catch return;
+
+    const file = std.fs.createFileAbsolute(path, .{}) catch return;
+    defer file.close();
+    file.writeAll(body.items) catch {};
+}
+
+fn readTrimmedFileOwned(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+    const raw = try file.readToEndAlloc(allocator, 256 * 1024);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const out = try allocator.dupe(u8, trimmed);
+    allocator.free(raw);
+    return out;
+}
+
+fn isHeartbeatContentEffectivelyEmpty(content: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (std.mem.startsWith(u8, trimmed, "#")) continue;
+        if (std.mem.startsWith(u8, trimmed, "<!--")) continue;
+        if (std.mem.eql(u8, trimmed, "- [ ]") or
+            std.mem.eql(u8, trimmed, "* [ ]") or
+            std.mem.eql(u8, trimmed, "- [x]") or
+            std.mem.eql(u8, trimmed, "* [x]"))
+        {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn asciiStartsWithIgnoreCaseAt(haystack: []const u8, start: usize, needle: []const u8) bool {
+    if (start + needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i < needle.len) : (i += 1) {
+        if (std.ascii.toUpper(haystack[start + i]) != std.ascii.toUpper(needle[i])) return false;
+    }
+    return true;
+}
+
+fn isHeartbeatAck(reply: []const u8) bool {
+    const trimmed = std.mem.trim(u8, reply, " \t\r\n");
+    if (trimmed.len == 0) return false;
+
+    var found_token = false;
+    var inside_tag = false;
+    var i: usize = 0;
+    while (i < trimmed.len) {
+        if (!inside_tag) {
+            if (asciiStartsWithIgnoreCaseAt(trimmed, i, "HEARTBEAT_OK")) {
+                found_token = true;
+                i += "HEARTBEAT_OK".len;
+                continue;
+            }
+            if (asciiStartsWithIgnoreCaseAt(trimmed, i, "HEARTBEATOK")) {
+                found_token = true;
+                i += "HEARTBEATOK".len;
+                continue;
+            }
+        }
+
+        const c = trimmed[i];
+        if (inside_tag) {
+            if (c == '>') inside_tag = false;
+            i += 1;
+            continue;
+        }
+        if (c == '<') {
+            inside_tag = true;
+            i += 1;
+            continue;
+        }
+
+        if (c < 128 and std.ascii.isAlphanumeric(c)) {
+            return false;
+        }
+        i += 1;
+    }
+    return found_token;
+}
+
+fn isHeartbeatActionableText(content: []const u8) bool {
+    for (content) |c| {
+        if (c < 128 and std.ascii.isAlphanumeric(c)) return true;
+    }
+    return false;
+}
+
+fn heartbeatActionableReplySlice(reply: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, reply, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (isHeartbeatAck(trimmed)) return null;
+    if (!isHeartbeatActionableText(trimmed)) return null;
+    return trimmed;
+}
+
+fn makeHeartbeatDedupeKey(
+    allocator: std.mem.Allocator,
+    user_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+) ![]u8 {
+    const hash = std.hash.Wyhash.hash(0, content);
+    return std.fmt.allocPrint(allocator, "heartbeat:{s}:{s}:{x}", .{ user_id, chat_id, hash });
+}
+
+fn resolveHeartbeatTelegramTarget(
+    allocator: std.mem.Allocator,
+    user_root: []const u8,
+) !?HeartbeatTelegramTarget {
+    const path = try std.fmt.allocPrint(allocator, "{s}/channel_state.json", .{user_root});
+    defer allocator.free(path);
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+    const raw = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(raw);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const telegram_obj = parsed.value.object.get("telegram") orelse return null;
+    if (telegram_obj != .object) return null;
+
+    const connected_val = telegram_obj.object.get("connected");
+    if (connected_val != null and connected_val.? == .bool and !connected_val.?.bool) return null;
+
+    var target = HeartbeatTelegramTarget{
+        .chat_id = 0,
+    };
+    errdefer target.deinit(allocator);
+
+    const chat_id_val = telegram_obj.object.get("chat_id") orelse return null;
+    target.chat_id = switch (chat_id_val) {
+        .integer => chat_id_val.integer,
+        .string => std.fmt.parseInt(i64, chat_id_val.string, 10) catch return null,
+        else => return null,
+    };
+    if (target.chat_id == 0) return null;
+
+    if (telegram_obj.object.get("account_id")) |account_id_val| {
+        if (account_id_val == .string and account_id_val.string.len > 0) {
+            target.account_id = try allocator.dupe(u8, account_id_val.string);
+            target.account_id_owned = true;
+        }
+    }
+
+    return target;
+}
+
+fn sendHeartbeatTelegramMessage(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    chat_id: i64,
+    content: []const u8,
+) !void {
+    var tg = telegram.TelegramChannel.init(allocator, bot_token, &.{"*"}, &.{}, "open");
+    var chat_id_buf: [32]u8 = undefined;
+    const chat_id_text = std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id}) catch return error.InvalidChatId;
+
+    var attempt: u8 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        tg.sendMessage(chat_id_text, content) catch |err| {
+            if (attempt + 1 >= 3) return err;
+            std.Thread.sleep(@as(u64, attempt + 1) * 300 * std.time.ns_per_ms);
+            continue;
+        };
+        return;
+    }
+}
+
+fn runHeartbeatAgentTurn(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    user_id: []const u8,
+    user_root: []const u8,
+    workspace_path: []const u8,
+    prompt: []const u8,
+) ![]const u8 {
+    var scheduler = CronScheduler.init(allocator, 1, true);
+    defer scheduler.deinit();
+    try scheduler.setExecutionContext(user_id, user_root, workspace_path);
+
+    var heartbeat_job = cron.CronJob{
+        .id = "heartbeat",
+        .expression = "* * * * *",
+        .command = "heartbeat",
+        .session_target = .main,
+    };
+    return runCronAgentTurn(@ptrCast(@constCast(config)), allocator, &scheduler, &heartbeat_job, prompt);
+}
+
+fn runTenantHeartbeatForUser(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    user_id: []const u8,
+    user_id_numeric: ?i64,
+    user_root: []const u8,
+    workspace_path: []const u8,
+    forced: bool,
+    reason: []const u8,
+    state_mgr: ?*zaki_state.Manager,
+) void {
+    const now_s = std.time.timestamp();
+    const state_json = loadHeartbeatStateJson(allocator, user_id_numeric, state_mgr);
+    defer if (state_json) |raw| allocator.free(raw);
+    var hb_cfg = loadUserHeartbeatConfig(
+        allocator,
+        user_root,
+        config.heartbeat.enabled,
+        config.heartbeat.interval_minutes,
+        state_json,
+    );
+    defer hb_cfg.deinit(allocator);
+
+    if (!forced and !hb_cfg.enabled) return;
+
+    const last_run_s = loadHeartbeatLastRunS(allocator, user_root);
+    const interval_s = @as(i64, hb_cfg.interval_minutes) * 60;
+    if (!forced and last_run_s > 0 and now_s - last_run_s < interval_s and now_s >= last_run_s) {
+        return;
+    }
+
+    const heartbeat_md_path = std.fmt.allocPrint(allocator, "{s}/HEARTBEAT.md", .{workspace_path}) catch return;
+    defer allocator.free(heartbeat_md_path);
+    const heartbeat_content = readTrimmedFileOwned(allocator, heartbeat_md_path) catch null;
+    defer if (heartbeat_content) |content| allocator.free(content);
+    if (heartbeat_content) |content| {
+        if (isHeartbeatContentEffectivelyEmpty(content)) {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_empty", reason);
+            return;
+        }
+    }
+
+    const reply = runHeartbeatAgentTurn(allocator, config, user_id, user_root, workspace_path, hb_cfg.prompt) catch |err| {
+        log.warn("heartbeat agent turn failed for user={s}: {}", .{ user_id, err });
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_turn", @errorName(err));
+        return;
+    };
+    defer allocator.free(reply);
+
+    const actionable_reply = heartbeatActionableReplySlice(reply) orelse {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "ok_ack", reason);
+        return;
+    };
+
+    var target = resolveHeartbeatTelegramTarget(allocator, user_root) catch |err| {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_target", @errorName(err));
+        return;
+    } orelse {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_target", reason);
+        return;
+    };
+    defer target.deinit(allocator);
+
+    const token_path = std.fmt.allocPrint(allocator, "{s}/secrets/telegram_bot_token", .{user_root}) catch {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_token_path", "alloc_failed");
+        return;
+    };
+    defer allocator.free(token_path);
+    const bot_token = readTrimmedFileOwned(allocator, token_path) catch null;
+    defer if (bot_token) |value| allocator.free(value);
+    const token = bot_token orelse {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_token", reason);
+        return;
+    };
+    if (token.len == 0) {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_token", reason);
+        return;
+    }
+
+    var chat_buf: [32]u8 = undefined;
+    const chat_id_text = std.fmt.bufPrint(&chat_buf, "{d}", .{target.chat_id}) catch "0";
+    const dedupe_key = makeHeartbeatDedupeKey(allocator, user_id, chat_id_text, actionable_reply) catch null;
+    defer if (dedupe_key) |key| allocator.free(key);
+    const decision = ops_guard.allowProactive("heartbeat", user_id, "telegram", chat_id_text, actionable_reply, dedupe_key, now_s);
+    switch (decision) {
+        .allow => {},
+        .blocked_rate => {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "blocked_rate", reason);
+            return;
+        },
+        .blocked_dedupe => {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "blocked_dedupe", reason);
+            return;
+        },
+    }
+
+    sendHeartbeatTelegramMessage(allocator, token, target.chat_id, actionable_reply) catch |err| {
+        ops_guard.recordProactiveSendError("heartbeat", user_id, "telegram", chat_id_text, @errorName(err), std.time.timestamp());
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_send", @errorName(err));
+        return;
+    };
+    ops_guard.recordProactiveSent("heartbeat", user_id, "telegram", chat_id_text, std.time.timestamp());
+    saveHeartbeatRuntimeState(allocator, user_root, now_s, "sent", reason);
+}
+
+fn runTenantHeartbeatSweep(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    owner_instance_id: []const u8,
+    forced_user_id: ?[]const u8,
+    reason: []const u8,
+    forced: bool,
+    state_mgr: ?*zaki_state.Manager,
+) void {
+    var users_dir = std.fs.openDirAbsolute(config.tenant.data_root, .{ .iterate = true }) catch return;
+    defer users_dir.close();
+
+    var iter = users_dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0) continue;
+        if (forced_user_id) |wanted| {
+            if (!std.mem.eql(u8, wanted, entry.name)) continue;
+        }
+
+        const user_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tenant.data_root, entry.name }) catch continue;
+        defer allocator.free(user_root);
+        const workspace_path = std.fmt.allocPrint(allocator, "{s}/workspace", .{user_root}) catch continue;
+        defer allocator.free(workspace_path);
+        const numeric_user_id = parseNumericUserIdFromDirName(entry.name);
+
+        var ownership_lock = tenant_lock.acquireUserOwnershipLock(
+            allocator,
+            user_root,
+            owner_instance_id,
+            TENANT_OWNERSHIP_LOCK_LEASE_SECS,
+        ) catch |err| switch (err) {
+            error.LockHeld => continue,
+            else => {
+                log.warn("heartbeat ownership lock failed for user={s}: {}", .{ entry.name, err });
+                continue;
+            },
+        };
+        defer ownership_lock.deinit();
+
+        runTenantHeartbeatForUser(
+            allocator,
+            config,
+            entry.name,
+            numeric_user_id,
+            user_root,
+            workspace_path,
+            forced,
+            reason,
+            state_mgr,
+        );
+    }
+}
+
+/// Heartbeat thread — writes state file, runs periodic heartbeat checks, and handles wake-now requests.
 fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState) void {
     const state_path = stateFilePath(allocator, config) catch return;
     defer allocator.free(state_path);
 
+    const owner_instance_id = if (config.tenant.enabled)
+        tenant_lock.resolveOwnerId(allocator) catch null
+    else
+        null;
+    defer if (owner_instance_id) |oid| allocator.free(oid);
+    var pg_mgr: ?*zaki_state.Manager = null;
+    defer if (pg_mgr) |state_mgr| {
+        state_mgr.deinit();
+        allocator.destroy(state_mgr);
+    };
+    if (config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres")) init_pg: {
+        const mgr = allocator.create(zaki_state.Manager) catch |err| {
+            log.warn("heartbeat postgres state disabled: manager alloc failed: {}", .{err});
+            break :init_pg;
+        };
+        errdefer allocator.destroy(mgr);
+        mgr.* = zaki_state.Manager.init(allocator, config.state) catch |err| {
+            allocator.destroy(mgr);
+            log.warn("heartbeat postgres state disabled: state init failed: {}", .{err});
+            break :init_pg;
+        };
+        pg_mgr = mgr;
+    }
+
+    var last_flush_s: i64 = 0;
+    var last_sweep_s: i64 = 0;
     while (!isShutdownRequested()) {
-        writeStateFile(allocator, state_path, state) catch {};
-        health.markComponentOk("heartbeat");
-        std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+        const now_s = std.time.timestamp();
+        if (now_s - last_flush_s >= STATUS_FLUSH_SECONDS or now_s < last_flush_s) {
+            last_flush_s = now_s;
+            writeStateFile(allocator, state_path, state) catch {};
+            health.markComponentOk("heartbeat");
+        }
+
+        var wake_processed: usize = 0;
+        while (wake_processed < HEARTBEAT_WAKE_MAX_DRAIN_PER_TICK) : (wake_processed += 1) {
+            const req = heartbeat_wake.dequeue() orelse break;
+            defer {
+                var mut_req = req;
+                mut_req.deinit();
+            }
+            if (!config.tenant.enabled) continue;
+            const owner_id = owner_instance_id orelse continue;
+            const forced = !std.mem.startsWith(u8, req.reason, CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX);
+            runTenantHeartbeatSweep(allocator, config, owner_id, req.user_id, req.reason, forced, pg_mgr);
+        }
+        const wake_pending = heartbeat_wake.pendingCount();
+        if (wake_pending > 0) {
+            log.debug("heartbeat wake backlog pending={d} processed_this_tick={d}", .{ wake_pending, wake_processed });
+        }
+
+        if (config.tenant.enabled and owner_instance_id != null) {
+            if (now_s - last_sweep_s >= HEARTBEAT_SWEEP_INTERVAL_SECS or now_s < last_sweep_s) {
+                last_sweep_s = now_s;
+                runTenantHeartbeatSweep(allocator, config, owner_instance_id.?, null, "interval", false, pg_mgr);
+            }
+        }
+
+        std.Thread.sleep(std.time.ns_per_s);
     }
 }
 
@@ -240,6 +879,19 @@ fn runCronAgentTurn(
 ) ![]const u8 {
     const cfg_ptr = ctx orelse return error.InvalidArgument;
     const cfg: *const Config = @ptrCast(@alignCast(cfg_ptr));
+
+    if (job.session_target == .main and job.wake_mode == .next_heartbeat) {
+        if (scheduler.context_user_id) |user_id| {
+            const reason = try std.fmt.allocPrint(
+                allocator,
+                "{s}{s}",
+                .{ CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX, job.id },
+            );
+            defer allocator.free(reason);
+            try heartbeat_wake.enqueue(user_id, reason);
+            return allocator.dupe(u8, "");
+        }
+    }
 
     var runtime_cfg = cfg.*;
     if (scheduler.context_workspace) |workspace| {
@@ -945,6 +1597,14 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     if (config.heartbeat.enabled) {
         state.addComponent("heartbeat");
+    } else if (config.tenant.enabled) {
+        const enabled_user_heartbeat_configs = countEnabledUserHeartbeatConfigsByFile(allocator, config.tenant.data_root);
+        if (enabled_user_heartbeat_configs > 0) {
+            log.warn(
+                "heartbeat disabled globally (agents.defaults.heartbeat.enabled=false); detected {d} user heartbeat configs enabled; no heartbeat polling will run until global heartbeat is enabled",
+                .{enabled_user_heartbeat_configs},
+            );
+        }
     }
 
     state.addComponent("scheduler");
@@ -982,7 +1642,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var hb_thread: ?std.Thread = null;
     if (config.heartbeat.enabled) {
         state.markRunning("heartbeat");
-        if (std.Thread.spawn(.{ .stack_size = 128 * 1024 }, heartbeatThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, heartbeatThread, .{ allocator, config, &state })) |thread| {
             hb_thread = thread;
         } else |err| {
             state.markError("heartbeat", @errorName(err));
@@ -1921,6 +2581,198 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     }
     try std.testing.expect(found_runtime);
     try std.testing.expect(found_external);
+}
+
+test "parseHeartbeatEveryToMinutes parses common units" {
+    try std.testing.expectEqual(@as(?u32, 30), parseHeartbeatEveryToMinutes("30m"));
+    try std.testing.expectEqual(@as(?u32, 120), parseHeartbeatEveryToMinutes("2h"));
+    try std.testing.expectEqual(@as(?u32, 1), parseHeartbeatEveryToMinutes("45s"));
+    try std.testing.expectEqual(@as(?u32, null), parseHeartbeatEveryToMinutes("invalid"));
+}
+
+test "countEnabledUserHeartbeatConfigsByFile counts enabled per-user heartbeat files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("1");
+    try tmp.dir.makePath("2");
+    try tmp.dir.makePath("3");
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    const user1_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/1/heartbeat.json", .{root});
+    defer std.testing.allocator.free(user1_path);
+    const user1_file = try std.fs.createFileAbsolute(user1_path, .{});
+    defer user1_file.close();
+    try user1_file.writeAll("{\"enabled\":true,\"every\":\"30m\"}\n");
+
+    const user2_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/2/heartbeat.json", .{root});
+    defer std.testing.allocator.free(user2_path);
+    const user2_file = try std.fs.createFileAbsolute(user2_path, .{});
+    defer user2_file.close();
+    try user2_file.writeAll("{\"enabled\":false,\"every\":\"30m\"}\n");
+
+    const user3_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/3/heartbeat.json", .{root});
+    defer std.testing.allocator.free(user3_path);
+    const user3_file = try std.fs.createFileAbsolute(user3_path, .{});
+    defer user3_file.close();
+    try user3_file.writeAll("{}\n");
+
+    const enabled_count = countEnabledUserHeartbeatConfigsByFile(std.testing.allocator, root);
+    try std.testing.expectEqual(@as(usize, 1), enabled_count);
+}
+
+test "loadUserHeartbeatConfig state json overrides file config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    const hb_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{root});
+    defer std.testing.allocator.free(hb_path);
+
+    const file = try std.fs.createFileAbsolute(hb_path, .{});
+    defer file.close();
+    try file.writeAll("{\"enabled\":false,\"interval_minutes\":5,\"prompt\":\"file prompt\"}\n");
+
+    var cfg = loadUserHeartbeatConfig(
+        std.testing.allocator,
+        root,
+        false,
+        30,
+        "{\"enabled\":true,\"interval_minutes\":45,\"prompt\":\"state prompt\"}",
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.enabled);
+    try std.testing.expectEqual(@as(u32, 45), cfg.interval_minutes);
+    try std.testing.expectEqualStrings("state prompt", cfg.prompt);
+}
+
+test "loadUserHeartbeatConfig falls back to file when state json is empty object" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    const hb_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{root});
+    defer std.testing.allocator.free(hb_path);
+
+    const file = try std.fs.createFileAbsolute(hb_path, .{});
+    defer file.close();
+    try file.writeAll("{\"enabled\":true,\"interval_minutes\":7,\"prompt\":\"file prompt\"}\n");
+
+    var cfg = loadUserHeartbeatConfig(
+        std.testing.allocator,
+        root,
+        false,
+        30,
+        "{}",
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.enabled);
+    try std.testing.expectEqual(@as(u32, 7), cfg.interval_minutes);
+    try std.testing.expectEqualStrings("file prompt", cfg.prompt);
+}
+
+test "loadUserHeartbeatConfig supports intervalSec compatibility key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    const hb_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{root});
+    defer std.testing.allocator.free(hb_path);
+
+    const file = try std.fs.createFileAbsolute(hb_path, .{});
+    defer file.close();
+    try file.writeAll("{\"enabled\":true,\"intervalSec\":300,\"prompt\":\"legacy seconds key\"}\n");
+
+    var cfg = loadUserHeartbeatConfig(
+        std.testing.allocator,
+        root,
+        false,
+        30,
+        "{}",
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.enabled);
+    try std.testing.expectEqual(@as(u32, 5), cfg.interval_minutes);
+    try std.testing.expectEqualStrings("legacy seconds key", cfg.prompt);
+}
+
+test "isHeartbeatContentEffectivelyEmpty handles comments and placeholders" {
+    try std.testing.expect(isHeartbeatContentEffectivelyEmpty("# header\n\n<!-- note -->\n- [ ]\n"));
+    try std.testing.expect(!isHeartbeatContentEffectivelyEmpty("# header\n- Send morning brief\n"));
+}
+
+test "isHeartbeatAck recognizes ack-only variants" {
+    try std.testing.expect(isHeartbeatAck("HEARTBEAT_OK"));
+    try std.testing.expect(isHeartbeatAck("<b>HEARTBEAT_OK</b> 🦞"));
+    try std.testing.expect(!isHeartbeatAck("HEARTBEAT_OK send a detailed report"));
+    try std.testing.expect(!isHeartbeatAck("Morning brief delivered"));
+}
+
+test "runCronAgentTurn defers main session next_heartbeat jobs" {
+    heartbeat_wake.clearForTest();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 4, true);
+    defer scheduler.deinit();
+    try scheduler.setExecutionContext("77", null, "/tmp");
+
+    const job = cron.CronJob{
+        .id = "job-heartbeat",
+        .expression = "* * * * *",
+        .command = "noop",
+        .job_type = .agent,
+        .session_target = .main,
+        .wake_mode = .next_heartbeat,
+    };
+
+    const output = try runCronAgentTurn(@ptrCast(@constCast(&cfg)), std.testing.allocator, &scheduler, &job, "ignored");
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("", output);
+    try std.testing.expectEqual(@as(usize, 1), heartbeat_wake.pendingCount());
+
+    var req = heartbeat_wake.dequeue() orelse return error.TestUnexpectedResult;
+    defer req.deinit();
+    try std.testing.expect(req.user_id != null);
+    try std.testing.expectEqualStrings("77", req.user_id.?);
+    try std.testing.expect(std.mem.startsWith(u8, req.reason, CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX));
+}
+
+test "heartbeatActionableReplySlice suppresses ack-only output" {
+    try std.testing.expect(heartbeatActionableReplySlice("HEARTBEAT_OK") == null);
+    try std.testing.expect(heartbeatActionableReplySlice("<b>HEARTBEAT_OK</b> ✅") == null);
+}
+
+test "heartbeatActionableReplySlice keeps actionable output" {
+    const slice = heartbeatActionableReplySlice("  Morning brief delivered  ") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Morning brief delivered", slice);
+}
+
+test "heartbeatActionableReplySlice drops non-actionable punctuation" {
+    try std.testing.expect(heartbeatActionableReplySlice("  ... !!!  ") == null);
+}
+
+test "makeHeartbeatDedupeKey stable for same payload" {
+    const key_a = try makeHeartbeatDedupeKey(std.testing.allocator, "1", "1110331014", "Morning brief delivered");
+    defer std.testing.allocator.free(key_a);
+    const key_b = try makeHeartbeatDedupeKey(std.testing.allocator, "1", "1110331014", "Morning brief delivered");
+    defer std.testing.allocator.free(key_b);
+    try std.testing.expectEqualStrings(key_a, key_b);
 }
 
 test "channelSupervisorThread respects shutdown" {

@@ -5,9 +5,16 @@ const bus = @import("bus.zig");
 const telegram = @import("channels/telegram.zig");
 const json_util = @import("json_util.zig");
 const http_util = @import("http_util.zig");
+const ops_guard = @import("ops_guard.zig");
 
 const log = std.log.scoped(.cron);
 threadlocal var test_store_path_override: ?[]const u8 = null;
+
+const MAX_JOB_RUNS_PER_WINDOW: u32 = 6;
+const JOB_BURST_WINDOW_SECS: i64 = 300;
+const FAILURE_COOLDOWN_THRESHOLD: u32 = 3;
+const FAILURE_COOLDOWN_SECS: i64 = 15 * 60;
+const BLOCKED_RETRY_DELAY_SECS: i64 = 60;
 
 pub const JobType = enum {
     shell,
@@ -40,6 +47,23 @@ pub const SessionTarget = enum {
     pub fn parse(raw: []const u8) SessionTarget {
         if (std.ascii.eqlIgnoreCase(raw, "main")) return .main;
         return .isolated;
+    }
+};
+
+pub const WakeMode = enum {
+    now,
+    next_heartbeat,
+
+    pub fn asStr(self: WakeMode) []const u8 {
+        return switch (self) {
+            .now => "now",
+            .next_heartbeat => "next_heartbeat",
+        };
+    }
+
+    pub fn parse(raw: []const u8) WakeMode {
+        if (std.ascii.eqlIgnoreCase(raw, "next_heartbeat")) return .next_heartbeat;
+        return .now;
     }
 };
 
@@ -113,6 +137,7 @@ pub const CronJob = struct {
     one_shot: bool = false,
     job_type: JobType = .shell,
     session_target: SessionTarget = .isolated,
+    wake_mode: WakeMode = .now,
     prompt: ?[]const u8 = null,
     prompt_owned: bool = false,
     name: ?[]const u8 = null,
@@ -127,6 +152,10 @@ pub const CronJob = struct {
     delivery: DeliveryConfig = .{},
     delivery_channel_owned: bool = false,
     delivery_to_owned: bool = false,
+    consecutive_failures: u32 = 0,
+    cooldown_until_secs: ?i64 = null,
+    burst_window_start_secs: i64 = 0,
+    burst_count_in_window: u32 = 0,
 };
 
 /// Duration unit for "once" delay parsing.
@@ -732,6 +761,28 @@ pub const CronScheduler = struct {
             if (job.paused or job.next_run_secs > now) continue;
             changed = true;
 
+            if (job.cooldown_until_secs) |cooldown_until_secs| {
+                if (cooldown_until_secs > now) {
+                    job.last_status = "cooldown";
+                    job.next_run_secs = cooldown_until_secs;
+                    ops_guard.recordSchedulerBlockedCooldown(self.context_user_id, job.id);
+                    continue;
+                }
+                job.cooldown_until_secs = null;
+            }
+            if (job.burst_window_start_secs == 0 or now < job.burst_window_start_secs or now - job.burst_window_start_secs >= JOB_BURST_WINDOW_SECS) {
+                job.burst_window_start_secs = now;
+                job.burst_count_in_window = 0;
+            }
+            if (job.burst_count_in_window >= MAX_JOB_RUNS_PER_WINDOW) {
+                job.last_status = "rate_limited";
+                job.next_run_secs = now + BLOCKED_RETRY_DELAY_SECS;
+                ops_guard.recordSchedulerBlockedBurst(self.context_user_id, job.id);
+                continue;
+            }
+            job.burst_count_in_window += 1;
+            ops_guard.recordSchedulerExecuted();
+
             switch (job.job_type) {
                 .shell => {
                     const command_to_run = blk: {
@@ -754,6 +805,12 @@ pub const CronScheduler = struct {
                     } orelse {
                         job.last_status = "error";
                         job.last_run_secs = now;
+                        noteJobFailure(job, now);
+                        if (job.cooldown_until_secs) |cooldown_until_secs| {
+                            job.next_run_secs = cooldown_until_secs;
+                        } else {
+                            job.next_run_secs = now + BLOCKED_RETRY_DELAY_SECS;
+                        }
                         continue;
                     };
                     defer self.allocator.free(command_to_run);
@@ -773,7 +830,22 @@ pub const CronScheduler = struct {
                         job.last_output_owned = false;
                         // Deliver error notification
                         if (out_bus) |b| {
-                            _ = deliverResult(self.allocator, job.delivery, "cron job failed to start", false, b) catch {};
+                            _ = deliverResult(
+                                self.allocator,
+                                job.delivery,
+                                "cron job failed to start",
+                                false,
+                                b,
+                                "cron",
+                                self.context_user_id,
+                                job.id,
+                            ) catch {};
+                        }
+                        noteJobFailure(job, now);
+                        if (job.cooldown_until_secs) |cooldown_until_secs| {
+                            job.next_run_secs = cooldown_until_secs;
+                        } else {
+                            job.next_run_secs = now + BLOCKED_RETRY_DELAY_SECS;
                         }
                         continue;
                     };
@@ -785,6 +857,11 @@ pub const CronScheduler = struct {
                     };
                     job.last_run_secs = now;
                     job.last_status = if (success) "ok" else "error";
+                    if (success) {
+                        noteJobSuccess(job);
+                    } else {
+                        noteJobFailure(job, now);
+                    }
 
                     // Store and deliver stdout
                     if (job.last_output_owned) {
@@ -798,7 +875,16 @@ pub const CronScheduler = struct {
 
                     if (out_bus) |b| {
                         const output = job.last_output orelse "";
-                        _ = deliverResultForContext(self.allocator, self.context_user_root, job.delivery, output, success, b) catch {};
+                        _ = deliverResultForContext(
+                            self.allocator,
+                            self.context_user_root,
+                            self.context_user_id,
+                            job.id,
+                            job.delivery,
+                            output,
+                            success,
+                            b,
+                        ) catch {};
                     }
                 },
                 .agent => {
@@ -825,6 +911,11 @@ pub const CronScheduler = struct {
                     };
                     job.last_run_secs = now;
                     job.last_status = if (success) "ok" else "error";
+                    if (success) {
+                        noteJobSuccess(job);
+                    } else {
+                        noteJobFailure(job, now);
+                    }
 
                     if (job.last_output_owned) {
                         if (job.last_output) |old| self.allocator.free(old);
@@ -833,7 +924,16 @@ pub const CronScheduler = struct {
                     job.last_output_owned = job.last_output != null;
 
                     if (out_bus) |b| {
-                        _ = deliverResultForContext(self.allocator, self.context_user_root, job.delivery, job.last_output orelse "", success, b) catch {};
+                        _ = deliverResultForContext(
+                            self.allocator,
+                            self.context_user_root,
+                            self.context_user_id,
+                            job.id,
+                            job.delivery,
+                            job.last_output orelse "",
+                            success,
+                            b,
+                        ) catch {};
                     }
                 },
             }
@@ -966,6 +1066,12 @@ fn appendJobFromJsonObjectWithPolicy(scheduler: *CronScheduler, obj: std.json.Ob
         }
         break :blk SessionTarget.isolated;
     };
+    const wake_mode = blk: {
+        if (obj.get("wake_mode")) |v| {
+            if (v == .string) break :blk WakeMode.parse(v.string);
+        }
+        break :blk WakeMode.now;
+    };
     const enabled = blk: {
         if (obj.get("enabled")) |v| {
             if (v == .bool) break :blk v.bool;
@@ -995,9 +1101,41 @@ fn appendJobFromJsonObjectWithPolicy(scheduler: *CronScheduler, obj: std.json.Ob
             if (v == .string) {
                 if (std.ascii.eqlIgnoreCase(v.string, "ok")) break :blk "ok";
                 if (std.ascii.eqlIgnoreCase(v.string, "error")) break :blk "error";
+                if (std.ascii.eqlIgnoreCase(v.string, "rate_limited")) break :blk "rate_limited";
+                if (std.ascii.eqlIgnoreCase(v.string, "cooldown")) break :blk "cooldown";
             }
         }
         break :blk null;
+    };
+    const consecutive_failures: u32 = blk: {
+        if (obj.get("consecutive_failures")) |v| {
+            if (v == .integer and v.integer >= 0) {
+                const clamped = std.math.clamp(v.integer, @as(i64, 0), @as(i64, std.math.maxInt(u32)));
+                break :blk @intCast(clamped);
+            }
+        }
+        break :blk 0;
+    };
+    const cooldown_until_secs: ?i64 = blk: {
+        if (obj.get("cooldown_until_secs")) |v| {
+            if (v == .integer) break :blk v.integer;
+        }
+        break :blk null;
+    };
+    const burst_window_start_secs: i64 = blk: {
+        if (obj.get("burst_window_start_secs")) |v| {
+            if (v == .integer) break :blk v.integer;
+        }
+        break :blk 0;
+    };
+    const burst_count_in_window: u32 = blk: {
+        if (obj.get("burst_count_in_window")) |v| {
+            if (v == .integer and v.integer >= 0) {
+                const clamped = std.math.clamp(v.integer, @as(i64, 0), @as(i64, std.math.maxInt(u32)));
+                break :blk @intCast(clamped);
+            }
+        }
+        break :blk 0;
     };
 
     var prompt: ?[]const u8 = null;
@@ -1071,6 +1209,7 @@ fn appendJobFromJsonObjectWithPolicy(scheduler: *CronScheduler, obj: std.json.Ob
         .one_shot = one_shot,
         .job_type = job_type,
         .session_target = session_target,
+        .wake_mode = wake_mode,
         .prompt = prompt,
         .prompt_owned = prompt != null,
         .name = name,
@@ -1085,6 +1224,10 @@ fn appendJobFromJsonObjectWithPolicy(scheduler: *CronScheduler, obj: std.json.Ob
         .delivery = delivery,
         .delivery_channel_owned = delivery.channel != null,
         .delivery_to_owned = delivery.to != null,
+        .consecutive_failures = consecutive_failures,
+        .cooldown_until_secs = cooldown_until_secs,
+        .burst_window_start_secs = burst_window_start_secs,
+        .burst_count_in_window = burst_count_in_window,
     });
 }
 
@@ -1136,6 +1279,8 @@ fn appendJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator,
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(buf, allocator, "session_target", job.session_target.asStr());
     try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "wake_mode", job.wake_mode.asStr());
+    try buf.appendSlice(allocator, ",");
     try appendNullableJsonStringField(buf, allocator, "prompt", job.prompt);
     try buf.appendSlice(allocator, ",");
     try appendNullableJsonStringField(buf, allocator, "name", job.name);
@@ -1151,6 +1296,21 @@ fn appendJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator,
     try json_util.appendJsonInt(buf, allocator, "created_at_s", job.created_at_s);
     try buf.appendSlice(allocator, ",");
     try appendNullableJsonStringField(buf, allocator, "last_output", job.last_output);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "consecutive_failures", job.consecutive_failures);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "cooldown_until_secs");
+    if (job.cooldown_until_secs) |cooldown_until_secs| {
+        var cooldown_buf: [24]u8 = undefined;
+        const cooldown_text = std.fmt.bufPrint(&cooldown_buf, "{d}", .{cooldown_until_secs}) catch unreachable;
+        try buf.appendSlice(allocator, cooldown_text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "burst_window_start_secs", job.burst_window_start_secs);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "burst_count_in_window", job.burst_count_in_window);
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(buf, allocator, "delivery");
     try buf.appendSlice(allocator, "{");
@@ -1198,6 +1358,9 @@ pub fn deliverResult(
     output: []const u8,
     success: bool,
     out_bus: *bus.Bus,
+    source: []const u8,
+    user_id: ?[]const u8,
+    dedupe_key: ?[]const u8,
 ) !bool {
     // Skip if mode is none
     if (delivery.mode == .none) return false;
@@ -1217,7 +1380,7 @@ pub fn deliverResult(
     if (output.len == 0) return false;
 
     const chat_id = delivery.to orelse "default";
-    const msg = try bus.makeOutbound(allocator, channel, chat_id, output);
+    const msg = try bus.makeOutboundAnnotated(allocator, channel, chat_id, output, source, user_id, dedupe_key);
     out_bus.publishOutbound(msg) catch |err| {
         // If best_effort, swallow the error after cleaning up
         if (delivery.best_effort) {
@@ -1239,6 +1402,18 @@ fn shouldDeliver(delivery: DeliveryConfig, output: []const u8, success: bool) bo
         .on_success => return success,
         .on_error => return !success,
         .always => return true,
+    }
+}
+
+fn noteJobSuccess(job: *CronJob) void {
+    job.consecutive_failures = 0;
+    job.cooldown_until_secs = null;
+}
+
+fn noteJobFailure(job: *CronJob, now: i64) void {
+    job.consecutive_failures +|= 1;
+    if (job.consecutive_failures >= FAILURE_COOLDOWN_THRESHOLD) {
+        job.cooldown_until_secs = now + FAILURE_COOLDOWN_SECS;
     }
 }
 
@@ -1488,6 +1663,8 @@ fn loadTelegramChatIdFromChannelState(allocator: std.mem.Allocator, user_root: [
 fn deliverTenantTelegram(
     allocator: std.mem.Allocator,
     user_root: []const u8,
+    user_id_opt: ?[]const u8,
+    dedupe_key: ?[]const u8,
     delivery: DeliveryConfig,
     output: []const u8,
     success: bool,
@@ -1514,11 +1691,27 @@ fn deliverTenantTelegram(
     else
         loadTelegramChatIdFromChannelState(allocator, user_root) orelse return false;
 
+    const proactive_decision = ops_guard.allowProactive(
+        "cron",
+        user_id_opt,
+        "telegram",
+        delivery.to orelse "default",
+        output,
+        dedupe_key,
+        now_s,
+    );
+    switch (proactive_decision) {
+        .allow => {},
+        .blocked_rate, .blocked_dedupe => return false,
+    }
+
     var tg = telegram.TelegramChannel.init(allocator, bot_token, &.{"*"}, &.{}, "open");
     sendTelegramMessageWithRetry(&tg, chat_id, output, policy.retry_budget) catch |err| {
+        ops_guard.recordProactiveSendError("cron", user_id_opt, "telegram", delivery.to orelse "default", @errorName(err), std.time.timestamp());
         if (delivery.best_effort) return false;
         return err;
     };
+    ops_guard.recordProactiveSent("cron", user_id_opt, "telegram", delivery.to orelse "default", std.time.timestamp());
     return true;
 }
 
@@ -1547,6 +1740,8 @@ fn sendTelegramMessageWithRetry(
 fn deliverResultForContext(
     allocator: std.mem.Allocator,
     context_user_root: ?[]const u8,
+    context_user_id: ?[]const u8,
+    job_id: []const u8,
     delivery: DeliveryConfig,
     output: []const u8,
     success: bool,
@@ -1555,14 +1750,14 @@ fn deliverResultForContext(
     if (context_user_root) |user_root| {
         if (delivery.channel) |channel| {
             if (std.ascii.eqlIgnoreCase(channel, "telegram")) {
-                return deliverTenantTelegram(allocator, user_root, delivery, output, success) catch |err| blk: {
+                return deliverTenantTelegram(allocator, user_root, context_user_id, job_id, delivery, output, success) catch |err| blk: {
                     if (!delivery.best_effort) return err;
                     break :blk false;
                 };
             }
         }
     }
-    return deliverResult(allocator, delivery, output, success, out_bus);
+    return deliverResult(allocator, delivery, output, success, out_bus, "cron", context_user_id, job_id);
 }
 
 // ── JSON Persistence ─────────────────────────────────────────────
@@ -2142,6 +2337,7 @@ test "save and load preserves extended cron fields" {
     _ = try scheduler.addJob("*/5 * * * *", "echo extended");
     scheduler.jobs.items[0].job_type = .agent;
     scheduler.jobs.items[0].session_target = .main;
+    scheduler.jobs.items[0].wake_mode = .next_heartbeat;
     scheduler.jobs.items[0].prompt = try std.testing.allocator.dupe(u8, "daily summary");
     scheduler.jobs.items[0].prompt_owned = true;
     scheduler.jobs.items[0].name = try std.testing.allocator.dupe(u8, "Daily Summary");
@@ -2169,6 +2365,7 @@ test "save and load preserves extended cron fields" {
     const job = loaded.listJobs()[0];
     try std.testing.expectEqual(JobType.agent, job.job_type);
     try std.testing.expectEqual(SessionTarget.main, job.session_target);
+    try std.testing.expectEqual(WakeMode.next_heartbeat, job.wake_mode);
     try std.testing.expectEqualStrings("daily summary", job.prompt.?);
     try std.testing.expectEqualStrings("Daily Summary", job.name.?);
     try std.testing.expectEqualStrings("openai/gpt-4.1", job.model.?);
@@ -2187,6 +2384,16 @@ fn testAgentRunner(
     prompt: []const u8,
 ) ![]u8 {
     return std.fmt.allocPrint(allocator, "ran:{s}", .{prompt});
+}
+
+fn failingAgentRunner(
+    _: ?*anyopaque,
+    _: std.mem.Allocator,
+    _: *const CronScheduler,
+    _: *const CronJob,
+    _: []const u8,
+) ![]u8 {
+    return error.TestFailure;
 }
 
 test "JobType parse and asStr" {
@@ -2212,12 +2419,14 @@ test "CronJob has new fields" {
         .command = "echo hi",
         .job_type = .agent,
         .session_target = .main,
+        .wake_mode = .next_heartbeat,
         .enabled = true,
         .delete_after_run = false,
         .created_at_s = 1000000,
     };
     try std.testing.expectEqual(JobType.agent, job.job_type);
     try std.testing.expectEqual(SessionTarget.main, job.session_target);
+    try std.testing.expectEqual(WakeMode.next_heartbeat, job.wake_mode);
     try std.testing.expect(job.enabled);
     try std.testing.expectEqual(@as(i64, 1000000), job.created_at_s);
 }
@@ -2298,7 +2507,7 @@ test "deliverResult creates correct OutboundMessage" {
         .to = "chat123",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "job output here", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "job output here", true, &test_bus, "cron", "1", "job-1");
     try std.testing.expect(delivered);
 
     // Consume and verify the message
@@ -2307,6 +2516,9 @@ test "deliverResult creates correct OutboundMessage" {
     try std.testing.expectEqualStrings("telegram", msg.channel);
     try std.testing.expectEqualStrings("chat123", msg.chat_id);
     try std.testing.expectEqualStrings("job output here", msg.content);
+    try std.testing.expectEqualStrings("cron", msg.source.?);
+    try std.testing.expectEqualStrings("1", msg.user_id.?);
+    try std.testing.expectEqualStrings("job-1", msg.dedupe_key.?);
 }
 
 test "deliverResult with mode none does nothing" {
@@ -2320,7 +2532,7 @@ test "deliverResult with mode none does nothing" {
         .to = "chat1",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus, "cron", "1", "job-1");
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -2336,7 +2548,7 @@ test "deliverResult with no channel does nothing" {
         .to = "chat1",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus, "cron", "1", "job-1");
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -2352,7 +2564,7 @@ test "deliverResult on_success skips on failure" {
         .to = "chat1",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "error output", false, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "error output", false, &test_bus, "cron", "1", "job-1");
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -2368,7 +2580,7 @@ test "deliverResult on_error skips on success" {
         .to = "chat1",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "ok output", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "ok output", true, &test_bus, "cron", "1", "job-1");
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -2384,7 +2596,7 @@ test "deliverResult on_error delivers on failure" {
         .to = "room42",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "crash log", false, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "crash log", false, &test_bus, "cron", "1", "job-1");
     try std.testing.expect(delivered);
 
     var msg = test_bus.consumeOutbound().?;
@@ -2405,7 +2617,7 @@ test "deliverResult uses default chat_id when to is null" {
         .to = null,
     };
 
-    const delivered = try deliverResult(allocator, delivery, "hello", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "hello", true, &test_bus, "cron", "1", "job-1");
     try std.testing.expect(delivered);
 
     var msg = test_bus.consumeOutbound().?;
@@ -2424,7 +2636,7 @@ test "deliverResult skips empty output" {
         .to = "chat1",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "", true, &test_bus, "cron", "1", "job-1");
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -2442,7 +2654,7 @@ test "deliverResult best_effort swallows closed bus error" {
     };
 
     // Should not return error because best_effort is true
-    const delivered = try deliverResult(allocator, delivery, "msg", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "msg", true, &test_bus, "cron", "1", "job-1");
     try std.testing.expect(!delivered);
 }
 
@@ -2620,6 +2832,62 @@ test "agent job uses configured runner when available" {
     try std.testing.expectEqualStrings("ran:hello-runner", scheduler.jobs.items[0].last_output.?);
 }
 
+test "tick applies cooldown after repeated failures" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    scheduler.setAgentRunner(failingAgentRunner, null);
+
+    try scheduler.jobs.append(allocator, .{
+        .id = try allocator.dupe(u8, "agent-fail-1"),
+        .expression = try allocator.dupe(u8, "* * * * *"),
+        .command = try allocator.dupe(u8, "fallback"),
+        .job_type = .agent,
+        .prompt = try allocator.dupe(u8, "please fail"),
+        .prompt_owned = true,
+        .next_run_secs = 0,
+    });
+
+    const now = std.time.timestamp();
+    var attempts: u32 = 0;
+    while (attempts < FAILURE_COOLDOWN_THRESHOLD) : (attempts += 1) {
+        _ = scheduler.tick(now + attempts, null);
+        scheduler.jobs.items[0].next_run_secs = 0;
+    }
+
+    try std.testing.expect(scheduler.jobs.items[0].cooldown_until_secs != null);
+    try std.testing.expectEqualStrings("error", scheduler.jobs.items[0].last_status.?);
+
+    _ = scheduler.tick(now + @as(i64, FAILURE_COOLDOWN_THRESHOLD), null);
+    try std.testing.expectEqualStrings("cooldown", scheduler.jobs.items[0].last_status.?);
+}
+
+test "tick applies burst guard after max executions in window" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    scheduler.setAgentRunner(testAgentRunner, null);
+
+    try scheduler.jobs.append(allocator, .{
+        .id = try allocator.dupe(u8, "agent-burst-1"),
+        .expression = try allocator.dupe(u8, "* * * * *"),
+        .command = try allocator.dupe(u8, "noop"),
+        .job_type = .agent,
+        .prompt = try allocator.dupe(u8, "burst"),
+        .prompt_owned = true,
+        .next_run_secs = 0,
+    });
+
+    const now = std.time.timestamp();
+    var i: u32 = 0;
+    while (i < MAX_JOB_RUNS_PER_WINDOW + 1) : (i += 1) {
+        _ = scheduler.tick(now, null);
+        scheduler.jobs.items[0].next_run_secs = 0;
+    }
+
+    try std.testing.expectEqualStrings("rate_limited", scheduler.jobs.items[0].last_status.?);
+}
+
 test "DeliveryMode parse and asStr" {
     try std.testing.expectEqual(DeliveryMode.none, DeliveryMode.parse("none"));
     try std.testing.expectEqual(DeliveryMode.always, DeliveryMode.parse("always"));
@@ -2670,6 +2938,7 @@ test "job json roundtrip preserves agent delivery fields" {
     const job = try scheduler.addOnce("5m", "message \"hello\"");
     job.job_type = .agent;
     job.session_target = .main;
+    job.wake_mode = .next_heartbeat;
     job.prompt = try allocator.dupe(u8, "remind me");
     job.prompt_owned = true;
     job.name = try allocator.dupe(u8, "Reminder");
@@ -2698,6 +2967,7 @@ test "job json roundtrip preserves agent delivery fields" {
     const restored = loaded.jobs.items[0];
     try std.testing.expectEqual(JobType.agent, restored.job_type);
     try std.testing.expectEqual(SessionTarget.main, restored.session_target);
+    try std.testing.expectEqual(WakeMode.next_heartbeat, restored.wake_mode);
     try std.testing.expect(restored.delete_after_run);
     try std.testing.expect(restored.one_shot);
     try std.testing.expect(restored.enabled);
@@ -2708,6 +2978,14 @@ test "job json roundtrip preserves agent delivery fields" {
     try std.testing.expectEqualStrings("remind me", restored.prompt.?);
     try std.testing.expectEqualStrings("Reminder", restored.name.?);
     try std.testing.expectEqualStrings("openrouter/moonshotai/kimi-k2.5", restored.model.?);
+}
+
+test "WakeMode parse and asStr" {
+    try std.testing.expectEqual(WakeMode.now, WakeMode.parse("now"));
+    try std.testing.expectEqual(WakeMode.next_heartbeat, WakeMode.parse("next_heartbeat"));
+    try std.testing.expectEqual(WakeMode.next_heartbeat, WakeMode.parse("NEXT_HEARTBEAT"));
+    try std.testing.expectEqualStrings("now", WakeMode.now.asStr());
+    try std.testing.expectEqualStrings("next_heartbeat", WakeMode.next_heartbeat.asStr());
 }
 
 test "loadTelegramChatIdFromChannelState reads tenant channel state" {

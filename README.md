@@ -123,14 +123,42 @@ Current config location:
 ```
 
 Example config file:
-- [config.example.json](/Users/nova/Desktop/nullclaw/config.example.json)
+- [config.example.json](config.example.json)
 
 A typical local setup for ZAKI integration needs:
 - model provider credentials
-- Brave API key if web search is enabled
+- web search provider API key(s) if `web_search` is enabled:
+  - `EXA_API_KEY` (Exa)
+  - `BRAVE_API_KEY` (Brave)
+  - `WEB_SEARCH_PROVIDER=auto|exa|brave` (default: `auto`)
 - gateway config
 - tenant config
 - state backend config when using Postgres tenant state
+
+### Web Search Provider Selection
+
+`web_search` provider is selected from environment:
+
+- `WEB_SEARCH_PROVIDER=auto` (default): Exa first when `EXA_API_KEY` is set, fallback to Brave when transient Exa failures occur and `BRAVE_API_KEY` is available
+- `WEB_SEARCH_PROVIDER=exa`: Exa only
+- `WEB_SEARCH_PROVIDER=brave`: Brave only
+
+Local verification examples:
+
+```bash
+# Exa only
+export WEB_SEARCH_PROVIDER=exa
+export EXA_API_KEY=...
+
+# Brave only
+export WEB_SEARCH_PROVIDER=brave
+export BRAVE_API_KEY=...
+
+# Auto mode with fallback
+export WEB_SEARCH_PROVIDER=auto
+export EXA_API_KEY=...
+export BRAVE_API_KEY=...
+```
 
 ## Build Targets
 
@@ -166,14 +194,14 @@ Primary extension points:
 - peripherals
 
 Important top-level modules:
-- [src/main.zig](/Users/nova/Desktop/nullclaw/src/main.zig)
-- [src/gateway.zig](/Users/nova/Desktop/nullclaw/src/gateway.zig)
-- [src/agent.zig](/Users/nova/Desktop/nullclaw/src/agent.zig)
-- [src/config.zig](/Users/nova/Desktop/nullclaw/src/config.zig)
-- [src/tools/root.zig](/Users/nova/Desktop/nullclaw/src/tools/root.zig)
-- [src/memory/root.zig](/Users/nova/Desktop/nullclaw/src/memory/root.zig)
-- [src/providers/root.zig](/Users/nova/Desktop/nullclaw/src/providers/root.zig)
-- [src/channels/root.zig](/Users/nova/Desktop/nullclaw/src/channels/root.zig)
+- [src/main.zig](src/main.zig)
+- [src/gateway.zig](src/gateway.zig)
+- [src/agent.zig](src/agent.zig)
+- [src/config.zig](src/config.zig)
+- [src/tools/root.zig](src/tools/root.zig)
+- [src/memory/root.zig](src/memory/root.zig)
+- [src/providers/root.zig](src/providers/root.zig)
+- [src/channels/root.zig](src/channels/root.zig)
 
 The design goal is small binaries, low runtime overhead, explicit interfaces, and secure defaults.
 
@@ -206,4 +234,4 @@ zig fmt src/**/*.zig
 
 ## License
 
-MIT. See [LICENSE](/Users/nova/Desktop/nullclaw/LICENSE).
+MIT. See [LICENSE](LICENSE).

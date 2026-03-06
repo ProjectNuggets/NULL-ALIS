@@ -1,13 +1,16 @@
-//! Web Search Tool — internet search via Brave Search API.
+//! Web Search Tool — internet search via Exa and Brave APIs.
 //!
-//! Provides web search capability for the agent. Requires BRAVE_API_KEY
-//! environment variable (free tier available at https://brave.com/search/api/).
+//! Provider selection is controlled by WEB_SEARCH_PROVIDER:
+//! - auto (default): Exa first when EXA_API_KEY is set, fallback to Brave
+//! - exa: Exa only
+//! - brave: Brave only
 
 const std = @import("std");
 const root = @import("root.zig");
 const platform = @import("../platform.zig");
 const http_util = @import("../root.zig").http_util;
 const net_security = @import("../root.zig").net_security;
+const json_util = @import("../json_util.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
@@ -16,11 +19,38 @@ const JsonObjectMap = root.JsonObjectMap;
 const MAX_RESULTS: usize = 10;
 /// Default number of search results.
 const DEFAULT_COUNT: usize = 5;
+/// Max snippet length in formatted output.
+const MAX_SNIPPET_CHARS: usize = 280;
 
-/// Web search tool using Brave Search API.
+const EXA_BASE_URL = "https://api.exa.ai/search";
+const EXA_HOST = "api.exa.ai";
+const BRAVE_BASE_URL = "https://api.search.brave.com/res/v1/web/search";
+const BRAVE_HOST = "api.search.brave.com";
+
+const ENV_PROVIDER = "WEB_SEARCH_PROVIDER";
+const ENV_EXA_API_KEY = "EXA_API_KEY";
+const ENV_BRAVE_API_KEY = "BRAVE_API_KEY";
+
+const SearchProviderMode = enum {
+    auto,
+    exa,
+    brave,
+};
+
+const ExaAttempt = union(enum) {
+    success: ToolResult,
+    fallbackable_error: []u8,
+    fatal_error: []u8,
+};
+
+/// Web search tool using Exa/Brave APIs.
 pub const WebSearchTool = struct {
+    /// Optional config override from tools.web_search_provider.
+    /// Empty means: use WEB_SEARCH_PROVIDER env selection.
+    provider_mode_override: []const u8 = "",
+
     pub const tool_name = "web_search";
-    pub const tool_description = "Search the web using Brave Search API. Returns titles, URLs, and descriptions. Requires BRAVE_API_KEY env var.";
+    pub const tool_description = "Search the web using Exa or Brave. Provider is selected by WEB_SEARCH_PROVIDER=auto|exa|brave. API keys: EXA_API_KEY and/or BRAVE_API_KEY.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"}},"required":["query"]}
     ;
@@ -34,7 +64,7 @@ pub const WebSearchTool = struct {
         };
     }
 
-    pub fn execute(_: *WebSearchTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(self: *WebSearchTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const query = root.getString(args, "query") orelse
             return ToolResult.fail("Missing required 'query' parameter");
 
@@ -42,63 +72,12 @@ pub const WebSearchTool = struct {
             return ToolResult.fail("'query' must not be empty");
 
         const count = parseCount(args);
-
-        // Get API key from environment
-        const api_key = platform.getEnvOrNull(allocator, "BRAVE_API_KEY") orelse
-            return ToolResult.fail("BRAVE_API_KEY environment variable not set. Get a free key at https://brave.com/search/api/");
-        defer allocator.free(api_key);
-
-        if (api_key.len == 0)
-            return ToolResult.fail("BRAVE_API_KEY is empty");
-
-        // URL-encode query
-        const encoded_query = try urlEncode(allocator, query);
-        defer allocator.free(encoded_query);
-
-        // Build URL
-        const url_str = try std.fmt.allocPrint(
-            allocator,
-            "https://api.search.brave.com/res/v1/web/search?q={s}&count={d}",
-            .{ encoded_query, count },
-        );
-        defer allocator.free(url_str);
-
-        const headers = [_][]const u8{
-            try std.fmt.allocPrint(allocator, "X-Subscription-Token: {s}", .{api_key}),
-            "Accept: application/json",
+        const mode = resolveProviderMode(self.provider_mode_override, allocator);
+        return switch (mode) {
+            .auto => executeAutoMode(allocator, query, count),
+            .exa => executeExaMode(allocator, query, count),
+            .brave => executeBraveMode(allocator, query, count),
         };
-        defer allocator.free(headers[0]);
-
-        const connect_host = net_security.resolveConnectHost(allocator, "api.search.brave.com", 443) catch
-            return ToolResult.fail("Unable to verify Brave Search host safety");
-        defer allocator.free(connect_host);
-
-        const response = http_util.request_with_mode(
-            allocator,
-            .{ .mode = .curl_only },
-            .{
-                .method = "GET",
-                .url = url_str,
-                .headers = &headers,
-                .timeout_ms = 20_000,
-                .subsystem = .tools,
-                .resolve_host = "api.search.brave.com",
-                .resolve_port = 443,
-                .connect_host = connect_host,
-            },
-        ) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Search request failed: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer allocator.free(response.body);
-
-        if (response.status_code != 200) {
-            const msg = try std.fmt.allocPrint(allocator, "Brave Search API returned HTTP {d}", .{response.status_code});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        }
-
-        // Parse JSON response and format results
-        return formatBraveResults(allocator, response.body, query);
     }
 };
 
@@ -128,6 +107,231 @@ pub fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 
 fn hexDigit(v: u8) u8 {
     return "0123456789ABCDEF"[v & 0x0f];
+}
+
+fn resolveProviderMode(provider_mode_override: []const u8, allocator: std.mem.Allocator) SearchProviderMode {
+    const trimmed_override = std.mem.trim(u8, provider_mode_override, " \t\r\n");
+    if (trimmed_override.len > 0) return parseProviderMode(trimmed_override);
+
+    const raw = platform.getEnvOrNull(allocator, ENV_PROVIDER) orelse return .auto;
+    defer allocator.free(raw);
+    return parseProviderMode(raw);
+}
+
+fn parseProviderMode(raw: []const u8) SearchProviderMode {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .auto;
+    if (std.ascii.eqlIgnoreCase(trimmed, "exa")) return .exa;
+    if (std.ascii.eqlIgnoreCase(trimmed, "brave")) return .brave;
+    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return .auto;
+    return .auto;
+}
+
+fn getTrimmedEnvOrNull(allocator: std.mem.Allocator, key: []const u8) ?[]u8 {
+    const raw = platform.getEnvOrNull(allocator, key) orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(raw);
+        return null;
+    }
+    if (trimmed.ptr == raw.ptr and trimmed.len == raw.len) return @constCast(raw);
+    const out = allocator.dupe(u8, trimmed) catch {
+        allocator.free(raw);
+        return null;
+    };
+    allocator.free(raw);
+    return out;
+}
+
+fn exaStatusAllowsFallback(status_code: u16) bool {
+    return status_code == 429 or status_code >= 500;
+}
+
+fn preferredAutoProvider(has_exa: bool, has_brave: bool) ?SearchProviderMode {
+    if (has_exa) return .exa;
+    if (has_brave) return .brave;
+    return null;
+}
+
+fn executeAutoMode(allocator: std.mem.Allocator, query: []const u8, count: usize) !ToolResult {
+    const exa_key = getTrimmedEnvOrNull(allocator, ENV_EXA_API_KEY);
+    defer if (exa_key) |key| allocator.free(key);
+
+    const brave_key = getTrimmedEnvOrNull(allocator, ENV_BRAVE_API_KEY);
+    defer if (brave_key) |key| allocator.free(key);
+
+    const preferred = preferredAutoProvider(exa_key != null, brave_key != null) orelse
+        return ToolResult.fail("No search provider configured. Set EXA_API_KEY or BRAVE_API_KEY.");
+
+    if (preferred == .exa) {
+        const exa_attempt = try tryExaSearch(allocator, query, count, exa_key.?);
+        switch (exa_attempt) {
+            .success => |result| return result,
+            .fatal_error => |msg| return .{ .success = false, .output = "", .error_msg = msg },
+            .fallbackable_error => |msg| {
+                defer allocator.free(msg);
+                if (brave_key) |key| return executeBraveSearchWithKey(allocator, query, count, key);
+                const err_msg = try std.fmt.allocPrint(
+                    allocator,
+                    "Exa search failed ({s}) and BRAVE_API_KEY is not set for fallback.",
+                    .{msg},
+                );
+                return .{ .success = false, .output = "", .error_msg = err_msg };
+            },
+        }
+    }
+
+    return executeBraveSearchWithKey(allocator, query, count, brave_key.?);
+}
+
+fn executeExaMode(allocator: std.mem.Allocator, query: []const u8, count: usize) !ToolResult {
+    const exa_key = getTrimmedEnvOrNull(allocator, ENV_EXA_API_KEY) orelse
+        return ToolResult.fail("EXA_API_KEY environment variable not set.");
+    defer allocator.free(exa_key);
+
+    const exa_attempt = try tryExaSearch(allocator, query, count, exa_key);
+    return switch (exa_attempt) {
+        .success => |result| result,
+        .fallbackable_error => |msg| .{ .success = false, .output = "", .error_msg = msg },
+        .fatal_error => |msg| .{ .success = false, .output = "", .error_msg = msg },
+    };
+}
+
+fn executeBraveMode(allocator: std.mem.Allocator, query: []const u8, count: usize) !ToolResult {
+    const brave_key = getTrimmedEnvOrNull(allocator, ENV_BRAVE_API_KEY) orelse
+        return ToolResult.fail("BRAVE_API_KEY environment variable not set. Get a free key at https://brave.com/search/api/");
+    defer allocator.free(brave_key);
+    return executeBraveSearchWithKey(allocator, query, count, brave_key);
+}
+
+fn executeBraveSearchWithKey(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    count: usize,
+    brave_api_key: []const u8,
+) !ToolResult {
+    const encoded_query = try urlEncode(allocator, query);
+    defer allocator.free(encoded_query);
+
+    const url_str = try std.fmt.allocPrint(
+        allocator,
+        "{s}?q={s}&count={d}",
+        .{ BRAVE_BASE_URL, encoded_query, count },
+    );
+    defer allocator.free(url_str);
+
+    const auth_header = try std.fmt.allocPrint(allocator, "X-Subscription-Token: {s}", .{brave_api_key});
+    defer allocator.free(auth_header);
+
+    const headers = [_][]const u8{
+        auth_header,
+        "Accept: application/json",
+    };
+
+    const connect_host = net_security.resolveConnectHost(allocator, BRAVE_HOST, 443) catch
+        return ToolResult.fail("Unable to verify Brave Search host safety");
+    defer allocator.free(connect_host);
+
+    const response = http_util.request_with_mode(
+        allocator,
+        .{ .mode = .curl_only },
+        .{
+            .method = "GET",
+            .url = url_str,
+            .headers = &headers,
+            .timeout_ms = 20_000,
+            .subsystem = .tools,
+            .resolve_host = BRAVE_HOST,
+            .resolve_port = 443,
+            .connect_host = connect_host,
+        },
+    ) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "Brave search request failed: {}", .{err});
+        return .{ .success = false, .output = "", .error_msg = msg };
+    };
+    defer allocator.free(response.body);
+
+    if (response.status_code != 200) {
+        const msg = try std.fmt.allocPrint(allocator, "Brave Search API returned HTTP {d}", .{response.status_code});
+        return .{ .success = false, .output = "", .error_msg = msg };
+    }
+
+    return formatBraveResults(allocator, response.body, query);
+}
+
+fn buildExaSearchBody(allocator: std.mem.Allocator, query: []const u8, count: usize) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+
+    try body.append(allocator, '{');
+    try json_util.appendJsonKey(&body, allocator, "query");
+    try json_util.appendJsonString(&body, allocator, query);
+    try body.append(allocator, ',');
+    try json_util.appendJsonKey(&body, allocator, "type");
+    try json_util.appendJsonString(&body, allocator, "auto");
+    try body.append(allocator, ',');
+    try json_util.appendJsonInt(&body, allocator, "numResults", @intCast(count));
+    try body.append(allocator, '}');
+
+    return body.toOwnedSlice(allocator);
+}
+
+fn tryExaSearch(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    count: usize,
+    exa_api_key: []const u8,
+) !ExaAttempt {
+    const request_body = try buildExaSearchBody(allocator, query, count);
+    defer allocator.free(request_body);
+
+    const auth_header = try std.fmt.allocPrint(allocator, "x-api-key: {s}", .{exa_api_key});
+    defer allocator.free(auth_header);
+    const headers = [_][]const u8{
+        auth_header,
+        "Content-Type: application/json",
+        "Accept: application/json",
+    };
+
+    const connect_host = net_security.resolveConnectHost(allocator, EXA_HOST, 443) catch
+        return .{ .fatal_error = try allocator.dupe(u8, "Unable to verify Exa host safety") };
+    defer allocator.free(connect_host);
+
+    const response = http_util.request_with_mode(
+        allocator,
+        .{ .mode = .curl_only },
+        .{
+            .method = "POST",
+            .url = EXA_BASE_URL,
+            .body = request_body,
+            .headers = &headers,
+            .timeout_ms = 20_000,
+            .subsystem = .tools,
+            .resolve_host = EXA_HOST,
+            .resolve_port = 443,
+            .connect_host = connect_host,
+        },
+    ) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "Exa search request failed: {}", .{err});
+        return .{ .fallbackable_error = msg };
+    };
+    defer allocator.free(response.body);
+
+    if (response.status_code != 200) {
+        const msg = try std.fmt.allocPrint(allocator, "Exa Search API returned HTTP {d}", .{response.status_code});
+        if (exaStatusAllowsFallback(response.status_code)) {
+            return .{ .fallbackable_error = msg };
+        }
+        return .{ .fatal_error = msg };
+    }
+
+    const parsed = try formatExaResults(allocator, response.body, query);
+    if (!parsed.success) {
+        const reason = parsed.error_msg orelse "unknown parse error";
+        const msg = try std.fmt.allocPrint(allocator, "Exa response parse failed: {s}", .{reason});
+        return .{ .fallbackable_error = msg };
+    }
+    return .{ .success = parsed };
 }
 
 /// Parse Brave Search JSON and format as text results.
@@ -161,13 +365,35 @@ pub fn formatBraveResults(allocator: std.mem.Allocator, json_body: []const u8, q
     if (results_arr.items.len == 0)
         return ToolResult.ok("No web results found.");
 
+    return formatSearchResults(allocator, query, results_arr.items, "title", "url", "description");
+}
+
+/// Parse Exa Search JSON and format as text results.
+pub fn formatExaResults(allocator: std.mem.Allocator, json_body: []const u8, query: []const u8) !ToolResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_body, .{}) catch
+        return ToolResult.fail("Failed to parse search response JSON");
+    defer parsed.deinit();
+
+    const root_val = switch (parsed.value) {
+        .object => |o| o,
+        else => return ToolResult.fail("Unexpected search response format"),
+    };
+
+    const results_val = root_val.get("results") orelse
+        return ToolResult.ok("No web results found.");
+    const results_arr = switch (results_val) {
+        .array => |a| a,
+        else => return ToolResult.ok("No web results found."),
+    };
+    if (results_arr.items.len == 0) return ToolResult.ok("No web results found.");
+
     // Format results
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-
     try std.fmt.format(buf.writer(allocator), "Results for: {s}\n\n", .{query});
 
-    for (results_arr.items, 0..) |item, i| {
+    var rank: usize = 0;
+    for (results_arr.items) |item| {
         const obj = switch (item) {
             .object => |o| o,
             else => continue,
@@ -175,16 +401,73 @@ pub fn formatBraveResults(allocator: std.mem.Allocator, json_body: []const u8, q
 
         const title = extractString(obj, "title") orelse "(no title)";
         const url = extractString(obj, "url") orelse "(no url)";
-        const desc = extractString(obj, "description") orelse "";
+        const desc = exaResultDescription(obj) orelse "";
 
-        try std.fmt.format(buf.writer(allocator), "{d}. {s}\n   {s}\n", .{ i + 1, title, url });
-        if (desc.len > 0) {
-            try std.fmt.format(buf.writer(allocator), "   {s}\n", .{desc});
-        }
-        try buf.append(allocator, '\n');
+        rank += 1;
+        try appendFormattedResult(buf.writer(allocator), rank, title, url, desc);
     }
 
+    if (rank == 0) return ToolResult.ok("No web results found.");
     return ToolResult.ok(try buf.toOwnedSlice(allocator));
+}
+
+fn formatSearchResults(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    items: []const std.json.Value,
+    title_key: []const u8,
+    url_key: []const u8,
+    desc_key: []const u8,
+) !ToolResult {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try std.fmt.format(buf.writer(allocator), "Results for: {s}\n\n", .{query});
+
+    var rank: usize = 0;
+    for (items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+
+        const title = extractString(obj, title_key) orelse "(no title)";
+        const url = extractString(obj, url_key) orelse "(no url)";
+        const desc = extractString(obj, desc_key) orelse "";
+
+        rank += 1;
+        try appendFormattedResult(buf.writer(allocator), rank, title, url, desc);
+    }
+
+    if (rank == 0) return ToolResult.ok("No web results found.");
+    return ToolResult.ok(try buf.toOwnedSlice(allocator));
+}
+
+fn appendFormattedResult(writer: anytype, rank: usize, title: []const u8, url: []const u8, desc: []const u8) !void {
+    try std.fmt.format(writer, "{d}. {s}\n   {s}\n", .{ rank, title, url });
+    if (desc.len > 0) {
+        const snippet = std.mem.trim(u8, desc, " \t\r\n");
+        if (snippet.len > MAX_SNIPPET_CHARS) {
+            try std.fmt.format(writer, "   {s}...\n", .{snippet[0..MAX_SNIPPET_CHARS]});
+        } else {
+            try std.fmt.format(writer, "   {s}\n", .{snippet});
+        }
+    }
+    try writer.writeByte('\n');
+}
+
+fn exaResultDescription(obj: std.json.ObjectMap) ?[]const u8 {
+    if (obj.get("highlights")) |v| {
+        if (v == .array) {
+            for (v.array.items) |item| {
+                if (item == .string and item.string.len > 0) return item.string;
+            }
+        }
+    }
+    if (extractString(obj, "summary")) |value| return value;
+    if (extractString(obj, "text")) |value| return value;
+    if (extractString(obj, "snippet")) |value| return value;
+    return null;
 }
 
 fn extractString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -228,9 +511,13 @@ test "WebSearchTool empty query fails" {
 }
 
 test "WebSearchTool no API key fails with helpful message" {
-    // This test relies on BRAVE_API_KEY not being set in test env
+    // This test relies on EXA_API_KEY and BRAVE_API_KEY not being set in test env.
     // If it is set, the test would try to make a real request
-    if (platform.getEnvOrNull(testing.allocator, "BRAVE_API_KEY")) |k| {
+    if (platform.getEnvOrNull(testing.allocator, ENV_BRAVE_API_KEY)) |k| {
+        testing.allocator.free(k);
+        return;
+    }
+    if (platform.getEnvOrNull(testing.allocator, ENV_EXA_API_KEY)) |k| {
         testing.allocator.free(k);
         return;
     }
@@ -239,7 +526,7 @@ test "WebSearchTool no API key fails with helpful message" {
     defer parsed.deinit();
     const result = try wst.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
-    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "BRAVE_API_KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "EXA_API_KEY") != null or std.mem.indexOf(u8, result.error_msg.?, "BRAVE_API_KEY") != null);
 }
 
 test "parseCount defaults to 5" {
@@ -313,5 +600,71 @@ test "formatBraveResults no web key" {
 
 test "formatBraveResults invalid JSON" {
     const result = try formatBraveResults(testing.allocator, "not json", "q");
+    try testing.expect(!result.success);
+}
+
+test "parseProviderMode supports known values and defaults" {
+    try testing.expectEqual(SearchProviderMode.auto, parseProviderMode(""));
+    try testing.expectEqual(SearchProviderMode.auto, parseProviderMode("AUTO"));
+    try testing.expectEqual(SearchProviderMode.exa, parseProviderMode("exa"));
+    try testing.expectEqual(SearchProviderMode.exa, parseProviderMode(" ExA "));
+    try testing.expectEqual(SearchProviderMode.brave, parseProviderMode("brave"));
+    try testing.expectEqual(SearchProviderMode.auto, parseProviderMode("unknown"));
+}
+
+test "resolveProviderMode prefers config override over env" {
+    try testing.expectEqual(SearchProviderMode.exa, resolveProviderMode("exa", testing.allocator));
+    try testing.expectEqual(SearchProviderMode.brave, resolveProviderMode("brave", testing.allocator));
+    try testing.expectEqual(SearchProviderMode.auto, resolveProviderMode("auto", testing.allocator));
+}
+
+test "preferredAutoProvider selection" {
+    try testing.expectEqual(@as(?SearchProviderMode, .exa), preferredAutoProvider(true, true));
+    try testing.expectEqual(@as(?SearchProviderMode, .exa), preferredAutoProvider(true, false));
+    try testing.expectEqual(@as(?SearchProviderMode, .brave), preferredAutoProvider(false, true));
+    try testing.expectEqual(@as(?SearchProviderMode, null), preferredAutoProvider(false, false));
+}
+
+test "exaStatusAllowsFallback decision matrix" {
+    try testing.expect(exaStatusAllowsFallback(429));
+    try testing.expect(exaStatusAllowsFallback(500));
+    try testing.expect(exaStatusAllowsFallback(503));
+    try testing.expect(!exaStatusAllowsFallback(400));
+    try testing.expect(!exaStatusAllowsFallback(401));
+    try testing.expect(!exaStatusAllowsFallback(403));
+}
+
+test "buildExaSearchBody escapes query and sets count" {
+    const body = try buildExaSearchBody(testing.allocator, "zig \"lang\"", 7);
+    defer testing.allocator.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "\"query\":\"zig \\\"lang\\\"\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"numResults\":7") != null);
+}
+
+test "formatExaResults parses valid JSON" {
+    const json =
+        \\{"results":[
+        \\  {"title":"Exa One","url":"https://exa.ai/one","highlights":["first highlight"],"text":"ignored"},
+        \\  {"title":"Exa Two","url":"https://exa.ai/two","text":"full text snippet"}
+        \\]}
+    ;
+    const result = try formatExaResults(testing.allocator, json, "exa query");
+    defer testing.allocator.free(result.output);
+    try testing.expect(result.success);
+    try testing.expect(std.mem.indexOf(u8, result.output, "Results for: exa query") != null);
+    try testing.expect(std.mem.indexOf(u8, result.output, "1. Exa One") != null);
+    try testing.expect(std.mem.indexOf(u8, result.output, "first highlight") != null);
+    try testing.expect(std.mem.indexOf(u8, result.output, "2. Exa Two") != null);
+}
+
+test "formatExaResults empty results" {
+    const json = "{\"results\":[]}";
+    const result = try formatExaResults(testing.allocator, json, "none");
+    try testing.expect(result.success);
+    try testing.expectEqualStrings("No web results found.", result.output);
+}
+
+test "formatExaResults invalid JSON" {
+    const result = try formatExaResults(testing.allocator, "invalid json", "q");
     try testing.expect(!result.success);
 }

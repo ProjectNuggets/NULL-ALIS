@@ -57,12 +57,8 @@ pub const ComposioTool = struct {
 
     fn listActionsV3(self: *ComposioTool, allocator: std.mem.Allocator, app_name: ?[]const u8) !ToolResult {
         var url_buf: [512]u8 = undefined;
-        const url = if (app_name) |a|
-            std.fmt.bufPrint(&url_buf, COMPOSIO_API_BASE_V3 ++ "/tools?toolkits={s}&page=1&page_size=100", .{a}) catch
-                return ToolResult.fail("URL too long")
-        else
-            std.fmt.bufPrint(&url_buf, COMPOSIO_API_BASE_V3 ++ "/tools?page=1&page_size=100", .{}) catch
-                return ToolResult.fail("URL too long");
+        const url = buildToolsListUrlV3(&url_buf, app_name) catch
+            return ToolResult.fail("URL too long");
 
         return self.httpGet(allocator, url);
     }
@@ -102,7 +98,7 @@ pub const ComposioTool = struct {
         defer allocator.free(slug);
 
         var url_buf: [512]u8 = undefined;
-        const url = std.fmt.bufPrint(&url_buf, COMPOSIO_API_BASE_V3 ++ "/tools/{s}/execute", .{slug}) catch
+        const url = buildExecuteToolUrlV3(&url_buf, slug) catch
             return ToolResult.fail("URL too long");
 
         const eid = normalizeEntityId(entity_id);
@@ -171,20 +167,12 @@ pub const ComposioTool = struct {
 
     // ── v3 connect ─────────────────────────────────────────────────
 
-    fn connectActionV3(self: *ComposioTool, allocator: std.mem.Allocator, app: ?[]const u8, entity: []const u8) !ToolResult {
-        const app_name = app orelse return ToolResult.fail("Missing 'app' for v3 connect");
-        _ = app_name;
-
+    fn connectActionV3(self: *ComposioTool, allocator: std.mem.Allocator, entity: []const u8, auth_config_id: []const u8) !ToolResult {
         var url_buf: [512]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, COMPOSIO_API_BASE_V3 ++ "/connected_accounts/link", .{}) catch
             return ToolResult.fail("URL too long");
-
-        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_buf.deinit(allocator);
-        try body_buf.appendSlice(allocator, "{\"user_id\":\"");
-        try appendJsonEscaped(&body_buf, allocator, entity);
-        try body_buf.appendSlice(allocator, "\"}");
-        const body = try body_buf.toOwnedSlice(allocator);
+        const body = buildConnectBodyV3(allocator, entity, auth_config_id) catch
+            return ToolResult.fail("Failed to build connect body");
         defer allocator.free(body);
 
         return self.httpPost(allocator, url, body);
@@ -192,20 +180,23 @@ pub const ComposioTool = struct {
 
     fn connectAction(self: *ComposioTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const app = root.getString(args, "app");
-        if (app == null and root.getString(args, "auth_config_id") == null) {
+        const auth_config_id = root.getString(args, "auth_config_id");
+        if (app == null and auth_config_id == null) {
             return ToolResult.fail("Missing 'app' or 'auth_config_id' for connect");
         }
 
         const entity_raw = root.getString(args, "entity_id");
         const entity = if (entity_raw) |e| e else self.entity_id;
 
-        // Try v3 first, fall back to v2
-        const v3_result = try self.connectActionV3(allocator, app, entity);
-        if (v3_result.success) return v3_result;
+        // V3 link requires auth_config_id; otherwise skip directly to v2 app connect.
+        if (auth_config_id) |auth_id| {
+            const v3_result = try self.connectActionV3(allocator, entity, auth_id);
+            if (v3_result.success) return v3_result;
 
-        // Free v3 error resources before fallback
-        if (v3_result.error_msg) |e| allocator.free(e);
-        if (v3_result.output.len > 0) allocator.free(v3_result.output);
+            // Free v3 error resources before fallback
+            if (v3_result.error_msg) |e| allocator.free(e);
+            if (v3_result.output.len > 0) allocator.free(v3_result.output);
+        }
 
         // v2 fallback requires app
         const app_for_v2 = app orelse return ToolResult.fail("Missing 'app' for connect (v2 fallback)");
@@ -338,18 +329,12 @@ pub const ComposioTool = struct {
 
 // ── Helper functions ────────────────────────────────────────────────
 
-/// Convert UPPER_SNAKE_CASE to kebab-case: GMAIL_FETCH_EMAILS -> gmail-fetch-emails
+/// Normalize tool slug by trimming only.
+/// Composio v3 expects the exact slug shape returned by list APIs
+/// (often UPPER_SNAKE_CASE for many toolkits).
 pub fn normalizeToolSlug(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     const trimmed = std.mem.trim(u8, name, " \t\n");
-    var result = try allocator.alloc(u8, trimmed.len);
-    for (trimmed, 0..) |c, i| {
-        if (c == '_') {
-            result[i] = '-';
-        } else {
-            result[i] = std.ascii.toLower(c);
-        }
-    }
-    return result;
+    return allocator.dupe(u8, trimmed);
 }
 
 /// Normalize entity ID: trim whitespace, default to "default" if empty.
@@ -359,6 +344,28 @@ pub fn normalizeEntityId(entity_id: ?[]const u8) []const u8 {
         if (trimmed.len > 0) return trimmed;
     }
     return "default";
+}
+
+fn buildToolsListUrlV3(url_buf: []u8, app_name: ?[]const u8) ![]const u8 {
+    return if (app_name) |a|
+        std.fmt.bufPrint(url_buf, COMPOSIO_API_BASE_V3 ++ "/tools?toolkit_slug={s}&page=1&page_size=100", .{a})
+    else
+        std.fmt.bufPrint(url_buf, COMPOSIO_API_BASE_V3 ++ "/tools?page=1&page_size=100", .{});
+}
+
+fn buildExecuteToolUrlV3(url_buf: []u8, tool_slug: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(url_buf, COMPOSIO_API_BASE_V3 ++ "/tools/execute/{s}", .{tool_slug});
+}
+
+fn buildConnectBodyV3(allocator: std.mem.Allocator, entity: []const u8, auth_config_id: []const u8) ![]u8 {
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(allocator);
+    try body_buf.appendSlice(allocator, "{\"user_id\":\"");
+    try appendJsonEscaped(&body_buf, allocator, entity);
+    try body_buf.appendSlice(allocator, "\",\"auth_config_id\":\"");
+    try appendJsonEscaped(&body_buf, allocator, auth_config_id);
+    try body_buf.appendSlice(allocator, "\"}");
+    return body_buf.toOwnedSlice(allocator);
 }
 
 /// Sanitize error message: redact potential secrets (long alphanumeric strings > 20 chars)
@@ -537,7 +544,7 @@ test "composio connect missing app" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "app") != null or std.mem.indexOf(u8, result.error_msg.?, "auth_config_id") != null);
 }
 
 test "composio connect with app invokes curl" {
@@ -558,16 +565,36 @@ test "composio v3 api base url" {
     try std.testing.expectEqualStrings("https://backend.composio.dev/api/v3", COMPOSIO_API_BASE_V3);
 }
 
-test "composio normalizeToolSlug converts UPPER_SNAKE to kebab" {
+test "composio buildToolsListUrlV3 uses toolkit_slug filter" {
+    var buf: [512]u8 = undefined;
+    const url = try buildToolsListUrlV3(&buf, "gmail");
+    try std.testing.expect(std.mem.indexOf(u8, url, "toolkit_slug=gmail") != null);
+}
+
+test "composio buildExecuteToolUrlV3 uses execute prefix path" {
+    var buf: [512]u8 = undefined;
+    const url = try buildExecuteToolUrlV3(&buf, "gmail-list-labels");
+    try std.testing.expectEqualStrings("https://backend.composio.dev/api/v3/tools/execute/gmail-list-labels", url);
+}
+
+test "composio buildConnectBodyV3 includes auth_config_id and user_id" {
+    const alloc = std.testing.allocator;
+    const body = try buildConnectBodyV3(alloc, "user-1", "ac_123");
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"user_id\":\"user-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"auth_config_id\":\"ac_123\"") != null);
+}
+
+test "composio normalizeToolSlug preserves UPPER_SNAKE" {
     const alloc = std.testing.allocator;
     const result = try normalizeToolSlug(alloc, "GMAIL_FETCH_EMAILS");
     defer alloc.free(result);
-    try std.testing.expectEqualStrings("gmail-fetch-emails", result);
+    try std.testing.expectEqualStrings("GMAIL_FETCH_EMAILS", result);
 }
 
-test "composio normalizeToolSlug handles already lowercase" {
+test "composio normalizeToolSlug trims whitespace only" {
     const alloc = std.testing.allocator;
-    const result = try normalizeToolSlug(alloc, "github-list-repos");
+    const result = try normalizeToolSlug(alloc, "  github-list-repos  ");
     defer alloc.free(result);
     try std.testing.expectEqualStrings("github-list-repos", result);
 }

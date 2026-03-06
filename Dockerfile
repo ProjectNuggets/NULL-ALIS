@@ -9,7 +9,7 @@ WORKDIR /app
 COPY build.zig build.zig.zon ./
 COPY src/ src/
 
-RUN zig build -Doptimize=ReleaseSmall
+RUN zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres
 
 # ── Stage 2: Config Prep ─────────────────────────────────────
 FROM busybox:1.37 AS config

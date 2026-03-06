@@ -681,6 +681,9 @@ pub const Config = struct {
         try w.print("    \"shell_max_output_bytes\": {d},\n", .{self.tools.shell_max_output_bytes});
         try w.print("    \"max_file_size_bytes\": {d},\n", .{self.tools.max_file_size_bytes});
         try w.print("    \"web_fetch_max_chars\": {d}", .{self.tools.web_fetch_max_chars});
+        if (self.tools.web_search_provider.len > 0) {
+            try w.print(",\n    \"web_search_provider\": \"{s}\"", .{self.tools.web_search_provider});
+        }
         // tools.media.audio
         {
             const am = self.audio_media;
@@ -3130,6 +3133,17 @@ test "profile defaults do not override explicit model primary" {
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
     try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
+}
+
+test "tools config parses web_search_provider" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"tools": {"web_search_provider": "exa"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("exa", cfg.tools.web_search_provider);
+    allocator.free(cfg.tools.web_search_provider);
 }
 
 test "save and parse preserve profile" {

@@ -388,7 +388,7 @@ pub fn allTools(
         try list.append(allocator, wft.tool());
 
         const wst = try allocator.create(web_search.WebSearchTool);
-        wst.* = .{};
+        wst.* = .{ .provider_mode_override = tc.web_search_provider };
         try list.append(allocator, wst.tool());
     }
 

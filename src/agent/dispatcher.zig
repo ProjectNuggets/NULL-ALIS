@@ -73,6 +73,9 @@ pub fn parseXmlToolCalls(
     allocator: std.mem.Allocator,
     response: []const u8,
 ) !ParseResult {
+    const open_tag = "<tool_call>";
+    const close_tag = "</tool_call>";
+
     var text_parts: std.ArrayListUnmanaged([]const u8) = .empty;
     defer text_parts.deinit(allocator);
 
@@ -85,19 +88,66 @@ pub fn parseXmlToolCalls(
         calls.deinit(allocator);
     }
 
-    var remaining = response;
+    var cursor: usize = 0;
 
-    while (std.mem.indexOf(u8, remaining, "<tool_call>")) |start| {
+    while (std.mem.indexOfPos(u8, response, cursor, open_tag)) |start| {
         // Text before the tag
-        const before = std.mem.trim(u8, remaining[0..start], " \t\r\n");
+        const before = std.mem.trim(u8, response[cursor..start], " \t\r\n");
         if (before.len > 0) {
             try text_parts.append(allocator, before);
         }
 
-        const after_open = remaining[start + 11 ..];
-        if (std.mem.indexOf(u8, after_open, "</tool_call>")) |end| {
-            const inner = std.mem.trim(u8, after_open[0..end], " \t\r\n");
+        const inner_start = start + open_tag.len;
+        const close_idx = std.mem.indexOfPos(u8, response, inner_start, close_tag);
+        const next_open_idx = std.mem.indexOfPos(u8, response, inner_start, open_tag);
 
+        var inner_end: usize = response.len;
+        var next_cursor: usize = response.len;
+        var last_unclosed_segment = false;
+
+        if (close_idx) |close_pos| {
+            if (next_open_idx) |next_pos| {
+                if (next_pos < close_pos) {
+                    // Malformed output: a new <tool_call> starts before the first close.
+                    // Treat this segment as one call and continue at the next opening tag.
+                    inner_end = next_pos;
+                    next_cursor = next_pos;
+                } else {
+                    inner_end = close_pos;
+                    next_cursor = close_pos + close_tag.len;
+                }
+            } else {
+                inner_end = close_pos;
+                next_cursor = close_pos + close_tag.len;
+            }
+        } else if (next_open_idx) |next_pos| {
+            // Unclosed call followed by another opening tag — still try to parse
+            // this segment to avoid leaking raw tool JSON to users.
+            inner_end = next_pos;
+            next_cursor = next_pos;
+        } else {
+            // Last unclosed tag at end-of-response.
+            inner_end = response.len;
+            next_cursor = response.len;
+            last_unclosed_segment = true;
+        }
+
+        const inner = std.mem.trim(u8, response[inner_start..inner_end], " \t\r\n");
+
+        var should_parse_inner = inner.len > 0;
+        if (should_parse_inner and last_unclosed_segment) {
+            // Keep historical safety for trailing prose after an unclosed tag:
+            // parse only if the remaining segment is a standalone JSON object.
+            should_parse_inner = false;
+            if (extractJsonObject(inner)) |json_slice| {
+                const json_trimmed = std.mem.trim(u8, json_slice, " \t\r\n");
+                if (json_trimmed.ptr == inner.ptr and json_trimmed.len == inner.len) {
+                    should_parse_inner = true;
+                }
+            }
+        }
+
+        if (should_parse_inner) {
             // Try to extract JSON object from inner content (may have markdown fences or preamble text)
             // Then fall back to <function=name><parameter=key>value</parameter></function> format
             var call_parsed = false;
@@ -118,16 +168,14 @@ pub fn parseXmlToolCalls(
                     else => {},
                 }
             }
-
-            remaining = after_open[end + 12 ..];
-        } else {
-            // Unclosed tag — stop parsing
-            break;
         }
+
+        if (next_cursor <= cursor) break;
+        cursor = next_cursor;
     }
 
     // Remaining text after last tool call
-    const trailing = std.mem.trim(u8, remaining, " \t\r\n");
+    const trailing = std.mem.trim(u8, response[cursor..], " \t\r\n");
     if (trailing.len > 0) {
         try text_parts.append(allocator, trailing);
     }
@@ -958,6 +1006,32 @@ test "parseToolCalls unclosed tag" {
     }
     // Unclosed tag should stop parsing, text before tag should be captured
     try std.testing.expectEqual(@as(usize, 0), result.calls.len);
+}
+
+test "parseToolCalls recovers malformed consecutive tool_call openings" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_call>
+        \\{"name":"file_edit","arguments":{"path":"a.log","old_text":"x","new_text":"y"}}
+        \\<tool_call>
+        \\{"name":"file_edit","arguments":{"path":"b.log","old_text":"x","new_text":"y"}}
+        \\<tool_call>
+        \\{"name":"file_edit","arguments":{"path":"c.log","old_text":"x","new_text":"y"}}
+    ;
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        if (result.text.len > 0) allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), result.calls.len);
+    try std.testing.expectEqualStrings("file_edit", result.calls[0].name);
+    try std.testing.expectEqualStrings("file_edit", result.calls[1].name);
+    try std.testing.expectEqualStrings("file_edit", result.calls[2].name);
 }
 
 test "parseToolCalls malformed JSON inside tag" {

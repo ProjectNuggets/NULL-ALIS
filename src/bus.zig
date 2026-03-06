@@ -39,12 +39,18 @@ pub const OutboundMessage = struct {
     chat_id: []const u8, // target chat
     content: []const u8, // response text
     media: []const []const u8 = &.{}, // file paths/URLs to send
+    source: ?[]const u8 = null, // proactive source tag: cron, heartbeat, spawn, tool
+    user_id: ?[]const u8 = null, // optional tenant user scope for guardrails/diagnostics
+    dedupe_key: ?[]const u8 = null, // optional explicit dedupe key for proactive sends
 
     pub fn deinit(self: *const OutboundMessage, allocator: Allocator) void {
         for (self.media) |m| allocator.free(m);
         if (self.media.len > 0) allocator.free(self.media);
         // channel is a string literal or long-lived config pointer — not owned, don't free
         if (self.account_id) |aid| allocator.free(aid);
+        if (self.source) |source| allocator.free(source);
+        if (self.user_id) |user_id| allocator.free(user_id);
+        if (self.dedupe_key) |dedupe_key| allocator.free(dedupe_key);
         allocator.free(self.chat_id);
         allocator.free(self.content);
     }
@@ -153,6 +159,23 @@ pub fn makeOutbound(
     };
 }
 
+pub fn makeOutboundAnnotated(
+    allocator: Allocator,
+    channel: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    source: ?[]const u8,
+    user_id: ?[]const u8,
+    dedupe_key: ?[]const u8,
+) Allocator.Error!OutboundMessage {
+    var msg = try makeOutbound(allocator, channel, chat_id, content);
+    errdefer msg.deinit(allocator);
+    msg.source = if (source) |s| try allocator.dupe(u8, s) else null;
+    msg.user_id = if (user_id) |u| try allocator.dupe(u8, u) else null;
+    msg.dedupe_key = if (dedupe_key) |d| try allocator.dupe(u8, d) else null;
+    return msg;
+}
+
 pub fn makeOutboundWithAccount(
     allocator: Allocator,
     channel: []const u8,
@@ -172,6 +195,24 @@ pub fn makeOutboundWithAccount(
         .chat_id = cid,
         .content = ct,
     };
+}
+
+pub fn makeOutboundWithAccountAnnotated(
+    allocator: Allocator,
+    channel: []const u8,
+    account_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    source: ?[]const u8,
+    user_id: ?[]const u8,
+    dedupe_key: ?[]const u8,
+) Allocator.Error!OutboundMessage {
+    var msg = try makeOutboundWithAccount(allocator, channel, account_id, chat_id, content);
+    errdefer msg.deinit(allocator);
+    msg.source = if (source) |s| try allocator.dupe(u8, s) else null;
+    msg.user_id = if (user_id) |u| try allocator.dupe(u8, u) else null;
+    msg.dedupe_key = if (dedupe_key) |d| try allocator.dupe(u8, d) else null;
+    return msg;
 }
 
 /// Create an OutboundMessage with media attachments.

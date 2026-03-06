@@ -27,10 +27,13 @@ const agent_routing = @import("agent_routing.zig");
 const agent_prompt = @import("agent/prompt.zig");
 const security = @import("security/policy.zig");
 const http_util = @import("http_util.zig");
+const json_util = @import("json_util.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const onboard = @import("onboard.zig");
 const zaki_state_mod = @import("zaki_state.zig");
 const zaki_session = @import("zaki_session.zig");
+const ops_guard = @import("ops_guard.zig");
+const heartbeat_wake = @import("heartbeat_wake.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -349,6 +352,24 @@ pub const GatewayState = struct {
     in_flight_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     drain_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    state_backend_configured: []const u8 = "file",
+    state_backend_effective: []const u8 = "file",
+    scheduler_backend: []const u8 = "file",
+    webhook_mode: []const u8 = "none",
+    heartbeat_enabled: bool = false,
+    heartbeat_interval_minutes: u32 = 0,
+    tenant_enabled_configured: bool = false,
+    postgres_port: u16 = 0,
+    postgres_host_buf: [64]u8 = [_]u8{0} ** 64,
+    postgres_host_len: usize = 0,
+    postgres_schema_buf: [64]u8 = [_]u8{0} ** 64,
+    postgres_schema_len: usize = 0,
+    config_path_buf: [160]u8 = [_]u8{0} ** 160,
+    config_path_len: usize = 0,
+    state_degraded: bool = false,
+    state_degraded_reason_buf: [64]u8 = [_]u8{0} ** 64,
+    state_degraded_reason_len: usize = 0,
+    last_degraded_warn_s: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
     zaki_state: ?*zaki_state_mod.Manager = null,
@@ -394,6 +415,22 @@ pub const GatewayState = struct {
             mgr.deinit();
             self.allocator.destroy(mgr);
         }
+    }
+
+    fn postgresHost(self: *const GatewayState) []const u8 {
+        return self.postgres_host_buf[0..self.postgres_host_len];
+    }
+
+    fn postgresSchema(self: *const GatewayState) []const u8 {
+        return self.postgres_schema_buf[0..self.postgres_schema_len];
+    }
+
+    fn degradedReason(self: *const GatewayState) []const u8 {
+        return self.state_degraded_reason_buf[0..self.state_degraded_reason_len];
+    }
+
+    fn configPath(self: *const GatewayState) []const u8 {
+        return self.config_path_buf[0..self.config_path_len];
     }
 };
 
@@ -1256,6 +1293,23 @@ fn readTrimmedSecretFile(allocator: std.mem.Allocator, path: []const u8) ![]cons
     return out;
 }
 
+fn resolveTenantTelegramBotTokenForSend(allocator: std.mem.Allocator, user_ctx: *const UserContext) ![]const u8 {
+    const secret_path = try resolveSecretPath(allocator, user_ctx.secrets_dir, "telegram_bot_token");
+    defer allocator.free(secret_path);
+
+    const raw = try readTrimmedSecretFile(allocator, secret_path);
+    const normalized = normalizeTelegramBotToken(raw);
+    if (!isLikelyTelegramBotToken(normalized)) {
+        if (raw.len > 0) allocator.free(raw);
+        return error.CurlFailed;
+    }
+    if (normalized.ptr == raw.ptr and normalized.len == raw.len) return raw;
+
+    const out = try allocator.dupe(u8, normalized);
+    if (raw.len > 0) allocator.free(raw);
+    return out;
+}
+
 fn maybeAcquireTenantOwnershipLock(
     allocator: std.mem.Allocator,
     state: *const GatewayState,
@@ -1348,7 +1402,9 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
         },
     ) catch |err| {
         if (job.bot_token.len > 0) {
-            sendTelegramReply(job.allocator, job.bot_token, job.chat_id, userFacingAgentError(err)) catch {};
+            sendTelegramReply(job.allocator, job.bot_token, job.chat_id, userFacingAgentError(err)) catch |send_err| {
+                log.warn("tenant telegram async error-reply send failed: {}", .{send_err});
+            };
         }
         return;
     };
@@ -1452,6 +1508,195 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
 
 fn normalizeTelegramSecretToken(value: []const u8) []const u8 {
     return std.mem.trim(u8, value, " \t\r\n\"");
+}
+
+fn isTelegramBotTokenChar(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
+}
+
+fn isTelegramBotTokenShape(value: []const u8) bool {
+    if (value.len < 16) return false;
+    const colon_idx = std.mem.indexOfScalar(u8, value, ':') orelse return false;
+    if (colon_idx == 0 or colon_idx + 1 >= value.len) return false;
+
+    for (value[0..colon_idx]) |ch| {
+        if (ch < '0' or ch > '9') return false;
+    }
+    for (value[colon_idx + 1 ..]) |ch| {
+        if (!isTelegramBotTokenChar(ch)) return false;
+    }
+    return true;
+}
+
+fn findTelegramBotTokenCandidate(value: []const u8) ?[]const u8 {
+    var idx: usize = 0;
+    while (idx < value.len) : (idx += 1) {
+        if (value[idx] != ':') continue;
+        if (idx == 0 or idx + 1 >= value.len) continue;
+
+        var left_start = idx;
+        while (left_start > 0) {
+            const ch = value[left_start - 1];
+            if (ch < '0' or ch > '9') break;
+            left_start -= 1;
+        }
+
+        const left_len = idx - left_start;
+        if (left_len < 5) continue;
+
+        var right_end = idx + 1;
+        while (right_end < value.len and isTelegramBotTokenChar(value[right_end])) {
+            right_end += 1;
+        }
+        const right_len = right_end - (idx + 1);
+        if (right_len < 10) continue;
+
+        const candidate = value[left_start..right_end];
+        if (isTelegramBotTokenShape(candidate)) return candidate;
+    }
+    return null;
+}
+
+fn normalizeTelegramBotToken(value: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len >= 2) {
+        const first = trimmed[0];
+        const last = trimmed[trimmed.len - 1];
+        if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
+            trimmed = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+        }
+    }
+    if (isTelegramBotTokenShape(trimmed)) return trimmed;
+    if (findTelegramBotTokenCandidate(trimmed)) |candidate| return candidate;
+    return trimmed;
+}
+
+fn copyIntoBuf(buf: []u8, value: []const u8) usize {
+    const n = @min(buf.len, value.len);
+    if (n > 0) @memcpy(buf[0..n], value[0..n]);
+    if (n < buf.len) @memset(buf[n..], 0);
+    return n;
+}
+
+fn parsePostgresHostPort(connection_string: []const u8) struct { host: []const u8, port: u16 } {
+    const scheme_split = std.mem.indexOf(u8, connection_string, "://") orelse return .{ .host = "", .port = 0 };
+    var tail = connection_string[scheme_split + 3 ..];
+    if (std.mem.indexOfScalar(u8, tail, '@')) |at_idx| {
+        tail = tail[at_idx + 1 ..];
+    }
+
+    if (tail.len == 0) return .{ .host = "", .port = 0 };
+    if (tail[0] == '[') {
+        const close_idx = std.mem.indexOfScalar(u8, tail, ']') orelse return .{ .host = "", .port = 0 };
+        const host = tail[1..close_idx];
+        var port: u16 = 5432;
+        if (close_idx + 1 < tail.len and tail[close_idx + 1] == ':') {
+            const after = tail[close_idx + 2 ..];
+            const end = std.mem.indexOfAny(u8, after, "/?") orelse after.len;
+            port = std.fmt.parseInt(u16, after[0..end], 10) catch 5432;
+        }
+        return .{ .host = host, .port = port };
+    }
+
+    const host_end = std.mem.indexOfAny(u8, tail, ":/?") orelse tail.len;
+    const host = tail[0..host_end];
+    var port: u16 = 5432;
+    if (host_end < tail.len and tail[host_end] == ':') {
+        const after = tail[host_end + 1 ..];
+        const end = std.mem.indexOfAny(u8, after, "/?") orelse after.len;
+        port = std.fmt.parseInt(u16, after[0..end], 10) catch 5432;
+    }
+    return .{ .host = host, .port = port };
+}
+
+fn detectWebhookMode(cfg: *const Config) []const u8 {
+    var enabled_count: u8 = 0;
+    var only: []const u8 = "none";
+
+    if (cfg.channels.telegram.len > 0) {
+        enabled_count += 1;
+        only = "telegram";
+    }
+    if (cfg.channels.whatsapp.len > 0) {
+        enabled_count += 1;
+        only = "whatsapp";
+    }
+    if (cfg.channels.line.len > 0) {
+        enabled_count += 1;
+        only = "line";
+    }
+    if (cfg.channels.lark.len > 0) {
+        enabled_count += 1;
+        only = "lark";
+    }
+    if (enabled_count == 0) return "none";
+    if (enabled_count == 1) return only;
+    return "multi";
+}
+
+fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init_error: ?anyerror) void {
+    state.state_backend_configured = cfg.state.backend;
+    state.state_backend_effective = if (state.zaki_state != null) "postgres" else "file";
+    state.scheduler_backend = if (state.zaki_state != null and cfg.tenant.enabled) "postgres" else "file";
+    state.webhook_mode = detectWebhookMode(cfg);
+    state.heartbeat_enabled = cfg.heartbeat.enabled;
+    state.heartbeat_interval_minutes = cfg.heartbeat.interval_minutes;
+    state.tenant_enabled_configured = cfg.tenant.enabled;
+    state.config_path_len = copyIntoBuf(&state.config_path_buf, cfg.config_path);
+    state.postgres_host_len = 0;
+    state.postgres_port = 0;
+    state.postgres_schema_len = copyIntoBuf(&state.postgres_schema_buf, cfg.state.postgres.schema);
+    if (std.mem.eql(u8, cfg.state.backend, "postgres")) {
+        const parsed = parsePostgresHostPort(cfg.state.postgres.connection_string);
+        state.postgres_host_len = copyIntoBuf(&state.postgres_host_buf, parsed.host);
+        state.postgres_port = parsed.port;
+    }
+
+    state.state_degraded = std.mem.eql(u8, cfg.state.backend, "postgres") and state.zaki_state == null;
+    if (state.state_degraded) {
+        const reason = if (postgres_init_error) |err| @errorName(err) else "postgres_init_failed";
+        state.state_degraded_reason_len = copyIntoBuf(&state.state_degraded_reason_buf, reason);
+    } else {
+        state.state_degraded_reason_len = 0;
+    }
+}
+
+fn logStartupSelfCheck(state: *const GatewayState) void {
+    log.info(
+        "startup.self_check config_path={s} tenant_enabled={s} heartbeat_enabled={s} heartbeat_interval_minutes={d} state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} webhook_mode={s}",
+        .{
+            state.configPath(),
+            if (state.tenant_enabled_configured) "true" else "false",
+            if (state.heartbeat_enabled) "true" else "false",
+            state.heartbeat_interval_minutes,
+            state.state_backend_configured,
+            state.state_backend_effective,
+            if (state.state_degraded) "true" else "false",
+            state.postgresHost(),
+            state.postgres_port,
+            state.postgresSchema(),
+            state.scheduler_backend,
+            state.webhook_mode,
+        },
+    );
+    if (state.state_degraded) {
+        log.warn(
+            "gateway running in degraded state: configured backend={s}, effective backend={s}, reason={s}",
+            .{ state.state_backend_configured, state.state_backend_effective, state.degradedReason() },
+        );
+    }
+}
+
+fn maybeLogDegradedStateWarning(state: *GatewayState) void {
+    if (!state.state_degraded) return;
+    const now = std.time.timestamp();
+    const last = state.last_degraded_warn_s.load(.acquire);
+    if (now - last < 300 and now >= last) return;
+    state.last_degraded_warn_s.store(now, .release);
+    log.warn(
+        "gateway degraded state persists: configured backend={s}, effective backend={s}, reason={s}",
+        .{ state.state_backend_configured, state.state_backend_effective, state.degradedReason() },
+    );
 }
 
 // ── WhatsApp HMAC-SHA256 Signature Verification ─────────────────
@@ -2291,11 +2536,14 @@ pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8)
 
 /// Send a reply to a Telegram chat using the Bot API.
 pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, chat_id: i64, text: []const u8) !void {
-    // Build the curl command to call the Telegram API
-    const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
-    defer allocator.free(url);
+    const normalized_bot_token = normalizeTelegramBotToken(bot_token);
+    if (!isLikelyTelegramBotToken(normalized_bot_token)) {
+        const colon_idx = std.mem.indexOfScalar(u8, normalized_bot_token, ':');
+        const colon_pos: i64 = if (colon_idx) |idx| @intCast(idx) else -1;
+        log.warn("telegram send skipped: invalid bot token shape chat_id={d} len={d} colon_pos={d}", .{ chat_id, normalized_bot_token.len, colon_pos });
+        return error.CurlFailed;
+    }
 
-    // JSON-escape the text for the body
     var body_buf: std.ArrayList(u8) = .empty;
     defer body_buf.deinit(allocator);
     const w = body_buf.writer(allocator);
@@ -2312,21 +2560,81 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
     }
     try w.writeAll("\"}");
 
-    const body = body_buf.items;
+    const resp = telegramApiCall(allocator, normalized_bot_token, "sendMessage", body_buf.items) catch |err| {
+        log.warn("telegramApiCall sendMessage failed: {}", .{err});
+        return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
+    };
+    defer allocator.free(resp);
+    if (!(jsonBoolField(resp, "ok") orelse false)) {
+        log.warn("telegram sendMessage api returned non-ok; retrying via curl fallback", .{});
+        return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
+    }
+}
 
-    var curl_child = std.process.Child.init(
+fn sendTelegramReplyViaCurlFallback(allocator: std.mem.Allocator, bot_token: []const u8, body: []const u8) !void {
+    const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
+    defer allocator.free(url);
+
+    var child = std.process.Child.init(
         &[_][]const u8{
-            "curl", "-s",                             "-X", "POST",
-            "-H",   "Content-Type: application/json", "-d", body,
+            "curl",
+            "-sS",
+            "--max-time",
+            "30",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
             url,
         },
         allocator,
     );
-    curl_child.stdout_behavior = .Pipe;
-    curl_child.stderr_behavior = .Pipe;
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
 
-    curl_child.spawn() catch return;
-    _ = curl_child.wait() catch {};
+    try child.spawn();
+
+    if (child.stdin) |stdin_file| {
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        };
+        stdin_file.close();
+        child.stdin = null;
+    } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlWriteError;
+    }
+
+    const stdout_bytes = if (child.stdout) |stdout_file|
+        stdout_file.readToEndAlloc(allocator, 1024 * 1024) catch &.{}
+    else
+        &.{};
+    defer if (stdout_bytes.len > 0) allocator.free(stdout_bytes);
+
+    const stderr_bytes = if (child.stderr) |stderr_file|
+        stderr_file.readToEndAlloc(allocator, 256 * 1024) catch &.{}
+    else
+        &.{};
+    defer if (stderr_bytes.len > 0) allocator.free(stderr_bytes);
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            if (stderr_bytes.len > 0) {
+                log.warn("telegram curl fallback failed code={d} stderr={s}", .{ code, stderr_bytes });
+            }
+            return error.CurlFailed;
+        },
+        else => return error.CurlFailed,
+    }
 }
 
 fn userFacingAgentError(err: anyerror) []const u8 {
@@ -2448,16 +2756,333 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
     );
 }
 
+fn appendHeartbeatRuntimeSummaryJson(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id_opt: ?[]const u8,
+) !void {
+    try json_util.appendJsonKey(buf, allocator, "heartbeat_runtime");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKey(buf, allocator, "user_id");
+    if (user_id_opt) |user_id| {
+        try json_util.appendJsonString(buf, allocator, user_id);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "available");
+
+    if (!state.tenant_enabled or user_id_opt == null) {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    }
+
+    const user_id = user_id_opt.?;
+    const path = std.fmt.allocPrint(allocator, "{s}/{s}/heartbeat_runtime.json", .{ state.tenant_data_root, user_id }) catch {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    };
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    };
+    defer file.close();
+
+    const raw = file.readToEndAlloc(allocator, 64 * 1024) catch {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    };
+    defer allocator.free(raw);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        try buf.appendSlice(allocator, "false,");
+        try json_util.appendJsonKey(buf, allocator, "last_run_s");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_status");
+        try buf.appendSlice(allocator, "null,");
+        try json_util.appendJsonKey(buf, allocator, "last_reason");
+        try buf.appendSlice(allocator, "null}");
+        return;
+    }
+
+    const obj = parsed.value.object;
+    const last_run_s = if (obj.get("last_run_s")) |v|
+        if (v == .integer) @as(?i64, v.integer) else null
+    else
+        null;
+    const last_status = if (obj.get("last_status")) |v|
+        if (v == .string) @as(?[]const u8, v.string) else null
+    else
+        null;
+    const last_reason = if (obj.get("last_reason")) |v|
+        if (v == .string) @as(?[]const u8, v.string) else null
+    else
+        null;
+
+    try buf.appendSlice(allocator, "true,");
+    try json_util.appendJsonKey(buf, allocator, "last_run_s");
+    if (last_run_s) |value| {
+        var int_buf: [24]u8 = undefined;
+        const text = std.fmt.bufPrint(&int_buf, "{d}", .{value}) catch "0";
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_status");
+    if (last_status) |value| {
+        try json_util.appendJsonString(buf, allocator, value);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_reason");
+    if (last_reason) |value| {
+        try json_util.appendJsonString(buf, allocator, value);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, "}");
+}
+
+fn internalDiagnosticsPayload(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id_opt: ?[]const u8,
+) ![]u8 {
+    const ops_json = try ops_guard.diagnosticsJson(allocator);
+    defer allocator.free(ops_json);
+
+    var last_trigger_ts_s: ?i64 = null;
+    var last_trigger_source: ?[]const u8 = null;
+    var last_trigger_action: ?[]const u8 = null;
+    var last_trigger_reason: ?[]const u8 = null;
+    const parsed_ops = std.json.parseFromSlice(std.json.Value, allocator, ops_json, .{}) catch null;
+    defer if (parsed_ops) |*p| p.deinit();
+    if (parsed_ops) |p| {
+        if (p.value == .object) {
+            if (p.value.object.get("last_event")) |last| {
+                if (last == .object) {
+                    if (last.object.get("ts_s")) |v| {
+                        if (v == .integer) last_trigger_ts_s = v.integer;
+                    }
+                    if (last.object.get("source")) |v| {
+                        if (v == .string and v.string.len > 0) last_trigger_source = v.string;
+                    }
+                    if (last.object.get("action")) |v| {
+                        if (v == .string and v.string.len > 0) last_trigger_action = v.string;
+                    }
+                    if (last.object.get("reason")) |v| {
+                        if (v == .string and v.string.len > 0) last_trigger_reason = v.string;
+                    }
+                }
+            }
+        }
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKey(&buf, allocator, "gateway");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "requests_total", @intCast(state.requests_total.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "in_flight_requests", @intCast(state.in_flight_requests.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "draining");
+    try buf.appendSlice(allocator, if (state.draining.load(.acquire)) "true" else "false");
+    try buf.appendSlice(allocator, "},");
+
+    try json_util.appendJsonKey(&buf, allocator, "startup_self_check");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(&buf, allocator, "config_path", state.configPath());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_configured", state.state_backend_configured);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_effective", state.state_backend_effective);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "heartbeat_enabled");
+    try buf.appendSlice(allocator, if (state.heartbeat_enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "heartbeat_interval_minutes", state.heartbeat_interval_minutes);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "tenant_enabled");
+    try buf.appendSlice(allocator, if (state.tenant_enabled_configured) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "degraded");
+    try buf.appendSlice(allocator, if (state.state_degraded) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "degraded_reason", state.degradedReason());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "postgres_host", state.postgresHost());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "postgres_port", state.postgres_port);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "postgres_schema", state.postgresSchema());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "scheduler_backend", state.scheduler_backend);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "webhook_mode", state.webhook_mode);
+    try buf.appendSlice(allocator, "},");
+
+    try json_util.appendJsonKey(&buf, allocator, "heartbeat_wake");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "pending", @intCast(heartbeat_wake.pendingCount()));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "dropped_total", @intCast(heartbeat_wake.droppedCount()));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "coalesced_total", @intCast(heartbeat_wake.coalescedCount()));
+    try buf.appendSlice(allocator, "},");
+
+    try json_util.appendJsonKey(&buf, allocator, "last_trigger");
+    if (last_trigger_source == null and last_trigger_action == null and last_trigger_reason == null and last_trigger_ts_s == null) {
+        try buf.appendSlice(allocator, "null,");
+    } else {
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKey(&buf, allocator, "ts_s");
+        if (last_trigger_ts_s) |value| {
+            var int_buf: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&int_buf, "{d}", .{value}) catch "0";
+            try buf.appendSlice(allocator, text);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "source");
+        if (last_trigger_source) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "action");
+        if (last_trigger_action) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "reason");
+        if (last_trigger_reason) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, "},");
+    }
+
+    try appendHeartbeatRuntimeSummaryJson(&buf, allocator, state, user_id_opt);
+    try buf.appendSlice(allocator, ",");
+
+    try json_util.appendJsonKey(&buf, allocator, "ops");
+    try buf.appendSlice(allocator, ops_json);
+    try buf.appendSlice(allocator, "}");
+    return buf.toOwnedSlice(allocator);
+}
+
 fn sseErrorEvent(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) ![]u8 {
+    const error_frame = try sseErrorFrame(allocator, code, msg);
+    defer allocator.free(error_frame);
+    const done_frame = try sseDoneFrame(allocator, null, null);
+    defer allocator.free(done_frame);
+
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try w.writeAll("event: error\ndata: {\"code\":\"");
+    try w.writeAll(error_frame);
+    try w.writeAll(done_frame);
+    return buf.toOwnedSlice(allocator);
+}
+
+const SSE_TOKEN_CHUNK_SIZE: usize = 96;
+
+fn sseStatusFrame(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: status\ndata: {\"type\":\"statusResponse\",\"content\":\"");
+    try jsonEscapeInto(w, content);
+    try w.writeAll("\"}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn sseErrorFrame(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: error\ndata: {\"type\":\"error\",\"code\":\"");
     try jsonEscapeInto(w, code);
     try w.writeAll("\",\"message\":\"");
     try jsonEscapeInto(w, msg);
     try w.writeAll("\"}\n\n");
-    try w.writeAll("event: done\ndata: {\"status\":\"error\"}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn sseTokenFrame(allocator: std.mem.Allocator, delta: []const u8, seq: usize) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: token\ndata: {\"delta\":\"");
+    try jsonEscapeInto(w, delta);
+    try w.writeAll("\",\"content\":\"");
+    try jsonEscapeInto(w, delta);
+    try w.print("\",\"seq\":{d}}}\n\n", .{seq});
+    return buf.toOwnedSlice(allocator);
+}
+
+fn sseDoneFrame(allocator: std.mem.Allocator, session_id: ?[]const u8, message_id: ?i64) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: done\ndata: {\"type\":\"done\"");
+    if (session_id) |sid| {
+        try w.writeAll(",\"session_id\":\"");
+        try jsonEscapeInto(w, sid);
+        try w.writeAll("\"");
+    }
+    if (message_id) |mid| {
+        try w.print(",\"message_id\":\"{d}\"", .{mid});
+    }
+    try w.writeAll("}\n\n");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -2468,21 +3093,223 @@ fn sseChatPayload(allocator: std.mem.Allocator, text: []const u8, session_id: []
     const message_id = std.time.milliTimestamp();
 
     var start: usize = 0;
-    const CHUNK_SIZE: usize = 96;
     var seq: usize = 0;
-    while (start < text.len) : (start += CHUNK_SIZE) {
-        const end = @min(start + CHUNK_SIZE, text.len);
-        try w.writeAll("event: token\ndata: {\"delta\":\"");
-        try jsonEscapeInto(w, text[start..end]);
-        try w.writeAll("\",\"content\":\"");
-        try jsonEscapeInto(w, text[start..end]);
-        try w.print("\",\"seq\":{d}}}\n\n", .{seq});
+    while (start < text.len) : (start += SSE_TOKEN_CHUNK_SIZE) {
+        const end = @min(start + SSE_TOKEN_CHUNK_SIZE, text.len);
+        const token_frame = try sseTokenFrame(allocator, text[start..end], seq);
+        defer allocator.free(token_frame);
+        try w.writeAll(token_frame);
         seq += 1;
     }
-    try w.writeAll("event: done\ndata: {\"status\":\"ok\",\"session_id\":\"");
-    try jsonEscapeInto(w, session_id);
-    try w.print("\",\"message_id\":\"{d}\"}}\n\n", .{message_id});
+    const done_frame = try sseDoneFrame(allocator, session_id, message_id);
+    defer allocator.free(done_frame);
+    try w.writeAll(done_frame);
     return buf.toOwnedSlice(allocator);
+}
+
+fn sendChunkedSseHeader(stream: anytype, status: []const u8) !void {
+    var header_buf: [512]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {s}\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nX-Accel-Buffering: no\r\n\r\n",
+        .{status},
+    );
+    try stream.writeAll(header);
+}
+
+fn sendChunkedSseFrame(stream: anytype, frame: []const u8) !void {
+    var prefix_buf: [32]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "{x}\r\n", .{frame.len});
+    try stream.writeAll(prefix);
+    try stream.writeAll(frame);
+    try stream.writeAll("\r\n");
+}
+
+fn finishChunkedSse(stream: anytype) !void {
+    try stream.writeAll("0\r\n\r\n");
+}
+
+fn sendSseErrorResponse(stream: anytype, allocator: std.mem.Allocator, status: []const u8, code: []const u8, msg: []const u8) void {
+    sendChunkedSseHeader(stream, status) catch return;
+    sendSseErrorFrames(stream, allocator, code, msg);
+}
+
+fn sendSseErrorFrames(stream: anytype, allocator: std.mem.Allocator, code: []const u8, msg: []const u8) void {
+    const error_fallback = "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
+    const error_owned = sseErrorFrame(allocator, code, msg) catch null;
+    defer if (error_owned) |frame| allocator.free(frame);
+    const error_frame: []const u8 = if (error_owned) |frame| frame else error_fallback;
+    sendChunkedSseFrame(stream, error_frame) catch return;
+
+    const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
+    const done_owned = sseDoneFrame(allocator, null, null) catch null;
+    defer if (done_owned) |frame| allocator.free(frame);
+    const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
+    sendChunkedSseFrame(stream, done_frame) catch return;
+
+    finishChunkedSse(stream) catch {};
+}
+
+fn handleApiChatStreamSseConnection(
+    root_allocator: std.mem.Allocator,
+    req_allocator: std.mem.Allocator,
+    stream: anytype,
+    raw_request: []const u8,
+    method: []const u8,
+    base_path: []const u8,
+    state: *GatewayState,
+    config_opt: ?*const Config,
+    session_mgr_opt: ?*session_mod.SessionManager,
+) bool {
+    if (!std.mem.eql(u8, base_path, "/api/v1/chat/stream")) return false;
+
+    const request_start_ms = std.time.milliTimestamp();
+    if (!validateInternalServiceToken(raw_request, state.internal_service_tokens)) {
+        sendSseErrorResponse(stream, req_allocator, "401 Unauthorized", "unauthorized", "unauthorized");
+        return true;
+    }
+    if (!std.mem.eql(u8, method, "POST")) {
+        sendSseErrorResponse(stream, req_allocator, "405 Method Not Allowed", "method_not_allowed", "method not allowed");
+        return true;
+    }
+    if (state.draining.load(.acquire)) {
+        sendSseErrorResponse(stream, req_allocator, "503 Service Unavailable", "gateway_draining", "gateway draining, retry shortly");
+        return true;
+    }
+
+    const body = extractBody(raw_request) orelse {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_body", "missing body");
+        return true;
+    };
+    const header_user_id = extractZakiUserId(raw_request);
+    if (state.tenant_enabled and header_user_id == null) {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_user_id", "missing X-Zaki-User-Id");
+        return true;
+    }
+    const user_id = header_user_id orelse jsonStringField(body, "user_id") orelse {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_user_id", "missing X-Zaki-User-Id");
+        return true;
+    };
+
+    var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "invalid_user", "invalid user");
+        return true;
+    };
+    defer user_ctx.deinit(req_allocator);
+
+    ensureUserProvisioned(state, &user_ctx) catch {
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
+        return true;
+    };
+    const project_ctx = onboard.zakiBotProjectContext();
+    onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &project_ctx) catch {};
+
+    var ownership_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
+        error.LockHeld => {
+            _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
+            sendSseErrorResponse(stream, req_allocator, "409 Conflict", "ownership_lock_conflict", "user is active on another node, retry shortly");
+            return true;
+        },
+        else => {
+            sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "tenant_lock_failed", "tenant ownership lock failed");
+            return true;
+        },
+    };
+    defer if (ownership_lock_opt) |*lock| lock.deinit();
+
+    const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_message", "missing message");
+        return true;
+    };
+
+    var session_buf: [256]u8 = undefined;
+    const session_key = zaki_session.userMainSessionKey(&session_buf, user_id);
+    _ = state.chat_stream_total.fetchAdd(1, .monotonic);
+    sendChunkedSseHeader(stream, "200 OK") catch return true;
+
+    const status_fallback = "event: status\ndata: {\"type\":\"statusResponse\",\"content\":\"Processing request\"}\n\n";
+    const status_owned = sseStatusFrame(req_allocator, "Processing request") catch null;
+    defer if (status_owned) |frame| req_allocator.free(frame);
+    const status_frame: []const u8 = if (status_owned) |frame| frame else status_fallback;
+    sendChunkedSseFrame(stream, status_frame) catch return true;
+
+    const chat_start_ms = std.time.milliTimestamp();
+    const reply = blk: {
+        if (state.tenant_enabled) {
+            const cfg = config_opt orelse {
+                _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
+                sendSseErrorFrames(stream, req_allocator, "tenant_config_missing", "tenant runtime unavailable");
+                return true;
+            };
+            const tenant_runtime = getTenantRuntime(state, cfg, &user_ctx) catch {
+                _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
+                sendSseErrorFrames(stream, req_allocator, "tenant_runtime_failed", "tenant runtime init failed");
+                return true;
+            };
+            break :blk tenant_runtime.processMessage(
+                session_key,
+                message,
+                .{
+                    .channel = "zaki_app",
+                    .is_group = false,
+                },
+                null,
+            ) catch {
+                _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
+                sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
+                return true;
+            };
+        }
+        if (session_mgr_opt) |sm| {
+            break :blk sm.processMessage(session_key, message, null) catch {
+                _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
+                sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
+                return true;
+            };
+        }
+        break :blk processIncomingMessage(root_allocator, message) catch {
+            _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
+            sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
+            return true;
+        };
+    };
+    defer root_allocator.free(reply);
+
+    const payload_text = if (reply.len > 0) reply else "received";
+    var start: usize = 0;
+    var seq: usize = 0;
+    while (start < payload_text.len) : (start += SSE_TOKEN_CHUNK_SIZE) {
+        const end = @min(start + SSE_TOKEN_CHUNK_SIZE, payload_text.len);
+        const token_owned = sseTokenFrame(req_allocator, payload_text[start..end], seq) catch {
+            sendSseErrorFrames(stream, req_allocator, "stream_encode_failed", "failed to encode token frame");
+            return true;
+        };
+        defer req_allocator.free(token_owned);
+        sendChunkedSseFrame(stream, token_owned) catch return true;
+        seq += 1;
+    }
+
+    const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
+    const done_owned = sseDoneFrame(req_allocator, session_key, std.time.milliTimestamp()) catch null;
+    defer if (done_owned) |frame| req_allocator.free(frame);
+    const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
+    sendChunkedSseFrame(stream, done_frame) catch {
+        sendSseErrorFrames(stream, req_allocator, "stream_done_failed", "failed to emit done frame");
+        return true;
+    };
+    finishChunkedSse(stream) catch return true;
+
+    const chat_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - chat_start_ms));
+    const request_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - request_start_ms));
+    log.info("chat.stream.complete user={s} session={s} chat_ms={d} sse_ms={d} total_ms={d}", .{
+        user_id,
+        session_key,
+        chat_duration_ms,
+        @as(u64, 0),
+        request_duration_ms,
+    });
+
+    return true;
 }
 
 fn parseUserPath(base_path: []const u8) ?struct { user_id: []const u8, subpath: []const u8 } {
@@ -2529,6 +3356,11 @@ fn buildWebhookUrlForUser(allocator: std.mem.Allocator, base_url: []const u8, us
     return std.fmt.allocPrint(allocator, "{s}/webhook/telegram?user_id={s}", .{ normalized, user_id });
 }
 
+fn isLikelyTelegramBotToken(token: []const u8) bool {
+    const trimmed = normalizeTelegramBotToken(token);
+    return isTelegramBotTokenShape(trimmed);
+}
+
 fn telegramApiUrl(allocator: std.mem.Allocator, bot_token: []const u8, method: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/{s}", .{ bot_token, method });
 }
@@ -2573,7 +3405,7 @@ fn handleApiRoute(
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         }
         if (state.draining.load(.acquire)) {
-            const body = sseErrorEvent(req_allocator, "gateway_draining", "gateway draining, retry shortly") catch "event: error\ndata: {\"code\":\"gateway_draining\",\"message\":\"gateway draining\"}\n\n";
+            const body = sseErrorEvent(req_allocator, "gateway_draining", "gateway draining, retry shortly") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"gateway_draining\",\"message\":\"gateway draining\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
             return .{ .status = "503 Service Unavailable", .body = body, .content_type = "text/event-stream; charset=utf-8" };
         }
 
@@ -2598,7 +3430,7 @@ fn handleApiRoute(
         var ownership_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
                 _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
-                const body_locked = sseErrorEvent(req_allocator, "ownership_lock_conflict", "user is active on another node, retry shortly") catch "event: error\ndata: {\"code\":\"ownership_lock_conflict\",\"message\":\"ownership lock conflict\"}\n\n";
+                const body_locked = sseErrorEvent(req_allocator, "ownership_lock_conflict", "user is active on another node, retry shortly") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"ownership lock conflict\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                 return .{
                     .status = "409 Conflict",
                     .body = body_locked,
@@ -2625,7 +3457,7 @@ fn handleApiRoute(
             if (state.tenant_enabled) {
                 const cfg = config_opt orelse {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                    const err_sse = sseErrorEvent(req_allocator, "tenant_config_missing", "tenant runtime unavailable") catch "event: error\ndata: {\"code\":\"tenant_config_missing\",\"message\":\"tenant runtime unavailable\"}\n\n";
+                    const err_sse = sseErrorEvent(req_allocator, "tenant_config_missing", "tenant runtime unavailable") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"tenant_config_missing\",\"message\":\"tenant runtime unavailable\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                     return .{
                         .status = "500 Internal Server Error",
                         .body = err_sse,
@@ -2634,7 +3466,7 @@ fn handleApiRoute(
                 };
                 const tenant_runtime = getTenantRuntime(state, cfg, &user_ctx) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                    const err_sse = sseErrorEvent(req_allocator, "tenant_runtime_failed", "tenant runtime init failed") catch "event: error\ndata: {\"code\":\"tenant_runtime_failed\",\"message\":\"tenant runtime init failed\"}\n\n";
+                    const err_sse = sseErrorEvent(req_allocator, "tenant_runtime_failed", "tenant runtime init failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"tenant_runtime_failed\",\"message\":\"tenant runtime init failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                     return .{
                         .status = "500 Internal Server Error",
                         .body = err_sse,
@@ -2651,7 +3483,7 @@ fn handleApiRoute(
                     null,
                 ) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                    const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
+                    const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                     return .{
                         .status = "500 Internal Server Error",
                         .body = err_sse,
@@ -2662,7 +3494,7 @@ fn handleApiRoute(
             if (session_mgr_opt) |sm| {
                 break :blk sm.processMessage(session_key, message, null) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                    const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
+                    const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                     return .{
                         .status = "500 Internal Server Error",
                         .body = err_sse,
@@ -2672,7 +3504,7 @@ fn handleApiRoute(
             }
             break :blk processIncomingMessage(root_allocator, message) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
+                const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                 return .{
                     .status = "500 Internal Server Error",
                     .body = err_sse,
@@ -2873,6 +3705,8 @@ fn handleApiRoute(
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
             }
+            // Ensure next turn picks up updated tenant config/tool settings immediately.
+            removeTenantRuntime(state, parsed.user_id);
             return .{ .body = "{\"status\":\"updated\"}" };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
@@ -3036,27 +3870,24 @@ fn handleApiRoute(
                 mgr.putSecret(user_id, "telegram_bot_token", tok) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
                 };
+                // Keep file secret in sync for local tenant runtime fallback.
+                writeFile(secret_path, tok) catch {};
             } else {
                 writeFile(secret_path, tok) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
                 };
             }
         }
-        const bot_token_raw = if (state.zaki_state) |mgr| blk: {
-            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-            const secret_value = mgr.getSecret(req_allocator, user_id, "telegram_bot_token") catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
-            };
-            break :blk secret_value orelse "";
-        } else blk: {
-            break :blk readFileOrDefault(req_allocator, secret_path, "") catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
-            };
+        const bot_token_raw = readTrimmedSecretFile(req_allocator, secret_path) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
         };
         defer if (state.zaki_state != null and bot_token_raw.len > 0) req_allocator.free(bot_token_raw);
-        const bot_token = std.mem.trim(u8, bot_token_raw, " \t\r\n");
+        const bot_token = normalizeTelegramBotToken(bot_token_raw);
         if (bot_token.len == 0) {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing bot_token\"}" };
+        }
+        if (!isLikelyTelegramBotToken(bot_token)) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid bot_token\"}" };
         }
         const account_id = jsonStringField(body, "account_id") orelse state.telegram_account_id;
         if (!isValidIdentifier(account_id)) {
@@ -3400,21 +4231,6 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             }
 
             const tenant_bot_token = blk: {
-                if (ctx.state.zaki_state) |mgr| {
-                    const numeric_user_id = parseNumericUserId(user_id) catch {
-                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                        ctx.response_status = "400 Bad Request";
-                        ctx.response_body = "{\"error\":\"invalid user\"}";
-                        return;
-                    };
-                    const secret_value = mgr.getSecret(ctx.req_allocator, numeric_user_id, "telegram_bot_token") catch {
-                        _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                        ctx.response_status = "500 Internal Server Error";
-                        ctx.response_body = "{\"error\":\"failed reading bot token\"}";
-                        return;
-                    };
-                    break :blk secret_value orelse "";
-                }
                 const secret_path = resolveSecretPath(ctx.req_allocator, user_ctx.secrets_dir, "telegram_bot_token") catch {
                     _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                     ctx.response_status = "500 Internal Server Error";
@@ -3436,7 +4252,14 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing telegram bot token\"}";
                 return;
             }
-            tg_bot_token = tenant_bot_token;
+            const normalized_tenant_bot_token = normalizeTelegramBotToken(tenant_bot_token);
+            if (!isLikelyTelegramBotToken(normalized_tenant_bot_token)) {
+                _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"invalid telegram bot token\"}";
+                return;
+            }
+            tg_bot_token = normalized_tenant_bot_token;
 
             if (tg_webhook_secret_token.len == 0) {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
@@ -3529,19 +4352,9 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     ctx.response_body = "{\"error\":\"tenant config missing\"}";
                     return;
                 };
-                if (enqueueTenantTelegramAsync(
-                    ctx.state,
-                    cfg,
-                    scoped_user_id.?,
-                    tg_account_id,
-                    tg_bot_token,
-                    chat_id.?,
-                    msg_text.?,
-                )) {
-                    ctx.response_body = "{\"status\":\"accepted\"}";
-                    return;
-                }
-                log.warn("tenant telegram async enqueue failed; falling back to synchronous processing", .{});
+                // Keep tenant Telegram webhook handling synchronous for deterministic
+                // delivery. Async queueing can acknowledge webhooks while worker-side
+                // failures silently drop replies.
 
                 var kb: [256]u8 = undefined;
                 const sk = zaki_session.userMainSessionKey(&kb, scoped_user_id.?);
@@ -3563,15 +4376,36 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         .chat_id = cid_str,
                     },
                 ) catch |err| blk: {
-                    if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
+                    if (tenant_user_ctx) |*send_user_ctx| {
+                        const send_token = resolveTenantTelegramBotTokenForSend(ctx.req_allocator, send_user_ctx) catch |token_err| {
+                            log.warn("telegram tenant token resolve before error-reply failed: {}", .{token_err});
+                            break :blk null;
+                        };
+                        defer if (send_token.len > 0) ctx.req_allocator.free(send_token);
+                        sendTelegramReply(ctx.req_allocator, send_token, chat_id.?, userFacingAgentError(err)) catch |send_err| {
+                            log.warn("telegram webhook error-reply send failed: {}", .{send_err});
+                        };
                     }
                     break :blk null;
                 };
                 if (reply) |r| {
                     defer ctx.root_allocator.free(r);
-                    if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch {};
+                    if (tenant_user_ctx) |*send_user_ctx| {
+                        const send_token_opt: ?[]const u8 = blk: {
+                            const send_token = resolveTenantTelegramBotTokenForSend(ctx.req_allocator, send_user_ctx) catch |token_err| {
+                                log.warn("telegram tenant token resolve before reply failed: {}", .{token_err});
+                                break :blk null;
+                            };
+                            break :blk send_token;
+                        };
+                        if (send_token_opt) |send_token| {
+                            defer if (send_token.len > 0) ctx.req_allocator.free(send_token);
+                            sendTelegramReply(ctx.req_allocator, send_token, chat_id.?, r) catch |send_err| {
+                                log.warn("telegram webhook reply send failed: {}", .{send_err});
+                            };
+                        } else {
+                            ctx.response_body = "{\"status\":\"received\"}";
+                        }
                     }
                     ctx.response_body = "{\"status\":\"ok\"}";
                 } else {
@@ -3601,14 +4435,18 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
                 const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, null) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch |send_err| {
+                            log.warn("telegram webhook sync error-reply send failed: {}", .{send_err});
+                        };
                     }
                     break :blk null;
                 };
                 if (reply) |r| {
                     defer ctx.root_allocator.free(r);
                     if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch {};
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch |send_err| {
+                            log.warn("telegram webhook sync reply send failed: {}", .{send_err});
+                        };
                     }
                     ctx.response_body = "{\"status\":\"ok\"}";
                 } else {
@@ -4300,6 +5138,7 @@ fn handleAcceptedConnection(
         return;
     };
     _ = state.requests_total.fetchAdd(1, .monotonic);
+    maybeLogDegradedStateWarning(state);
 
     // Parse first line: "METHOD /path HTTP/1.1\r\n"
     const first_line_end = std.mem.indexOf(u8, raw, "\r\n") orelse {
@@ -4320,18 +5159,21 @@ fn handleAcceptedConnection(
     defer _ = state.in_flight_requests.fetchSub(1, .acq_rel);
 
     // Simple routing — control endpoints + descriptor-driven channel webhooks + ZAKI API.
-    const ControlRoute = enum { health, ready, webhook, pair, metrics, drain, undrain, shutdown };
+    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, drain, undrain, shutdown };
     const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
         .{ "/health", .health },
         .{ "/ready", .ready },
         .{ "/webhook", .webhook },
         .{ "/pair", .pair },
         .{ "/metrics", .metrics },
+        .{ "/internal/diagnostics", .diagnostics },
+        .{ "/internal/wake-heartbeat", .wake_heartbeat },
         .{ "/internal/drain", .drain },
         .{ "/internal/undrain", .undrain },
         .{ "/internal/shutdown", .shutdown },
     });
     const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
+    const is_chat_stream_path = std.mem.eql(u8, base_path, "/api/v1/chat/stream");
     const is_post = std.mem.eql(u8, method_str, "POST");
     var response_status: []const u8 = "200 OK";
     var response_body: []const u8 = "";
@@ -4342,6 +5184,7 @@ fn handleAcceptedConnection(
     const is_ops_path = std.mem.eql(u8, base_path, "/health") or
         std.mem.eql(u8, base_path, "/ready") or
         std.mem.eql(u8, base_path, "/metrics") or
+        is_chat_stream_path or
         is_internal_path;
     if (state.draining.load(.acquire) and !is_ops_path) {
         _ = state.drain_rejected_total.fetchAdd(1, .monotonic);
@@ -4354,7 +5197,20 @@ fn handleAcceptedConnection(
         return;
     }
 
-    if (std.mem.startsWith(u8, base_path, "/api/v1/")) {
+    if (is_chat_stream_path) {
+        _ = handleApiChatStreamSseConnection(
+            allocator,
+            req_allocator,
+            conn.stream,
+            raw,
+            method_str,
+            base_path,
+            state,
+            config_opt,
+            session_mgr_opt,
+        );
+        return;
+    } else if (std.mem.startsWith(u8, base_path, "/api/v1/")) {
         const api_resp = handleApiRoute(
             allocator,
             req_allocator,
@@ -4528,6 +5384,55 @@ fn handleAcceptedConnection(
                 response_content_type = "text/plain; version=0.0.4";
             }
         },
+        .diagnostics => {
+            if (!std.mem.eql(u8, method_str, "GET")) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (!validateInternalServiceToken(raw, state.internal_service_tokens)) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                const user_id = extractHeader(raw, "X-Zaki-User-Id");
+                response_body = internalDiagnosticsPayload(req_allocator, state, user_id) catch "{\"error\":\"diagnostics unavailable\"}";
+            }
+        },
+        .wake_heartbeat => {
+            if (!std.mem.eql(u8, method_str, "POST")) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (!validateInternalServiceToken(raw, state.internal_service_tokens)) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                const body = extractBody(raw);
+                const user_id_from_header = extractHeader(raw, "X-Zaki-User-Id");
+                var user_id_owned: ?[]u8 = null;
+                defer if (user_id_owned) |value| req_allocator.free(value);
+                const user_id = blk: {
+                    if (body) |b| {
+                        if (jsonStringField(b, "user_id")) |value| break :blk value;
+                        if (jsonIntField(b, "user_id")) |value| {
+                            user_id_owned = std.fmt.allocPrint(req_allocator, "{d}", .{value}) catch null;
+                            break :blk user_id_owned;
+                        }
+                    }
+                    break :blk user_id_from_header;
+                };
+
+                const reason = if (body) |b| jsonStringField(b, "reason") orelse "internal_wake_hook" else "internal_wake_hook";
+                heartbeat_wake.enqueue(user_id, reason) catch {
+                    response_status = "500 Internal Server Error";
+                    response_body = "{\"error\":\"wake enqueue failed\"}";
+                    sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+                    return;
+                };
+
+                response_body = if (user_id) |uid|
+                    std.fmt.allocPrint(req_allocator, "{{\"status\":\"queued\",\"user_id\":\"{s}\"}}", .{uid}) catch "{\"status\":\"queued\"}"
+                else
+                    "{\"status\":\"queued\",\"scope\":\"all\"}";
+            }
+        },
         .drain => {
             if (!std.mem.eql(u8, method_str, "POST")) {
                 response_status = "405 Method Not Allowed";
@@ -4680,6 +5585,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
+        var postgres_init_error: ?anyerror = null;
         state.rate_limiter = GatewayRateLimiter.init(
             cfg.gateway.pair_rate_limit_per_minute,
             cfg.gateway.webhook_rate_limit_per_minute,
@@ -4728,6 +5634,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             const mgr = allocator.create(zaki_state_mod.Manager) catch break :init_state;
             mgr.* = zaki_state_mod.Manager.init(allocator, cfg.state) catch |err| {
                 allocator.destroy(mgr);
+                postgres_init_error = err;
                 log.warn("zaki state init failed, falling back to file state: {}", .{err});
                 break :init_state;
             };
@@ -4803,6 +5710,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 session_mgr_opt = sm;
             }
         }
+
+        applyStartupSelfCheck(&state, cfg, postgres_init_error);
+        logStartupSelfCheck(&state);
     }
     if (state.pairing_guard == null) {
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
@@ -5213,6 +6123,22 @@ test "parseTelegramUserState rejects invalid account_id" {
 test "normalizeTelegramSecretToken trims whitespace and quotes" {
     try std.testing.expectEqualStrings("abc123", normalizeTelegramSecretToken("  \"abc123\" \r\n"));
     try std.testing.expectEqualStrings("", normalizeTelegramSecretToken(" \t\r\n\"\""));
+}
+
+test "normalizeTelegramBotToken trims wrapping quotes" {
+    try std.testing.expectEqualStrings("123:ABC_def-ghi", normalizeTelegramBotToken("  \"123:ABC_def-ghi\"  "));
+    try std.testing.expectEqualStrings("123:ABC_def-ghi", normalizeTelegramBotToken("  '123:ABC_def-ghi'  "));
+}
+
+test "isLikelyTelegramBotToken accepts quoted valid token and rejects json blob" {
+    try std.testing.expect(isLikelyTelegramBotToken(" \"123456789:AAABBBccc___---\" "));
+    try std.testing.expect(!isLikelyTelegramBotToken("{\"key\":\"telegram_bot_token\",\"value\":\"123:ABC\"}"));
+}
+
+test "normalizeTelegramBotToken extracts valid token from wrapped blob" {
+    const wrapped = "{\"key\":\"telegram_bot_token\",\"value\":\"123456789:AAABBBccc___---\"}";
+    try std.testing.expectEqualStrings("123456789:AAABBBccc___---", normalizeTelegramBotToken(wrapped));
+    try std.testing.expect(isLikelyTelegramBotToken(wrapped));
 }
 
 test "readTrimmedSecretFile trims trailing whitespace" {
@@ -6788,10 +7714,11 @@ test "sseErrorEvent includes code and terminal done event" {
     const sse = try sseErrorEvent(std.testing.allocator, "chat_failed", "chat failed");
     defer std.testing.allocator.free(sse);
     try std.testing.expect(std.mem.indexOf(u8, sse, "event: error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sse, "\"type\":\"error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"code\":\"chat_failed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"message\":\"chat failed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "event: done") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sse, "\"status\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sse, "\"type\":\"done\"") != null);
 }
 
 test "sseChatPayload emits token deltas and done metadata" {
@@ -6802,7 +7729,7 @@ test "sseChatPayload emits token deltas and done metadata" {
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"content\":\"hello world\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"seq\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "event: done") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sse, "\"status\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sse, "\"type\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"session_id\":\"agent:zaki-bot:user:user_a:main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"message_id\":\"") != null);
 }
