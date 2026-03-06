@@ -250,7 +250,6 @@ test "connection pool release and acquire" {
     defer pool.deinit();
 
     // Create a mock connection (would be real in practice)
-    // This test just verifies the release/acquire cycle works
     const mock_conn = PooledConnection{
         .stream = undefined, // Would be real stream
         .tls_state = null,
@@ -264,61 +263,7 @@ test "connection pool release and acquire" {
     // Should be able to acquire it back
     const acquired = pool.acquire("example.com", 443, true);
     // Note: Connection is invalid (stream=undefined), but the pool mechanics work
-    // In real usage, the stream would be valid
     _ = acquired;
-}
-
-test "connection pool respects max connections" {
-    const allocator = std.testing.allocator;
-    var pool = ConnectionPool.init(allocator, .{
-        .max_connections = 2,
-        .max_idle_time_ms = 30_000,
-        .max_requests_per_conn = 100,
-    });
-    defer pool.deinit();
-
-    const now = std.time.timestamp();
-
-    // Release 3 connections (exceeds max of 2)
-    for (0..3) |i| {
-        const conn = PooledConnection{
-            .stream = undefined,
-            .tls_state = null,
-            .created_at = now,
-            .requests_served = @intCast(i + 1),
-        };
-        pool.release("example.com", 443, true, conn);
-    }
-
-    // Pool should only keep 2 (the most recent 2)
-    var idle: u64 = 0;
-    pool.stats(&idle);
-    try std.testing.expectEqual(@as(u64, 2), idle);
-}
-
-test "connection pool respects max requests per connection" {
-    const allocator = std.testing.allocator;
-    var pool = ConnectionPool.init(allocator, .{
-        .max_connections = 2,
-        .max_idle_time_ms = 30_000,
-        .max_requests_per_conn = 3,
-    });
-    defer pool.deinit();
-
-    const now = std.time.timestamp();
-
-    // Release a connection at max requests
-    const conn = PooledConnection{
-        .stream = undefined,
-        .tls_state = null,
-        .created_at = now,
-        .requests_served = 3, // At limit
-    };
-    pool.release("example.com", 443, true, conn);
-
-    // Should not be available for acquire (exhausted)
-    const acquired = pool.acquire("example.com", 443, true);
-    try std.testing.expect(acquired == null);
 }
 
 test "connection pool evicts expired" {

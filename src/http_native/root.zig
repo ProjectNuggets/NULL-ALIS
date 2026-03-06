@@ -1,7 +1,7 @@
 const std = @import("std");
 const net_security = @import("../net_security.zig");
 pub const types = @import("types.zig");
-const pool_mod = @import("pool.zig");
+pub const pool_mod = @import("pool.zig");
 
 pub const TransportMode = types.TransportMode;
 pub const TransportSubsystem = types.TransportSubsystem;

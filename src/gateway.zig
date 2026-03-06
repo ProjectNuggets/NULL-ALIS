@@ -27,6 +27,7 @@ const agent_routing = @import("agent_routing.zig");
 const agent_prompt = @import("agent/prompt.zig");
 const security = @import("security/policy.zig");
 const http_util = @import("http_util.zig");
+const http_native = @import("http_native/root.zig");
 const json_util = @import("json_util.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const onboard = @import("onboard.zig");
@@ -2727,6 +2728,9 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\nullalis_http_transport_fallback_total{{subsystem="providers"}} {d}
         \\nullalis_http_transport_fallback_total{{subsystem="channels"}} {d}
         \\nullalis_http_transport_fallback_total{{subsystem="system"}} {d}
+        \\# HELP nullalis_http_pool_idle_connections Current idle connections in pool.
+        \\# TYPE nullalis_http_pool_idle_connections gauge
+        \\nullalis_http_pool_idle_connections {d}
         \\
     ,
         .{
@@ -2752,6 +2756,17 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             transport_stats.providers_fallback_total,
             transport_stats.channels_fallback_total,
             transport_stats.system_fallback_total,
+            blk: {
+                // Get pool stats
+                const pool = http_native.pool_mod.globalPool(allocator, .{
+                    .max_connections = 8,
+                    .max_idle_time_ms = 30_000,
+                    .max_requests_per_conn = 100,
+                });
+                var idle: u64 = 0;
+                pool.stats(&idle);
+                break :blk idle;
+            },
         },
     );
 }
@@ -2946,6 +2961,46 @@ fn internalDiagnosticsPayload(
     try json_util.appendJsonInt(&buf, allocator, "outbound_len", @intCast(bus_outbound_len));
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "capacity", @intCast(bus_capacity));
+    try buf.appendSlice(allocator, "},");
+
+    // Add transport section with pool stats
+    const transport_stats_diag = http_util.transport_stats_snapshot();
+    var pool_idle_diag: u64 = 0;
+    {
+        const pool = http_native.pool_mod.globalPool(allocator, .{
+            .max_connections = 8,
+            .max_idle_time_ms = 30_000,
+            .max_requests_per_conn = 100,
+        });
+        pool.stats(&pool_idle_diag);
+    }
+
+    try json_util.appendJsonKey(&buf, allocator, "transport");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKey(&buf, allocator, "native");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "tools", @intCast(transport_stats_diag.tools_native_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "providers", @intCast(transport_stats_diag.providers_native_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "channels", @intCast(transport_stats_diag.channels_native_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "system", @intCast(transport_stats_diag.system_native_total));
+    try buf.appendSlice(allocator, "},");
+    try json_util.appendJsonKey(&buf, allocator, "curl");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "tools", @intCast(transport_stats_diag.tools_curl_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "providers", @intCast(transport_stats_diag.providers_curl_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "channels", @intCast(transport_stats_diag.channels_curl_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "system", @intCast(transport_stats_diag.system_curl_total));
+    try buf.appendSlice(allocator, "},");
+    try json_util.appendJsonKey(&buf, allocator, "pool");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "idle_connections", @intCast(pool_idle_diag));
+    try buf.appendSlice(allocator, "},");
     try buf.appendSlice(allocator, "},");
 
     try json_util.appendJsonKey(&buf, allocator, "startup_self_check");
