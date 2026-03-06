@@ -224,6 +224,13 @@ fn parseHeartbeatEveryToMinutes(raw: []const u8) ?u32 {
     return @intCast(clamped);
 }
 
+fn parseHeartbeatSecondsToMinutes(value: i64) ?u32 {
+    if (value <= 0) return null;
+    const mins_i64 = @max(@as(i64, 1), @divFloor(value + 59, 60));
+    const clamped = @min(mins_i64, @as(i64, std.math.maxInt(u32)));
+    return @intCast(clamped);
+}
+
 fn applyHeartbeatConfigObject(cfg: *UserHeartbeatConfig, allocator: std.mem.Allocator, object: std.json.ObjectMap) void {
     if (object.get("enabled")) |v| {
         if (v == .bool) cfg.enabled = v.bool;
@@ -232,6 +239,21 @@ fn applyHeartbeatConfigObject(cfg: *UserHeartbeatConfig, allocator: std.mem.Allo
         if (v == .integer and v.integer > 0) {
             const clamped = @min(v.integer, @as(i64, std.math.maxInt(u32)));
             cfg.interval_minutes = @intCast(clamped);
+        }
+    }
+    if (object.get("intervalSec")) |v| {
+        if (v == .integer) {
+            if (parseHeartbeatSecondsToMinutes(v.integer)) |mins| cfg.interval_minutes = mins;
+        }
+    }
+    if (object.get("interval_seconds")) |v| {
+        if (v == .integer) {
+            if (parseHeartbeatSecondsToMinutes(v.integer)) |mins| cfg.interval_minutes = mins;
+        }
+    }
+    if (object.get("interval_sec")) |v| {
+        if (v == .integer) {
+            if (parseHeartbeatSecondsToMinutes(v.integer)) |mins| cfg.interval_minutes = mins;
         }
     }
     if (object.get("every")) |v| {
@@ -2655,6 +2677,34 @@ test "loadUserHeartbeatConfig falls back to file when state json is empty object
     try std.testing.expect(cfg.enabled);
     try std.testing.expectEqual(@as(u32, 7), cfg.interval_minutes);
     try std.testing.expectEqualStrings("file prompt", cfg.prompt);
+}
+
+test "loadUserHeartbeatConfig supports intervalSec compatibility key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    const hb_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{root});
+    defer std.testing.allocator.free(hb_path);
+
+    const file = try std.fs.createFileAbsolute(hb_path, .{});
+    defer file.close();
+    try file.writeAll("{\"enabled\":true,\"intervalSec\":300,\"prompt\":\"legacy seconds key\"}\n");
+
+    var cfg = loadUserHeartbeatConfig(
+        std.testing.allocator,
+        root,
+        false,
+        30,
+        "{}",
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.enabled);
+    try std.testing.expectEqual(@as(u32, 5), cfg.interval_minutes);
+    try std.testing.expectEqualStrings("legacy seconds key", cfg.prompt);
 }
 
 test "isHeartbeatContentEffectivelyEmpty handles comments and placeholders" {
