@@ -150,6 +150,43 @@ pub fn acquireUserOwnershipLock(
     return error.LockHeld;
 }
 
+pub fn countOwnedUserLocks(
+    allocator: std.mem.Allocator,
+    tenant_data_root: []const u8,
+    owner_id: []const u8,
+) !usize {
+    if (owner_id.len == 0) return 0;
+
+    var root_dir = std.fs.openDirAbsolute(tenant_data_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer root_dir.close();
+
+    var it = root_dir.iterate();
+    const now = std.time.timestamp();
+    var owned: usize = 0;
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0) continue;
+
+        const user_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tenant_data_root, entry.name }) catch continue;
+        defer allocator.free(user_root);
+        const lock_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ user_root, LOCK_FILE_NAME }) catch continue;
+        defer allocator.free(lock_path);
+
+        const record = readRecordOwned(allocator, lock_path) catch continue;
+        defer allocator.free(record.owner_id);
+        defer allocator.free(record.lock_token);
+
+        if (record.expires_at > now and std.mem.eql(u8, record.owner_id, owner_id)) {
+            owned += 1;
+        }
+    }
+
+    return owned;
+}
+
 fn readTrimmedEnvVar(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
     const raw = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return null,
@@ -299,4 +336,33 @@ test "resolveOwnerId returns non-empty value" {
     const owner = try resolveOwnerId(std.testing.allocator);
     defer std.testing.allocator.free(owner);
     try std.testing.expect(owner.len > 0);
+}
+
+test "countOwnedUserLocks counts only active locks for owner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("u1");
+    try tmp.dir.makePath("u2");
+    try tmp.dir.makePath("u3");
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    const now = std.time.timestamp();
+
+    const u1_lock = try std.fmt.allocPrint(std.testing.allocator, "{s}/u1/{s}", .{ root, LOCK_FILE_NAME });
+    defer std.testing.allocator.free(u1_lock);
+    try writeRecord(u1_lock, "pod-a", now + 60, "token-u1");
+
+    const u2_lock = try std.fmt.allocPrint(std.testing.allocator, "{s}/u2/{s}", .{ root, LOCK_FILE_NAME });
+    defer std.testing.allocator.free(u2_lock);
+    try writeRecord(u2_lock, "pod-b", now + 60, "token-u2");
+
+    const u3_lock = try std.fmt.allocPrint(std.testing.allocator, "{s}/u3/{s}", .{ root, LOCK_FILE_NAME });
+    defer std.testing.allocator.free(u3_lock);
+    try writeRecord(u3_lock, "pod-a", now - 60, "token-u3-expired");
+
+    const owned = try countOwnedUserLocks(std.testing.allocator, root, "pod-a");
+    try std.testing.expectEqual(@as(usize, 1), owned);
 }

@@ -2953,6 +2953,14 @@ fn internalDiagnosticsPayload(
     const bus_inbound_len: usize = if (state.event_bus) |eb| eb.inboundLen() else 0;
     const bus_outbound_len: usize = if (state.event_bus) |eb| eb.outboundLen() else 0;
     const bus_capacity: usize = if (state.event_bus) |eb| eb.queueCapacity() else bus_mod.QUEUE_CAPACITY;
+    const owned_users_count: usize = blk: {
+        if (!state.tenant_enabled or !state.ownership_lock_enabled or state.owner_instance_id.len == 0) break :blk 0;
+        break :blk tenant_lock.countOwnedUserLocks(
+            allocator,
+            state.tenant_data_root,
+            state.owner_instance_id,
+        ) catch 0;
+    };
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
@@ -2968,6 +2976,21 @@ fn internalDiagnosticsPayload(
     try buf.appendSlice(allocator, "},");
 
     try json_util.appendJsonKeyValue(&buf, allocator, "runtime_mode", "threaded");
+    try buf.appendSlice(allocator, ",");
+
+    try json_util.appendJsonKey(&buf, allocator, "instance_id");
+    if (state.owner_instance_id.len > 0) {
+        try json_util.appendJsonString(&buf, allocator, state.owner_instance_id);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+
+    try json_util.appendJsonInt(&buf, allocator, "owned_users_count", @intCast(owned_users_count));
+    try buf.appendSlice(allocator, ",");
+
+    const tenant_lock_lease_secs_i64: i64 = @intCast(@min(state.ownership_lock_lease_secs, @as(u64, std.math.maxInt(i64))));
+    try json_util.appendJsonInt(&buf, allocator, "tenant_lock_lease_secs", tenant_lock_lease_secs_i64);
     try buf.appendSlice(allocator, ",");
 
     try json_util.appendJsonKey(&buf, allocator, "bus");
@@ -7641,11 +7664,18 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     var eb = bus_mod.Bus.init();
     defer eb.close();
     gs.event_bus = &eb;
+    gs.tenant_enabled = true;
+    gs.ownership_lock_enabled = true;
+    gs.ownership_lock_lease_secs = 300;
+    gs.owner_instance_id = "diag-owner";
 
     const payload = try internalDiagnosticsPayload(allocator, &gs, null);
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"runtime_mode\":\"threaded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"instance_id\":\"diag-owner\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"owned_users_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_lease_secs\":300") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"bus\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"inbound_len\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"outbound_len\":0") != null);
