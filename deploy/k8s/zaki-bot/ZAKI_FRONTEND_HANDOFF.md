@@ -26,10 +26,12 @@ Request body:
 Stream parser rules:
 
 1. Parse SSE incrementally.
-2. On `event: token`, append `data.delta` (fallback `data.content`).
-3. On `event: error`, show inline recoverable error state.
-4. On `event: done`, close stream and persist final assistant message.
-5. If network drops after some `token` events, keep partial content visible.
+2. On `event: progress`, render ephemeral "alive" status chips/timeline (do not persist into message content).
+3. On `event: token`, append `data.delta` (fallback `data.content`).
+4. On `event: error`, show inline recoverable error state.
+5. On `event: done`, close stream and persist final assistant message.
+6. If network drops after some `token` events, keep partial content visible.
+7. Ignore unknown event types safely.
 
 ## 3) Right-side controls (required)
 

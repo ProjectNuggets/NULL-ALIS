@@ -19,6 +19,7 @@ const memory_mod = @import("memory/root.zig");
 const Memory = memory_mod.Memory;
 const observability = @import("observability.zig");
 const Observer = observability.Observer;
+const MultiObserver = observability.MultiObserver;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
@@ -65,6 +66,7 @@ pub const SessionManager = struct {
     pub const ProcessMessageOptions = struct {
         message_turn_context: ?tools_mod.MessageTurnContext = null,
         turn_origin: tools_mod.TurnOrigin = .user,
+        progress_observer: ?Observer = null,
     };
 
     pub fn init(
@@ -228,6 +230,16 @@ pub const SessionManager = struct {
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
 
+        const base_observer = session.agent.observer;
+        var merged_observers_buf: [2]Observer = undefined;
+        var merged_observer_impl: MultiObserver = undefined;
+        if (options.progress_observer) |progress_observer| {
+            merged_observers_buf = .{ base_observer, progress_observer };
+            merged_observer_impl = .{ .observers = merged_observers_buf[0..] };
+            session.agent.observer = merged_observer_impl.observer();
+            defer session.agent.observer = base_observer;
+        }
+
         const agent_start_ms = std.time.milliTimestamp();
         const response = try session.agent.turn(content);
         const agent_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - agent_start_ms));
@@ -364,6 +376,44 @@ const MockProvider = struct {
     }
 
     fn mockDeinit(_: *anyopaque) void {}
+};
+
+const CountingObserver = struct {
+    event_count: u32 = 0,
+    saw_turn_stage: bool = false,
+
+    const vtable = Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = name,
+    };
+
+    fn observer(self: *CountingObserver) Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    fn resolve(ptr: *anyopaque) *CountingObserver {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self = resolve(ptr);
+        self.event_count += 1;
+        switch (event.*) {
+            .turn_stage => self.saw_turn_stage = true,
+            else => {},
+        }
+    }
+
+    fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flush(_: *anyopaque) void {}
+    fn name(_: *anyopaque) []const u8 {
+        return "counting";
+    }
 };
 
 /// Create a test SessionManager with mock provider.
@@ -587,6 +637,22 @@ test "processMessage different keys — independent sessions" {
     try testing.expect(sa != sb);
     try testing.expectEqual(@as(u64, 1), sa.turn_count);
     try testing.expectEqual(@as(u64, 1), sb.turn_count);
+}
+
+test "processMessageWithContext forwards progress observer and restores base observer" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    var progress = CountingObserver{};
+    const response = try sm.processMessageWithContext("progress:1", "hello", null, .{
+        .progress_observer = progress.observer(),
+    });
+    defer testing.allocator.free(response);
+
+    const session = try sm.getOrCreate("progress:1");
+    try testing.expectEqualStrings("noop", session.agent.observer.getName());
 }
 
 test "processMessage /new clears autosave only for current session" {

@@ -74,6 +74,7 @@ Success response:
 - HTTP `200`
 - `Content-Type: text/event-stream; charset=utf-8`
 - Events:
+  - `event: progress` with `{"type":"progress","phase":"...","state":"...","label":"..."}` (optional, may appear multiple times)
   - `event: token` with `{"delta":"...","content":"...","seq":<int>}`
   - `event: done` with `{"status":"ok","session_id":"...","message_id":"..."}`
 
@@ -89,6 +90,7 @@ Important:
 
 - Preserve partial token text if stream ends after token events.
 - Treat `event: done` as terminal.
+- Pass through unknown/new SSE event types unchanged for forward compatibility.
 
 ## 5) Expected status code handling
 

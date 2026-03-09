@@ -9,6 +9,7 @@ pub const ObserverEvent = union(enum) {
     tool_call_start: struct { tool: []const u8 },
     tool_call: struct { tool: []const u8, duration_ms: u64, success: bool },
     tool_iterations_exhausted: struct { iterations: u32 },
+    turn_stage: struct { stage: []const u8, iteration: ?u32 = null, duration_ms: ?u64 = null, count: ?u32 = null },
     turn_complete: void,
     channel_message: struct { channel: []const u8, direction: []const u8 },
     heartbeat_tick: void,
@@ -105,6 +106,29 @@ pub const LogObserver = struct {
             .tool_call_start => |e| std.log.info("tool.start tool={s}", .{e.tool}),
             .tool_call => |e| std.log.info("tool.call tool={s} duration_ms={d} success={}", .{ e.tool, e.duration_ms, e.success }),
             .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
+            .turn_stage => |e| {
+                if (e.iteration) |iteration| {
+                    if (e.duration_ms) |duration_ms| {
+                        if (e.count) |count| {
+                            std.log.info("turn.stage stage={s} iteration={d} duration_ms={d} count={d}", .{ e.stage, iteration, duration_ms, count });
+                        } else {
+                            std.log.info("turn.stage stage={s} iteration={d} duration_ms={d}", .{ e.stage, iteration, duration_ms });
+                        }
+                    } else {
+                        std.log.info("turn.stage stage={s} iteration={d}", .{ e.stage, iteration });
+                    }
+                } else if (e.duration_ms) |duration_ms| {
+                    if (e.count) |count| {
+                        std.log.info("turn.stage stage={s} duration_ms={d} count={d}", .{ e.stage, duration_ms, count });
+                    } else {
+                        std.log.info("turn.stage stage={s} duration_ms={d}", .{ e.stage, duration_ms });
+                    }
+                } else if (e.count) |count| {
+                    std.log.info("turn.stage stage={s} count={d}", .{ e.stage, count });
+                } else {
+                    std.log.info("turn.stage stage={s}", .{e.stage});
+                }
+            },
             .turn_complete => std.log.info("turn.complete", .{}),
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
@@ -162,6 +186,9 @@ pub const VerboseObserver = struct {
             },
             .tool_call => |e| {
                 stderr.print("< Tool {s} (success={}, duration_ms={d})\n", .{ e.tool, e.success, e.duration_ms }) catch {};
+            },
+            .turn_stage => |e| {
+                stderr.print("> Stage {s}\n", .{e.stage}) catch {};
             },
             .turn_complete => {
                 stderr.print("< Complete\n", .{}) catch {};
@@ -275,6 +302,7 @@ pub const FileObserver = struct {
             .tool_call_start => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call_start\",\"tool\":\"{s}\"}}", .{e.tool}) catch return,
             .tool_call => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call\",\"tool\":\"{s}\",\"duration_ms\":{d},\"success\":{}}}", .{ e.tool, e.duration_ms, e.success }) catch return,
             .tool_iterations_exhausted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_iterations_exhausted\",\"iterations\":{d}}}", .{e.iterations}) catch return,
+            .turn_stage => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_stage\",\"stage\":\"{s}\"}}", .{e.stage}) catch return,
             .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":\"{s}\",\"direction\":\"{s}\"}}", .{ e.channel, e.direction }) catch return,
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
@@ -494,6 +522,11 @@ pub const OtelObserver = struct {
                 const iter_str = std.fmt.bufPrint(&iter_buf, "{d}", .{e.iterations}) catch "0";
                 self.addSpan("tool.iterations_exhausted", now, now, &.{
                     .{ .key = "iterations", .value = iter_str },
+                });
+            },
+            .turn_stage => |e| {
+                self.addSpan("turn.stage", now, now, &.{
+                    .{ .key = "stage", .value = e.stage },
                 });
             },
             .turn_complete => {
