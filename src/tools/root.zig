@@ -490,6 +490,7 @@ pub const ToolTenantContext = struct {
     numeric_user_id: ?i64 = null,
     session_key: ?[]const u8 = null,
     state_mgr: ?*zaki_state.Manager = null,
+    expect_postgres_state: bool = false,
 };
 
 threadlocal var current_tenant_context: ToolTenantContext = .{};

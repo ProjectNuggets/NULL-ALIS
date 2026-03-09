@@ -78,6 +78,8 @@ pub const RuntimeInfoTool = struct {
         const scheduler_backend = root.schedulerBackend(self.config, tenant_ctx);
         const degraded_reason = root.degradedReason(self.config, tenant_ctx);
         const degraded = degraded_reason.len > 0;
+        const context_incomplete = tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or tenant_ctx.numeric_user_id == null);
+        const data_source = runtimeDataSourceLabel(tenant_ctx);
         const user_id = user_id_override orelse tenant_ctx.user_id;
         const entity_id = resolveComposioEntityId(self.config, tenant_ctx, user_id_override);
         var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx);
@@ -90,7 +92,7 @@ pub const RuntimeInfoTool = struct {
                 try configured_channels.append(allocator, meta.key);
             }
         }
-        if (isTelegramConfigured(self.config, telegram_state) and !containsString(configured_channels.items, "telegram")) {
+        if (isTelegramConfigured(self.config, telegram_state.state) and !containsString(configured_channels.items, "telegram")) {
             try configured_channels.append(allocator, "telegram");
         }
 
@@ -122,6 +124,11 @@ pub const RuntimeInfoTool = struct {
         try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_effective", effective_backend);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKeyValue(&buf, allocator, "scheduler_backend", scheduler_backend);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "data_source", data_source);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "context_incomplete");
+        try buf.appendSlice(allocator, if (context_incomplete) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "degraded");
         try buf.appendSlice(allocator, if (degraded) "true" else "false");
@@ -195,35 +202,47 @@ pub const RuntimeInfoTool = struct {
 
     fn buildIntegrationsJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8) ![]u8 {
         const tenant_ctx = root.getTenantContext();
+        const context_incomplete = tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or tenant_ctx.numeric_user_id == null);
+        const data_source = runtimeDataSourceLabel(tenant_ctx);
         const entity_id = resolveComposioEntityId(self.config, tenant_ctx, user_id_override);
         var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx);
         defer telegram_state.deinit(allocator);
-        const telegram_configured = isTelegramConfigured(self.config, telegram_state);
+        const telegram_configured = isTelegramConfigured(self.config, telegram_state.state);
         const composio_readiness = self.resolveComposioReadiness(allocator, entity_id);
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(allocator);
         try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKeyValue(&buf, allocator, "data_source", data_source);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "context_incomplete");
+        try buf.appendSlice(allocator, if (context_incomplete) "true" else "false");
+        try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "telegram");
         try buf.appendSlice(allocator, "{");
         try json_util.appendJsonKey(&buf, allocator, "configured");
         try buf.appendSlice(allocator, if (telegram_configured) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "connected");
-        if (telegram_state.connected) |connected| {
+        if (telegram_state.state.connected) |connected| {
             try buf.appendSlice(allocator, if (connected) "true" else "false");
         } else {
             try buf.appendSlice(allocator, "null");
         }
         try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "data_source", telegram_state.data_source);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "context_incomplete");
+        try buf.appendSlice(allocator, if (telegram_state.context_incomplete) "true" else "false");
+        try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "account_id");
-        if (telegram_state.account_id) |account_id| {
+        if (telegram_state.state.account_id) |account_id| {
             try json_util.appendJsonString(&buf, allocator, account_id);
         } else {
             try buf.appendSlice(allocator, "null");
         }
         try buf.appendSlice(allocator, ",");
-        try appendOptionalInt(&buf, allocator, "chat_id", telegram_state.chat_id);
+        try appendOptionalInt(&buf, allocator, "chat_id", telegram_state.state.chat_id);
         try buf.appendSlice(allocator, "},");
         try json_util.appendJsonKey(&buf, allocator, "composio");
         try buf.appendSlice(allocator, "{");
@@ -379,6 +398,22 @@ const TelegramState = struct {
         if (self.account_id) |account_id| allocator.free(account_id);
     }
 };
+
+const TelegramStateSnapshot = struct {
+    state: TelegramState = .{},
+    data_source: []const u8 = "unknown",
+    context_incomplete: bool = false,
+
+    fn deinit(self: *TelegramStateSnapshot, allocator: std.mem.Allocator) void {
+        self.state.deinit(allocator);
+    }
+};
+
+fn runtimeDataSourceLabel(tenant_ctx: root.ToolTenantContext) []const u8 {
+    if (tenant_ctx.state_mgr != null and tenant_ctx.numeric_user_id != null) return "postgres";
+    if (tenant_ctx.expect_postgres_state) return "context_missing";
+    return "file_fallback";
+}
 
 fn resolveComposioEntityId(config: *const config_mod.Config, tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) []const u8 {
     if (user_id_override) |user_id| return user_id;
@@ -637,24 +672,36 @@ fn deriveUserRoot(workspace_dir: []const u8) []const u8 {
     return std.fs.path.dirname(workspace_dir) orelse workspace_dir;
 }
 
-fn readTelegramState(allocator: std.mem.Allocator, config: *const config_mod.Config, tenant_ctx: root.ToolTenantContext) !TelegramState {
+fn readTelegramState(allocator: std.mem.Allocator, config: *const config_mod.Config, tenant_ctx: root.ToolTenantContext) !TelegramStateSnapshot {
     if (tenant_ctx.numeric_user_id) |numeric_user_id| {
         if (tenant_ctx.state_mgr) |state_mgr| {
             const raw = state_mgr.getTelegramStateJson(allocator, numeric_user_id) catch return .{};
             defer allocator.free(raw);
-            return parseTelegramStateJson(allocator, raw);
+            return .{
+                .state = try parseTelegramStateJson(allocator, raw),
+                .data_source = "postgres",
+            };
         }
+    }
+    if (tenant_ctx.expect_postgres_state) {
+        return .{
+            .data_source = "context_missing",
+            .context_incomplete = true,
+        };
     }
 
     const user_root = deriveUserRoot(config.workspace_dir);
     const path = try std.fmt.allocPrint(allocator, "{s}/channel_state.json", .{user_root});
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return .{};
+    const file = std.fs.openFileAbsolute(path, .{}) catch return .{ .data_source = "file_fallback" };
     defer file.close();
     const raw = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(raw);
-    return parseTelegramStateJson(allocator, raw);
+    return .{
+        .state = try parseTelegramStateJson(allocator, raw),
+        .data_source = "file_fallback",
+    };
 }
 
 fn parseTelegramStateJson(allocator: std.mem.Allocator, raw: []const u8) !TelegramState {
@@ -733,6 +780,8 @@ test "runtime info summary includes state backend keys" {
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"state_backend_configured\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"enabled_tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"data_source\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"context_incomplete\"") != null);
 }
 
 test "runtime info parseToolkitAvailability supports object items" {
@@ -776,4 +825,20 @@ test "runtime info telegram configured uses runtime state fallback" {
 
     const connected_state = TelegramState{ .connected = true };
     try std.testing.expect(isTelegramConfigured(&cfg, connected_state));
+}
+
+test "runtime info telegram snapshot marks context missing for expected postgres state" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const snapshot = try readTelegramState(std.testing.allocator, &cfg, .{
+        .user_id = "7",
+        .expect_postgres_state = true,
+    });
+    var snapshot_mut = snapshot;
+    defer snapshot_mut.deinit(std.testing.allocator);
+    try std.testing.expect(snapshot.context_incomplete);
+    try std.testing.expectEqualStrings("context_missing", snapshot.data_source);
 }

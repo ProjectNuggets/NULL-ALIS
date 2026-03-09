@@ -17,6 +17,9 @@ fn loadSchedulerForContext(allocator: std.mem.Allocator) !struct {
     tenant: root.ToolTenantContext,
 } {
     const tenant = root.getTenantContext();
+    if (tenant.expect_postgres_state and (tenant.state_mgr == null or tenant.numeric_user_id == null)) {
+        return error.MissingTenantStateContext;
+    }
     var scheduler = CronScheduler.init(allocator, DEFAULT_MAX_ACTIVE_JOBS, true);
     if (tenant.state_mgr) |mgr| {
         if (tenant.numeric_user_id) |user_id| {
@@ -170,8 +173,9 @@ pub const ScheduleTool = struct {
             return ToolResult.fail("Missing 'action' parameter");
 
         if (std.mem.eql(u8, action, "list")) {
-            const loaded = loadSchedulerForContext(allocator) catch {
-                return ToolResult.ok("No scheduled jobs.");
+            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+                error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
+                else => return ToolResult.ok("No scheduled jobs."),
             };
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
@@ -209,9 +213,12 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for get action");
 
-            const loaded = loadSchedulerForContext(allocator) catch {
-                const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+                error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
+                else => {
+                    const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                },
             };
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
@@ -245,8 +252,9 @@ pub const ScheduleTool = struct {
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
             const requested_id = normalizeRequestedId(root.getString(args, "id"));
 
-            const loaded = loadSchedulerForContext(allocator) catch {
-                return ToolResult.fail("Failed to load scheduler state");
+            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+                error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
+                else => return ToolResult.fail("Failed to load scheduler state"),
             };
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
@@ -302,8 +310,9 @@ pub const ScheduleTool = struct {
                 return ToolResult.fail("Delay too short; minimum is 60s");
             };
 
-            const loaded = loadSchedulerForContext(allocator) catch {
-                return ToolResult.fail("Failed to load scheduler state");
+            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+                error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
+                else => return ToolResult.fail("Failed to load scheduler state"),
             };
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
@@ -344,8 +353,9 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for cancel action");
 
-            const loaded = loadSchedulerForContext(allocator) catch {
-                return ToolResult.fail("Failed to load scheduler state");
+            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+                error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
+                else => return ToolResult.fail("Failed to load scheduler state"),
             };
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
@@ -363,8 +373,9 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter");
 
-            const loaded = loadSchedulerForContext(allocator) catch {
-                return ToolResult.fail("Failed to load scheduler state");
+            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+                error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
+                else => return ToolResult.fail("Failed to load scheduler state"),
             };
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
@@ -421,6 +432,22 @@ test "schedule schema has action" {
     const t = st.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "action") != null);
+}
+
+test "schedule fails fast when postgres tenant context is missing" {
+    var st = ScheduleTool{};
+    const t = st.tool();
+    root.setTenantContext(.{
+        .user_id = "42",
+        .expect_postgres_state = true,
+    });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"action\":\"list\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "context") != null);
 }
 
 test "schedule validateOnceDelay enforces minimum" {

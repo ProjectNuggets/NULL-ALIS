@@ -30,6 +30,7 @@ const Command = enum {
     version,
     onboard,
     doctor,
+    arzt,
     cron,
     channel,
     skills,
@@ -54,6 +55,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "-V", .version },
         .{ "onboard", .onboard },
         .{ "doctor", .doctor },
+        .{ "arzt", .arzt },
         .{ "cron", .cron },
         .{ "channel", .channel },
         .{ "skills", .skills },
@@ -113,6 +115,7 @@ fn runMain(allocator: std.mem.Allocator) !void {
         .agent => try yc.agent.run(allocator, sub_args),
         .onboard => try runOnboard(allocator, sub_args),
         .doctor => try yc.doctor.run(allocator),
+        .arzt => try yc.doctor.run(allocator),
         .help => printUsage(),
         .gateway => try runGateway(allocator, sub_args),
         .service => try runService(allocator, sub_args),
@@ -238,6 +241,339 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 // ── Cron ─────────────────────────────────────────────────────────
 
+const CronBackendMode = enum {
+    auto,
+    file,
+    postgres,
+};
+
+const CronBackendError = error{
+    PostgresBackendNotEnabled,
+    MissingConfig,
+    InvalidRuntimeConfig,
+    MissingUserId,
+};
+
+const PostgresCronContext = struct {
+    cfg: *const yc.config.Config,
+    user_id: i64,
+};
+
+fn parseCronBackendMode(raw: []const u8) ?CronBackendMode {
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
+    if (std.mem.eql(u8, raw, "file")) return .file;
+    if (std.mem.eql(u8, raw, "postgres")) return .postgres;
+    return null;
+}
+
+fn resolveCronBackendMode(cfg_opt: ?*const yc.config.Config, mode: CronBackendMode) CronBackendMode {
+    return switch (mode) {
+        .file => .file,
+        .postgres => .postgres,
+        .auto => blk: {
+            if (cfg_opt) |cfg| {
+                if (cfg.tenant.enabled and std.mem.eql(u8, cfg.state.backend, "postgres") and build_options.enable_postgres) {
+                    break :blk .postgres;
+                }
+            }
+            break :blk .file;
+        },
+    };
+}
+
+fn resolvePostgresCronContext(cfg_opt: ?*const yc.config.Config, user_id_opt: ?i64) CronBackendError!PostgresCronContext {
+    if (!build_options.enable_postgres) return error.PostgresBackendNotEnabled;
+    const cfg = cfg_opt orelse return error.MissingConfig;
+    if (!cfg.tenant.enabled or !std.mem.eql(u8, cfg.state.backend, "postgres")) {
+        return error.InvalidRuntimeConfig;
+    }
+    const user_id = user_id_opt orelse return error.MissingUserId;
+    return .{
+        .cfg = cfg,
+        .user_id = user_id,
+    };
+}
+
+fn mainSessionKeyForUser(allocator: std.mem.Allocator, user_id: i64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "agent:zaki-bot:user:{d}:main", .{user_id});
+}
+
+fn tenantWorkspacePathForUser(allocator: std.mem.Allocator, cfg: *const yc.config.Config, user_id: i64) ![]u8 {
+    if (cfg.tenant.data_root.len > 0) {
+        return std.fmt.allocPrint(allocator, "{s}/{d}/workspace", .{ cfg.tenant.data_root, user_id });
+    }
+    return allocator.dupe(u8, cfg.workspace_dir);
+}
+
+fn ensurePostgresCronUserProvisioned(allocator: std.mem.Allocator, cfg: *const yc.config.Config, user_id: i64) !void {
+    var mgr = try yc.zaki_state.Manager.init(allocator, cfg.state);
+    defer mgr.deinit();
+    const workspace_path = try tenantWorkspacePathForUser(allocator, cfg, user_id);
+    defer allocator.free(workspace_path);
+    try mgr.provisionUser(user_id, workspace_path);
+}
+
+fn loadCronSchedulerFromPostgres(
+    allocator: std.mem.Allocator,
+    cfg: *const yc.config.Config,
+    user_id: i64,
+) !yc.cron.CronScheduler {
+    try ensurePostgresCronUserProvisioned(allocator, cfg, user_id);
+
+    var scheduler = yc.cron.CronScheduler.init(allocator, cfg.scheduler.max_tasks, cfg.scheduler.enabled);
+    errdefer scheduler.deinit();
+
+    var mgr = try yc.zaki_state.Manager.init(allocator, cfg.state);
+    defer mgr.deinit();
+
+    const jobs_json = try mgr.getJobsJson(allocator, user_id);
+    defer allocator.free(jobs_json);
+    const trimmed = std.mem.trim(u8, jobs_json, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "[]")) return scheduler;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return scheduler;
+
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        try yc.cron.appendJobFromJsonObject(&scheduler, item.object);
+    }
+
+    return scheduler;
+}
+
+fn saveCronSchedulerToPostgres(
+    allocator: std.mem.Allocator,
+    cfg: *const yc.config.Config,
+    user_id: i64,
+    scheduler: *const yc.cron.CronScheduler,
+) !void {
+    try ensurePostgresCronUserProvisioned(allocator, cfg, user_id);
+
+    var mgr = try yc.zaki_state.Manager.init(allocator, cfg.state);
+    defer mgr.deinit();
+
+    const content = try yc.cron.saveJobsToSlice(allocator, scheduler);
+    defer allocator.free(content);
+    const session_key = try mainSessionKeyForUser(allocator, user_id);
+    defer allocator.free(session_key);
+    try mgr.replaceJobsJson(user_id, session_key, content);
+}
+
+fn runCronPostgres(
+    allocator: std.mem.Allocator,
+    cfg: *const yc.config.Config,
+    user_id: i64,
+    subcmd: []const u8,
+    args: []const []const u8,
+) !void {
+    if (std.mem.eql(u8, subcmd, "list")) {
+        var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
+        defer scheduler.deinit();
+
+        const jobs = scheduler.listJobs();
+        if (jobs.len == 0) {
+            std.debug.print("info(cron): No scheduled tasks yet.\n", .{});
+            std.debug.print("info(cron): Usage:\n", .{});
+            std.debug.print("info(cron):   nullalis cron add '*/10 * * * *' 'echo hello'\n", .{});
+            std.debug.print("info(cron):   nullalis cron once 30m 'echo reminder'\n", .{});
+            return;
+        }
+
+        std.debug.print("info(cron): Scheduled jobs ({d}):\n", .{jobs.len});
+        for (jobs) |job| {
+            const flags: []const u8 = blk: {
+                if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
+                if (job.paused) break :blk " [paused]";
+                if (job.one_shot) break :blk " [one-shot]";
+                break :blk "";
+            };
+            const status = job.last_status orelse "n/a";
+            std.debug.print("info(cron): - {s} | {s} | next={d} | status={s}{s} cmd: {s}\n", .{
+                job.id,
+                job.expression,
+                job.next_run_secs,
+                status,
+                flags,
+                job.command,
+            });
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "add")) {
+        if (args.len < 2) {
+            std.debug.print("Usage: nullalis cron add <expression> <command>\n", .{});
+            std.process.exit(1);
+        }
+        var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
+        defer scheduler.deinit();
+        const job = try scheduler.addJob(args[0], args[1]);
+        try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
+        std.debug.print("info(cron): Added cron job {s}\n", .{job.id});
+        std.debug.print("info(cron):   Expr: {s}\n", .{job.expression});
+        std.debug.print("info(cron):   Next: {d}\n", .{job.next_run_secs});
+        std.debug.print("info(cron):   Cmd : {s}\n", .{job.command});
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "once")) {
+        if (args.len < 2) {
+            std.debug.print("Usage: nullalis cron once <delay> <command>\n", .{});
+            std.process.exit(1);
+        }
+        var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
+        defer scheduler.deinit();
+        const job = try scheduler.addOnce(args[0], args[1]);
+        try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
+        std.debug.print("info(cron): Added one-shot task {s}\n", .{job.id});
+        std.debug.print("info(cron):   Runs at: {d}\n", .{job.next_run_secs});
+        std.debug.print("info(cron):   Cmd    : {s}\n", .{job.command});
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "remove")) {
+        if (args.len < 1) {
+            std.debug.print("Usage: nullalis cron remove <id>\n", .{});
+            std.process.exit(1);
+        }
+        var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
+        defer scheduler.deinit();
+        if (scheduler.removeJob(args[0])) {
+            try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
+            std.debug.print("info(cron): Removed cron job {s}\n", .{args[0]});
+        } else {
+            std.debug.print("info(cron): Cron job '{s}' not found\n", .{args[0]});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "pause")) {
+        if (args.len < 1) {
+            std.debug.print("Usage: nullalis cron pause <id>\n", .{});
+            std.process.exit(1);
+        }
+        var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
+        defer scheduler.deinit();
+        if (scheduler.pauseJob(args[0])) {
+            try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
+            std.debug.print("info(cron): Paused job {s}\n", .{args[0]});
+        } else {
+            std.debug.print("info(cron): Cron job '{s}' not found\n", .{args[0]});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "resume")) {
+        if (args.len < 1) {
+            std.debug.print("Usage: nullalis cron resume <id>\n", .{});
+            std.process.exit(1);
+        }
+        var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
+        defer scheduler.deinit();
+        if (scheduler.resumeJob(args[0])) {
+            try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
+            std.debug.print("info(cron): Resumed job {s}\n", .{args[0]});
+        } else {
+            std.debug.print("info(cron): Cron job '{s}' not found\n", .{args[0]});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "run")) {
+        if (args.len < 1) {
+            std.debug.print("Usage: nullalis cron run <id>\n", .{});
+            std.process.exit(1);
+        }
+        var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
+        defer scheduler.deinit();
+
+        if (scheduler.getJob(args[0])) |job| {
+            std.debug.print("info(cron): Running job '{s}': {s}\n", .{ args[0], job.command });
+            const result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ yc.platform.getShell(), yc.platform.getShellFlag(), job.command },
+            }) catch |err| {
+                std.debug.print("error(cron): Job '{s}' failed: {s}\n", .{ args[0], @errorName(err) });
+                return;
+            };
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            if (result.stdout.len > 0) std.debug.print("{s}\n", .{result.stdout});
+            const exit_code: u8 = switch (result.term) {
+                .Exited => |code| code,
+                else => 1,
+            };
+            std.debug.print("info(cron): Job '{s}' completed (exit {d}).\n", .{ args[0], exit_code });
+        } else {
+            std.debug.print("info(cron): Cron job '{s}' not found\n", .{args[0]});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "update")) {
+        if (args.len < 1) {
+            std.debug.print("Usage: nullalis cron update <id> [--expression <expr>] [--command <cmd>] [--enable] [--disable]\n", .{});
+            std.process.exit(1);
+        }
+        const id = args[0];
+        var expression: ?[]const u8 = null;
+        var command: ?[]const u8 = null;
+        var enabled: ?bool = null;
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--expression") and i + 1 < args.len) {
+                i += 1;
+                expression = args[i];
+            } else if (std.mem.eql(u8, args[i], "--command") and i + 1 < args.len) {
+                i += 1;
+                command = args[i];
+            } else if (std.mem.eql(u8, args[i], "--enable")) {
+                enabled = true;
+            } else if (std.mem.eql(u8, args[i], "--disable")) {
+                enabled = false;
+            }
+        }
+
+        var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
+        defer scheduler.deinit();
+        const patch = yc.cron.CronJobPatch{
+            .expression = expression,
+            .command = command,
+            .enabled = enabled,
+        };
+        if (scheduler.updateJob(allocator, id, patch)) {
+            try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
+            std.debug.print("info(cron): Updated job {s}\n", .{id});
+        } else {
+            std.debug.print("info(cron): Cron job '{s}' not found\n", .{id});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "runs")) {
+        if (args.len < 1) {
+            std.debug.print("Usage: nullalis cron runs <id>\n", .{});
+            std.process.exit(1);
+        }
+        var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
+        defer scheduler.deinit();
+        if (scheduler.getJob(args[0])) |job| {
+            std.debug.print("info(cron): Run history for job {s} ({s}):\n", .{ args[0], job.command });
+            const status = job.last_status orelse "never run";
+            std.debug.print("info(cron):   Last status: {s}\n", .{status});
+            std.debug.print("info(cron):   Next run:    {d}\n", .{job.next_run_secs});
+        } else {
+            std.debug.print("info(cron): Cron job '{s}' not found\n", .{args[0]});
+        }
+        return;
+    }
+
+    std.debug.print("Unknown cron command: {s}\n", .{subcmd});
+    std.process.exit(1);
+}
+
 fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
         std.debug.print(
@@ -253,81 +589,136 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  run <id>                      Run a scheduled task immediately
             \\  update <id> [options]         Update a cron job
             \\  runs <id>                     List recent run history for a job
+            \\  --backend <auto|file|postgres>  Scheduler backend (default: auto)
+            \\  --user-id <id>                Required with postgres backend
             \\
         , .{});
         std.process.exit(1);
     }
 
     const subcmd = sub_args[0];
+    var backend_mode: CronBackendMode = .auto;
+    var user_id_opt: ?i64 = null;
+    var filtered: std.ArrayList([]const u8) = .empty;
+    defer filtered.deinit(allocator);
+
+    var i: usize = 1;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
+        if (std.mem.eql(u8, arg, "--backend")) {
+            if (i + 1 >= sub_args.len) {
+                std.debug.print("Usage: nullalis cron {s} ... --backend <auto|file|postgres>\n", .{subcmd});
+                std.process.exit(1);
+            }
+            i += 1;
+            backend_mode = parseCronBackendMode(sub_args[i]) orelse {
+                std.debug.print("Invalid --backend value: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            };
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--user-id")) {
+            if (i + 1 >= sub_args.len) {
+                std.debug.print("Usage: nullalis cron {s} ... --user-id <id>\n", .{subcmd});
+                std.process.exit(1);
+            }
+            i += 1;
+            user_id_opt = std.fmt.parseInt(i64, sub_args[i], 10) catch {
+                std.debug.print("Invalid --user-id value: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            };
+            continue;
+        }
+        try filtered.append(allocator, arg);
+    }
+
+    var cfg_opt: ?yc.config.Config = yc.config.Config.load(allocator) catch null;
+    defer if (cfg_opt) |*cfg| cfg.deinit();
+    const cfg_ptr: ?*const yc.config.Config = if (cfg_opt) |*cfg| cfg else null;
+    const resolved_backend = resolveCronBackendMode(cfg_ptr, backend_mode);
+
+    if (resolved_backend == .postgres) {
+        const ctx = resolvePostgresCronContext(cfg_ptr, user_id_opt) catch |err| {
+            switch (err) {
+                error.PostgresBackendNotEnabled => std.debug.print("Postgres backend is not enabled in this build.\n", .{}),
+                error.MissingConfig => std.debug.print("No config found; postgres cron backend is unavailable.\n", .{}),
+                error.InvalidRuntimeConfig => std.debug.print("Postgres cron backend requires tenant.enabled=true and state.backend=postgres.\n", .{}),
+                error.MissingUserId => std.debug.print("Postgres cron backend requires --user-id <id>.\n", .{}),
+            }
+            std.process.exit(1);
+        };
+        try runCronPostgres(allocator, ctx.cfg, ctx.user_id, subcmd, filtered.items);
+        return;
+    }
 
     if (std.mem.eql(u8, subcmd, "list")) {
         try yc.cron.cliListJobs(allocator);
     } else if (std.mem.eql(u8, subcmd, "add")) {
-        if (sub_args.len < 3) {
+        if (filtered.items.len < 2) {
             std.debug.print("Usage: nullalis cron add <expression> <command>\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2]);
+        try yc.cron.cliAddJob(allocator, filtered.items[0], filtered.items[1]);
     } else if (std.mem.eql(u8, subcmd, "once")) {
-        if (sub_args.len < 3) {
+        if (filtered.items.len < 2) {
             std.debug.print("Usage: nullalis cron once <delay> <command>\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliAddOnce(allocator, sub_args[1], sub_args[2]);
+        try yc.cron.cliAddOnce(allocator, filtered.items[0], filtered.items[1]);
     } else if (std.mem.eql(u8, subcmd, "remove")) {
-        if (sub_args.len < 2) {
+        if (filtered.items.len < 1) {
             std.debug.print("Usage: nullalis cron remove <id>\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliRemoveJob(allocator, sub_args[1]);
+        try yc.cron.cliRemoveJob(allocator, filtered.items[0]);
     } else if (std.mem.eql(u8, subcmd, "pause")) {
-        if (sub_args.len < 2) {
+        if (filtered.items.len < 1) {
             std.debug.print("Usage: nullalis cron pause <id>\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliPauseJob(allocator, sub_args[1]);
+        try yc.cron.cliPauseJob(allocator, filtered.items[0]);
     } else if (std.mem.eql(u8, subcmd, "resume")) {
-        if (sub_args.len < 2) {
+        if (filtered.items.len < 1) {
             std.debug.print("Usage: nullalis cron resume <id>\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliResumeJob(allocator, sub_args[1]);
+        try yc.cron.cliResumeJob(allocator, filtered.items[0]);
     } else if (std.mem.eql(u8, subcmd, "run")) {
-        if (sub_args.len < 2) {
+        if (filtered.items.len < 1) {
             std.debug.print("Usage: nullalis cron run <id>\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliRunJob(allocator, sub_args[1]);
+        try yc.cron.cliRunJob(allocator, filtered.items[0]);
     } else if (std.mem.eql(u8, subcmd, "update")) {
-        if (sub_args.len < 2) {
+        if (filtered.items.len < 1) {
             std.debug.print("Usage: nullalis cron update <id> [--expression <expr>] [--command <cmd>] [--enable] [--disable]\n", .{});
             std.process.exit(1);
         }
-        const id = sub_args[1];
+        const id = filtered.items[0];
         var expression: ?[]const u8 = null;
         var command: ?[]const u8 = null;
         var enabled: ?bool = null;
-        var i: usize = 2;
-        while (i < sub_args.len) : (i += 1) {
-            if (std.mem.eql(u8, sub_args[i], "--expression") and i + 1 < sub_args.len) {
-                i += 1;
-                expression = sub_args[i];
-            } else if (std.mem.eql(u8, sub_args[i], "--command") and i + 1 < sub_args.len) {
-                i += 1;
-                command = sub_args[i];
-            } else if (std.mem.eql(u8, sub_args[i], "--enable")) {
+        var j: usize = 1;
+        while (j < filtered.items.len) : (j += 1) {
+            if (std.mem.eql(u8, filtered.items[j], "--expression") and j + 1 < filtered.items.len) {
+                j += 1;
+                expression = filtered.items[j];
+            } else if (std.mem.eql(u8, filtered.items[j], "--command") and j + 1 < filtered.items.len) {
+                j += 1;
+                command = filtered.items[j];
+            } else if (std.mem.eql(u8, filtered.items[j], "--enable")) {
                 enabled = true;
-            } else if (std.mem.eql(u8, sub_args[i], "--disable")) {
+            } else if (std.mem.eql(u8, filtered.items[j], "--disable")) {
                 enabled = false;
             }
         }
         try yc.cron.cliUpdateJob(allocator, id, expression, command, enabled);
     } else if (std.mem.eql(u8, subcmd, "runs")) {
-        if (sub_args.len < 2) {
+        if (filtered.items.len < 1) {
             std.debug.print("Usage: nullalis cron runs <id>\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliListRuns(allocator, sub_args[1]);
+        try yc.cron.cliListRuns(allocator, filtered.items[0]);
     } else {
         std.debug.print("Unknown cron command: {s}\n", .{subcmd});
         std.process.exit(1);
@@ -2584,6 +2975,7 @@ fn printUsage() void {
         \\  status      Show system status
         \\  version     Show CLI version
         \\  doctor      Run diagnostics
+        \\  arzt        Alias for doctor diagnostics
         \\  cron        Manage scheduled tasks
         \\  channel     Manage channels (Telegram, Discord, Slack, ...)
         \\  skills      Manage skills
@@ -2602,7 +2994,7 @@ fn printUsage() void {
         \\  gateway [--port PORT] [--host HOST]
         \\  version | --version | -V
         \\  service <install|start|stop|status|uninstall>
-        \\  cron <list|add|once|remove|pause|resume> [ARGS]
+        \\  cron <list|add|once|remove|pause|resume> [ARGS] [--backend auto|file|postgres] [--user-id ID]
         \\  channel <list|start|status|add|remove> [ARGS]
         \\  skills <list|install|remove> [ARGS]
         \\  hardware <discover|introspect|info> [ARGS]
@@ -2623,6 +3015,7 @@ test "parse known commands" {
     try std.testing.expectEqual(.version, parseCommand("version").?);
     try std.testing.expectEqual(.version, parseCommand("--version").?);
     try std.testing.expectEqual(.version, parseCommand("-V").?);
+    try std.testing.expectEqual(.arzt, parseCommand("arzt").?);
     try std.testing.expectEqual(.service, parseCommand("service").?);
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
     try std.testing.expectEqual(.memory, parseCommand("memory").?);
@@ -2632,6 +3025,67 @@ test "parse known commands" {
     try std.testing.expectEqual(.update, parseCommand("update").?);
     try std.testing.expect(parseCommand("daemon") == null);
     try std.testing.expect(parseCommand("unknown") == null);
+}
+
+test "resolveCronBackendMode auto selects postgres for tenant postgres config" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullalis-test",
+        .config_path = "/tmp/nullalis-test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = true;
+    cfg.state.backend = "postgres";
+    const resolved = resolveCronBackendMode(&cfg, .auto);
+    if (build_options.enable_postgres) {
+        try std.testing.expectEqual(CronBackendMode.postgres, resolved);
+    } else {
+        try std.testing.expectEqual(CronBackendMode.file, resolved);
+    }
+}
+
+test "resolveCronBackendMode auto selects file for non-tenant mode" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullalis-test",
+        .config_path = "/tmp/nullalis-test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = false;
+    cfg.state.backend = "postgres";
+    try std.testing.expectEqual(CronBackendMode.file, resolveCronBackendMode(&cfg, .auto));
+}
+
+test "resolvePostgresCronContext requires user id in tenant postgres mode" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullalis-test",
+        .config_path = "/tmp/nullalis-test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = true;
+    cfg.state.backend = "postgres";
+
+    if (build_options.enable_postgres) {
+        try std.testing.expectError(error.MissingUserId, resolvePostgresCronContext(&cfg, null));
+        const ctx = try resolvePostgresCronContext(&cfg, 42);
+        try std.testing.expectEqual(@as(i64, 42), ctx.user_id);
+        try std.testing.expect(ctx.cfg == &cfg);
+    } else {
+        try std.testing.expectError(error.PostgresBackendNotEnabled, resolvePostgresCronContext(&cfg, 42));
+    }
+}
+
+test "resolvePostgresCronContext rejects non-tenant config" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullalis-test",
+        .config_path = "/tmp/nullalis-test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = false;
+    cfg.state.backend = "postgres";
+    if (build_options.enable_postgres) {
+        try std.testing.expectError(error.InvalidRuntimeConfig, resolvePostgresCronContext(&cfg, 7));
+    } else {
+        try std.testing.expectError(error.PostgresBackendNotEnabled, resolvePostgresCronContext(&cfg, 7));
+    }
 }
 
 test "parsePositiveUsize accepts only positive integers" {

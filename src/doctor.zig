@@ -14,6 +14,7 @@ const Config = @import("config.zig").Config;
 const channel_catalog = @import("channel_catalog.zig");
 const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
+const runtime_truth = @import("diagnostics/runtime_truth.zig");
 const builtin = @import("builtin");
 
 /// Staleness thresholds (seconds).
@@ -116,16 +117,19 @@ pub fn runDoctor(
 ) !void {
     var items: std.ArrayList(DiagItem) = .empty;
     defer items.deinit(allocator);
+    var snapshot = try runtime_truth.collectRuntimeSnapshot(allocator, config, null);
+    defer snapshot.deinit(allocator);
 
     // Core checks (matching ZeroClaw)
     try checkConfigSemantics(allocator, config, &items);
     try checkWorkspace(allocator, config, &items);
     try checkDaemonState(allocator, config, &items);
     try checkEnvironment(allocator, &items);
+    try checkRuntimeSnapshot(allocator, &snapshot, &items);
 
     // nullalis-specific extras
     checkSandbox(allocator, config, &items);
-    try checkCronStatus(allocator, &items);
+    try checkCronStoreLocal(allocator, snapshot.source, &items);
     checkChannels(allocator, config, &items);
 
     // Print grouped report
@@ -612,19 +616,86 @@ fn checkSandbox(allocator: std.mem.Allocator, cfg: *const Config, items: *std.Ar
     items.append(allocator, DiagItem.ok(cat, "sandbox: enabled")) catch {};
 }
 
-/// Check cron scheduler status.
-fn checkCronStatus(allocator: std.mem.Allocator, items: *std.ArrayList(DiagItem)) !void {
-    const cat = "cron";
+fn checkRuntimeSnapshot(
+    allocator: std.mem.Allocator,
+    snapshot: *const runtime_truth.RuntimeSnapshot,
+    items: *std.ArrayList(DiagItem),
+) !void {
+    const cat = "runtime";
+    const source_msg = try std.fmt.allocPrint(allocator, "source: {s}", .{snapshot.source.toSlice()});
+    if (snapshot.source == .gateway_internal) {
+        try items.append(allocator, DiagItem.ok(cat, source_msg));
+    } else {
+        try items.append(allocator, DiagItem.warn(cat, source_msg));
+    }
+    try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+        allocator,
+        "state backend: configured={s} effective={s}",
+        .{ snapshot.state_backend_configured, snapshot.state_backend_effective },
+    )));
+    try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+        allocator,
+        "scheduler backend: {s}",
+        .{snapshot.scheduler_backend},
+    )));
+    try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+        allocator,
+        "scheduler limits: configured max_tasks={d} max_concurrent={d}",
+        .{ snapshot.scheduler_max_tasks_configured, snapshot.scheduler_max_concurrent_configured },
+    )));
+    if (snapshot.scheduler_max_tasks_effective) |max_tasks_effective| {
+        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+            allocator,
+            "scheduler effective max_tasks: {d}",
+            .{max_tasks_effective},
+        )));
+    } else {
+        try items.append(allocator, DiagItem.warn(cat, "scheduler effective max_tasks unavailable"));
+    }
+    try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+        allocator,
+        "heartbeat: enabled={s} interval={d}m tenant={s}",
+        .{
+            if (snapshot.heartbeat_enabled) "true" else "false",
+            snapshot.heartbeat_interval_minutes,
+            if (snapshot.tenant_enabled) "true" else "false",
+        },
+    )));
+
+    if (snapshot.context_incomplete) {
+        try items.append(allocator, DiagItem.warn(cat, "runtime context incomplete; values may be fallback-only"));
+    }
+    if (snapshot.degraded) {
+        try items.append(allocator, DiagItem.err(cat, try std.fmt.allocPrint(
+            allocator,
+            "runtime degraded: {s}",
+            .{snapshot.degraded_reason},
+        )));
+    } else {
+        try items.append(allocator, DiagItem.ok(cat, "runtime not degraded"));
+    }
+}
+
+/// Check local cron store status.
+fn checkCronStoreLocal(
+    allocator: std.mem.Allocator,
+    source: runtime_truth.Source,
+    items: *std.ArrayList(DiagItem),
+) !void {
+    const cat = "cron_store_local";
+    if (source == .gateway_internal) {
+        try items.append(allocator, DiagItem.warn(cat, "local cron store is informational only; runtime scheduler source is gateway/internal diagnostics"));
+    }
     var scheduler = cron.CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     cron.loadJobs(&scheduler) catch {
-        try items.append(allocator, DiagItem.ok(cat, "cron: no jobs file (first run)"));
+        try items.append(allocator, DiagItem.ok(cat, "local cron store: no jobs file (first run)"));
         return;
     };
 
     const jobs = scheduler.listJobs();
     if (jobs.len == 0) {
-        try items.append(allocator, DiagItem.ok(cat, "cron: no scheduled jobs"));
+        try items.append(allocator, DiagItem.ok(cat, "local cron store: no scheduled jobs"));
     } else {
         var active: usize = 0;
         var paused: usize = 0;
@@ -637,7 +708,7 @@ fn checkCronStatus(allocator: std.mem.Allocator, items: *std.ArrayList(DiagItem)
         }
         try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
             allocator,
-            "cron: {d} jobs ({d} active, {d} paused)",
+            "local cron store: {d} jobs ({d} active, {d} paused)",
             .{ jobs.len, active, paused },
         )));
     }
@@ -888,6 +959,58 @@ test "checkDaemonState parses valid JSON state" {
     }
     try std.testing.expect(found_running);
     try std.testing.expect(found_scheduler);
+}
+
+test "checkRuntimeSnapshot emits runtime source and backend fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var items: std.ArrayList(DiagItem) = .empty;
+
+    var snapshot = runtime_truth.RuntimeSnapshot{
+        .source = .local_fallback,
+        .state_backend_configured = try allocator.dupe(u8, "postgres"),
+        .state_backend_effective = try allocator.dupe(u8, "unknown"),
+        .scheduler_backend = try allocator.dupe(u8, "unknown"),
+        .degraded = false,
+        .degraded_reason = try allocator.dupe(u8, ""),
+        .heartbeat_enabled = true,
+        .heartbeat_interval_minutes = 30,
+        .tenant_enabled = true,
+        .scheduler_max_tasks_configured = 64,
+        .scheduler_max_concurrent_configured = 4,
+        .context_incomplete = true,
+    };
+    defer snapshot.deinit(allocator);
+
+    try checkRuntimeSnapshot(allocator, &snapshot, &items);
+
+    var found_source = false;
+    var found_backend = false;
+    for (items.items) |item| {
+        if (std.mem.indexOf(u8, item.message, "source: local_fallback") != null) found_source = true;
+        if (std.mem.indexOf(u8, item.message, "state backend") != null) found_backend = true;
+    }
+    try std.testing.expect(found_source);
+    try std.testing.expect(found_backend);
+}
+
+test "checkCronStoreLocal marks local cron informational when runtime source is gateway" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var items: std.ArrayList(DiagItem) = .empty;
+
+    try checkCronStoreLocal(allocator, .gateway_internal, &items);
+
+    var found_marker = false;
+    for (items.items) |item| {
+        if (std.mem.indexOf(u8, item.message, "informational only") != null) {
+            found_marker = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_marker);
 }
 
 test "staleness constants are reasonable" {

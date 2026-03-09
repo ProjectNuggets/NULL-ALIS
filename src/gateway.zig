@@ -824,6 +824,7 @@ const TenantRuntime = struct {
             .numeric_user_id = numeric_user_id,
             .session_key = session_key,
             .state_mgr = self.state_mgr,
+            .expect_postgres_state = self.config.tenant.enabled and std.mem.eql(u8, self.config.state.backend, "postgres"),
         });
         defer tools_mod.clearTenantContext();
         return self.session_mgr.processMessageWithContext(session_key, message, conversation_context, .{

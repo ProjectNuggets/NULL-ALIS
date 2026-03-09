@@ -7,6 +7,17 @@ This runbook covers:
 - scheduler guardrails (min delay, burst cap, failure cooldown)
 - proactive outbound loop protection (dedupe + rate limit)
 - `/internal/diagnostics` validation
+- runtime truth source ordering for CLI/operator checks
+
+## Runtime Truth Source Order
+
+Use this order when values disagree:
+1. `/internal/diagnostics` (`startup_self_check`) is authoritative.
+2. `runtime_info` is next; honor `data_source` and `context_incomplete`.
+3. Local file/config checks are fallback only.
+
+Operational rule:
+- In tenant+Postgres deployments, treat file cron state as informational only.
 
 ## Dev Checks
 
@@ -46,6 +57,18 @@ Expected sections:
 - scheduler counters (`scheduler_executed_total`, `scheduler_blocked_burst_total`, `scheduler_blocked_cooldown_total`)
 - `recent_events` with `source`, `action`, `reason`
 
+### 2b. Validate CLI runtime truth alignment
+```bash
+nullalis doctor
+nullalis arzt
+nullalis status
+```
+
+Expected:
+- `doctor` and `arzt` output is identical.
+- Runtime section shows `source`, `state configured/effective`, `scheduler backend`, `degraded`.
+- If gateway diagnostics are unavailable, source is `local_fallback` and context may be marked incomplete.
+
 ### 3. Validate schedule creation guardrails
 One-shot minimum delay:
 ```bash
@@ -59,6 +82,21 @@ schedule once delay=60s command="message \"test\""
 ```
 
 Tenant-backed users are capped to 64 active jobs.
+
+### 3b. Validate backend-aware cron CLI
+```bash
+# tenant+postgres mode: requires --user-id
+nullalis cron list --backend postgres --user-id 1
+nullalis cron add "0 8 * * *" "echo morning" --backend postgres --user-id 1
+
+# non-tenant or explicit file mode
+nullalis cron list --backend file
+```
+
+Expected:
+- tenant+postgres + missing `--user-id` fails fast.
+- explicit postgres path reads/writes tenant scheduler state.
+- file mode remains available for local/non-tenant operation.
 
 ### 4. Validate proactive loop protection
 Trigger repeated proactive sends (cron/tool) with same content in short window.

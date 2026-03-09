@@ -993,6 +993,7 @@ fn runCronAgentTurn(
         .numeric_user_id = numeric_user_id,
         .session_key = session_key,
         .state_mgr = if (tenant_state_mgr) |*mgr| mgr else null,
+        .expect_postgres_state = runtime_cfg.tenant.enabled and std.mem.eql(u8, runtime_cfg.state.backend, "postgres"),
     });
     defer tools_mod.clearTenantContext();
 

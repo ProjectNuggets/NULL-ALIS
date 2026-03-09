@@ -2,6 +2,7 @@ const std = @import("std");
 const Config = @import("config.zig").Config;
 const version = @import("version.zig");
 const channel_catalog = @import("channel_catalog.zig");
+const runtime_truth = @import("diagnostics/runtime_truth.zig");
 
 pub fn run(allocator: std.mem.Allocator) !void {
     var buf: [4096]u8 = undefined;
@@ -15,6 +16,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
         return;
     };
     defer cfg.deinit();
+    var snapshot = try runtime_truth.collectRuntimeSnapshot(allocator, &cfg, null);
+    defer snapshot.deinit(allocator);
 
     try w.print("nullALIS Status\n\n", .{});
     try w.print("Version:     {s}\n", .{version.string});
@@ -53,6 +56,24 @@ pub fn run(allocator: std.mem.Allocator) !void {
         cfg.scheduler.max_tasks,
         cfg.scheduler.max_concurrent,
     });
+    try w.print("Runtime:     source={s}, state configured={s}, effective={s}, scheduler_backend={s}\n", .{
+        snapshot.source.toSlice(),
+        snapshot.state_backend_configured,
+        snapshot.state_backend_effective,
+        snapshot.scheduler_backend,
+    });
+    try w.print("Runtime HB:  enabled={s}, interval={d}m, tenant={s}, degraded={s}\n", .{
+        if (snapshot.heartbeat_enabled) "true" else "false",
+        snapshot.heartbeat_interval_minutes,
+        if (snapshot.tenant_enabled) "true" else "false",
+        if (snapshot.degraded) "true" else "false",
+    });
+    if (snapshot.degraded and snapshot.degraded_reason.len > 0) {
+        try w.print("Runtime Err: {s}\n", .{snapshot.degraded_reason});
+    }
+    if (snapshot.context_incomplete) {
+        try w.print("Runtime:     context incomplete (fallback mode)\n", .{});
+    }
 
     // Cost tracking
     try w.print("Cost:        {s}\n", .{

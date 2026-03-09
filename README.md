@@ -160,6 +160,37 @@ zig build -Dengines=base,sqlite,postgres
 curl http://127.0.0.1:3000/health
 ```
 
+## Runtime Truth and Diagnostics
+
+Authoritative source order for runtime state:
+1. `GET /internal/diagnostics` (`startup_self_check` + ops state)
+2. `runtime_info` with explicit `data_source` markers
+3. Local config/file fallback surfaces (always marked as fallback/context-incomplete)
+
+CLI diagnostics:
+
+```bash
+nullalis doctor
+nullalis arzt    # alias of doctor
+nullalis status
+```
+
+`doctor`/`arzt` now report:
+- runtime source (`gateway_internal` or `local_fallback`)
+- state backend (configured vs effective)
+- scheduler backend and limits (configured/effective)
+- degraded and context-incomplete markers
+
+Cron CLI is backend-aware:
+
+```bash
+nullalis cron list --backend auto
+nullalis cron list --backend postgres --user-id 1
+nullalis cron add "0 8 * * *" "message \"Morning brief\"" --backend postgres --user-id 1
+```
+
+In tenant+Postgres mode, postgres cron operations require explicit `--user-id`.
+
 ## Configuration
 
 Default config path:
