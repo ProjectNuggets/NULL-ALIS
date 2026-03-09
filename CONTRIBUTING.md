@@ -1,0 +1,27 @@
+# Contributing
+
+Thanks for contributing to nullALIS.
+
+## Inbound Licensing
+
+By submitting a contribution (code, docs, tests, or other content), you agree that:
+- your contribution is licensed under the repository's dual-license model
+  (`AGPL-3.0-or-later` and commercial licensing), and
+- you have the legal right to submit the contribution under those terms.
+
+This follows an inbound-equals-outbound policy unless otherwise agreed in writing.
+
+## Development Checks
+
+Before opening a PR:
+
+```bash
+zig build test --summary all
+zig build -Doptimize=ReleaseSmall
+```
+
+Optional (recommended):
+
+```bash
+git config core.hooksPath .githooks
+```

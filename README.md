@@ -10,7 +10,7 @@
 
 ## Current Status (March 9, 2026)
 
-`nullALIS` is in a `v0.1` hardening phase focused on reliability, runtime correctness, and operator-grade behavior.
+`nullALIS v0.1` is release-ready, with hardening focused on reliability, runtime correctness, and operator-grade behavior.
 
 Current verified baseline on active branch work:
 - Full tests pass: `zig build test --summary all` (`4444` passed, `4` skipped).
@@ -225,6 +225,11 @@ Web search provider selection:
 - More adaptive memory retrieval and context shaping.
 - UI/UX polish for multi-modal and operator experiences.
 
+## Benchmark
+
+- [DTaaS-Bench v0.2 spec](docs/dtaas-bench-v0.2-spec.md)
+- [DTaaS-Bench v0.2 run manifest template](docs/dtaas-bench-run-manifest-v0.2.json)
+
 ## Enablers
 
 - Strong test baseline with high coverage and leak-sensitive allocators.
@@ -258,4 +263,8 @@ zig fmt src/**/*.zig
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Dual-license (provisional):
+- AGPL-3.0-or-later
+- Commercial license
+
+See [LICENSE](LICENSE) and [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
