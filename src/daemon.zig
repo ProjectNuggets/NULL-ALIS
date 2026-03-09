@@ -976,6 +976,26 @@ fn runCronAgentTurn(
         break :blk zaki_session.fallbackCronSessionKey();
     };
 
+    const numeric_user_id = if (scheduler.context_user_id) |user_id|
+        std.fmt.parseInt(i64, user_id, 10) catch null
+    else
+        null;
+    var tenant_state_mgr: ?zaki_state.Manager = null;
+    if (runtime_cfg.tenant.enabled and
+        std.mem.eql(u8, runtime_cfg.state.backend, "postgres") and
+        numeric_user_id != null)
+    {
+        tenant_state_mgr = zaki_state.Manager.init(allocator, runtime_cfg.state) catch null;
+    }
+    defer if (tenant_state_mgr) |*mgr| mgr.deinit();
+    tools_mod.setTenantContext(.{
+        .user_id = scheduler.context_user_id,
+        .numeric_user_id = numeric_user_id,
+        .session_key = session_key,
+        .state_mgr = if (tenant_state_mgr) |*mgr| mgr else null,
+    });
+    defer tools_mod.clearTenantContext();
+
     const turn_origin: tools_mod.TurnOrigin = if (std.mem.eql(u8, job.id, "heartbeat"))
         .heartbeat
     else

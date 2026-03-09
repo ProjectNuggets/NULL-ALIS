@@ -153,7 +153,7 @@ pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
     pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID (optional deterministic ID for create/add/once, required for get/cancel/pause/resume)"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -243,6 +243,7 @@ pub const ScheduleTool = struct {
                 return ToolResult.fail("Missing 'command' parameter");
             const expression = root.getString(args, "expression") orelse
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
+            const requested_id = normalizeRequestedId(root.getString(args, "id"));
 
             const loaded = loadSchedulerForContext(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
@@ -250,10 +251,35 @@ pub const ScheduleTool = struct {
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
 
+            if (requested_id) |id| {
+                if (scheduler.getJob(id)) |existing| {
+                    const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
+                        existing.id,
+                        existing.expression,
+                        existing.command,
+                    });
+                    return ToolResult{ .success = true, .output = msg };
+                }
+            }
+
+            if (findMatchingRecurringJob(scheduler.listJobs(), expression, command)) |existing| {
+                const msg = try std.fmt.allocPrint(allocator, "Job already exists {s} | {s} | cmd: {s}", .{
+                    existing.id,
+                    existing.expression,
+                    existing.command,
+                });
+                return ToolResult{ .success = true, .output = msg };
+            }
+
             const job = scheduler.addJob(expression, command) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
+
+            if (requested_id) |id| {
+                allocator.free(job.id);
+                job.id = try allocator.dupe(u8, id);
+            }
 
             try applyTenantDefaults(&scheduler, allocator, job.id, command);
             saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
@@ -271,6 +297,7 @@ pub const ScheduleTool = struct {
                 return ToolResult.fail("Missing 'command' parameter");
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
+            const requested_id = normalizeRequestedId(root.getString(args, "id"));
             validateOnceDelay(delay) catch {
                 return ToolResult.fail("Delay too short; minimum is 60s");
             };
@@ -281,10 +308,26 @@ pub const ScheduleTool = struct {
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
 
+            if (requested_id) |id| {
+                if (scheduler.getJob(id)) |existing| {
+                    const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
+                        existing.id,
+                        existing.expression,
+                        existing.command,
+                    });
+                    return ToolResult{ .success = true, .output = msg };
+                }
+            }
+
             const job = scheduler.addOnce(delay, command) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
+
+            if (requested_id) |id| {
+                allocator.free(job.id);
+                job.id = try allocator.dupe(u8, id);
+            }
 
             try applyTenantDefaults(&scheduler, allocator, job.id, command);
             saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
@@ -344,6 +387,27 @@ pub const ScheduleTool = struct {
     }
 };
 
+fn normalizeRequestedId(raw: ?[]const u8) ?[]const u8 {
+    const value = raw orelse return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return trimmed;
+}
+
+fn findMatchingRecurringJob(
+    jobs: []const cron.CronJob,
+    expression: []const u8,
+    command: []const u8,
+) ?*const cron.CronJob {
+    for (jobs) |*job| {
+        if (job.one_shot) continue;
+        if (!std.mem.eql(u8, job.expression, expression)) continue;
+        if (!std.mem.eql(u8, job.command, command)) continue;
+        return job;
+    }
+    return null;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "schedule tool name" {
@@ -362,6 +426,27 @@ test "schedule schema has action" {
 test "schedule validateOnceDelay enforces minimum" {
     try std.testing.expectError(error.DelayTooShort, validateOnceDelay("10s"));
     try validateOnceDelay("60s");
+}
+
+test "schedule normalizeRequestedId trims and drops empty values" {
+    try std.testing.expect(normalizeRequestedId(null) == null);
+    try std.testing.expect(normalizeRequestedId("   ") == null);
+    try std.testing.expectEqualStrings("morning-brief", normalizeRequestedId("  morning-brief  ").?);
+}
+
+test "schedule findMatchingRecurringJob returns recurring exact match only" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("0 8 * * *", "send morning brief");
+    _ = try scheduler.addJob("*/15 * * * *", "send heartbeat");
+    _ = try scheduler.addOnce("30m", "send morning brief");
+
+    const found = findMatchingRecurringJob(scheduler.listJobs(), "0 8 * * *", "send morning brief");
+    try std.testing.expect(found != null);
+    try std.testing.expect(!found.?.one_shot);
+
+    try std.testing.expect(findMatchingRecurringJob(scheduler.listJobs(), "0 9 * * *", "send morning brief") == null);
 }
 
 fn schedule_test_output_is_heap_owned(output: []const u8) bool {
@@ -429,7 +514,10 @@ test "schedule create with expression" {
     defer free_schedule_test_error_if_owned(result.error_msg);
     // Succeeds if HOME/.nullalis is writable, otherwise may fail gracefully
     if (result.success) {
-        try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
+        try std.testing.expect(
+            std.mem.indexOf(u8, result.output, "Created job") != null or
+                std.mem.indexOf(u8, result.output, "already exists") != null,
+        );
     }
 }
 
@@ -556,7 +644,10 @@ test "schedule add creates recurring job" {
     defer free_schedule_test_output_if_owned(result.output);
     defer free_schedule_test_error_if_owned(result.error_msg);
     if (result.success) {
-        try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
+        try std.testing.expect(
+            std.mem.indexOf(u8, result.output, "Created job") != null or
+                std.mem.indexOf(u8, result.output, "already exists") != null,
+        );
     }
 }
 
