@@ -364,13 +364,45 @@ test "schedule validateOnceDelay enforces minimum" {
     try validateOnceDelay("60s");
 }
 
+fn schedule_test_output_is_heap_owned(output: []const u8) bool {
+    return output.len > 0 and !std.mem.eql(u8, output, "No scheduled jobs.");
+}
+
+fn schedule_test_error_is_heap_owned(error_msg: []const u8) bool {
+    if (std.mem.eql(u8, error_msg, "Missing 'action' parameter")) return false;
+    if (std.mem.eql(u8, error_msg, "Missing 'id' parameter for get action")) return false;
+    if (std.mem.eql(u8, error_msg, "Missing 'command' parameter")) return false;
+    if (std.mem.eql(u8, error_msg, "Missing 'expression' parameter for cron job")) return false;
+    if (std.mem.eql(u8, error_msg, "Missing 'delay' parameter for one-shot task")) return false;
+    if (std.mem.eql(u8, error_msg, "Delay too short; minimum is 60s")) return false;
+    if (std.mem.eql(u8, error_msg, "Missing 'id' parameter for cancel action")) return false;
+    if (std.mem.eql(u8, error_msg, "Missing 'id' parameter")) return false;
+    if (std.mem.eql(u8, error_msg, "Failed to load scheduler state")) return false;
+    return true;
+}
+
+fn free_schedule_test_output_if_owned(output: []const u8) void {
+    if (schedule_test_output_is_heap_owned(output)) {
+        std.testing.allocator.free(output);
+    }
+}
+
+fn free_schedule_test_error_if_owned(error_msg: ?[]const u8) void {
+    if (error_msg) |msg| {
+        if (schedule_test_error_is_heap_owned(msg)) {
+            std.testing.allocator.free(msg);
+        }
+    }
+}
+
 test "schedule list returns success" {
     var st = ScheduleTool{};
     const t = st.tool();
     const parsed = try root.parseTestArgs("{\"action\": \"list\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(result.success);
     // Either "No scheduled jobs." or a formatted job list
     try std.testing.expect(result.output.len > 0);
@@ -382,7 +414,7 @@ test "schedule unknown action" {
     const parsed = try root.parseTestArgs("{\"action\": \"explode\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unknown action") != null);
 }
@@ -393,7 +425,8 @@ test "schedule create with expression" {
     const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"*/5 * * * *\", \"command\": \"echo hello\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     // Succeeds if HOME/.nullalis is writable, otherwise may fail gracefully
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
@@ -408,6 +441,8 @@ test "schedule missing action" {
     const parsed = try root.parseTestArgs("{}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "action") != null);
 }
@@ -418,6 +453,8 @@ test "schedule get missing id" {
     const parsed = try root.parseTestArgs("{\"action\": \"get\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "id") != null);
 }
@@ -428,7 +465,7 @@ test "schedule get nonexistent job" {
     const parsed = try root.parseTestArgs("{\"action\": \"get\", \"id\": \"nonexistent-123\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not found") != null);
 }
@@ -439,6 +476,8 @@ test "schedule cancel requires id" {
     const parsed = try root.parseTestArgs("{\"action\": \"cancel\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
 }
 
@@ -448,8 +487,8 @@ test "schedule cancel nonexistent job returns not found" {
     const parsed = try root.parseTestArgs("{\"action\": \"cancel\", \"id\": \"job-nonexistent\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     // Job doesn't exist in the real scheduler, so cancel returns not-found or success if previously created
     if (!result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not found") != null);
@@ -462,8 +501,8 @@ test "schedule remove nonexistent job returns not found" {
     const parsed = try root.parseTestArgs("{\"action\": \"remove\", \"id\": \"job-nonexistent\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     if (!result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not found") != null);
     }
@@ -475,8 +514,8 @@ test "schedule pause nonexistent job returns not found" {
     const parsed = try root.parseTestArgs("{\"action\": \"pause\", \"id\": \"job-nonexistent\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     if (!result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not found") != null);
     }
@@ -488,8 +527,8 @@ test "schedule resume nonexistent job returns not found" {
     const parsed = try root.parseTestArgs("{\"action\": \"resume\", \"id\": \"job-nonexistent\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     if (!result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not found") != null);
     }
@@ -501,7 +540,8 @@ test "schedule once creates one-shot task" {
     const parsed = try root.parseTestArgs("{\"action\": \"once\", \"delay\": \"30m\", \"command\": \"echo later\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "one-shot") != null);
     }
@@ -513,7 +553,8 @@ test "schedule add creates recurring job" {
     const parsed = try root.parseTestArgs("{\"action\": \"add\", \"expression\": \"0 * * * *\", \"command\": \"echo hourly\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
     }
@@ -525,6 +566,8 @@ test "schedule create missing command" {
     const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"* * * * *\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "command") != null);
 }
@@ -535,6 +578,8 @@ test "schedule create missing expression" {
     const parsed = try root.parseTestArgs("{\"action\": \"create\", \"command\": \"echo hi\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "expression") != null);
 }
@@ -545,6 +590,8 @@ test "schedule once missing delay" {
     const parsed = try root.parseTestArgs("{\"action\": \"once\", \"command\": \"echo hi\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "delay") != null);
 }
@@ -555,6 +602,8 @@ test "schedule pause requires id" {
     const parsed = try root.parseTestArgs("{\"action\": \"pause\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
 }
 
@@ -564,6 +613,8 @@ test "schedule resume requires id" {
     const parsed = try root.parseTestArgs("{\"action\": \"resume\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
 }
 
