@@ -23,6 +23,8 @@ const zaki_dual_memory = @import("memory/engines/zaki_dual.zig");
 const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
+const Observer = observability.Observer;
+const ObserverEvent = observability.ObserverEvent;
 const agent_routing = @import("agent_routing.zig");
 const agent_prompt = @import("agent/prompt.zig");
 const security = @import("security/policy.zig");
@@ -811,6 +813,7 @@ const TenantRuntime = struct {
         message: []const u8,
         conversation_context: ?agent_prompt.ConversationContext,
         message_turn_context: ?tools_mod.MessageTurnContext,
+        progress_observer: ?Observer,
     ) ![]const u8 {
         self.lock.lock();
         defer self.lock.unlock();
@@ -823,7 +826,10 @@ const TenantRuntime = struct {
             .state_mgr = self.state_mgr,
         });
         defer tools_mod.clearTenantContext();
-        return self.session_mgr.processMessageWithToolContext(session_key, message, conversation_context, message_turn_context);
+        return self.session_mgr.processMessageWithContext(session_key, message, conversation_context, .{
+            .message_turn_context = message_turn_context,
+            .progress_observer = progress_observer,
+        });
     }
 };
 
@@ -1530,6 +1536,7 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
             .account_id = job.account_id,
             .chat_id = chat_id_str,
         },
+        null,
     ) catch |err| {
         if (job.bot_token.len > 0) {
             sendTelegramReply(job.allocator, job.bot_token, job.chat_id, userFacingAgentError(err)) catch |send_err| {
@@ -3257,6 +3264,189 @@ fn sseStatusFrame(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
+fn sseProgressFrame(
+    allocator: std.mem.Allocator,
+    phase: []const u8,
+    state: []const u8,
+    label: []const u8,
+    tool: ?[]const u8,
+    iteration: ?u32,
+    duration_ms: ?u64,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("event: progress\ndata: {\"type\":\"progress\",\"phase\":\"");
+    try jsonEscapeInto(w, phase);
+    try w.writeAll("\",\"state\":\"");
+    try jsonEscapeInto(w, state);
+    try w.writeAll("\",\"label\":\"");
+    try jsonEscapeInto(w, label);
+    try w.writeAll("\"");
+    if (tool) |tool_name| {
+        try w.writeAll(",\"tool\":\"");
+        try jsonEscapeInto(w, tool_name);
+        try w.writeAll("\"");
+    }
+    if (iteration) |value| {
+        try w.print(",\"iteration\":{d}", .{value});
+    }
+    if (duration_ms) |value| {
+        try w.print(",\"duration_ms\":{d}", .{value});
+    }
+    try w.writeAll("}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn SseProgressObserver(comptime StreamType: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        stream: StreamType,
+        stream_failed: bool = false,
+        last_emit_ms: i64 = 0,
+        last_emit_hash: u64 = 0,
+
+        const Self = @This();
+        const DEDUPE_WINDOW_MS: i64 = 250;
+
+        const vtable = Observer.VTable{
+            .record_event = recordEvent,
+            .record_metric = recordMetric,
+            .flush = flush,
+            .name = name,
+        };
+
+        fn init(allocator: std.mem.Allocator, stream: StreamType) Self {
+            return .{
+                .allocator = allocator,
+                .stream = stream,
+            };
+        }
+
+        fn observer(self: *Self) Observer {
+            return .{
+                .ptr = @ptrCast(self),
+                .vtable = &vtable,
+            };
+        }
+
+        fn resolve(ptr: *anyopaque) *Self {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn shouldSuppressDuplicate(
+            self: *Self,
+            phase: []const u8,
+            state: []const u8,
+            label: []const u8,
+            tool: ?[]const u8,
+            iteration: ?u32,
+        ) bool {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(phase);
+            hasher.update(state);
+            hasher.update(label);
+            if (tool) |tool_name| hasher.update(tool_name);
+            if (iteration) |value| {
+                var iter_buf: [16]u8 = undefined;
+                const iter_text = std.fmt.bufPrint(&iter_buf, "{d}", .{value}) catch "";
+                hasher.update(iter_text);
+            }
+            const hash = hasher.final();
+            const now_ms = std.time.milliTimestamp();
+            if (self.last_emit_hash == hash and now_ms - self.last_emit_ms < DEDUPE_WINDOW_MS) return true;
+            self.last_emit_hash = hash;
+            self.last_emit_ms = now_ms;
+            return false;
+        }
+
+        fn emit(
+            self: *Self,
+            phase: []const u8,
+            state: []const u8,
+            label: []const u8,
+            tool: ?[]const u8,
+            iteration: ?u32,
+            duration_ms: ?u64,
+        ) void {
+            if (self.stream_failed) return;
+            if (self.shouldSuppressDuplicate(phase, state, label, tool, iteration)) return;
+            const frame = sseProgressFrame(self.allocator, phase, state, label, tool, iteration, duration_ms) catch return;
+            defer self.allocator.free(frame);
+            sendChunkedSseFrame(self.stream, frame) catch {
+                self.stream_failed = true;
+                return;
+            };
+        }
+
+        fn emitStage(self: *Self, stage: []const u8, iteration: ?u32, duration_ms: ?u64, count: ?u32) void {
+            _ = count;
+            if (std.mem.eql(u8, stage, "memory_enrich")) {
+                self.emit("thinking", "update", "Retrieving memory", null, iteration, duration_ms);
+                return;
+            }
+            if (std.mem.eql(u8, stage, "build_provider_messages")) {
+                self.emit("thinking", "update", "Preparing model request", null, iteration, duration_ms);
+                return;
+            }
+            if (std.mem.eql(u8, stage, "parse_provider_response")) {
+                self.emit("thinking", "update", "Processing model response", null, iteration, duration_ms);
+                return;
+            }
+            if (std.mem.eql(u8, stage, "tool_reflection")) {
+                self.emit("thinking", "update", "Reflecting on tool results", null, iteration, duration_ms);
+                return;
+            }
+            if (std.mem.eql(u8, stage, "compose_final_reply")) {
+                self.emit("compose", "update", "Composing final response", null, iteration, duration_ms);
+                return;
+            }
+            if (std.mem.eql(u8, stage, "finalize_no_tools")) {
+                self.emit("finalize", "update", "Finalizing response", null, iteration, duration_ms);
+                return;
+            }
+        }
+
+        fn recordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+            const self = resolve(ptr);
+            switch (event.*) {
+                .llm_request => self.emit("thinking", "start", "Thinking", null, null, null),
+                .llm_response => |e| {
+                    if (e.success) {
+                        self.emit("compose", "update", "Model response received", null, null, e.duration_ms);
+                    } else {
+                        self.emit("finalize", "error", "Model request failed", null, null, e.duration_ms);
+                    }
+                },
+                .tool_call_start => |e| {
+                    var label_buf: [160]u8 = undefined;
+                    const label = std.fmt.bufPrint(&label_buf, "Using {s}", .{e.tool}) catch "Using tool";
+                    self.emit("tool", "start", label, e.tool, null, null);
+                },
+                .tool_call => |e| {
+                    var label_buf: [192]u8 = undefined;
+                    const label = if (e.success)
+                        (std.fmt.bufPrint(&label_buf, "{s} completed", .{e.tool}) catch "Tool completed")
+                    else
+                        (std.fmt.bufPrint(&label_buf, "{s} failed", .{e.tool}) catch "Tool failed");
+                    self.emit("tool", if (e.success) "done" else "error", label, e.tool, null, e.duration_ms);
+                },
+                .tool_iterations_exhausted => self.emit("finalize", "error", "Tool iteration limit reached", null, null, null),
+                .turn_stage => |e| self.emitStage(e.stage, e.iteration, e.duration_ms, e.count),
+                .turn_complete => self.emit("finalize", "done", "Response ready", null, null, null),
+                else => {},
+            }
+        }
+
+        fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+        fn flush(_: *anyopaque) void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "sse_progress";
+        }
+    };
+}
+
 fn sseErrorFrame(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -3456,6 +3646,9 @@ fn handleApiChatStreamSseConnection(
     const status_frame: []const u8 = if (status_owned) |frame| frame else status_fallback;
     sendChunkedSseFrame(stream, status_frame) catch return true;
 
+    var progress_observer_impl = SseProgressObserver(@TypeOf(stream)).init(req_allocator, stream);
+    const progress_observer = progress_observer_impl.observer();
+
     const chat_start_ms = std.time.milliTimestamp();
     const reply = blk: {
         if (state.tenant_enabled) {
@@ -3477,6 +3670,7 @@ fn handleApiChatStreamSseConnection(
                     .is_group = false,
                 },
                 null,
+                progress_observer,
             ) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
@@ -3484,7 +3678,9 @@ fn handleApiChatStreamSseConnection(
             };
         }
         if (session_mgr_opt) |sm| {
-            break :blk sm.processMessage(session_key, message, null) catch {
+            break :blk sm.processMessageWithContext(session_key, message, null, .{
+                .progress_observer = progress_observer,
+            }) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
                 return true;
@@ -3710,6 +3906,7 @@ fn handleApiRoute(
                         .channel = "zaki_app",
                         .is_group = false,
                     },
+                    null,
                     null,
                 ) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
@@ -4619,6 +4816,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         .account_id = tg_account_id,
                         .chat_id = cid_str,
                     },
+                    null,
                 ) catch |err| blk: {
                     if (tenant_user_ctx) |*send_user_ctx| {
                         const send_token = resolveTenantTelegramBotTokenForSend(ctx.req_allocator, send_user_ctx) catch |token_err| {
@@ -8035,6 +8233,28 @@ test "sseErrorEvent includes code and terminal done event" {
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"message\":\"chat failed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "event: done") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"type\":\"done\"") != null);
+}
+
+test "sseProgressFrame emits progress payload with optional fields" {
+    const frame = try sseProgressFrame(
+        std.testing.allocator,
+        "tool",
+        "start",
+        "Using \"schedule\"",
+        "schedule",
+        2,
+        123,
+    );
+    defer std.testing.allocator.free(frame);
+
+    try std.testing.expect(std.mem.indexOf(u8, frame, "event: progress") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"type\":\"progress\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"phase\":\"tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"state\":\"start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"label\":\"Using \\\"schedule\\\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool\":\"schedule\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"iteration\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"duration_ms\":123") != null);
 }
 
 test "sseChatPayload emits token deltas and done metadata" {

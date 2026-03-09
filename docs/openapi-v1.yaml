@@ -301,7 +301,7 @@ paths:
                   type: string
       responses:
         "200":
-          description: SSE stream (`status`, `token`, `done`)
+          description: SSE stream (`status`, optional `progress`, `token`, `done`)
           content:
             text/event-stream:
               schema:

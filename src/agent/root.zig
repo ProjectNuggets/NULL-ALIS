@@ -740,6 +740,11 @@ pub const Agent = struct {
             try self.allocator.dupe(u8, user_message);
         const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
         log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
+        const memory_stage_event = ObserverEvent{ .turn_stage = .{
+            .stage = "memory_enrich",
+            .duration_ms = enrich_duration_ms,
+        } };
+        self.observer.recordEvent(&memory_stage_event);
         errdefer self.allocator.free(enriched);
 
         try self.history.append(self.allocator, .{
@@ -794,6 +799,13 @@ pub const Agent = struct {
                 build_messages_duration_ms,
                 self.history.items.len,
             });
+            const build_stage_event = ObserverEvent{ .turn_stage = .{
+                .stage = "build_provider_messages",
+                .iteration = iteration,
+                .duration_ms = build_messages_duration_ms,
+                .count = @intCast(@min(self.history.items.len, std.math.maxInt(u32))),
+            } };
+            self.observer.recordEvent(&build_stage_event);
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
@@ -997,6 +1009,13 @@ pub const Agent = struct {
                     parse_duration_ms,
                     parsed_calls.len,
                 });
+                const parse_stage_event = ObserverEvent{ .turn_stage = .{
+                    .stage = "parse_provider_response",
+                    .iteration = iteration,
+                    .duration_ms = parse_duration_ms,
+                    .count = @intCast(@min(parsed_calls.len, std.math.maxInt(u32))),
+                } };
+                self.observer.recordEvent(&parse_stage_event);
             } else {
                 const parse_start_ms = std.time.milliTimestamp();
                 // No native tool calls — parse response text for XML tool calls
@@ -1013,6 +1032,13 @@ pub const Agent = struct {
                     parse_duration_ms,
                     parsed_calls.len,
                 });
+                const parse_stage_event = ObserverEvent{ .turn_stage = .{
+                    .stage = "parse_provider_response",
+                    .iteration = iteration,
+                    .duration_ms = parse_duration_ms,
+                    .count = @intCast(@min(parsed_calls.len, std.math.maxInt(u32))),
+                } };
+                self.observer.recordEvent(&parse_stage_event);
             }
 
             // Determine display text
@@ -1066,6 +1092,12 @@ pub const Agent = struct {
                 const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
                 const compose_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compose_start_ms));
                 log.info("turn.stage stage=compose_final_reply iteration={d} duration_ms={d}", .{ iteration, compose_duration_ms });
+                const compose_stage_event = ObserverEvent{ .turn_stage = .{
+                    .stage = "compose_final_reply",
+                    .iteration = iteration,
+                    .duration_ms = compose_duration_ms,
+                } };
+                self.observer.recordEvent(&compose_stage_event);
                 errdefer self.allocator.free(final_text);
 
                 // Dupe from display_text directly (not from final_text) to avoid double-dupe
@@ -1150,6 +1182,12 @@ pub const Agent = struct {
                     finalize_duration_ms,
                     total_turn_ms,
                 });
+                const finalize_stage_event = ObserverEvent{ .turn_stage = .{
+                    .stage = "finalize_no_tools",
+                    .iteration = iteration,
+                    .duration_ms = finalize_duration_ms,
+                } };
+                self.observer.recordEvent(&finalize_stage_event);
 
                 return final_text;
             }
@@ -1224,6 +1262,13 @@ pub const Agent = struct {
                 reflect_duration_ms,
                 results_buf.items.len,
             });
+            const reflect_stage_event = ObserverEvent{ .turn_stage = .{
+                .stage = "tool_reflection",
+                .iteration = iteration,
+                .duration_ms = reflect_duration_ms,
+                .count = @intCast(@min(results_buf.items.len, std.math.maxInt(u32))),
+            } };
+            self.observer.recordEvent(&reflect_stage_event);
 
             const trim_start_ms = std.time.milliTimestamp();
             self.trimHistory();
