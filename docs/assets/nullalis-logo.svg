@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">nullALIS</title>
+  <desc id="desc">nullALIS logo mark and wordmark</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b132b"/>
+      <stop offset="100%" stop-color="#1c2541"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#56ccf2"/>
+      <stop offset="100%" stop-color="#2f80ed"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#6ee7b7"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="320" rx="24" fill="url(#bg)"/>
+
+  <g transform="translate(100 64)">
+    <circle cx="96" cy="96" r="72" fill="none" stroke="url(#ink)" stroke-width="14"/>
+    <ellipse cx="96" cy="96" rx="110" ry="38" fill="none" stroke="url(#accent)" stroke-width="10" opacity="0.9"/>
+    <circle cx="168" cy="96" r="12" fill="#6ee7b7"/>
+    <circle cx="48" cy="96" r="8" fill="#56ccf2" opacity="0.9"/>
+    <circle cx="96" cy="96" r="18" fill="url(#ink)"/>
+  </g>
+
+  <g transform="translate(300 96)">
+    <text x="0" y="92" font-family="Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="92" font-weight="700" fill="#f8fafc">
+      null<tspan fill="#7dd3fc">ALIS</tspan>
+    </text>
+    <text x="4" y="138" font-family="Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="24" fill="#93c5fd">
+      autonomous runtime for digital twins
+    </text>
+  </g>
+</svg>

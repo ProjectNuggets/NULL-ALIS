@@ -1,111 +1,132 @@
 # nullALIS
 
-`nullALIS` is a Zig-first autonomous agent runtime for persistent digital twins, multitenant agent products, and local-first operator workflows.
+<p align="center">
+  <img src="docs/assets/nullalis-logo.svg" alt="nullALIS logo" width="420" />
+</p>
 
-It is the engine behind `ZAKI BOT`: one persistent conversation, durable memory, proactive jobs, channel integrations, and a workspace the agent can actually use.
+<p align="center">
+  Zig-first autonomous agent runtime for persistent digital twins and multitenant products.
+</p>
 
-## Runtime Naming
+## Current Status (March 9, 2026)
 
-The product brand is `nullALIS`.
+`nullALIS` is in a `v0.1` hardening phase focused on reliability, runtime correctness, and operator-grade behavior.
 
-The current runtime identity uses lowercase `nullalis` for:
-- executable name: `nullalis`
-- default config path: `~/.nullalis/`
-- service and artifact names
+Current verified baseline on active branch work:
+- Full tests pass: `zig build test --summary all` (`4444` passed, `4` skipped).
+- Build passes with production engines: `zig build -Dengines=base,sqlite,postgres`.
+- Postgres-backed tenant runtime is the authoritative state path when configured.
+- Chat SSE contract is stable, with additive `progress` events for live UX (`status/progress/token/done`).
 
-That split is intentional: branded product name in docs, lowercase runtime names in commands and filesystems.
+References:
+- [v0.1 final sweep](docs/final-sweep-2026-03-09.md)
+- [ops runbook](docs/reliability-ops-runbook.md)
+- [runtime status notes](docs/status-2026-03-06.md)
 
-## What nullALIS Does
+## What nullALIS Is
 
-`nullALIS` is built to run a serious agent, not a toy chat surface.
+`nullALIS` is the runtime engine behind productized agents like `ZAKI BOT`.
 
-Core capabilities:
-- persistent chat sessions
-- durable memory with markdown workspace files and Postgres-backed tenant state
-- proactive jobs, reminders, heartbeat behavior, and scheduler execution
-- agent tools for files, shell, git, web, browser, memory, delegation, and integrations
-- channel support including Telegram and app-backed chat
-- SSE chat streaming for app integrations
-- multitenant runtime model for products like `ZAKI BOT`
-- Kubernetes-friendly deployment model
+It is designed for:
+- persistent per-user sessions
+- durable memory and runtime state
+- proactive scheduling and background autonomy
+- secure, multitenant operation
+- backend/frontend integration through stable APIs and SSE streams
 
-## Current Product Direction
+Naming note:
+- Brand: `nullALIS`
+- Runtime/CLI/config path: `nullalis` (binary), `~/.nullalis/`
 
-The current repository is being shaped around three requirements:
-- `nullALIS` as the runtime and backend engine
-- `ZAKI BOT` as the user-facing digital twin inside ZAKI
-- a scalable multitenant architecture with Postgres as canonical tenant state and workspace files kept live on disk
+## Current Capabilities
 
-That means the system is designed around:
-- one persistent main session per user
-- per-user memory, config, secrets, jobs, and channel state
-- workspace files such as `BOOTSTRAP.md`, `IDENTITY.md`, `USER.md`, `SOUL.md`, `HEARTBEAT.md`, `MEMORY.md`, and daily memory notes
+### 1) Conversation Runtime
+- Persistent main-session model per user.
+- Session-scoped history, autosave, and slash command support.
+- Tool-call loop with reflection, bounded iterations, and fallback completion behavior.
+- Streaming reply transport via `/api/v1/chat/stream`.
 
-## v0.1 Release Readiness (Current Branch)
+### 2) Memory and State
+Hybrid memory architecture:
+- Workspace markdown files for human-readable continuity.
+- Postgres-backed tenant state for durable canonical runtime data.
+- pgvector-compatible semantic retrieval path (when configured).
+- Runtime introspection via `runtime_info` and `/runtime` command surfaces.
 
-As of `2026-03-09`, `v0.1` is ready as a hardening release candidate.
+### 3) Autonomy and Scheduling
+- Heartbeat and scheduler execution paths with turn-origin wiring (`user`, `heartbeat`, `scheduler`).
+- Background policy guardrails (restricted tools for autonomous/background turns).
+- Postgres-backed scheduler path in tenant mode.
+- Reminder/proactive guardrails (dedupe/rate-limit instrumentation available in diagnostics).
 
-Validated:
-- `zig build test --summary all`
-- `zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres`
-- `scripts/preflight.sh` (postgres/state startup gates)
-- Docker image build and runtime health (`/health`)
-- Kubernetes manifest render (`kubectl kustomize deploy/k8s/zaki-bot`)
+### 4) Tooling and Integrations
+- Broad built-in tool surface (files, shell, git, memory, web, browser, scheduling, integrations).
+- Composio integration path for Gmail/Drive/Calendar readiness in multitenant deployments.
+- Per-user Composio entity scoping supported at runtime.
+- Telegram and app channel integration with shared main timeline model.
 
-Open non-blocking items tracked for v0.2:
-- reserved turn origins `wake` and `proactive` are defined but not wired as independent flows
-- startup schema `NOTICE` noise is still high in local logs
-- subagent control remains completion-oriented (no mid-flight interrupt/steer in-place)
+### 5) Platform and Deployment
+- Local runtime for operator/dev workflows.
+- Docker-friendly runtime packaging.
+- Kubernetes manifests and integration handoff docs for ZAKI backend/frontend.
+- Health/readiness/metrics/internal diagnostics endpoints.
 
-Reference:
-- [docs/final-sweep-2026-03-09.md](docs/final-sweep-2026-03-09.md)
+## Tech Stack
 
-## Key Features
+Core stack:
+- Language: Zig (`0.15.2` baseline in this repository).
+- Runtime style: vtable-driven interfaces, modular factories.
+- State: Postgres (tenant runtime), SQLite and markdown where configured.
+- Semantic store: pgvector and pluggable vector/embedding providers.
+- Transport: native HTTP + SSE chat streams (`/api/v1/chat/stream`).
+- Channels: Telegram plus app/backend API pathways.
+- Integrations: Composio and tool adapters.
 
-### Persistent Digital Twin
-- one long-lived conversation
-- remembers across sessions
-- can store and recall facts, preferences, plans, and work context
-- keeps a readable workspace, not just database state
+Ops stack:
+- Observability: structured runtime logs + metrics endpoints.
+- Deployment: Docker + Kubernetes manifests under `deploy/k8s/zaki-bot/`.
 
-### Real Workspace
-The agent can work with:
-- files
-- repos
-- shell commands
-- git
-- screenshots and images
-- browser and web tools
-- markdown memory files
+## Architecture At a Glance
 
-### Proactive Behavior
-- scheduled reminders
-- recurring jobs
-- heartbeat/proactive follow-up patterns
-- channel-aware delivery paths
+Primary extension boundaries:
+- Providers: model backends and routing
+- Channels: inbound/outbound messaging transports
+- Tools: runtime action surface
+- Memory: storage/retrieval backends
+- Observability: event/metric emission backends
 
-### Multitenant Runtime
-For product integrations such as `ZAKI BOT`, the runtime supports:
-- per-user session isolation
-- per-user config and secrets
-- per-user channel state
-- shared app + Telegram timeline model
-- SSE chat streaming behind a trusted backend
+Key source entry points:
+- [src/main.zig](src/main.zig)
+- [src/gateway.zig](src/gateway.zig)
+- [src/agent/root.zig](src/agent/root.zig)
+- [src/session.zig](src/session.zig)
+- [src/tools/root.zig](src/tools/root.zig)
+- [src/memory/root.zig](src/memory/root.zig)
+- [src/providers/root.zig](src/providers/root.zig)
+- [src/channels/root.zig](src/channels/root.zig)
+- [src/observability.zig](src/observability.zig)
 
-## ZAKI BOT Integration Model
+## API and Swagger
 
-The current integration model assumes:
-- ZAKI frontend talks to ZAKI backend
-- ZAKI backend proxies authenticated requests to `nullALIS`
-- `nullALIS` resolves a canonical `user_id`
-- app and Telegram share one main session timeline per user
+OpenAPI contract:
+- [docs/openapi-v1.yaml](docs/openapi-v1.yaml)
 
-Canonical main session pattern:
-- `agent:zaki-bot:user:{user_id}:main`
+Important endpoints:
+- `/health`, `/ready`, `/metrics`
+- `/internal/diagnostics`
+- `/api/v1/chat/stream`
+- `/api/v1/users/*` tenant surfaces
 
-Tenant runtime state is moving toward:
-- canonical Postgres state for runtime correctness
-- live workspace files on disk for usability and continuity
+SSE chat stream contract:
+- `event: status` (initial status)
+- `event: progress` (optional runtime progress hints)
+- `event: token` (assistant text deltas)
+- `event: error` (stream error payload)
+- `event: done` (terminal frame)
+
+Integration handoff specs:
+- [ZAKI backend handoff](deploy/k8s/zaki-bot/ZAKI_BACKEND_HANDOFF.md)
+- [ZAKI frontend handoff](deploy/k8s/zaki-bot/ZAKI_FRONTEND_HANDOFF.md)
 
 ## Quick Start
 
@@ -115,13 +136,19 @@ Tenant runtime state is moving toward:
 zig build
 ```
 
-### Run Tests
+### Full Test Suite
 
 ```bash
 zig build test --summary all
 ```
 
-### Run the Gateway Locally
+### Build with Postgres + SQLite Engines
+
+```bash
+zig build -Dengines=base,sqlite,postgres
+```
+
+### Run Gateway
 
 ```bash
 ./zig-out/bin/nullalis gateway --host 127.0.0.1 --port 3000
@@ -133,127 +160,63 @@ zig build test --summary all
 curl http://127.0.0.1:3000/health
 ```
 
-## Local Config
+## Configuration
 
-Current config location:
+Default config path:
 
 ```text
 ~/.nullalis/config.json
 ```
 
-Example config file:
+Example:
 - [config.example.json](config.example.json)
 
-A typical local setup for ZAKI integration needs:
-- model provider credentials
-- web search provider API key(s) if `web_search` is enabled:
-  - `EXA_API_KEY` (Exa)
-  - `BRAVE_API_KEY` (Brave)
-  - `WEB_SEARCH_PROVIDER=auto|exa|brave` (default: `auto`)
-- gateway config
-- tenant config
-- state backend config when using Postgres tenant state
+Web search provider selection:
+- `WEB_SEARCH_PROVIDER=auto|exa|brave` (default `auto`)
+- `EXA_API_KEY`
+- `BRAVE_API_KEY`
 
-### Web Search Provider Selection
+## Roadmap
 
-`web_search` provider is selected from environment:
+### v0.1 (Current): Reliability and Runtime Truth
+- Stabilize runtime behavior under continuous operation.
+- Keep Postgres runtime path authoritative.
+- Harden autonomous/background behavior and UX.
+- Ship stream progress visibility and better perceived liveness.
 
-- `WEB_SEARCH_PROVIDER=auto` (default): Exa first when `EXA_API_KEY` is set, fallback to Brave when transient Exa failures occur and `BRAVE_API_KEY` is available
-- `WEB_SEARCH_PROVIDER=exa`: Exa only
-- `WEB_SEARCH_PROVIDER=brave`: Brave only
+### v0.2: Orchestration Maturity
+- Wire reserved origins (`wake`, `proactive`) into explicit execution flows.
+- Improve subagent/A2A control surfaces and lifecycle observability.
+- Reduce startup/operator noise and tighten deployment ergonomics.
 
-Local verification examples:
+### v0.3: DTaaS Expansion
+- Deeper live-data integrations and richer proactive intelligence.
+- More adaptive memory retrieval and context shaping.
+- UI/UX polish for multi-modal and operator experiences.
 
-```bash
-# Exa only
-export WEB_SEARCH_PROVIDER=exa
-export EXA_API_KEY=...
+## Enablers
 
-# Brave only
-export WEB_SEARCH_PROVIDER=brave
-export BRAVE_API_KEY=...
+- Strong test baseline with high coverage and leak-sensitive allocators.
+- Clear extension boundaries (providers/channels/tools/memory/observer).
+- Tenant runtime isolation model and canonical user/session routing.
+- Existing runbooks and deployment docs for operational rollout.
 
-# Auto mode with fallback
-export WEB_SEARCH_PROVIDER=auto
-export EXA_API_KEY=...
-export BRAVE_API_KEY=...
-```
+## Blockers and Risks
 
-## Build Targets
+- Startup schema/migration `NOTICE` verbosity still hurts operator signal quality.
+- Reserved origins `wake` and `proactive` are defined but not yet active execution paths.
+- Subagent control is still completion-oriented (limited in-flight steering model).
+- Any cross-service integration quality is coupled to upstream API stability and token hygiene.
 
-Development build:
+## Development Workflow
 
-```bash
-zig build
-```
-
-Release build:
-
-```bash
-zig build -Doptimize=ReleaseSmall
-```
-
-Postgres + markdown memory build example:
-
-```bash
-zig build -Dengines=sqlite,postgres,markdown
-```
-
-## Architecture
-
-`nullALIS` is a vtable-driven Zig codebase.
-
-Primary extension points:
-- providers
-- channels
-- tools
-- memory backends
-- observability backends
-- runtime adapters
-- peripherals
-
-Important top-level modules:
-- [src/main.zig](src/main.zig)
-- [src/gateway.zig](src/gateway.zig)
-- [src/agent.zig](src/agent.zig)
-- [src/config.zig](src/config.zig)
-- [src/tools/root.zig](src/tools/root.zig)
-- [src/memory/root.zig](src/memory/root.zig)
-- [src/providers/root.zig](src/providers/root.zig)
-- [src/channels/root.zig](src/channels/root.zig)
-
-The design goal is small binaries, low runtime overhead, explicit interfaces, and secure defaults.
-
-## API Contract (Swagger / OpenAPI)
-
-Gateway API contract is documented in:
-- [docs/openapi-v1.yaml](docs/openapi-v1.yaml)
-
-It covers:
-- health/readiness/metrics
-- pairing and webhook endpoints
-- internal operator endpoints (`/internal/*`)
-- app API endpoints (`/api/v1/chat/stream`, `/api/v1/users/*`)
-
-## Repository Status
-
-The repository is currently in an active transition across four fronts:
-- runtime rename from legacy `nullclaw` naming to `nullalis`
-- `ZAKI BOT` product integration
-- Postgres-backed multitenant runtime state
-- native outbound transport work to replace `curl` in production hot paths
-
-That means some names in the codebase still reflect the old product name while the product direction and documentation move to `nullALIS`.
-
-## Development Notes
-
-Activate repo hooks once per clone:
+Activate hooks once:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-Useful commands:
+Common loop:
 
 ```bash
 zig build
