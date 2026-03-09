@@ -48,10 +48,13 @@ spec:
             - -c
             - |
               set -eu
-              mkdir -p /nullclaw-data/.nullclaw
+              export HOME=/nullclaw-data
+              export NULLALIS_CONFIG_PATH=/nullclaw-data/.nullalis/config.json
+
+              mkdir -p /nullclaw-data/.nullalis
               mkdir -p "${TENANT_DATA_ROOT}"
 
-              cat > /nullclaw-data/.nullclaw/config.json <<JSON
+              cat > /nullclaw-data/.nullalis/config.json <<JSON
               {
                 "agents": {
                   "defaults": {
@@ -102,7 +105,7 @@ spec:
               }
               JSON
 
-              exec nullclaw gateway --host "${GATEWAY_HOST}" --port "${GATEWAY_PORT}"
+              exec nullalis gateway --host "${GATEWAY_HOST}" --port "${GATEWAY_PORT}"
           volumeMounts:
             - name: tenant-data
               mountPath: /data

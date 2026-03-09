@@ -9,7 +9,7 @@ services:
       - path: .env
         required: false
     volumes:
-      - nullalis-data:/root/.nullalis
+      - nullalis-data:/nullclaw-data
     restart: unless-stopped
 
   gateway:
@@ -17,15 +17,15 @@ services:
     image: nullalis:latest
     profiles: ["gateway"]
     ports:
-      - "8080:8080"
+      - "3000:3000"
     env_file:
       - path: .env
         required: false
     volumes:
-      - nullalis-data:/root/.nullalis
+      - nullalis-data:/nullclaw-data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
       interval: 30s
       timeout: 5s
       retries: 3

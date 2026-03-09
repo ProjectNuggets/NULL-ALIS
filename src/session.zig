@@ -62,6 +62,11 @@ pub const SessionManager = struct {
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
 
+    pub const ProcessMessageOptions = struct {
+        message_turn_context: ?tools_mod.MessageTurnContext = null,
+        turn_origin: tools_mod.TurnOrigin = .user,
+    };
+
     pub fn init(
         allocator: Allocator,
         config: *const Config,
@@ -181,7 +186,7 @@ pub const SessionManager = struct {
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
-        return self.processMessageWithToolContext(session_key, content, conversation_context, null);
+        return self.processMessageWithContext(session_key, content, conversation_context, .{});
     }
 
     pub fn processMessageWithToolContext(
@@ -191,14 +196,33 @@ pub const SessionManager = struct {
         conversation_context: ?ConversationContext,
         message_turn_context: ?tools_mod.MessageTurnContext,
     ) ![]const u8 {
+        return self.processMessageWithContext(session_key, content, conversation_context, .{
+            .message_turn_context = message_turn_context,
+        });
+    }
+
+    pub fn processMessageWithContext(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+        options: ProcessMessageOptions,
+    ) ![]const u8 {
         const total_start_ms = std.time.milliTimestamp();
         const session = try self.getOrCreate(session_key);
 
         session.mutex.lock();
         defer session.mutex.unlock();
 
-        tools_mod.setMessageTurnContext(message_turn_context);
+        tools_mod.setMessageTurnContext(options.message_turn_context);
         defer tools_mod.clearMessageTurnContext();
+        tools_mod.setTurnContext(.{
+            .origin = options.turn_origin,
+            .session_key = session_key,
+            .provider = session.agent.default_provider,
+            .model = session.agent.model_name,
+        });
+        defer tools_mod.clearTurnContext();
 
         // Set conversation context for this turn (Signal-specific for now)
         session.agent.conversation_context = conversation_context;

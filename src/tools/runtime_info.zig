@@ -1,0 +1,779 @@
+const std = @import("std");
+const channel_catalog = @import("../channel_catalog.zig");
+const config_mod = @import("../config.zig");
+const json_util = @import("../json_util.zig");
+const process_util = @import("process_util.zig");
+const root = @import("root.zig");
+
+const Tool = root.Tool;
+const ToolResult = root.ToolResult;
+const JsonObjectMap = root.JsonObjectMap;
+
+const COMPOSIO_API_BASE_V1 = "https://backend.composio.dev/api/v1";
+const COMPOSIO_API_BASE_V3 = "https://backend.composio.dev/api/v3";
+
+const ComposioReadiness = struct {
+    connected_accounts_state: []const u8 = "unknown",
+    api_reachable: ?bool = null,
+    gmail_toolkit_available: ?bool = null,
+    google_drive_toolkit_available: ?bool = null,
+    google_calendar_toolkit_available: ?bool = null,
+    gmail_connected: ?bool = null,
+    google_drive_connected: ?bool = null,
+    google_calendar_connected: ?bool = null,
+};
+
+const ConnectedAccountsStatus = struct {
+    gmail_connected: bool = false,
+    google_drive_connected: bool = false,
+    google_calendar_connected: bool = false,
+};
+
+pub const RuntimeInfoTool = struct {
+    config: *const config_mod.Config,
+    runtime_tools: ?[]const Tool = null,
+
+    pub const tool_name = "runtime_info";
+    pub const tool_description = "Read runtime status, current session context, integrations, scheduler, heartbeat, and ops state as structured JSON.";
+    pub const tool_params =
+        \\{"type":"object","properties":{"section":{"type":"string","enum":["summary","session","integrations","scheduler","heartbeat","ops"],"description":"Runtime section to inspect"},"user_id":{"type":"string","description":"Optional tenant user id override for reporting"},"verbose":{"type":"boolean","description":"Include larger summaries where available"}}}
+    ;
+
+    pub const vtable = root.ToolVTable(@This());
+
+    pub fn tool(self: *RuntimeInfoTool) Tool {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    pub fn execute(self: *RuntimeInfoTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        const section = root.getString(args, "section") orelse "summary";
+        const verbose = root.getBool(args, "verbose") orelse false;
+        const user_id_override = root.getString(args, "user_id");
+
+        const output = if (std.mem.eql(u8, section, "summary"))
+            try self.buildSummaryJson(allocator, user_id_override, verbose)
+        else if (std.mem.eql(u8, section, "session"))
+            try self.buildSessionJson(allocator)
+        else if (std.mem.eql(u8, section, "integrations"))
+            try self.buildIntegrationsJson(allocator, user_id_override)
+        else if (std.mem.eql(u8, section, "scheduler"))
+            try self.buildSchedulerJson(allocator)
+        else if (std.mem.eql(u8, section, "heartbeat"))
+            try self.buildHeartbeatJson(allocator)
+        else if (std.mem.eql(u8, section, "ops"))
+            try self.buildOpsJson(allocator)
+        else
+            return ToolResult.fail("Unknown section. Use summary, session, integrations, scheduler, heartbeat, or ops.");
+
+        return ToolResult{ .success = true, .output = output };
+    }
+
+    fn buildSummaryJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8, verbose: bool) ![]u8 {
+        const tenant_ctx = root.getTenantContext();
+        const turn_ctx = root.getTurnContext();
+        const effective_backend = root.effectiveStateBackend(self.config, tenant_ctx);
+        const scheduler_backend = root.schedulerBackend(self.config, tenant_ctx);
+        const degraded_reason = root.degradedReason(self.config, tenant_ctx);
+        const degraded = degraded_reason.len > 0;
+        const user_id = user_id_override orelse tenant_ctx.user_id;
+        const entity_id = resolveComposioEntityId(self.config, tenant_ctx, user_id_override);
+        var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx);
+        defer telegram_state.deinit(allocator);
+
+        var configured_channels: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer configured_channels.deinit(allocator);
+        for (channel_catalog.known_channels) |meta| {
+            if (channel_catalog.isBuildEnabled(meta.id) and channel_catalog.configuredCount(self.config, meta.id) > 0) {
+                try configured_channels.append(allocator, meta.key);
+            }
+        }
+        if (isTelegramConfigured(self.config, telegram_state) and !containsString(configured_channels.items, "telegram")) {
+            try configured_channels.append(allocator, "telegram");
+        }
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKeyValue(&buf, allocator, "provider", turn_ctx.provider orelse self.config.default_provider);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "model", turn_ctx.model orelse (self.config.default_model orelse ""));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "turn_origin", turn_ctx.origin.toSlice());
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "session_key");
+        if (turn_ctx.session_key) |session_key| {
+            try json_util.appendJsonString(&buf, allocator, session_key);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "user_id");
+        if (user_id) |resolved| {
+            try json_util.appendJsonString(&buf, allocator, resolved);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_configured", self.config.state.backend);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_effective", effective_backend);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "scheduler_backend", scheduler_backend);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "degraded");
+        try buf.appendSlice(allocator, if (degraded) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "degraded_reason", degraded_reason);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "heartbeat_enabled");
+        try buf.appendSlice(allocator, if (self.config.heartbeat.enabled) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "heartbeat_interval_minutes", self.config.heartbeat.interval_minutes);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "tenant_enabled");
+        try buf.appendSlice(allocator, if (self.config.tenant.enabled) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "configured_channels");
+        try appendStringArray(&buf, allocator, configured_channels.items);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "enabled_tools");
+        try appendToolNames(&buf, allocator, self.runtime_tools);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "composio");
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKey(&buf, allocator, "enabled");
+        try buf.appendSlice(allocator, if (self.config.composio.enabled) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "configured");
+        try buf.appendSlice(allocator, if (self.config.composio.api_key != null and self.config.composio.enabled) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "entity_id");
+        try json_util.appendJsonString(&buf, allocator, entity_id);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "auth_flow_requires_user_turn");
+        try buf.appendSlice(allocator, "true");
+        try buf.appendSlice(allocator, "}");
+        if (verbose) {
+            try buf.appendSlice(allocator, ",");
+            try json_util.appendJsonKeyValue(&buf, allocator, "workspace_dir", self.config.workspace_dir);
+        }
+        try buf.appendSlice(allocator, "}");
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn buildSessionJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator) ![]u8 {
+        _ = self;
+        const tenant_ctx = root.getTenantContext();
+        const turn_ctx = root.getTurnContext();
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKeyValue(&buf, allocator, "turn_origin", turn_ctx.origin.toSlice());
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "session_key");
+        if (turn_ctx.session_key) |session_key| {
+            try json_util.appendJsonString(&buf, allocator, session_key);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "tenant_user_id");
+        if (tenant_ctx.user_id) |user_id| {
+            try json_util.appendJsonString(&buf, allocator, user_id);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try appendOptionalInt(&buf, allocator, "tenant_numeric_user_id", tenant_ctx.numeric_user_id);
+        try buf.appendSlice(allocator, "}");
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn buildIntegrationsJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8) ![]u8 {
+        const tenant_ctx = root.getTenantContext();
+        const entity_id = resolveComposioEntityId(self.config, tenant_ctx, user_id_override);
+        var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx);
+        defer telegram_state.deinit(allocator);
+        const telegram_configured = isTelegramConfigured(self.config, telegram_state);
+        const composio_readiness = self.resolveComposioReadiness(allocator, entity_id);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKey(&buf, allocator, "telegram");
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKey(&buf, allocator, "configured");
+        try buf.appendSlice(allocator, if (telegram_configured) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "connected");
+        if (telegram_state.connected) |connected| {
+            try buf.appendSlice(allocator, if (connected) "true" else "false");
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "account_id");
+        if (telegram_state.account_id) |account_id| {
+            try json_util.appendJsonString(&buf, allocator, account_id);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try appendOptionalInt(&buf, allocator, "chat_id", telegram_state.chat_id);
+        try buf.appendSlice(allocator, "},");
+        try json_util.appendJsonKey(&buf, allocator, "composio");
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKey(&buf, allocator, "enabled");
+        try buf.appendSlice(allocator, if (self.config.composio.enabled) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "configured");
+        try buf.appendSlice(allocator, if (self.config.composio.enabled and self.config.composio.api_key != null) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "entity_id");
+        try json_util.appendJsonString(&buf, allocator, entity_id);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "per_user_scope");
+        try buf.appendSlice(allocator, if (tenant_ctx.user_id != null) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "connected_accounts_state", composio_readiness.connected_accounts_state);
+        try buf.appendSlice(allocator, ",");
+        try appendOptionalBool(&buf, allocator, "api_reachable", composio_readiness.api_reachable);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "gmail_toolkit", "gmail");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "google_drive_toolkit", "googledrive");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "google_calendar_toolkit", "googlecalendar");
+        try buf.appendSlice(allocator, ",");
+        try appendOptionalBool(&buf, allocator, "gmail_toolkit_available", composio_readiness.gmail_toolkit_available);
+        try buf.appendSlice(allocator, ",");
+        try appendOptionalBool(&buf, allocator, "google_drive_toolkit_available", composio_readiness.google_drive_toolkit_available);
+        try buf.appendSlice(allocator, ",");
+        try appendOptionalBool(&buf, allocator, "google_calendar_toolkit_available", composio_readiness.google_calendar_toolkit_available);
+        try buf.appendSlice(allocator, ",");
+        try appendOptionalBool(&buf, allocator, "gmail_connected", composio_readiness.gmail_connected);
+        try buf.appendSlice(allocator, ",");
+        try appendOptionalBool(&buf, allocator, "google_drive_connected", composio_readiness.google_drive_connected);
+        try buf.appendSlice(allocator, ",");
+        try appendOptionalBool(&buf, allocator, "google_calendar_connected", composio_readiness.google_calendar_connected);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "auth_flow_requires_user_turn");
+        try buf.appendSlice(allocator, "true");
+        try buf.appendSlice(allocator, "}");
+        try buf.appendSlice(allocator, "}");
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn buildSchedulerJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator) ![]u8 {
+        const tenant_ctx = root.getTenantContext();
+        const effective_backend = root.effectiveStateBackend(self.config, tenant_ctx);
+        const scheduler_backend = root.schedulerBackend(self.config, tenant_ctx);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKey(&buf, allocator, "enabled");
+        try buf.appendSlice(allocator, if (self.config.scheduler.enabled) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "backend", scheduler_backend);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_effective", effective_backend);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "max_tasks", self.config.scheduler.max_tasks);
+        try buf.appendSlice(allocator, "}");
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn buildHeartbeatJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator) ![]u8 {
+        const turn_ctx = root.getTurnContext();
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKey(&buf, allocator, "enabled");
+        try buf.appendSlice(allocator, if (self.config.heartbeat.enabled) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "interval_minutes", self.config.heartbeat.interval_minutes);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "current_turn_origin", turn_ctx.origin.toSlice());
+        try buf.appendSlice(allocator, "}");
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn buildOpsJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator) ![]u8 {
+        const tenant_ctx = root.getTenantContext();
+        const turn_ctx = root.getTurnContext();
+        const degraded_reason = root.degradedReason(self.config, tenant_ctx);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKeyValue(&buf, allocator, "turn_origin", turn_ctx.origin.toSlice());
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "workspace_dir", self.config.workspace_dir);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_effective", root.effectiveStateBackend(self.config, tenant_ctx));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "degraded");
+        try buf.appendSlice(allocator, if (degraded_reason.len > 0) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "degraded_reason", degraded_reason);
+        try buf.appendSlice(allocator, "}");
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn resolveComposioReadiness(self: *RuntimeInfoTool, allocator: std.mem.Allocator, entity_id: []const u8) ComposioReadiness {
+        var readiness = ComposioReadiness{};
+
+        if (!self.config.composio.enabled) {
+            readiness.connected_accounts_state = "disabled";
+            return readiness;
+        }
+
+        const api_key = self.config.composio.api_key orelse {
+            readiness.connected_accounts_state = "not_configured";
+            return readiness;
+        };
+
+        readiness.gmail_toolkit_available = queryToolkitAvailability(allocator, api_key, "gmail");
+        readiness.google_drive_toolkit_available = queryToolkitAvailability(allocator, api_key, "googledrive");
+        readiness.google_calendar_toolkit_available = queryToolkitAvailability(allocator, api_key, "googlecalendar");
+
+        const any_toolkit_probe = readiness.gmail_toolkit_available != null or
+            readiness.google_drive_toolkit_available != null or
+            readiness.google_calendar_toolkit_available != null;
+
+        if (queryConnectedAccounts(allocator, api_key, entity_id)) |connected| {
+            readiness.gmail_connected = connected.gmail_connected;
+            readiness.google_drive_connected = connected.google_drive_connected;
+            readiness.google_calendar_connected = connected.google_calendar_connected;
+
+            readiness.api_reachable = true;
+            const any_connected = connected.gmail_connected or connected.google_drive_connected or connected.google_calendar_connected;
+            readiness.connected_accounts_state = if (any_connected) "connected" else "not_connected";
+            return readiness;
+        }
+
+        if (any_toolkit_probe) {
+            readiness.api_reachable = true;
+            readiness.connected_accounts_state = "unverified";
+        } else {
+            readiness.api_reachable = false;
+            readiness.connected_accounts_state = "api_unreachable";
+        }
+
+        return readiness;
+    }
+};
+
+const TelegramState = struct {
+    connected: ?bool = null,
+    account_id: ?[]u8 = null,
+    chat_id: ?i64 = null,
+
+    fn deinit(self: *TelegramState, allocator: std.mem.Allocator) void {
+        if (self.account_id) |account_id| allocator.free(account_id);
+    }
+};
+
+fn resolveComposioEntityId(config: *const config_mod.Config, tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) []const u8 {
+    if (user_id_override) |user_id| return user_id;
+    if (tenant_ctx.user_id) |user_id| return user_id;
+    return config.composio.entity_id;
+}
+
+fn normalizeComposioToolkitSlug(name: []const u8) []const u8 {
+    return std.mem.trim(u8, name, " \t\r\n");
+}
+
+fn queryEscapeComponent(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (input) |ch| {
+        const is_unreserved = std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == '~';
+        if (is_unreserved) {
+            try out.append(allocator, ch);
+            continue;
+        }
+        var encoded: [3]u8 = undefined;
+        _ = std.fmt.bufPrint(&encoded, "%{X:0>2}", .{@as(u8, ch)}) catch unreachable;
+        try out.appendSlice(allocator, &encoded);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn readArrayField(value: std.json.Value, field: []const u8) ?[]const std.json.Value {
+    if (value != .object) return null;
+    if (value.object.get(field)) |field_value| {
+        if (field_value == .array) return field_value.array.items;
+    }
+    return null;
+}
+
+fn firstStringField(obj: std.json.ObjectMap, keys: []const []const u8) ?[]const u8 {
+    for (keys) |key| {
+        if (obj.get(key)) |value| {
+            if (value == .string and value.string.len > 0) return value.string;
+        }
+    }
+    return null;
+}
+
+fn boolFromField(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    if (obj.get(key)) |value| {
+        return switch (value) {
+            .bool => value.bool,
+            .string => |s| blk: {
+                if (std.ascii.eqlIgnoreCase(s, "true") or std.ascii.eqlIgnoreCase(s, "connected") or std.ascii.eqlIgnoreCase(s, "active")) break :blk true;
+                if (std.ascii.eqlIgnoreCase(s, "false") or std.ascii.eqlIgnoreCase(s, "disconnected") or std.ascii.eqlIgnoreCase(s, "inactive")) break :blk false;
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+    return null;
+}
+
+fn stringImpliesConnected(status: []const u8) ?bool {
+    if (status.len == 0) return null;
+    if (std.mem.indexOf(u8, status, "connected") != null) return true;
+    if (std.mem.indexOf(u8, status, "active") != null) return true;
+    if (std.mem.indexOf(u8, status, "authorized") != null) return true;
+    if (std.mem.indexOf(u8, status, "linked") != null) return true;
+    if (std.mem.indexOf(u8, status, "enabled") != null) return true;
+    if (std.mem.indexOf(u8, status, "disconnected") != null) return false;
+    if (std.mem.indexOf(u8, status, "revoked") != null) return false;
+    if (std.mem.indexOf(u8, status, "expired") != null) return false;
+    if (std.mem.indexOf(u8, status, "error") != null) return false;
+    return null;
+}
+
+fn detectAppFamily(value: []const u8) enum { gmail, drive, calendar, other } {
+    var lower_buf: [128]u8 = undefined;
+    const n = @min(value.len, lower_buf.len);
+    _ = std.ascii.lowerString(lower_buf[0..n], value[0..n]);
+    const lower = lower_buf[0..n];
+    if (std.mem.indexOf(u8, lower, "gmail") != null) return .gmail;
+    if (std.mem.indexOf(u8, lower, "drive") != null) return .drive;
+    if (std.mem.indexOf(u8, lower, "calendar") != null) return .calendar;
+    return .other;
+}
+
+fn composioCurlGet(allocator: std.mem.Allocator, api_key: []const u8, url: []const u8) ?[]u8 {
+    const auth_header = std.fmt.allocPrint(allocator, "x-api-key: {s}", .{api_key}) catch return null;
+    defer allocator.free(auth_header);
+
+    const argv = [_][]const u8{
+        "curl",
+        "-sL",
+        "-m",
+        "6",
+        "-H",
+        auth_header,
+        "-H",
+        "Accept: application/json",
+        url,
+    };
+
+    const result = process_util.run(allocator, &argv, .{ .max_output_bytes = 256 * 1024 }) catch return null;
+    defer allocator.free(result.stderr);
+    if (!result.success) {
+        allocator.free(result.stdout);
+        return null;
+    }
+    if (result.stdout.len == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+    return result.stdout;
+}
+
+fn parseToolkitAvailability(raw: []const u8, allocator: std.mem.Allocator) ?bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    defer parsed.deinit();
+    const root_value = parsed.value;
+
+    if (root_value == .array) return root_value.array.items.len > 0;
+    if (root_value != .object) return null;
+
+    if (readArrayField(root_value, "items")) |items| return items.len > 0;
+    if (readArrayField(root_value, "data")) |items| return items.len > 0;
+    if (readArrayField(root_value, "results")) |items| return items.len > 0;
+    if (readArrayField(root_value, "tools")) |items| return items.len > 0;
+
+    if (root_value.object.get("total")) |total| {
+        return switch (total) {
+            .integer => total.integer > 0,
+            .float => total.float > 0.0,
+            .string => (std.fmt.parseInt(i64, total.string, 10) catch 0) > 0,
+            else => null,
+        };
+    }
+
+    return null;
+}
+
+fn queryToolkitAvailability(allocator: std.mem.Allocator, api_key: []const u8, toolkit_slug: []const u8) ?bool {
+    const slug = normalizeComposioToolkitSlug(toolkit_slug);
+    var url_buf: [512]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, COMPOSIO_API_BASE_V3 ++ "/tools?toolkit_slug={s}&page=1&page_size=1", .{slug}) catch return null;
+    const raw = composioCurlGet(allocator, api_key, url) orelse return null;
+    defer allocator.free(raw);
+    return parseToolkitAvailability(raw, allocator);
+}
+
+fn parseConnectedAccounts(raw: []const u8, allocator: std.mem.Allocator) ?ConnectedAccountsStatus {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root_value = parsed.value;
+    const accounts: []const std.json.Value = blk: {
+        if (root_value == .array) break :blk root_value.array.items;
+        if (root_value != .object) return null;
+        if (readArrayField(root_value, "items")) |items| break :blk items;
+        if (readArrayField(root_value, "data")) |items| break :blk items;
+        if (readArrayField(root_value, "results")) |items| break :blk items;
+        if (readArrayField(root_value, "connectedAccounts")) |items| break :blk items;
+        if (readArrayField(root_value, "connected_accounts")) |items| break :blk items;
+        if (readArrayField(root_value, "accounts")) |items| break :blk items;
+        return null;
+    };
+
+    var status = ConnectedAccountsStatus{};
+    for (accounts) |item| {
+        if (item != .object) continue;
+        const app_name = firstStringField(item.object, &.{
+            "toolkit_slug",
+            "toolkitSlug",
+            "appName",
+            "app_name",
+            "app",
+            "integration",
+            "name",
+        }) orelse continue;
+
+        const connected = blk: {
+            if (boolFromField(item.object, "connected")) |v| break :blk v;
+            if (boolFromField(item.object, "is_connected")) |v| break :blk v;
+            const status_str = firstStringField(item.object, &.{ "status", "connection_status", "connectionStatus" });
+            if (status_str) |s| {
+                var lower_buf: [64]u8 = undefined;
+                const n = @min(s.len, lower_buf.len);
+                _ = std.ascii.lowerString(lower_buf[0..n], s[0..n]);
+                if (stringImpliesConnected(lower_buf[0..n])) |v| break :blk v;
+            }
+            break :blk true;
+        };
+
+        switch (detectAppFamily(app_name)) {
+            .gmail => status.gmail_connected = status.gmail_connected or connected,
+            .drive => status.google_drive_connected = status.google_drive_connected or connected,
+            .calendar => status.google_calendar_connected = status.google_calendar_connected or connected,
+            .other => {},
+        }
+    }
+
+    return status;
+}
+
+fn queryConnectedAccounts(allocator: std.mem.Allocator, api_key: []const u8, entity_id: []const u8) ?ConnectedAccountsStatus {
+    const escaped = queryEscapeComponent(allocator, entity_id) catch return null;
+    defer allocator.free(escaped);
+
+    var url_buf: [768]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, COMPOSIO_API_BASE_V1 ++ "/connectedAccounts?entity_id={s}", .{escaped}) catch return null;
+    const raw = composioCurlGet(allocator, api_key, url) orelse return null;
+    defer allocator.free(raw);
+    return parseConnectedAccounts(raw, allocator);
+}
+
+fn appendStringArray(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, values: []const []const u8) !void {
+    try buf.appendSlice(allocator, "[");
+    for (values, 0..) |value, i| {
+        if (i != 0) try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonString(buf, allocator, value);
+    }
+    try buf.appendSlice(allocator, "]");
+}
+
+fn appendToolNames(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, tools: ?[]const Tool) !void {
+    try buf.appendSlice(allocator, "[");
+    if (tools) |runtime_tools| {
+        for (runtime_tools, 0..) |tool, i| {
+            if (i != 0) try buf.appendSlice(allocator, ",");
+            try json_util.appendJsonString(buf, allocator, tool.name());
+        }
+    }
+    try buf.appendSlice(allocator, "]");
+}
+
+fn appendOptionalInt(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, key: []const u8, value: ?i64) !void {
+    try json_util.appendJsonKey(buf, allocator, key);
+    if (value) |resolved| {
+        var number_buf: [24]u8 = undefined;
+        const rendered = std.fmt.bufPrint(&number_buf, "{d}", .{resolved}) catch unreachable;
+        try buf.appendSlice(allocator, rendered);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendOptionalBool(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, key: []const u8, value: ?bool) !void {
+    try json_util.appendJsonKey(buf, allocator, key);
+    if (value) |resolved| {
+        try buf.appendSlice(allocator, if (resolved) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn deriveUserRoot(workspace_dir: []const u8) []const u8 {
+    return std.fs.path.dirname(workspace_dir) orelse workspace_dir;
+}
+
+fn readTelegramState(allocator: std.mem.Allocator, config: *const config_mod.Config, tenant_ctx: root.ToolTenantContext) !TelegramState {
+    if (tenant_ctx.numeric_user_id) |numeric_user_id| {
+        if (tenant_ctx.state_mgr) |state_mgr| {
+            const raw = state_mgr.getTelegramStateJson(allocator, numeric_user_id) catch return .{};
+            defer allocator.free(raw);
+            return parseTelegramStateJson(allocator, raw);
+        }
+    }
+
+    const user_root = deriveUserRoot(config.workspace_dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/channel_state.json", .{user_root});
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch return .{};
+    defer file.close();
+    const raw = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(raw);
+    return parseTelegramStateJson(allocator, raw);
+}
+
+fn parseTelegramStateJson(allocator: std.mem.Allocator, raw: []const u8) !TelegramState {
+    var state = TelegramState{};
+    errdefer state.deinit(allocator);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    const telegram_value = parsed.value.object.get("telegram") orelse return .{};
+    if (telegram_value != .object) return .{};
+
+    if (telegram_value.object.get("connected")) |connected_value| {
+        if (connected_value == .bool) state.connected = connected_value.bool;
+    }
+    if (telegram_value.object.get("account_id")) |account_value| {
+        if (account_value == .string and account_value.string.len > 0) {
+            state.account_id = try allocator.dupe(u8, account_value.string);
+        }
+    }
+    if (telegram_value.object.get("chat_id")) |chat_id_value| {
+        state.chat_id = switch (chat_id_value) {
+            .integer => chat_id_value.integer,
+            .string => std.fmt.parseInt(i64, chat_id_value.string, 10) catch null,
+            else => null,
+        };
+    }
+    return state;
+}
+
+fn hasTelegramRuntimeState(state: TelegramState) bool {
+    return state.connected != null or state.account_id != null or state.chat_id != null;
+}
+
+fn isTelegramConfigured(config: *const config_mod.Config, state: TelegramState) bool {
+    return config.channels.telegram.len > 0 or hasTelegramRuntimeState(state);
+}
+
+fn containsString(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
+}
+
+test "runtime info tool name" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    try std.testing.expectEqualStrings("runtime_info", t.name());
+}
+
+test "runtime info summary includes state backend keys" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    root.setTurnContext(.{
+        .origin = .user,
+        .session_key = "agent:test",
+        .provider = "openrouter",
+        .model = "moonshotai/kimi-k2.5",
+    });
+    defer root.clearTurnContext();
+    const parsed = try root.parseTestArgs("{\"section\":\"summary\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"state_backend_configured\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"enabled_tools\"") != null);
+}
+
+test "runtime info parseToolkitAvailability supports object items" {
+    const raw =
+        \\{"items":[{"slug":"gmail-send"}],"page":1}
+    ;
+    const avail = parseToolkitAvailability(raw, std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, true), avail);
+}
+
+test "runtime info parseToolkitAvailability supports total" {
+    const raw =
+        \\{"total":0}
+    ;
+    const avail = parseToolkitAvailability(raw, std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, false), avail);
+}
+
+test "runtime info parseConnectedAccounts maps gmail drive calendar" {
+    const raw =
+        \\[
+        \\  {"toolkit_slug":"gmail","status":"connected"},
+        \\  {"appName":"googledrive","status":"active"},
+        \\  {"app":"googlecalendar","status":"connected"}
+        \\]
+    ;
+    const status = parseConnectedAccounts(raw, std.testing.allocator) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(status.gmail_connected);
+    try std.testing.expect(status.google_drive_connected);
+    try std.testing.expect(status.google_calendar_connected);
+}
+
+test "runtime info telegram configured uses runtime state fallback" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const empty_state = TelegramState{};
+    try std.testing.expect(!isTelegramConfigured(&cfg, empty_state));
+
+    const connected_state = TelegramState{ .connected = true };
+    try std.testing.expect(isTelegramConfigured(&cfg, connected_state));
+}

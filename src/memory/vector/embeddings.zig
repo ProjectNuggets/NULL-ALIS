@@ -13,6 +13,7 @@ const GeminiEmbedding = @import("embeddings_gemini.zig").GeminiEmbedding;
 const VoyageEmbedding = @import("embeddings_voyage.zig").VoyageEmbedding;
 const OllamaEmbedding = @import("embeddings_ollama.zig").OllamaEmbedding;
 const net_security = @import("../../net_security.zig");
+const log = std.log.scoped(.embeddings);
 
 // ── Embedding provider vtable ─────────────────────────────────────
 
@@ -71,6 +72,129 @@ pub const NoopEmbedding = struct {
         if (self_.allocator) |alloc| {
             alloc.destroy(self_);
         }
+    }
+
+    const vtable = EmbeddingProvider.VTable{
+        .name = &implName,
+        .dimensions = &implDimensions,
+        .embed = &implEmbed,
+        .deinit = &implDeinit,
+    };
+
+    pub fn provider(self: *Self) EmbeddingProvider {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+};
+
+// ── Local deterministic embedding provider ───────────────────────
+
+/// Local hash-based embeddings for offline semantic fallback.
+/// This avoids external API calls and gives deterministic vectors suitable
+/// for approximate semantic recall when remote providers are unavailable.
+pub const LocalHashEmbedding = struct {
+    allocator: ?std.mem.Allocator = null,
+    dims: u32 = 384,
+
+    const Self = @This();
+    const FNV_OFFSET: u64 = 1469598103934665603;
+    const FNV_PRIME: u64 = 1099511628211;
+
+    pub fn init(allocator: std.mem.Allocator, dims: u32) !*Self {
+        const self_ = try allocator.create(Self);
+        self_.* = .{
+            .allocator = allocator,
+            .dims = if (dims > 0) dims else 384,
+        };
+        return self_;
+    }
+
+    fn implName(_: *anyopaque) []const u8 {
+        return "local";
+    }
+
+    fn implDimensions(ptr: *anyopaque) u32 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.dims;
+    }
+
+    fn hashLowerWithSeed(bytes: []const u8, seed: u64) u64 {
+        var h = FNV_OFFSET ^ seed;
+        for (bytes) |ch| {
+            const lower = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+            h ^= @as(u64, lower);
+            h *%= FNV_PRIME;
+        }
+        return h;
+    }
+
+    fn isWordByte(ch: u8) bool {
+        return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-';
+    }
+
+    fn addFeature(vec: []f32, bytes: []const u8, seed: u64, weight: f32) void {
+        if (vec.len == 0 or bytes.len == 0) return;
+        const h = hashLowerWithSeed(bytes, seed);
+        const idx: usize = @intCast(h % @as(u64, @intCast(vec.len)));
+        const signed_weight: f32 = if ((h & 1) == 0) weight else -weight;
+        vec[idx] += signed_weight;
+    }
+
+    fn addTokenFeatures(vec: []f32, token: []const u8) void {
+        addFeature(vec, token, 0x9E37_79B9_7F4A_7C15, 1.0);
+
+        if (token.len >= 2) {
+            var i: usize = 0;
+            while (i + 2 <= token.len) : (i += 1) {
+                addFeature(vec, token[i .. i + 2], 0xC2B2_AE3D_27D4_EB4F, 0.18);
+            }
+        }
+
+        if (token.len >= 3) {
+            var i: usize = 0;
+            while (i + 3 <= token.len) : (i += 1) {
+                addFeature(vec, token[i .. i + 3], 0x1656_67B1_9E37_79F9, 0.30);
+            }
+        }
+    }
+
+    fn implEmbed(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror![]f32 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        if (text.len == 0) return allocator.alloc(f32, 0);
+
+        const dim_count: usize = @intCast(self_.dims);
+        if (dim_count == 0) return allocator.alloc(f32, 0);
+
+        const vec = try allocator.alloc(f32, dim_count);
+        @memset(vec, 0);
+
+        var token_count: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            while (i < text.len and !isWordByte(text[i])) : (i += 1) {}
+            const start = i;
+            while (i < text.len and isWordByte(text[i])) : (i += 1) {}
+            if (i <= start) continue;
+            addTokenFeatures(vec, text[start..i]);
+            token_count += 1;
+        }
+
+        if (token_count == 0) return vec;
+
+        var norm_sq: f64 = 0.0;
+        for (vec) |v| norm_sq += @as(f64, @floatCast(v * v));
+        if (norm_sq > 0.0) {
+            const inv_norm: f32 = @floatCast(1.0 / std.math.sqrt(norm_sq));
+            for (vec) |*v| v.* *= inv_norm;
+        }
+        return vec;
+    }
+
+    fn implDeinit(ptr: *anyopaque) void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        if (self_.allocator) |alloc| alloc.destroy(self_);
     }
 
     const vtable = EmbeddingProvider.VTable{
@@ -181,18 +305,57 @@ pub const OpenAiEmbedding = struct {
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
 
+        var headers: [4]std.http.Header = undefined;
+        var header_count: usize = 0;
+        headers[header_count] = .{ .name = "Authorization", .value = auth_header };
+        header_count += 1;
+        headers[header_count] = .{ .name = "Content-Type", .value = "application/json" };
+        header_count += 1;
+        if (std.mem.indexOf(u8, self_.base_url, "openrouter.ai") != null) {
+            // OpenRouter embedding requests use OpenAI-compatible payloads but benefit from
+            // explicit client identity headers for policy/routing.
+            headers[header_count] = .{ .name = "HTTP-Referer", .value = "https://nullalis.local" };
+            header_count += 1;
+            headers[header_count] = .{ .name = "X-Title", .value = "nullalis" };
+            header_count += 1;
+        }
+
         const result = client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body_buf.items,
-            .extra_headers = &.{
-                .{ .name = "Authorization", .value = auth_header },
-                .{ .name = "Content-Type", .value = "application/json" },
-            },
+            .extra_headers = headers[0..header_count],
             .response_writer = &aw.writer,
         }) catch return error.EmbeddingApiError;
 
         if (result.status != .ok) {
+            const status_code: u16 = @intFromEnum(result.status);
+            const resp_body = aw.writer.buffer[0..aw.writer.end];
+            if (resp_body.len > 0) {
+                log.warn("embedding request failed status={d} provider={s} body={s}", .{
+                    status_code,
+                    self_.base_url,
+                    std.mem.trim(u8, resp_body, " \t\r\n"),
+                });
+            } else {
+                log.warn("embedding request failed status={d} provider={s}", .{
+                    status_code,
+                    self_.base_url,
+                });
+            }
+
+            if (status_code == 401 or status_code == 403) {
+                return error.EmbeddingAuthError;
+            }
+            if (status_code == 404 and resp_body.len > 0 and
+                (std.mem.indexOf(u8, resp_body, "No endpoints found matching your data policy") != null or
+                    std.mem.indexOf(u8, resp_body, "data policy") != null))
+            {
+                return error.EmbeddingPolicyBlocked;
+            }
+            if (status_code >= 400 and status_code < 500) {
+                return error.EmbeddingRequestRejected;
+            }
             return error.EmbeddingApiError;
         }
 
@@ -470,6 +633,28 @@ pub fn createEmbeddingProvider(
         return impl_.provider();
     }
 
+    if (std.mem.eql(u8, provider_name, "openrouter")) {
+        var impl_ = try OpenAiEmbedding.init(
+            allocator,
+            "https://openrouter.ai/api/v1",
+            api_key orelse "",
+            model,
+            dims,
+        );
+        return impl_.provider();
+    }
+
+    if (std.mem.eql(u8, provider_name, "together") or std.mem.eql(u8, provider_name, "together-ai")) {
+        var impl_ = try OpenAiEmbedding.init(
+            allocator,
+            "https://api.together.xyz/v1",
+            api_key orelse "",
+            model,
+            dims,
+        );
+        return impl_.provider();
+    }
+
     if (std.mem.eql(u8, provider_name, "gemini")) {
         var impl_ = try GeminiEmbedding.init(
             allocator,
@@ -499,6 +684,11 @@ pub fn createEmbeddingProvider(
             null,
             if (dims > 0) dims else null,
         );
+        return impl_.provider();
+    }
+
+    if (std.mem.eql(u8, provider_name, "local")) {
+        var impl_ = try LocalHashEmbedding.init(allocator, dims);
         return impl_.provider();
     }
 
@@ -670,6 +860,47 @@ test "createEmbeddingProvider openai is heap allocated and deinit frees memory" 
     try std.testing.expectEqual(@as(u32, 1536), p.getDimensions());
     // deinit must free all allocations without crashing.
     p.deinit();
+}
+
+test "createEmbeddingProvider openrouter" {
+    const p = try createEmbeddingProvider(std.testing.allocator, "openrouter", "test-key", "text-embedding-3-small", 1536);
+    try std.testing.expectEqualStrings("openai", p.getName());
+    try std.testing.expectEqual(@as(u32, 1536), p.getDimensions());
+    p.deinit();
+}
+
+test "createEmbeddingProvider together" {
+    const p = try createEmbeddingProvider(std.testing.allocator, "together", "test-key", "intfloat/multilingual-e5-large-instruct", 1024);
+    try std.testing.expectEqualStrings("openai", p.getName());
+    try std.testing.expectEqual(@as(u32, 1024), p.getDimensions());
+    p.deinit();
+}
+
+test "createEmbeddingProvider local" {
+    const p = try createEmbeddingProvider(std.testing.allocator, "local", null, "", 384);
+    defer p.deinit();
+    try std.testing.expectEqualStrings("local", p.getName());
+    try std.testing.expectEqual(@as(u32, 384), p.getDimensions());
+
+    const vec = try p.embed(std.testing.allocator, "favorite snack pistachio");
+    defer std.testing.allocator.free(vec);
+    try std.testing.expectEqual(@as(usize, 384), vec.len);
+}
+
+test "LocalHashEmbedding is deterministic" {
+    const p = try createEmbeddingProvider(std.testing.allocator, "local", null, "", 128);
+    defer p.deinit();
+
+    const v1 = try p.embed(std.testing.allocator, "Team sync at 8am tomorrow");
+    defer std.testing.allocator.free(v1);
+    const v2 = try p.embed(std.testing.allocator, "Team sync at 8am tomorrow");
+    defer std.testing.allocator.free(v2);
+
+    try std.testing.expectEqual(@as(usize, 128), v1.len);
+    try std.testing.expectEqual(v1.len, v2.len);
+    for (v1, v2) |a, b| {
+        try std.testing.expect(@abs(a - b) < 0.000001);
+    }
 }
 
 test "createEmbeddingProvider gemini" {

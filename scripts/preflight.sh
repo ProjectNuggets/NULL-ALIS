@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_PATH="${NULLALIS_CONFIG_PATH:-$HOME/.nullclaw/config.json}"
+CONFIG_PATH="${NULLALIS_CONFIG_PATH:-$HOME/.nullalis/config.json}"
 PREFLIGHT_PORT="${PREFLIGHT_PORT:-3001}"
 PREFLIGHT_WAIT_SECONDS="${PREFLIGHT_WAIT_SECONDS:-6}"
 PSQL_BIN="${PSQL_BIN:-psql}"
@@ -52,6 +52,9 @@ if ! command -v "$PSQL_BIN" >/dev/null 2>&1; then
   fi
 fi
 
+if [[ ! -f "$CONFIG_PATH" && "$CONFIG_PATH" == "$HOME/.nullalis/config.json" && -f "$HOME/.nullclaw/config.json" ]]; then
+  CONFIG_PATH="$HOME/.nullclaw/config.json"
+fi
 [[ -f "$CONFIG_PATH" ]] || fail "config not found at $CONFIG_PATH"
 
 echo "preflight: Gate 1 - state.backend must be postgres"

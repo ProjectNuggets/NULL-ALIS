@@ -9,7 +9,10 @@ set -euo pipefail
 : "${BASE_ID:=7000000}"
 : "${PROMPT:=reply exactly ok no tools}"
 
-SECRET_PATH="${SECRET_PATH:-$HOME/.nullclaw/data/users/${USER_ID}/telegram.json}"
+SECRET_PATH="${SECRET_PATH:-$HOME/.nullalis/data/users/${USER_ID}/telegram.json}"
+if [[ ! -f "${SECRET_PATH}" && "${SECRET_PATH}" == "$HOME/.nullalis/data/users/${USER_ID}/telegram.json" && -f "$HOME/.nullclaw/data/users/${USER_ID}/telegram.json" ]]; then
+  SECRET_PATH="$HOME/.nullclaw/data/users/${USER_ID}/telegram.json"
+fi
 if [[ ! -f "${SECRET_PATH}" ]]; then
   echo "missing secret file: ${SECRET_PATH}" >&2
   exit 1

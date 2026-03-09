@@ -1,9 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const providers = @import("../providers/root.zig");
-const Tool = @import("../tools/root.zig").Tool;
+const tools_mod = @import("../tools/root.zig");
+const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
 const spawn_tool_mod = @import("../tools/spawn.zig");
+const message_tool = @import("../tools/message.zig");
 const subagent_mod = @import("../subagent.zig");
 const memory_mod = @import("../memory/root.zig");
 const config_types = @import("../config_types.zig");
@@ -477,6 +479,13 @@ fn findShellTool(self: anytype) ?Tool {
     return null;
 }
 
+fn findToolByName(self: anytype, name: []const u8) ?Tool {
+    for (self.tools) |t| {
+        if (std.ascii.eqlIgnoreCase(t.name(), name)) return t;
+    }
+    return null;
+}
+
 fn clearSessionState(self: anytype) void {
     self.clearHistory();
     clearPendingExecCommand(self);
@@ -679,6 +688,154 @@ fn formatStatus(self: anytype) ![]const u8 {
         try w.writeAll("Session TTL: off\n");
     }
     return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatRuntimeStatus(self: anytype) ![]const u8 {
+    const runtime_tool = findToolByName(self, "runtime_info") orelse
+        return try self.allocator.dupe(u8, "Runtime info tool unavailable");
+
+    const summary_json = try executeRuntimeInfoSection(self, runtime_tool, "summary");
+    errdefer self.allocator.free(summary_json);
+    const integrations_json = try executeRuntimeInfoSection(self, runtime_tool, "integrations");
+    errdefer self.allocator.free(integrations_json);
+
+    const summary_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, summary_json, .{}) catch {
+        self.allocator.free(integrations_json);
+        return summary_json;
+    };
+    defer summary_parsed.deinit();
+    const integrations_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, integrations_json, .{}) catch {
+        self.allocator.free(integrations_json);
+        return summary_json;
+    };
+    defer integrations_parsed.deinit();
+    defer self.allocator.free(summary_json);
+    defer self.allocator.free(integrations_json);
+
+    if (summary_parsed.value != .object or integrations_parsed.value != .object) {
+        return try self.allocator.dupe(u8, "Runtime info unavailable");
+    }
+
+    const summary_obj = summary_parsed.value.object;
+    const integrations_obj = integrations_parsed.value.object;
+    const composio_obj = jsonObjectFieldObject(integrations_obj, "composio");
+    const telegram_obj = jsonObjectFieldObject(integrations_obj, "telegram");
+
+    const state_configured = jsonObjectFieldString(summary_obj, "state_backend_configured") orelse "unknown";
+    const state_effective = jsonObjectFieldString(summary_obj, "state_backend_effective") orelse "unknown";
+    const scheduler_backend = jsonObjectFieldString(summary_obj, "scheduler_backend") orelse "unknown";
+    const degraded = optionalBoolToLabel(jsonObjectFieldBool(summary_obj, "degraded"));
+    const origin = jsonObjectFieldString(summary_obj, "turn_origin") orelse "unknown";
+    const provider = jsonObjectFieldString(summary_obj, "provider") orelse "unknown";
+    const model = jsonObjectFieldString(summary_obj, "model") orelse "unknown";
+    const session_key = jsonObjectFieldString(summary_obj, "session_key") orelse "n/a";
+    const user_id = jsonObjectFieldString(summary_obj, "user_id") orelse "n/a";
+
+    const telegram_configured = if (telegram_obj) |obj| optionalBoolToLabel(jsonObjectFieldBool(obj, "configured")) else "unknown";
+    const telegram_connected = if (telegram_obj) |obj| optionalBoolToLabel(jsonObjectFieldBool(obj, "connected")) else "unknown";
+
+    const composio_enabled = if (composio_obj) |obj| optionalBoolToLabel(jsonObjectFieldBool(obj, "enabled")) else "unknown";
+    const composio_configured = if (composio_obj) |obj| optionalBoolToLabel(jsonObjectFieldBool(obj, "configured")) else "unknown";
+    const composio_entity = if (composio_obj) |obj| jsonObjectFieldString(obj, "entity_id") orelse "n/a" else "n/a";
+    const accounts_state = if (composio_obj) |obj| jsonObjectFieldString(obj, "connected_accounts_state") orelse "unknown" else "unknown";
+
+    const gmail_label = if (composio_obj) |obj|
+        composioReadinessLabel(jsonObjectFieldBool(obj, "gmail_connected"), accounts_state)
+    else
+        "unknown";
+    const drive_label = if (composio_obj) |obj|
+        composioReadinessLabel(jsonObjectFieldBool(obj, "google_drive_connected"), accounts_state)
+    else
+        "unknown";
+    const calendar_label = if (composio_obj) |obj|
+        composioReadinessLabel(jsonObjectFieldBool(obj, "google_calendar_connected"), accounts_state)
+    else
+        "unknown";
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const w = out.writer(self.allocator);
+    try w.print("State: configured={s} effective={s} scheduler={s} degraded={s}\n", .{
+        state_configured,
+        state_effective,
+        scheduler_backend,
+        degraded,
+    });
+    try w.print("Turn: origin={s} provider={s} model={s}\n", .{
+        origin,
+        provider,
+        model,
+    });
+    try w.print("Session: key={s} user={s}\n", .{
+        session_key,
+        user_id,
+    });
+    try w.print("Telegram: configured={s} connected={s}\n", .{
+        telegram_configured,
+        telegram_connected,
+    });
+    try w.print("Composio: enabled={s} configured={s} entity={s} accounts={s}\n", .{
+        composio_enabled,
+        composio_configured,
+        composio_entity,
+        accounts_state,
+    });
+    try w.print("Composio readiness: gmail={s} drive={s} calendar={s}", .{
+        gmail_label,
+        drive_label,
+        calendar_label,
+    });
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn executeRuntimeInfoSection(self: anytype, runtime_tool: Tool, section: []const u8) ![]u8 {
+    const request = try std.fmt.allocPrint(self.allocator, "{{\"section\":\"{s}\"}}", .{section});
+    defer self.allocator.free(request);
+    const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, request, .{});
+    defer parsed.deinit();
+    const result = try runtime_tool.execute(self.allocator, parsed.value.object);
+    if (!result.success) {
+        return try self.allocator.dupe(u8, result.error_msg orelse "Runtime info unavailable");
+    }
+    return @constCast(result.output);
+}
+
+fn jsonObjectFieldString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    if (value == .string) return value.string;
+    return null;
+}
+
+fn jsonObjectFieldBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .bool => value.bool,
+        .string => |s| blk: {
+            if (std.ascii.eqlIgnoreCase(s, "true")) break :blk true;
+            if (std.ascii.eqlIgnoreCase(s, "false")) break :blk false;
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+fn jsonObjectFieldObject(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const value = obj.get(key) orelse return null;
+    if (value == .object) return value.object;
+    return null;
+}
+
+fn optionalBoolToLabel(value: ?bool) []const u8 {
+    if (value) |resolved| return if (resolved) "true" else "false";
+    return "unknown";
+}
+
+fn composioReadinessLabel(connected: ?bool, accounts_state: []const u8) []const u8 {
+    if (connected) |v| return if (v) "connected" else "not_connected";
+    if (std.mem.eql(u8, accounts_state, "disabled")) return "disabled";
+    if (std.mem.eql(u8, accounts_state, "not_configured")) return "not_configured";
+    if (std.mem.eql(u8, accounts_state, "api_unreachable")) return "api_unreachable";
+    return "unknown";
 }
 
 fn handleThinkCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -1314,8 +1471,10 @@ fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8) ![]cons
     const manager = findSubagentManager(self) orelse
         return try self.allocator.dupe(u8, "Spawn tool is not enabled.");
 
-    const origin_chat = self.memory_session_id orelse "agent";
-    const task_id = manager.spawn(trimmed_task, label, "agent", origin_chat) catch |err| {
+    const turn_ctx = message_tool.MessageTool.getTurnContext();
+    const origin_channel = turn_ctx.channel orelse "agent";
+    const origin_chat = turn_ctx.chat_id orelse self.memory_session_id orelse "agent";
+    const task_id = manager.spawn(trimmed_task, label, origin_channel, origin_chat) catch |err| {
         return switch (err) {
             error.TooManyConcurrentSubagents => try self.allocator.dupe(u8, "Too many concurrent subagents. Wait for a task to finish."),
             else => try std.fmt.allocPrint(self.allocator, "Failed to spawn subagent: {s}", .{@errorName(err)}),
@@ -1327,6 +1486,82 @@ fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8) ![]cons
         "Spawned subagent task #{d} ({s}).",
         .{ task_id, label },
     );
+}
+
+test "spawnSubagentTask routes to current turn channel and chat" {
+    var cfg = config_module.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    var spawn_tool = spawn_tool_mod.SpawnTool{ .manager = &manager };
+    const tools = [_]Tool{spawn_tool.tool()};
+
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        memory_session_id: ?[]const u8,
+        tools: []const Tool,
+    }{
+        .allocator = std.testing.allocator,
+        .memory_session_id = "agent:zaki-bot:user:1:main",
+        .tools = &tools,
+    };
+
+    message_tool.MessageTool.setTurnContext(.{
+        .channel = "telegram",
+        .chat_id = "tg-chat-123",
+    });
+    defer message_tool.MessageTool.clearTurnContext();
+
+    const result = try spawnSubagentTask(&dummy, "check routing", "subagent");
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Spawned subagent task #") != null);
+
+    manager.mutex.lock();
+    defer manager.mutex.unlock();
+    const state = manager.tasks.get(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("telegram", state.origin_channel.?);
+    try std.testing.expectEqualStrings("tg-chat-123", state.origin_chat_id.?);
+    try std.testing.expectEqualStrings("tg-chat-123", state.session_key.?);
+}
+
+test "spawnSubagentTask falls back to agent channel and current session key" {
+    var cfg = config_module.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    var spawn_tool = spawn_tool_mod.SpawnTool{ .manager = &manager };
+    const tools = [_]Tool{spawn_tool.tool()};
+
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        memory_session_id: ?[]const u8,
+        tools: []const Tool,
+    }{
+        .allocator = std.testing.allocator,
+        .memory_session_id = "agent:zaki-bot:user:88:main",
+        .tools = &tools,
+    };
+
+    message_tool.MessageTool.clearTurnContext();
+
+    const result = try spawnSubagentTask(&dummy, "fallback routing", "subagent");
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Spawned subagent task #") != null);
+
+    manager.mutex.lock();
+    defer manager.mutex.unlock();
+    const state = manager.tasks.get(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("agent", state.origin_channel.?);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:88:main", state.origin_chat_id.?);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:88:main", state.session_key.?);
 }
 
 fn handleAgentsCommand(self: anytype) ![]const u8 {
@@ -2124,7 +2359,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         return try self.allocator.dupe(u8,
             \\Available commands:
             \\  /new, /reset [model], /restart [model]
-            \\  /help, /commands, /status, /whoami, /id
+            \\  /help, /commands, /status, /runtime, /whoami, /id
             \\  /model, /models, /model <name>
             \\  /think, /verbose, /reasoning
             \\  /exec, /queue, /usage, /tts, /voice
@@ -2143,6 +2378,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     }
 
     if (isSlashName(cmd, "status")) return try formatStatus(self);
+    if (isSlashName(cmd, "runtime")) return try formatRuntimeStatus(self);
     if (isSlashName(cmd, "whoami") or isSlashName(cmd, "id")) return try formatWhoAmI(self);
     if (isSlashName(cmd, "model") or isSlashName(cmd, "models")) {
         if (cmd.arg.len == 0 or
@@ -2337,7 +2573,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const w = out.writer(self.allocator);
         try w.print("Search results: {d}\n", .{results.len});
         for (results, 0..) |c, idx| {
-            try w.print("  {d}. {s} [{s}] score={d:.4}", .{ idx + 1, c.key, c.category.toString(), c.final_score });
+            try w.print("  {d}. {s} [{s}] rrf_score={d:.4}", .{ idx + 1, c.key, c.category.toString(), c.final_score });
             if (c.vector_score) |vs| {
                 try w.print(" vector_score={d:.4}", .{vs});
             } else {

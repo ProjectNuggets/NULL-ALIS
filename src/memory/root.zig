@@ -116,6 +116,11 @@ pub const CacheStats = diagnostics.CacheStats;
 pub const diagnoseRuntime = diagnostics.diagnose;
 pub const formatDiagnosticReport = diagnostics.formatReport;
 
+pub const InitRuntimeOptions = struct {
+    providers: []const config_types.ProviderEntry = &.{},
+    search_api_key_override: ?[]const u8 = null,
+};
+
 // Extended retrieval stages
 pub const expandQuery = query_expansion.expandQuery;
 pub const ExpandedQuery = query_expansion.ExpandedQuery;
@@ -398,7 +403,7 @@ pub const ResolvedConfig = struct {
     primary_backend: []const u8,
     retrieval_mode: []const u8, // "disabled" | "keyword" | "hybrid"
     vector_mode: []const u8, // "none" | "sqlite_shared" | "sqlite_sidecar" | "qdrant" | "pgvector"
-    embedding_provider: []const u8, // "none" | "openai" | "gemini" | "voyage" | "ollama" | "auto"
+    embedding_provider: []const u8, // "none" | "openai" | "openrouter" | "together" | "gemini" | "voyage" | "ollama" | "local" | "auto"
     rollout_mode: []const u8,
     vector_sync_mode: []const u8, // "best_effort" | "durable_outbox"
     hygiene_enabled: bool,
@@ -452,17 +457,23 @@ pub const MemoryRuntime = struct {
                 // Bypass engine, use recall() directly
                 const entries = try self.memory.recall(allocator, query, limit, session_id);
                 defer freeEntries(allocator, entries);
-                return retrieval.entriesToCandidates(allocator, entries);
+                const candidates = try retrieval.entriesToCandidates(allocator, entries);
+                self.hydrateThinCandidatesFromPrimary(allocator, candidates);
+                return candidates;
             },
             .hybrid => {
                 // Use engine if available, else fall back
                 if (self._engine) |engine| {
                     const candidates = try engine.search(allocator, query, session_id);
-                    return trimCandidatesToLimit(allocator, candidates, limit);
+                    const trimmed = try trimCandidatesToLimit(allocator, candidates, limit);
+                    self.hydrateThinCandidatesFromPrimary(allocator, trimmed);
+                    return trimmed;
                 }
                 const entries = try self.memory.recall(allocator, query, limit, session_id);
                 defer freeEntries(allocator, entries);
-                return retrieval.entriesToCandidates(allocator, entries);
+                const candidates = try retrieval.entriesToCandidates(allocator, entries);
+                self.hydrateThinCandidatesFromPrimary(allocator, candidates);
+                return candidates;
             },
             .shadow_hybrid => {
                 // Run both, serve keyword result, log hybrid for comparison
@@ -480,8 +491,43 @@ pub const MemoryRuntime = struct {
                     log.info("shadow: keyword={d} hybrid={d} results", .{ keyword_results.len, hybrid_results.len });
                 }
 
+                self.hydrateThinCandidatesFromPrimary(allocator, keyword_results);
                 return keyword_results;
             },
+        }
+    }
+
+    fn needsContentHydration(candidate: *const RetrievalCandidate) bool {
+        if (candidate.key.len == 0) return false;
+        return std.mem.eql(u8, candidate.content, candidate.key) and
+            std.mem.eql(u8, candidate.snippet, candidate.key);
+    }
+
+    fn hydrateThinCandidateFromPrimary(self: *MemoryRuntime, allocator: std.mem.Allocator, candidate: *RetrievalCandidate) void {
+        if (!needsContentHydration(candidate)) return;
+
+        const entry = self.memory.get(allocator, candidate.key) catch return;
+        if (entry) |owned_entry| {
+            defer owned_entry.deinit(allocator);
+            if (owned_entry.content.len == 0) return;
+
+            const hydrated_content = allocator.dupe(u8, owned_entry.content) catch return;
+            errdefer allocator.free(hydrated_content);
+            const hydrated_snippet = allocator.dupe(u8, owned_entry.content) catch return;
+
+            allocator.free(candidate.content);
+            allocator.free(candidate.snippet);
+            candidate.content = hydrated_content;
+            candidate.snippet = hydrated_snippet;
+        }
+    }
+
+    /// Replaces vector-style thin candidates (content/snippet equal to key)
+    /// with canonical primary-memory content for richer previews and context.
+    /// Bounded to the current search result set (already top-K).
+    fn hydrateThinCandidatesFromPrimary(self: *MemoryRuntime, allocator: std.mem.Allocator, candidates: []RetrievalCandidate) void {
+        for (candidates) |*candidate| {
+            self.hydrateThinCandidateFromPrimary(allocator, candidate);
         }
     }
 
@@ -659,6 +705,58 @@ pub fn initRuntime(
     config: *const config_types.MemoryConfig,
     workspace_dir: []const u8,
 ) ?MemoryRuntime {
+    return initRuntimeWithOptions(allocator, config, workspace_dir, .{});
+}
+
+fn providerNameForEmbeddingApiKey(provider_name: []const u8) []const u8 {
+    if (std.mem.eql(u8, provider_name, "google")) return "gemini";
+    if (std.mem.eql(u8, provider_name, "google-gemini")) return "gemini";
+    if (std.mem.eql(u8, provider_name, "together-ai")) return "together";
+    if (std.mem.startsWith(u8, provider_name, "custom:")) {
+        const base_url = provider_name["custom:".len..];
+        if (std.mem.indexOf(u8, base_url, "openrouter.ai") != null) return "openrouter";
+        if (std.mem.indexOf(u8, base_url, "api.openai.com") != null) return "openai";
+        if (std.mem.indexOf(u8, base_url, "generativelanguage.googleapis.com") != null) return "gemini";
+        if (std.mem.indexOf(u8, base_url, "api.together.xyz") != null) return "together";
+    }
+    return provider_name;
+}
+
+fn resolveEmbeddingApiKey(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    override_key: ?[]const u8,
+    providers: []const config_types.ProviderEntry,
+) ?[]u8 {
+    const key_lookup = providerNameForEmbeddingApiKey(provider_name);
+
+    if (providers.len > 0) {
+        for (providers) |entry| {
+            if (entry.api_key) |key| {
+                if (std.mem.eql(u8, providerNameForEmbeddingApiKey(entry.name), key_lookup)) {
+                    return allocator.dupe(u8, key) catch null;
+                }
+            }
+        }
+    }
+
+    const provider_env_key = provider_api_key.resolveApiKey(allocator, key_lookup, null) catch null;
+    if (provider_env_key) |key| return key;
+
+    if (override_key) |explicit| {
+        const resolved = provider_api_key.resolveApiKey(allocator, key_lookup, explicit) catch null;
+        if (resolved) |key| return key;
+    }
+
+    return null;
+}
+
+pub fn initRuntimeWithOptions(
+    allocator: std.mem.Allocator,
+    config: *const config_types.MemoryConfig,
+    workspace_dir: []const u8,
+    opts: InitRuntimeOptions,
+) ?MemoryRuntime {
     const desc = registry.findBackend(config.backend) orelse {
         const enabled_backends = registry.formatEnabledBackends(allocator) catch null;
         defer if (enabled_backends) |names| allocator.free(names);
@@ -795,7 +893,12 @@ pub fn initRuntime(
     var resolved_vector_mode: []const u8 = "none";
     var resolved_vector_sync_mode: []const u8 = "best_effort";
     if (config.search.enabled and !std.mem.eql(u8, config.search.provider, "none") and config.search.query.hybrid.enabled) vec_plane: {
-        const primary_api_key = provider_api_key.resolveApiKey(allocator, config.search.provider, null) catch null;
+        const primary_api_key = resolveEmbeddingApiKey(
+            allocator,
+            config.search.provider,
+            opts.search_api_key_override,
+            opts.providers,
+        );
         defer if (primary_api_key) |k| allocator.free(k);
 
         // 1. Create EmbeddingProvider (with optional fallback via ProviderRouter)
@@ -813,7 +916,12 @@ pub fn initRuntime(
         if (!std.mem.eql(u8, config.search.fallback_provider, "none") and
             config.search.fallback_provider.len > 0)
         wrap_router: {
-            const fallback_api_key = provider_api_key.resolveApiKey(allocator, config.search.fallback_provider, null) catch null;
+            const fallback_api_key = resolveEmbeddingApiKey(
+                allocator,
+                config.search.fallback_provider,
+                null,
+                opts.providers,
+            );
             defer if (fallback_api_key) |k| allocator.free(k);
 
             const fallback_ep = embeddings.createEmbeddingProvider(
@@ -1140,6 +1248,24 @@ const test_resolved_cfg: ResolvedConfig = .{
     .source_count = 0,
     .fallback_policy = "degrade",
 };
+
+fn makeTestRetrievalCandidate(allocator: std.mem.Allocator, key: []const u8, content: []const u8, snippet: []const u8) !RetrievalCandidate {
+    return .{
+        .id = try allocator.dupe(u8, key),
+        .key = try allocator.dupe(u8, key),
+        .content = try allocator.dupe(u8, content),
+        .snippet = try allocator.dupe(u8, snippet),
+        .category = .daily,
+        .keyword_rank = null,
+        .vector_score = 0.84,
+        .final_score = 0.016,
+        .source = try allocator.dupe(u8, "vector"),
+        .source_path = try allocator.dupe(u8, ""),
+        .start_line = 0,
+        .end_line = 0,
+        .created_at = 0,
+    };
+}
 
 test "MemoryCategory toString roundtrip" {
     const core: MemoryCategory = .core;
@@ -1509,6 +1635,72 @@ test "MemoryRuntime.search hybrid path respects caller limit" {
     try std.testing.expectEqual(@as(usize, 1), results.len);
 }
 
+test "MemoryRuntime.search hydration enriches thin vector-style candidate content" {
+    var backend = memory_lru.InMemoryLruMemory.init(std.testing.allocator, 32);
+    defer backend.deinit();
+
+    const mem = backend.memory();
+    try mem.store("user_favorite_color", "Boss loves navy blue.", .core, null);
+
+    var rt = MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+        .resolved = test_resolved_cfg,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = std.testing.allocator,
+        ._embedding_provider = null,
+        ._vector_store = null,
+        ._circuit_breaker = null,
+        ._outbox = null,
+    };
+
+    var candidates = try std.testing.allocator.alloc(RetrievalCandidate, 1);
+    errdefer std.testing.allocator.free(candidates);
+    candidates[0] = try makeTestRetrievalCandidate(std.testing.allocator, "user_favorite_color", "user_favorite_color", "user_favorite_color");
+    defer retrieval.freeCandidates(std.testing.allocator, candidates);
+
+    rt.hydrateThinCandidatesFromPrimary(std.testing.allocator, candidates);
+    try std.testing.expectEqualStrings("Boss loves navy blue.", candidates[0].content);
+    try std.testing.expectEqualStrings("Boss loves navy blue.", candidates[0].snippet);
+}
+
+test "MemoryRuntime.search hydration leaves non-thin candidate unchanged" {
+    var backend = memory_lru.InMemoryLruMemory.init(std.testing.allocator, 32);
+    defer backend.deinit();
+
+    const mem = backend.memory();
+    try mem.store("user_favorite_color", "Boss loves navy blue.", .core, null);
+
+    var rt = MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+        .resolved = test_resolved_cfg,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = std.testing.allocator,
+        ._embedding_provider = null,
+        ._vector_store = null,
+        ._circuit_breaker = null,
+        ._outbox = null,
+    };
+
+    var candidates = try std.testing.allocator.alloc(RetrievalCandidate, 1);
+    errdefer std.testing.allocator.free(candidates);
+    candidates[0] = try makeTestRetrievalCandidate(std.testing.allocator, "user_favorite_color", "already rich content", "already rich content");
+    defer retrieval.freeCandidates(std.testing.allocator, candidates);
+
+    rt.hydrateThinCandidatesFromPrimary(std.testing.allocator, candidates);
+    try std.testing.expectEqualStrings("already rich content", candidates[0].content);
+    try std.testing.expectEqualStrings("already rich content", candidates[0].snippet);
+}
+
 test "initRuntime with hybrid disabled has no embedding provider" {
     try requireBackendEnabledForTests("none");
 
@@ -1802,6 +1994,56 @@ test "MemoryRuntime.deinit cleans up P3 resources" {
     // P3 fields are null for "none" backend with hybrid disabled, but deinit should handle that.
     rt.deinit();
     // testing allocator detects leaks
+}
+
+test "providerNameForEmbeddingApiKey normalizes aliases" {
+    try std.testing.expectEqualStrings("gemini", providerNameForEmbeddingApiKey("google"));
+    try std.testing.expectEqualStrings("gemini", providerNameForEmbeddingApiKey("google-gemini"));
+    try std.testing.expectEqualStrings("together", providerNameForEmbeddingApiKey("together-ai"));
+    try std.testing.expectEqualStrings("openrouter", providerNameForEmbeddingApiKey("custom:https://openrouter.ai/api/v1"));
+    try std.testing.expectEqualStrings("openai", providerNameForEmbeddingApiKey("custom:https://api.openai.com/v1"));
+    try std.testing.expectEqualStrings("gemini", providerNameForEmbeddingApiKey("custom:https://generativelanguage.googleapis.com/v1beta"));
+    try std.testing.expectEqualStrings("together", providerNameForEmbeddingApiKey("custom:https://api.together.xyz/v1"));
+}
+
+test "resolveEmbeddingApiKey prefers configured provider key" {
+    const providers = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "sk-or-test" },
+    };
+    const resolved = resolveEmbeddingApiKey(std.testing.allocator, "openrouter", null, &providers) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings("sk-or-test", resolved);
+}
+
+test "resolveEmbeddingApiKey maps custom openrouter to provider key" {
+    const providers = [_]config_types.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "sk-or-test" },
+    };
+    const resolved = resolveEmbeddingApiKey(std.testing.allocator, "custom:https://openrouter.ai/api/v1", null, &providers) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings("sk-or-test", resolved);
+}
+
+test "resolveEmbeddingApiKey prefers provider config over override key" {
+    const providers = [_]config_types.ProviderEntry{
+        .{ .name = "together", .api_key = "together-correct" },
+    };
+    const resolved = resolveEmbeddingApiKey(std.testing.allocator, "together", "override-wrong", &providers) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings("together-correct", resolved);
+}
+
+test "resolveEmbeddingApiKey accepts together-ai provider alias in config" {
+    const providers = [_]config_types.ProviderEntry{
+        .{ .name = "together-ai", .api_key = "together-alias-key" },
+    };
+    const resolved = resolveEmbeddingApiKey(std.testing.allocator, "together", null, &providers) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings("together-alias-key", resolved);
 }
 
 test {

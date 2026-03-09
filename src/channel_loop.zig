@@ -267,6 +267,7 @@ pub const ChannelRuntime = struct {
 
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
+            .config = config,
             .http_enabled = config.http_request.enabled,
             .browser_enabled = config.browser.enabled,
             .screenshot_enabled = true,
@@ -284,7 +285,10 @@ pub const ChannelRuntime = struct {
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
         // Optional memory backend
-        var mem_rt = memory_mod.initRuntime(allocator, &config.memory, config.workspace_dir);
+        var mem_rt = memory_mod.initRuntimeWithOptions(allocator, &config.memory, config.workspace_dir, .{
+            .providers = config.providers,
+            .search_api_key_override = resolved_key,
+        });
         errdefer if (mem_rt) |*rt| rt.deinit();
         const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
 

@@ -1,0 +1,784 @@
+openapi: 3.0.3
+info:
+  title: nullalis Gateway API
+  version: "0.1"
+  description: |
+    Runtime HTTP API for nullalis v0.1.
+
+    Notes:
+    - `/api/v1/*` and `/internal/*` endpoints require `X-Internal-Token`.
+    - `X-Zaki-User-Id` is required for `/api/v1/chat/stream` when tenant mode is enabled.
+    - `/webhook` auth is pairing-token based (Bearer), depending on pairing guard state.
+    - `/webhook/telegram` auth is Telegram secret-token based.
+servers:
+  - url: http://127.0.0.1:3000
+    description: Local gateway
+
+tags:
+  - name: ops
+  - name: internal
+  - name: app
+  - name: user
+  - name: webhook
+
+paths:
+  /health:
+    get:
+      tags: [ops]
+      summary: Liveness check
+      responses:
+        "200":
+          description: Gateway is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+              examples:
+                ok:
+                  value: { status: "ok" }
+                degraded:
+                  value: { status: "degraded" }
+
+  /ready:
+    get:
+      tags: [ops]
+      summary: Readiness check
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "503":
+          description: Not ready or draining
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus metrics
+      responses:
+        "200":
+          description: Metrics payload
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /pair:
+    post:
+      tags: [ops]
+      summary: Pair gateway and mint bearer token
+      parameters:
+        - in: header
+          name: X-Pairing-Code
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Pairing succeeded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, token]
+                properties:
+                  status:
+                    type: string
+                    example: paired
+                  token:
+                    type: string
+        "400":
+          description: Missing pairing code
+        "401":
+          description: Invalid pairing code
+        "409":
+          description: Already paired
+        "429":
+          description: Pairing rate-limited or locked out
+
+  /webhook:
+    post:
+      tags: [webhook]
+      summary: Generic webhook chat ingress
+      description: |
+        Pairing-token protected generic webhook endpoint.
+        Authorization is expected as `Authorization: Bearer <token>` when pairing guard enforces tokens.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              properties:
+                message:
+                  type: string
+                text:
+                  type: string
+      responses:
+        "200":
+          description: Accepted or replied
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Unauthorized
+        "429":
+          description: Rate limited
+
+  /webhook/telegram:
+    post:
+      tags: [webhook]
+      summary: Telegram webhook ingress
+      parameters:
+        - in: query
+          name: user_id
+          required: false
+          schema:
+            type: string
+          description: Required when tenant mode is enabled.
+        - in: header
+          name: X-Telegram-Bot-Api-Secret-Token
+          required: false
+          schema:
+            type: string
+          description: Required when secret token is configured.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Processed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Invalid request
+        "403":
+          description: Unauthorized Telegram config/token
+        "409":
+          description: Tenant ownership lock conflict
+        "429":
+          description: Rate limited
+
+  /internal/diagnostics:
+    get:
+      tags: [internal]
+      summary: Runtime diagnostics snapshot
+      security:
+        - InternalToken: []
+      parameters:
+        - in: header
+          name: X-Zaki-User-Id
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Diagnostics payload
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Unauthorized
+
+  /internal/wake-heartbeat:
+    post:
+      tags: [internal]
+      summary: Enqueue heartbeat wake
+      security:
+        - InternalToken: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user_id:
+                  oneOf:
+                    - type: string
+                    - type: integer
+                reason:
+                  type: string
+      responses:
+        "200":
+          description: Enqueued
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Unauthorized
+
+  /internal/drain:
+    post:
+      tags: [internal]
+      summary: Enter drain mode
+      security:
+        - InternalToken: []
+      responses:
+        "200":
+          description: Draining enabled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /internal/undrain:
+    post:
+      tags: [internal]
+      summary: Exit drain mode
+      security:
+        - InternalToken: []
+      responses:
+        "200":
+          description: Draining disabled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /internal/shutdown:
+    post:
+      tags: [internal]
+      summary: Request graceful shutdown
+      security:
+        - InternalToken: []
+      responses:
+        "200":
+          description: Shutdown requested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /api/v1/chat/stream:
+    post:
+      tags: [app]
+      summary: Chat with SSE streaming
+      security:
+        - InternalToken: []
+      parameters:
+        - in: header
+          name: X-Zaki-User-Id
+          required: false
+          schema:
+            type: string
+          description: Required when tenant mode is enabled.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+                text:
+                  type: string
+                user_id:
+                  type: string
+      responses:
+        "200":
+          description: SSE stream (`status`, `token`, `done`)
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          description: Invalid payload or missing user header in tenant mode
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          description: Unauthorized internal token
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "503":
+          description: Gateway draining
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /api/v1/users/provision:
+    post:
+      tags: [user]
+      summary: Prepare tenant user state/workspace
+      security:
+        - InternalToken: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user_id:
+                  type: string
+      responses:
+        "200":
+          description: User provisioned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "400":
+          description: Missing/invalid user_id
+        "409":
+          description: Tenant ownership lock conflict
+
+  /api/v1/users/{user_id}/onboarding:
+    get:
+      tags: [user]
+      summary: Get onboarding state
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Onboarding state JSON
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    put:
+      tags: [user]
+      summary: Update onboarding and workspace scaffolding fields
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bootstrap: { type: string }
+                identity: { type: string }
+                user: { type: string }
+                soul: { type: string }
+                heartbeat: { type: string }
+                completed: { type: boolean }
+      responses:
+        "200":
+          description: Updated onboarding state
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/users/{user_id}/config:
+    get:
+      tags: [user]
+      summary: Get user config JSON
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Config content
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    patch:
+      tags: [user]
+      summary: Patch/replace user config JSON
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+    put:
+      tags: [user]
+      summary: Replace user config JSON
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /api/v1/users/{user_id}/heartbeat:
+    get:
+      tags: [user]
+      summary: Get user heartbeat config
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Heartbeat config
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    put:
+      tags: [user]
+      summary: Set user heartbeat config
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /api/v1/users/{user_id}/cron:
+    get:
+      tags: [user]
+      summary: Get user cron/jobs payload
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Job list payload
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+    post:
+      tags: [user]
+      summary: Replace cron/jobs payload
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+    patch:
+      tags: [user]
+      summary: Replace cron/jobs payload
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+    put:
+      tags: [user]
+      summary: Replace cron/jobs payload
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+    delete:
+      tags: [user]
+      summary: Clear user cron/jobs
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /api/v1/users/{user_id}/secrets/{key}:
+    get:
+      tags: [user]
+      summary: Read user secret
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - in: path
+          name: key
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Secret value
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, value]
+                properties:
+                  key: { type: string }
+                  value: { type: string }
+        "404":
+          description: Secret not found
+    put:
+      tags: [user]
+      summary: Upsert user secret
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - in: path
+          name: key
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                value:
+                  type: string
+          text/plain:
+            schema:
+              type: string
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+    delete:
+      tags: [user]
+      summary: Delete user secret
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - in: path
+          name: key
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "404":
+          description: Secret not found
+
+  /api/v1/users/{user_id}/channels/telegram/connect:
+    post:
+      tags: [user]
+      summary: Connect Telegram channel for user
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              properties:
+                account_id:
+                  type: string
+                bot_token:
+                  type: string
+                webhook_url:
+                  type: string
+                webhook_base_url:
+                  type: string
+                webhook_secret_token:
+                  type: string
+                allow_from:
+                  type: array
+                  items: { type: string }
+                drop_pending_updates:
+                  type: boolean
+      responses:
+        "200":
+          description: Connected
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Invalid connect payload
+        "502":
+          description: Telegram API rejected connect operation
+
+  /api/v1/users/{user_id}/channels/telegram/disconnect:
+    delete:
+      tags: [user]
+      summary: Disconnect Telegram channel for user
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bot_token:
+                  type: string
+                drop_pending_updates:
+                  type: boolean
+      responses:
+        "200":
+          description: Disconnected
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "502":
+          description: Telegram API rejected disconnect operation
+
+components:
+  parameters:
+    UserIdPath:
+      in: path
+      name: user_id
+      required: true
+      schema:
+        type: string
+      description: Tenant user identifier.
+
+  securitySchemes:
+    InternalToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Token
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+
+  schemas:
+    StatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+      additionalProperties: true

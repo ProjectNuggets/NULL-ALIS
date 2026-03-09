@@ -119,6 +119,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
+        .config = &cfg,
         .http_enabled = cfg.http_request.enabled,
         .browser_enabled = cfg.browser.enabled,
         .composio_api_key = if (cfg.composio.enabled) cfg.composio.api_key else null,
@@ -134,7 +135,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer tools_mod.deinitTools(allocator, tools);
 
     // Create memory (optional — don't fail if it can't init)
-    var mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
+    var mem_rt = memory_mod.initRuntimeWithOptions(allocator, &cfg.memory, cfg.workspace_dir, .{
+        .providers = cfg.providers,
+        .search_api_key_override = resolved_api_key,
+    });
     defer if (mem_rt) |*rt| rt.deinit();
     const mem_opt: ?Memory = if (mem_rt) |rt| rt.memory else null;
 

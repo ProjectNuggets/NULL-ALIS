@@ -733,6 +733,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tl.object.get("web_search_provider")) |v| {
                 if (v == .string) self.tools.web_search_provider = try self.allocator.dupe(u8, v.string);
             }
+            if (tl.object.get("web_search_exa_api_key")) |v| {
+                if (v == .string) self.tools.web_search_exa_api_key = try self.allocator.dupe(u8, v.string);
+            }
+            if (tl.object.get("web_search_brave_api_key")) |v| {
+                if (v == .string) self.tools.web_search_brave_api_key = try self.allocator.dupe(u8, v.string);
+            }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {
                 if (media == .object) {
@@ -772,6 +778,18 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                 }
             }
+        }
+    }
+
+    // Legacy top-level web-search keys (backward compatibility)
+    if (root.get("exa_api_key")) |v| {
+        if (v == .string and self.tools.web_search_exa_api_key.len == 0) {
+            self.tools.web_search_exa_api_key = try self.allocator.dupe(u8, v.string);
+        }
+    }
+    if (root.get("brave_api_key")) |v| {
+        if (v == .string and self.tools.web_search_brave_api_key.len == 0) {
+            self.tools.web_search_brave_api_key = try self.allocator.dupe(u8, v.string);
         }
     }
 

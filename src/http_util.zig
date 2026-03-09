@@ -84,7 +84,10 @@ fn record_transport_outcome(subsystem: TransportSubsystem, outcome: TransportOut
 
 fn subsystem_supports_native(subsystem: TransportSubsystem) bool {
     return switch (subsystem) {
-        .tools, .providers, .channels => true,
+        // Provider traffic is still routed via curl because the native TLS path
+        // can abort the process under real HTTPS workloads on macOS/Zig 0.15.
+        .tools, .channels => true,
+        .providers => false,
         .system => false,
     };
 }
@@ -645,4 +648,11 @@ test "request_with_mode curl_only uses curl compatibility path" {
     _ = cfg;
     _ = opts;
     try std.testing.expect(true);
+}
+
+test "subsystem_supports_native disables providers" {
+    try std.testing.expect(subsystem_supports_native(.tools));
+    try std.testing.expect(!subsystem_supports_native(.providers));
+    try std.testing.expect(subsystem_supports_native(.channels));
+    try std.testing.expect(!subsystem_supports_native(.system));
 }

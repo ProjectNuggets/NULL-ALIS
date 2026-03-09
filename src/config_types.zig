@@ -161,6 +161,12 @@ pub const ToolsConfig = struct {
     /// Optional explicit provider override for web_search tool.
     /// Empty string means "use WEB_SEARCH_PROVIDER env behavior".
     web_search_provider: []const u8 = "",
+    /// Optional static Exa key for web_search.
+    /// Empty string means "resolve from EXA_API_KEY env at runtime".
+    web_search_exa_api_key: []const u8 = "",
+    /// Optional static Brave key for web_search.
+    /// Empty string means "resolve from BRAVE_API_KEY env at runtime".
+    web_search_brave_api_key: []const u8 = "",
 };
 
 pub const ModelRouteConfig = struct {

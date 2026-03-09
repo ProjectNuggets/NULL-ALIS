@@ -684,6 +684,12 @@ pub const Config = struct {
         if (self.tools.web_search_provider.len > 0) {
             try w.print(",\n    \"web_search_provider\": \"{s}\"", .{self.tools.web_search_provider});
         }
+        if (self.tools.web_search_exa_api_key.len > 0) {
+            try w.print(",\n    \"web_search_exa_api_key\": \"{s}\"", .{self.tools.web_search_exa_api_key});
+        }
+        if (self.tools.web_search_brave_api_key.len > 0) {
+            try w.print(",\n    \"web_search_brave_api_key\": \"{s}\"", .{self.tools.web_search_brave_api_key});
+        }
         // tools.media.audio
         {
             const am = self.audio_media;
@@ -3146,6 +3152,45 @@ test "tools config parses web_search_provider" {
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("exa", cfg.tools.web_search_provider);
     allocator.free(cfg.tools.web_search_provider);
+}
+
+test "tools config parses web search api keys" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"tools": {"web_search_exa_api_key": "exa-test", "web_search_brave_api_key": "brave-test"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("exa-test", cfg.tools.web_search_exa_api_key);
+    try std.testing.expectEqualStrings("brave-test", cfg.tools.web_search_brave_api_key);
+    allocator.free(cfg.tools.web_search_exa_api_key);
+    allocator.free(cfg.tools.web_search_brave_api_key);
+}
+
+test "legacy top-level web search keys map into tools config" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"exa_api_key":"exa-legacy","brave_api_key":"brave-legacy"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("exa-legacy", cfg.tools.web_search_exa_api_key);
+    try std.testing.expectEqualStrings("brave-legacy", cfg.tools.web_search_brave_api_key);
+    allocator.free(cfg.tools.web_search_exa_api_key);
+    allocator.free(cfg.tools.web_search_brave_api_key);
+}
+
+test "tools web search keys override legacy top-level keys" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"exa_api_key":"exa-legacy","brave_api_key":"brave-legacy","tools":{"web_search_exa_api_key":"exa-tools","web_search_brave_api_key":"brave-tools"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("exa-tools", cfg.tools.web_search_exa_api_key);
+    try std.testing.expectEqualStrings("brave-tools", cfg.tools.web_search_brave_api_key);
+    allocator.free(cfg.tools.web_search_exa_api_key);
+    allocator.free(cfg.tools.web_search_brave_api_key);
 }
 
 test "save and parse preserve profile" {

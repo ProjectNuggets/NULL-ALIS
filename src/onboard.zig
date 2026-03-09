@@ -1991,22 +1991,16 @@ fn heartbeatTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) !
             return std.fmt.allocPrint(allocator,
                 \\# HEARTBEAT.md - {s}
                 \\
-                \\Use this file to define recurring, proactive work.
+                \\# Keep this file empty (or with only comments) to skip heartbeat API calls.
                 \\
-                \\Default operating rules:
-                \\- be useful, not noisy
-                \\- respect quiet hours and notification limits
-                \\- prefer summaries, drafts, and preparation over interruption
-                \\- if a recurring task can wait, batch it
+                \\# Add short recurring tasks below only when the user explicitly wants them.
                 \\
-                \\Suggested categories:
-                \\- morning brief
-                \\- inbox or message triage after integrations are connected
-                \\- project status follow-ups
-                \\- reminders before deadlines
-                \\- nightly summaries and next-step planning
-                \\
-                \\Keep only tasks the user actually wants automated.
+                \\# Suggested categories:
+                \\# - morning brief
+                \\# - inbox or message triage after integrations are connected
+                \\# - project status follow-ups
+                \\# - reminders before deadlines
+                \\# - nightly summaries and next-step planning
                 \\
             , .{ctx.agent_name});
         },
@@ -2682,7 +2676,8 @@ test "zaki templates contain onboarding and proactive guidance" {
 
     const heartbeat = try heartbeatTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(heartbeat);
-    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "recurring, proactive work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "skip heartbeat API calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "# - morning brief") != null);
 
     const bootstrap = try bootstrapTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(bootstrap);

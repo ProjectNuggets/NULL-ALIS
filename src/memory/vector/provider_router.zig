@@ -31,6 +31,9 @@ pub const ErrorClass = enum {
 /// Classify an embedding error for fallback decisions.
 pub fn classifyError(err: anyerror) ErrorClass {
     return switch (err) {
+        error.EmbeddingAuthError => .auth,
+        error.EmbeddingPolicyBlocked => .permanent,
+        error.EmbeddingRequestRejected => .permanent,
         error.EmbeddingApiError => .transient,
         error.InvalidEmbeddingResponse => .permanent,
         error.OutOfMemory => .permanent,
@@ -60,6 +63,9 @@ pub const ProviderRouter = struct {
     fallbacks: []EmbeddingProvider,
     /// Named routes for hint-based selection.
     routes: []EmbeddingRoute,
+    /// Permanently disable providers after hard failures (auth/policy/rejected request).
+    primary_disabled: bool = false,
+    fallback_disabled: []bool,
     /// Metrics: total embed calls.
     metrics: Metrics,
 
@@ -84,8 +90,10 @@ pub const ProviderRouter = struct {
             .primary = primary,
             .fallbacks = try allocator.dupe(EmbeddingProvider, fallbacks),
             .routes = try allocator.dupe(EmbeddingRoute, routes),
+            .fallback_disabled = try allocator.alloc(bool, fallbacks.len),
             .metrics = .{},
         };
+        @memset(self_.fallback_disabled, false);
         return self_;
     }
 
@@ -96,6 +104,7 @@ pub const ProviderRouter = struct {
             fb.deinit();
         }
         self.allocator.free(self.fallbacks);
+        self.allocator.free(self.fallback_disabled);
         self.allocator.free(self.routes);
         self.allocator.destroy(self);
     }
@@ -137,38 +146,61 @@ pub const ProviderRouter = struct {
             return allocator.alloc(f32, 0);
         }
 
-        // Try primary provider
-        if (self_.primary.embed(allocator, text)) |result| {
-            self_.metrics.primary_successes += 1;
-            return result;
-        } else |primary_err| {
-            const class = classifyError(primary_err);
-            log.warn("primary provider '{s}' failed (class={s}): {}", .{
-                self_.primary.getName(),
-                @tagName(class),
-                primary_err,
-            });
+        var first_err: ?anyerror = null;
 
-            // Try fallbacks in order
-            for (self_.fallbacks) |fb| {
-                if (fb.embed(allocator, text)) |result| {
-                    self_.metrics.fallback_successes += 1;
-                    log.info("fallback to '{s}' succeeded", .{fb.getName()});
-                    return result;
-                } else |fb_err| {
-                    const fb_class = classifyError(fb_err);
+        // Try primary provider unless disabled by a previous permanent failure.
+        if (!self_.primary_disabled) {
+            if (self_.primary.embed(allocator, text)) |result| {
+                self_.metrics.primary_successes += 1;
+                return result;
+            } else |primary_err| {
+                const class = classifyError(primary_err);
+                if (class == .auth or class == .permanent) {
+                    self_.primary_disabled = true;
+                    log.warn("primary provider '{s}' disabled after hard failure (class={s})", .{
+                        self_.primary.getName(),
+                        @tagName(class),
+                    });
+                } else {
+                    log.warn("primary provider '{s}' failed (class={s}): {}", .{
+                        self_.primary.getName(),
+                        @tagName(class),
+                        primary_err,
+                    });
+                }
+                first_err = primary_err;
+            }
+        }
+
+        // Try fallbacks in order
+        for (self_.fallbacks, 0..) |fb, i| {
+            if (self_.fallback_disabled[i]) continue;
+            if (fb.embed(allocator, text)) |result| {
+                self_.metrics.fallback_successes += 1;
+                log.info("fallback to '{s}' succeeded", .{fb.getName()});
+                return result;
+            } else |fb_err| {
+                const fb_class = classifyError(fb_err);
+                if (fb_class == .auth or fb_class == .permanent) {
+                    self_.fallback_disabled[i] = true;
+                    log.warn("fallback provider '{s}' disabled after hard failure (class={s})", .{
+                        fb.getName(),
+                        @tagName(fb_class),
+                    });
+                } else {
                     log.warn("fallback provider '{s}' failed (class={s}): {}", .{
                         fb.getName(),
                         @tagName(fb_class),
                         fb_err,
                     });
                 }
+                if (first_err == null) first_err = fb_err;
             }
-
-            // All providers failed
-            self_.metrics.total_failures += 1;
-            return primary_err;
         }
+
+        // All providers failed
+        self_.metrics.total_failures += 1;
+        return first_err orelse error.EmbeddingApiError;
     }
 
     fn implDeinit(ptr: *anyopaque) void {
@@ -248,6 +280,16 @@ test "extractHint empty after prefix" {
 test "classifyError maps EmbeddingApiError to transient" {
     const class = classifyError(error.EmbeddingApiError);
     try std.testing.expectEqual(ErrorClass.transient, class);
+}
+
+test "classifyError maps EmbeddingPolicyBlocked to permanent" {
+    const class = classifyError(error.EmbeddingPolicyBlocked);
+    try std.testing.expectEqual(ErrorClass.permanent, class);
+}
+
+test "classifyError maps EmbeddingAuthError to auth" {
+    const class = classifyError(error.EmbeddingAuthError);
+    try std.testing.expectEqual(ErrorClass.auth, class);
 }
 
 test "classifyError maps InvalidEmbeddingResponse to permanent" {
@@ -443,6 +485,48 @@ const FailingTestProvider = struct {
     }
 };
 
+const PolicyBlockedCountingProvider = struct {
+    allocator: ?std.mem.Allocator = null,
+    call_count: *usize,
+
+    const Self = @This();
+
+    fn implName(_: *anyopaque) []const u8 {
+        return "policy_blocked";
+    }
+
+    fn implDimensions(_: *anyopaque) u32 {
+        return 3;
+    }
+
+    fn implEmbed(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror![]f32 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        self_.call_count.* += 1;
+        return error.EmbeddingPolicyBlocked;
+    }
+
+    fn implDeinit(ptr: *anyopaque) void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        if (self_.allocator) |alloc| {
+            alloc.destroy(self_);
+        }
+    }
+
+    const vtable_inst = EmbeddingProvider.VTable{
+        .name = &implName,
+        .dimensions = &implDimensions,
+        .embed = &implEmbed,
+        .deinit = &implDeinit,
+    };
+
+    fn provider(self: *Self) EmbeddingProvider {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable_inst,
+        };
+    }
+};
+
 test "primary available routes to primary" {
     // Create a working primary (noop) and verify it's used
     const noop1 = try std.testing.allocator.create(embeddings.NoopEmbedding);
@@ -522,4 +606,38 @@ test "all providers fail returns error" {
     try std.testing.expectEqual(@as(u64, 0), router.metrics.primary_successes);
     try std.testing.expectEqual(@as(u64, 0), router.metrics.fallback_successes);
     try std.testing.expectEqual(@as(u64, 1), router.metrics.total_failures);
+}
+
+test "provider router disables permanent failing primary and uses fallback" {
+    var primary_calls: usize = 0;
+    const failing_primary = try std.testing.allocator.create(PolicyBlockedCountingProvider);
+    failing_primary.* = .{
+        .allocator = std.testing.allocator,
+        .call_count = &primary_calls,
+    };
+
+    const local_fb = try std.testing.allocator.create(embeddings.LocalHashEmbedding);
+    local_fb.* = .{
+        .allocator = std.testing.allocator,
+        .dims = 64,
+    };
+
+    var router = try ProviderRouter.init(
+        std.testing.allocator,
+        failing_primary.provider(),
+        &.{local_fb.provider()},
+        &.{},
+    );
+    const p = router.provider();
+    defer p.deinit();
+
+    const v1 = try p.embed(std.testing.allocator, "favorite snack pistachio");
+    defer std.testing.allocator.free(v1);
+    try std.testing.expectEqual(@as(usize, 64), v1.len);
+    try std.testing.expectEqual(@as(usize, 1), primary_calls);
+
+    const v2 = try p.embed(std.testing.allocator, "favorite snack pistachio");
+    defer std.testing.allocator.free(v2);
+    try std.testing.expectEqual(@as(usize, 1), primary_calls);
+    try std.testing.expectEqual(@as(u64, 2), router.metrics.fallback_successes);
 }

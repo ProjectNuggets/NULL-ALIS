@@ -89,6 +89,16 @@ Expected:
 - `heartbeat_wake.pending` drains back to `0`
 - recent ops events include `source="heartbeat"` with `sent` or explicit block/error reason
 
+### 6. Run integration preflight (startup + Composio readiness)
+```bash
+./scripts/preflight-integrations.sh
+```
+
+Checks:
+- `startup.self_check` has `state_effective=postgres`, `scheduler_backend=postgres`, `degraded=false`
+- Composio toolkit availability for `gmail`, `googledrive`, `googlecalendar`
+- per-entity connected-account readiness probe for Gmail/Drive/Calendar
+
 ## Prod Checks
 
 ### 1. Health + readiness

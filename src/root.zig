@@ -78,6 +78,7 @@ pub const rag = @import("rag.zig");
 pub const skillforge = @import("skillforge.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const voice = @import("voice.zig");
+pub const zaki_state = @import("zaki_state.zig");
 
 test {
     // Run tests from all imported modules

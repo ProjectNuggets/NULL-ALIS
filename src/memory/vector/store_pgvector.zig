@@ -20,6 +20,7 @@ const store_mod = @import("store.zig");
 const VectorStore = store_mod.VectorStore;
 const VectorResult = store_mod.VectorResult;
 const HealthStatus = store_mod.HealthStatus;
+const log = std.log.scoped(.memory_pgvector);
 
 const c = if (build_options.enable_postgres) @cImport({
     @cInclude("libpq-fe.h");
@@ -133,10 +134,40 @@ pub const PgvectorVectorStore = struct {
             const result = c.PQexec(conn, sql);
             defer c.PQclear(result);
             const status = c.PQresultStatus(result);
-            if (status != c.PGRES_COMMAND_OK) return error.PgSchemaFailed;
+            if (status != c.PGRES_COMMAND_OK) {
+                log.warn("pgvector extension ensure failed: {s}", .{pqErrorMessage(conn, result)});
+                return error.PgSchemaFailed;
+            }
         }
 
         // Create table with vector column
+        try self.createTable();
+
+        // If an existing table uses a different vector dimension than current config,
+        // rebuild it so upserts/searches do not fail on dimension mismatch.
+        if (try self.readEmbeddingDimensions()) |existing_dims| {
+            if (existing_dims != self.dimensions) {
+                log.warn(
+                    "pgvector dimension mismatch for table '{s}': existing={d} expected={d}; rebuilding vector table",
+                    .{ self.table_name, existing_dims, self.dimensions },
+                );
+                const drop_sql_plain = try std.fmt.allocPrint(self.allocator, "DROP TABLE IF EXISTS {s}", .{self.table_name});
+                defer self.allocator.free(drop_sql_plain);
+                const drop_sql = try self.allocator.dupeZ(u8, drop_sql_plain);
+                defer self.allocator.free(drop_sql);
+                const drop_result = c.PQexec(conn, drop_sql.ptr);
+                defer c.PQclear(drop_result);
+                if (c.PQresultStatus(drop_result) != c.PGRES_COMMAND_OK) {
+                    log.warn("pgvector table drop failed: {s}", .{pqErrorMessage(conn, drop_result)});
+                    return error.PgSchemaFailed;
+                }
+                try self.createTable();
+            }
+        }
+    }
+
+    fn createTable(self: *Self) !void {
+        const conn = self.conn orelse return error.PgNotConnected;
         const create_sql_plain = try std.fmt.allocPrint(self.allocator,
             \\CREATE TABLE IF NOT EXISTS {s} (
             \\  key TEXT PRIMARY KEY,
@@ -152,8 +183,55 @@ pub const PgvectorVectorStore = struct {
             const result = c.PQexec(conn, create_sql.ptr);
             defer c.PQclear(result);
             const status = c.PQresultStatus(result);
-            if (status != c.PGRES_COMMAND_OK) return error.PgSchemaFailed;
+            if (status != c.PGRES_COMMAND_OK) {
+                log.warn("pgvector table ensure failed: {s}", .{pqErrorMessage(conn, result)});
+                return error.PgSchemaFailed;
+            }
         }
+    }
+
+    fn readEmbeddingDimensions(self: *Self) !?u32 {
+        const conn = self.conn orelse return error.PgNotConnected;
+        const table_z = try self.allocator.dupeZ(u8, self.table_name);
+        defer self.allocator.free(table_z);
+        const sql =
+            "SELECT a.atttypmod FROM pg_attribute a " ++
+            "JOIN pg_class c ON c.oid = a.attrelid " ++
+            "JOIN pg_namespace n ON n.oid = c.relnamespace " ++
+            "WHERE c.relname = $1 AND a.attname = 'embedding' " ++
+            "AND a.attnum > 0 AND NOT a.attisdropped " ++
+            "ORDER BY (n.nspname = current_schema()) DESC LIMIT 1";
+        const params = [_][*c]const u8{table_z.ptr};
+        const result = c.PQexecParams(conn, sql, 1, null, &params, null, null, 0);
+        defer c.PQclear(result);
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+            log.warn("pgvector dimension query failed: {s}", .{pqErrorMessage(conn, result)});
+            return error.PgQueryFailed;
+        }
+        if (c.PQntuples(result) < 1) return null;
+        const raw = c.PQgetvalue(result, 0, 0);
+        if (raw == null) return null;
+        const typmod_slice: []const u8 = std.mem.span(raw);
+        const typmod = std.fmt.parseInt(i32, typmod_slice, 10) catch return null;
+        if (typmod <= 0) return null;
+        // pgvector stores declared dimensions in atttypmod for vector(N).
+        return @intCast(typmod);
+    }
+
+    fn pqErrorMessage(conn: *c.PGconn, result: ?*c.PGresult) []const u8 {
+        if (result) |res| {
+            const raw = c.PQresultErrorMessage(res);
+            if (raw != null) {
+                const msg = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
+                if (msg.len > 0) return msg;
+            }
+        }
+        const conn_raw = c.PQerrorMessage(conn);
+        if (conn_raw != null) {
+            const msg = std.mem.trim(u8, std.mem.span(conn_raw), " \t\r\n");
+            if (msg.len > 0) return msg;
+        }
+        return "unknown postgres error";
     }
 
     // ── Vector formatting helpers ─────────────────────────────────
@@ -196,8 +274,8 @@ pub const PgvectorVectorStore = struct {
 
         const sql_plain = try std.fmt.allocPrint(
             alloc,
-            "INSERT INTO {s} (key, embedding, updated_at) VALUES ($1, $2, now()) " ++
-                "ON CONFLICT (key) DO UPDATE SET embedding = $2, updated_at = now()",
+            "INSERT INTO {s} (key, embedding, updated_at) VALUES ($1, $2::vector, now()) " ++
+                "ON CONFLICT (key) DO UPDATE SET embedding = $2::vector, updated_at = now()",
             .{self.table_name},
         );
         defer alloc.free(sql_plain);
@@ -209,7 +287,10 @@ pub const PgvectorVectorStore = struct {
         defer c.PQclear(result);
 
         const status = c.PQresultStatus(result);
-        if (status != c.PGRES_COMMAND_OK) return error.PgQueryFailed;
+        if (status != c.PGRES_COMMAND_OK) {
+            log.warn("pgvector upsert failed table={s} key={s}: {s}", .{ self.table_name, key, pqErrorMessage(conn, result) });
+            return error.PgQueryFailed;
+        }
     }
 
     fn implSearch(ptr: *anyopaque, alloc: Allocator, query_embedding: []const f32, limit: u32) anyerror![]VectorResult {
@@ -230,7 +311,7 @@ pub const PgvectorVectorStore = struct {
         const sql_plain = try std.fmt.allocPrint(
             alloc,
             "SELECT key, 1 - (embedding <=> $1::vector) AS similarity " ++
-                "FROM {s} ORDER BY embedding <=> $1::vector LIMIT $2",
+                "FROM {s} ORDER BY embedding <=> $1::vector LIMIT $2::int",
             .{self.table_name},
         );
         defer alloc.free(sql_plain);
@@ -242,7 +323,10 @@ pub const PgvectorVectorStore = struct {
         defer c.PQclear(result);
 
         const status = c.PQresultStatus(result);
-        if (status != c.PGRES_TUPLES_OK) return error.PgQueryFailed;
+        if (status != c.PGRES_TUPLES_OK) {
+            log.warn("pgvector search failed table={s}: {s}", .{ self.table_name, pqErrorMessage(conn, result) });
+            return error.PgQueryFailed;
+        }
 
         const nrows = c.PQntuples(result);
         var results: std.ArrayListUnmanaged(VectorResult) = .empty;
@@ -294,7 +378,10 @@ pub const PgvectorVectorStore = struct {
         defer c.PQclear(result);
 
         const status = c.PQresultStatus(result);
-        if (status != c.PGRES_COMMAND_OK) return error.PgQueryFailed;
+        if (status != c.PGRES_COMMAND_OK) {
+            log.warn("pgvector delete failed table={s} key={s}: {s}", .{ self.table_name, key, pqErrorMessage(conn, result) });
+            return error.PgQueryFailed;
+        }
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -311,7 +398,10 @@ pub const PgvectorVectorStore = struct {
         defer c.PQclear(result);
 
         const status = c.PQresultStatus(result);
-        if (status != c.PGRES_TUPLES_OK) return error.PgQueryFailed;
+        if (status != c.PGRES_TUPLES_OK) {
+            log.warn("pgvector count failed table={s}: {s}", .{ self.table_name, pqErrorMessage(conn, result) });
+            return error.PgQueryFailed;
+        }
 
         if (c.PQntuples(result) < 1) return 0;
 

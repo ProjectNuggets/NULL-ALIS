@@ -1,9 +1,10 @@
 //! Web Search Tool — internet search via Exa and Brave APIs.
 //!
-//! Provider selection is controlled by WEB_SEARCH_PROVIDER:
+//! Provider selection is controlled by tools.web_search_provider or WEB_SEARCH_PROVIDER:
 //! - auto (default): Exa first when EXA_API_KEY is set, fallback to Brave
 //! - exa: Exa only
 //! - brave: Brave only
+//! If the selected mode lacks its API key, runtime falls back to the other provider when possible.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -37,6 +38,11 @@ const SearchProviderMode = enum {
     brave,
 };
 
+const ResolvedApiKey = struct {
+    value: []const u8,
+    owned: bool = false,
+};
+
 const ExaAttempt = union(enum) {
     success: ToolResult,
     fallbackable_error: []u8,
@@ -48,9 +54,15 @@ pub const WebSearchTool = struct {
     /// Optional config override from tools.web_search_provider.
     /// Empty means: use WEB_SEARCH_PROVIDER env selection.
     provider_mode_override: []const u8 = "",
+    /// Optional config override from tools.web_search_exa_api_key.
+    /// Empty means: use EXA_API_KEY env resolution.
+    exa_api_key_override: []const u8 = "",
+    /// Optional config override from tools.web_search_brave_api_key.
+    /// Empty means: use BRAVE_API_KEY env resolution.
+    brave_api_key_override: []const u8 = "",
 
     pub const tool_name = "web_search";
-    pub const tool_description = "Search the web using Exa or Brave. Provider is selected by WEB_SEARCH_PROVIDER=auto|exa|brave. API keys: EXA_API_KEY and/or BRAVE_API_KEY.";
+    pub const tool_description = "Search the web using Exa or Brave. Provider is selected by tools.web_search_provider or WEB_SEARCH_PROVIDER=auto|exa|brave. API keys: tools.web_search_exa_api_key/tools.web_search_brave_api_key or EXA_API_KEY/BRAVE_API_KEY. If selected mode is missing its key, fallback provider is used when available.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"}},"required":["query"]}
     ;
@@ -74,9 +86,9 @@ pub const WebSearchTool = struct {
         const count = parseCount(args);
         const mode = resolveProviderMode(self.provider_mode_override, allocator);
         return switch (mode) {
-            .auto => executeAutoMode(allocator, query, count),
-            .exa => executeExaMode(allocator, query, count),
-            .brave => executeBraveMode(allocator, query, count),
+            .auto => executeAutoMode(allocator, query, count, self.exa_api_key_override, self.brave_api_key_override),
+            .exa => executeExaMode(allocator, query, count, self.exa_api_key_override, self.brave_api_key_override),
+            .brave => executeBraveMode(allocator, query, count, self.brave_api_key_override, self.exa_api_key_override),
         };
     }
 };
@@ -143,6 +155,21 @@ fn getTrimmedEnvOrNull(allocator: std.mem.Allocator, key: []const u8) ?[]u8 {
     return out;
 }
 
+fn resolveApiKey(allocator: std.mem.Allocator, configured_key: []const u8, env_key: []const u8) ?ResolvedApiKey {
+    const configured_trimmed = std.mem.trim(u8, configured_key, " \t\r\n");
+    if (configured_trimmed.len > 0) {
+        return .{ .value = configured_trimmed, .owned = false };
+    }
+    const env_val = getTrimmedEnvOrNull(allocator, env_key) orelse return null;
+    return .{ .value = env_val, .owned = true };
+}
+
+fn freeResolvedApiKey(allocator: std.mem.Allocator, key: ?ResolvedApiKey) void {
+    if (key) |k| {
+        if (k.owned) allocator.free(k.value);
+    }
+}
+
 fn exaStatusAllowsFallback(status_code: u16) bool {
     return status_code == 429 or status_code >= 500;
 }
@@ -153,27 +180,33 @@ fn preferredAutoProvider(has_exa: bool, has_brave: bool) ?SearchProviderMode {
     return null;
 }
 
-fn executeAutoMode(allocator: std.mem.Allocator, query: []const u8, count: usize) !ToolResult {
-    const exa_key = getTrimmedEnvOrNull(allocator, ENV_EXA_API_KEY);
-    defer if (exa_key) |key| allocator.free(key);
+fn executeAutoMode(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    count: usize,
+    exa_key_override: []const u8,
+    brave_key_override: []const u8,
+) !ToolResult {
+    const exa_key = resolveApiKey(allocator, exa_key_override, ENV_EXA_API_KEY);
+    defer freeResolvedApiKey(allocator, exa_key);
 
-    const brave_key = getTrimmedEnvOrNull(allocator, ENV_BRAVE_API_KEY);
-    defer if (brave_key) |key| allocator.free(key);
+    const brave_key = resolveApiKey(allocator, brave_key_override, ENV_BRAVE_API_KEY);
+    defer freeResolvedApiKey(allocator, brave_key);
 
     const preferred = preferredAutoProvider(exa_key != null, brave_key != null) orelse
-        return ToolResult.fail("No search provider configured. Set EXA_API_KEY or BRAVE_API_KEY.");
+        return ToolResult.fail("No search provider configured. Set tools.web_search_exa_api_key/tools.web_search_brave_api_key or EXA_API_KEY/BRAVE_API_KEY.");
 
     if (preferred == .exa) {
-        const exa_attempt = try tryExaSearch(allocator, query, count, exa_key.?);
+        const exa_attempt = try tryExaSearch(allocator, query, count, exa_key.?.value);
         switch (exa_attempt) {
             .success => |result| return result,
             .fatal_error => |msg| return .{ .success = false, .output = "", .error_msg = msg },
             .fallbackable_error => |msg| {
                 defer allocator.free(msg);
-                if (brave_key) |key| return executeBraveSearchWithKey(allocator, query, count, key);
+                if (brave_key) |key| return executeBraveSearchWithKey(allocator, query, count, key.value);
                 const err_msg = try std.fmt.allocPrint(
                     allocator,
-                    "Exa search failed ({s}) and BRAVE_API_KEY is not set for fallback.",
+                    "Exa search failed ({s}) and Brave key is not set for fallback.",
                     .{msg},
                 );
                 return .{ .success = false, .output = "", .error_msg = err_msg };
@@ -181,27 +214,57 @@ fn executeAutoMode(allocator: std.mem.Allocator, query: []const u8, count: usize
         }
     }
 
-    return executeBraveSearchWithKey(allocator, query, count, brave_key.?);
+    return executeBraveSearchWithKey(allocator, query, count, brave_key.?.value);
 }
 
-fn executeExaMode(allocator: std.mem.Allocator, query: []const u8, count: usize) !ToolResult {
-    const exa_key = getTrimmedEnvOrNull(allocator, ENV_EXA_API_KEY) orelse
-        return ToolResult.fail("EXA_API_KEY environment variable not set.");
-    defer allocator.free(exa_key);
+fn executeExaMode(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    count: usize,
+    exa_key_override: []const u8,
+    brave_key_override: []const u8,
+) !ToolResult {
+    const exa_key = resolveApiKey(allocator, exa_key_override, ENV_EXA_API_KEY);
+    defer freeResolvedApiKey(allocator, exa_key);
+    if (exa_key) |key| {
+        const exa_attempt = try tryExaSearch(allocator, query, count, key.value);
+        return switch (exa_attempt) {
+            .success => |result| result,
+            .fallbackable_error => |msg| .{ .success = false, .output = "", .error_msg = msg },
+            .fatal_error => |msg| .{ .success = false, .output = "", .error_msg = msg },
+        };
+    }
 
-    const exa_attempt = try tryExaSearch(allocator, query, count, exa_key);
-    return switch (exa_attempt) {
-        .success => |result| result,
-        .fallbackable_error => |msg| .{ .success = false, .output = "", .error_msg = msg },
-        .fatal_error => |msg| .{ .success = false, .output = "", .error_msg = msg },
-    };
+    const brave_key = resolveApiKey(allocator, brave_key_override, ENV_BRAVE_API_KEY);
+    defer freeResolvedApiKey(allocator, brave_key);
+    if (brave_key) |key| return executeBraveSearchWithKey(allocator, query, count, key.value);
+
+    return ToolResult.fail("Exa key not set. Configure tools.web_search_exa_api_key or EXA_API_KEY.");
 }
 
-fn executeBraveMode(allocator: std.mem.Allocator, query: []const u8, count: usize) !ToolResult {
-    const brave_key = getTrimmedEnvOrNull(allocator, ENV_BRAVE_API_KEY) orelse
-        return ToolResult.fail("BRAVE_API_KEY environment variable not set. Get a free key at https://brave.com/search/api/");
-    defer allocator.free(brave_key);
-    return executeBraveSearchWithKey(allocator, query, count, brave_key);
+fn executeBraveMode(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    count: usize,
+    brave_key_override: []const u8,
+    exa_key_override: []const u8,
+) !ToolResult {
+    const brave_key = resolveApiKey(allocator, brave_key_override, ENV_BRAVE_API_KEY);
+    defer freeResolvedApiKey(allocator, brave_key);
+    if (brave_key) |key| return executeBraveSearchWithKey(allocator, query, count, key.value);
+
+    const exa_key = resolveApiKey(allocator, exa_key_override, ENV_EXA_API_KEY);
+    defer freeResolvedApiKey(allocator, exa_key);
+    if (exa_key) |key| {
+        const exa_attempt = try tryExaSearch(allocator, query, count, key.value);
+        return switch (exa_attempt) {
+            .success => |result| result,
+            .fallbackable_error => |msg| .{ .success = false, .output = "", .error_msg = msg },
+            .fatal_error => |msg| .{ .success = false, .output = "", .error_msg = msg },
+        };
+    }
+
+    return ToolResult.fail("Brave key not set. Configure tools.web_search_brave_api_key or BRAVE_API_KEY. Get a free key at https://brave.com/search/api/");
 }
 
 fn executeBraveSearchWithKey(
@@ -234,7 +297,8 @@ fn executeBraveSearchWithKey(
 
     const response = http_util.request_with_mode(
         allocator,
-        .{ .mode = .native_preferred },
+        // Keep search on curl transport for runtime stability.
+        .{ .mode = .curl_only },
         .{
             .method = "GET",
             .url = url_str,
@@ -299,7 +363,8 @@ fn tryExaSearch(
 
     const response = http_util.request_with_mode(
         allocator,
-        .{ .mode = .native_preferred },
+        // Keep search on curl transport for runtime stability.
+        .{ .mode = .curl_only },
         .{
             .method = "POST",
             .url = EXA_BASE_URL,
@@ -526,7 +591,14 @@ test "WebSearchTool no API key fails with helpful message" {
     defer parsed.deinit();
     const result = try wst.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
-    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "EXA_API_KEY") != null or std.mem.indexOf(u8, result.error_msg.?, "BRAVE_API_KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "web_search_exa_api_key") != null or std.mem.indexOf(u8, result.error_msg.?, "web_search_brave_api_key") != null);
+}
+
+test "resolveApiKey prefers configured value and trims whitespace" {
+    const resolved = resolveApiKey(testing.allocator, "  exa-config-key \n", "NULLALIS_TEST_KEY_NOT_SET") orelse return error.TestUnexpectedResult;
+    defer if (resolved.owned) testing.allocator.free(resolved.value);
+    try testing.expectEqualStrings("exa-config-key", resolved.value);
+    try testing.expect(!resolved.owned);
 }
 
 test "parseCount defaults to 5" {

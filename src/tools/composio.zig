@@ -11,7 +11,7 @@ const COMPOSIO_API_BASE_V3 = "https://backend.composio.dev/api/v3";
 /// Composio tool — proxy actions to the Composio managed tool platform.
 /// Supports 1000+ OAuth integrations (Gmail, Notion, GitHub, Slack, etc.).
 /// Operations: list (available actions), execute (run an action), connect (get OAuth URL).
-/// Uses v3 API endpoints with v2 fallback for compatibility.
+/// Uses v3 API endpoints by default; list/execute keep legacy fallback for compatibility.
 pub const ComposioTool = struct {
     api_key: []const u8,
     entity_id: []const u8,
@@ -21,7 +21,7 @@ pub const ComposioTool = struct {
         "Use action='list' to see available actions, action='execute' with action_name/tool_slug and params, " ++
         "or action='connect' with app/auth_config_id to get OAuth URL.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["list","execute","connect"],"description":"Operation: list, execute, or connect"},"app":{"type":"string","description":"App/toolkit filter for list, or app for connect"},"action_name":{"type":"string","description":"Action identifier to execute"},"tool_slug":{"type":"string","description":"Preferred v3 tool slug (alias of action_name)"},"params":{"type":"object","description":"Parameters for the action"},"entity_id":{"type":"string","description":"Entity/user ID for multi-user setups"},"auth_config_id":{"type":"string","description":"Optional v3 auth config id for connect"},"connected_account_id":{"type":"string","description":"Optional connected account ID for execute"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["list","execute","connect"],"description":"Operation: list, execute, or connect"},"app":{"type":"string","description":"App/toolkit filter for list, or app/toolkit slug for connect"},"action_name":{"type":"string","description":"Action identifier to execute"},"tool_slug":{"type":"string","description":"Preferred v3 tool slug (alias of action_name)"},"params":{"type":"object","description":"Parameters for the action"},"entity_id":{"type":"string","description":"Entity/user ID for multi-user setups"},"auth_config_id":{"type":"string","description":"Optional v3 auth config id for connect"},"callback_url":{"type":"string","description":"Optional callback URL for connect link session"},"connection_data":{"type":"object","description":"Optional connect prefill data for OAuth link generation"},"connected_account_id":{"type":"string","description":"Optional connected account ID for execute"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -167,83 +167,87 @@ pub const ComposioTool = struct {
 
     // ── v3 connect ─────────────────────────────────────────────────
 
-    fn connectActionV3(self: *ComposioTool, allocator: std.mem.Allocator, entity: []const u8, auth_config_id: []const u8) !ToolResult {
+    fn connectActionV3(self: *ComposioTool, allocator: std.mem.Allocator, entity: []const u8, auth_config_id: []const u8, args: JsonObjectMap) !ToolResult {
         var url_buf: [512]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, COMPOSIO_API_BASE_V3 ++ "/connected_accounts/link", .{}) catch
             return ToolResult.fail("URL too long");
-        const body = buildConnectBodyV3(allocator, entity, auth_config_id) catch
+        const body = buildConnectBodyV3(allocator, entity, auth_config_id, args) catch
             return ToolResult.fail("Failed to build connect body");
         defer allocator.free(body);
 
         return self.httpPost(allocator, url, body);
     }
 
+    fn resolveAuthConfigIdV3(self: *ComposioTool, allocator: std.mem.Allocator, app: []const u8) ![]u8 {
+        const trimmed = std.mem.trim(u8, app, " \t\n");
+        if (trimmed.len == 0) return error.AuthConfigNotFound;
+
+        const canonical = try lowerNoSeparators(allocator, trimmed);
+        defer allocator.free(canonical);
+
+        var candidates: [2][]const u8 = .{ trimmed, canonical };
+        var candidate_count: usize = 1;
+        if (!std.mem.eql(u8, canonical, trimmed)) {
+            candidates[1] = canonical;
+            candidate_count = 2;
+        }
+
+        var i: usize = 0;
+        while (i < candidate_count) : (i += 1) {
+            var url_buf: [640]u8 = undefined;
+            const url = std.fmt.bufPrint(
+                &url_buf,
+                COMPOSIO_API_BASE_V3 ++ "/auth_configs?toolkit_slug={s}&show_disabled=false&limit=25",
+                .{candidates[i]},
+            ) catch return error.AuthConfigLookupFailed;
+
+            const lookup = try self.httpGet(allocator, url);
+            defer if (lookup.error_msg) |e| allocator.free(e);
+            defer if (lookup.output.len > 0) allocator.free(lookup.output);
+            if (!lookup.success) continue;
+
+            if (parseFirstAuthConfigId(allocator, lookup.output)) |auth_id| {
+                return auth_id;
+            } else |_| {}
+        }
+
+        return error.AuthConfigNotFound;
+    }
+
     fn connectAction(self: *ComposioTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const app = root.getString(args, "app");
-        const auth_config_id = root.getString(args, "auth_config_id");
-        if (app == null and auth_config_id == null) {
+        const auth_config_id_in = root.getString(args, "auth_config_id");
+        if (app == null and auth_config_id_in == null) {
             return ToolResult.fail("Missing 'app' or 'auth_config_id' for connect");
         }
 
         const entity_raw = root.getString(args, "entity_id");
         const entity = if (entity_raw) |e| e else self.entity_id;
 
-        // V3 link requires auth_config_id; otherwise skip directly to v2 app connect.
-        if (auth_config_id) |auth_id| {
-            const v3_result = try self.connectActionV3(allocator, entity, auth_id);
-            if (v3_result.success) return v3_result;
+        var auth_config_id_owned: ?[]u8 = null;
+        defer if (auth_config_id_owned) |owned| allocator.free(owned);
+        const auth_config_id = if (auth_config_id_in) |given|
+            given
+        else blk: {
+            const app_name = app orelse return ToolResult.fail("Missing 'app' for connect");
+            auth_config_id_owned = self.resolveAuthConfigIdV3(allocator, app_name) catch |err| {
+                return switch (err) {
+                    error.AuthConfigNotFound => blk_err: {
+                        const msg = allocator.dupe(u8, "No v3 auth_config found for app. Pass auth_config_id explicitly.") catch
+                            break :blk_err ToolResult.fail("No v3 auth_config found for app. Pass auth_config_id explicitly.");
+                        break :blk_err ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    },
+                    else => blk_err: {
+                        const msg = allocator.dupe(u8, "Failed to resolve auth_config_id via v3 auth_configs") catch
+                            break :blk_err ToolResult.fail("Failed to resolve auth_config_id via v3 auth_configs");
+                        break :blk_err ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    },
+                };
+            };
+            break :blk auth_config_id_owned.?;
+        };
 
-            // Free v3 error resources before fallback
-            if (v3_result.error_msg) |e| allocator.free(e);
-            if (v3_result.output.len > 0) allocator.free(v3_result.output);
-        }
-
-        // v2 fallback requires app
-        const app_for_v2 = app orelse return ToolResult.fail("Missing 'app' for connect (v2 fallback)");
-
-        const auth_header = try std.fmt.allocPrint(allocator, "X-API-Key: {s}", .{self.api_key});
-        defer allocator.free(auth_header);
-
-        var v2_body_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer v2_body_buf.deinit(allocator);
-        try v2_body_buf.appendSlice(allocator, "{\"entity_id\":\"");
-        try appendJsonEscaped(&v2_body_buf, allocator, entity);
-        try v2_body_buf.appendSlice(allocator, "\",\"appName\":\"");
-        try appendJsonEscaped(&v2_body_buf, allocator, app_for_v2);
-        try v2_body_buf.appendSlice(allocator, "\"}");
-        const body = try v2_body_buf.toOwnedSlice(allocator);
-        defer allocator.free(body);
-
-        var argv_buf: [20][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-sL";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "15";
-        argc += 1;
-        argv_buf[argc] = "-X";
-        argc += 1;
-        argv_buf[argc] = "POST";
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = auth_header;
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = "Content-Type: application/json";
-        argc += 1;
-        argv_buf[argc] = "-d";
-        argc += 1;
-        argv_buf[argc] = body;
-        argc += 1;
-        argv_buf[argc] = "https://backend.composio.dev/api/v1/connectedAccounts";
-        argc += 1;
-
-        return self.runCurl(allocator, argv_buf[0..argc]);
+        return self.connectActionV3(allocator, entity, auth_config_id, args);
     }
 
     // ── HTTP helpers ───────────────────────────────────────────────
@@ -357,15 +361,80 @@ fn buildExecuteToolUrlV3(url_buf: []u8, tool_slug: []const u8) ![]const u8 {
     return std.fmt.bufPrint(url_buf, COMPOSIO_API_BASE_V3 ++ "/tools/execute/{s}", .{tool_slug});
 }
 
-fn buildConnectBodyV3(allocator: std.mem.Allocator, entity: []const u8, auth_config_id: []const u8) ![]u8 {
+fn buildConnectBodyV3(allocator: std.mem.Allocator, entity: []const u8, auth_config_id: []const u8, args: JsonObjectMap) ![]u8 {
     var body_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer body_buf.deinit(allocator);
     try body_buf.appendSlice(allocator, "{\"user_id\":\"");
     try appendJsonEscaped(&body_buf, allocator, entity);
     try body_buf.appendSlice(allocator, "\",\"auth_config_id\":\"");
     try appendJsonEscaped(&body_buf, allocator, auth_config_id);
-    try body_buf.appendSlice(allocator, "\"}");
+    try body_buf.appendSlice(allocator, "\"");
+
+    if (root.getString(args, "callback_url")) |callback_url| {
+        try body_buf.appendSlice(allocator, ",\"callback_url\":\"");
+        try appendJsonEscaped(&body_buf, allocator, callback_url);
+        try body_buf.appendSlice(allocator, "\"");
+    }
+
+    if (root.getValue(args, "connection_data")) |connection_data| {
+        const connection_data_json = std.json.Stringify.valueAlloc(allocator, connection_data, .{}) catch null;
+        defer if (connection_data_json) |cd| allocator.free(cd);
+        if (connection_data_json) |cd| {
+            try body_buf.appendSlice(allocator, ",\"connection_data\":");
+            try body_buf.appendSlice(allocator, cd);
+        }
+    }
+
+    try body_buf.appendSlice(allocator, "}");
     return body_buf.toOwnedSlice(allocator);
+}
+
+fn lowerNoSeparators(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    for (input) |c| {
+        if (c == '-' or c == '_' or c == ' ') continue;
+        try out.append(allocator, std.ascii.toLower(c));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseFirstAuthConfigId(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.InvalidResponse;
+    const obj = parsed.value.object;
+
+    if (extractAuthConfigIdFromObject(allocator, obj)) |id| return id else |_| {}
+
+    const list_fields = [_][]const u8{ "items", "data", "results", "auth_configs" };
+    for (list_fields) |field| {
+        const list_val = obj.get(field) orelse continue;
+        if (list_val != .array) continue;
+        for (list_val.array.items) |item| {
+            if (item != .object) continue;
+            if (extractAuthConfigIdFromObject(allocator, item.object)) |id| return id else |_| {}
+        }
+    }
+
+    return error.AuthConfigNotFound;
+}
+
+fn extractAuthConfigIdFromObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8 {
+    if (obj.get("status")) |status_val| {
+        if (status_val == .string and std.ascii.eqlIgnoreCase(status_val.string, "DISABLED")) {
+            return error.AuthConfigDisabled;
+        }
+    }
+    const id_fields = [_][]const u8{ "id", "auth_config_id", "authConfigId", "nanoid" };
+    for (id_fields) |field| {
+        const id_val = obj.get(field) orelse continue;
+        if (id_val == .string and id_val.string.len > 0) {
+            return allocator.dupe(u8, id_val.string);
+        }
+    }
+    return error.AuthConfigNotFound;
 }
 
 /// Sanitize error message: redact potential secrets (long alphanumeric strings > 20 chars)
@@ -458,6 +527,8 @@ test "composio tool schema has action" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "app") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "connected_account_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "auth_config_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "callback_url") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "connection_data") != null);
 }
 
 test "composio missing action returns error" {
@@ -579,10 +650,40 @@ test "composio buildExecuteToolUrlV3 uses execute prefix path" {
 
 test "composio buildConnectBodyV3 includes auth_config_id and user_id" {
     const alloc = std.testing.allocator;
-    const body = try buildConnectBodyV3(alloc, "user-1", "ac_123");
+    const parsed = try root.parseTestArgs("{}");
+    defer parsed.deinit();
+    const body = try buildConnectBodyV3(alloc, "user-1", "ac_123", parsed.value.object);
     defer alloc.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"user_id\":\"user-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"auth_config_id\":\"ac_123\"") != null);
+}
+
+test "composio buildConnectBodyV3 includes callback_url and connection_data when provided" {
+    const alloc = std.testing.allocator;
+    const parsed = try root.parseTestArgs(
+        \\{"callback_url":"https://example.com/cb","connection_data":{"tenant":"acme"}}
+    );
+    defer parsed.deinit();
+    const body = try buildConnectBodyV3(alloc, "user-1", "ac_123", parsed.value.object);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"callback_url\":\"https://example.com/cb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"connection_data\":{\"tenant\":\"acme\"}") != null);
+}
+
+test "composio lowerNoSeparators normalizes toolkit slug variants" {
+    const alloc = std.testing.allocator;
+    const normalized = try lowerNoSeparators(alloc, "Google-Drive");
+    defer alloc.free(normalized);
+    try std.testing.expectEqualStrings("googledrive", normalized);
+}
+
+test "composio parseFirstAuthConfigId reads id from items payload" {
+    const alloc = std.testing.allocator;
+    const id = try parseFirstAuthConfigId(alloc,
+        \\{"items":[{"id":"ac_abc123","status":"ENABLED"}]}
+    );
+    defer alloc.free(id);
+    try std.testing.expectEqualStrings("ac_abc123", id);
 }
 
 test "composio normalizeToolSlug preserves UPPER_SNAKE" {

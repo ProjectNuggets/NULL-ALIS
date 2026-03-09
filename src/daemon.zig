@@ -6,6 +6,7 @@
 //!   - Periodic state file writing (daemon_state.json)
 //!   - Ctrl+C graceful shutdown
 
+const builtin = @import("builtin");
 const std = @import("std");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
@@ -26,6 +27,7 @@ const telegram = @import("channels/telegram.zig");
 const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
 const json_util = @import("json_util.zig");
+const tools_mod = @import("tools/root.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 
 const log = std.log.scoped(.daemon);
@@ -189,11 +191,25 @@ fn sendGatewayControlCommand(host: []const u8, port: u16, path: []const u8, inte
 }
 
 const HEARTBEAT_PROMPT_DEFAULT =
-    "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.";
+    "Read HEARTBEAT.md if it exists (workspace context) and follow it strictly. Use runtime_info and schedule before other tools. Trust schedule state over memory for whether jobs exist. Trust delivery or run history over memory for whether something already happened today. Do not use shell, composio, or exploratory discovery. If nothing needs user-visible action, reply HEARTBEAT_OK. If you remediate something, reply with one concise sentence only.";
 const HEARTBEAT_RUNTIME_FILENAME = "heartbeat_runtime.json";
 const CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX = "cron.next_heartbeat:";
 const HEARTBEAT_SWEEP_INTERVAL_SECS: i64 = 30;
 const HEARTBEAT_WAKE_MAX_DRAIN_PER_TICK: usize = 4;
+
+fn ignoreSigpipe() void {
+    switch (builtin.os.tag) {
+        .windows, .wasi => return,
+        else => {},
+    }
+
+    const sigact = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.PIPE, &sigact, null);
+}
 
 const UserHeartbeatConfig = struct {
     enabled: bool,
@@ -428,6 +444,8 @@ fn readTrimmedFileOwned(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
 }
 
 fn isHeartbeatContentEffectivelyEmpty(content: []const u8) bool {
+    if (isDefaultHeartbeatTemplate(content)) return true;
+
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -444,6 +462,25 @@ fn isHeartbeatContentEffectivelyEmpty(content: []const u8) bool {
         return false;
     }
     return true;
+}
+
+fn isDefaultHeartbeatTemplate(content: []const u8) bool {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed.len == 0) return true;
+
+    if (std.mem.indexOf(u8, trimmed, "# Keep this file empty (or with only comments) to skip heartbeat API calls.") != null) {
+        return true;
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "# HEARTBEAT.md - ") and
+        std.mem.indexOf(u8, trimmed, "Use this file to define recurring, proactive work.") != null and
+        std.mem.indexOf(u8, trimmed, "Suggested categories:") != null and
+        std.mem.indexOf(u8, trimmed, "Keep only tasks the user actually wants automated.") != null)
+    {
+        return true;
+    }
+
+    return false;
 }
 
 fn asciiStartsWithIgnoreCaseAt(haystack: []const u8, start: usize, needle: []const u8) bool {
@@ -503,10 +540,28 @@ fn isHeartbeatActionableText(content: []const u8) bool {
     return false;
 }
 
+fn heartbeatLooksRoutineNarration(reply: []const u8) bool {
+    var lowered: [512]u8 = undefined;
+    const clipped_len = @min(reply.len, lowered.len);
+    _ = std.ascii.lowerString(lowered[0..clipped_len], reply[0..clipped_len]);
+    const content = lowered[0..clipped_len];
+
+    if (std.mem.indexOf(u8, content, "not 08:00") != null) return true;
+    if (std.mem.indexOf(u8, content, "not 8:00") != null) return true;
+    if (std.mem.indexOf(u8, content, "outside the scheduled window") != null) return true;
+    if (std.mem.indexOf(u8, content, "outside the window") != null) return true;
+    if (std.mem.indexOf(u8, content, "not the scheduled time") != null) return true;
+    if (std.mem.indexOf(u8, content, "job does not exist") != null) return true;
+    if (std.mem.indexOf(u8, content, "job doesn't exist") != null) return true;
+    if (std.mem.indexOf(u8, content, "job is missing") != null) return true;
+    return false;
+}
+
 fn heartbeatActionableReplySlice(reply: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, reply, " \t\r\n");
     if (trimmed.len == 0) return null;
     if (isHeartbeatAck(trimmed)) return null;
+    if (heartbeatLooksRoutineNarration(trimmed)) return null;
     if (!isHeartbeatActionableText(trimmed)) return null;
     return trimmed;
 }
@@ -921,7 +976,13 @@ fn runCronAgentTurn(
         break :blk zaki_session.fallbackCronSessionKey();
     };
 
-    return runtime.session_mgr.processMessage(session_key, prompt, null);
+    const turn_origin: tools_mod.TurnOrigin = if (std.mem.eql(u8, job.id, "heartbeat"))
+        .heartbeat
+    else
+        .scheduler;
+    return runtime.session_mgr.processMessageWithContext(session_key, prompt, null, .{
+        .turn_origin = turn_origin,
+    });
 }
 
 fn clearSchedulerSnapshot(
@@ -1608,6 +1669,8 @@ fn inboundDispatcherThread(
 /// shutdown is requested (Ctrl+C signal or explicit request).
 /// `host` and `port` are CLI-parsed values that override `config.gateway`.
 pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
+    ignoreSigpipe();
+
     // Ensure lifecycle parity: workspace bootstrap files must exist
     // even when users skip onboard and start runtime directly.
     const project_ctx = onboard.projectContextForConfig(config);
@@ -2869,6 +2932,11 @@ test "heartbeatActionableReplySlice suppresses ack-only output" {
     try std.testing.expect(heartbeatActionableReplySlice("<b>HEARTBEAT_OK</b> ✅") == null);
 }
 
+test "heartbeatActionableReplySlice suppresses routine schedule narration" {
+    try std.testing.expect(heartbeatActionableReplySlice("It is not 08:00 CET yet, so no brief will be sent.") == null);
+    try std.testing.expect(heartbeatActionableReplySlice("The morning-brief job does not exist right now.") == null);
+}
+
 test "heartbeatActionableReplySlice keeps actionable output" {
     const slice = heartbeatActionableReplySlice("  Morning brief delivered  ") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("Morning brief delivered", slice);
@@ -2876,6 +2944,37 @@ test "heartbeatActionableReplySlice keeps actionable output" {
 
 test "heartbeatActionableReplySlice drops non-actionable punctuation" {
     try std.testing.expect(heartbeatActionableReplySlice("  ... !!!  ") == null);
+}
+
+test "default heartbeat templates are treated as effectively empty" {
+    try std.testing.expect(isHeartbeatContentEffectivelyEmpty(
+        \\# HEARTBEAT.md
+        \\
+        \\# Keep this file empty (or with only comments) to skip heartbeat API calls.
+        \\
+        \\# Add tasks below when you want the agent to check something periodically.
+    ));
+
+    try std.testing.expect(isHeartbeatContentEffectivelyEmpty(
+        \\# HEARTBEAT.md - ZAKI BOT
+        \\
+        \\Use this file to define recurring, proactive work.
+        \\
+        \\Default operating rules:
+        \\- be useful, not noisy
+        \\- respect quiet hours and notification limits
+        \\- prefer summaries, drafts, and preparation over interruption
+        \\- if a recurring task can wait, batch it
+        \\
+        \\Suggested categories:
+        \\- morning brief
+        \\- inbox or message triage after integrations are connected
+        \\- project status follow-ups
+        \\- reminders before deadlines
+        \\- nightly summaries and next-step planning
+        \\
+        \\Keep only tasks the user actually wants automated.
+    ));
 }
 
 test "makeHeartbeatDedupeKey stable for same payload" {

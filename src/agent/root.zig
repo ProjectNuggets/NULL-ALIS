@@ -1364,6 +1364,15 @@ pub const Agent = struct {
                     }
                 }
 
+                if (tools_mod.toolBlockedForCurrentTurn(call.name, args)) |msg| {
+                    return .{
+                        .name = call.name,
+                        .output = msg,
+                        .success = false,
+                        .tool_call_id = call.tool_call_id,
+                    };
+                }
+
                 const result = t.execute(tool_allocator, args) catch |err| {
                     return .{
                         .name = call.name,
@@ -3229,7 +3238,7 @@ test "bindMemoryTools wires memory tools to sqlite backend" {
         .allocator = allocator,
     };
 
-    const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{});
+    const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{ .config = &cfg });
     defer tools_mod.deinitTools(allocator, tools);
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");

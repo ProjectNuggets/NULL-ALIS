@@ -303,6 +303,64 @@ const TenantTelegramAsyncJobQueue = struct {
     }
 };
 
+const UserPreparationGate = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    active: std.StringHashMapUnmanaged(void) = .empty,
+
+    const Guard = struct {
+        gate: *UserPreparationGate,
+        key: []const u8,
+        held: bool = true,
+
+        fn release(self: *Guard) void {
+            if (!self.held) return;
+            self.gate.mutex.lock();
+            defer self.gate.mutex.unlock();
+            if (self.gate.active.fetchRemove(self.key)) |kv| {
+                self.gate.allocator.free(@constCast(kv.key));
+            }
+            self.held = false;
+            self.gate.cond.broadcast();
+        }
+
+        fn deinit(self: *Guard) void {
+            self.release();
+        }
+    };
+
+    fn init(allocator: std.mem.Allocator) UserPreparationGate {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *UserPreparationGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.active.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+        }
+        self.active.deinit(self.allocator);
+    }
+
+    fn acquire(self: *UserPreparationGate, user_id: []const u8) !Guard {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.active.contains(user_id)) {
+            self.cond.wait(&self.mutex);
+        }
+
+        const owned = try self.allocator.dupe(u8, user_id);
+        errdefer self.allocator.free(owned);
+        try self.active.put(self.allocator, owned, {});
+        return .{
+            .gate = self,
+            .key = owned,
+        };
+    }
+};
+
 /// Gateway server state, shared across request handlers.
 pub const GatewayState = struct {
     allocator: std.mem.Allocator,
@@ -338,6 +396,7 @@ pub const GatewayState = struct {
     ownership_lock_lease_secs: u64 = TENANT_OWNERSHIP_LOCK_LEASE_SECS,
     owner_instance_id: []const u8 = "",
     owner_instance_id_owned: bool = false,
+    user_preparation_gate: UserPreparationGate,
     tenant_runtime_mutex: std.Thread.Mutex = .{},
     tenant_runtimes: std.StringHashMapUnmanaged(*TenantRuntime) = .empty,
     tenant_telegram_queue: TenantTelegramAsyncJobQueue = .{},
@@ -388,6 +447,7 @@ pub const GatewayState = struct {
             .whatsapp_app_secret = "",
             .whatsapp_access_token = "",
             .telegram_bot_token = "",
+            .user_preparation_gate = UserPreparationGate.init(allocator),
             .pairing_guard = null,
         };
     }
@@ -399,6 +459,7 @@ pub const GatewayState = struct {
         }
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
+        self.user_preparation_gate.deinit();
         self.tenant_runtime_mutex.lock();
         defer self.tenant_runtime_mutex.unlock();
         var rt_it = self.tenant_runtimes.iterator();
@@ -476,6 +537,57 @@ const TenantRuntime = struct {
     last_used_s: i64,
     lock: std.Thread.Mutex = .{},
 
+    fn semanticEmbeddingProviderForPrimary(primary_provider: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, primary_provider, "openrouter")) return "together";
+        if (std.mem.eql(u8, primary_provider, "together") or std.mem.eql(u8, primary_provider, "together-ai")) return "together";
+        if (std.mem.eql(u8, primary_provider, "openai")) return "openai";
+        if (std.mem.eql(u8, primary_provider, "gemini") or std.mem.eql(u8, primary_provider, "google") or std.mem.eql(u8, primary_provider, "google-gemini")) return "gemini";
+        if (std.mem.eql(u8, primary_provider, "voyage")) return "voyage";
+        if (std.mem.eql(u8, primary_provider, "ollama")) return "ollama";
+        return null;
+    }
+
+    fn applyTenantSemanticMemoryDefaults(cfg: *Config) void {
+        if (!std.mem.eql(u8, cfg.state.backend, "postgres")) return;
+
+        // Reuse tenant state Postgres connection for pgvector store unless explicitly overridden.
+        if (cfg.memory.postgres.url.len == 0 and cfg.state.postgres.connection_string.len > 0) {
+            cfg.memory.postgres.url = cfg.state.postgres.connection_string;
+        }
+        if (std.mem.eql(u8, cfg.memory.postgres.schema, "public") and cfg.state.postgres.schema.len > 0) {
+            cfg.memory.postgres.schema = cfg.state.postgres.schema;
+        }
+
+        const has_semantic_override =
+            !std.mem.eql(u8, cfg.memory.search.provider, "none") or
+            !std.mem.eql(u8, cfg.memory.search.fallback_provider, "none") or
+            cfg.memory.search.query.hybrid.enabled or
+            !std.mem.eql(u8, cfg.memory.search.store.kind, "auto") or
+            !std.mem.eql(u8, cfg.memory.reliability.rollout_mode, "off");
+        if (has_semantic_override) return;
+
+        // Default tenant Postgres runtimes to semantic-ready retrieval, while keeping
+        // explicit user memory config authoritative.
+        cfg.memory.profile = "postgres_hybrid";
+        cfg.memory.applyProfileDefaults();
+        // Tenant runtime uses zaki_dual (markdown workspace + canonical Postgres state).
+        // Keep the primary backend pinned to markdown and only inherit semantic/vector knobs.
+        cfg.memory.backend = "markdown";
+
+        if (semanticEmbeddingProviderForPrimary(cfg.default_provider)) |provider_name| {
+            cfg.memory.search.provider = provider_name;
+            if (std.mem.eql(u8, provider_name, "together") and std.mem.eql(u8, cfg.memory.search.model, "text-embedding-3-small")) {
+                cfg.memory.search.model = "intfloat/multilingual-e5-large-instruct";
+                cfg.memory.search.dimensions = 1024;
+            }
+            if (std.mem.eql(u8, cfg.memory.search.fallback_provider, "none") and !std.mem.eql(u8, provider_name, "local")) {
+                // Keep semantic recall available if the remote embedding provider
+                // is blocked/unavailable at runtime.
+                cfg.memory.search.fallback_provider = "local";
+            }
+        }
+    }
+
     fn init(
         allocator: std.mem.Allocator,
         base_config: *const Config,
@@ -538,7 +650,11 @@ const TenantRuntime = struct {
         const provider_i: providers.Provider = runtime.provider_bundle.provider();
         const resolved_api_key = runtime.provider_bundle.primaryApiKey();
 
-        runtime.mem_rt = memory_mod.initRuntime(allocator, &runtime.config.memory, runtime.config.workspace_dir);
+        applyTenantSemanticMemoryDefaults(&runtime.config);
+        runtime.mem_rt = memory_mod.initRuntimeWithOptions(allocator, &runtime.config.memory, runtime.config.workspace_dir, .{
+            .providers = runtime.config.providers,
+            .search_api_key_override = resolved_api_key,
+        });
         errdefer if (runtime.mem_rt) |*rt| rt.deinit();
         if (runtime.mem_rt) |*rt| {
             if (state_mgr != null and std.mem.eql(u8, runtime.config.state.backend, "postgres")) {
@@ -580,6 +696,7 @@ const TenantRuntime = struct {
         };
 
         runtime.tools = tools_mod.allTools(allocator, runtime.config.workspace_dir, .{
+            .config = &runtime.config,
             .http_enabled = runtime.config.http_request.enabled,
             .browser_enabled = runtime.config.browser.enabled,
             .screenshot_enabled = true,
@@ -1070,6 +1187,9 @@ fn usesPostgresTenantState(state: *const GatewayState) bool {
 
 fn resolveUserContext(allocator: std.mem.Allocator, state: *const GatewayState, user_id: []const u8) !UserContext {
     if (!isValidIdentifier(user_id)) return error.InvalidUserId;
+    if (usesPostgresTenantState(state)) {
+        _ = parseNumericUserId(user_id) catch return error.InvalidUserId;
+    }
     const user_root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ state.tenant_data_root, user_id });
     errdefer allocator.free(user_root);
 
@@ -1104,10 +1224,14 @@ fn resolveUserContext(allocator: std.mem.Allocator, state: *const GatewayState, 
     };
 }
 
-fn ensureUserProvisioned(state: *GatewayState, ctx: *const UserContext) !void {
+fn ensureUserDirectories(ctx: *const UserContext) !void {
     try makeAbsolutePath(ctx.user_root);
     try makeAbsolutePath(ctx.workspace_path);
     try makeAbsolutePath(ctx.secrets_dir);
+}
+
+fn ensureUserProvisioned(state: *GatewayState, ctx: *const UserContext) !void {
+    try ensureUserDirectories(ctx);
     if (state.zaki_state) |mgr| {
         const user_id = try parseNumericUserId(ctx.user_id);
         try mgr.provisionUser(user_id, ctx.workspace_path);
@@ -1118,6 +1242,11 @@ fn ensureUserProvisioned(state: *GatewayState, ctx: *const UserContext) !void {
         ensureFileWithDefault(ctx.heartbeat_path, "{}\n") catch {};
         ensureFileWithDefault(ctx.channel_state_path, "{}\n") catch {};
     }
+}
+
+fn scaffoldUserWorkspace(allocator: std.mem.Allocator, ctx: *const UserContext) void {
+    const project_ctx = onboard.zakiBotProjectContext();
+    onboard.scaffoldWorkspace(allocator, ctx.workspace_path, &project_ctx) catch {};
 }
 
 fn makeAbsolutePath(path: []const u8) !void {
@@ -3280,12 +3409,16 @@ fn handleApiChatStreamSseConnection(
     };
     defer user_ctx.deinit(req_allocator);
 
-    ensureUserProvisioned(state, &user_ctx) catch {
+    var prep_guard = state.user_preparation_gate.acquire(user_ctx.user_id) catch {
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "preparation_gate_failed", "user preparation gate failed");
+        return true;
+    };
+    defer prep_guard.deinit();
+
+    ensureUserDirectories(&user_ctx) catch {
         sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
         return true;
     };
-    const project_ctx = onboard.zakiBotProjectContext();
-    onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &project_ctx) catch {};
 
     var ownership_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
         error.LockHeld => {
@@ -3299,6 +3432,13 @@ fn handleApiChatStreamSseConnection(
         },
     };
     defer if (ownership_lock_opt) |*lock| lock.deinit();
+
+    ensureUserProvisioned(state, &user_ctx) catch {
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
+        return true;
+    };
+    scaffoldUserWorkspace(req_allocator, &user_ctx);
+    prep_guard.release();
 
     const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse {
         sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_message", "missing message");
@@ -3505,11 +3645,13 @@ fn handleApiRoute(
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
         };
         defer user_ctx.deinit(req_allocator);
-        ensureUserProvisioned(state, &user_ctx) catch {
+        var prep_guard = state.user_preparation_gate.acquire(user_ctx.user_id) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user preparation gate failed\"}" };
+        };
+        defer prep_guard.deinit();
+        ensureUserDirectories(&user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user provisioning failed\"}" };
         };
-        const project_ctx = onboard.zakiBotProjectContext();
-        onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &project_ctx) catch {};
         var ownership_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
                 _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
@@ -3528,6 +3670,11 @@ fn handleApiRoute(
             },
         };
         defer if (ownership_lock_opt) |*lock| lock.deinit();
+        ensureUserProvisioned(state, &user_ctx) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user provisioning failed\"}" };
+        };
+        scaffoldUserWorkspace(req_allocator, &user_ctx);
+        prep_guard.release();
 
         const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing message\"}" };
@@ -3631,11 +3778,13 @@ fn handleApiRoute(
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
         };
         defer user_ctx.deinit(req_allocator);
-        ensureUserProvisioned(state, &user_ctx) catch {
+        var prep_guard = state.user_preparation_gate.acquire(user_ctx.user_id) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user preparation gate failed\"}" };
+        };
+        defer prep_guard.deinit();
+        ensureUserDirectories(&user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
         };
-        const project_ctx = onboard.zakiBotProjectContext();
-        onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &project_ctx) catch {};
         var provision_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
                 _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
@@ -3644,6 +3793,11 @@ fn handleApiRoute(
             else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"tenant ownership lock failed\"}" },
         };
         defer if (provision_lock_opt) |*lock| lock.deinit();
+        ensureUserProvisioned(state, &user_ctx) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
+        };
+        scaffoldUserWorkspace(req_allocator, &user_ctx);
+        prep_guard.release();
         return .{ .body = "{\"status\":\"provisioned\"}" };
     }
 
@@ -3654,11 +3808,13 @@ fn handleApiRoute(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
     };
     defer user_ctx.deinit(req_allocator);
-    ensureUserProvisioned(state, &user_ctx) catch {
+    var prep_guard = state.user_preparation_gate.acquire(user_ctx.user_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user preparation gate failed\"}" };
+    };
+    defer prep_guard.deinit();
+    ensureUserDirectories(&user_ctx) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
     };
-    const project_ctx = onboard.zakiBotProjectContext();
-    onboard.scaffoldWorkspace(req_allocator, user_ctx.workspace_path, &project_ctx) catch {};
     const needs_write_lock = !std.mem.eql(u8, method, "GET");
     var user_write_lock_opt: ?tenant_lock.UserOwnershipLock = null;
     if (needs_write_lock) {
@@ -3671,6 +3827,11 @@ fn handleApiRoute(
         };
     }
     defer if (user_write_lock_opt) |*lock| lock.deinit();
+    ensureUserProvisioned(state, &user_ctx) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
+    };
+    scaffoldUserWorkspace(req_allocator, &user_ctx);
+    prep_guard.release();
 
     if (std.mem.eql(u8, parsed.subpath, "onboarding")) {
         if (std.mem.eql(u8, method, "GET")) {
@@ -5757,7 +5918,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 const resolved_api_key = bundle.primaryApiKey();
 
                 // Optional memory backend.
-                mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
+                mem_rt = memory_mod.initRuntimeWithOptions(allocator, &cfg.memory, cfg.workspace_dir, .{
+                    .providers = cfg.providers,
+                    .search_api_key_override = resolved_api_key,
+                });
 
                 const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
                 if (subagent_manager) |mgr| {
@@ -5767,6 +5931,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
                 // Tools.
                 tools_slice = tools_mod.allTools(allocator, cfg.workspace_dir, .{
+                    .config = cfg,
                     .http_enabled = cfg.http_request.enabled,
                     .browser_enabled = cfg.browser.enabled,
                     .screenshot_enabled = true,
@@ -7657,6 +7822,49 @@ test "GatewayState event_bus defaults to null" {
     try std.testing.expect(gs.event_bus == null);
 }
 
+test "resolveUserContext rejects non-numeric user ids when postgres tenant state is enabled" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    gs.tenant_enabled = true;
+    gs.zaki_state = @ptrFromInt(1);
+
+    try std.testing.expectError(error.InvalidUserId, resolveUserContext(allocator, &gs, "stable-user"));
+}
+
+const TestGateThreadCtx = struct {
+    gate: *UserPreparationGate,
+    acquired: *std.atomic.Value(bool),
+};
+
+fn testAcquirePreparationGate(ctx: *TestGateThreadCtx) void {
+    var guard = ctx.gate.acquire("user-1") catch return;
+    defer guard.deinit();
+    ctx.acquired.store(true, .release);
+}
+
+test "UserPreparationGate serializes same-user work on one node" {
+    var gate = UserPreparationGate.init(std.testing.allocator);
+    defer gate.deinit();
+
+    var first = try gate.acquire("user-1");
+    defer first.deinit();
+
+    var acquired = std.atomic.Value(bool).init(false);
+    var ctx = TestGateThreadCtx{
+        .gate = &gate,
+        .acquired = &acquired,
+    };
+    const thread = try std.Thread.spawn(.{}, testAcquirePreparationGate, .{&ctx});
+
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    try std.testing.expect(!acquired.load(.acquire));
+
+    first.release();
+    thread.join();
+    try std.testing.expect(acquired.load(.acquire));
+}
+
 test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     const allocator = std.testing.allocator;
     var gs = GatewayState.init(allocator);
@@ -7840,4 +8048,57 @@ test "sseChatPayload emits token deltas and done metadata" {
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"type\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"session_id\":\"agent:zaki-bot:user:user_a:main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"message_id\":\"") != null);
+}
+
+test "tenant semantic memory defaults enable postgres_hybrid safely" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.state.backend = "postgres";
+    cfg.state.postgres.connection_string = "postgresql://zaki:zaki@127.0.0.1:5432/zaki";
+    cfg.state.postgres.schema = "zaki_bot";
+    cfg.default_provider = "openrouter";
+
+    TenantRuntime.applyTenantSemanticMemoryDefaults(&cfg);
+
+    try std.testing.expectEqualStrings("postgres_hybrid", cfg.memory.profile);
+    try std.testing.expectEqualStrings("markdown", cfg.memory.backend);
+    try std.testing.expectEqualStrings("together", cfg.memory.search.provider);
+    try std.testing.expectEqualStrings("intfloat/multilingual-e5-large-instruct", cfg.memory.search.model);
+    try std.testing.expectEqual(@as(u32, 1024), cfg.memory.search.dimensions);
+    try std.testing.expectEqualStrings("local", cfg.memory.search.fallback_provider);
+    try std.testing.expect(cfg.memory.search.query.hybrid.enabled);
+    try std.testing.expectEqualStrings("pgvector", cfg.memory.search.store.kind);
+    try std.testing.expectEqualStrings("on", cfg.memory.reliability.rollout_mode);
+    try std.testing.expectEqualStrings("postgresql://zaki:zaki@127.0.0.1:5432/zaki", cfg.memory.postgres.url);
+    try std.testing.expectEqualStrings("zaki_bot", cfg.memory.postgres.schema);
+}
+
+test "tenant semantic memory defaults preserve explicit overrides" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.state.backend = "postgres";
+    cfg.state.postgres.connection_string = "postgresql://zaki:zaki@127.0.0.1:5432/zaki";
+    cfg.state.postgres.schema = "zaki_bot";
+    cfg.memory.profile = "custom";
+    cfg.memory.search.provider = "gemini";
+    cfg.memory.search.query.hybrid.enabled = true;
+    cfg.memory.search.store.kind = "qdrant";
+    cfg.memory.reliability.rollout_mode = "canary";
+
+    TenantRuntime.applyTenantSemanticMemoryDefaults(&cfg);
+
+    try std.testing.expectEqualStrings("custom", cfg.memory.profile);
+    try std.testing.expectEqualStrings("gemini", cfg.memory.search.provider);
+    try std.testing.expectEqualStrings("none", cfg.memory.search.fallback_provider);
+    try std.testing.expect(cfg.memory.search.query.hybrid.enabled);
+    try std.testing.expectEqualStrings("qdrant", cfg.memory.search.store.kind);
+    try std.testing.expectEqualStrings("canary", cfg.memory.reliability.rollout_mode);
+    try std.testing.expectEqualStrings("postgresql://zaki:zaki@127.0.0.1:5432/zaki", cfg.memory.postgres.url);
+    try std.testing.expectEqualStrings("zaki_bot", cfg.memory.postgres.schema);
 }

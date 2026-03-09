@@ -5,6 +5,7 @@
 //! scheduling, delegation, browser, and image tools.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const bus = @import("../bus.zig");
 const memory_mod = @import("../memory/root.zig");
 const zaki_state = @import("../zaki_state.zig");
@@ -67,6 +68,7 @@ pub const delegate = @import("delegate.zig");
 pub const browser = @import("browser.zig");
 pub const image = @import("image.zig");
 pub const composio = @import("composio.zig");
+pub const runtime_info = @import("runtime_info.zig");
 pub const screenshot = @import("screenshot.zig");
 pub const browser_open = @import("browser_open.zig");
 pub const hardware_info = @import("hardware_info.zig");
@@ -266,6 +268,7 @@ pub fn allTools(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
     opts: struct {
+        config: ?*const @import("../config.zig").Config = null,
         http_enabled: bool = false,
         browser_enabled: bool = false,
         screenshot_enabled: bool = false,
@@ -364,6 +367,12 @@ pub fn allTools(
     scht.* = .{};
     try list.append(allocator, scht.tool());
 
+    const rit = try allocator.create(runtime_info.RuntimeInfoTool);
+    rit.* = .{
+        .config = opts.config orelse return error.InvalidArgument,
+    };
+    try list.append(allocator, rit.tool());
+
     // Spawn tool (async subagent)
     const sp = try allocator.create(spawn.SpawnTool);
     sp.* = .{ .manager = opts.subagent_manager };
@@ -388,7 +397,11 @@ pub fn allTools(
         try list.append(allocator, wft.tool());
 
         const wst = try allocator.create(web_search.WebSearchTool);
-        wst.* = .{ .provider_mode_override = tc.web_search_provider };
+        wst.* = .{
+            .provider_mode_override = tc.web_search_provider,
+            .exa_api_key_override = tc.web_search_exa_api_key,
+            .brave_api_key_override = tc.web_search_brave_api_key,
+        };
         try list.append(allocator, wst.tool());
     }
 
@@ -441,10 +454,37 @@ pub fn allTools(
         }
     }
 
-    return list.toOwnedSlice(allocator);
+    const tools_slice = try list.toOwnedSlice(allocator);
+    bindRuntimeInfoTools(tools_slice);
+    return tools_slice;
 }
 
 pub const MessageTurnContext = message.MessageTool.TurnContext;
+pub const TurnOrigin = enum {
+    user,
+    heartbeat,
+    scheduler,
+    wake,
+    proactive,
+
+    pub fn toSlice(self: TurnOrigin) []const u8 {
+        return switch (self) {
+            .user => "user",
+            .heartbeat => "heartbeat",
+            .scheduler => "scheduler",
+            .wake => "wake",
+            .proactive => "proactive",
+        };
+    }
+};
+
+pub const RuntimeTurnContext = struct {
+    origin: TurnOrigin = .user,
+    session_key: ?[]const u8 = null,
+    provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+};
+
 pub const ToolTenantContext = struct {
     user_id: ?[]const u8 = null,
     numeric_user_id: ?i64 = null,
@@ -453,6 +493,7 @@ pub const ToolTenantContext = struct {
 };
 
 threadlocal var current_tenant_context: ToolTenantContext = .{};
+threadlocal var current_turn_context: RuntimeTurnContext = .{};
 
 pub fn setMessageTurnContext(ctx: ?MessageTurnContext) void {
     if (ctx) |value| {
@@ -476,6 +517,77 @@ pub fn clearTenantContext() void {
 
 pub fn getTenantContext() ToolTenantContext {
     return current_tenant_context;
+}
+
+pub fn setTurnContext(ctx: ?RuntimeTurnContext) void {
+    current_turn_context = ctx orelse .{};
+}
+
+pub fn clearTurnContext() void {
+    current_turn_context = .{};
+}
+
+pub fn getTurnContext() RuntimeTurnContext {
+    return current_turn_context;
+}
+
+pub fn isBackgroundTurnOrigin(origin: TurnOrigin) bool {
+    return switch (origin) {
+        .user => false,
+        .heartbeat, .scheduler, .wake, .proactive => true,
+    };
+}
+
+pub fn effectiveStateBackend(config: *const @import("../config.zig").Config, tenant_ctx: ToolTenantContext) []const u8 {
+    if (!std.mem.eql(u8, config.state.backend, "postgres")) return "file";
+    if (!build_options.enable_postgres) return "file";
+    if (config.tenant.enabled and tenant_ctx.state_mgr == null) return "file";
+    return "postgres";
+}
+
+pub fn schedulerBackend(config: *const @import("../config.zig").Config, tenant_ctx: ToolTenantContext) []const u8 {
+    if (!config.tenant.enabled) return "file";
+    if (std.mem.eql(u8, effectiveStateBackend(config, tenant_ctx), "postgres")) return "postgres";
+    return "file";
+}
+
+pub fn degradedReason(config: *const @import("../config.zig").Config, tenant_ctx: ToolTenantContext) []const u8 {
+    if (!std.mem.eql(u8, config.state.backend, "postgres")) return "";
+    if (!build_options.enable_postgres) return "PostgresNotEnabled";
+    if (config.tenant.enabled and tenant_ctx.state_mgr == null) return "PostgresUnavailable";
+    return "";
+}
+
+pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]const u8 {
+    const turn_ctx = getTurnContext();
+    if (!isBackgroundTurnOrigin(turn_ctx.origin)) return null;
+
+    if (std.mem.eql(u8, tool_name, runtime_info.RuntimeInfoTool.tool_name)) return null;
+    if (std.mem.eql(u8, tool_name, schedule.ScheduleTool.tool_name)) return null;
+    if (std.mem.eql(u8, tool_name, file_read.FileReadTool.tool_name)) return null;
+    if (std.mem.eql(u8, tool_name, memory_recall.MemoryRecallTool.tool_name)) return null;
+    if (std.mem.eql(u8, tool_name, memory_list.MemoryListTool.tool_name)) return null;
+    if (std.mem.eql(u8, tool_name, web_search.WebSearchTool.tool_name) and
+        (turn_ctx.origin == .heartbeat or turn_ctx.origin == .scheduler)) return null;
+
+    if (std.mem.eql(u8, tool_name, composio.ComposioTool.tool_name)) {
+        const action = getString(args, "action") orelse "execute";
+        if (std.mem.eql(u8, action, "connect")) {
+            return "Composio connect is disabled for background turns";
+        }
+        return "Composio is disabled for background turns";
+    }
+
+    return "Tool is disabled for background turns";
+}
+
+pub fn bindRuntimeInfoTools(tools: []const Tool) void {
+    for (tools) |t| {
+        if (t.vtable == &runtime_info.RuntimeInfoTool.vtable) {
+            const rt: *runtime_info.RuntimeInfoTool = @ptrCast(@alignCast(t.ptr));
+            rt.runtime_tools = tools;
+        }
+    }
 }
 
 /// Bind a memory backend to memory tools in a pre-built tool list.
@@ -639,6 +751,41 @@ test "tool result ok" {
     try std.testing.expect(r.error_msg == null);
 }
 
+test "background turns block shell and allow runtime info" {
+    setTurnContext(.{ .origin = .heartbeat });
+    defer clearTurnContext();
+
+    const shell_args = try parseTestArgs("{\"command\":\"echo hello\"}");
+    defer shell_args.deinit();
+    try std.testing.expect(toolBlockedForCurrentTurn("shell", shell_args.value.object) != null);
+
+    const runtime_args = try parseTestArgs("{\"section\":\"summary\"}");
+    defer runtime_args.deinit();
+    try std.testing.expect(toolBlockedForCurrentTurn("runtime_info", runtime_args.value.object) == null);
+}
+
+test "heartbeat and scheduler turns allow web search" {
+    const args = try parseTestArgs("{\"query\":\"latest zig release\"}");
+    defer args.deinit();
+    defer clearTurnContext();
+
+    setTurnContext(.{ .origin = .heartbeat });
+    try std.testing.expect(toolBlockedForCurrentTurn("web_search", args.value.object) == null);
+
+    setTurnContext(.{ .origin = .scheduler });
+    try std.testing.expect(toolBlockedForCurrentTurn("web_search", args.value.object) == null);
+}
+
+test "background turns block composio connect" {
+    setTurnContext(.{ .origin = .scheduler });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"action\":\"connect\",\"app\":\"gmail\"}");
+    defer parsed.deinit();
+    const blocked = toolBlockedForCurrentTurn("composio", parsed.value.object) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "disabled") != null);
+}
+
 test "tool result fail" {
     const r = ToolResult.fail("boom");
     try std.testing.expect(!r.success);
@@ -714,33 +861,85 @@ test "tool spec generation" {
 }
 
 test "all tools includes extras when enabled" {
+    const Config = @import("../config.zig").Config;
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
         .http_enabled = true,
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 14 + http_request + web_fetch + web_search + browser = 18
-    try std.testing.expectEqual(@as(usize, 18), tools.len);
+    // base 15 + http_request + web_fetch + web_search + browser = 19
+    try std.testing.expectEqual(@as(usize, 19), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
-    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
+    const Config = @import("../config.zig").Config;
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
     defer deinitTools(std.testing.allocator, tools);
     // shell + file_read + file_write + file_edit + file_append + git + image_info
-    // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule + spawn = 14
-    try std.testing.expectEqual(@as(usize, 14), tools.len);
+    // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule + runtime_info + spawn = 15
+    try std.testing.expectEqual(@as(usize, 15), tools.len);
+}
+
+test "all tools binds runtime_info to finalized tool slice" {
+    const Config = @import("../config.zig").Config;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
+    defer deinitTools(std.testing.allocator, tools);
+
+    setTurnContext(.{
+        .origin = .user,
+        .session_key = "agent:test",
+        .provider = "openrouter",
+        .model = "moonshotai/kimi-k2.5",
+    });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"section\":\"summary\"}");
+    defer parsed.deinit();
+
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "runtime_info")) continue;
+        const result = try t.execute(std.testing.allocator, parsed.value.object);
+        defer std.testing.allocator.free(result.output);
+        try std.testing.expect(result.success);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "\"runtime_info\"") != null);
+        return;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "all tools includes message when event bus is available" {
+    const Config = @import("../config.zig").Config;
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
     var event_bus = bus.Bus.init();
     defer event_bus.close();
 
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
         .event_bus = &event_bus,
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    try std.testing.expectEqual(@as(usize, 15), tools.len);
+    try std.testing.expectEqual(@as(usize, 16), tools.len);
 
     var found_message = false;
     for (tools) |t| {
@@ -765,6 +964,7 @@ test "all tools wires subagent manager into spawn tool" {
     defer manager.deinit();
 
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
         .subagent_manager = &manager,
     });
     defer deinitTools(std.testing.allocator, tools);

@@ -41,6 +41,25 @@ That means the system is designed around:
 - per-user memory, config, secrets, jobs, and channel state
 - workspace files such as `BOOTSTRAP.md`, `IDENTITY.md`, `USER.md`, `SOUL.md`, `HEARTBEAT.md`, `MEMORY.md`, and daily memory notes
 
+## v0.1 Release Readiness (Current Branch)
+
+As of `2026-03-09`, `v0.1` is ready as a hardening release candidate.
+
+Validated:
+- `zig build test --summary all`
+- `zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres`
+- `scripts/preflight.sh` (postgres/state startup gates)
+- Docker image build and runtime health (`/health`)
+- Kubernetes manifest render (`kubectl kustomize deploy/k8s/zaki-bot`)
+
+Open non-blocking items tracked for v0.2:
+- reserved turn origins `wake` and `proactive` are defined but not wired as independent flows
+- startup schema `NOTICE` noise is still high in local logs
+- subagent control remains completion-oriented (no mid-flight interrupt/steer in-place)
+
+Reference:
+- [docs/final-sweep-2026-03-09.md](docs/final-sweep-2026-03-09.md)
+
 ## Key Features
 
 ### Persistent Digital Twin
@@ -204,6 +223,17 @@ Important top-level modules:
 - [src/channels/root.zig](src/channels/root.zig)
 
 The design goal is small binaries, low runtime overhead, explicit interfaces, and secure defaults.
+
+## API Contract (Swagger / OpenAPI)
+
+Gateway API contract is documented in:
+- [docs/openapi-v1.yaml](docs/openapi-v1.yaml)
+
+It covers:
+- health/readiness/metrics
+- pairing and webhook endpoints
+- internal operator endpoints (`/internal/*`)
+- app API endpoints (`/api/v1/chat/stream`, `/api/v1/users/*`)
 
 ## Repository Status
 

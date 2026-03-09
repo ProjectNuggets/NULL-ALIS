@@ -635,6 +635,7 @@ fn printMemoryUsage() void {
         \\                                List memory entries (default limit: 20)
         \\  drain-outbox                  Drain durable vector outbox queue
         \\  forget <key>                  Delete entry from primary memory (if backend supports)
+        \\  cleanup-test-keys             One-time cleanup of known test keys (markdown + postgres + vectors)
         \\
     , .{});
 }
@@ -643,6 +644,236 @@ fn parsePositiveUsize(arg: []const u8) ?usize {
     const n = std.fmt.parseInt(usize, arg, 10) catch return null;
     if (n == 0) return null;
     return n;
+}
+
+fn isTestMemoryKey(key: []const u8) bool {
+    if (std.mem.eql(u8, key, "preferred_transport")) return true;
+    if (std.mem.eql(u8, key, "user_preferred_transport")) return true;
+    if (std.mem.eql(u8, key, "test_semantic_v2")) return true;
+    if (std.mem.eql(u8, key, "test_semantic_v1")) return true;
+
+    const prefixes = [_][]const u8{
+        "test_",
+        "tool_test",
+        "probe_test",
+        "runtime_test",
+        "diagnostic_test",
+        "smoke_",
+        "stable_",
+        "qa_test",
+    };
+    inline for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, key, prefix)) return true;
+    }
+    return std.mem.indexOf(u8, key, "_test_") != null;
+}
+
+fn extractKeyFromMarkdownLine(line: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, "- **")) return null;
+    const rest = line[4..];
+    const end = std.mem.indexOf(u8, rest, "**:") orelse return null;
+    const key = std.mem.trim(u8, rest[0..end], " \t");
+    if (key.len == 0) return null;
+    return key;
+}
+
+fn addKeyToSet(
+    allocator: std.mem.Allocator,
+    set: *std.StringHashMapUnmanaged(void),
+    key: []const u8,
+) !void {
+    if (set.contains(key)) return;
+    const owned = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned);
+    try set.put(allocator, owned, {});
+}
+
+fn freeKeySet(allocator: std.mem.Allocator, set: *std.StringHashMapUnmanaged(void)) void {
+    var it = set.iterator();
+    while (it.next()) |kv| allocator.free(@constCast(kv.key_ptr.*));
+    set.deinit(allocator);
+}
+
+fn collectTestKeysFromMarkdownFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    set: *std.StringHashMapUnmanaged(void),
+) !void {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return;
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024 * 8);
+    defer allocator.free(content);
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line_raw| {
+        const line = std.mem.trimRight(u8, line_raw, "\r");
+        const key = extractKeyFromMarkdownLine(line) orelse continue;
+        if (!isTestMemoryKey(key)) continue;
+        try addKeyToSet(allocator, set, key);
+    }
+}
+
+fn collectTestKeysFromMemoryDir(
+    allocator: std.mem.Allocator,
+    memory_dir: []const u8,
+    set: *std.StringHashMapUnmanaged(void),
+) !void {
+    var dir = std.fs.openDirAbsolute(memory_dir, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+        const path = try std.fs.path.join(allocator, &.{ memory_dir, entry.name });
+        defer allocator.free(path);
+        try collectTestKeysFromMarkdownFile(allocator, path, set);
+    }
+}
+
+fn rewriteMarkdownFileRemovingKeys(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    set: *const std.StringHashMapUnmanaged(void),
+) !usize {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return 0;
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024 * 8);
+    defer allocator.free(content);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var removed: usize = 0;
+    var first = true;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line_raw| {
+        const line = std.mem.trimRight(u8, line_raw, "\r");
+        var keep = true;
+        if (extractKeyFromMarkdownLine(line)) |key| {
+            if (set.contains(key)) {
+                keep = false;
+                removed += 1;
+            }
+        }
+        if (!keep) continue;
+        if (!first) try out.append(allocator, '\n');
+        first = false;
+        try out.appendSlice(allocator, line);
+    }
+
+    if (removed > 0) {
+        var out_file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+        defer out_file.close();
+        try out_file.writeAll(out.items);
+    }
+    return removed;
+}
+
+fn rewriteMemoryDirRemovingKeys(
+    allocator: std.mem.Allocator,
+    memory_dir: []const u8,
+    set: *const std.StringHashMapUnmanaged(void),
+) !usize {
+    var dir = std.fs.openDirAbsolute(memory_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var it = dir.iterate();
+    var removed: usize = 0;
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+        const path = try std.fs.path.join(allocator, &.{ memory_dir, entry.name });
+        defer allocator.free(path);
+        removed += try rewriteMarkdownFileRemovingKeys(allocator, path, set);
+    }
+    return removed;
+}
+
+fn cleanupTestMemoryKeys(allocator: std.mem.Allocator, cfg: *yc.config.Config) !void {
+    if (!std.mem.eql(u8, cfg.state.backend, "postgres")) {
+        std.debug.print("State backend is not postgres; cleanup skipped.\n", .{});
+        return;
+    }
+
+    var mgr = try yc.zaki_state.Manager.init(allocator, cfg.state);
+    defer mgr.deinit();
+
+    const users_root = cfg.tenant.data_root;
+    var users_dir = std.fs.openDirAbsolute(users_root, .{ .iterate = true }) catch |err| {
+        std.debug.print("Failed to open users root '{s}': {s}\n", .{ users_root, @errorName(err) });
+        return;
+    };
+    defer users_dir.close();
+
+    var vector_store: ?*yc.memory.store_pgvector.PgvectorVectorStore = null;
+    if (cfg.state.postgres.connection_string.len > 0) {
+        vector_store = yc.memory.store_pgvector.PgvectorVectorStore.init(allocator, .{
+            .connection_url = cfg.state.postgres.connection_string,
+            .table_name = cfg.memory.search.store.pgvector_table,
+            .dimensions = 1024,
+        }) catch |err| blk: {
+            std.debug.print("Warning: vector store init failed; vector deletes disabled: {s}\n", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    defer if (vector_store) |vs| vs.deinit();
+
+    var scanned_users: usize = 0;
+    var touched_users: usize = 0;
+    var canonical_deleted: usize = 0;
+    var vector_delete_attempts: usize = 0;
+    var markdown_lines_removed: usize = 0;
+
+    var it = users_dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const user_id = std.fmt.parseInt(i64, entry.name, 10) catch continue;
+        scanned_users += 1;
+
+        var keys: std.StringHashMapUnmanaged(void) = .empty;
+        defer freeKeySet(allocator, &keys);
+
+        const workspace = try std.fs.path.join(allocator, &.{ users_root, entry.name, "workspace" });
+        defer allocator.free(workspace);
+        const memory_md = try std.fs.path.join(allocator, &.{ workspace, "MEMORY.md" });
+        defer allocator.free(memory_md);
+        const memory_dir = try std.fs.path.join(allocator, &.{ workspace, "memory" });
+        defer allocator.free(memory_dir);
+
+        try collectTestKeysFromMarkdownFile(allocator, memory_md, &keys);
+        try collectTestKeysFromMemoryDir(allocator, memory_dir, &keys);
+
+        const entries = mgr.listMemories(allocator, user_id, null, null) catch |err| {
+            std.debug.print("Warning: listMemories failed for user {d}: {s}\n", .{ user_id, @errorName(err) });
+            continue;
+        };
+        defer yc.memory.freeEntries(allocator, entries);
+        for (entries) |mem_entry| {
+            if (isTestMemoryKey(mem_entry.key)) {
+                try addKeyToSet(allocator, &keys, mem_entry.key);
+            }
+        }
+
+        if (keys.count() == 0) continue;
+        touched_users += 1;
+
+        var key_it = keys.iterator();
+        while (key_it.next()) |kv| {
+            const key = kv.key_ptr.*;
+            if (mgr.forgetMemory(user_id, key) catch false) canonical_deleted += 1;
+            if (vector_store) |vs| {
+                vs.store().delete(key) catch {};
+                vector_delete_attempts += 1;
+            }
+        }
+
+        markdown_lines_removed += try rewriteMarkdownFileRemovingKeys(allocator, memory_md, &keys);
+        markdown_lines_removed += try rewriteMemoryDirRemovingKeys(allocator, memory_dir, &keys);
+    }
+
+    std.debug.print(
+        "Cleanup complete. scanned_users={d} touched_users={d} canonical_deleted={d} vector_delete_attempts={d} markdown_lines_removed={d}\n",
+        .{ scanned_users, touched_users, canonical_deleted, vector_delete_attempts, markdown_lines_removed },
+    );
 }
 
 fn printMemoryRuntimeInitFailure(allocator: std.mem.Allocator, backend: []const u8) void {
@@ -669,14 +900,14 @@ fn printRetrievalScoreLine(c: yc.memory.RetrievalCandidate) void {
     const kw_rank: []const u8 = if (c.keyword_rank != null) "yes" else "no";
     const vec_score: f32 = c.vector_score orelse -1.0;
     if (c.vector_score) |_| {
-        std.debug.print("     score={d:.4} keyword_ranked={s} vector_score={d:.4} source={s}\n", .{
+        std.debug.print("     rrf_score={d:.4} keyword_ranked={s} vector_score={d:.4} source={s}\n", .{
             c.final_score,
             kw_rank,
             vec_score,
             c.source,
         });
     } else {
-        std.debug.print("     score={d:.4} keyword_ranked={s} vector_score=n/a source={s}\n", .{
+        std.debug.print("     rrf_score={d:.4} keyword_ranked={s} vector_score=n/a source={s}\n", .{
             c.final_score,
             kw_rank,
             c.source,
@@ -690,19 +921,29 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         std.process.exit(1);
     }
 
+    const subcmd = sub_args[0];
+
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullalis onboard` first\n", .{});
         std.process.exit(1);
     };
     defer cfg.deinit();
 
-    var mem_rt = yc.memory.initRuntime(allocator, &cfg.memory, cfg.workspace_dir) orelse {
+    if (std.mem.eql(u8, subcmd, "cleanup-test-keys")) {
+        cleanupTestMemoryKeys(allocator, &cfg) catch |err| {
+            std.debug.print("cleanup-test-keys failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        return;
+    }
+
+    var mem_rt = yc.memory.initRuntimeWithOptions(allocator, &cfg.memory, cfg.workspace_dir, .{
+        .providers = cfg.providers,
+    }) orelse {
         printMemoryRuntimeInitFailure(allocator, cfg.memory.backend);
         std.process.exit(1);
     };
     defer mem_rt.deinit();
-
-    const subcmd = sub_args[0];
 
     if (std.mem.eql(u8, subcmd, "stats")) {
         const r = mem_rt.resolved;
@@ -1526,6 +1767,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
 
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
+        .config = config,
         .http_enabled = config.http_request.enabled,
         .browser_enabled = config.browser.enabled,
         .screenshot_enabled = true,
@@ -1546,7 +1788,10 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     }
 
     // Create optional memory backend (don't fail if unavailable)
-    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
+    var mem_rt = yc.memory.initRuntimeWithOptions(allocator, &config.memory, config.workspace_dir, .{
+        .providers = config.providers,
+        .search_api_key_override = resolved_api_key,
+    });
     defer if (mem_rt) |*rt| rt.deinit();
     const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
 
@@ -1830,6 +2075,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
+        .config = &config,
         .http_enabled = config.http_request.enabled,
         .browser_enabled = config.browser.enabled,
         .screenshot_enabled = true,
@@ -1850,7 +2096,10 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     }
 
     // Create optional memory backend (don't fail if unavailable)
-    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
+    var mem_rt = yc.memory.initRuntimeWithOptions(allocator, &config.memory, config.workspace_dir, .{
+        .providers = config.providers,
+        .search_api_key_override = resolved_api_key,
+    });
     defer if (mem_rt) |*rt| rt.deinit();
     const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
 

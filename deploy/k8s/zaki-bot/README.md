@@ -129,7 +129,7 @@ USER_IDS=test-user-1,test-user-2 \
 - Tenant cron deliveries can use this state for proactive Telegram sends.
 
 5. Tenant ownership lock is enabled for write paths.
-- Lock file: `/data/users/{user_id}/.nullclaw-owner.lock`
+- Lock file: `/data/users/{user_id}/.nullalis-owner.lock`
 - Lock conflicts return HTTP `409` with retry semantics.
 - Conflict metric: `nullclaw_gateway_tenant_lock_conflicts_total`
 
