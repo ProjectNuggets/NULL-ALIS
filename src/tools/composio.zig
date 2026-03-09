@@ -451,12 +451,6 @@ fn normalizeConnectLinkResponse(allocator: std.mem.Allocator, raw_body: []const 
         try out.appendSlice(allocator, ",\"connected_account_id\":null");
     }
 
-    if (link_token != null and redirect_in != null) {
-        try out.appendSlice(allocator, ",\"link_token\":\"");
-        try appendJsonEscaped(&out, allocator, link_token.?);
-        try out.appendSlice(allocator, "\"");
-    }
-
     try out.appendSlice(allocator, ",\"note\":\"Open redirect_url exactly as returned; avoid rebuilding from link_token.\"}");
     const owned = try out.toOwnedSlice(allocator);
     return owned;
