@@ -175,7 +175,15 @@ pub const ComposioTool = struct {
             return ToolResult.fail("Failed to build connect body");
         defer allocator.free(body);
 
-        return self.httpPost(allocator, url, body);
+        var raw = try self.httpPost(allocator, url, body);
+        if (!raw.success) return raw;
+
+        const normalized = try normalizeConnectLinkResponse(allocator, raw.output);
+        if (normalized) |payload| {
+            allocator.free(raw.output);
+            raw.output = payload;
+        }
+        return raw;
     }
 
     fn resolveAuthConfigIdV3(self: *ComposioTool, allocator: std.mem.Allocator, app: []const u8) ![]u8 {
@@ -260,7 +268,7 @@ pub const ComposioTool = struct {
         var argc: usize = 0;
         argv_buf[argc] = "curl";
         argc += 1;
-        argv_buf[argc] = "-sL";
+        argv_buf[argc] = "-sS";
         argc += 1;
         argv_buf[argc] = "-m";
         argc += 1;
@@ -387,6 +395,71 @@ fn buildConnectBodyV3(allocator: std.mem.Allocator, entity: []const u8, auth_con
 
     try body_buf.appendSlice(allocator, "}");
     return body_buf.toOwnedSlice(allocator);
+}
+
+fn firstObjectString(obj: std.json.ObjectMap, comptime fields: []const []const u8) ?[]const u8 {
+    inline for (fields) |field| {
+        if (obj.get(field)) |v| {
+            if (v == .string and v.string.len > 0) return v.string;
+        }
+    }
+    return null;
+}
+
+/// Normalize Composio connect response into a stable payload that always includes
+/// one canonical URL field (`redirect_url`).
+fn normalizeConnectLinkResponse(allocator: std.mem.Allocator, raw_body: []const u8) !?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const obj = parsed.value.object;
+    const redirect_in = firstObjectString(obj, &.{ "redirect_url", "redirectUrl", "url", "link" });
+    const link_token = firstObjectString(obj, &.{ "link_token", "linkToken" });
+    const expires_at = firstObjectString(obj, &.{ "expires_at", "expiresAt" });
+    const connected_account_id = firstObjectString(obj, &.{ "connected_account_id", "connectedAccountId" });
+
+    const redirect_url: ?[]const u8 = if (redirect_in) |url|
+        url
+    else if (link_token) |token|
+        std.fmt.allocPrint(allocator, "https://connect.composio.dev/link/{s}", .{token}) catch null
+    else
+        null;
+    defer if (redirect_in == null and redirect_url != null) allocator.free(redirect_url.?);
+
+    if (redirect_url == null) return null;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"status\":\"connect_link_created\",\"redirect_url\":\"");
+    try appendJsonEscaped(&out, allocator, redirect_url.?);
+    try out.appendSlice(allocator, "\"");
+
+    if (expires_at) |value| {
+        try out.appendSlice(allocator, ",\"expires_at\":\"");
+        try appendJsonEscaped(&out, allocator, value);
+        try out.appendSlice(allocator, "\"");
+    } else {
+        try out.appendSlice(allocator, ",\"expires_at\":null");
+    }
+
+    if (connected_account_id) |value| {
+        try out.appendSlice(allocator, ",\"connected_account_id\":\"");
+        try appendJsonEscaped(&out, allocator, value);
+        try out.appendSlice(allocator, "\"");
+    } else {
+        try out.appendSlice(allocator, ",\"connected_account_id\":null");
+    }
+
+    if (link_token != null and redirect_in != null) {
+        try out.appendSlice(allocator, ",\"link_token\":\"");
+        try appendJsonEscaped(&out, allocator, link_token.?);
+        try out.appendSlice(allocator, "\"");
+    }
+
+    try out.appendSlice(allocator, ",\"note\":\"Open redirect_url exactly as returned; avoid rebuilding from link_token.\"}");
+    const owned = try out.toOwnedSlice(allocator);
+    return owned;
 }
 
 fn lowerNoSeparators(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -668,6 +741,33 @@ test "composio buildConnectBodyV3 includes callback_url and connection_data when
     defer alloc.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"callback_url\":\"https://example.com/cb\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"connection_data\":{\"tenant\":\"acme\"}") != null);
+}
+
+test "composio normalizeConnectLinkResponse prefers redirect_url" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"link_token":"lk_abc","redirect_url":"https://connect.composio.dev/link/lk_abc?sid=1","expires_at":"2026-03-10T00:00:00Z","connected_account_id":"ca_123"}
+    ;
+    const normalized = try normalizeConnectLinkResponse(alloc, raw);
+    defer if (normalized) |v| alloc.free(v);
+    try std.testing.expect(normalized != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.?, "\"redirect_url\":\"https://connect.composio.dev/link/lk_abc?sid=1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.?, "\"connected_account_id\":\"ca_123\"") != null);
+}
+
+test "composio normalizeConnectLinkResponse builds redirect_url from link_token" {
+    const alloc = std.testing.allocator;
+    const raw = "{\"link_token\":\"lk_xyz\"}";
+    const normalized = try normalizeConnectLinkResponse(alloc, raw);
+    defer if (normalized) |v| alloc.free(v);
+    try std.testing.expect(normalized != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.?, "\"redirect_url\":\"https://connect.composio.dev/link/lk_xyz\"") != null);
+}
+
+test "composio normalizeConnectLinkResponse returns null for non-object payload" {
+    const alloc = std.testing.allocator;
+    const normalized = try normalizeConnectLinkResponse(alloc, "[]");
+    try std.testing.expect(normalized == null);
 }
 
 test "composio lowerNoSeparators normalizes toolkit slug variants" {
