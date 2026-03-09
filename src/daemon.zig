@@ -554,6 +554,49 @@ fn heartbeatLooksRoutineNarration(reply: []const u8) bool {
     if (std.mem.indexOf(u8, content, "job does not exist") != null) return true;
     if (std.mem.indexOf(u8, content, "job doesn't exist") != null) return true;
     if (std.mem.indexOf(u8, content, "job is missing") != null) return true;
+    if (std.mem.indexOf(u8, content, "current time is") != null) return true;
+    if (std.mem.indexOf(u8, content, "window has passed") != null) return true;
+    if (std.mem.indexOf(u8, content, "nothing needs attention") != null) return true;
+    if (std.mem.indexOf(u8, content, "nothing requires attention") != null) return true;
+    if (std.mem.indexOf(u8, content, "no action needed") != null) return true;
+    return false;
+}
+
+fn heartbeatLooksVerboseDigest(reply: []const u8) bool {
+    const trimmed = std.mem.trim(u8, reply, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (trimmed.len > 240) return true;
+
+    var newline_count: usize = 0;
+    var sentence_count: usize = 0;
+    for (trimmed) |c| {
+        if (c == '\n') newline_count += 1;
+        if (c == '.' or c == '!' or c == '?') sentence_count += 1;
+    }
+    if (newline_count > 0) return true;
+    if (sentence_count > 2) return true;
+
+    var lowered: [512]u8 = undefined;
+    const clipped_len = @min(trimmed.len, lowered.len);
+    _ = std.ascii.lowerString(lowered[0..clipped_len], trimmed[0..clipped_len]);
+    const content = lowered[0..clipped_len];
+
+    if (std.mem.indexOf(u8, content, "##") != null) return true;
+    if (std.mem.indexOf(u8, content, "your schedule") != null) return true;
+    if (std.mem.indexOf(u8, content, "top middle east news") != null) return true;
+    if (std.mem.indexOf(u8, content, "weather:") != null) return true;
+
+    const has_morning_brief = std.mem.indexOf(u8, content, "morning-brief") != null or std.mem.indexOf(u8, content, "morning brief") != null;
+    if (has_morning_brief) {
+        const has_short_status = std.mem.indexOf(u8, content, "created") != null or
+            std.mem.indexOf(u8, content, "scheduled") != null or
+            std.mem.indexOf(u8, content, "delivered") != null or
+            std.mem.indexOf(u8, content, "sent") != null or
+            std.mem.indexOf(u8, content, "failed") != null or
+            std.mem.indexOf(u8, content, "error") != null or
+            std.mem.indexOf(u8, content, "blocked") != null;
+        if (!has_short_status) return true;
+    }
     return false;
 }
 
@@ -562,8 +605,35 @@ fn heartbeatActionableReplySlice(reply: []const u8) ?[]const u8 {
     if (trimmed.len == 0) return null;
     if (isHeartbeatAck(trimmed)) return null;
     if (heartbeatLooksRoutineNarration(trimmed)) return null;
+    if (heartbeatLooksVerboseDigest(trimmed)) return null;
     if (!isHeartbeatActionableText(trimmed)) return null;
     return trimmed;
+}
+
+fn heartbeatDedupeBucket(content: []const u8) ?[]const u8 {
+    var lowered: [512]u8 = undefined;
+    const clipped_len = @min(content.len, lowered.len);
+    _ = std.ascii.lowerString(lowered[0..clipped_len], content[0..clipped_len]);
+    const norm = lowered[0..clipped_len];
+
+    const has_morning_brief = std.mem.indexOf(u8, norm, "morning-brief") != null or std.mem.indexOf(u8, norm, "morning brief") != null;
+    if (has_morning_brief) {
+        if (std.mem.indexOf(u8, norm, "created") != null or std.mem.indexOf(u8, norm, "scheduled") != null) {
+            return "morning_brief_configured";
+        }
+        if (std.mem.indexOf(u8, norm, "delivered") != null or std.mem.indexOf(u8, norm, "sent") != null) {
+            return "morning_brief_delivered";
+        }
+    }
+    if (std.mem.indexOf(u8, norm, "max tasks reached") != null or std.mem.indexOf(u8, norm, "max capacity") != null) {
+        return "scheduler_capacity";
+    }
+    if (std.mem.indexOf(u8, norm, "external tools disabled") != null or
+        std.mem.indexOf(u8, norm, "tools disabled during heartbeat") != null)
+    {
+        return "background_tools_disabled";
+    }
+    return null;
 }
 
 fn makeHeartbeatDedupeKey(
@@ -572,6 +642,9 @@ fn makeHeartbeatDedupeKey(
     chat_id: []const u8,
     content: []const u8,
 ) ![]u8 {
+    if (heartbeatDedupeBucket(content)) |bucket| {
+        return std.fmt.allocPrint(allocator, "heartbeat:{s}:{s}:{s}", .{ user_id, chat_id, bucket });
+    }
     const hash = std.hash.Wyhash.hash(0, content);
     return std.fmt.allocPrint(allocator, "heartbeat:{s}:{s}:{x}", .{ user_id, chat_id, hash });
 }
@@ -2963,6 +3036,19 @@ test "heartbeatActionableReplySlice keeps actionable output" {
     try std.testing.expectEqualStrings("Morning brief delivered", slice);
 }
 
+test "heartbeatActionableReplySlice suppresses verbose morning brief payloads" {
+    try std.testing.expect(heartbeatActionableReplySlice(
+        \\## Morning Brief - March 9, 2026
+        \\Weather: Hamburg 4C
+        \\Top Middle East news: ...
+    ) == null);
+}
+
+test "heartbeatActionableReplySlice keeps concise remediation sentence" {
+    const slice = heartbeatActionableReplySlice("Created morning-brief job for 08:00 CET.") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Created morning-brief job for 08:00 CET.", slice);
+}
+
 test "heartbeatActionableReplySlice drops non-actionable punctuation" {
     try std.testing.expect(heartbeatActionableReplySlice("  ... !!!  ") == null);
 }
@@ -3002,6 +3088,14 @@ test "makeHeartbeatDedupeKey stable for same payload" {
     const key_a = try makeHeartbeatDedupeKey(std.testing.allocator, "1", "1110331014", "Morning brief delivered");
     defer std.testing.allocator.free(key_a);
     const key_b = try makeHeartbeatDedupeKey(std.testing.allocator, "1", "1110331014", "Morning brief delivered");
+    defer std.testing.allocator.free(key_b);
+    try std.testing.expectEqualStrings(key_a, key_b);
+}
+
+test "makeHeartbeatDedupeKey normalizes morning brief schedule variants" {
+    const key_a = try makeHeartbeatDedupeKey(std.testing.allocator, "1", "1110331014", "Created the daily morning brief job at 08:00 CET.");
+    defer std.testing.allocator.free(key_a);
+    const key_b = try makeHeartbeatDedupeKey(std.testing.allocator, "1", "1110331014", "Created morning-brief cron job (08:00 CET daily).");
     defer std.testing.allocator.free(key_b);
     try std.testing.expectEqualStrings(key_a, key_b);
 }
