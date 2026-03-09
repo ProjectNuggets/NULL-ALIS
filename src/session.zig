@@ -36,6 +36,8 @@ pub const Session = struct {
     last_consolidated: u64 = 0,
     session_key: []const u8, // owned copy
     turn_count: u64,
+    turn_observers: [2]Observer,
+    turn_observer_multi: MultiObserver,
     mutex: std.Thread.Mutex,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
@@ -142,6 +144,8 @@ pub const SessionManager = struct {
             .last_consolidated = 0,
             .session_key = owned_key,
             .turn_count = 0,
+            .turn_observers = .{ self.observer, self.observer },
+            .turn_observer_multi = .{ .observers = &.{} },
             .mutex = .{},
         };
         // From here, session owns agent — must deinit on error.
@@ -231,17 +235,20 @@ pub const SessionManager = struct {
         defer session.agent.conversation_context = null;
 
         const base_observer = session.agent.observer;
-        var merged_observers_buf: [2]Observer = undefined;
-        var merged_observer_impl: MultiObserver = undefined;
+        var progress_attached = false;
         if (options.progress_observer) |progress_observer| {
-            merged_observers_buf = .{ base_observer, progress_observer };
-            merged_observer_impl = .{ .observers = merged_observers_buf[0..] };
-            session.agent.observer = merged_observer_impl.observer();
-            defer session.agent.observer = base_observer;
+            session.turn_observers = .{ base_observer, progress_observer };
+            session.turn_observer_multi.observers = session.turn_observers[0..];
+            session.agent.observer = session.turn_observer_multi.observer();
+            progress_attached = true;
         }
+        defer if (progress_attached) {
+            session.agent.observer = base_observer;
+            session.turn_observer_multi.observers = &.{};
+        };
 
         const agent_start_ms = std.time.milliTimestamp();
-        const response = try session.agent.turn(content);
+        const response = try (&session.agent).turn(content);
         const agent_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - agent_start_ms));
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
@@ -324,6 +331,7 @@ pub const SessionManager = struct {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+var test_noop_observer_impl = observability.NoopObserver{};
 
 // ---------------------------------------------------------------------------
 // MockProvider — returns a fixed response, no network calls
@@ -422,14 +430,13 @@ fn testSessionManager(allocator: Allocator, mock: *MockProvider, cfg: *const Con
 }
 
 fn testSessionManagerWithMemory(allocator: Allocator, mock: *MockProvider, cfg: *const Config, mem: ?Memory, session_store: ?memory_mod.SessionStore) SessionManager {
-    var noop = observability.NoopObserver{};
     return SessionManager.init(
         allocator,
         cfg,
         mock.provider(),
         &.{},
         mem,
-        noop.observer(),
+        test_noop_observer_impl.observer(),
         session_store,
         null,
     );
@@ -651,8 +658,28 @@ test "processMessageWithContext forwards progress observer and restores base obs
     });
     defer testing.allocator.free(response);
 
+    try testing.expect(progress.event_count > 0);
+    try testing.expect(progress.saw_turn_stage);
+
     const session = try sm.getOrCreate("progress:1");
     try testing.expectEqualStrings("noop", session.agent.observer.getName());
+}
+
+test "agent turn emits observer events with counting observer" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("progress:direct");
+    var progress = CountingObserver{};
+    session.agent.observer = progress.observer();
+
+    const response = try session.agent.turn("hello");
+    defer testing.allocator.free(response);
+
+    try testing.expect(progress.event_count > 0);
+    try testing.expect(progress.saw_turn_stage);
 }
 
 test "processMessage /new clears autosave only for current session" {

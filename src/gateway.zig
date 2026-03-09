@@ -3373,9 +3373,13 @@ fn SseProgressObserver(comptime StreamType: type) type {
         ) void {
             if (self.stream_failed) return;
             if (self.shouldSuppressDuplicate(phase, state, label, tool, iteration)) return;
-            const frame = sseProgressFrame(self.allocator, phase, state, label, tool, iteration, duration_ms) catch return;
+            const frame = sseProgressFrame(self.allocator, phase, state, label, tool, iteration, duration_ms) catch |err| {
+                log.warn("chat.stream.progress encode failed phase={s} state={s}: {}", .{ phase, state, err });
+                return;
+            };
             defer self.allocator.free(frame);
-            sendChunkedSseFrame(self.stream, frame) catch {
+            sendChunkedSseFrame(self.stream, frame) catch |err| {
+                log.warn("chat.stream.progress emit failed phase={s} state={s}: {}", .{ phase, state, err });
                 self.stream_failed = true;
                 return;
             };

@@ -1,0 +1,129 @@
+{
+  "manifest_version": "dtaas-bench/v0.2",
+  "run_id": "2026-03-09T12-00-00Z-nullalis-v0.1.1",
+  "run_date_utc": "2026-03-09T12:00:00Z",
+  "runner": {
+    "organization": "example-org",
+    "operator": "example-operator",
+    "contact": "ops@example.org"
+  },
+  "runtime": {
+    "name": "nullalis",
+    "version": "v0.1.1",
+    "commit_sha": "REPLACE_WITH_GIT_SHA",
+    "build_mode": "ReleaseSmall",
+    "config_hash_sha256": "REPLACE_WITH_CONFIG_HASH"
+  },
+  "harness": {
+    "name": "dtaas-bench",
+    "version": "v0.2",
+    "commit_sha": "REPLACE_WITH_HARNESS_SHA"
+  },
+  "environment": {
+    "os": "linux",
+    "kernel": "6.x",
+    "cpu_model": "REPLACE_WITH_CPU",
+    "cpu_cores": 8,
+    "memory_gb": 32,
+    "region": "eu-central-1",
+    "network_profile": "default",
+    "container_runtime": "docker",
+    "orchestrator": "k8s"
+  },
+  "model_profile": {
+    "provider": "openrouter",
+    "model": "moonshotai/kimi-k2.5",
+    "temperature": 0.2,
+    "max_tokens": 2048
+  },
+  "dimensions": {
+    "autonomy_control": {
+      "measured": true,
+      "score": 0,
+      "confidence": "high",
+      "n_runs": 1,
+      "metrics": {}
+    },
+    "memory_persistence": {
+      "measured": true,
+      "score": 0,
+      "confidence": "medium",
+      "n_runs": 1,
+      "metrics": {}
+    },
+    "autonomous_execution": {
+      "measured": true,
+      "score": 0,
+      "confidence": "medium",
+      "n_runs": 1,
+      "metrics": {}
+    },
+    "cross_channel_consistency": {
+      "measured": true,
+      "score": 0,
+      "confidence": "medium",
+      "n_runs": 1,
+      "metrics": {}
+    },
+    "integration_capability_depth": {
+      "measured": true,
+      "score": 0,
+      "confidence": "high",
+      "n_runs": 1,
+      "metrics": {}
+    },
+    "security_privacy": {
+      "measured": true,
+      "score": 0,
+      "confidence": "high",
+      "n_runs": 1,
+      "metrics": {}
+    },
+    "multi_tenant_isolation_fairness": {
+      "measured": true,
+      "score": 0,
+      "confidence": "high",
+      "n_runs": 1,
+      "metrics": {}
+    },
+    "operational_resilience": {
+      "measured": true,
+      "score": 0,
+      "confidence": "medium",
+      "n_runs": 3,
+      "metrics": {}
+    },
+    "scale_cost_latency": {
+      "measured": true,
+      "score": 0,
+      "confidence": "medium",
+      "n_runs": 3,
+      "metrics": {}
+    }
+  },
+  "scores": {
+    "verified_composite_score": 0,
+    "projected_composite_score": null,
+    "tier": "Experimental",
+    "uncertainty_band": "0"
+  },
+  "sota_gates": {
+    "autonomous_48h": false,
+    "cross_channel_3_live": false,
+    "resilience_failure_matrix": false,
+    "tenant_isolation_suite": false,
+    "security_adversarial_suite": false
+  },
+  "artifacts": {
+    "raw_results_json": "https://example.org/results/raw.json",
+    "timing_traces": "https://example.org/results/timing.json",
+    "security_suite_output": "https://example.org/results/security.json",
+    "resilience_suite_output": "https://example.org/results/resilience.json",
+    "logs_archive": "https://example.org/results/logs.tar.zst",
+    "ci_job_url": "https://ci.example.org/job/1234"
+  },
+  "integrity": {
+    "manifest_sha256": "REPLACE_WITH_MANIFEST_SHA256",
+    "runner_signature": "REPLACE_WITH_SIGNATURE"
+  }
+}
