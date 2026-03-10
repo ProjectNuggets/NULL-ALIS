@@ -43,6 +43,7 @@ It includes:
 - Default model: `openrouter/moonshotai/kimi-k2.5`
 - Tenant mode: enabled
 - State backend: `postgres` (via runtime env wiring)
+- Composio: configurable via env (`COMPOSIO_ENABLED` + `COMPOSIO_API_KEY`)
 
 ## Integration handoff docs
 
@@ -64,6 +65,7 @@ Update these fields before apply:
 - `INTERNAL_SERVICE_TOKEN`
 - `OPENROUTER_API_KEY`
 - `POSTGRES_CONNECTION_STRING`
+- `COMPOSIO_API_KEY` (if Composio is enabled)
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
  - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (if not using workload identity)
@@ -71,8 +73,14 @@ Update these fields before apply:
 5. `02-configmap.yaml`:
 - `PUBLIC_BASE_URL`, `TELEGRAM_ALLOW_FROM` policy
 - Postgres state tuning (`STATE_BACKEND`, `POSTGRES_SCHEMA`, `POSTGRES_POOL_MAX`, timeout values)
+- Composio toggles (`COMPOSIO_ENABLED`, `COMPOSIO_ENTITY_ID`)
 - `LITESTREAM_S3_BUCKET`, `LITESTREAM_S3_PREFIX`
 - `AWS_REGION` (if required by your S3 endpoint)
+
+Composio scoping model:
+- `COMPOSIO_API_KEY` is global app/platform auth.
+- In tenant mode, runtime binds Composio `entity_id` to the current tenant user id for per-user OAuth/account scope.
+- `COMPOSIO_ENTITY_ID` is fallback/default and is not the primary tenant scoping mechanism.
 
 ## Apply order
 ```bash

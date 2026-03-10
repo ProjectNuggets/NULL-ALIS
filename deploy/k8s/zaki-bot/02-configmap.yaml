@@ -14,6 +14,8 @@ data:
   POSTGRES_POOL_MAX: "16"
   POSTGRES_STATEMENT_TIMEOUT_MS: "5000"
   POSTGRES_LOCK_TIMEOUT_MS: "2000"
+  COMPOSIO_ENABLED: "false"
+  COMPOSIO_ENTITY_ID: "default"
 
   # Tenant user data root on mounted RWX volume.
   TENANT_DATA_ROOT: "/data/users"
