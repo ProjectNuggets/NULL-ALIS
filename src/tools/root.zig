@@ -559,6 +559,42 @@ pub fn degradedReason(config: *const @import("../config.zig").Config, tenant_ctx
     return "";
 }
 
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (containsIgnoreCase(haystack, needle)) return true;
+    }
+    return false;
+}
+
+fn isReadOnlyComposioExecute(args: JsonObjectMap) bool {
+    const slug = getString(args, "tool_slug") orelse
+        getString(args, "action_name") orelse
+        return false;
+
+    const write_hints = [_][]const u8{
+        "send",    "create", "update",    "delete",  "remove", "write", "post",   "put",  "patch",
+        "insert",  "append", "modify",    "archive", "trash",  "star",  "label",  "move", "upload",
+        "connect", "auth",   "authorize", "grant",   "revoke", "share", "invite", "book", "schedule",
+    };
+    if (containsAnyIgnoreCase(slug, &write_hints)) return false;
+
+    const read_hints = [_][]const u8{
+        "list", "get", "fetch", "read", "search", "find", "query", "lookup", "retrieve", "view", "download",
+    };
+    return containsAnyIgnoreCase(slug, &read_hints);
+}
+
 pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]const u8 {
     const turn_ctx = getTurnContext();
     if (!isBackgroundTurnOrigin(turn_ctx.origin)) return null;
@@ -573,10 +609,15 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
 
     if (std.mem.eql(u8, tool_name, composio.ComposioTool.tool_name)) {
         const action = getString(args, "action") orelse "execute";
-        if (std.mem.eql(u8, action, "connect")) {
+        if (std.ascii.eqlIgnoreCase(action, "connect")) {
             return "Composio connect is disabled for background turns";
         }
-        return "Composio is disabled for background turns";
+        if (std.ascii.eqlIgnoreCase(action, "list")) return null;
+        if (std.ascii.eqlIgnoreCase(action, "execute")) {
+            if (isReadOnlyComposioExecute(args)) return null;
+            return "Composio write/unknown execute actions are disabled for background turns";
+        }
+        return "Composio action is disabled for background turns";
     }
 
     return "Tool is disabled for background turns";
@@ -782,6 +823,34 @@ test "background turns block composio connect" {
     defer clearTurnContext();
 
     const parsed = try parseTestArgs("{\"action\":\"connect\",\"app\":\"gmail\"}");
+    defer parsed.deinit();
+    const blocked = toolBlockedForCurrentTurn("composio", parsed.value.object) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "disabled") != null);
+}
+
+test "background turns allow composio list" {
+    setTurnContext(.{ .origin = .scheduler });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"action\":\"list\",\"app\":\"gmail\"}");
+    defer parsed.deinit();
+    try std.testing.expect(toolBlockedForCurrentTurn("composio", parsed.value.object) == null);
+}
+
+test "background turns allow composio read-only execute" {
+    setTurnContext(.{ .origin = .heartbeat });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"action\":\"execute\",\"tool_slug\":\"gmail-list-messages\"}");
+    defer parsed.deinit();
+    try std.testing.expect(toolBlockedForCurrentTurn("composio", parsed.value.object) == null);
+}
+
+test "background turns block composio write execute" {
+    setTurnContext(.{ .origin = .heartbeat });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"action\":\"execute\",\"tool_slug\":\"gmail-send-email\"}");
     defer parsed.deinit();
     const blocked = toolBlockedForCurrentTurn("composio", parsed.value.object) orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, blocked, "disabled") != null);
