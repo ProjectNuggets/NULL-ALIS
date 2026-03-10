@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nullclaw-pgbouncer
+  namespace: zaki-bot-staging
+  labels:
+    app.kubernetes.io/name: nullclaw-pgbouncer
+    app.kubernetes.io/part-of: zaki-bot
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nullclaw-pgbouncer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nullclaw-pgbouncer
+        app.kubernetes.io/part-of: zaki-bot
+    spec:
+      containers:
+        - name: pgbouncer
+          image: bitnami/pgbouncer:1.24.1
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: nullclaw-runtime-config
+            - secretRef:
+                name: nullclaw-runtime-secrets
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              mkdir -p /tmp/pgbouncer
+
+              cat > /tmp/pgbouncer/pgbouncer.ini <<EOF
+              [databases]
+              ${PGBOUNCER_DB_NAME} = host=${PGBOUNCER_DB_HOST} port=${PGBOUNCER_DB_PORT} dbname=${PGBOUNCER_DB_NAME} user=${PGBOUNCER_DB_USER} password=${PGBOUNCER_DB_PASSWORD}
+
+              [pgbouncer]
+              listen_addr = 0.0.0.0
+              listen_port = ${PGBOUNCER_PORT}
+              auth_type = plain
+              auth_file = /tmp/pgbouncer/userlist.txt
+              pool_mode = ${PGBOUNCER_POOL_MODE}
+              max_client_conn = ${PGBOUNCER_MAX_CLIENT_CONN}
+              default_pool_size = ${PGBOUNCER_DEFAULT_POOL_SIZE}
+              reserve_pool_size = ${PGBOUNCER_RESERVE_POOL_SIZE}
+              min_pool_size = ${PGBOUNCER_MIN_POOL_SIZE}
+              max_db_connections = ${PGBOUNCER_MAX_DB_CONNECTIONS}
+              ignore_startup_parameters = extra_float_digits
+              server_reset_query = DISCARD ALL
+              admin_users = ${PGBOUNCER_ADMIN_USER}
+              stats_users = ${PGBOUNCER_STATS_USER}
+              EOF
+
+              cat > /tmp/pgbouncer/userlist.txt <<EOF
+              "${PGBOUNCER_DB_USER}" "${PGBOUNCER_DB_PASSWORD}"
+              "${PGBOUNCER_ADMIN_USER}" "${PGBOUNCER_ADMIN_PASSWORD}"
+              "${PGBOUNCER_STATS_USER}" "${PGBOUNCER_STATS_PASSWORD}"
+              EOF
+
+              exec /opt/bitnami/pgbouncer/bin/pgbouncer /tmp/pgbouncer/pgbouncer.ini
+          ports:
+            - name: pgbouncer
+              containerPort: 6432
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: pgbouncer
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: pgbouncer
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

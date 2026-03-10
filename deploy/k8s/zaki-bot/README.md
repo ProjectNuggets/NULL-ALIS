@@ -12,6 +12,7 @@ Compatibility note:
 It includes:
 - Namespace, Secret template, ConfigMap, RWX PVC
 - Deployment with drain/shutdown lifecycle hooks
+- PgBouncer deployment/service for Postgres connection pooling
 - Litestream sidecar config for SQLite WAL replication to S3
 - Service, Ingress, PDB, HPA
 - ServiceMonitor for Prometheus Operator
@@ -32,6 +33,9 @@ It includes:
 - `10-servicemonitor.yaml`
 - `11-litestream-configmap.yaml`
 - `12-prometheusrule.yaml`
+- `13-pgbouncer-deployment.yaml`
+- `14-pgbouncer-service.yaml`
+- `15-pgbouncer-pdb.yaml`
 - `kustomization.yaml`
 - `smoke.sh`
 - `restore-drill.sh`
@@ -43,7 +47,21 @@ It includes:
 - Default model: `openrouter/moonshotai/kimi-k2.5`
 - Tenant mode: enabled
 - State backend: `postgres` (via runtime env wiring)
+- Postgres connection routing: PgBouncer-enabled by default (`POSTGRES_USE_PGBOUNCER=true`)
 - Composio: configurable via env (`COMPOSIO_ENABLED` + `COMPOSIO_API_KEY`)
+
+## Production profile (moderate workload)
+Recommended baseline for production:
+- `nullclaw` HPA: `minReplicas=3`, `maxReplicas=12`
+- `nullclaw` resources per pod: request `750m/1Gi`, limit `2 CPU/2Gi`
+- runtime DB pool: `POSTGRES_POOL_MAX=8` (keep app pool conservative with PgBouncer in front)
+- PgBouncer: `pool_mode=transaction`, `default_pool_size=20`, `reserve_pool_size=5`, `max_client_conn=4000`
+- Postgres primary: start at `8 vCPU / 32Gi RAM / fast SSD`
+
+Planning envelope (validate with your own traffic replay):
+- 1 nullclaw pod: ~15-25 concurrent active turns
+- 6 nullclaw pods: ~90-150 concurrent active turns
+- 12 nullclaw pods: ~180-300 concurrent active turns
 
 ## Integration handoff docs
 
@@ -65,6 +83,15 @@ Update these fields before apply:
 - `INTERNAL_SERVICE_TOKEN`
 - `OPENROUTER_API_KEY`
 - `POSTGRES_CONNECTION_STRING`
+- `PGBOUNCER_CONNECTION_STRING` (recommended runtime DSN via `nullclaw-pgbouncer:6432`)
+- PgBouncer upstream and auth values:
+  - `PGBOUNCER_DB_HOST`
+  - `PGBOUNCER_DB_PORT`
+  - `PGBOUNCER_DB_NAME`
+  - `PGBOUNCER_DB_USER`
+  - `PGBOUNCER_DB_PASSWORD`
+  - `PGBOUNCER_ADMIN_USER` / `PGBOUNCER_ADMIN_PASSWORD`
+  - `PGBOUNCER_STATS_USER` / `PGBOUNCER_STATS_PASSWORD`
 - `COMPOSIO_API_KEY` (if Composio is enabled)
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
@@ -73,6 +100,7 @@ Update these fields before apply:
 5. `02-configmap.yaml`:
 - `PUBLIC_BASE_URL`, `TELEGRAM_ALLOW_FROM` policy
 - Postgres state tuning (`STATE_BACKEND`, `POSTGRES_SCHEMA`, `POSTGRES_POOL_MAX`, timeout values)
+- PgBouncer toggles/tuning (`POSTGRES_USE_PGBOUNCER`, `PGBOUNCER_*`)
 - Composio toggles (`COMPOSIO_ENABLED`, `COMPOSIO_ENTITY_ID`)
 - `LITESTREAM_S3_BUCKET`, `LITESTREAM_S3_PREFIX`
 - `AWS_REGION` (if required by your S3 endpoint)
@@ -100,6 +128,12 @@ kubectl -n zaki-bot-staging port-forward svc/nullclaw 3000:80
 curl -s http://127.0.0.1:3000/metrics | head -n 40
 curl -s http://127.0.0.1:3000/internal/diagnostics -H "X-Internal-Token: ${INTERNAL_TOKEN}" | jq '.startup_self_check'
 ```
+If PgBouncer is enabled, verify state path points to the pooler:
+```bash
+kubectl -n zaki-bot-staging get pods -l app.kubernetes.io/name=nullclaw-pgbouncer
+kubectl -n zaki-bot-staging get svc/nullclaw-pgbouncer
+curl -s http://127.0.0.1:3000/internal/diagnostics -H "X-Internal-Token: ${INTERNAL_TOKEN}" | jq '.startup_self_check | {pg_host,pg_port,scheduler_backend,state_effective,degraded}'
+```
 3. Run smoke test.
 ```bash
 BASE_URL=https://agent-staging.zaki.com \
@@ -108,6 +142,7 @@ USER_ID=test-user-1 \
 TELEGRAM_BOT_TOKEN=... \
 WEBHOOK_BASE_URL=https://agent-staging.zaki.com \
 TELEGRAM_WEBHOOK_SECRET=... \
+PGBOUNCER_EXPECTED=true \
 ./deploy/k8s/zaki-bot/smoke.sh
 ```
 4. Run restore drill for sampled users.
@@ -161,6 +196,11 @@ USER_IDS=test-user-1,test-user-2 \
 - Telegram webhook reject spikes (`nullclaw_gateway_telegram_webhook_rejected_total`)
 - Chat stream error ratio (`nullclaw_gateway_chat_stream_errors_total / _total`)
 - Litestream lag (`litestream_replica_lag_seconds`)
+
+9. PgBouncer is the recommended production connection path.
+- Keep `POSTGRES_USE_PGBOUNCER=true` in production.
+- Keep nullALIS `POSTGRES_POOL_MAX` conservative (default `8`) and let PgBouncer absorb client bursts.
+- Use direct `POSTGRES_CONNECTION_STRING` only for emergency bypass/debug.
 
 ## Readiness status
 Current status: **ready for staging integration and production rollout after environment values are filled**.

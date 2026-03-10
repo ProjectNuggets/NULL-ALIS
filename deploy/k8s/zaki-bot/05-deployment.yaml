@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/name: nullclaw
     app.kubernetes.io/part-of: zaki-bot
 spec:
-  replicas: 2
+  replicas: 3
   revisionHistoryLimit: 5
   strategy:
     type: RollingUpdate
@@ -54,6 +54,11 @@ spec:
               mkdir -p /nullclaw-data/.nullalis
               mkdir -p "${TENANT_DATA_ROOT}"
 
+              POSTGRES_RUNTIME_CONNECTION_STRING="${POSTGRES_CONNECTION_STRING}"
+              if [ "${POSTGRES_USE_PGBOUNCER:-false}" = "true" ] && [ -n "${PGBOUNCER_CONNECTION_STRING:-}" ]; then
+                POSTGRES_RUNTIME_CONNECTION_STRING="${PGBOUNCER_CONNECTION_STRING}"
+              fi
+
               cat > /nullclaw-data/.nullalis/config.json <<JSON
               {
                 "agents": {
@@ -89,7 +94,7 @@ spec:
                 "state": {
                   "backend": "${STATE_BACKEND}",
                   "postgres": {
-                    "connection_string": "${POSTGRES_CONNECTION_STRING}",
+                    "connection_string": "${POSTGRES_RUNTIME_CONNECTION_STRING}",
                     "schema": "${POSTGRES_SCHEMA}",
                     "pool_max": ${POSTGRES_POOL_MAX},
                     "statement_timeout_ms": ${POSTGRES_STATEMENT_TIMEOUT_MS},
@@ -158,8 +163,8 @@ spec:
                     curl -sS -X POST "http://127.0.0.1:3000/internal/shutdown" -H "X-Internal-Token: ${INTERNAL_SERVICE_TOKEN}" || true
           resources:
             requests:
-              cpu: "250m"
-              memory: "512Mi"
+              cpu: "750m"
+              memory: "1Gi"
             limits:
               cpu: "2"
               memory: "2Gi"

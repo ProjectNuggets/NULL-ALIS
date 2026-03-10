@@ -14,3 +14,6 @@ resources:
   - 10-servicemonitor.yaml
   - 11-litestream-configmap.yaml
   - 12-prometheusrule.yaml
+  - 13-pgbouncer-deployment.yaml
+  - 14-pgbouncer-service.yaml
+  - 15-pgbouncer-pdb.yaml

@@ -7,6 +7,7 @@ set -euo pipefail
 : "${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN}"
 : "${WEBHOOK_BASE_URL:?Set WEBHOOK_BASE_URL, e.g. https://agent-staging.zaki.com}"
 : "${TELEGRAM_WEBHOOK_SECRET:?Set TELEGRAM_WEBHOOK_SECRET}"
+: "${PGBOUNCER_EXPECTED:=false}"
 
 auth=(-H "X-Internal-Token: ${INTERNAL_TOKEN}")
 json=(-H "Content-Type: application/json")
@@ -14,6 +15,15 @@ json=(-H "Content-Type: application/json")
 echo "[1/9] health and ready"
 curl -fsS "${BASE_URL}/health" >/dev/null
 curl -fsS "${BASE_URL}/ready" >/dev/null
+
+if [[ "${PGBOUNCER_EXPECTED}" == "true" ]]; then
+  echo "[1b/9] verify runtime is routed via PgBouncer"
+  pg_port="$(curl -fsS "${BASE_URL}/internal/diagnostics" "${auth[@]}" | jq -r '.startup_self_check.pg_port // ""')"
+  if [[ "${pg_port}" != "6432" ]]; then
+    echo "expected pg_port=6432 (PgBouncer), got: ${pg_port}" >&2
+    exit 1
+  fi
+fi
 
 echo "[2/9] provision user"
 curl -fsS -X POST "${BASE_URL}/api/v1/users/provision" "${auth[@]}" "${json[@]}" \

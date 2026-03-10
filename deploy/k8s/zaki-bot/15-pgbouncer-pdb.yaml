@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nullclaw-pgbouncer
+  namespace: zaki-bot-staging
+  labels:
+    app.kubernetes.io/name: nullclaw-pgbouncer
+    app.kubernetes.io/part-of: zaki-bot
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nullclaw-pgbouncer
