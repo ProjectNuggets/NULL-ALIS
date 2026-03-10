@@ -37,6 +37,7 @@ const zaki_state_mod = @import("zaki_state.zig");
 const zaki_session = @import("zaki_session.zig");
 const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
+const runtime_resolver = @import("delivery/runtime_resolver.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -1430,7 +1431,32 @@ fn readTrimmedSecretFile(allocator: std.mem.Allocator, path: []const u8) ![]cons
     return out;
 }
 
-fn resolveTenantTelegramBotTokenForSend(allocator: std.mem.Allocator, user_ctx: *const UserContext) ![]const u8 {
+fn resolveTenantTelegramBotTokenForSend(
+    allocator: std.mem.Allocator,
+    user_ctx: *const UserContext,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
+    numeric_user_id_opt: ?i64,
+) ![]const u8 {
+    if (state_mgr_opt) |state_mgr| {
+        if (numeric_user_id_opt) |numeric_user_id| {
+            const secret_opt = state_mgr.getSecret(allocator, numeric_user_id, "telegram_bot_token") catch null;
+            if (secret_opt) |token_owned| {
+                errdefer allocator.free(token_owned);
+                const normalized_secret = normalizeTelegramBotToken(token_owned);
+                if (!isLikelyTelegramBotToken(normalized_secret)) {
+                    allocator.free(token_owned);
+                    return error.CurlFailed;
+                }
+                if (normalized_secret.ptr == token_owned.ptr and normalized_secret.len == token_owned.len) {
+                    return token_owned;
+                }
+                const out = try allocator.dupe(u8, normalized_secret);
+                allocator.free(token_owned);
+                return out;
+            }
+        }
+    }
+
     const secret_path = try resolveSecretPath(allocator, user_ctx.secrets_dir, "telegram_bot_token");
     defer allocator.free(secret_path);
 
@@ -3052,6 +3078,106 @@ fn appendHeartbeatRuntimeSummaryJson(
     try buf.appendSlice(allocator, "}");
 }
 
+fn appendIntegrationsSummaryJson(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id_opt: ?[]const u8,
+) !void {
+    try json_util.appendJsonKey(buf, allocator, "integrations");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKey(buf, allocator, "telegram");
+    try buf.appendSlice(allocator, "{");
+
+    const expect_postgres_state = state.tenant_enabled and std.mem.eql(u8, state.state_backend_effective, "postgres");
+    const numeric_user_id = blk: {
+        if (user_id_opt) |user_id| {
+            break :blk std.fmt.parseInt(i64, user_id, 10) catch null;
+        }
+        break :blk null;
+    };
+    const user_root = blk: {
+        if (user_id_opt) |user_id| {
+            break :blk std.fmt.allocPrint(allocator, "{s}/{s}", .{ state.tenant_data_root, user_id }) catch null;
+        }
+        break :blk null;
+    };
+    defer if (user_root) |path| allocator.free(path);
+
+    const configured_from_runtime = state.telegram_bot_token.len > 0;
+    var configured = configured_from_runtime;
+    var connected: ?bool = null;
+    var account_id: ?[]u8 = null;
+    defer if (account_id) |value| allocator.free(value);
+    var chat_id: ?i64 = null;
+    var data_source: []const u8 = if (user_id_opt != null) "context_missing" else "global";
+
+    if (user_id_opt != null) {
+        var resolved = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
+            .channel = "telegram",
+            .tenant_ctx = .{
+                .state_mgr = state.zaki_state,
+                .numeric_user_id = numeric_user_id,
+                .expect_postgres_state = expect_postgres_state,
+            },
+            .user_root = user_root,
+        }) catch |err| switch (err) {
+            error.MissingTenantContext => null,
+            error.NotConnected => null,
+            error.MissingCredential => null,
+            error.InvalidTarget => null,
+            error.UnsupportedChannel => null,
+            else => null,
+        };
+        if (resolved) |*ctx| {
+            defer ctx.deinit(allocator);
+            data_source = ctx.data_source;
+            connected = ctx.connected;
+            if (ctx.account_id) |value| {
+                account_id = try allocator.dupe(u8, value);
+            }
+            if (runtime_resolver.parseResolvedTargetChatId(ctx)) |parsed_chat_id| {
+                chat_id = parsed_chat_id;
+            } else |_| {}
+            if (ctx.credential_token != null) configured = true;
+            if (ctx.connected) configured = true;
+            if (ctx.target_id != null) configured = true;
+        } else {
+            if (expect_postgres_state) data_source = "context_missing";
+        }
+    }
+
+    try json_util.appendJsonKey(buf, allocator, "configured");
+    try buf.appendSlice(allocator, if (configured) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "connected");
+    if (connected) |value| {
+        try buf.appendSlice(allocator, if (value) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "account_id");
+    if (account_id) |value| {
+        try json_util.appendJsonString(buf, allocator, value);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "chat_id");
+    if (chat_id) |value| {
+        var int_buf: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&int_buf, "{d}", .{value}) catch "0";
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "data_source", data_source);
+    try buf.appendSlice(allocator, "}");
+    try buf.appendSlice(allocator, "}");
+}
+
 fn internalDiagnosticsPayload(
     allocator: std.mem.Allocator,
     state: *const GatewayState,
@@ -3231,6 +3357,8 @@ fn internalDiagnosticsPayload(
     }
 
     try appendHeartbeatRuntimeSummaryJson(&buf, allocator, state, user_id_opt);
+    try buf.appendSlice(allocator, ",");
+    try appendIntegrationsSummaryJson(&buf, allocator, state, user_id_opt);
     try buf.appendSlice(allocator, ",");
 
     try json_util.appendJsonKey(&buf, allocator, "ops");
@@ -4573,6 +4701,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         var scoped_user_id: ?[]const u8 = null;
         var use_shared_main = false;
         var tenant_channel_state_path: ?[]const u8 = null;
+        var numeric_user_id_opt: ?i64 = null;
         defer if (tenant_channel_state_path) |p| ctx.req_allocator.free(p);
         var tenant_user_ctx: ?UserContext = null;
         defer if (tenant_user_ctx) |*value| value.deinit(ctx.req_allocator);
@@ -4638,6 +4767,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         ctx.response_body = "{\"error\":\"invalid user\"}";
                         return;
                     };
+                    numeric_user_id_opt = numeric_user_id;
                     const raw_state = mgr.getTelegramStateJson(ctx.req_allocator, numeric_user_id) catch {
                         _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                         ctx.response_status = "403 Forbidden";
@@ -4676,36 +4806,19 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 tg_webhook_secret_token = secret;
             }
 
-            const tenant_bot_token = blk: {
-                const secret_path = resolveSecretPath(ctx.req_allocator, user_ctx.secrets_dir, "telegram_bot_token") catch {
-                    _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                    ctx.response_status = "500 Internal Server Error";
-                    ctx.response_body = "{\"error\":\"secret path failed\"}";
-                    return;
-                };
-                defer ctx.req_allocator.free(secret_path);
-                break :blk readTrimmedSecretFile(ctx.req_allocator, secret_path) catch {
-                    _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                    ctx.response_status = "500 Internal Server Error";
-                    ctx.response_body = "{\"error\":\"failed reading bot token\"}";
-                    return;
-                };
-            };
-            defer if (ctx.state.zaki_state != null and tenant_bot_token.len > 0) ctx.req_allocator.free(tenant_bot_token);
-            if (tenant_bot_token.len == 0) {
+            const tenant_bot_token = resolveTenantTelegramBotTokenForSend(
+                ctx.req_allocator,
+                user_ctx,
+                ctx.state.zaki_state,
+                numeric_user_id_opt,
+            ) catch {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                 ctx.response_status = "403 Forbidden";
                 ctx.response_body = "{\"error\":\"missing telegram bot token\"}";
                 return;
-            }
-            const normalized_tenant_bot_token = normalizeTelegramBotToken(tenant_bot_token);
-            if (!isLikelyTelegramBotToken(normalized_tenant_bot_token)) {
-                _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                ctx.response_status = "403 Forbidden";
-                ctx.response_body = "{\"error\":\"invalid telegram bot token\"}";
-                return;
-            }
-            tg_bot_token = normalized_tenant_bot_token;
+            };
+            defer if (tenant_bot_token.len > 0) ctx.req_allocator.free(tenant_bot_token);
+            tg_bot_token = tenant_bot_token;
 
             if (tg_webhook_secret_token.len == 0) {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
@@ -4809,6 +4922,15 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     ctx.response_body = "{\"error\":\"tenant runtime init failed\"}";
                     return;
                 };
+                var typing_channel = channels.telegram.TelegramChannel.init(
+                    ctx.req_allocator,
+                    tg_bot_token,
+                    &.{"*"},
+                    &.{},
+                    "open",
+                );
+                typing_channel.startTyping(cid_str) catch {};
+                defer typing_channel.stopTyping(cid_str) catch {};
                 const reply: ?[]const u8 = tenant_runtime.processMessage(
                     sk,
                     msg_text.?,
@@ -4824,7 +4946,12 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     null,
                 ) catch |err| blk: {
                     if (tenant_user_ctx) |*send_user_ctx| {
-                        const send_token = resolveTenantTelegramBotTokenForSend(ctx.req_allocator, send_user_ctx) catch |token_err| {
+                        const send_token = resolveTenantTelegramBotTokenForSend(
+                            ctx.req_allocator,
+                            send_user_ctx,
+                            ctx.state.zaki_state,
+                            numeric_user_id_opt,
+                        ) catch |token_err| {
                             log.warn("telegram tenant token resolve before error-reply failed: {}", .{token_err});
                             break :blk null;
                         };
@@ -4839,7 +4966,12 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     defer ctx.root_allocator.free(r);
                     if (tenant_user_ctx) |*send_user_ctx| {
                         const send_token_opt: ?[]const u8 = blk: {
-                            const send_token = resolveTenantTelegramBotTokenForSend(ctx.req_allocator, send_user_ctx) catch |token_err| {
+                            const send_token = resolveTenantTelegramBotTokenForSend(
+                                ctx.req_allocator,
+                                send_user_ctx,
+                                ctx.state.zaki_state,
+                                numeric_user_id_opt,
+                            ) catch |token_err| {
                                 log.warn("telegram tenant token resolve before reply failed: {}", .{token_err});
                                 break :blk null;
                             };

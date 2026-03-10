@@ -28,6 +28,8 @@ const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
 const json_util = @import("json_util.zig");
 const tools_mod = @import("tools/root.zig");
+const runtime_resolver = @import("delivery/runtime_resolver.zig");
+const morning_brief = @import("morning_brief.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 
 const log = std.log.scoped(.daemon);
@@ -38,6 +40,9 @@ const STATUS_FLUSH_SECONDS: u64 = 5;
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
 const MAX_DISPATCHER_WORKERS: u32 = 64;
+const MORNING_BRIEF_JOB_ID = morning_brief.MORNING_BRIEF_JOB_ID;
+const MORNING_BRIEF_AGENT_COMMAND = morning_brief.MORNING_BRIEF_AGENT_COMMAND;
+const MORNING_BRIEF_AGENT_PROMPT = morning_brief.MORNING_BRIEF_AGENT_PROMPT;
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -219,16 +224,6 @@ const UserHeartbeatConfig = struct {
 
     fn deinit(self: *UserHeartbeatConfig, allocator: std.mem.Allocator) void {
         if (self.prompt_owned) allocator.free(self.prompt);
-    }
-};
-
-const HeartbeatTelegramTarget = struct {
-    chat_id: i64,
-    account_id: []const u8 = "main",
-    account_id_owned: bool = false,
-
-    fn deinit(self: *HeartbeatTelegramTarget, allocator: std.mem.Allocator) void {
-        if (self.account_id_owned) allocator.free(self.account_id);
     }
 };
 
@@ -649,50 +644,130 @@ fn makeHeartbeatDedupeKey(
     return std.fmt.allocPrint(allocator, "heartbeat:{s}:{s}:{x}", .{ user_id, chat_id, hash });
 }
 
-fn resolveHeartbeatTelegramTarget(
+fn isMorningBriefJobId(id: []const u8) bool {
+    return morning_brief.isMorningBriefId(id);
+}
+
+fn commandLooksMorningBrief(command: []const u8) bool {
+    return morning_brief.commandLooksMorningBrief(command);
+}
+
+fn shouldSelfHealMorningBriefJob(job: *const cron.CronJob) bool {
+    return isMorningBriefJobId(job.id) or commandLooksMorningBrief(job.command);
+}
+
+fn replaceJobOwnedString(
     allocator: std.mem.Allocator,
-    user_root: []const u8,
-) !?HeartbeatTelegramTarget {
-    const path = try std.fmt.allocPrint(allocator, "{s}/channel_state.json", .{user_root});
-    defer allocator.free(path);
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer file.close();
-    const raw = try file.readToEndAlloc(allocator, 128 * 1024);
-    defer allocator.free(raw);
+    field: *[]const u8,
+    new_value: []const u8,
+) !bool {
+    if (std.mem.eql(u8, field.*, new_value)) return false;
+    allocator.free(field.*);
+    field.* = try allocator.dupe(u8, new_value);
+    return true;
+}
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const telegram_obj = parsed.value.object.get("telegram") orelse return null;
-    if (telegram_obj != .object) return null;
+fn replaceJobOptionalOwnedString(
+    allocator: std.mem.Allocator,
+    field: *?[]const u8,
+    owned: *bool,
+    new_value: []const u8,
+) !bool {
+    if (field.*) |existing| {
+        if (std.mem.eql(u8, existing, new_value)) return false;
+        if (owned.*) allocator.free(existing);
+    }
+    field.* = try allocator.dupe(u8, new_value);
+    owned.* = true;
+    return true;
+}
 
-    const connected_val = telegram_obj.object.get("connected");
-    if (connected_val != null and connected_val.? == .bool and !connected_val.?.bool) return null;
+fn resolveMorningBriefTarget(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    user_root: ?[]const u8,
+    numeric_user_id: ?i64,
+    state_mgr: ?*zaki_state.Manager,
+) ?[]u8 {
+    var resolved = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
+        .channel = "telegram",
+        .tenant_ctx = .{
+            .state_mgr = state_mgr,
+            .numeric_user_id = numeric_user_id,
+            .expect_postgres_state = config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres"),
+        },
+        .user_root = user_root,
+    }) catch return null;
+    defer resolved.deinit(allocator);
 
-    var target = HeartbeatTelegramTarget{
-        .chat_id = 0,
-    };
-    errdefer target.deinit(allocator);
+    runtime_resolver.requireConnectedTarget(&resolved) catch return null;
+    const target_id = resolved.target_id orelse return null;
+    return allocator.dupe(u8, target_id) catch null;
+}
 
-    const chat_id_val = telegram_obj.object.get("chat_id") orelse return null;
-    target.chat_id = switch (chat_id_val) {
-        .integer => chat_id_val.integer,
-        .string => std.fmt.parseInt(i64, chat_id_val.string, 10) catch return null,
-        else => return null,
-    };
-    if (target.chat_id == 0) return null;
+fn selfHealMorningBriefJob(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    user_root: ?[]const u8,
+    numeric_user_id: ?i64,
+    state_mgr: ?*zaki_state.Manager,
+    job: *cron.CronJob,
+) !bool {
+    if (!shouldSelfHealMorningBriefJob(job)) return false;
 
-    if (telegram_obj.object.get("account_id")) |account_id_val| {
-        if (account_id_val == .string and account_id_val.string.len > 0) {
-            target.account_id = try allocator.dupe(u8, account_id_val.string);
-            target.account_id_owned = true;
-        }
+    var changed = false;
+    changed = (try replaceJobOwnedString(allocator, &job.id, MORNING_BRIEF_JOB_ID)) or changed;
+    changed = (try replaceJobOwnedString(allocator, &job.command, MORNING_BRIEF_AGENT_COMMAND)) or changed;
+    changed = (try replaceJobOptionalOwnedString(allocator, &job.prompt, &job.prompt_owned, MORNING_BRIEF_AGENT_PROMPT)) or changed;
+    changed = (try replaceJobOptionalOwnedString(allocator, &job.delivery.channel, &job.delivery_channel_owned, "telegram")) or changed;
+
+    if (resolveMorningBriefTarget(allocator, config, user_root, numeric_user_id, state_mgr)) |target| {
+        defer allocator.free(target);
+        changed = (try replaceJobOptionalOwnedString(allocator, &job.delivery.to, &job.delivery_to_owned, target)) or changed;
     }
 
-    return target;
+    if (job.job_type != .agent) {
+        job.job_type = .agent;
+        changed = true;
+    }
+    if (job.session_target != .main) {
+        job.session_target = .main;
+        changed = true;
+    }
+    if (job.wake_mode != .now) {
+        job.wake_mode = .now;
+        changed = true;
+    }
+    if (job.delivery.mode != .always) {
+        job.delivery.mode = .always;
+        changed = true;
+    }
+    if (!job.delivery.best_effort) {
+        job.delivery.best_effort = true;
+        changed = true;
+    }
+    if (job.last_status != null) {
+        job.last_status = null;
+        changed = true;
+    }
+    if (job.consecutive_failures != 0) {
+        job.consecutive_failures = 0;
+        changed = true;
+    }
+    if (job.cooldown_until_secs != null) {
+        job.cooldown_until_secs = null;
+        changed = true;
+    }
+    if (job.burst_count_in_window != 0) {
+        job.burst_count_in_window = 0;
+        changed = true;
+    }
+    if (job.burst_window_start_secs != 0) {
+        job.burst_window_start_secs = 0;
+        changed = true;
+    }
+
+    return changed;
 }
 
 fn sendHeartbeatTelegramMessage(
@@ -791,33 +866,60 @@ fn runTenantHeartbeatForUser(
         return;
     };
 
-    var target = resolveHeartbeatTelegramTarget(allocator, user_root) catch |err| {
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_target", @errorName(err));
-        return;
-    } orelse {
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_target", reason);
-        return;
+    var delivery_ctx = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
+        .channel = "telegram",
+        .tenant_ctx = .{
+            .state_mgr = state_mgr,
+            .numeric_user_id = user_id_numeric,
+            .expect_postgres_state = config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres"),
+        },
+        .user_root = user_root,
+    }) catch |err| switch (err) {
+        error.MissingTenantContext => {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "context_incomplete", reason);
+            return;
+        },
+        error.NotConnected, error.InvalidTarget => {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_target", reason);
+            return;
+        },
+        error.MissingCredential => {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_token", reason);
+            return;
+        },
+        error.UnsupportedChannel => {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_target", @errorName(err));
+            return;
+        },
+        else => {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_target", @errorName(err));
+            return;
+        },
     };
-    defer target.deinit(allocator);
+    defer delivery_ctx.deinit(allocator);
 
-    const token_path = std.fmt.allocPrint(allocator, "{s}/secrets/telegram_bot_token", .{user_root}) catch {
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_token_path", "alloc_failed");
-        return;
-    };
-    defer allocator.free(token_path);
-    const bot_token = readTrimmedFileOwned(allocator, token_path) catch null;
-    defer if (bot_token) |value| allocator.free(value);
-    const token = bot_token orelse {
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_token", reason);
-        return;
-    };
-    if (token.len == 0) {
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_token", reason);
+    if (delivery_ctx.context_incomplete) {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "context_incomplete", reason);
         return;
     }
 
+    runtime_resolver.requireConnectedTarget(&delivery_ctx) catch {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_target", reason);
+        return;
+    };
+
+    const token = runtime_resolver.requireCredential(&delivery_ctx) catch {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_token", reason);
+        return;
+    };
+
+    const chat_id = runtime_resolver.parseResolvedTargetChatId(&delivery_ctx) catch {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_target", reason);
+        return;
+    };
+
     var chat_buf: [32]u8 = undefined;
-    const chat_id_text = std.fmt.bufPrint(&chat_buf, "{d}", .{target.chat_id}) catch "0";
+    const chat_id_text = std.fmt.bufPrint(&chat_buf, "{d}", .{chat_id}) catch "0";
     const dedupe_key = makeHeartbeatDedupeKey(allocator, user_id, chat_id_text, actionable_reply) catch null;
     defer if (dedupe_key) |key| allocator.free(key);
     const decision = ops_guard.allowProactive("heartbeat", user_id, "telegram", chat_id_text, actionable_reply, dedupe_key, now_s);
@@ -833,7 +935,7 @@ fn runTenantHeartbeatForUser(
         },
     }
 
-    sendHeartbeatTelegramMessage(allocator, token, target.chat_id, actionable_reply) catch |err| {
+    sendHeartbeatTelegramMessage(allocator, token, chat_id, actionable_reply) catch |err| {
         ops_guard.recordProactiveSendError("heartbeat", user_id, "telegram", chat_id_text, @errorName(err), std.time.timestamp());
         saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_send", @errorName(err));
         return;
@@ -1213,13 +1315,24 @@ fn runTenantSchedulerTick(
         defer scheduler.deinit();
         scheduler.setAgentRunner(runCronAgentTurn, @ptrCast(@constCast(config)));
         scheduler.setExecutionContext(entry.name, user_root, workspace_path) catch continue;
+        scheduler.setTenantStateContext(null, null, false);
         cron.loadJobsFromPath(&scheduler, cron_path) catch |err| {
             log.warn("tenant scheduler load failed for user={s}: {}", .{ entry.name, err });
             continue;
         };
 
+        var healed_before_tick = false;
+        const numeric_user_id = parseNumericUserIdFromDirName(entry.name);
+        for (scheduler.jobs.items) |*job| {
+            const healed = selfHealMorningBriefJob(allocator, config, user_root, numeric_user_id, null, job) catch false;
+            if (healed) {
+                healed_before_tick = true;
+                log.info("scheduler.morning_brief.self_heal backend=file user={s} job={s}", .{ entry.name, job.id });
+            }
+        }
+
         const changed = scheduler.tick(now, event_bus);
-        if (changed) {
+        if (changed or healed_before_tick) {
             cron.saveJobsToPath(&scheduler, cron_path) catch |err| {
                 log.warn("tenant scheduler save failed for user={s}: {}", .{ entry.name, err });
             };
@@ -1255,6 +1368,7 @@ fn runTenantSchedulerTickPostgres(
         const user_id_text = try std.fmt.bufPrint(&user_buf, "{d}", .{job.user_id});
         const user_root = std.fs.path.dirname(job.workspace_path) orelse "";
         try scheduler.setExecutionContext(user_id_text, user_root, job.workspace_path);
+        scheduler.setTenantStateContext(job.user_id, mgr, true);
 
         const started_at_s = std.time.timestamp();
         var finish_status: []const u8 = "error";
@@ -1274,6 +1388,12 @@ fn runTenantSchedulerTickPostgres(
             };
             continue;
         };
+
+        if (scheduler.jobs.items.len > 0) {
+            if (selfHealMorningBriefJob(allocator, config, user_root, job.user_id, mgr, &scheduler.jobs.items[0]) catch false) {
+                log.info("scheduler.morning_brief.self_heal backend=postgres user={d} job={s}", .{ job.user_id, scheduler.jobs.items[0].id });
+            }
+        }
 
         _ = scheduler.tick(std.time.timestamp(), event_bus);
         if (scheduler.listJobs().len == 0) {
@@ -3082,6 +3202,28 @@ test "default heartbeat templates are treated as effectively empty" {
         \\
         \\Keep only tasks the user actually wants automated.
     ));
+}
+
+test "commandLooksMorningBrief ignores generic heartbeat commands" {
+    try std.testing.expect(commandLooksMorningBrief("daily_morning_brief"));
+    try std.testing.expect(commandLooksMorningBrief("send morning brief at 08:00"));
+    try std.testing.expect(!commandLooksMorningBrief("heartbeat run now"));
+}
+
+test "shouldSelfHealMorningBriefJob only matches explicit morning brief identity" {
+    var heartbeat_job = cron.CronJob{
+        .id = "job-heartbeat",
+        .expression = "*/5 * * * *",
+        .command = "heartbeat run now",
+    };
+    try std.testing.expect(!shouldSelfHealMorningBriefJob(&heartbeat_job));
+
+    var brief_job = cron.CronJob{
+        .id = "morning-brief",
+        .expression = "0 8 * * *",
+        .command = "echo legacy",
+    };
+    try std.testing.expect(shouldSelfHealMorningBriefJob(&brief_job));
 }
 
 test "makeHeartbeatDedupeKey stable for same payload" {

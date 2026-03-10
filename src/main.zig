@@ -73,6 +73,38 @@ fn parseCommand(arg: []const u8) ?Command {
     return command_map.get(arg);
 }
 
+fn parseOptionalUserIdFlag(command_name: []const u8, sub_args: []const []const u8) ?[]const u8 {
+    var user_id: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
+        if (std.mem.eql(u8, arg, "--user-id")) {
+            if (i + 1 >= sub_args.len) {
+                std.debug.print("Usage: nullalis {s} [--user-id <id>]\n", .{command_name});
+                std.process.exit(1);
+            }
+            i += 1;
+            if (sub_args[i].len == 0) {
+                std.debug.print("Invalid --user-id value: empty\n", .{});
+                std.process.exit(1);
+            }
+            user_id = sub_args[i];
+            continue;
+        }
+        std.debug.print("Unknown option for {s}: {s}\n", .{ command_name, arg });
+        std.debug.print("Usage: nullalis {s} [--user-id <id>]\n", .{command_name});
+        std.process.exit(1);
+    }
+    return user_id;
+}
+
+fn printMaxTasksReached(max_tasks: usize) void {
+    std.debug.print(
+        "Scheduler at max capacity ({d} jobs). Remove old jobs or increase scheduler.max_tasks.\n",
+        .{max_tasks},
+    );
+}
+
 pub fn main() !void {
     // Enable UTF-8 output on Windows console (fixes Cyrillic/Unicode garbling)
     if (comptime builtin.os.tag == .windows) {
@@ -111,11 +143,20 @@ fn runMain(allocator: std.mem.Allocator) !void {
 
     switch (cmd) {
         .version => printVersion(),
-        .status => try yc.status.run(allocator),
+        .status => {
+            const user_id = parseOptionalUserIdFlag("status", sub_args);
+            try yc.status.runWithUser(allocator, user_id);
+        },
         .agent => try yc.agent.run(allocator, sub_args),
         .onboard => try runOnboard(allocator, sub_args),
-        .doctor => try yc.doctor.run(allocator),
-        .arzt => try yc.doctor.run(allocator),
+        .doctor => {
+            const user_id = parseOptionalUserIdFlag("doctor", sub_args);
+            try yc.doctor.runWithUser(allocator, user_id);
+        },
+        .arzt => {
+            const user_id = parseOptionalUserIdFlag("arzt", sub_args);
+            try yc.doctor.runWithUser(allocator, user_id);
+        },
         .help => printUsage(),
         .gateway => try runGateway(allocator, sub_args),
         .service => try runService(allocator, sub_args),
@@ -409,7 +450,13 @@ fn runCronPostgres(
         }
         var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
         defer scheduler.deinit();
-        const job = try scheduler.addJob(args[0], args[1]);
+        const job = scheduler.addJob(args[0], args[1]) catch |err| {
+            if (err == error.MaxTasksReached) {
+                printMaxTasksReached(scheduler.max_tasks);
+                std.process.exit(1);
+            }
+            return err;
+        };
         try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
         std.debug.print("info(cron): Added cron job {s}\n", .{job.id});
         std.debug.print("info(cron):   Expr: {s}\n", .{job.expression});
@@ -425,7 +472,13 @@ fn runCronPostgres(
         }
         var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
         defer scheduler.deinit();
-        const job = try scheduler.addOnce(args[0], args[1]);
+        const job = scheduler.addOnce(args[0], args[1]) catch |err| {
+            if (err == error.MaxTasksReached) {
+                printMaxTasksReached(scheduler.max_tasks);
+                std.process.exit(1);
+            }
+            return err;
+        };
         try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
         std.debug.print("info(cron): Added one-shot task {s}\n", .{job.id});
         std.debug.print("info(cron):   Runs at: {d}\n", .{job.next_run_secs});
@@ -658,13 +711,27 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("Usage: nullalis cron add <expression> <command>\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliAddJob(allocator, filtered.items[0], filtered.items[1]);
+        yc.cron.cliAddJob(allocator, filtered.items[0], filtered.items[1]) catch |err| {
+            if (err == error.MaxTasksReached) {
+                const max_tasks = if (cfg_ptr) |cfg| @max(@as(usize, 1), cfg.scheduler.max_tasks) else @as(usize, 1024);
+                printMaxTasksReached(max_tasks);
+                std.process.exit(1);
+            }
+            return err;
+        };
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (filtered.items.len < 2) {
             std.debug.print("Usage: nullalis cron once <delay> <command>\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliAddOnce(allocator, filtered.items[0], filtered.items[1]);
+        yc.cron.cliAddOnce(allocator, filtered.items[0], filtered.items[1]) catch |err| {
+            if (err == error.MaxTasksReached) {
+                const max_tasks = if (cfg_ptr) |cfg| @max(@as(usize, 1), cfg.scheduler.max_tasks) else @as(usize, 1024);
+                printMaxTasksReached(max_tasks);
+                std.process.exit(1);
+            }
+            return err;
+        };
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (filtered.items.len < 1) {
             std.debug.print("Usage: nullalis cron remove <id>\n", .{});
@@ -2992,7 +3059,10 @@ fn printUsage() void {
         \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--memory MEM]
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
+        \\  status [--user-id ID]
         \\  version | --version | -V
+        \\  doctor [--user-id ID]
+        \\  arzt [--user-id ID]
         \\  service <install|start|stop|status|uninstall>
         \\  cron <list|add|once|remove|pause|resume> [ARGS] [--backend auto|file|postgres] [--user-id ID]
         \\  channel <list|start|status|add|remove> [ARGS]

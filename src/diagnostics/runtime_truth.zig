@@ -31,6 +31,9 @@ pub const RuntimeSnapshot = struct {
     scheduler_max_tasks_effective: ?u32 = null,
     telegram_configured: ?bool = null,
     telegram_connected: ?bool = null,
+    telegram_account_id: ?[]u8 = null,
+    telegram_chat_id: ?i64 = null,
+    telegram_data_source: ?[]u8 = null,
     context_incomplete: bool = false,
 
     pub fn deinit(self: *RuntimeSnapshot, allocator: std.mem.Allocator) void {
@@ -38,6 +41,8 @@ pub const RuntimeSnapshot = struct {
         allocator.free(self.state_backend_effective);
         allocator.free(self.scheduler_backend);
         allocator.free(self.degraded_reason);
+        if (self.telegram_account_id) |value| allocator.free(value);
+        if (self.telegram_data_source) |value| allocator.free(value);
     }
 };
 
@@ -96,7 +101,9 @@ fn collectGatewayInternalSnapshot(
     snapshot.scheduler_max_tasks_configured = cfg.scheduler.max_tasks;
     snapshot.scheduler_max_concurrent_configured = cfg.scheduler.max_concurrent;
     snapshot.scheduler_max_tasks_effective = cfg.scheduler.max_tasks;
-    snapshot.telegram_configured = channel_catalog.configuredCount(cfg, .telegram) > 0;
+    if (snapshot.telegram_configured == null and snapshot.telegram_data_source == null) {
+        snapshot.telegram_configured = channel_catalog.configuredCount(cfg, .telegram) > 0;
+    }
     return snapshot;
 }
 
@@ -117,6 +124,39 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
     const heartbeat_interval_minutes = readObjectU32(startup, "heartbeat_interval_minutes") orelse 0;
     const tenant_enabled = readObjectBool(startup, "tenant_enabled") orelse false;
 
+    var telegram_configured: ?bool = null;
+    var telegram_connected: ?bool = null;
+    var telegram_account_id: ?[]u8 = null;
+    errdefer if (telegram_account_id) |value| allocator.free(value);
+    var telegram_chat_id: ?i64 = null;
+    var telegram_data_source: ?[]u8 = null;
+    errdefer if (telegram_data_source) |value| allocator.free(value);
+
+    if (parsed.value.object.get("integrations")) |integrations_value| {
+        if (integrations_value == .object) {
+            if (integrations_value.object.get("telegram")) |telegram_value| {
+                if (telegram_value == .object) {
+                    telegram_configured = readObjectBool(telegram_value.object, "configured");
+                    telegram_connected = readObjectBool(telegram_value.object, "connected");
+                    if (readObjectString(telegram_value.object, "account_id")) |value| {
+                        if (!std.mem.eql(u8, value, "null")) {
+                            telegram_account_id = try allocator.dupe(u8, value);
+                        }
+                    }
+                    telegram_chat_id = readObjectI64(telegram_value.object, "chat_id");
+                    if (readObjectString(telegram_value.object, "data_source")) |value| {
+                        telegram_data_source = try allocator.dupe(u8, value);
+                    }
+                    if (telegram_data_source) |source| {
+                        if (std.mem.eql(u8, source, "global") and telegram_connected == null and telegram_configured != true) {
+                            telegram_configured = null;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     return .{
         .source = .gateway_internal,
         .state_backend_configured = try allocator.dupe(u8, configured),
@@ -129,6 +169,11 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
         .tenant_enabled = tenant_enabled,
         .scheduler_max_tasks_configured = 0,
         .scheduler_max_concurrent_configured = 0,
+        .telegram_configured = telegram_configured,
+        .telegram_connected = telegram_connected,
+        .telegram_account_id = telegram_account_id,
+        .telegram_chat_id = telegram_chat_id,
+        .telegram_data_source = telegram_data_source,
     };
 }
 
@@ -165,6 +210,9 @@ fn collectLocalFallbackSnapshot(allocator: std.mem.Allocator, cfg: *const config
         .scheduler_max_tasks_effective = if (std.mem.eql(u8, scheduler_backend, "unknown")) null else cfg.scheduler.max_tasks,
         .telegram_configured = channel_catalog.configuredCount(cfg, .telegram) > 0,
         .telegram_connected = null,
+        .telegram_account_id = null,
+        .telegram_chat_id = null,
+        .telegram_data_source = try allocator.dupe(u8, "local_fallback"),
         .context_incomplete = context_incomplete,
     };
 }
@@ -190,6 +238,15 @@ fn readObjectU32(obj: std.json.ObjectMap, key: []const u8) ?u32 {
     };
 }
 
+fn readObjectI64(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .integer => v.integer,
+        .string => std.fmt.parseInt(i64, v.string, 10) catch null,
+        else => null,
+    };
+}
+
 test "parseGatewayDiagnosticsPayload reads startup self check" {
     const payload =
         \\{
@@ -202,6 +259,15 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
         \\    "heartbeat_enabled": true,
         \\    "heartbeat_interval_minutes": 30,
         \\    "tenant_enabled": true
+        \\  },
+        \\  "integrations": {
+        \\    "telegram": {
+        \\      "configured": true,
+        \\      "connected": true,
+        \\      "account_id": "main",
+        \\      "chat_id": 1110331014,
+        \\      "data_source": "postgres"
+        \\    }
         \\  }
         \\}
     ;
@@ -212,6 +278,11 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
     try std.testing.expectEqualStrings("postgres", snapshot.scheduler_backend);
     try std.testing.expect(snapshot.heartbeat_enabled);
     try std.testing.expectEqual(@as(u32, 30), snapshot.heartbeat_interval_minutes);
+    try std.testing.expectEqual(@as(?bool, true), snapshot.telegram_configured);
+    try std.testing.expectEqual(@as(?bool, true), snapshot.telegram_connected);
+    try std.testing.expectEqualStrings("main", snapshot.telegram_account_id.?);
+    try std.testing.expectEqual(@as(?i64, 1110331014), snapshot.telegram_chat_id);
+    try std.testing.expectEqualStrings("postgres", snapshot.telegram_data_source.?);
 }
 
 test "collectLocalFallbackSnapshot marks unknown effective backend when runtime probe is unavailable" {

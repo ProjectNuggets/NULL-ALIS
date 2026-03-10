@@ -7,12 +7,22 @@ const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 const message_tool = @import("message.zig");
+const runtime_resolver = @import("../delivery/runtime_resolver.zig");
+const config_mod = @import("../config.zig");
+const morning_brief = @import("../morning_brief.zig");
 
 const DEFAULT_MAX_ACTIVE_JOBS: usize = 1024;
-const MAX_ACTIVE_JOBS_PER_USER: usize = 64;
 const MIN_ONCE_DELAY_SECS: i64 = 60;
+const MORNING_BRIEF_JOB_ID = morning_brief.MORNING_BRIEF_JOB_ID;
+const MORNING_BRIEF_AGENT_COMMAND = morning_brief.MORNING_BRIEF_AGENT_COMMAND;
+const MORNING_BRIEF_AGENT_PROMPT = morning_brief.MORNING_BRIEF_AGENT_PROMPT;
 
-fn loadSchedulerForContext(allocator: std.mem.Allocator) !struct {
+fn resolveSchedulerMaxTasks(config: ?*const config_mod.Config) usize {
+    if (config) |cfg| return @max(@as(usize, 1), cfg.scheduler.max_tasks);
+    return DEFAULT_MAX_ACTIVE_JOBS;
+}
+
+fn loadSchedulerForContext(allocator: std.mem.Allocator, config: ?*const config_mod.Config) !struct {
     scheduler: CronScheduler,
     tenant: root.ToolTenantContext,
 } {
@@ -20,10 +30,11 @@ fn loadSchedulerForContext(allocator: std.mem.Allocator) !struct {
     if (tenant.expect_postgres_state and (tenant.state_mgr == null or tenant.numeric_user_id == null)) {
         return error.MissingTenantStateContext;
     }
-    var scheduler = CronScheduler.init(allocator, DEFAULT_MAX_ACTIVE_JOBS, true);
+    const max_tasks = resolveSchedulerMaxTasks(config);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
     if (tenant.state_mgr) |mgr| {
         if (tenant.numeric_user_id) |user_id| {
-            scheduler.max_tasks = MAX_ACTIVE_JOBS_PER_USER;
+            scheduler.max_tasks = max_tasks;
             const jobs_json = try mgr.getJobsJson(allocator, user_id);
             defer allocator.free(jobs_json);
             const trimmed = std.mem.trim(u8, jobs_json, " \t\r\n");
@@ -42,12 +53,117 @@ fn loadSchedulerForContext(allocator: std.mem.Allocator) !struct {
         }
     }
     scheduler = loadScheduler(allocator) catch scheduler;
+    scheduler.max_tasks = max_tasks;
     return .{ .scheduler = scheduler, .tenant = tenant };
 }
 
 fn validateOnceDelay(delay: []const u8) !void {
     const delay_secs = try cron.parseDuration(delay);
     if (delay_secs < MIN_ONCE_DELAY_SECS) return error.DelayTooShort;
+}
+
+fn normalizeIdToken(raw: []const u8) []const u8 {
+    return std.mem.trim(u8, raw, " \t\r\n");
+}
+
+fn isMorningBriefId(id: []const u8) bool {
+    return morning_brief.isMorningBriefId(normalizeIdToken(id));
+}
+
+fn shouldCanonicalizeMorningBrief(requested_id: ?[]const u8, created_job_id: []const u8, command: []const u8) bool {
+    return morning_brief.shouldCanonicalize(requested_id, created_job_id, command);
+}
+
+const TelegramDeliveryTarget = struct {
+    account_id: []const u8 = "main",
+    account_id_owned: bool = false,
+    chat_id: []u8,
+
+    fn deinit(self: *TelegramDeliveryTarget, allocator: std.mem.Allocator) void {
+        if (self.account_id_owned) allocator.free(self.account_id);
+        allocator.free(self.chat_id);
+    }
+};
+
+fn maxTasksReachedError(allocator: std.mem.Allocator, max_tasks: usize) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "Scheduler at max capacity ({d} jobs). Remove old jobs or increase scheduler.max_tasks.",
+        .{max_tasks},
+    );
+}
+
+fn resolveTelegramDeliveryTarget(allocator: std.mem.Allocator, tenant: root.ToolTenantContext) !?TelegramDeliveryTarget {
+    const turn = message_tool.MessageTool.getTurnContext();
+    const target_hint = if (turn.channel != null and std.ascii.eqlIgnoreCase(turn.channel.?, "telegram")) turn.chat_id else null;
+    var resolved = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
+        .channel = "telegram",
+        .tenant_ctx = .{
+            .state_mgr = tenant.state_mgr,
+            .numeric_user_id = tenant.numeric_user_id,
+            .expect_postgres_state = tenant.expect_postgres_state,
+        },
+        .target_hint = target_hint,
+    }) catch return null;
+    defer resolved.deinit(allocator);
+
+    runtime_resolver.requireConnectedTarget(&resolved) catch return null;
+    const chat_id_text = resolved.target_id orelse return null;
+
+    var target = TelegramDeliveryTarget{
+        .chat_id = try allocator.dupe(u8, chat_id_text),
+    };
+    errdefer target.deinit(allocator);
+
+    if (resolved.account_id) |account_id| {
+        target.account_id = try allocator.dupe(u8, account_id);
+        target.account_id_owned = true;
+    }
+    return target;
+}
+
+fn normalizeMorningBriefJob(
+    scheduler: *CronScheduler,
+    allocator: std.mem.Allocator,
+    tenant: root.ToolTenantContext,
+    job_id: []const u8,
+) !void {
+    const job = scheduler.getMutableJob(job_id) orelse return error.JobNotFound;
+    job.session_target = .main;
+    job.wake_mode = .now;
+    job.job_type = .agent;
+
+    allocator.free(job.command);
+    job.command = try allocator.dupe(u8, MORNING_BRIEF_AGENT_COMMAND);
+
+    if (job.prompt_owned) {
+        if (job.prompt) |existing| allocator.free(existing);
+    }
+    job.prompt = try allocator.dupe(u8, MORNING_BRIEF_AGENT_PROMPT);
+    job.prompt_owned = true;
+
+    if (job.delivery_channel_owned) {
+        if (job.delivery.channel) |existing| allocator.free(existing);
+    }
+    job.delivery.mode = .always;
+    job.delivery.best_effort = true;
+    job.delivery.channel = try allocator.dupe(u8, "telegram");
+    job.delivery_channel_owned = true;
+    if (try resolveTelegramDeliveryTarget(allocator, tenant)) |resolved_target| {
+        var target = resolved_target;
+        defer target.deinit(allocator);
+        if (job.delivery_to_owned) {
+            if (job.delivery.to) |existing| allocator.free(existing);
+        }
+        job.delivery.to = try allocator.dupe(u8, target.chat_id);
+        job.delivery_to_owned = true;
+    }
+
+    job.last_status = null;
+    job.cooldown_until_secs = null;
+    job.consecutive_failures = 0;
+    job.burst_count_in_window = 0;
+    job.burst_window_start_secs = 0;
 }
 
 fn saveSchedulerForContext(scheduler: *CronScheduler, tenant: root.ToolTenantContext) !void {
@@ -153,6 +269,8 @@ fn applyTenantDefaults(
 /// Schedule tool — lets the agent manage recurring and one-shot scheduled tasks.
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
+    config: ?*const config_mod.Config = null,
+
     pub const tool_name = "schedule";
     pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume";
     pub const tool_params =
@@ -168,12 +286,12 @@ pub const ScheduleTool = struct {
         };
     }
 
-    pub fn execute(_: *ScheduleTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(self: *ScheduleTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const action = root.getString(args, "action") orelse
             return ToolResult.fail("Missing 'action' parameter");
 
         if (std.mem.eql(u8, action, "list")) {
-            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+            const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
                 error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
                 else => return ToolResult.ok("No scheduled jobs."),
             };
@@ -213,7 +331,7 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for get action");
 
-            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+            const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
                 error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
                 else => {
                     const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
@@ -250,14 +368,29 @@ pub const ScheduleTool = struct {
                 return ToolResult.fail("Missing 'command' parameter");
             const expression = root.getString(args, "expression") orelse
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
-            const requested_id = normalizeRequestedId(root.getString(args, "id"));
+            const requested_id_raw = normalizeRequestedId(root.getString(args, "id"));
+            const morning_brief_request = shouldCanonicalizeMorningBrief(requested_id_raw, requested_id_raw orelse "", command);
+            const requested_id: ?[]const u8 = if (morning_brief_request) MORNING_BRIEF_JOB_ID else requested_id_raw;
 
-            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+            const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
                 error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
                 else => return ToolResult.fail("Failed to load scheduler state"),
             };
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
+
+            if (morning_brief_request) {
+                if (findMorningBriefJob(scheduler.listJobs())) |existing| {
+                    normalizeMorningBriefJob(&scheduler, allocator, loaded.tenant, existing.id) catch {};
+                    saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
+                    const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
+                        existing.id,
+                        existing.expression,
+                        existing.command,
+                    });
+                    return ToolResult{ .success = true, .output = msg };
+                }
+            }
 
             if (requested_id) |id| {
                 if (scheduler.getJob(id)) |existing| {
@@ -280,6 +413,10 @@ pub const ScheduleTool = struct {
             }
 
             const job = scheduler.addJob(expression, command) catch |err| {
+                if (err == error.MaxTasksReached) {
+                    const msg = try maxTasksReachedError(allocator, scheduler.max_tasks);
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                }
                 const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
@@ -289,7 +426,18 @@ pub const ScheduleTool = struct {
                 job.id = try allocator.dupe(u8, id);
             }
 
-            try applyTenantDefaults(&scheduler, allocator, job.id, command);
+            if (shouldCanonicalizeMorningBrief(requested_id, job.id, command)) {
+                normalizeMorningBriefJob(&scheduler, allocator, loaded.tenant, job.id) catch |err| {
+                    _ = scheduler.removeJob(job.id);
+                    const message = switch (err) {
+                        else => "Failed to normalize morning-brief job",
+                    };
+                    const msg = try allocator.dupe(u8, message);
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
+            } else {
+                try applyTenantDefaults(&scheduler, allocator, job.id, command);
+            }
             saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
 
             const msg = try std.fmt.allocPrint(allocator, "Created job {s} | {s} | cmd: {s}", .{
@@ -305,17 +453,32 @@ pub const ScheduleTool = struct {
                 return ToolResult.fail("Missing 'command' parameter");
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
-            const requested_id = normalizeRequestedId(root.getString(args, "id"));
+            const requested_id_raw = normalizeRequestedId(root.getString(args, "id"));
+            const morning_brief_request = shouldCanonicalizeMorningBrief(requested_id_raw, requested_id_raw orelse "", command);
+            const requested_id: ?[]const u8 = if (morning_brief_request) MORNING_BRIEF_JOB_ID else requested_id_raw;
             validateOnceDelay(delay) catch {
                 return ToolResult.fail("Delay too short; minimum is 60s");
             };
 
-            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+            const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
                 error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
                 else => return ToolResult.fail("Failed to load scheduler state"),
             };
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
+
+            if (morning_brief_request) {
+                if (findMorningBriefJob(scheduler.listJobs())) |existing| {
+                    normalizeMorningBriefJob(&scheduler, allocator, loaded.tenant, existing.id) catch {};
+                    saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
+                    const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
+                        existing.id,
+                        existing.expression,
+                        existing.command,
+                    });
+                    return ToolResult{ .success = true, .output = msg };
+                }
+            }
 
             if (requested_id) |id| {
                 if (scheduler.getJob(id)) |existing| {
@@ -329,6 +492,10 @@ pub const ScheduleTool = struct {
             }
 
             const job = scheduler.addOnce(delay, command) catch |err| {
+                if (err == error.MaxTasksReached) {
+                    const msg = try maxTasksReachedError(allocator, scheduler.max_tasks);
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                }
                 const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
@@ -338,7 +505,18 @@ pub const ScheduleTool = struct {
                 job.id = try allocator.dupe(u8, id);
             }
 
-            try applyTenantDefaults(&scheduler, allocator, job.id, command);
+            if (shouldCanonicalizeMorningBrief(requested_id, job.id, command)) {
+                normalizeMorningBriefJob(&scheduler, allocator, loaded.tenant, job.id) catch |err| {
+                    _ = scheduler.removeJob(job.id);
+                    const message = switch (err) {
+                        else => "Failed to normalize morning-brief job",
+                    };
+                    const msg = try allocator.dupe(u8, message);
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
+            } else {
+                try applyTenantDefaults(&scheduler, allocator, job.id, command);
+            }
             saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
 
             const msg = try std.fmt.allocPrint(allocator, "Created one-shot task {s} | runs at {d} | cmd: {s}", .{
@@ -353,7 +531,7 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for cancel action");
 
-            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+            const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
                 error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
                 else => return ToolResult.fail("Failed to load scheduler state"),
             };
@@ -373,7 +551,7 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter");
 
-            const loaded = loadSchedulerForContext(allocator) catch |err| switch (err) {
+            const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
                 error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
                 else => return ToolResult.fail("Failed to load scheduler state"),
             };
@@ -419,6 +597,14 @@ fn findMatchingRecurringJob(
     return null;
 }
 
+fn findMorningBriefJob(jobs: []const cron.CronJob) ?*const cron.CronJob {
+    for (jobs) |*job| {
+        if (isMorningBriefId(job.id)) return job;
+        if (morning_brief.commandLooksMorningBrief(job.command)) return job;
+    }
+    return null;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "schedule tool name" {
@@ -459,6 +645,20 @@ test "schedule normalizeRequestedId trims and drops empty values" {
     try std.testing.expect(normalizeRequestedId(null) == null);
     try std.testing.expect(normalizeRequestedId("   ") == null);
     try std.testing.expectEqualStrings("morning-brief", normalizeRequestedId("  morning-brief  ").?);
+}
+
+test "schedule canonicalization does not treat generic heartbeat commands as morning brief" {
+    try std.testing.expect(shouldCanonicalizeMorningBrief(null, "job-1", "send morning brief at 8"));
+    try std.testing.expect(shouldCanonicalizeMorningBrief(null, "job-1", "daily_morning_brief"));
+    try std.testing.expect(!shouldCanonicalizeMorningBrief(null, "job-1", "heartbeat run now"));
+}
+
+test "schedule canonicalization trigger matches id legacy and semantic hints" {
+    try std.testing.expect(shouldCanonicalizeMorningBrief("morning-brief", "job-1", "echo hello"));
+    try std.testing.expect(shouldCanonicalizeMorningBrief(null, "job-1", "schedule morning-brief"));
+    try std.testing.expect(shouldCanonicalizeMorningBrief(null, "job-1", "daily_morning_brief"));
+    try std.testing.expect(shouldCanonicalizeMorningBrief(null, "job-1", "send morning brief at 8"));
+    try std.testing.expect(!shouldCanonicalizeMorningBrief(null, "job-1", "echo hello"));
 }
 
 test "schedule findMatchingRecurringJob returns recurring exact match only" {

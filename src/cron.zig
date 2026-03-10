@@ -1,11 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
+const config_mod = @import("config.zig");
 const bus = @import("bus.zig");
 const telegram = @import("channels/telegram.zig");
 const json_util = @import("json_util.zig");
 const http_util = @import("http_util.zig");
 const ops_guard = @import("ops_guard.zig");
+const zaki_state = @import("zaki_state.zig");
+const runtime_resolver = @import("delivery/runtime_resolver.zig");
 
 const log = std.log.scoped(.cron);
 threadlocal var test_store_path_override: ?[]const u8 = null;
@@ -440,6 +443,9 @@ pub const CronScheduler = struct {
     context_user_id: ?[]const u8 = null,
     context_user_root: ?[]const u8 = null,
     context_workspace: ?[]const u8 = null,
+    context_numeric_user_id: ?i64 = null,
+    context_state_mgr: ?*zaki_state.Manager = null,
+    context_expect_postgres_state: bool = false,
     agent_runner: ?AgentRunnerFn = null,
     agent_runner_ctx: ?*anyopaque = null,
 
@@ -508,6 +514,17 @@ pub const CronScheduler = struct {
     pub fn setAgentRunner(self: *CronScheduler, runner: ?AgentRunnerFn, runner_ctx: ?*anyopaque) void {
         self.agent_runner = runner;
         self.agent_runner_ctx = runner_ctx;
+    }
+
+    pub fn setTenantStateContext(
+        self: *CronScheduler,
+        numeric_user_id: ?i64,
+        state_mgr: ?*zaki_state.Manager,
+        expect_postgres_state: bool,
+    ) void {
+        self.context_numeric_user_id = numeric_user_id;
+        self.context_state_mgr = state_mgr;
+        self.context_expect_postgres_state = expect_postgres_state;
     }
 
     fn hasJobId(self: *const CronScheduler, id: []const u8) bool {
@@ -879,6 +896,9 @@ pub const CronScheduler = struct {
                             self.allocator,
                             self.context_user_root,
                             self.context_user_id,
+                            self.context_numeric_user_id,
+                            self.context_state_mgr,
+                            self.context_expect_postgres_state,
                             job.id,
                             job.delivery,
                             output,
@@ -928,6 +948,9 @@ pub const CronScheduler = struct {
                             self.allocator,
                             self.context_user_root,
                             self.context_user_id,
+                            self.context_numeric_user_id,
+                            self.context_state_mgr,
+                            self.context_expect_postgres_state,
                             job.id,
                             job.delivery,
                             job.last_output orelse "",
@@ -1641,29 +1664,13 @@ fn isInQuietHours(policy: AutonomyPolicy, now_s: i64) bool {
     return hour >= policy.quiet_start_hour or hour < policy.quiet_end_hour;
 }
 
-fn loadTelegramChatIdFromChannelState(allocator: std.mem.Allocator, user_root: []const u8) ?i64 {
-    const path = std.fmt.allocPrint(allocator, "{s}/channel_state.json", .{user_root}) catch return null;
-    defer allocator.free(path);
-    const content = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer content.close();
-    const raw = content.readToEndAlloc(allocator, 64 * 1024) catch return null;
-    defer allocator.free(raw);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const telegram_obj = parsed.value.object.get("telegram") orelse return null;
-    if (telegram_obj != .object) return null;
-    const chat_id = telegram_obj.object.get("chat_id") orelse return null;
-    if (chat_id == .integer) return chat_id.integer;
-    if (chat_id == .string) return parseChatIdString(chat_id.string);
-    return null;
-}
-
 fn deliverTenantTelegram(
     allocator: std.mem.Allocator,
     user_root: []const u8,
     user_id_opt: ?[]const u8,
+    numeric_user_id_opt: ?i64,
+    state_mgr_opt: ?*zaki_state.Manager,
+    expect_postgres_state: bool,
     dedupe_key: ?[]const u8,
     delivery: DeliveryConfig,
     output: []const u8,
@@ -1679,23 +1686,36 @@ fn deliverTenantTelegram(
         return false;
     }
 
-    const token_path = try std.fmt.allocPrint(allocator, "{s}/secrets/telegram_bot_token", .{user_root});
-    defer allocator.free(token_path);
-    const token_owned = try readTrimmedFileOwned(allocator, token_path);
-    defer if (token_owned) |v| allocator.free(v);
-    const bot_token = token_owned orelse return false;
-    if (bot_token.len == 0) return false;
+    var resolved_ctx = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
+        .channel = "telegram",
+        .tenant_ctx = .{
+            .state_mgr = state_mgr_opt,
+            .numeric_user_id = numeric_user_id_opt,
+            .expect_postgres_state = expect_postgres_state,
+        },
+        .user_root = user_root,
+        .target_hint = delivery.to,
+    }) catch |err| switch (err) {
+        error.MissingTenantContext,
+        error.NotConnected,
+        error.MissingCredential,
+        error.InvalidTarget,
+        error.UnsupportedChannel,
+        => return false,
+        else => return err,
+    };
+    defer resolved_ctx.deinit(allocator);
 
-    const chat_id = if (delivery.to) |to|
-        parseChatIdString(to) orelse return false
-    else
-        loadTelegramChatIdFromChannelState(allocator, user_root) orelse return false;
+    runtime_resolver.requireConnectedTarget(&resolved_ctx) catch return false;
+    const bot_token = runtime_resolver.requireCredential(&resolved_ctx) catch return false;
+    const chat_id = runtime_resolver.parseResolvedTargetChatId(&resolved_ctx) catch return false;
+    const target_label = resolved_ctx.target_id orelse "default";
 
     const proactive_decision = ops_guard.allowProactive(
         "cron",
         user_id_opt,
         "telegram",
-        delivery.to orelse "default",
+        target_label,
         output,
         dedupe_key,
         now_s,
@@ -1707,11 +1727,11 @@ fn deliverTenantTelegram(
 
     var tg = telegram.TelegramChannel.init(allocator, bot_token, &.{"*"}, &.{}, "open");
     sendTelegramMessageWithRetry(&tg, chat_id, output, policy.retry_budget) catch |err| {
-        ops_guard.recordProactiveSendError("cron", user_id_opt, "telegram", delivery.to orelse "default", @errorName(err), std.time.timestamp());
+        ops_guard.recordProactiveSendError("cron", user_id_opt, "telegram", target_label, @errorName(err), std.time.timestamp());
         if (delivery.best_effort) return false;
         return err;
     };
-    ops_guard.recordProactiveSent("cron", user_id_opt, "telegram", delivery.to orelse "default", std.time.timestamp());
+    ops_guard.recordProactiveSent("cron", user_id_opt, "telegram", target_label, std.time.timestamp());
     return true;
 }
 
@@ -1741,6 +1761,9 @@ fn deliverResultForContext(
     allocator: std.mem.Allocator,
     context_user_root: ?[]const u8,
     context_user_id: ?[]const u8,
+    context_numeric_user_id: ?i64,
+    context_state_mgr: ?*zaki_state.Manager,
+    context_expect_postgres_state: bool,
     job_id: []const u8,
     delivery: DeliveryConfig,
     output: []const u8,
@@ -1750,7 +1773,18 @@ fn deliverResultForContext(
     if (context_user_root) |user_root| {
         if (delivery.channel) |channel| {
             if (std.ascii.eqlIgnoreCase(channel, "telegram")) {
-                return deliverTenantTelegram(allocator, user_root, context_user_id, job_id, delivery, output, success) catch |err| blk: {
+                return deliverTenantTelegram(
+                    allocator,
+                    user_root,
+                    context_user_id,
+                    context_numeric_user_id,
+                    context_state_mgr,
+                    context_expect_postgres_state,
+                    job_id,
+                    delivery,
+                    output,
+                    success,
+                ) catch |err| blk: {
                     if (!delivery.best_effort) return err;
                     break :blk false;
                 };
@@ -1902,11 +1936,18 @@ fn isRecoverableCronStoreError(err: anyerror) bool {
     };
 }
 
+fn resolveCliMaxTasks(allocator: std.mem.Allocator) usize {
+    var cfg = config_mod.Config.load(allocator) catch return 1024;
+    defer cfg.deinit();
+    return @max(@as(usize, 1), cfg.scheduler.max_tasks);
+}
+
 // ── CLI entry points (called from main.zig) ──────────────────────
 
 /// CLI: list all cron jobs.
 pub fn cliListJobs(allocator: std.mem.Allocator) !void {
-    var scheduler = CronScheduler.init(allocator, 1024, true);
+    const max_tasks = resolveCliMaxTasks(allocator);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
@@ -1941,7 +1982,8 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
 
 /// CLI: add a recurring cron job.
 pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: []const u8) !void {
-    var scheduler = CronScheduler.init(allocator, 1024, true);
+    const max_tasks = resolveCliMaxTasks(allocator);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
@@ -1956,7 +1998,8 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
 
 /// CLI: add a one-shot delayed task.
 pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []const u8) !void {
-    var scheduler = CronScheduler.init(allocator, 1024, true);
+    const max_tasks = resolveCliMaxTasks(allocator);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
@@ -1970,7 +2013,8 @@ pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []co
 
 /// CLI: remove a cron job by ID.
 pub fn cliRemoveJob(allocator: std.mem.Allocator, id: []const u8) !void {
-    var scheduler = CronScheduler.init(allocator, 1024, true);
+    const max_tasks = resolveCliMaxTasks(allocator);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
@@ -1984,7 +2028,8 @@ pub fn cliRemoveJob(allocator: std.mem.Allocator, id: []const u8) !void {
 
 /// CLI: pause a cron job by ID.
 pub fn cliPauseJob(allocator: std.mem.Allocator, id: []const u8) !void {
-    var scheduler = CronScheduler.init(allocator, 1024, true);
+    const max_tasks = resolveCliMaxTasks(allocator);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
@@ -1998,7 +2043,8 @@ pub fn cliPauseJob(allocator: std.mem.Allocator, id: []const u8) !void {
 
 /// CLI: resume a paused cron job by ID.
 pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
-    var scheduler = CronScheduler.init(allocator, 1024, true);
+    const max_tasks = resolveCliMaxTasks(allocator);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
@@ -2011,7 +2057,8 @@ pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
 }
 
 pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
-    var scheduler = CronScheduler.init(allocator, 1024, true);
+    const max_tasks = resolveCliMaxTasks(allocator);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
@@ -2045,7 +2092,8 @@ pub fn cliUpdateJob(
     command: ?[]const u8,
     enabled: ?bool,
 ) !void {
-    var scheduler = CronScheduler.init(allocator, 1024, true);
+    const max_tasks = resolveCliMaxTasks(allocator);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
@@ -2064,7 +2112,8 @@ pub fn cliUpdateJob(
 
 /// CLI: list run history for a cron job.
 pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8) !void {
-    var scheduler = CronScheduler.init(allocator, 1024, true);
+    const max_tasks = resolveCliMaxTasks(allocator);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
@@ -2986,25 +3035,6 @@ test "WakeMode parse and asStr" {
     try std.testing.expectEqual(WakeMode.next_heartbeat, WakeMode.parse("NEXT_HEARTBEAT"));
     try std.testing.expectEqualStrings("now", WakeMode.now.asStr());
     try std.testing.expectEqualStrings("next_heartbeat", WakeMode.next_heartbeat.asStr());
-}
-
-test "loadTelegramChatIdFromChannelState reads tenant channel state" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makeDir("tenant");
-
-    const user_root = try tmp.dir.realpathAlloc(std.testing.allocator, "tenant");
-    defer std.testing.allocator.free(user_root);
-
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/channel_state.json", .{user_root});
-    defer std.testing.allocator.free(path);
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll("{\"telegram\":{\"connected\":true,\"chat_id\":-100777}}");
-
-    const chat_id = loadTelegramChatIdFromChannelState(std.testing.allocator, user_root);
-    try std.testing.expect(chat_id != null);
-    try std.testing.expectEqual(@as(i64, -100777), chat_id.?);
 }
 
 test "parseChatIdString handles valid and invalid values" {

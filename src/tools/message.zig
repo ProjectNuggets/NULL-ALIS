@@ -12,6 +12,7 @@ const JsonObjectMap = root.JsonObjectMap;
 const bus = @import("../bus.zig");
 const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
+const runtime_resolver = @import("../delivery/runtime_resolver.zig");
 
 /// Message tool — sends a message to a specific channel/chat via the bus.
 pub const MessageTool = struct {
@@ -164,18 +165,23 @@ pub const MessageTool = struct {
         const user_id = tenant_ctx.numeric_user_id orelse
             return ToolResult.fail("Telegram direct send unavailable: no tenant user");
 
-        const bot_token = state_mgr.getSecret(allocator, user_id, "telegram_bot_token") catch
-            return ToolResult.fail("Failed to load Telegram bot token");
-        defer if (bot_token) |tok| allocator.free(tok);
-        const token = bot_token orelse
-            return ToolResult.fail("Telegram bot token is not configured");
+        var resolved = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
+            .channel = "telegram",
+            .tenant_ctx = .{
+                .state_mgr = state_mgr,
+                .numeric_user_id = user_id,
+                .expect_postgres_state = tenant_ctx.expect_postgres_state,
+            },
+            .target_hint = requested_chat_id,
+        }) catch return ToolResult.fail("Failed to resolve Telegram runtime context");
+        defer resolved.deinit(allocator);
 
-        const resolved_chat_id = if (requested_chat_id) |chat_id| blk: {
-            break :blk allocator.dupe(u8, chat_id) catch
-                return ToolResult.fail("Failed to allocate chat id");
-        } else resolve_telegram_chat_id_from_state(allocator, state_mgr, user_id) catch
-            return ToolResult.fail("Failed to resolve Telegram chat_id from state");
-        defer allocator.free(resolved_chat_id);
+        runtime_resolver.requireConnectedTarget(&resolved) catch
+            return ToolResult.fail("Telegram chat is not connected");
+        const token = runtime_resolver.requireCredential(&resolved) catch
+            return ToolResult.fail("Telegram bot token is not configured");
+        const resolved_chat_id = resolved.target_id orelse
+            return ToolResult.fail("Telegram chat is not connected");
 
         const url = std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{token}) catch
             return ToolResult.fail("Failed to build Telegram API URL");
@@ -218,26 +224,6 @@ pub const MessageTool = struct {
         } else |_| {
             return ToolResult.ok("Message sent to telegram");
         }
-    }
-
-    fn resolve_telegram_chat_id_from_state(
-        allocator: std.mem.Allocator,
-        state_mgr: anytype,
-        user_id: i64,
-    ) ![]u8 {
-        const state_json = try state_mgr.getTelegramStateJson(allocator, user_id);
-        defer allocator.free(state_json);
-
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, state_json, .{});
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidTelegramState;
-        const obj = parsed.value.object;
-        const chat_val = obj.get("chat_id") orelse return error.MissingTelegramChatId;
-        return switch (chat_val) {
-            .string => allocator.dupe(u8, chat_val.string),
-            .integer => std.fmt.allocPrint(allocator, "{d}", .{chat_val.integer}),
-            else => error.InvalidTelegramState,
-        };
     }
 };
 

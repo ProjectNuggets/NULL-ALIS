@@ -364,7 +364,7 @@ pub fn allTools(
     try list.append(allocator, dlt.tool());
 
     const scht = try allocator.create(schedule.ScheduleTool);
-    scht.* = .{};
+    scht.* = .{ .config = opts.config };
     try list.append(allocator, scht.tool());
 
     const rit = try allocator.create(runtime_info.RuntimeInfoTool);

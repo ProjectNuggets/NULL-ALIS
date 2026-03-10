@@ -112,12 +112,13 @@ pub const DiagResult = struct {
 pub fn runDoctor(
     allocator: std.mem.Allocator,
     config: *const Config,
+    user_id: ?[]const u8,
     writer: anytype,
     color: bool,
 ) !void {
     var items: std.ArrayList(DiagItem) = .empty;
     defer items.deinit(allocator);
-    var snapshot = try runtime_truth.collectRuntimeSnapshot(allocator, config, null);
+    var snapshot = try runtime_truth.collectRuntimeSnapshot(allocator, config, user_id);
     defer snapshot.deinit(allocator);
 
     // Core checks (matching ZeroClaw)
@@ -126,6 +127,12 @@ pub fn runDoctor(
     try checkDaemonState(allocator, config, &items);
     try checkEnvironment(allocator, &items);
     try checkRuntimeSnapshot(allocator, &snapshot, &items);
+    if (snapshot.tenant_enabled and std.mem.eql(u8, snapshot.scheduler_backend, "postgres") and user_id == null) {
+        try items.append(allocator, DiagItem.warn(
+            "runtime",
+            "tenant runtime detected; run `nullalis doctor --user-id <id>` for user-scoped integration truth",
+        ));
+    }
 
     // nullalis-specific extras
     checkSandbox(allocator, config, &items);
@@ -162,6 +169,10 @@ pub fn runDoctor(
 
 /// Legacy entry point — uses stdout directly.
 pub fn run(allocator: std.mem.Allocator) !void {
+    return runWithUser(allocator, null);
+}
+
+pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
     const stdout_file = std.fs.File.stdout();
     var stdout_buf: [4096]u8 = undefined;
     var bw = stdout_file.writer(&stdout_buf);
@@ -182,7 +193,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    try runDoctor(arena.allocator(), &cfg, stdout, color);
+    try runDoctor(arena.allocator(), &cfg, user_id, stdout, color);
     try stdout.flush();
 }
 
@@ -661,6 +672,18 @@ fn checkRuntimeSnapshot(
             if (snapshot.tenant_enabled) "true" else "false",
         },
     )));
+    if (snapshot.telegram_configured != null or snapshot.telegram_connected != null) {
+        const source_label = if (snapshot.telegram_data_source) |source| source else "unknown";
+        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+            allocator,
+            "telegram runtime: configured={s} connected={s} source={s}",
+            .{
+                if (snapshot.telegram_configured != null and snapshot.telegram_configured.?) "true" else if (snapshot.telegram_configured == null) "unknown" else "false",
+                if (snapshot.telegram_connected != null and snapshot.telegram_connected.?) "true" else if (snapshot.telegram_connected == null) "unknown" else "false",
+                source_label,
+            },
+        )));
+    }
 
     if (snapshot.context_incomplete) {
         try items.append(allocator, DiagItem.warn(cat, "runtime context incomplete; values may be fallback-only"));

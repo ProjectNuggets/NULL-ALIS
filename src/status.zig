@@ -5,6 +5,10 @@ const channel_catalog = @import("channel_catalog.zig");
 const runtime_truth = @import("diagnostics/runtime_truth.zig");
 
 pub fn run(allocator: std.mem.Allocator) !void {
+    return runWithUser(allocator, null);
+}
+
+pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
     var buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&buf);
     const w = &bw.interface;
@@ -16,7 +20,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         return;
     };
     defer cfg.deinit();
-    var snapshot = try runtime_truth.collectRuntimeSnapshot(allocator, &cfg, null);
+    var snapshot = try runtime_truth.collectRuntimeSnapshot(allocator, &cfg, user_id);
     defer snapshot.deinit(allocator);
 
     try w.print("nullALIS Status\n\n", .{});
@@ -62,6 +66,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
         snapshot.state_backend_effective,
         snapshot.scheduler_backend,
     });
+    if (user_id) |resolved_user_id| {
+        try w.print("Runtime:     scoped_user_id={s}\n", .{resolved_user_id});
+    } else if (cfg.tenant.enabled and std.mem.eql(u8, cfg.state.backend, "postgres")) {
+        try w.print("Runtime:     tenant runtime detected; add --user-id <id> for user-scoped integration truth\n", .{});
+    }
     try w.print("Runtime HB:  enabled={s}, interval={d}m, tenant={s}, degraded={s}\n", .{
         if (snapshot.heartbeat_enabled) "true" else "false",
         snapshot.heartbeat_interval_minutes,
@@ -73,6 +82,19 @@ pub fn run(allocator: std.mem.Allocator) !void {
     }
     if (snapshot.context_incomplete) {
         try w.print("Runtime:     context incomplete (fallback mode)\n", .{});
+    }
+    if (snapshot.telegram_configured != null or snapshot.telegram_connected != null) {
+        try w.print("Runtime TG:  configured={s}, connected={s}", .{
+            if (snapshot.telegram_configured != null and snapshot.telegram_configured.?) "true" else if (snapshot.telegram_configured == null) "unknown" else "false",
+            if (snapshot.telegram_connected != null and snapshot.telegram_connected.?) "true" else if (snapshot.telegram_connected == null) "unknown" else "false",
+        });
+        if (snapshot.telegram_chat_id) |chat_id| {
+            try w.print(", chat_id={d}", .{chat_id});
+        }
+        if (snapshot.telegram_data_source) |source| {
+            try w.print(", source={s}", .{source});
+        }
+        try w.print("\n", .{});
     }
 
     // Cost tracking

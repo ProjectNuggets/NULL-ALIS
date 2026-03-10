@@ -711,18 +711,24 @@ fn parseTelegramStateJson(allocator: std.mem.Allocator, raw: []const u8) !Telegr
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return .{};
     defer parsed.deinit();
     if (parsed.value != .object) return .{};
-    const telegram_value = parsed.value.object.get("telegram") orelse return .{};
-    if (telegram_value != .object) return .{};
+    const telegram_obj = blk: {
+        if (parsed.value.object.get("telegram")) |telegram_value| {
+            if (telegram_value == .object) break :blk telegram_value.object;
+        }
+        // Postgres-backed telegram state is stored as top-level object fields.
+        // File fallback (channel_state.json) stores telegram under a nested key.
+        break :blk parsed.value.object;
+    };
 
-    if (telegram_value.object.get("connected")) |connected_value| {
+    if (telegram_obj.get("connected")) |connected_value| {
         if (connected_value == .bool) state.connected = connected_value.bool;
     }
-    if (telegram_value.object.get("account_id")) |account_value| {
+    if (telegram_obj.get("account_id")) |account_value| {
         if (account_value == .string and account_value.string.len > 0) {
             state.account_id = try allocator.dupe(u8, account_value.string);
         }
     }
-    if (telegram_value.object.get("chat_id")) |chat_id_value| {
+    if (telegram_obj.get("chat_id")) |chat_id_value| {
         state.chat_id = switch (chat_id_value) {
             .integer => chat_id_value.integer,
             .string => std.fmt.parseInt(i64, chat_id_value.string, 10) catch null,
@@ -841,4 +847,15 @@ test "runtime info telegram snapshot marks context missing for expected postgres
     defer snapshot_mut.deinit(std.testing.allocator);
     try std.testing.expect(snapshot.context_incomplete);
     try std.testing.expectEqualStrings("context_missing", snapshot.data_source);
+}
+
+test "runtime info parseTelegramStateJson supports top-level postgres shape" {
+    const raw =
+        \\{"connected":true,"account_id":"main","chat_id":1110331014}
+    ;
+    var state = try parseTelegramStateJson(std.testing.allocator, raw);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, true), state.connected);
+    try std.testing.expectEqualStrings("main", state.account_id.?);
+    try std.testing.expectEqual(@as(?i64, 1110331014), state.chat_id);
 }
