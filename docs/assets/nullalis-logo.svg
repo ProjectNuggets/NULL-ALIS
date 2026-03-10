@@ -1,37 +1,44 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
   <title id="title">nullALIS</title>
-  <desc id="desc">nullALIS logo mark and wordmark</desc>
+  <desc id="desc">nullALIS SOTA logo mark and wordmark</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0b132b"/>
-      <stop offset="100%" stop-color="#1c2541"/>
+      <stop offset="0%" stop-color="#070b15"/>
+      <stop offset="55%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#111827"/>
     </linearGradient>
-    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#56ccf2"/>
-      <stop offset="100%" stop-color="#2f80ed"/>
+    <radialGradient id="glow" cx="0.22" cy="0.3" r="0.9">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.35"/>
+      <stop offset="60%" stop-color="#22d3ee" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#67e8f9"/>
+      <stop offset="100%" stop-color="#2563eb"/>
     </linearGradient>
-    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#6ee7b7"/>
-      <stop offset="100%" stop-color="#22d3ee"/>
+    <linearGradient id="word" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="65%" stop-color="#e2e8f0"/>
+      <stop offset="100%" stop-color="#cbd5e1"/>
     </linearGradient>
   </defs>
 
-  <rect x="0" y="0" width="1200" height="320" rx="24" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1200" height="320" rx="30" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1200" height="320" rx="30" fill="url(#glow)"/>
 
-  <g transform="translate(100 64)">
-    <circle cx="96" cy="96" r="72" fill="none" stroke="url(#ink)" stroke-width="14"/>
-    <ellipse cx="96" cy="96" rx="110" ry="38" fill="none" stroke="url(#accent)" stroke-width="10" opacity="0.9"/>
-    <circle cx="168" cy="96" r="12" fill="#6ee7b7"/>
-    <circle cx="48" cy="96" r="8" fill="#56ccf2" opacity="0.9"/>
-    <circle cx="96" cy="96" r="18" fill="url(#ink)"/>
+  <g transform="translate(96 56)">
+    <rect x="0" y="0" width="208" height="208" rx="56" fill="#0b1224" stroke="url(#mark)" stroke-width="6"/>
+    <path d="M48 154V54h26l38 55 38-55h26v100h-28V98l-36 50-36-50v56z" fill="url(#mark)"/>
+    <circle cx="172" cy="42" r="11" fill="#22d3ee"/>
+    <circle cx="172" cy="42" r="20" fill="none" stroke="#22d3ee" stroke-opacity="0.35" stroke-width="2"/>
   </g>
 
-  <g transform="translate(300 96)">
-    <text x="0" y="92" font-family="Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="92" font-weight="700" fill="#f8fafc">
-      null<tspan fill="#7dd3fc">ALIS</tspan>
+  <g transform="translate(356 92)">
+    <text x="0" y="84" font-family="Space Grotesk, Sora, Inter, system-ui, sans-serif" font-size="92" font-weight="700" letter-spacing="1" fill="url(#word)">
+      null<tspan fill="#67e8f9">ALIS</tspan>
     </text>
-    <text x="4" y="138" font-family="Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="24" fill="#93c5fd">
-      autonomous runtime for digital twins
+    <text x="3" y="128" font-family="Space Grotesk, Sora, Inter, system-ui, sans-serif" font-size="22" letter-spacing="3.2" fill="#93c5fd">
+      AUTONOMOUS DIGITAL TWIN RUNTIME
     </text>
   </g>
 </svg>
