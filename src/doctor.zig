@@ -122,7 +122,8 @@ pub fn runDoctor(
     defer snapshot.deinit(allocator);
 
     // Core checks (matching ZeroClaw)
-    try checkConfigSemantics(allocator, config, &items);
+    const runtime_channel_connected = snapshot.telegram_connected != null and snapshot.telegram_connected.?;
+    try checkConfigSemantics(allocator, config, runtime_channel_connected, &items);
     try checkWorkspace(allocator, config, &items);
     try checkDaemonState(allocator, config, &items);
     try checkEnvironment(allocator, &items);
@@ -202,6 +203,7 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
 pub fn checkConfigSemantics(
     allocator: std.mem.Allocator,
     config: *const Config,
+    runtime_channel_connected: bool,
     items: *std.ArrayList(DiagItem),
 ) !void {
     const cat = "config";
@@ -279,6 +281,8 @@ pub fn checkConfigSemantics(
 
     if (has_channel) {
         try items.append(allocator, DiagItem.ok(cat, "at least one channel configured"));
+    } else if (runtime_channel_connected) {
+        try items.append(allocator, DiagItem.ok(cat, "tenant-scoped channel connected via runtime state"));
     } else {
         try items.append(allocator, DiagItem.warn(cat, "no channels configured -- run `nullalis onboard` to set one up"));
     }
@@ -815,7 +819,7 @@ test "checkConfigSemantics catches temperature out of range" {
 
     var cfg = testConfig();
     cfg.default_temperature = 5.0;
-    try checkConfigSemantics(allocator, &cfg, &items);
+    try checkConfigSemantics(allocator, &cfg, false, &items);
 
     var found_temp_err = false;
     for (items.items) |item| {
@@ -834,7 +838,7 @@ test "checkConfigSemantics accepts valid temperature" {
 
     var cfg = testConfig();
     cfg.default_temperature = 0.7;
-    try checkConfigSemantics(allocator, &cfg, &items);
+    try checkConfigSemantics(allocator, &cfg, false, &items);
 
     var found_temp_ok = false;
     for (items.items) |item| {
@@ -853,7 +857,7 @@ test "checkConfigSemantics warns empty default provider" {
 
     var cfg = testConfig();
     cfg.default_provider = "";
-    try checkConfigSemantics(allocator, &cfg, &items);
+    try checkConfigSemantics(allocator, &cfg, false, &items);
 
     var found_err = false;
     for (items.items) |item| {
@@ -871,7 +875,7 @@ test "checkConfigSemantics warns no channels" {
     var items: std.ArrayList(DiagItem) = .empty;
 
     const cfg = testConfig();
-    try checkConfigSemantics(allocator, &cfg, &items);
+    try checkConfigSemantics(allocator, &cfg, false, &items);
 
     var found_warn = false;
     for (items.items) |item| {
@@ -880,6 +884,29 @@ test "checkConfigSemantics warns no channels" {
         }
     }
     try std.testing.expect(found_warn);
+}
+
+test "checkConfigSemantics uses runtime channel truth when connected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var items: std.ArrayList(DiagItem) = .empty;
+
+    const cfg = testConfig();
+    try checkConfigSemantics(allocator, &cfg, true, &items);
+
+    var found_runtime_ok = false;
+    var found_no_channels_warn = false;
+    for (items.items) |item| {
+        if (std.mem.indexOf(u8, item.message, "tenant-scoped channel connected via runtime state") != null and item.severity == .ok) {
+            found_runtime_ok = true;
+        }
+        if (std.mem.indexOf(u8, item.message, "no channels configured") != null and item.severity == .warn) {
+            found_no_channels_warn = true;
+        }
+    }
+    try std.testing.expect(found_runtime_ok);
+    try std.testing.expect(!found_no_channels_warn);
 }
 
 test "parseDfAvailableMb parses output" {

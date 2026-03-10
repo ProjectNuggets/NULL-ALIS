@@ -131,6 +131,8 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
         var status_buf: [64]u8 = undefined;
         const status_text = if (meta.id == .cli)
             "always"
+        else if (meta.id == .telegram and snapshot.telegram_connected != null)
+            if (snapshot.telegram_connected.?) "connected (runtime)" else "not connected (runtime)"
         else
             channel_catalog.statusText(&cfg, meta, &status_buf);
         try w.print("  {s}: {s}\n", .{ meta.label, status_text });
