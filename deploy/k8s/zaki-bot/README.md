@@ -42,6 +42,7 @@ It includes:
 - Profile: `zaki_bot`
 - Default model: `openrouter/moonshotai/kimi-k2.5`
 - Tenant mode: enabled
+- State backend: `postgres` (via runtime env wiring)
 
 ## Integration handoff docs
 
@@ -62,12 +63,14 @@ Update these fields before apply:
 3. `01-secrets-template.yaml`:
 - `INTERNAL_SERVICE_TOKEN`
 - `OPENROUTER_API_KEY`
+- `POSTGRES_CONNECTION_STRING`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
  - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (if not using workload identity)
 4. `07-ingress.yaml`: host and TLS secret if different.
 5. `02-configmap.yaml`:
 - `PUBLIC_BASE_URL`, `TELEGRAM_ALLOW_FROM` policy
+- Postgres state tuning (`STATE_BACKEND`, `POSTGRES_SCHEMA`, `POSTGRES_POOL_MAX`, timeout values)
 - `LITESTREAM_S3_BUCKET`, `LITESTREAM_S3_PREFIX`
 - `AWS_REGION` (if required by your S3 endpoint)
 
@@ -87,6 +90,7 @@ kubectl -n zaki-bot-staging describe deploy/nullclaw
 ```bash
 kubectl -n zaki-bot-staging port-forward svc/nullclaw 3000:80
 curl -s http://127.0.0.1:3000/metrics | head -n 40
+curl -s http://127.0.0.1:3000/internal/diagnostics -H "X-Internal-Token: ${INTERNAL_TOKEN}" | jq '.startup_self_check'
 ```
 3. Run smoke test.
 ```bash

@@ -86,6 +86,16 @@ spec:
                   "runtime_cache_max_users": 2048,
                   "runtime_idle_ttl_secs": 1800
                 },
+                "state": {
+                  "backend": "${STATE_BACKEND}",
+                  "postgres": {
+                    "connection_string": "${POSTGRES_CONNECTION_STRING}",
+                    "schema": "${POSTGRES_SCHEMA}",
+                    "pool_max": ${POSTGRES_POOL_MAX},
+                    "statement_timeout_ms": ${POSTGRES_STATEMENT_TIMEOUT_MS},
+                    "lock_timeout_ms": ${POSTGRES_LOCK_TIMEOUT_MS}
+                  }
+                },
                 "session": {
                   "cross_channel_shared_main": true
                 },
