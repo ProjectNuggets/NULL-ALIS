@@ -43,6 +43,7 @@ const MAX_DISPATCHER_WORKERS: u32 = 64;
 const MORNING_BRIEF_JOB_ID = morning_brief.MORNING_BRIEF_JOB_ID;
 const MORNING_BRIEF_AGENT_COMMAND = morning_brief.MORNING_BRIEF_AGENT_COMMAND;
 const MORNING_BRIEF_AGENT_PROMPT = morning_brief.MORNING_BRIEF_AGENT_PROMPT;
+const HEARTBEAT_WAKE_COMMAND = "__wake_heartbeat";
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -798,6 +799,7 @@ fn runHeartbeatAgentTurn(
     user_root: []const u8,
     workspace_path: []const u8,
     prompt: []const u8,
+    turn_origin: tools_mod.TurnOrigin,
 ) ![]const u8 {
     var scheduler = CronScheduler.init(allocator, 1, true);
     defer scheduler.deinit();
@@ -806,7 +808,7 @@ fn runHeartbeatAgentTurn(
     var heartbeat_job = cron.CronJob{
         .id = "heartbeat",
         .expression = "* * * * *",
-        .command = "heartbeat",
+        .command = if (turn_origin == .wake) HEARTBEAT_WAKE_COMMAND else "heartbeat",
         .session_target = .main,
     };
     return runCronAgentTurn(@ptrCast(@constCast(config)), allocator, &scheduler, &heartbeat_job, prompt);
@@ -854,7 +856,12 @@ fn runTenantHeartbeatForUser(
         }
     }
 
-    const reply = runHeartbeatAgentTurn(allocator, config, user_id, user_root, workspace_path, hb_cfg.prompt) catch |err| {
+    const turn_origin: tools_mod.TurnOrigin = if (forced and !std.mem.eql(u8, reason, "interval"))
+        .wake
+    else
+        .heartbeat;
+
+    const reply = runHeartbeatAgentTurn(allocator, config, user_id, user_root, workspace_path, hb_cfg.prompt, turn_origin) catch |err| {
         log.warn("heartbeat agent turn failed for user={s}: {}", .{ user_id, err });
         saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_turn", @errorName(err));
         return;
@@ -1172,13 +1179,19 @@ fn runCronAgentTurn(
     });
     defer tools_mod.clearTenantContext();
 
-    const turn_origin: tools_mod.TurnOrigin = if (std.mem.eql(u8, job.id, "heartbeat"))
-        .heartbeat
-    else
-        .scheduler;
+    const turn_origin: tools_mod.TurnOrigin = resolveCronTurnOrigin(job);
     return runtime.session_mgr.processMessageWithContext(session_key, prompt, null, .{
         .turn_origin = turn_origin,
     });
+}
+
+fn resolveCronTurnOrigin(job: *const cron.CronJob) tools_mod.TurnOrigin {
+    if (std.mem.eql(u8, job.command, HEARTBEAT_WAKE_COMMAND)) return .wake;
+    if (std.mem.eql(u8, job.id, "heartbeat")) return .heartbeat;
+    return switch (job.delivery.mode) {
+        .none => .scheduler,
+        else => .proactive,
+    };
 }
 
 fn clearSchedulerSnapshot(
@@ -3139,6 +3152,41 @@ test "runCronAgentTurn defers main session next_heartbeat jobs" {
     try std.testing.expect(req.user_id != null);
     try std.testing.expectEqualStrings("77", req.user_id.?);
     try std.testing.expect(std.mem.startsWith(u8, req.reason, CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX));
+}
+
+test "resolveCronTurnOrigin maps wake heartbeat command to wake origin" {
+    const job = cron.CronJob{
+        .id = "heartbeat",
+        .expression = "* * * * *",
+        .command = HEARTBEAT_WAKE_COMMAND,
+    };
+    try std.testing.expectEqual(tools_mod.TurnOrigin.wake, resolveCronTurnOrigin(&job));
+}
+
+test "resolveCronTurnOrigin maps delivery jobs to proactive origin" {
+    const job = cron.CronJob{
+        .id = "daily-brief",
+        .expression = "0 8 * * *",
+        .command = "daily_morning_brief",
+        .job_type = .agent,
+        .session_target = .main,
+        .delivery = .{
+            .mode = .always,
+            .channel = "telegram",
+            .to = "chat-1",
+        },
+    };
+    try std.testing.expectEqual(tools_mod.TurnOrigin.proactive, resolveCronTurnOrigin(&job));
+}
+
+test "resolveCronTurnOrigin keeps scheduler origin for non-delivery jobs" {
+    const job = cron.CronJob{
+        .id = "sync-task",
+        .expression = "*/5 * * * *",
+        .command = "sync",
+        .delivery = .{ .mode = .none },
+    };
+    try std.testing.expectEqual(tools_mod.TurnOrigin.scheduler, resolveCronTurnOrigin(&job));
 }
 
 test "heartbeatActionableReplySlice suppresses ack-only output" {

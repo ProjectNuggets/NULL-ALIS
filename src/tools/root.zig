@@ -595,16 +595,62 @@ fn isReadOnlyComposioExecute(args: JsonObjectMap) bool {
     return containsAnyIgnoreCase(slug, &read_hints);
 }
 
+const BackgroundOriginPolicy = struct {
+    allow_schedule_write: bool,
+    allow_composio_read_execute: bool,
+};
+
+fn backgroundPolicyForOrigin(origin: TurnOrigin) BackgroundOriginPolicy {
+    return switch (origin) {
+        // Periodic autonomous lane; keep permissive for existing heartbeat remediation flows.
+        .heartbeat => .{
+            .allow_schedule_write = true,
+            .allow_composio_read_execute = true,
+        },
+        // Explicit on-demand wake jobs should be able to read and self-repair.
+        .wake => .{
+            .allow_schedule_write = true,
+            .allow_composio_read_execute = true,
+        },
+        // User-visible autonomous delivery lane (briefs/reminders).
+        .proactive => .{
+            .allow_schedule_write = true,
+            .allow_composio_read_execute = true,
+        },
+        // Internal scheduler maintenance lane; keep conservative to avoid self-loop mutation.
+        .scheduler => .{
+            .allow_schedule_write = false,
+            .allow_composio_read_execute = false,
+        },
+        .user => .{
+            .allow_schedule_write = true,
+            .allow_composio_read_execute = true,
+        },
+    };
+}
+
+fn isReadOnlyScheduleAction(args: JsonObjectMap) bool {
+    const action = getString(args, "action") orelse return true;
+    return std.ascii.eqlIgnoreCase(action, "list") or
+        std.ascii.eqlIgnoreCase(action, "get") or
+        std.ascii.eqlIgnoreCase(action, "runs");
+}
+
 pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]const u8 {
     const turn_ctx = getTurnContext();
     if (!isBackgroundTurnOrigin(turn_ctx.origin)) return null;
+    const policy = backgroundPolicyForOrigin(turn_ctx.origin);
 
     if (std.mem.eql(u8, tool_name, runtime_info.RuntimeInfoTool.tool_name)) return null;
-    if (std.mem.eql(u8, tool_name, schedule.ScheduleTool.tool_name)) return null;
+    if (std.mem.eql(u8, tool_name, schedule.ScheduleTool.tool_name)) {
+        if (policy.allow_schedule_write or isReadOnlyScheduleAction(args)) return null;
+        return "Schedule writes are disabled for scheduler-origin maintenance turns";
+    }
     if (std.mem.eql(u8, tool_name, file_read.FileReadTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, memory_recall.MemoryRecallTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, memory_list.MemoryListTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, web_search.WebSearchTool.tool_name)) return null;
+    if (std.mem.eql(u8, tool_name, web_fetch.WebFetchTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, message.MessageTool.tool_name)) return null;
 
     if (std.mem.eql(u8, tool_name, composio.ComposioTool.tool_name)) {
@@ -614,7 +660,10 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
         }
         if (std.ascii.eqlIgnoreCase(action, "list")) return null;
         if (std.ascii.eqlIgnoreCase(action, "execute")) {
-            if (isReadOnlyComposioExecute(args)) return null;
+            if (policy.allow_composio_read_execute and isReadOnlyComposioExecute(args)) return null;
+            if (!policy.allow_composio_read_execute) {
+                return "Composio execute is disabled for scheduler-origin maintenance turns";
+            }
             return "Composio write/unknown execute actions are disabled for background turns";
         }
         return "Composio action is disabled for background turns";
@@ -629,7 +678,7 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
     if (std.mem.eql(u8, tool_name, delegate.DelegateTool.tool_name)) {
         return "Delegate is disabled for background turns";
     }
-    return "Tool is disabled for background turns; allowed: runtime_info, schedule, file_read, memory_recall, memory_list, web_search, message, composio(list/read)";
+    return "Tool is disabled for background turns; allowed: runtime_info, schedule(read), file_read, memory_recall, memory_list, web_search, web_fetch, message, composio(list/read by origin)";
 }
 
 pub fn bindRuntimeInfoTools(tools: []const Tool) void {
@@ -842,6 +891,35 @@ test "background turns allow message tool" {
     try std.testing.expect(toolBlockedForCurrentTurn("message", parsed.value.object) == null);
 }
 
+test "scheduler-origin maintenance blocks schedule writes" {
+    setTurnContext(.{ .origin = .scheduler });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"action\":\"create\",\"expression\":\"*/5 * * * *\",\"command\":\"echo hi\"}");
+    defer parsed.deinit();
+    const blocked = toolBlockedForCurrentTurn("schedule", parsed.value.object) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "Schedule writes are disabled") != null);
+}
+
+test "proactive origin allows schedule writes" {
+    setTurnContext(.{ .origin = .proactive });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"action\":\"create\",\"expression\":\"*/5 * * * *\",\"command\":\"echo hi\"}");
+    defer parsed.deinit();
+    try std.testing.expect(toolBlockedForCurrentTurn("schedule", parsed.value.object) == null);
+}
+
+test "scheduler-origin maintenance blocks composio execute" {
+    setTurnContext(.{ .origin = .scheduler });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"action\":\"execute\",\"tool_slug\":\"gmail-list-messages\"}");
+    defer parsed.deinit();
+    const blocked = toolBlockedForCurrentTurn("composio", parsed.value.object) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "Composio execute is disabled") != null);
+}
+
 test "background turns block composio connect" {
     setTurnContext(.{ .origin = .scheduler });
     defer clearTurnContext();
@@ -862,7 +940,7 @@ test "background turns allow composio list" {
 }
 
 test "background turns allow composio read-only execute" {
-    setTurnContext(.{ .origin = .heartbeat });
+    setTurnContext(.{ .origin = .proactive });
     defer clearTurnContext();
 
     const parsed = try parseTestArgs("{\"action\":\"execute\",\"tool_slug\":\"gmail-list-messages\"}");
