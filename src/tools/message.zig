@@ -87,15 +87,17 @@ pub const MessageTool = struct {
                 return ToolResult.fail("No channel specified and no default channel set"));
         const channel = std.mem.trim(u8, channel_raw, " \t\r\n");
         if (channel.len == 0) return ToolResult.fail("Channel must not be empty");
+        const is_telegram_channel = std.ascii.eqlIgnoreCase(channel, "telegram");
 
         var account_id = root.getString(args, "account_id") orelse msg_turn_ctx.account_id;
 
         var chat_id_opt = root.getString(args, "chat_id") orelse msg_turn_ctx.chat_id;
         var resolved_telegram: ?runtime_resolver.DeliveryResolvedContext = null;
         defer if (resolved_telegram) |*ctx| ctx.deinit(allocator);
+        const tenant_ctx = root.getTenantContext();
+        const can_direct_telegram = tenant_ctx.state_mgr != null and tenant_ctx.numeric_user_id != null;
 
-        if (is_background_origin and std.mem.eql(u8, channel, "telegram")) {
-            const tenant_ctx = root.getTenantContext();
+        if (is_telegram_channel and (is_background_origin or can_direct_telegram)) {
             if (tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or tenant_ctx.numeric_user_id == null)) {
                 return ToolResult.fail("Telegram context is incomplete for background send");
             }
@@ -108,15 +110,28 @@ pub const MessageTool = struct {
                     .expect_postgres_state = tenant_ctx.expect_postgres_state,
                 },
                 .target_hint = chat_id_opt,
-            }) catch return ToolResult.fail("Failed to resolve Telegram runtime context");
+            }) catch blk: {
+                if (is_background_origin) {
+                    return ToolResult.fail("Failed to resolve Telegram runtime context");
+                }
+                break :blk null;
+            };
 
-            runtime_resolver.requireConnectedTarget(&resolved_telegram.?) catch
-                return ToolResult.fail("Telegram chat is not connected");
-            chat_id_opt = resolved_telegram.?.target_id;
-            if (account_id == null) account_id = resolved_telegram.?.account_id;
+            if (resolved_telegram != null) {
+                runtime_resolver.requireConnectedTarget(&resolved_telegram.?) catch
+                    return ToolResult.fail("Telegram chat is not connected");
+                if (chat_id_opt == null) chat_id_opt = resolved_telegram.?.target_id;
+                if (account_id == null) account_id = resolved_telegram.?.account_id;
+            }
         }
 
-        if (self.event_bus == null and std.mem.eql(u8, channel, "telegram")) {
+        // Prefer direct Telegram delivery when tenant state is available.
+        // This provides immediate success/failure instead of "queued" semantics,
+        // and avoids account mismatch drops in the async dispatcher path.
+        if (is_telegram_channel and can_direct_telegram) {
+            return send_telegram_direct(allocator, content, account_id, chat_id_opt, is_background_origin);
+        }
+        if (self.event_bus == null and is_telegram_channel) {
             return send_telegram_direct(allocator, content, account_id, chat_id_opt, is_background_origin);
         }
 
@@ -127,7 +142,6 @@ pub const MessageTool = struct {
             return ToolResult.fail("Message tool not connected to event bus");
 
         const outbound_allocator = self.outbound_allocator orelse allocator;
-        const tenant_ctx = root.getTenantContext();
         var user_id_buf: [32]u8 = undefined;
         const user_id_opt: ?[]const u8 = if (tenant_ctx.numeric_user_id) |user_id|
             std.fmt.bufPrint(&user_id_buf, "{d}", .{user_id}) catch null
