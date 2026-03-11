@@ -1032,6 +1032,10 @@ pub const Agent = struct {
                         .role = .assistant,
                         .content = history_copy,
                     });
+                    // Keep cache-hit turns bounded too; otherwise history can grow
+                    // unbounded when many turns short-circuit before finalize.
+                    self.last_turn_compacted = false;
+                    self.trimHistory();
                     return cached_hit.response;
                 }
             }
@@ -1046,6 +1050,10 @@ pub const Agent = struct {
                     .role = .assistant,
                     .content = history_copy,
                 });
+                // Keep cache-hit turns bounded too; otherwise history can grow
+                // unbounded when many turns short-circuit before finalize.
+                self.last_turn_compacted = false;
+                self.trimHistory();
                 return cached_response;
             }
         }
