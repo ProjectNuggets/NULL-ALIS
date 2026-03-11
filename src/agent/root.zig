@@ -1885,6 +1885,11 @@ pub const Agent = struct {
         return self.history.items.len;
     }
 
+    /// Enforce configured history bounds (used by restore/maintenance paths).
+    pub fn enforceHistoryBounds(self: *Agent) void {
+        self.trimHistory();
+    }
+
     /// Load persisted messages into history (for session restore).
     /// Each entry has .role ("user"/"assistant") and .content.
     /// The agent takes ownership of the content strings.

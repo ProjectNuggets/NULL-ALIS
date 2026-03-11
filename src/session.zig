@@ -19,11 +19,14 @@ const memory_mod = @import("memory/root.zig");
 const Memory = memory_mod.Memory;
 const observability = @import("observability.zig");
 const Observer = observability.Observer;
+const ObserverEvent = observability.ObserverEvent;
 const MultiObserver = observability.MultiObserver;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const log = std.log.scoped(.session);
+const SESSION_LOCK_WAIT_STAGE = "session_lock_wait";
+const SESSION_LOCK_WAIT_WARN_MS: u64 = 50;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Session
@@ -156,6 +159,7 @@ pub const SessionManager = struct {
             const entries = store.loadMessages(self.allocator, session_key) catch &.{};
             if (entries.len > 0) {
                 session.agent.loadHistory(entries) catch {};
+                session.agent.enforceHistoryBounds();
                 for (entries) |entry| {
                     self.allocator.free(entry.role);
                     self.allocator.free(entry.content);
@@ -217,7 +221,9 @@ pub const SessionManager = struct {
         const total_start_ms = std.time.milliTimestamp();
         const session = try self.getOrCreate(session_key);
 
+        const lock_wait_start_ms = std.time.milliTimestamp();
         session.mutex.lock();
+        const lock_wait_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - lock_wait_start_ms));
         defer session.mutex.unlock();
 
         tools_mod.setMessageTurnContext(options.message_turn_context);
@@ -246,6 +252,17 @@ pub const SessionManager = struct {
             session.agent.observer = base_observer;
             session.turn_observer_multi.observers = &.{};
         };
+
+        if (lock_wait_ms > 0) {
+            const lock_wait_event = ObserverEvent{ .turn_stage = .{
+                .stage = SESSION_LOCK_WAIT_STAGE,
+                .duration_ms = lock_wait_ms,
+            } };
+            session.agent.observer.recordEvent(&lock_wait_event);
+            if (lock_wait_ms >= SESSION_LOCK_WAIT_WARN_MS) {
+                log.warn("session.lock_wait session={s} wait_ms={d}", .{ session_key, lock_wait_ms });
+            }
+        }
 
         const agent_start_ms = std.time.milliTimestamp();
         const response = try (&session.agent).turn(content);
@@ -862,6 +879,32 @@ test "processMessage with sqlite memory first turn does not panic" {
     }
     // One user + one assistant message should be persisted.
     try testing.expect(entries.len >= 2);
+}
+
+test "session restore enforces max history bound before first turn" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.agent.max_history_messages = 5;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    var idx: usize = 0;
+    while (idx < 12) : (idx += 1) {
+        const role = if ((idx % 2) == 0) "user" else "assistant";
+        const msg = try std.fmt.allocPrint(testing.allocator, "message-{d}", .{idx});
+        defer testing.allocator.free(msg);
+        try store.saveMessage("restore:trim", role, msg);
+    }
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, sqlite_mem.memory(), store);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("restore:trim");
+    try testing.expectEqual(@as(usize, 5), session.agent.historyLen());
+    const last = session.agent.history.items[session.agent.history.items.len - 1].content;
+    try testing.expectEqualStrings("message-11", last);
 }
 
 // ---------------------------------------------------------------------------

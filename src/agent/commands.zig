@@ -2157,13 +2157,59 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
 }
 
 fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
+    const parsed = splitFirstToken(arg);
+    const action_or_name = parsed.head;
+
+    if (std.ascii.eqlIgnoreCase(action_or_name, "search")) {
+        const query = std.mem.trim(u8, parsed.tail, " \t");
+        if (query.len == 0) {
+            return try self.allocator.dupe(u8, "Usage: /skill search <query>");
+        }
+        const results = skills_mod.searchDecisionHubSkills(self.allocator, query, 8) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Decision Hub search failed: {s}", .{@errorName(err)});
+        };
+        defer skills_mod.freeDecisionHubSearchResults(self.allocator, results);
+        if (results.len == 0) return try self.allocator.dupe(u8, "No matching skills found in Decision Hub.");
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const w = out.writer(self.allocator);
+        try w.print("Decision Hub results ({d}):\n", .{results.len});
+        for (results) |item| {
+            try w.print("- {s}/{s}", .{ item.org_slug, item.skill_name });
+            if (item.latest_version.len > 0) try w.print(" @ {s}", .{item.latest_version});
+            if (item.safety_rating.len > 0) try w.print(" [grade {s}]", .{item.safety_rating});
+            if (item.description.len > 0) try w.print(" — {s}", .{item.description});
+            try w.writeByte('\n');
+        }
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    if (std.ascii.eqlIgnoreCase(action_or_name, "install")) {
+        const target = std.mem.trim(u8, parsed.tail, " \t");
+        if (target.len == 0) {
+            return try self.allocator.dupe(u8, "Usage: /skill install <org/skill or query>");
+        }
+        const installed = skills_mod.installSkillFromDecisionHubQueryOrRef(
+            self.allocator,
+            target,
+            self.workspace_dir,
+            .{},
+        ) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Skill install failed: {s}", .{@errorName(err)});
+        };
+        defer skills_mod.freeDecisionHubInstallResult(self.allocator, &installed);
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Installed {s}/{s}@{s} as `{s}`. It is now available for /skill and prompt usage.",
+            .{ installed.org_slug, installed.skill_name, installed.resolved_version, installed.installed_name },
+        );
+    }
+
     const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
     };
     defer skills_mod.freeSkills(self.allocator, skills);
-
-    const parsed = splitFirstToken(arg);
-    const action_or_name = parsed.head;
 
     if (action_or_name.len == 0 or std.ascii.eqlIgnoreCase(action_or_name, "list")) {
         if (skills.len == 0) {

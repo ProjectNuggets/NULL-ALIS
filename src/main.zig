@@ -870,7 +870,8 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\
             \\Commands:
             \\  list                          List installed skills
-            \\  install <source>              Install from GitHub URL or path
+            \\  search <query>                Search Decision Hub by natural language
+            \\  install <source|query>        Install from local path or Decision Hub
             \\  remove <name>                 Remove a skill
             \\  info <name>                   Show skill details
             \\
@@ -907,14 +908,56 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         }
     } else if (std.mem.eql(u8, subcmd, "install")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullalis skills install <source>\n", .{});
+            std.debug.print("Usage: nullalis skills install <source|query>\n", .{});
             std.process.exit(1);
         }
-        yc.skills.installSkillFromPath(allocator, sub_args[1], cfg.workspace_dir) catch |err| {
-            std.debug.print("Failed to install skill: {s}\n", .{@errorName(err)});
+        const local_path_exists = sub_args.len == 2 and blk: {
+            std.fs.cwd().access(sub_args[1], .{}) catch break :blk false;
+            break :blk true;
+        };
+        if (local_path_exists) {
+            yc.skills.installSkillFromPath(allocator, sub_args[1], cfg.workspace_dir) catch |err| {
+                std.debug.print("Failed to install skill from path: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            std.debug.print("Skill installed from path: {s}\n", .{sub_args[1]});
+        } else {
+            const target = try std.mem.join(allocator, " ", sub_args[1..]);
+            defer allocator.free(target);
+            const result = yc.skills.installSkillFromDecisionHubQueryOrRef(allocator, target, cfg.workspace_dir, .{}) catch |err| {
+                std.debug.print("Failed to install from Decision Hub: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer yc.skills.freeDecisionHubInstallResult(allocator, &result);
+            std.debug.print(
+                "Installed {s}/{s}@{s} as local skill `{s}`\n",
+                .{ result.org_slug, result.skill_name, result.resolved_version, result.installed_name },
+            );
+        }
+    } else if (std.mem.eql(u8, subcmd, "search")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullalis skills search <query>\n", .{});
+            std.process.exit(1);
+        }
+        const query = try std.mem.join(allocator, " ", sub_args[1..]);
+        defer allocator.free(query);
+        const results = yc.skills.searchDecisionHubSkills(allocator, query, 10) catch |err| {
+            std.debug.print("Decision Hub search failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
-        std.debug.print("Skill installed from: {s}\n", .{sub_args[1]});
+        defer yc.skills.freeDecisionHubSearchResults(allocator, results);
+        if (results.len == 0) {
+            std.debug.print("No matching skills found.\n", .{});
+        } else {
+            std.debug.print("Decision Hub matches ({d}):\n", .{results.len});
+            for (results) |item| {
+                std.debug.print("  {s}/{s}", .{ item.org_slug, item.skill_name });
+                if (item.latest_version.len > 0) std.debug.print(" @ {s}", .{item.latest_version});
+                if (item.safety_rating.len > 0) std.debug.print(" [grade {s}]", .{item.safety_rating});
+                if (item.description.len > 0) std.debug.print(" -- {s}", .{item.description});
+                std.debug.print("\n", .{});
+            }
+        }
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullalis skills remove <name>\n", .{});
@@ -3066,7 +3109,7 @@ fn printUsage() void {
         \\  service <install|start|stop|status|uninstall>
         \\  cron <list|add|once|remove|pause|resume> [ARGS] [--backend auto|file|postgres] [--user-id ID]
         \\  channel <list|start|status|add|remove> [ARGS]
-        \\  skills <list|install|remove> [ARGS]
+        \\  skills <list|search|install|remove> [ARGS]
         \\  hardware <discover|introspect|info> [ARGS]
         \\  migrate openclaw [--dry-run] [--source PATH]
         \\  memory <stats|count|reindex|search|get|list|drain-outbox|forget> [ARGS]

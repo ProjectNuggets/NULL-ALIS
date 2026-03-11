@@ -68,6 +68,7 @@ pub const delegate = @import("delegate.zig");
 pub const browser = @import("browser.zig");
 pub const image = @import("image.zig");
 pub const composio = @import("composio.zig");
+pub const skill_registry = @import("skill_registry.zig");
 pub const runtime_info = @import("runtime_info.zig");
 pub const screenshot = @import("screenshot.zig");
 pub const browser_open = @import("browser_open.zig");
@@ -372,6 +373,10 @@ pub fn allTools(
         .config = opts.config orelse return error.InvalidArgument,
     };
     try list.append(allocator, rit.tool());
+
+    const skrt = try allocator.create(skill_registry.SkillRegistryTool);
+    skrt.* = .{ .workspace_dir = workspace_dir };
+    try list.append(allocator, skrt.tool());
 
     // Spawn tool (async subagent)
     const sp = try allocator.create(spawn.SpawnTool);
@@ -1045,8 +1050,8 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 15 + http_request + web_fetch + web_search + browser = 19
-    try std.testing.expectEqual(@as(usize, 19), tools.len);
+    // base 16 + http_request + web_fetch + web_search + browser = 20
+    try std.testing.expectEqual(@as(usize, 20), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -1059,8 +1064,8 @@ test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
     defer deinitTools(std.testing.allocator, tools);
     // shell + file_read + file_write + file_edit + file_append + git + image_info
-    // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule + runtime_info + spawn = 15
-    try std.testing.expectEqual(@as(usize, 15), tools.len);
+    // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule + runtime_info + skill_registry + spawn = 16
+    try std.testing.expectEqual(@as(usize, 16), tools.len);
 }
 
 test "all tools binds runtime_info to finalized tool slice" {
@@ -1111,7 +1116,7 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    try std.testing.expectEqual(@as(usize, 16), tools.len);
+    try std.testing.expectEqual(@as(usize, 17), tools.len);
 
     var found_message = false;
     for (tools) |t| {

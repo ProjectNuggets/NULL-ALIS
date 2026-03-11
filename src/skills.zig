@@ -1,5 +1,6 @@
 const std = @import("std");
 const platform = @import("platform.zig");
+const http_util = @import("http_util.zig");
 
 // Skills — user-defined capabilities loaded from disk.
 //
@@ -42,6 +43,42 @@ pub const SkillManifest = struct {
     always: bool = false,
     requires_bins: []const []const u8 = &.{},
     requires_env: []const []const u8 = &.{},
+};
+
+pub const DECISION_HUB_DEFAULT_API_URL = "https://hub.decision.ai";
+pub const DECISION_HUB_ENV_API_URL = "NULLALIS_DECISION_HUB_API_URL";
+pub const DECISION_HUB_ENV_TOKEN = "NULLALIS_DECISION_HUB_TOKEN";
+pub const DHUB_ENV_API_URL = "DHUB_API_URL";
+pub const DHUB_ENV_TOKEN = "DHUB_TOKEN";
+
+pub const DecisionHubSkillRef = struct {
+    org_slug: []const u8,
+    skill_name: []const u8,
+};
+
+pub const DecisionHubSearchResult = struct {
+    org_slug: []const u8,
+    skill_name: []const u8,
+    description: []const u8,
+    safety_rating: []const u8,
+    latest_version: []const u8,
+};
+
+pub const DecisionHubInstallOptions = struct {
+    spec: []const u8 = "latest",
+    allow_risky: bool = false,
+};
+
+pub const DecisionHubInstallResult = struct {
+    org_slug: []const u8,
+    skill_name: []const u8,
+    installed_name: []const u8,
+    resolved_version: []const u8,
+};
+
+const RequestHeaders = struct {
+    headers: []const []const u8,
+    owned_auth: ?[]u8,
 };
 
 // ── JSON Parsing (manual, no allocations) ───────────────────────
@@ -148,6 +185,489 @@ fn parseStringArray(allocator: std.mem.Allocator, json: []const u8, key: []const
 fn freeStringArray(allocator: std.mem.Allocator, arr: []const []const u8) void {
     for (arr) |item| allocator.free(item);
     allocator.free(arr);
+}
+
+fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (input) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            try buf.append(allocator, c);
+        } else if (c == ' ') {
+            try buf.append(allocator, '+');
+        } else {
+            try buf.appendSlice(allocator, &.{ '%', "0123456789ABCDEF"[c >> 4], "0123456789ABCDEF"[c & 0x0f] });
+        }
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+fn apiBaseUrl(allocator: std.mem.Allocator) ![]u8 {
+    if (platform.getEnvOrNull(allocator, DECISION_HUB_ENV_API_URL)) |v| {
+        defer allocator.free(v);
+        const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (std.mem.startsWith(u8, trimmed, "https://") or std.mem.startsWith(u8, trimmed, "http://")) {
+                return allocator.dupe(u8, std.mem.trimRight(u8, trimmed, "/"));
+            }
+            return std.fmt.allocPrint(allocator, "https://{s}", .{std.mem.trim(u8, trimmed, "/")});
+        }
+    }
+    if (platform.getEnvOrNull(allocator, DHUB_ENV_API_URL)) |v| {
+        defer allocator.free(v);
+        const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (std.mem.startsWith(u8, trimmed, "https://") or std.mem.startsWith(u8, trimmed, "http://")) {
+                return allocator.dupe(u8, std.mem.trimRight(u8, trimmed, "/"));
+            }
+            return std.fmt.allocPrint(allocator, "https://{s}", .{std.mem.trim(u8, trimmed, "/")});
+        }
+    }
+    return allocator.dupe(u8, DECISION_HUB_DEFAULT_API_URL);
+}
+
+fn apiToken(allocator: std.mem.Allocator) ?[]u8 {
+    if (platform.getEnvOrNull(allocator, DECISION_HUB_ENV_TOKEN)) |v| {
+        const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        if (trimmed.len == 0) {
+            allocator.free(v);
+            return null;
+        }
+        if (trimmed.ptr == v.ptr and trimmed.len == v.len) return @constCast(v);
+        const out = allocator.dupe(u8, trimmed) catch {
+            allocator.free(v);
+            return null;
+        };
+        allocator.free(v);
+        return out;
+    }
+    if (platform.getEnvOrNull(allocator, DHUB_ENV_TOKEN)) |v| {
+        const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        if (trimmed.len == 0) {
+            allocator.free(v);
+            return null;
+        }
+        if (trimmed.ptr == v.ptr and trimmed.len == v.len) return @constCast(v);
+        const out = allocator.dupe(u8, trimmed) catch {
+            allocator.free(v);
+            return null;
+        };
+        allocator.free(v);
+        return out;
+    }
+    return null;
+}
+
+fn buildRequestHeaders(
+    allocator: std.mem.Allocator,
+    token: ?[]const u8,
+) !RequestHeaders {
+    if (token) |t| {
+        const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{t});
+        const headers = try allocator.alloc([]const u8, 1);
+        headers[0] = auth;
+        return .{ .headers = headers, .owned_auth = auth };
+    }
+    const empty = try allocator.alloc([]const u8, 0);
+    return .{ .headers = empty, .owned_auth = null };
+}
+
+fn freeRequestHeaders(
+    allocator: std.mem.Allocator,
+    bundle: RequestHeaders,
+) void {
+    if (bundle.owned_auth) |auth| allocator.free(auth);
+    allocator.free(bundle.headers);
+}
+
+fn jsonObjectString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn validSkillSegment(segment: []const u8) bool {
+    if (segment.len == 0) return false;
+    for (segment) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.') continue;
+        return false;
+    }
+    return true;
+}
+
+pub fn isDecisionHubSkillRef(input: []const u8) bool {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    const slash = std.mem.indexOfScalar(u8, trimmed, '/') orelse return false;
+    if (std.mem.indexOfScalarPos(u8, trimmed, slash + 1, '/')) |_| return false;
+    const org = trimmed[0..slash];
+    const name = trimmed[slash + 1 ..];
+    return validSkillSegment(org) and validSkillSegment(name);
+}
+
+pub fn parseDecisionHubSkillRef(input: []const u8) !DecisionHubSkillRef {
+    if (!isDecisionHubSkillRef(input)) return error.InvalidSkillReference;
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    const slash = std.mem.indexOfScalar(u8, trimmed, '/').?;
+    return .{
+        .org_slug = trimmed[0..slash],
+        .skill_name = trimmed[slash + 1 ..],
+    };
+}
+
+pub fn freeDecisionHubSearchResults(allocator: std.mem.Allocator, results: []DecisionHubSearchResult) void {
+    for (results) |r| {
+        allocator.free(r.org_slug);
+        allocator.free(r.skill_name);
+        allocator.free(r.description);
+        allocator.free(r.safety_rating);
+        allocator.free(r.latest_version);
+    }
+    allocator.free(results);
+}
+
+pub fn freeDecisionHubInstallResult(allocator: std.mem.Allocator, result: *const DecisionHubInstallResult) void {
+    allocator.free(result.org_slug);
+    allocator.free(result.skill_name);
+    allocator.free(result.installed_name);
+    allocator.free(result.resolved_version);
+}
+
+pub fn searchDecisionHubSkills(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    max_results: usize,
+) ![]DecisionHubSearchResult {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed.len == 0) return error.EmptyQuery;
+
+    const api_url = try apiBaseUrl(allocator);
+    defer allocator.free(api_url);
+    const encoded_query = try urlEncode(allocator, trimmed);
+    defer allocator.free(encoded_query);
+
+    const url = try std.fmt.allocPrint(allocator, "{s}/v1/ask?q={s}", .{ api_url, encoded_query });
+    defer allocator.free(url);
+
+    const token = apiToken(allocator);
+    defer if (token) |t| allocator.free(t);
+    const header_bundle = try buildRequestHeaders(allocator, token);
+    defer freeRequestHeaders(allocator, header_bundle);
+
+    const response = try http_util.request_with_mode(allocator, .{}, .{
+        .method = "GET",
+        .url = url,
+        .headers = header_bundle.headers,
+        .body = null,
+        .timeout_ms = 30_000,
+        .subsystem = .tools,
+    });
+    defer allocator.free(response.body);
+
+    if (response.status_code != 200) return error.DecisionHubSearchFailed;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDecisionHubResponse;
+    const skills_val = parsed.value.object.get("skills") orelse return try allocator.alloc(DecisionHubSearchResult, 0);
+    if (skills_val != .array) return try allocator.alloc(DecisionHubSearchResult, 0);
+
+    var out: std.ArrayList(DecisionHubSearchResult) = .empty;
+    errdefer {
+        for (out.items) |item| {
+            allocator.free(item.org_slug);
+            allocator.free(item.skill_name);
+            allocator.free(item.description);
+            allocator.free(item.safety_rating);
+            allocator.free(item.latest_version);
+        }
+        out.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    while (i < skills_val.array.items.len and i < max_results) : (i += 1) {
+        const item = skills_val.array.items[i];
+        if (item != .object) continue;
+        const org_slug = jsonObjectString(item.object, "org_slug") orelse continue;
+        const skill_name = jsonObjectString(item.object, "skill_name") orelse continue;
+        const description = jsonObjectString(item.object, "description") orelse "";
+        const safety_rating = jsonObjectString(item.object, "safety_rating") orelse "";
+        const latest_version = jsonObjectString(item.object, "latest_version") orelse "";
+
+        try out.append(allocator, .{
+            .org_slug = try allocator.dupe(u8, org_slug),
+            .skill_name = try allocator.dupe(u8, skill_name),
+            .description = try allocator.dupe(u8, description),
+            .safety_rating = try allocator.dupe(u8, safety_rating),
+            .latest_version = try allocator.dupe(u8, latest_version),
+        });
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+const ResolvedDecisionHubSkill = struct {
+    org_slug: []const u8,
+    skill_name: []const u8,
+    version: []const u8,
+    download_url: []const u8,
+    checksum: []const u8,
+};
+
+fn resolveDecisionHubSkill(
+    allocator: std.mem.Allocator,
+    ref: DecisionHubSkillRef,
+    options: DecisionHubInstallOptions,
+) !ResolvedDecisionHubSkill {
+    const api_url = try apiBaseUrl(allocator);
+    defer allocator.free(api_url);
+    const encoded_spec = try urlEncode(allocator, options.spec);
+    defer allocator.free(encoded_spec);
+    const allow_risky_str = if (options.allow_risky) "true" else "false";
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "{s}/v1/resolve/{s}/{s}?spec={s}&allow_risky={s}",
+        .{ api_url, ref.org_slug, ref.skill_name, encoded_spec, allow_risky_str },
+    );
+    defer allocator.free(url);
+
+    const token = apiToken(allocator);
+    defer if (token) |t| allocator.free(t);
+    const header_bundle = try buildRequestHeaders(allocator, token);
+    defer freeRequestHeaders(allocator, header_bundle);
+
+    const response = try http_util.request_with_mode(allocator, .{}, .{
+        .method = "GET",
+        .url = url,
+        .headers = header_bundle.headers,
+        .body = null,
+        .timeout_ms = 60_000,
+        .subsystem = .tools,
+    });
+    defer allocator.free(response.body);
+
+    if (response.status_code == 404) return error.SkillNotFound;
+    if (response.status_code != 200) return error.DecisionHubResolveFailed;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDecisionHubResponse;
+    const version = jsonObjectString(parsed.value.object, "version") orelse return error.InvalidDecisionHubResponse;
+    const download_url = jsonObjectString(parsed.value.object, "download_url") orelse return error.InvalidDecisionHubResponse;
+    const checksum = jsonObjectString(parsed.value.object, "checksum") orelse return error.InvalidDecisionHubResponse;
+
+    return .{
+        .org_slug = try allocator.dupe(u8, ref.org_slug),
+        .skill_name = try allocator.dupe(u8, ref.skill_name),
+        .version = try allocator.dupe(u8, version),
+        .download_url = try allocator.dupe(u8, download_url),
+        .checksum = try allocator.dupe(u8, checksum),
+    };
+}
+
+fn freeResolvedDecisionHubSkill(allocator: std.mem.Allocator, resolved: *const ResolvedDecisionHubSkill) void {
+    allocator.free(resolved.org_slug);
+    allocator.free(resolved.skill_name);
+    allocator.free(resolved.version);
+    allocator.free(resolved.download_url);
+    allocator.free(resolved.checksum);
+}
+
+fn verifySha256Hex(bytes: []const u8, expected_hex: []const u8) bool {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const actual_hex = std.fmt.bytesToHex(digest, .lower);
+    const trimmed_expected = std.mem.trim(u8, expected_hex, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(actual_hex[0..], trimmed_expected);
+}
+
+fn commandSucceeded(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn extractZipArchive(
+    allocator: std.mem.Allocator,
+    zip_path: []const u8,
+    output_dir: []const u8,
+) !void {
+    const unzip_res = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "unzip", "-qq", "-o", zip_path, "-d", output_dir },
+        .max_output_bytes = 8 * 1024,
+    }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (unzip_res) |res| {
+        defer {
+            allocator.free(res.stdout);
+            allocator.free(res.stderr);
+        }
+        if (commandSucceeded(res.term)) return;
+    }
+
+    const bsdtar_res = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "bsdtar", "-xf", zip_path, "-C", output_dir },
+        .max_output_bytes = 8 * 1024,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.MissingArchiveExtractor,
+        else => return err,
+    };
+    defer {
+        allocator.free(bsdtar_res.stdout);
+        allocator.free(bsdtar_res.stderr);
+    }
+    if (!commandSucceeded(bsdtar_res.term)) return error.ZipExtractFailed;
+}
+
+fn findInstalledSkillSourceDir(allocator: std.mem.Allocator, extracted_dir: []const u8) ![]u8 {
+    const root_manifest = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{extracted_dir});
+    defer allocator.free(root_manifest);
+    if (std.fs.accessAbsolute(root_manifest, .{})) |_| {
+        return allocator.dupe(u8, extracted_dir);
+    } else |_| {}
+
+    const dir = try std.fs.openDirAbsolute(extracted_dir, .{ .iterate = true });
+    var dir_mut = dir;
+    defer dir_mut.close();
+    var it = dir_mut.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ extracted_dir, entry.name });
+        defer allocator.free(candidate);
+        const candidate_manifest = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{candidate});
+        defer allocator.free(candidate_manifest);
+        if (std.fs.accessAbsolute(candidate_manifest, .{})) |_| {
+            return allocator.dupe(u8, candidate);
+        } else |_| {}
+    }
+    return error.ManifestNotFound;
+}
+
+fn ensureSyntheticManifestIfMissing(
+    allocator: std.mem.Allocator,
+    source_dir: []const u8,
+    resolved: ResolvedDecisionHubSkill,
+) !void {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{source_dir});
+    defer allocator.free(manifest_path);
+    if (std.fs.accessAbsolute(manifest_path, .{})) |_| return else |_| {}
+
+    const description = try std.fmt.allocPrint(
+        allocator,
+        "Installed from Decision Hub: {s}/{s}",
+        .{ resolved.org_slug, resolved.skill_name },
+    );
+    defer allocator.free(description);
+
+    const manifest_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"name\":\"{s}\",\"version\":\"{s}\",\"description\":\"{s}\",\"author\":\"{s}\"}}",
+        .{ resolved.skill_name, resolved.version, description, resolved.org_slug },
+    );
+    defer allocator.free(manifest_json);
+
+    const f = try std.fs.createFileAbsolute(manifest_path, .{});
+    defer f.close();
+    try f.writeAll(manifest_json);
+}
+
+fn installResolvedDecisionHubSkill(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    resolved: ResolvedDecisionHubSkill,
+) !DecisionHubInstallResult {
+    const response = try http_util.request_with_mode(allocator, .{}, .{
+        .method = "GET",
+        .url = resolved.download_url,
+        .headers = &.{},
+        .body = null,
+        .timeout_ms = 120_000,
+        .subsystem = .tools,
+    });
+    defer allocator.free(response.body);
+    if (response.status_code != 200) return error.DecisionHubDownloadFailed;
+    if (!verifySha256Hex(response.body, resolved.checksum)) return error.DecisionHubChecksumMismatch;
+
+    const tmp_dir = try std.fmt.allocPrint(allocator, "{s}/state/tmp", .{workspace_dir});
+    defer allocator.free(tmp_dir);
+    std.fs.makeDirAbsolute(tmp_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => std.fs.cwd().makePath(tmp_dir) catch return err,
+    };
+
+    const nonce = std.crypto.random.int(u64);
+    const zip_path = try std.fmt.allocPrint(allocator, "{s}/decision-hub-{d}.zip", .{ tmp_dir, nonce });
+    defer allocator.free(zip_path);
+    const extracted_dir = try std.fmt.allocPrint(allocator, "{s}/decision-hub-{d}", .{ tmp_dir, nonce });
+    defer allocator.free(extracted_dir);
+    defer std.fs.deleteTreeAbsolute(extracted_dir) catch {};
+    defer std.fs.deleteFileAbsolute(zip_path) catch {};
+
+    {
+        const f = try std.fs.createFileAbsolute(zip_path, .{});
+        defer f.close();
+        try f.writeAll(response.body);
+    }
+    std.fs.makeDirAbsolute(extracted_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    try extractZipArchive(allocator, zip_path, extracted_dir);
+    const source_dir = findInstalledSkillSourceDir(allocator, extracted_dir) catch |err| switch (err) {
+        error.ManifestNotFound => try allocator.dupe(u8, extracted_dir),
+        else => return err,
+    };
+    defer allocator.free(source_dir);
+    try ensureSyntheticManifestIfMissing(allocator, source_dir, resolved);
+    try installSkillFromPath(allocator, source_dir, workspace_dir);
+
+    const installed_skill = try loadSkill(allocator, source_dir);
+    defer freeSkill(allocator, &installed_skill);
+    return .{
+        .org_slug = try allocator.dupe(u8, resolved.org_slug),
+        .skill_name = try allocator.dupe(u8, resolved.skill_name),
+        .installed_name = try allocator.dupe(u8, installed_skill.name),
+        .resolved_version = try allocator.dupe(u8, resolved.version),
+    };
+}
+
+pub fn installSkillFromDecisionHubRef(
+    allocator: std.mem.Allocator,
+    skill_ref: []const u8,
+    workspace_dir: []const u8,
+    options: DecisionHubInstallOptions,
+) !DecisionHubInstallResult {
+    const ref = try parseDecisionHubSkillRef(skill_ref);
+    const resolved = try resolveDecisionHubSkill(allocator, ref, options);
+    defer freeResolvedDecisionHubSkill(allocator, &resolved);
+    return installResolvedDecisionHubSkill(allocator, workspace_dir, resolved);
+}
+
+pub fn installSkillFromDecisionHubQueryOrRef(
+    allocator: std.mem.Allocator,
+    query_or_ref: []const u8,
+    workspace_dir: []const u8,
+    options: DecisionHubInstallOptions,
+) !DecisionHubInstallResult {
+    const trimmed = std.mem.trim(u8, query_or_ref, " \t\r\n");
+    if (trimmed.len == 0) return error.EmptyQuery;
+    if (isDecisionHubSkillRef(trimmed)) {
+        return installSkillFromDecisionHubRef(allocator, trimmed, workspace_dir, options);
+    }
+
+    const hits = try searchDecisionHubSkills(allocator, trimmed, 1);
+    defer freeDecisionHubSearchResults(allocator, hits);
+    if (hits.len == 0) return error.SkillNotFound;
+
+    const ref = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hits[0].org_slug, hits[0].skill_name });
+    defer allocator.free(ref);
+    return installSkillFromDecisionHubRef(allocator, ref, workspace_dir, options);
 }
 
 /// Parse a skill.json manifest from raw JSON bytes.
@@ -481,8 +1001,10 @@ pub fn removeSkill(allocator: std.mem.Allocator, name: []const u8, workspace_dir
 
 // ── Community Skills Sync ────────────────────────────────────────
 
-pub const OPEN_SKILLS_REPO_URL = "https://github.com/besoeasy/open-skills";
 pub const COMMUNITY_SYNC_INTERVAL_DAYS: u64 = 7;
+pub const COMMUNITY_SKILLS_ENABLED_ENV = "NULLALIS_COMMUNITY_SKILLS_ENABLED";
+pub const COMMUNITY_SKILLS_DIR_ENV = "NULLALIS_COMMUNITY_SKILLS_DIR";
+pub const COMMUNITY_SYNC_DEFERRED_MESSAGE = "community skills sync deferred-explicit: source repository connector not configured";
 
 pub const CommunitySkillsSync = struct {
     enabled: bool,
@@ -544,18 +1066,19 @@ fn writeSyncMarker(allocator: std.mem.Allocator, marker_path: []const u8) !void 
     return writeSyncMarkerWithTimestamp(allocator, marker_path, std.time.timestamp());
 }
 
-/// Synchronize community skills from the open-skills repository.
-/// Gracefully returns without error if git is unavailable or sync is disabled.
+/// Synchronize community skill metadata without remote repository access.
+/// The remote connector is intentionally deferred; this function only updates
+/// local sync markers when community sync is enabled.
 pub fn syncCommunitySkills(allocator: std.mem.Allocator, workspace_dir: []const u8) !void {
     // Check if enabled via env var
-    const enabled_env = platform.getEnvOrNull(allocator, "NULLCLAW_OPEN_SKILLS_ENABLED");
+    const enabled_env = platform.getEnvOrNull(allocator, COMMUNITY_SKILLS_ENABLED_ENV);
     defer if (enabled_env) |v| allocator.free(v);
     if (enabled_env == null) return; // not set — disabled
     if (std.mem.eql(u8, enabled_env.?, "false")) return;
 
     // Determine community skills directory
     const community_dir = blk: {
-        if (platform.getEnvOrNull(allocator, "NULLCLAW_OPEN_SKILLS_DIR")) |dir| {
+        if (platform.getEnvOrNull(allocator, COMMUNITY_SKILLS_DIR_ENV)) |dir| {
             break :blk dir;
         }
         break :blk try std.fmt.allocPrint(allocator, "{s}/skills/community", .{workspace_dir});
@@ -574,27 +1097,11 @@ pub fn syncCommunitySkills(allocator: std.mem.Allocator, workspace_dir: []const 
         if (now - last_sync < interval) return; // still fresh
     }
 
-    // Determine if community_dir exists
-    const dir_exists = blk: {
-        std.fs.accessAbsolute(community_dir, .{}) catch break :blk false;
-        break :blk true;
+    // Ensure the local community directory exists; remote connector is deferred.
+    std.fs.makeDirAbsolute(community_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {},
     };
-
-    if (!dir_exists) {
-        // Clone
-        _ = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{ "git", "clone", "--depth", "1", OPEN_SKILLS_REPO_URL, community_dir },
-            .max_output_bytes = 8192,
-        }) catch return; // git unavailable — graceful degradation
-    } else {
-        // Pull
-        _ = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{ "git", "-C", community_dir, "pull", "--ff-only" },
-            .max_output_bytes = 8192,
-        }) catch return; // git unavailable — graceful degradation
-    }
 
     // Update marker
     writeSyncMarker(allocator, marker_path) catch {};
@@ -712,7 +1219,7 @@ fn countMdFiles(dir_path: []const u8) u32 {
 /// This wraps syncCommunitySkills with additional information about the outcome.
 pub fn syncCommunitySkillsResult(allocator: std.mem.Allocator, workspace_dir: []const u8) !SyncResult {
     // Check if enabled via env var
-    const enabled_env = platform.getEnvOrNull(allocator, "NULLCLAW_OPEN_SKILLS_ENABLED");
+    const enabled_env = platform.getEnvOrNull(allocator, COMMUNITY_SKILLS_ENABLED_ENV);
     defer if (enabled_env) |v| allocator.free(v);
     if (enabled_env == null) {
         return SyncResult{
@@ -731,7 +1238,7 @@ pub fn syncCommunitySkillsResult(allocator: std.mem.Allocator, workspace_dir: []
 
     // Determine community skills directory
     const community_dir = blk: {
-        if (platform.getEnvOrNull(allocator, "NULLCLAW_OPEN_SKILLS_DIR")) |dir| {
+        if (platform.getEnvOrNull(allocator, COMMUNITY_SKILLS_DIR_ENV)) |dir| {
             break :blk dir;
         }
         break :blk try std.fmt.allocPrint(allocator, "{s}/skills/community", .{workspace_dir});
@@ -757,47 +1264,19 @@ pub fn syncCommunitySkillsResult(allocator: std.mem.Allocator, workspace_dir: []
         }
     }
 
-    // Determine if community_dir exists
-    const dir_exists = blk: {
-        std.fs.accessAbsolute(community_dir, .{}) catch break :blk false;
-        break :blk true;
+    std.fs.makeDirAbsolute(community_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {},
     };
-
-    if (!dir_exists) {
-        _ = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{ "git", "clone", "--depth", "1", OPEN_SKILLS_REPO_URL, community_dir },
-            .max_output_bytes = 8192,
-        }) catch {
-            return SyncResult{
-                .synced = false,
-                .skills_count = 0,
-                .message = try allocator.dupe(u8, "git clone failed"),
-            };
-        };
-    } else {
-        _ = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{ "git", "-C", community_dir, "pull", "--ff-only" },
-            .max_output_bytes = 8192,
-        }) catch {
-            const count = countMdFiles(community_dir);
-            return SyncResult{
-                .synced = false,
-                .skills_count = count,
-                .message = try allocator.dupe(u8, "git pull failed"),
-            };
-        };
-    }
 
     // Update marker
     writeSyncMarker(allocator, marker_path) catch {};
 
     const count = countMdFiles(community_dir);
     return SyncResult{
-        .synced = true,
+        .synced = false,
         .skills_count = count,
-        .message = try std.fmt.allocPrint(allocator, "synced {d} community skills", .{count}),
+        .message = try allocator.dupe(u8, COMMUNITY_SYNC_DEFERRED_MESSAGE),
     };
 }
 
@@ -1292,7 +1771,7 @@ test "readSyncMarker returns null for nonexistent file" {
 }
 
 test "syncCommunitySkills disabled when env not set" {
-    // NULLCLAW_OPEN_SKILLS_ENABLED is not set in test environment,
+    // NULLALIS_COMMUNITY_SKILLS_ENABLED is not set in test environment,
     // so syncCommunitySkills should return immediately without doing anything
     const allocator = std.testing.allocator;
     try syncCommunitySkills(allocator, "/tmp/nullalis-test-sync-disabled");
@@ -1418,8 +1897,9 @@ test "CommunitySkillsSync struct" {
     try std.testing.expectEqualStrings("/tmp/skills/community", sync.skills_dir);
 }
 
-test "OPEN_SKILLS_REPO_URL is set" {
-    try std.testing.expectEqualStrings("https://github.com/besoeasy/open-skills", OPEN_SKILLS_REPO_URL);
+test "community skills env constants are set" {
+    try std.testing.expectEqualStrings("NULLALIS_COMMUNITY_SKILLS_ENABLED", COMMUNITY_SKILLS_ENABLED_ENV);
+    try std.testing.expectEqualStrings("NULLALIS_COMMUNITY_SKILLS_DIR", COMMUNITY_SKILLS_DIR_ENV);
 }
 
 test "COMMUNITY_SYNC_INTERVAL_DAYS is 7" {
@@ -1540,7 +2020,7 @@ test "checkRequirements marks available when no requirements" {
 test "checkRequirements detects missing env var" {
     const allocator = std.testing.allocator;
     const env_arr = try allocator.alloc([]const u8, 1);
-    env_arr[0] = try allocator.dupe(u8, "NULLCLAW_TEST_NONEXISTENT_VAR_XYZ123");
+    env_arr[0] = try allocator.dupe(u8, "NULLALIS_TEST_NONEXISTENT_VAR_XYZ123");
     var skill = Skill{
         .name = "needs-env",
         .requires_env = env_arr,
@@ -1550,7 +2030,7 @@ test "checkRequirements detects missing env var" {
     defer freeStringArray(allocator, skill.requires_env);
 
     try std.testing.expect(!skill.available);
-    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "env:NULLCLAW_TEST_NONEXISTENT_VAR_XYZ123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "env:NULLALIS_TEST_NONEXISTENT_VAR_XYZ123") != null);
 }
 
 test "checkBinaryExists finds common binary" {
@@ -1700,7 +2180,7 @@ test "checkRequirements detects both missing bin and env" {
     const bin_arr = try allocator.alloc([]const u8, 1);
     bin_arr[0] = try allocator.dupe(u8, "nullalis_missing_bin_abc");
     const env_arr = try allocator.alloc([]const u8, 1);
-    env_arr[0] = try allocator.dupe(u8, "NULLCLAW_MISSING_ENV_ABC");
+    env_arr[0] = try allocator.dupe(u8, "NULLALIS_MISSING_ENV_ABC");
     var skill = Skill{
         .name = "needs-both",
         .requires_bins = bin_arr,
@@ -1713,7 +2193,7 @@ test "checkRequirements detects both missing bin and env" {
 
     try std.testing.expect(!skill.available);
     try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "bin:nullalis_missing_bin_abc") != null);
-    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "env:NULLCLAW_MISSING_ENV_ABC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "env:NULLALIS_MISSING_ENV_ABC") != null);
 }
 
 test "listSkillsMerged runs checkRequirements" {
@@ -1773,7 +2253,7 @@ test "SyncResult struct fields" {
 }
 
 test "syncCommunitySkillsResult disabled when env not set" {
-    // NULLCLAW_OPEN_SKILLS_ENABLED is not set in test environment
+    // NULLALIS_COMMUNITY_SKILLS_ENABLED is not set in test environment
     const allocator = std.testing.allocator;
     const result = try syncCommunitySkillsResult(allocator, "/tmp/nullalis-test-sync-result-disabled");
     defer freeSyncResult(allocator, &result);
@@ -1820,4 +2300,30 @@ test "freeSyncResult frees message" {
     };
     // freeSyncResult should not leak — testing allocator will catch leaks
     freeSyncResult(allocator, &result);
+}
+
+test "isDecisionHubSkillRef accepts org/skill format" {
+    try std.testing.expect(isDecisionHubSkillRef("pymc-labs/causalpy"));
+    try std.testing.expect(isDecisionHubSkillRef("acme-org/my_skill.v2"));
+}
+
+test "isDecisionHubSkillRef rejects malformed input" {
+    try std.testing.expect(!isDecisionHubSkillRef("just-one"));
+    try std.testing.expect(!isDecisionHubSkillRef("bad/ref/extra"));
+    try std.testing.expect(!isDecisionHubSkillRef("bad ref/name"));
+}
+
+test "parseDecisionHubSkillRef splits org and skill" {
+    const parsed = try parseDecisionHubSkillRef("pymc-labs/causalpy");
+    try std.testing.expectEqualStrings("pymc-labs", parsed.org_slug);
+    try std.testing.expectEqualStrings("causalpy", parsed.skill_name);
+}
+
+test "verifySha256Hex validates expected digest" {
+    const data = "hello";
+    // SHA-256("hello")
+    const good = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const bad = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expect(verifySha256Hex(data, good));
+    try std.testing.expect(!verifySha256Hex(data, bad));
 }
