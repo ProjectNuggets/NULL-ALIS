@@ -12,6 +12,11 @@ Establish a defensible baseline of what is:
 This ledger is the control document for "use what exists first" decisions.
 
 ## Baseline Verification Snapshot
+- Baseline SHA (pre-activation patch): `0f413b4e1d7c8c7fcb50e464438d8b60758f7203`
+- Baseline operator checks (user `1`, 2026-03-11):
+  - `nullalis status --user-id 1`
+  - `nullalis doctor --user-id 1`
+  - `GET /internal/diagnostics` with `X-Zaki-User-Id: 1`
 - Semantic cache wiring is active in agent turn path:
   - read/hit path: `src/agent/root.zig:755`
   - write path: `src/agent/root.zig:1179`
@@ -50,6 +55,11 @@ This ledger is the control document for "use what exists first" decisions.
 
 ## B. Initialized-but-Inert (Confirmed)
 
+Classification rule in v0.1.1:
+1. `active`: runtime-enforced behavior.
+2. `deferred-explicit`: accepted in config/commands but explicitly surfaced as not runtime-active.
+3. `experimental-gated`: runtime-active only behind clear explicit gates.
+
 ### B1. `system_prompt_has_conversation_context` (write-only state)
 - Declared and set/reset:
   - `src/agent/root.zig:297`
@@ -66,7 +76,8 @@ This ledger is the control document for "use what exists first" decisions.
   - `src/agent/commands.zig:636`
   - `src/agent/commands.zig:954`
 - No execution-path enforcement in `Agent.turn(...)`.
-- Recommendation: wire in scheduler/turn dispatcher or mark as experimental/off by default in UX copy.
+- Classification: `deferred-explicit`.
+- Runtime note: startup/runtime surfaces must warn when these are set.
 
 ### B3. TTS controls are command-visible but runtime-inert
 - Fields:
@@ -76,7 +87,7 @@ This ledger is the control document for "use what exists first" decisions.
   - `src/agent/commands.zig:640`
   - `src/agent/commands.zig:1028`
 - No TTS synthesis/output path in core turn execution.
-- Recommendation: keep as staged config surface, do not represent as active feature in operator UX.
+- Classification: `deferred-explicit`.
 
 ### B4. Activation/send/session TTL are command-visible but runtime-inert
 - Fields:
@@ -89,7 +100,7 @@ This ledger is the control document for "use what exists first" decisions.
   - `src/agent/commands.zig:1239`
   - `src/agent/commands.zig:1186`
 - No enforcement in main turn/session execution path.
-- Recommendation: either wire into channel dispatch/session eviction or clearly mark as future/runtime-noop.
+- Classification: `deferred-explicit` until wiring is complete.
 
 ## C. Metadata-Only (Not Bugs)
 

@@ -299,6 +299,9 @@ paths:
                   type: string
                 user_id:
                   type: string
+                session_key:
+                  type: string
+                  description: Optional session key override. In tenant mode it must belong to the authenticated user (`agent:zaki-bot:user:{user_id}:...`).
       responses:
         "200":
           description: SSE stream (`status`, optional `progress`, `token`, `done`)

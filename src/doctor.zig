@@ -655,6 +655,16 @@ fn checkRuntimeSnapshot(
     )));
     try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
         allocator,
+        "providers: chat={s} fallbacks={s} embedding={s} source={s}",
+        .{
+            snapshot.chat_provider_effective,
+            snapshot.chat_fallback_chain,
+            snapshot.embedding_provider_effective,
+            snapshot.provider_data_source,
+        },
+    )));
+    try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+        allocator,
         "scheduler limits: configured max_tasks={d} max_concurrent={d}",
         .{ snapshot.scheduler_max_tasks_configured, snapshot.scheduler_max_concurrent_configured },
     )));
@@ -1029,6 +1039,10 @@ test "checkRuntimeSnapshot emits runtime source and backend fields" {
         .tenant_enabled = true,
         .scheduler_max_tasks_configured = 64,
         .scheduler_max_concurrent_configured = 4,
+        .chat_provider_effective = try allocator.dupe(u8, "openrouter"),
+        .chat_fallback_chain = try allocator.dupe(u8, "together"),
+        .embedding_provider_effective = try allocator.dupe(u8, "together"),
+        .provider_data_source = try allocator.dupe(u8, "config"),
         .context_incomplete = true,
     };
     defer snapshot.deinit(allocator);

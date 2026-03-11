@@ -66,6 +66,12 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
         snapshot.state_backend_effective,
         snapshot.scheduler_backend,
     });
+    try w.print("Runtime LLM: chat_provider={s}, fallbacks={s}, embedding_provider={s}, source={s}\n", .{
+        snapshot.chat_provider_effective,
+        snapshot.chat_fallback_chain,
+        snapshot.embedding_provider_effective,
+        snapshot.provider_data_source,
+    });
     if (user_id) |resolved_user_id| {
         try w.print("Runtime:     scoped_user_id={s}\n", .{resolved_user_id});
     } else if (cfg.tenant.enabled and std.mem.eql(u8, cfg.state.backend, "postgres")) {

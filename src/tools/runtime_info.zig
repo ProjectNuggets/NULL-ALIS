@@ -2,6 +2,7 @@ const std = @import("std");
 const channel_catalog = @import("../channel_catalog.zig");
 const config_mod = @import("../config.zig");
 const json_util = @import("../json_util.zig");
+const tool_dispatcher = @import("../tool_dispatcher.zig");
 const process_util = @import("process_util.zig");
 const root = @import("root.zig");
 
@@ -81,6 +82,10 @@ pub const RuntimeInfoTool = struct {
         const degraded = degraded_reason.len > 0;
         const context_incomplete = tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or scoped_numeric_user_id == null);
         const data_source = runtimeDataSourceLabel(tenant_ctx, user_id_override);
+        const chat_provider_effective = normalizeProviderAlias(self.config.default_provider);
+        const embedding_provider_effective = normalizeProviderAlias(self.config.memory.search.provider);
+        const chat_fallback_chain = try allocNormalizedFallbackChain(allocator, self.config.reliability.fallback_providers);
+        defer allocator.free(chat_fallback_chain);
         const user_id = user_id_override orelse tenant_ctx.user_id;
         const entity_id = resolveComposioEntityId(self.config, tenant_ctx, user_id_override);
         var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx, user_id_override);
@@ -128,6 +133,25 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKeyValue(&buf, allocator, "data_source", data_source);
         try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "chat_provider_effective", chat_provider_effective);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "chat_fallback_chain", chat_fallback_chain);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "embedding_provider_effective", embedding_provider_effective);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "provider_data_source", "config");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "tool_dispatcher_configured", self.config.agent.tool_dispatcher);
+        try buf.appendSlice(allocator, ",");
+        const dispatch_parsed = tool_dispatcher.parseMode(self.config.agent.tool_dispatcher);
+        try json_util.appendJsonKeyValue(&buf, allocator, "tool_dispatcher_effective", tool_dispatcher.effectiveMode(self.config.agent.parallel_tools, dispatch_parsed.mode).toSlice());
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "tool_dispatcher_supported");
+        try buf.appendSlice(allocator, if (dispatch_parsed.supported) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "parallel_tools");
+        try buf.appendSlice(allocator, if (self.config.agent.parallel_tools) "true" else "false");
+        try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "context_incomplete");
         try buf.appendSlice(allocator, if (context_incomplete) "true" else "false");
         try buf.appendSlice(allocator, ",");
@@ -149,6 +173,9 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "enabled_tools");
         try appendToolNames(&buf, allocator, self.runtime_tools);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "deferred_controls");
+        try appendDeferredControls(&buf, allocator, self.config);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "composio");
         try buf.appendSlice(allocator, "{");
@@ -206,6 +233,10 @@ pub const RuntimeInfoTool = struct {
         const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
         const context_incomplete = tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or scoped_numeric_user_id == null);
         const data_source = runtimeDataSourceLabel(tenant_ctx, user_id_override);
+        const chat_provider_effective = normalizeProviderAlias(self.config.default_provider);
+        const embedding_provider_effective = normalizeProviderAlias(self.config.memory.search.provider);
+        const chat_fallback_chain = try allocNormalizedFallbackChain(allocator, self.config.reliability.fallback_providers);
+        defer allocator.free(chat_fallback_chain);
         const entity_id = resolveComposioEntityId(self.config, tenant_ctx, user_id_override);
         var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx, user_id_override);
         defer telegram_state.deinit(allocator);
@@ -216,6 +247,14 @@ pub const RuntimeInfoTool = struct {
         defer buf.deinit(allocator);
         try buf.appendSlice(allocator, "{");
         try json_util.appendJsonKeyValue(&buf, allocator, "data_source", data_source);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "chat_provider_effective", chat_provider_effective);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "chat_fallback_chain", chat_fallback_chain);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "embedding_provider_effective", embedding_provider_effective);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "provider_data_source", "config");
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "context_incomplete");
         try buf.appendSlice(allocator, if (context_incomplete) "true" else "false");
@@ -416,6 +455,29 @@ fn runtimeDataSourceLabel(tenant_ctx: root.ToolTenantContext, user_id_override: 
     if (tenant_ctx.state_mgr != null and scoped_numeric_user_id != null) return "postgres";
     if (tenant_ctx.expect_postgres_state) return "context_missing";
     return "file_fallback";
+}
+
+fn normalizeProviderAlias(provider_name: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, provider_name, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "together-ai")) return "together";
+    if (std.mem.eql(u8, trimmed, "google-gemini")) return "gemini";
+    return trimmed;
+}
+
+fn allocNormalizedFallbackChain(allocator: std.mem.Allocator, providers: []const []const u8) ![]u8 {
+    if (providers.len == 0) return allocator.dupe(u8, "none");
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    var wrote_any = false;
+    for (providers) |provider_name| {
+        const normalized = normalizeProviderAlias(provider_name);
+        if (normalized.len == 0) continue;
+        if (wrote_any) try out.append(allocator, ',');
+        try out.appendSlice(allocator, normalized);
+        wrote_any = true;
+    }
+    if (!wrote_any) return allocator.dupe(u8, "none");
+    return out.toOwnedSlice(allocator);
 }
 
 fn resolveScopedNumericUserId(tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) ?i64 {
@@ -660,6 +722,19 @@ fn appendToolNames(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocato
     try buf.appendSlice(allocator, "]");
 }
 
+fn appendDeferredControls(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, config: *const config_mod.Config) !void {
+    try buf.appendSlice(allocator, "[");
+    const parsed = tool_dispatcher.parseMode(config.agent.tool_dispatcher);
+    if (!parsed.supported) {
+        const label = try std.fmt.allocPrint(allocator, "agent.tool_dispatcher={s}(unsupported_fallback:auto)", .{
+            config.agent.tool_dispatcher,
+        });
+        defer allocator.free(label);
+        try json_util.appendJsonString(buf, allocator, label);
+    }
+    try buf.appendSlice(allocator, "]");
+}
+
 fn appendOptionalInt(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, key: []const u8, value: ?i64) !void {
     try json_util.appendJsonKey(buf, allocator, key);
     if (value) |resolved| {
@@ -817,6 +892,11 @@ test "runtime info summary includes state backend keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"enabled_tools\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"data_source\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"context_incomplete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"chat_provider_effective\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"chat_fallback_chain\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"embedding_provider_effective\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"provider_data_source\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"deferred_controls\"") != null);
 }
 
 test "runtime info parseToolkitAvailability supports object items" {
@@ -876,6 +956,52 @@ test "runtime info telegram snapshot marks context missing for expected postgres
     defer snapshot_mut.deinit(std.testing.allocator);
     try std.testing.expect(snapshot.context_incomplete);
     try std.testing.expectEqualStrings("context_missing", snapshot.data_source);
+}
+
+test "runtime info summary surfaces active dispatcher state" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.agent.parallel_tools = true;
+    cfg.agent.tool_dispatcher = "parallel";
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    root.setTurnContext(.{
+        .origin = .user,
+        .session_key = "agent:test",
+        .provider = "openrouter",
+        .model = "moonshotai/kimi-k2.5",
+    });
+    defer root.clearTurnContext();
+    const parsed = try root.parseTestArgs("{\"section\":\"summary\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"parallel_tools\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"tool_dispatcher_effective\":\"parallel\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"deferred_controls\":[]") != null);
+}
+
+test "runtime info summary surfaces unsupported dispatcher as deferred-explicit" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.agent.parallel_tools = true;
+    cfg.agent.tool_dispatcher = "xml";
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    const parsed = try root.parseTestArgs("{\"section\":\"summary\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"tool_dispatcher_supported\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "unsupported_fallback:auto") != null);
 }
 
 test "runtime info telegram snapshot treats invalid override as context missing in postgres mode" {

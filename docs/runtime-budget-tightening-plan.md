@@ -27,6 +27,13 @@ Out of scope:
 - changing business logic of individual tools
 - policy broadening (auth/connect in background remains unchanged)
 
+## Known Non-Goals For v0.1.1 Baseline Activation
+- No path deletion of legacy/deferred controls.
+- No broad background policy expansion.
+- No provider transport rearchitecture (providers remain curl transport path).
+- No parallel tool execution wiring in this patch.
+- No native token-stream with tool-calls redesign in this patch.
+
 ## Step-by-Step Plan
 
 ### Step 1: Add a single TurnBudget contract

@@ -22,6 +22,7 @@ const capabilities_mod = @import("../capabilities.zig");
 const multimodal = @import("../multimodal.zig");
 const platform = @import("../platform.zig");
 const observability = @import("../observability.zig");
+const tool_dispatcher = @import("../tool_dispatcher.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
@@ -210,6 +211,8 @@ pub const Agent = struct {
         }
     };
 
+    const ToolDispatcherMode = tool_dispatcher.Mode;
+
     allocator: std.mem.Allocator,
     provider: Provider,
     tools: []const Tool,
@@ -235,6 +238,8 @@ pub const Agent = struct {
     allowed_paths: []const []const u8 = &.{},
     max_tool_iterations: u32,
     max_history_messages: u32,
+    parallel_tools: bool = false,
+    tool_dispatcher_mode: ToolDispatcherMode = .auto,
     auto_save: bool,
     token_limit: u64 = 0,
     token_limit_override: ?u64 = null,
@@ -364,6 +369,8 @@ pub const Agent = struct {
             .allowed_paths = cfg.autonomy.allowed_paths,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
+            .parallel_tools = cfg.agent.parallel_tools,
+            .tool_dispatcher_mode = tool_dispatcher.parseMode(cfg.agent.tool_dispatcher).mode,
             .auto_save = cfg.memory.auto_save,
             .token_limit = resolved_token_limit,
             .token_limit_override = token_limit_override,
@@ -537,6 +544,261 @@ pub const Agent = struct {
 
     fn execBlockMessage(self: *Agent, args: std.json.ObjectMap) ?[]const u8 {
         return commands.execBlockMessage(self, args);
+    }
+
+    const PolicyPreflightResult = union(enum) {
+        allowed,
+        blocked: ToolExecutionResult,
+    };
+
+    const ParallelToolWorker = struct {
+        agent: *Agent,
+        call: ParsedToolCall,
+        turn_ctx: tools_mod.RuntimeTurnContext,
+        tenant_ctx: tools_mod.ToolTenantContext,
+        message_ctx: tools_mod.MessageTurnContext,
+        arena: std.heap.ArenaAllocator,
+        result: ToolExecutionResult,
+        duration_ms: u64 = 0,
+
+        fn init(
+            agent: *Agent,
+            call: ParsedToolCall,
+            turn_ctx: tools_mod.RuntimeTurnContext,
+            tenant_ctx: tools_mod.ToolTenantContext,
+            message_ctx: tools_mod.MessageTurnContext,
+        ) ParallelToolWorker {
+            return .{
+                .agent = agent,
+                .call = call,
+                .turn_ctx = turn_ctx,
+                .tenant_ctx = tenant_ctx,
+                .message_ctx = message_ctx,
+                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+                .result = .{
+                    .name = call.name,
+                    .output = "Tool execution did not run",
+                    .success = false,
+                    .tool_call_id = call.tool_call_id,
+                },
+            };
+        }
+
+        fn deinit(self: *ParallelToolWorker) void {
+            self.arena.deinit();
+        }
+
+        fn run(self: *ParallelToolWorker) void {
+            tools_mod.setTurnContext(self.turn_ctx);
+            defer tools_mod.clearTurnContext();
+
+            tools_mod.setTenantContext(self.tenant_ctx);
+            defer tools_mod.clearTenantContext();
+
+            tools_mod.setMessageTurnContext(self.message_ctx);
+            defer tools_mod.clearMessageTurnContext();
+
+            const worker_allocator = self.arena.allocator();
+            const start_ms = std.time.milliTimestamp();
+            self.result = self.agent.executeToolUnchecked(worker_allocator, self.call);
+            self.duration_ms = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - start_ms)));
+        }
+    };
+
+    fn effectiveToolDispatcherMode(self: *const Agent) ToolDispatcherMode {
+        return tool_dispatcher.effectiveMode(self.parallel_tools, self.tool_dispatcher_mode);
+    }
+
+    fn shouldParallelDispatch(self: *const Agent, parsed_calls: []const ParsedToolCall) bool {
+        if (parsed_calls.len < 2) return false;
+        if (self.effectiveToolDispatcherMode() != .parallel) return false;
+        for (parsed_calls) |call| {
+            if (!self.isParallelSafeToolCall(call)) return false;
+        }
+        return true;
+    }
+
+    fn toolCallHasAction(allocator: std.mem.Allocator, arguments_json: []const u8, expected_action: []const u8) bool {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{}) catch return false;
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |obj| obj,
+            else => return false,
+        };
+        const raw = switch (object.get("action") orelse return false) {
+            .string => |value| value,
+            else => return false,
+        };
+        return std.mem.eql(u8, raw, expected_action);
+    }
+
+    fn isParallelSafeToolCall(self: *const Agent, call: ParsedToolCall) bool {
+        if (std.mem.eql(u8, call.name, tools_mod.runtime_info.RuntimeInfoTool.tool_name)) return true;
+        if (std.mem.eql(u8, call.name, tools_mod.file_read.FileReadTool.tool_name)) return true;
+        if (std.mem.eql(u8, call.name, tools_mod.web_search.WebSearchTool.tool_name)) return true;
+        if (std.mem.eql(u8, call.name, tools_mod.web_fetch.WebFetchTool.tool_name)) return true;
+
+        if (std.mem.eql(u8, call.name, tools_mod.schedule.ScheduleTool.tool_name)) {
+            return toolCallHasAction(self.allocator, call.arguments_json, "list") or
+                toolCallHasAction(self.allocator, call.arguments_json, "get") or
+                toolCallHasAction(self.allocator, call.arguments_json, "runs");
+        }
+
+        if (std.mem.eql(u8, call.name, tools_mod.composio.ComposioTool.tool_name)) {
+            return toolCallHasAction(self.allocator, call.arguments_json, "list");
+        }
+
+        return false;
+    }
+
+    fn preflightToolPolicy(self: *Agent, call: ParsedToolCall) PolicyPreflightResult {
+        if (self.policy) |pol| {
+            if (!pol.canAct()) {
+                return .{ .blocked = .{
+                    .name = call.name,
+                    .output = "Action blocked: agent is in read-only mode",
+                    .success = false,
+                    .tool_call_id = call.tool_call_id,
+                } };
+            }
+            const allowed = pol.recordAction() catch true;
+            if (!allowed) {
+                return .{ .blocked = .{
+                    .name = call.name,
+                    .output = "Rate limit exceeded",
+                    .success = false,
+                    .tool_call_id = call.tool_call_id,
+                } };
+            }
+        }
+        return .allowed;
+    }
+
+    fn executeToolCallsSerial(
+        self: *Agent,
+        tool_allocator: std.mem.Allocator,
+        parsed_calls: []const ParsedToolCall,
+        results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
+    ) !void {
+        for (parsed_calls) |call| {
+            const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
+            self.observer.recordEvent(&tool_start_event);
+
+            const tool_timer = std.time.milliTimestamp();
+            const result = self.executeTool(tool_allocator, call);
+            const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
+
+            const tool_event = ObserverEvent{ .tool_call = .{
+                .tool = call.name,
+                .duration_ms = tool_duration,
+                .success = result.success,
+            } };
+            self.observer.recordEvent(&tool_event);
+
+            try results_buf.append(self.allocator, result);
+        }
+    }
+
+    fn executeToolCallsParallel(
+        self: *Agent,
+        tool_allocator: std.mem.Allocator,
+        parsed_calls: []const ParsedToolCall,
+        results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
+    ) !void {
+        var worker_initialized = try self.allocator.alloc(bool, parsed_calls.len);
+        defer self.allocator.free(worker_initialized);
+        @memset(worker_initialized, false);
+
+        var workers = try self.allocator.alloc(ParallelToolWorker, parsed_calls.len);
+        defer {
+            for (workers, 0..) |*worker, i| {
+                if (worker_initialized[i]) worker.deinit();
+            }
+            self.allocator.free(workers);
+        }
+
+        var spawned = try self.allocator.alloc(bool, parsed_calls.len);
+        defer self.allocator.free(spawned);
+        @memset(spawned, false);
+
+        var blocked = try self.allocator.alloc(bool, parsed_calls.len);
+        defer self.allocator.free(blocked);
+        @memset(blocked, false);
+
+        var ordered_results = try self.allocator.alloc(ToolExecutionResult, parsed_calls.len);
+        defer self.allocator.free(ordered_results);
+
+        var ordered_durations = try self.allocator.alloc(u64, parsed_calls.len);
+        defer self.allocator.free(ordered_durations);
+        @memset(ordered_durations, 0);
+
+        var threads = try self.allocator.alloc(std.Thread, parsed_calls.len);
+        defer self.allocator.free(threads);
+
+        const turn_ctx = tools_mod.getTurnContext();
+        const tenant_ctx = tools_mod.getTenantContext();
+        const message_ctx = tools_mod.message.MessageTool.getTurnContext();
+
+        var force_serial_tail = false;
+
+        for (parsed_calls, 0..) |call, i| {
+            const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
+            self.observer.recordEvent(&tool_start_event);
+
+            switch (self.preflightToolPolicy(call)) {
+                .blocked => |result| {
+                    blocked[i] = true;
+                    ordered_results[i] = result;
+                    continue;
+                },
+                .allowed => {},
+            }
+
+            if (force_serial_tail) {
+                const start_ms = std.time.milliTimestamp();
+                const result = self.executeToolUnchecked(tool_allocator, call);
+                ordered_results[i] = result;
+                ordered_durations[i] = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - start_ms)));
+                continue;
+            }
+
+            workers[i] = ParallelToolWorker.init(self, call, turn_ctx, tenant_ctx, message_ctx);
+            worker_initialized[i] = true;
+            threads[i] = std.Thread.spawn(.{}, ParallelToolWorker.run, .{&workers[i]}) catch {
+                const start_ms = std.time.milliTimestamp();
+                const result = self.executeToolUnchecked(tool_allocator, call);
+                ordered_results[i] = result;
+                ordered_durations[i] = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - start_ms)));
+                force_serial_tail = true;
+                continue;
+            };
+            spawned[i] = true;
+        }
+
+        for (parsed_calls, 0..) |call, i| {
+            if (blocked[i]) continue;
+            if (!spawned[i]) continue;
+
+            threads[i].join();
+            ordered_durations[i] = workers[i].duration_ms;
+            ordered_results[i] = .{
+                .name = call.name,
+                .output = try tool_allocator.dupe(u8, workers[i].result.output),
+                .success = workers[i].result.success,
+                .tool_call_id = call.tool_call_id,
+            };
+        }
+
+        for (parsed_calls, 0..) |call, i| {
+            const result = ordered_results[i];
+            const tool_event = ObserverEvent{ .tool_call = .{
+                .tool = call.name,
+                .duration_ms = ordered_durations[i],
+                .success = result.success,
+            } };
+            self.observer.recordEvent(&tool_event);
+            try results_buf.append(self.allocator, result);
+        }
     }
 
     pub fn formatModelStatus(self: *const Agent) ![]const u8 {
@@ -1254,28 +1516,24 @@ pub const Agent = struct {
                 .content = assistant_content,
             });
 
-            // Execute each tool call
+            // Execute tool calls (serial by default, optional parallel dispatcher)
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
             defer results_buf.deinit(self.allocator);
             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
-
-            for (parsed_calls) |call| {
-                const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
-                self.observer.recordEvent(&tool_start_event);
-
-                const tool_timer = std.time.milliTimestamp();
-                const result = self.executeTool(arena, call);
-                const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
-
-                const tool_event = ObserverEvent{ .tool_call = .{
-                    .tool = call.name,
-                    .duration_ms = tool_duration,
-                    .success = result.success,
-                } };
-                self.observer.recordEvent(&tool_event);
-
-                try results_buf.append(self.allocator, result);
+            const dispatch_start_ms = std.time.milliTimestamp();
+            const used_parallel_dispatch = self.shouldParallelDispatch(parsed_calls);
+            if (used_parallel_dispatch) {
+                try self.executeToolCallsParallel(arena, parsed_calls, &results_buf);
+            } else {
+                try self.executeToolCallsSerial(arena, parsed_calls, &results_buf);
             }
+            const dispatch_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - dispatch_start_ms));
+            log.info("turn.stage stage=dispatch_tools iteration={d} duration_ms={d} mode={s} calls={d}", .{
+                iteration,
+                dispatch_duration_ms,
+                if (used_parallel_dispatch) "parallel" else "serial",
+                parsed_calls.len,
+            });
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
             const reflect_start_ms = std.time.milliTimestamp();
@@ -1383,27 +1641,13 @@ pub const Agent = struct {
     /// Execute a tool by name lookup.
     /// Parses arguments_json once into a std.json.ObjectMap and passes it to the tool.
     fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
-        // Policy gate: check autonomy and rate limit
-        if (self.policy) |pol| {
-            if (!pol.canAct()) {
-                return .{
-                    .name = call.name,
-                    .output = "Action blocked: agent is in read-only mode",
-                    .success = false,
-                    .tool_call_id = call.tool_call_id,
-                };
-            }
-            const allowed = pol.recordAction() catch true;
-            if (!allowed) {
-                return .{
-                    .name = call.name,
-                    .output = "Rate limit exceeded",
-                    .success = false,
-                    .tool_call_id = call.tool_call_id,
-                };
-            }
-        }
+        return switch (self.preflightToolPolicy(call)) {
+            .allowed => self.executeToolUnchecked(tool_allocator, call),
+            .blocked => |result| result,
+        };
+    }
 
+    fn executeToolUnchecked(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
         for (self.tools) |t| {
             if (std.mem.eql(u8, t.name(), call.name)) {
                 // Parse arguments JSON to ObjectMap ONCE
@@ -3657,6 +3901,298 @@ test "Agent tool loop frees dynamic tool outputs" {
 
     try std.testing.expectEqualStrings("done", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "Agent parallel dispatcher runs safe tool calls concurrently when enabled" {
+    const ParallelProbeState = struct {
+        mutex: std.Thread.Mutex = .{},
+        active: u32 = 0,
+        max_active: u32 = 0,
+    };
+
+    const SlowReadTool = struct {
+        const Self = @This();
+        pub const tool_name = "web_search";
+        pub const tool_description = "Synthetic read tool for parallel dispatcher testing";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        state: *ParallelProbeState,
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.state.mutex.lock();
+            self.state.active += 1;
+            if (self.state.active > self.state.max_active) self.state.max_active = self.state.active;
+            self.state.mutex.unlock();
+            defer {
+                self.state.mutex.lock();
+                self.state.active -= 1;
+                self.state.mutex.unlock();
+            }
+
+            std.Thread.sleep(60 * std.time.ns_per_ms);
+            return .{
+                .success = true,
+                .output = try allocator.dupe(u8, "ok"),
+            };
+        }
+    };
+
+    const TwoCallProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 2);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-1"),
+                    .name = try allocator.dupe(u8, "web_search"),
+                    .arguments = try allocator.dupe(u8, "{\"query\":\"one\"}"),
+                };
+                tool_calls[1] = .{
+                    .id = try allocator.dupe(u8, "call-2"),
+                    .name = try allocator.dupe(u8, "web_search"),
+                    .arguments = try allocator.dupe(u8, "{\"query\":\"two\"}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "running"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "two-call-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = TwoCallProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = TwoCallProvider.chatWithSystem,
+        .chat = TwoCallProvider.chat,
+        .supportsNativeTools = TwoCallProvider.supportsNativeTools,
+        .getName = TwoCallProvider.getName,
+        .deinit = TwoCallProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var probe_state = ParallelProbeState{};
+    var tool_impl = SlowReadTool{ .state = &probe_state };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .parallel_tools = true,
+        .tool_dispatcher_mode = .parallel,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run tools");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expect(probe_state.max_active >= 2);
+}
+
+test "Agent dispatcher stays serial when parallel tools are disabled" {
+    const ParallelProbeState = struct {
+        mutex: std.Thread.Mutex = .{},
+        active: u32 = 0,
+        max_active: u32 = 0,
+    };
+
+    const SlowReadTool = struct {
+        const Self = @This();
+        pub const tool_name = "web_search";
+        pub const tool_description = "Synthetic read tool for serial dispatcher testing";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        state: *ParallelProbeState,
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.state.mutex.lock();
+            self.state.active += 1;
+            if (self.state.active > self.state.max_active) self.state.max_active = self.state.active;
+            self.state.mutex.unlock();
+            defer {
+                self.state.mutex.lock();
+                self.state.active -= 1;
+                self.state.mutex.unlock();
+            }
+
+            std.Thread.sleep(40 * std.time.ns_per_ms);
+            return .{
+                .success = true,
+                .output = try allocator.dupe(u8, "ok"),
+            };
+        }
+    };
+
+    const TwoCallProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 2);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-1"),
+                    .name = try allocator.dupe(u8, "web_search"),
+                    .arguments = try allocator.dupe(u8, "{\"query\":\"one\"}"),
+                };
+                tool_calls[1] = .{
+                    .id = try allocator.dupe(u8, "call-2"),
+                    .name = try allocator.dupe(u8, "web_search"),
+                    .arguments = try allocator.dupe(u8, "{\"query\":\"two\"}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "running"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "two-call-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = TwoCallProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = TwoCallProvider.chatWithSystem,
+        .chat = TwoCallProvider.chat,
+        .supportsNativeTools = TwoCallProvider.supportsNativeTools,
+        .getName = TwoCallProvider.getName,
+        .deinit = TwoCallProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var probe_state = ParallelProbeState{};
+    var tool_impl = SlowReadTool{ .state = &probe_state };
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .parallel_tools = false,
+        .tool_dispatcher_mode = .auto,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run tools");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(u32, 1), probe_state.max_active);
 }
 
 test "Agent streaming fields can be set" {

@@ -197,6 +197,9 @@ pub const Config = struct {
                 if (self.default_model == null) {
                     self.default_model = try self.allocator.dupe(u8, "moonshotai/kimi-k2.5");
                 }
+                if (std.mem.eql(u8, self.default_provider, "openrouter") and self.reliability.fallback_providers.len == 0) {
+                    self.reliability.fallback_providers = &.{"together"};
+                }
             },
         }
     }
@@ -3115,6 +3118,8 @@ test "profile zaki_bot enables http request defaults" {
     try std.testing.expect(!cfg.browser.enabled);
     try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
     try std.testing.expectEqualStrings("moonshotai/kimi-k2.5", cfg.default_model.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.reliability.fallback_providers.len);
+    try std.testing.expectEqualStrings("together", cfg.reliability.fallback_providers[0]);
 }
 
 test "profile defaults do not override explicit http request disable" {
@@ -3128,6 +3133,8 @@ test "profile defaults do not override explicit http request disable" {
     try cfg.parseJson(json);
     try std.testing.expect(!cfg.http_request.enabled);
     try std.testing.expectEqualStrings("moonshotai/kimi-k2.5", cfg.default_model.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.reliability.fallback_providers.len);
+    try std.testing.expectEqualStrings("together", cfg.reliability.fallback_providers[0]);
 }
 
 test "profile defaults do not override explicit model primary" {
@@ -3141,6 +3148,7 @@ test "profile defaults do not override explicit model primary" {
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
     try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
+    try std.testing.expectEqual(@as(usize, 0), cfg.reliability.fallback_providers.len);
 }
 
 test "tools config parses web_search_provider" {

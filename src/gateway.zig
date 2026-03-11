@@ -38,6 +38,7 @@ const zaki_session = @import("zaki_session.zig");
 const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
 const runtime_resolver = @import("delivery/runtime_resolver.zig");
+const tool_dispatcher = @import("tool_dispatcher.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -432,6 +433,11 @@ pub const GatewayState = struct {
     state_degraded: bool = false,
     state_degraded_reason_buf: [64]u8 = [_]u8{0} ** 64,
     state_degraded_reason_len: usize = 0,
+    chat_provider_effective: []const u8 = "unknown",
+    embedding_provider_effective: []const u8 = "none",
+    provider_data_source: []const u8 = "config",
+    chat_fallback_chain_buf: [256]u8 = [_]u8{0} ** 256,
+    chat_fallback_chain_len: usize = 0,
     last_degraded_warn_s: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
@@ -497,6 +503,10 @@ pub const GatewayState = struct {
     fn configPath(self: *const GatewayState) []const u8 {
         return self.config_path_buf[0..self.config_path_len];
     }
+
+    fn chatFallbackChain(self: *const GatewayState) []const u8 {
+        return self.chat_fallback_chain_buf[0..self.chat_fallback_chain_len];
+    }
 };
 
 const UserContext = struct {
@@ -537,8 +547,7 @@ const TenantRuntime = struct {
     subagent_manager: ?*subagent_mod.SubagentManager,
     log_obs: *observability.LogObserver,
     session_mgr: session_mod.SessionManager,
-    last_used_s: i64,
-    lock: std.Thread.Mutex = .{},
+    last_used_s: std.atomic.Value(i64),
 
     fn semanticEmbeddingProviderForPrimary(primary_provider: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, primary_provider, "openrouter")) return "together";
@@ -619,7 +628,7 @@ const TenantRuntime = struct {
             .subagent_manager = null,
             .log_obs = undefined,
             .session_mgr = undefined,
-            .last_used_s = std.time.timestamp(),
+            .last_used_s = std.atomic.Value(i64).init(std.time.timestamp()),
         };
         runtime.config.workspace_dir = runtime.workspace_path;
         if (state_mgr != null) {
@@ -816,9 +825,7 @@ const TenantRuntime = struct {
         message_turn_context: ?tools_mod.MessageTurnContext,
         progress_observer: ?Observer,
     ) ![]const u8 {
-        self.lock.lock();
-        defer self.lock.unlock();
-        self.last_used_s = std.time.timestamp();
+        self.last_used_s.store(std.time.timestamp(), .release);
         const numeric_user_id = std.fmt.parseInt(i64, self.user_id, 10) catch null;
         tools_mod.setTenantContext(.{
             .user_id = self.user_id,
@@ -828,10 +835,14 @@ const TenantRuntime = struct {
             .expect_postgres_state = self.config.tenant.enabled and std.mem.eql(u8, self.config.state.backend, "postgres"),
         });
         defer tools_mod.clearTenantContext();
-        return self.session_mgr.processMessageWithContext(session_key, message, conversation_context, .{
+        const response = try self.session_mgr.processMessageWithContext(session_key, message, conversation_context, .{
             .message_turn_context = message_turn_context,
             .progress_observer = progress_observer,
         });
+        if (self.config.agent.session_idle_timeout_secs > 0) {
+            _ = self.session_mgr.evictIdle(self.config.agent.session_idle_timeout_secs);
+        }
+        return response;
     }
 };
 
@@ -852,7 +863,8 @@ fn pruneTenantRuntimeCache(state: *GatewayState, now_s: i64) void {
         var it = state.tenant_runtimes.iterator();
         while (it.next()) |entry| {
             const rt = entry.value_ptr.*;
-            if (now_s - rt.last_used_s > ttl_s) {
+            const last_used = rt.last_used_s.load(.acquire);
+            if (now_s - last_used > ttl_s) {
                 const key_copy = state.allocator.dupe(u8, entry.key_ptr.*) catch continue;
                 stale_keys.append(state.allocator, key_copy) catch state.allocator.free(key_copy);
             }
@@ -869,8 +881,9 @@ fn pruneTenantRuntimeCache(state: *GatewayState, now_s: i64) void {
         var it = state.tenant_runtimes.iterator();
         while (it.next()) |entry| {
             const rt = entry.value_ptr.*;
-            if (rt.last_used_s < oldest_ts) {
-                oldest_ts = rt.last_used_s;
+            const last_used = rt.last_used_s.load(.acquire);
+            if (last_used < oldest_ts) {
+                oldest_ts = last_used;
                 if (oldest_key) |prev| state.allocator.free(prev);
                 oldest_key = state.allocator.dupe(u8, entry.key_ptr.*) catch null;
             }
@@ -896,7 +909,7 @@ fn getTenantRuntime(
     pruneTenantRuntimeCache(state, now_s);
 
     if (state.tenant_runtimes.get(user_ctx.user_id)) |runtime| {
-        runtime.last_used_s = now_s;
+        runtime.last_used_s.store(now_s, .release);
         return runtime;
     }
 
@@ -1798,6 +1811,37 @@ fn detectWebhookMode(cfg: *const Config) []const u8 {
     return "multi";
 }
 
+fn normalizeProviderAlias(provider_name: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, provider_name, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "together-ai")) return "together";
+    if (std.mem.eql(u8, trimmed, "google-gemini")) return "gemini";
+    return trimmed;
+}
+
+fn buildFallbackChainIntoBuf(buf: []u8, fallback_providers: []const []const u8) usize {
+    if (fallback_providers.len == 0) return copyIntoBuf(buf, "none");
+    var used: usize = 0;
+    var wrote_any = false;
+    for (fallback_providers) |provider_name| {
+        const normalized = normalizeProviderAlias(provider_name);
+        if (normalized.len == 0) continue;
+        if (wrote_any) {
+            if (used >= buf.len) break;
+            buf[used] = ',';
+            used += 1;
+        }
+        const copy_len = @min(normalized.len, buf.len - used);
+        if (copy_len == 0) break;
+        @memcpy(buf[used .. used + copy_len], normalized[0..copy_len]);
+        used += copy_len;
+        wrote_any = true;
+        if (copy_len < normalized.len) break;
+    }
+    if (!wrote_any) return copyIntoBuf(buf, "none");
+    if (used < buf.len) @memset(buf[used..], 0);
+    return used;
+}
+
 fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init_error: ?anyerror) void {
     state.state_backend_configured = cfg.state.backend;
     state.state_backend_effective = if (state.zaki_state != null) "postgres" else "file";
@@ -1806,6 +1850,10 @@ fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init
     state.heartbeat_enabled = cfg.heartbeat.enabled;
     state.heartbeat_interval_minutes = cfg.heartbeat.interval_minutes;
     state.tenant_enabled_configured = cfg.tenant.enabled;
+    state.chat_provider_effective = normalizeProviderAlias(cfg.default_provider);
+    state.embedding_provider_effective = normalizeProviderAlias(cfg.memory.search.provider);
+    state.provider_data_source = "config";
+    state.chat_fallback_chain_len = buildFallbackChainIntoBuf(&state.chat_fallback_chain_buf, cfg.reliability.fallback_providers);
     state.config_path_len = copyIntoBuf(&state.config_path_buf, cfg.config_path);
     state.postgres_host_len = 0;
     state.postgres_port = 0;
@@ -1823,11 +1871,18 @@ fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init
     } else {
         state.state_degraded_reason_len = 0;
     }
+
+    const dispatch_mode = tool_dispatcher.parseMode(cfg.agent.tool_dispatcher);
+    if (!dispatch_mode.supported) {
+        log.warn("deferred-explicit: agent.tool_dispatcher={s} is unsupported; falling back to auto", .{
+            cfg.agent.tool_dispatcher,
+        });
+    }
 }
 
 fn logStartupSelfCheck(state: *const GatewayState) void {
     log.info(
-        "startup.self_check config_path={s} tenant_enabled={s} heartbeat_enabled={s} heartbeat_interval_minutes={d} state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} webhook_mode={s}",
+        "startup.self_check config_path={s} tenant_enabled={s} heartbeat_enabled={s} heartbeat_interval_minutes={d} state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} webhook_mode={s} chat_provider={s} chat_fallbacks={s} embedding_provider={s}",
         .{
             state.configPath(),
             if (state.tenant_enabled_configured) "true" else "false",
@@ -1841,6 +1896,9 @@ fn logStartupSelfCheck(state: *const GatewayState) void {
             state.postgresSchema(),
             state.scheduler_backend,
             state.webhook_mode,
+            state.chat_provider_effective,
+            state.chatFallbackChain(),
+            state.embedding_provider_effective,
         },
     );
     if (state.state_degraded) {
@@ -3308,6 +3366,14 @@ fn internalDiagnosticsPayload(
     try json_util.appendJsonKeyValue(&buf, allocator, "scheduler_backend", state.scheduler_backend);
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(&buf, allocator, "webhook_mode", state.webhook_mode);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "chat_provider_effective", state.chat_provider_effective);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "chat_fallback_chain", state.chatFallbackChain());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "embedding_provider_effective", state.embedding_provider_effective);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "provider_data_source", state.provider_data_source);
     try buf.appendSlice(allocator, "},");
 
     try json_util.appendJsonKey(&buf, allocator, "heartbeat_wake");
@@ -3685,6 +3751,29 @@ fn sendSseErrorFrames(stream: anytype, allocator: std.mem.Allocator, code: []con
     finishChunkedSse(stream) catch {};
 }
 
+const ChatStreamSessionKeyError = error{
+    InvalidSessionKey,
+    SessionKeyUserMismatch,
+};
+
+fn sessionKeyOwnedByUser(session_key: []const u8, user_id: []const u8) bool {
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "agent:zaki-bot:user:{s}:", .{user_id}) catch return false;
+    return std.mem.startsWith(u8, session_key, prefix);
+}
+
+fn resolveChatStreamSessionKey(body: []const u8, user_id: []const u8, tenant_enabled: bool, fallback_buf: []u8) ChatStreamSessionKeyError![]const u8 {
+    const requested = jsonStringField(body, "session_key");
+    if (requested) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > 255) return error.InvalidSessionKey;
+        if (std.mem.indexOfAny(u8, trimmed, "\r\n") != null) return error.InvalidSessionKey;
+        if (tenant_enabled and !sessionKeyOwnedByUser(trimmed, user_id)) return error.SessionKeyUserMismatch;
+        return trimmed;
+    }
+    return zaki_session.userMainSessionKey(fallback_buf, user_id);
+}
+
 fn handleApiChatStreamSseConnection(
     root_allocator: std.mem.Allocator,
     req_allocator: std.mem.Allocator,
@@ -3769,7 +3858,18 @@ fn handleApiChatStreamSseConnection(
     };
 
     var session_buf: [256]u8 = undefined;
-    const session_key = zaki_session.userMainSessionKey(&session_buf, user_id);
+    const session_key = resolveChatStreamSessionKey(body, user_id, state.tenant_enabled, &session_buf) catch |err| {
+        const code: []const u8 = switch (err) {
+            error.InvalidSessionKey => "invalid_session_key",
+            error.SessionKeyUserMismatch => "session_key_user_mismatch",
+        };
+        const msg: []const u8 = switch (err) {
+            error.InvalidSessionKey => "invalid session_key",
+            error.SessionKeyUserMismatch => "session_key must belong to the authenticated user",
+        };
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", code, msg);
+        return true;
+    };
     _ = state.chat_stream_total.fetchAdd(1, .monotonic);
     sendChunkedSseHeader(stream, "200 OK") catch return true;
 
@@ -4008,7 +4108,22 @@ fn handleApiRoute(
         const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing message\"}" };
         var session_buf: [256]u8 = undefined;
-        const session_key = zaki_session.userMainSessionKey(&session_buf, user_id);
+        const session_key = resolveChatStreamSessionKey(body, user_id, state.tenant_enabled, &session_buf) catch |err| {
+            const code: []const u8 = switch (err) {
+                error.InvalidSessionKey => "invalid_session_key",
+                error.SessionKeyUserMismatch => "session_key_user_mismatch",
+            };
+            const msg: []const u8 = switch (err) {
+                error.InvalidSessionKey => "invalid session_key",
+                error.SessionKeyUserMismatch => "session_key must belong to the authenticated user",
+            };
+            const err_sse = sseErrorEvent(req_allocator, code, msg) catch "event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_session_key\",\"message\":\"invalid session_key\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
+            return .{
+                .status = "400 Bad Request",
+                .body = err_sse,
+                .content_type = "text/event-stream; charset=utf-8",
+            };
+        };
         _ = state.chat_stream_total.fetchAdd(1, .monotonic);
 
         const chat_start_ms = std.time.milliTimestamp();
@@ -8405,6 +8520,36 @@ test "sseChatPayload emits token deltas and done metadata" {
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"type\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"session_id\":\"agent:zaki-bot:user:user_a:main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sse, "\"message_id\":\"") != null);
+}
+
+test "resolveChatStreamSessionKey falls back to canonical user main key" {
+    var fallback_buf: [256]u8 = undefined;
+    const session_key = try resolveChatStreamSessionKey("{\"message\":\"hi\"}", "42", true, &fallback_buf);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:42:main", session_key);
+}
+
+test "resolveChatStreamSessionKey accepts tenant-owned override" {
+    var fallback_buf: [256]u8 = undefined;
+    const session_key = try resolveChatStreamSessionKey(
+        "{\"message\":\"hi\",\"session_key\":\"agent:zaki-bot:user:42:thread:abc\"}",
+        "42",
+        true,
+        &fallback_buf,
+    );
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:42:thread:abc", session_key);
+}
+
+test "resolveChatStreamSessionKey rejects cross-user override in tenant mode" {
+    var fallback_buf: [256]u8 = undefined;
+    try std.testing.expectError(
+        error.SessionKeyUserMismatch,
+        resolveChatStreamSessionKey(
+            "{\"message\":\"hi\",\"session_key\":\"agent:zaki-bot:user:43:main\"}",
+            "42",
+            true,
+            &fallback_buf,
+        ),
+    );
 }
 
 test "tenant semantic memory defaults enable postgres_hybrid safely" {

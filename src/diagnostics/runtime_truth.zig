@@ -29,6 +29,10 @@ pub const RuntimeSnapshot = struct {
     scheduler_max_tasks_configured: u32,
     scheduler_max_concurrent_configured: u32,
     scheduler_max_tasks_effective: ?u32 = null,
+    chat_provider_effective: []u8,
+    chat_fallback_chain: []u8,
+    embedding_provider_effective: []u8,
+    provider_data_source: []u8,
     telegram_configured: ?bool = null,
     telegram_connected: ?bool = null,
     telegram_account_id: ?[]u8 = null,
@@ -41,6 +45,10 @@ pub const RuntimeSnapshot = struct {
         allocator.free(self.state_backend_effective);
         allocator.free(self.scheduler_backend);
         allocator.free(self.degraded_reason);
+        allocator.free(self.chat_provider_effective);
+        allocator.free(self.chat_fallback_chain);
+        allocator.free(self.embedding_provider_effective);
+        allocator.free(self.provider_data_source);
         if (self.telegram_account_id) |value| allocator.free(value);
         if (self.telegram_data_source) |value| allocator.free(value);
     }
@@ -98,9 +106,30 @@ fn collectGatewayInternalSnapshot(
     if (response.status_code != 200) return error.DiagnosticsUnavailable;
 
     var snapshot = try parseGatewayDiagnosticsPayload(allocator, response.body);
+    errdefer snapshot.deinit(allocator);
+    var provider_from_config = false;
     snapshot.scheduler_max_tasks_configured = cfg.scheduler.max_tasks;
     snapshot.scheduler_max_concurrent_configured = cfg.scheduler.max_concurrent;
     snapshot.scheduler_max_tasks_effective = cfg.scheduler.max_tasks;
+    if (std.mem.eql(u8, snapshot.chat_provider_effective, "unknown")) {
+        allocator.free(snapshot.chat_provider_effective);
+        snapshot.chat_provider_effective = try allocator.dupe(u8, normalizeProviderAlias(cfg.default_provider));
+        provider_from_config = true;
+    }
+    if (std.mem.eql(u8, snapshot.chat_fallback_chain, "none") and cfg.reliability.fallback_providers.len > 0) {
+        allocator.free(snapshot.chat_fallback_chain);
+        snapshot.chat_fallback_chain = try allocNormalizedFallbackChain(allocator, cfg.reliability.fallback_providers);
+        provider_from_config = true;
+    }
+    if (std.mem.eql(u8, snapshot.embedding_provider_effective, "none") and cfg.memory.search.provider.len > 0) {
+        allocator.free(snapshot.embedding_provider_effective);
+        snapshot.embedding_provider_effective = try allocator.dupe(u8, normalizeProviderAlias(cfg.memory.search.provider));
+        provider_from_config = true;
+    }
+    if (provider_from_config) {
+        allocator.free(snapshot.provider_data_source);
+        snapshot.provider_data_source = try allocator.dupe(u8, "config");
+    }
     if (snapshot.telegram_configured == null and snapshot.telegram_data_source == null) {
         snapshot.telegram_configured = channel_catalog.configuredCount(cfg, .telegram) > 0;
     }
@@ -123,6 +152,10 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
     const heartbeat_enabled = readObjectBool(startup, "heartbeat_enabled") orelse false;
     const heartbeat_interval_minutes = readObjectU32(startup, "heartbeat_interval_minutes") orelse 0;
     const tenant_enabled = readObjectBool(startup, "tenant_enabled") orelse false;
+    const chat_provider_effective = normalizeProviderAlias(readObjectString(startup, "chat_provider_effective") orelse "unknown");
+    const chat_fallback_chain = normalizeFallbackChain(readObjectString(startup, "chat_fallback_chain") orelse "none");
+    const embedding_provider_effective = normalizeProviderAlias(readObjectString(startup, "embedding_provider_effective") orelse "none");
+    const provider_data_source = readObjectString(startup, "provider_data_source") orelse "gateway_internal";
 
     var telegram_configured: ?bool = null;
     var telegram_connected: ?bool = null;
@@ -169,6 +202,10 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
         .tenant_enabled = tenant_enabled,
         .scheduler_max_tasks_configured = 0,
         .scheduler_max_concurrent_configured = 0,
+        .chat_provider_effective = try allocator.dupe(u8, chat_provider_effective),
+        .chat_fallback_chain = try allocator.dupe(u8, chat_fallback_chain),
+        .embedding_provider_effective = try allocator.dupe(u8, embedding_provider_effective),
+        .provider_data_source = try allocator.dupe(u8, provider_data_source),
         .telegram_configured = telegram_configured,
         .telegram_connected = telegram_connected,
         .telegram_account_id = telegram_account_id,
@@ -208,6 +245,10 @@ fn collectLocalFallbackSnapshot(allocator: std.mem.Allocator, cfg: *const config
         .scheduler_max_tasks_configured = cfg.scheduler.max_tasks,
         .scheduler_max_concurrent_configured = cfg.scheduler.max_concurrent,
         .scheduler_max_tasks_effective = if (std.mem.eql(u8, scheduler_backend, "unknown")) null else cfg.scheduler.max_tasks,
+        .chat_provider_effective = try allocator.dupe(u8, normalizeProviderAlias(cfg.default_provider)),
+        .chat_fallback_chain = try allocNormalizedFallbackChain(allocator, cfg.reliability.fallback_providers),
+        .embedding_provider_effective = try allocator.dupe(u8, normalizeProviderAlias(cfg.memory.search.provider)),
+        .provider_data_source = try allocator.dupe(u8, "config"),
         .telegram_configured = channel_catalog.configuredCount(cfg, .telegram) > 0,
         .telegram_connected = null,
         .telegram_account_id = null,
@@ -215,6 +256,36 @@ fn collectLocalFallbackSnapshot(allocator: std.mem.Allocator, cfg: *const config
         .telegram_data_source = try allocator.dupe(u8, "local_fallback"),
         .context_incomplete = context_incomplete,
     };
+}
+
+fn normalizeProviderAlias(provider_name: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, provider_name, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "together-ai")) return "together";
+    if (std.mem.eql(u8, trimmed, "google-gemini")) return "gemini";
+    return trimmed;
+}
+
+fn normalizeFallbackChain(chain: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, chain, " \t\r\n");
+    if (trimmed.len == 0) return "none";
+    if (std.mem.eql(u8, trimmed, "together-ai")) return "together";
+    return trimmed;
+}
+
+fn allocNormalizedFallbackChain(allocator: std.mem.Allocator, providers: []const []const u8) ![]u8 {
+    if (providers.len == 0) return allocator.dupe(u8, "none");
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    var wrote_any = false;
+    for (providers) |provider_name| {
+        const normalized = normalizeProviderAlias(provider_name);
+        if (normalized.len == 0) continue;
+        if (wrote_any) try out.append(allocator, ',');
+        try out.appendSlice(allocator, normalized);
+        wrote_any = true;
+    }
+    if (!wrote_any) return allocator.dupe(u8, "none");
+    return out.toOwnedSlice(allocator);
 }
 
 fn readObjectString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -283,6 +354,10 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
     try std.testing.expectEqualStrings("main", snapshot.telegram_account_id.?);
     try std.testing.expectEqual(@as(?i64, 1110331014), snapshot.telegram_chat_id);
     try std.testing.expectEqualStrings("postgres", snapshot.telegram_data_source.?);
+    try std.testing.expectEqualStrings("unknown", snapshot.chat_provider_effective);
+    try std.testing.expectEqualStrings("none", snapshot.chat_fallback_chain);
+    try std.testing.expectEqualStrings("none", snapshot.embedding_provider_effective);
+    try std.testing.expectEqualStrings("gateway_internal", snapshot.provider_data_source);
 }
 
 test "collectLocalFallbackSnapshot marks unknown effective backend when runtime probe is unavailable" {
@@ -307,4 +382,8 @@ test "collectLocalFallbackSnapshot marks unknown effective backend when runtime 
         try std.testing.expectEqualStrings("file", snapshot.state_backend_effective);
         try std.testing.expect(!snapshot.context_incomplete);
     }
+    try std.testing.expectEqualStrings("openrouter", snapshot.chat_provider_effective);
+    try std.testing.expectEqualStrings("none", snapshot.chat_fallback_chain);
+    try std.testing.expectEqualStrings("none", snapshot.embedding_provider_effective);
+    try std.testing.expectEqualStrings("config", snapshot.provider_data_source);
 }
