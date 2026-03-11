@@ -79,7 +79,7 @@ pub fn loadContext(
     var wrote_header = false;
 
     for (scoped_entries) |entry| {
-        if (memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+        if (memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content) or memory_mod.isMarkdownLineKey(entry.key)) continue;
         if (!wrote_header) {
             try w.writeAll("[Memory context]\n");
             wrote_header = true;
@@ -98,7 +98,7 @@ pub fn loadContext(
             for (entries) |entry| {
                 if (entry.session_id != null) continue; // keep scoped isolation (no cross-session bleed)
                 if (containsKey(scoped_entries, entry.key)) continue;
-                if (memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+                if (memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content) or memory_mod.isMarkdownLineKey(entry.key)) continue;
 
                 if (!wrote_header) {
                     try w.writeAll("[Memory context]\n");
@@ -143,7 +143,7 @@ pub fn loadContextWithRuntime(
     var wrote_header = false;
 
     for (candidates) |cand| {
-        if (memory_mod.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
+        if (memory_mod.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet) or memory_mod.isMarkdownLineKey(cand.key)) continue;
         if (!wrote_header) {
             try w.writeAll("[Memory context]\n");
             wrote_header = true;
@@ -336,15 +336,64 @@ test "loadContext filters markdown-encoded internal entries" {
     defer sqlite_mem.deinit();
     const mem = sqlite_mem.memory();
 
-    // Markdown backend serializes memory as "**key**: value".
-    try mem.store("MEMORY:3", "**last_hygiene_at**: 1772051598", .core, null);
-    try mem.store("MEMORY:4", "**Name**: User", .core, null);
+    // Markdown backend can include encoded keys in content.
+    try mem.store("raw_entry", "**last_hygiene_at**: 1772051598", .core, null);
+    try mem.store("user_name", "User", .core, null);
 
     const context = try loadContext(allocator, mem, "User", null);
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "last_hygiene_at") == null);
-    try std.testing.expect(std.mem.indexOf(u8, context, "**Name**: User") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "user_name") != null);
+}
+
+test "loadContextWithRuntime filters markdown line keys" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("MEMORY:8", "Name: ZAKI BOT", .core, null);
+    try mem.store("user_alias", "ZAKI BOT", .core, null);
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const context = try loadContextWithRuntime(allocator, &rt, "ZAKI", null);
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "MEMORY:8") == null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "user_alias") != null);
 }
 
 test "loadContext filters bootstrap prompt internal keys" {

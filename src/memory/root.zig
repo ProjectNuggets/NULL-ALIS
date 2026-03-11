@@ -294,6 +294,18 @@ pub fn isInternalMemoryKey(key: []const u8) bool {
         std.mem.startsWith(u8, key, PromptBootstrapKeyPrefix);
 }
 
+/// Returns true for markdown fallback line keys like "MEMORY:8".
+/// These keys are parser artifacts (filename + line index), not stable user keys.
+pub fn isMarkdownLineKey(key: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, "MEMORY:")) return false;
+    const suffix = key["MEMORY:".len..];
+    if (suffix.len == 0) return false;
+    for (suffix) |ch| {
+        if (!std.ascii.isDigit(ch)) return false;
+    }
+    return true;
+}
+
 pub fn extractMarkdownMemoryKey(content: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, content, " \t");
     if (!std.mem.startsWith(u8, trimmed, "**")) return null;

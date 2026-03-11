@@ -74,15 +74,16 @@ pub const RuntimeInfoTool = struct {
     fn buildSummaryJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8, verbose: bool) ![]u8 {
         const tenant_ctx = root.getTenantContext();
         const turn_ctx = root.getTurnContext();
+        const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
         const effective_backend = root.effectiveStateBackend(self.config, tenant_ctx);
         const scheduler_backend = root.schedulerBackend(self.config, tenant_ctx);
         const degraded_reason = root.degradedReason(self.config, tenant_ctx);
         const degraded = degraded_reason.len > 0;
-        const context_incomplete = tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or tenant_ctx.numeric_user_id == null);
-        const data_source = runtimeDataSourceLabel(tenant_ctx);
+        const context_incomplete = tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or scoped_numeric_user_id == null);
+        const data_source = runtimeDataSourceLabel(tenant_ctx, user_id_override);
         const user_id = user_id_override orelse tenant_ctx.user_id;
         const entity_id = resolveComposioEntityId(self.config, tenant_ctx, user_id_override);
-        var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx);
+        var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx, user_id_override);
         defer telegram_state.deinit(allocator);
 
         var configured_channels: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -202,10 +203,11 @@ pub const RuntimeInfoTool = struct {
 
     fn buildIntegrationsJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8) ![]u8 {
         const tenant_ctx = root.getTenantContext();
-        const context_incomplete = tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or tenant_ctx.numeric_user_id == null);
-        const data_source = runtimeDataSourceLabel(tenant_ctx);
+        const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
+        const context_incomplete = tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or scoped_numeric_user_id == null);
+        const data_source = runtimeDataSourceLabel(tenant_ctx, user_id_override);
         const entity_id = resolveComposioEntityId(self.config, tenant_ctx, user_id_override);
-        var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx);
+        var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx, user_id_override);
         defer telegram_state.deinit(allocator);
         const telegram_configured = isTelegramConfigured(self.config, telegram_state.state);
         const composio_readiness = self.resolveComposioReadiness(allocator, entity_id);
@@ -409,10 +411,20 @@ const TelegramStateSnapshot = struct {
     }
 };
 
-fn runtimeDataSourceLabel(tenant_ctx: root.ToolTenantContext) []const u8 {
-    if (tenant_ctx.state_mgr != null and tenant_ctx.numeric_user_id != null) return "postgres";
+fn runtimeDataSourceLabel(tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) []const u8 {
+    const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
+    if (tenant_ctx.state_mgr != null and scoped_numeric_user_id != null) return "postgres";
     if (tenant_ctx.expect_postgres_state) return "context_missing";
     return "file_fallback";
+}
+
+fn resolveScopedNumericUserId(tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) ?i64 {
+    if (user_id_override) |user_id| {
+        const trimmed = std.mem.trim(u8, user_id, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return std.fmt.parseInt(i64, trimmed, 10) catch null;
+    }
+    return tenant_ctx.numeric_user_id;
 }
 
 fn resolveComposioEntityId(config: *const config_mod.Config, tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) []const u8 {
@@ -672,10 +684,16 @@ fn deriveUserRoot(workspace_dir: []const u8) []const u8 {
     return std.fs.path.dirname(workspace_dir) orelse workspace_dir;
 }
 
-fn readTelegramState(allocator: std.mem.Allocator, config: *const config_mod.Config, tenant_ctx: root.ToolTenantContext) !TelegramStateSnapshot {
-    if (tenant_ctx.numeric_user_id) |numeric_user_id| {
-        if (tenant_ctx.state_mgr) |state_mgr| {
-            const raw = state_mgr.getTelegramStateJson(allocator, numeric_user_id) catch return .{};
+fn readTelegramState(
+    allocator: std.mem.Allocator,
+    config: *const config_mod.Config,
+    tenant_ctx: root.ToolTenantContext,
+    user_id_override: ?[]const u8,
+) !TelegramStateSnapshot {
+    const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
+    if (tenant_ctx.state_mgr) |state_mgr| {
+        if (scoped_numeric_user_id) |numeric_user_id| {
+            const raw = state_mgr.getTelegramStateJson(allocator, numeric_user_id) catch return .{ .data_source = "postgres" };
             defer allocator.free(raw);
             return .{
                 .state = try parseTelegramStateJson(allocator, raw),
@@ -688,6 +706,17 @@ fn readTelegramState(allocator: std.mem.Allocator, config: *const config_mod.Con
             .data_source = "context_missing",
             .context_incomplete = true,
         };
+    }
+
+    if (user_id_override) |user_id| {
+        if (tenant_ctx.user_id) |ctx_user_id| {
+            if (!std.mem.eql(u8, user_id, ctx_user_id)) {
+                return .{
+                    .data_source = "context_missing",
+                    .context_incomplete = true,
+                };
+            }
+        }
     }
 
     const user_root = deriveUserRoot(config.workspace_dir);
@@ -842,7 +871,24 @@ test "runtime info telegram snapshot marks context missing for expected postgres
     const snapshot = try readTelegramState(std.testing.allocator, &cfg, .{
         .user_id = "7",
         .expect_postgres_state = true,
-    });
+    }, null);
+    var snapshot_mut = snapshot;
+    defer snapshot_mut.deinit(std.testing.allocator);
+    try std.testing.expect(snapshot.context_incomplete);
+    try std.testing.expectEqualStrings("context_missing", snapshot.data_source);
+}
+
+test "runtime info telegram snapshot treats invalid override as context missing in postgres mode" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const snapshot = try readTelegramState(std.testing.allocator, &cfg, .{
+        .user_id = "7",
+        .numeric_user_id = 7,
+        .expect_postgres_state = true,
+    }, "invalid-user-id");
     var snapshot_mut = snapshot;
     defer snapshot_mut.deinit(std.testing.allocator);
     try std.testing.expect(snapshot.context_incomplete);

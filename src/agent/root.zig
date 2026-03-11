@@ -752,14 +752,30 @@ pub const Agent = struct {
             .content = enriched,
         });
 
-        // ── Response cache check ──
+        // ── Response/Semantic cache check ──
+        var key_buf: [16]u8 = undefined;
+        const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
+            self.history.items[0].content
+        else
+            null;
+        const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, user_message);
+
+        if (self.mem_rt) |rt| {
+            if (rt.semanticCache()) |sc| {
+                if (sc.get(self.allocator, key_hex, user_message) catch null) |cached_hit| {
+                    errdefer self.allocator.free(cached_hit.response);
+                    const history_copy = try self.allocator.dupe(u8, cached_hit.response);
+                    errdefer self.allocator.free(history_copy);
+                    try self.history.append(self.allocator, .{
+                        .role = .assistant,
+                        .content = history_copy,
+                    });
+                    return cached_hit.response;
+                }
+            }
+        }
+
         if (self.response_cache) |rc| {
-            var key_buf: [16]u8 = undefined;
-            const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
-                self.history.items[0].content
-            else
-                null;
-            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, user_message);
             if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
                 errdefer self.allocator.free(cached_response);
                 const history_copy = try self.allocator.dupe(u8, cached_response);
@@ -1161,16 +1177,36 @@ pub const Agent = struct {
                 self.allocator.free(base_text);
 
                 // ── Cache store (only for direct responses, no tool calls) ──
+                const cache_start_ms = std.time.milliTimestamp();
+                var cached = false;
+                var store_key_buf: [16]u8 = undefined;
+                const sys_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
+                    self.history.items[0].content
+                else
+                    null;
+                const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, user_message);
+                const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
+
+                if (self.mem_rt) |rt| {
+                    if (rt.semanticCache()) |sc| {
+                        sc.put(
+                            self.allocator,
+                            store_key_hex,
+                            self.model_name,
+                            final_text,
+                            token_count,
+                            user_message,
+                        ) catch {};
+                        cached = true;
+                    }
+                }
+
                 if (self.response_cache) |rc| {
-                    const cache_start_ms = std.time.milliTimestamp();
-                    var store_key_buf: [16]u8 = undefined;
-                    const sys_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
-                        self.history.items[0].content
-                    else
-                        null;
-                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, user_message);
-                    const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
                     rc.put(self.allocator, store_key_hex, self.model_name, final_text, token_count) catch {};
+                    cached = true;
+                }
+
+                if (cached) {
                     const cache_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - cache_start_ms));
                     log.info("turn.stage stage=response_cache_put iteration={d} duration_ms={d}", .{ iteration, cache_duration_ms });
                 }
@@ -3090,6 +3126,146 @@ test "turn refreshes system prompt after workspace markdown change" {
     const second = try agent.turn("second");
     defer allocator.free(second);
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "SOUL-V2-UPDATED") != null);
+}
+
+test "turn uses semantic cache when runtime semantic cache is available" {
+    if (!@import("build_options").enable_sqlite) return error.SkipZigTest;
+
+    const CountingProvider = struct {
+        const State = struct {
+            calls: u32 = 0,
+        };
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            return .{
+                .content = try allocator.dupe(u8, "provider-answer"),
+                .tool_calls = &.{},
+                .usage = .{ .prompt_tokens = 4, .completion_tokens = 6, .total_tokens = 10 },
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "counting-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var provider_state = CountingProvider.State{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = CountingProvider.chatWithSystem,
+        .chat = CountingProvider.chat,
+        .supportsNativeTools = CountingProvider.supportsNativeTools,
+        .getName = CountingProvider.getName,
+        .deinit = CountingProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = workspace,
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const sem_cache_path = try std.fs.path.joinZ(allocator, &.{ workspace, "semantic_cache_test.db" });
+    defer allocator.free(std.mem.span(sem_cache_path.ptr));
+    const sem_cache = try allocator.create(memory_mod.semantic_cache.SemanticCache);
+    sem_cache.* = try memory_mod.semantic_cache.SemanticCache.init(
+        sem_cache_path.ptr,
+        60,
+        1000,
+        0.95,
+        null,
+    );
+    defer {
+        sem_cache.deinit();
+        allocator.destroy(sem_cache);
+    }
+
+    var none_backend = memory_mod.none.NoneMemory.init();
+    defer none_backend.deinit();
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "none",
+        .retrieval_mode = "disabled",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = true,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = none_backend.memory(),
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+        ._semantic_cache = sem_cache,
+    };
+    agent.mem_rt = &rt;
+
+    const first = try agent.turn("semantic cache probe");
+    defer allocator.free(first);
+    try std.testing.expectEqualStrings("provider-answer", first);
+    try std.testing.expectEqual(@as(u32, 1), provider_state.calls);
+
+    const sem_stats_after_first = try sem_cache.stats();
+    try std.testing.expect(sem_stats_after_first.count >= 1);
+
+    const second = try agent.turn("semantic cache probe");
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings("provider-answer", second);
+    try std.testing.expectEqual(@as(u32, 1), provider_state.calls);
+
+    const sem_stats_after_second = try sem_cache.stats();
+    try std.testing.expect(sem_stats_after_second.hits >= 1);
 }
 
 test "exec security deny blocks shell tool execution" {

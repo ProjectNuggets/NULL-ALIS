@@ -154,6 +154,19 @@ zig build -Dengines=base,sqlite,postgres
 ./zig-out/bin/nullalis gateway --host 127.0.0.1 --port 3000
 ```
 
+### Run Gateway (Clean Ops Terminal)
+
+Use the noise-filtered launcher for high-signal runtime logs:
+
+```bash
+scripts/gateway-clean.sh --host 127.0.0.1 --port 3000
+```
+
+Profiles:
+- `--profile ops` (default): startup/runtime truth, stage summaries, errors/warnings.
+- `--profile debug`: full runtime logs except Postgres `NOTICE` spam.
+- `--raw`: no filtering.
+
 ### Health Check
 
 ```bash

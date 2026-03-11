@@ -604,8 +604,8 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
     if (std.mem.eql(u8, tool_name, file_read.FileReadTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, memory_recall.MemoryRecallTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, memory_list.MemoryListTool.tool_name)) return null;
-    if (std.mem.eql(u8, tool_name, web_search.WebSearchTool.tool_name) and
-        (turn_ctx.origin == .heartbeat or turn_ctx.origin == .scheduler)) return null;
+    if (std.mem.eql(u8, tool_name, web_search.WebSearchTool.tool_name)) return null;
+    if (std.mem.eql(u8, tool_name, message.MessageTool.tool_name)) return null;
 
     if (std.mem.eql(u8, tool_name, composio.ComposioTool.tool_name)) {
         const action = getString(args, "action") orelse "execute";
@@ -620,7 +620,16 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
         return "Composio action is disabled for background turns";
     }
 
-    return "Tool is disabled for background turns";
+    if (std.mem.eql(u8, tool_name, shell.ShellTool.tool_name)) {
+        return "Shell is disabled for background turns";
+    }
+    if (std.mem.eql(u8, tool_name, spawn.SpawnTool.tool_name)) {
+        return "Spawn is disabled for background turns";
+    }
+    if (std.mem.eql(u8, tool_name, delegate.DelegateTool.tool_name)) {
+        return "Delegate is disabled for background turns";
+    }
+    return "Tool is disabled for background turns; allowed: runtime_info, schedule, file_read, memory_recall, memory_list, web_search, message, composio(list/read)";
 }
 
 pub fn bindRuntimeInfoTools(tools: []const Tool) void {
@@ -806,7 +815,7 @@ test "background turns block shell and allow runtime info" {
     try std.testing.expect(toolBlockedForCurrentTurn("runtime_info", runtime_args.value.object) == null);
 }
 
-test "heartbeat and scheduler turns allow web search" {
+test "all background origins allow web search" {
     const args = try parseTestArgs("{\"query\":\"latest zig release\"}");
     defer args.deinit();
     defer clearTurnContext();
@@ -816,6 +825,21 @@ test "heartbeat and scheduler turns allow web search" {
 
     setTurnContext(.{ .origin = .scheduler });
     try std.testing.expect(toolBlockedForCurrentTurn("web_search", args.value.object) == null);
+
+    setTurnContext(.{ .origin = .wake });
+    try std.testing.expect(toolBlockedForCurrentTurn("web_search", args.value.object) == null);
+
+    setTurnContext(.{ .origin = .proactive });
+    try std.testing.expect(toolBlockedForCurrentTurn("web_search", args.value.object) == null);
+}
+
+test "background turns allow message tool" {
+    setTurnContext(.{ .origin = .scheduler });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"content\":\"hello\",\"channel\":\"telegram\",\"chat_id\":\"42\"}");
+    defer parsed.deinit();
+    try std.testing.expect(toolBlockedForCurrentTurn("message", parsed.value.object) == null);
 }
 
 test "background turns block composio connect" {

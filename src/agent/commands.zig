@@ -693,10 +693,11 @@ fn formatStatus(self: anytype) ![]const u8 {
 fn formatRuntimeStatus(self: anytype) ![]const u8 {
     const runtime_tool = findToolByName(self, "runtime_info") orelse
         return try self.allocator.dupe(u8, "Runtime info tool unavailable");
+    const tenant_ctx = tools_mod.getTenantContext();
 
-    const summary_json = try executeRuntimeInfoSection(self, runtime_tool, "summary");
+    const summary_json = try executeRuntimeInfoSection(self, runtime_tool, "summary", tenant_ctx.user_id);
     errdefer self.allocator.free(summary_json);
-    const integrations_json = try executeRuntimeInfoSection(self, runtime_tool, "integrations");
+    const integrations_json = try executeRuntimeInfoSection(self, runtime_tool, "integrations", tenant_ctx.user_id);
     errdefer self.allocator.free(integrations_json);
 
     const summary_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, summary_json, .{}) catch {
@@ -788,8 +789,11 @@ fn formatRuntimeStatus(self: anytype) ![]const u8 {
     return try out.toOwnedSlice(self.allocator);
 }
 
-fn executeRuntimeInfoSection(self: anytype, runtime_tool: Tool, section: []const u8) ![]u8 {
-    const request = try std.fmt.allocPrint(self.allocator, "{{\"section\":\"{s}\"}}", .{section});
+fn executeRuntimeInfoSection(self: anytype, runtime_tool: Tool, section: []const u8, user_id_opt: ?[]const u8) ![]u8 {
+    const request = if (user_id_opt) |user_id|
+        try std.fmt.allocPrint(self.allocator, "{{\"section\":\"{s}\",\"user_id\":\"{s}\"}}", .{ section, user_id })
+    else
+        try std.fmt.allocPrint(self.allocator, "{{\"section\":\"{s}\"}}", .{section});
     defer self.allocator.free(request);
     const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, request, .{});
     defer parsed.deinit();
