@@ -688,6 +688,18 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("parallel_tools")) |v| {
                 if (v == .bool) self.agent.parallel_tools = v.bool;
             }
+            if (ag.object.get("parallel_tools_rollout_percent")) |v| {
+                if (v == .integer) {
+                    const raw = v.integer;
+                    if (raw <= 0) {
+                        self.agent.parallel_tools_rollout_percent = 0;
+                    } else if (raw >= 100) {
+                        self.agent.parallel_tools_rollout_percent = 100;
+                    } else {
+                        self.agent.parallel_tools_rollout_percent = @intCast(raw);
+                    }
+                }
+            }
             if (ag.object.get("tool_dispatcher")) |v| {
                 if (v == .string) self.agent.tool_dispatcher = try self.allocator.dupe(u8, v.string);
             }

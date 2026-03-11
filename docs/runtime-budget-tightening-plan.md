@@ -160,3 +160,4 @@ Rollout order:
 ## Notes for Discussion
 - Budget values should be environment-specific (dev/staging/prod profiles).
 - Keep benchmark timeout policy independent from runtime budgets; benchmark should observe runtime behavior, not mask it.
+- Use `scripts/load-burst.py` for repeatable 20/50/100 multi-user burst checks and track p50/p95/p99 deltas before/after each runtime patch.

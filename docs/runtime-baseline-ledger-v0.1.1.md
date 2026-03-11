@@ -44,6 +44,10 @@ This ledger is the control document for "use what exists first" decisions.
 - Message timeout is used in provider requests:
   - `src/agent/root.zig:273`
   - `src/agent/root.zig:840`
+- Parallel tool dispatch is runtime-active behind explicit gates:
+  - `agent.parallel_tools` + `agent.tool_dispatcher`
+  - deterministic canary gate `agent.parallel_tools_rollout_percent` (session-key bucket)
+  - dispatch safety allowlist is enforced before parallel execution
 
 ### A3. Session and tenant wiring
 - Session manager injects `mem_rt` and caches into per-session agent:
@@ -101,6 +105,12 @@ Classification rule in v0.1.1:
   - `src/agent/commands.zig:1186`
 - No enforcement in main turn/session execution path.
 - Classification: `deferred-explicit` until wiring is complete.
+
+### B5. `agent.compact_context` is parsed but not wired to turn behavior
+- Parsed from config:
+  - `src/config_parse.zig`
+- No active read gate in turn execution path.
+- Classification: `deferred-explicit`.
 
 ## C. Metadata-Only (Not Bugs)
 

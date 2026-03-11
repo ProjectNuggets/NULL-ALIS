@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""
+nullalis multi-user burst load check for /api/v1/chat/stream.
+
+Default intent:
+- one request per distinct user (realistic burst profile)
+- parse SSE until terminal done/error
+- report p50/p95/p99 and wall-clock time
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import statistics
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+
+
+@dataclass
+class RequestResult:
+    ok: bool
+    user_id: str
+    request_id: int
+    elapsed_ms: int
+    reason: str
+    status_code: int | None = None
+
+
+def percentile(values: list[int], pct: float) -> int:
+    if not values:
+        return 0
+    if len(values) == 1:
+        return values[0]
+    ordered = sorted(values)
+    idx = int(round((pct / 100.0) * (len(ordered) - 1)))
+    idx = max(0, min(idx, len(ordered) - 1))
+    return ordered[idx]
+
+
+def run_one(
+    *,
+    url: str,
+    token: str,
+    timeout_secs: int,
+    message: str,
+    user_id: str,
+    request_id: int,
+    session_key: str | None,
+) -> RequestResult:
+    started = time.time()
+    body_obj = {"message": message}
+    if session_key:
+        body_obj["session_key"] = session_key
+    body = json.dumps(body_obj).encode("utf-8")
+    req = urllib.request.Request(
+        url=url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Internal-Token": token,
+            "X-Zaki-User-Id": user_id,
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
+            status = resp.getcode()
+            if status < 200 or status >= 300:
+                elapsed_ms = int((time.time() - started) * 1000)
+                return RequestResult(False, user_id, request_id, elapsed_ms, "http_status", status)
+
+            saw_done = False
+            saw_error = False
+            for raw in resp:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("event:"):
+                    continue
+                event_name = line.split(":", 1)[1].strip()
+                if event_name == "error":
+                    saw_error = True
+                if event_name == "done":
+                    saw_done = True
+                    break
+
+            elapsed_ms = int((time.time() - started) * 1000)
+            if saw_done and not saw_error:
+                return RequestResult(True, user_id, request_id, elapsed_ms, "ok", status)
+            if saw_done and saw_error:
+                return RequestResult(False, user_id, request_id, elapsed_ms, "sse_error_done", status)
+            return RequestResult(False, user_id, request_id, elapsed_ms, "stream_no_done", status)
+    except urllib.error.HTTPError as err:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return RequestResult(False, user_id, request_id, elapsed_ms, "http_error", err.code)
+    except TimeoutError:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return RequestResult(False, user_id, request_id, elapsed_ms, "timeout", None)
+    except Exception:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return RequestResult(False, user_id, request_id, elapsed_ms, "exception", None)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run nullalis burst load against /api/v1/chat/stream")
+    parser.add_argument("--url", default="http://127.0.0.1:3000/api/v1/chat/stream")
+    parser.add_argument("--token", required=True, help="X-Internal-Token value")
+    parser.add_argument("--mode", choices=["multi-user", "single-user"], default="multi-user")
+    parser.add_argument("--users", type=int, default=20, help="Distinct users to include")
+    parser.add_argument("--requests", type=int, default=0, help="Total requests; 0 means users count")
+    parser.add_argument("--workers", type=int, default=0, help="Thread workers; 0 means requests count")
+    parser.add_argument("--timeout-secs", type=int, default=240)
+    parser.add_argument("--message", default="health check")
+    parser.add_argument(
+        "--session-key-template",
+        default="agent:zaki-bot:user:{user_id}:main",
+        help=(
+            "Session key template. Default targets each user's main lane. "
+            "Use empty string to omit session_key, or include {request_id} for isolated-per-request lanes."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON summary")
+    args = parser.parse_args()
+
+    total_requests = args.requests if args.requests > 0 else args.users
+    workers = args.workers if args.workers > 0 else total_requests
+    workers = max(1, workers)
+
+    user_ids: list[str] = []
+    if args.mode == "single-user":
+        user_ids = ["1"] * total_requests
+    else:
+        # Round-robin requests across users 1..N.
+        user_count = max(1, args.users)
+        for i in range(total_requests):
+            user_ids.append(str((i % user_count) + 1))
+
+    started = time.time()
+    results: list[RequestResult] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = []
+        for req_id, user_id in enumerate(user_ids):
+            session_key = None
+            if args.session_key_template:
+                session_key = args.session_key_template.format(user_id=user_id, request_id=req_id)
+            futures.append(
+                pool.submit(
+                    run_one,
+                    url=args.url,
+                    token=args.token,
+                    timeout_secs=args.timeout_secs,
+                    message=args.message,
+                    user_id=user_id,
+                    request_id=req_id,
+                    session_key=session_key,
+                )
+            )
+
+        for f in concurrent.futures.as_completed(futures):
+            results.append(f.result())
+
+    wall_ms = int((time.time() - started) * 1000)
+    success = [r for r in results if r.ok]
+    failures = [r for r in results if not r.ok]
+    latencies = [r.elapsed_ms for r in success]
+
+    distinct_users = len(set(user_ids))
+    summary = {
+        "mode": args.mode,
+        "requested_users": args.users,
+        "distinct_users": distinct_users,
+        "requests": total_requests,
+        "workers": workers,
+        "success": len(success),
+        "errors": len(failures),
+        "wall_ms": wall_ms,
+        "latency_ms": {
+            "p50": percentile(latencies, 50),
+            "p95": percentile(latencies, 95),
+            "p99": percentile(latencies, 99),
+            "mean": int(statistics.mean(latencies)) if latencies else 0,
+            "min": min(latencies) if latencies else 0,
+            "max": max(latencies) if latencies else 0,
+        },
+        "error_reasons": {},
+    }
+    for err in failures:
+        summary["error_reasons"][err.reason] = summary["error_reasons"].get(err.reason, 0) + 1
+
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(
+            f"[load-burst] mode={summary['mode']} requested_users={summary['requested_users']} "
+            f"distinct_users={summary['distinct_users']} "
+            f"requests={summary['requests']} workers={summary['workers']}"
+        )
+        print(
+            f"[load-burst] success={summary['success']} errors={summary['errors']} "
+            f"wall_ms={summary['wall_ms']}"
+        )
+        lat = summary["latency_ms"]
+        print(
+            "[load-burst] latency_ms "
+            f"p50={lat['p50']} p95={lat['p95']} p99={lat['p99']} "
+            f"mean={lat['mean']} min={lat['min']} max={lat['max']}"
+        )
+        if summary["error_reasons"]:
+            print(f"[load-burst] errors_by_reason={summary['error_reasons']}")
+
+    # CI-friendly: non-zero when any request failed.
+    return 0 if len(failures) == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

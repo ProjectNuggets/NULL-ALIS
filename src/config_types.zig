@@ -140,6 +140,9 @@ pub const AgentConfig = struct {
     max_tool_iterations: u32 = 25,
     max_history_messages: u32 = 50,
     parallel_tools: bool = false,
+    /// Deterministic session canary gate for parallel tool dispatch.
+    /// 0 disables parallel dispatch even when enabled; 100 enables all sessions.
+    parallel_tools_rollout_percent: u8 = 100,
     tool_dispatcher: []const u8 = "auto",
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
     /// Internal parse marker: true only when token_limit is explicitly set in config.

@@ -182,15 +182,15 @@ pub const MessageTool = struct {
             if (account_id) |aid| {
                 break :blk std.fmt.allocPrint(
                     allocator,
-                    "Message sent to {s}:{s}:{s} ({d} chars)",
+                    "Message queued to {s}:{s}:{s} ({d} chars, async delivery not confirmed)",
                     .{ channel, aid, chat_id, content.len },
-                ) catch return ToolResult.ok("Message sent");
+                ) catch return ToolResult.ok("Message queued");
             }
             break :blk std.fmt.allocPrint(
                 allocator,
-                "Message sent to {s}:{s} ({d} chars)",
+                "Message queued to {s}:{s} ({d} chars, async delivery not confirmed)",
                 .{ channel, chat_id, content.len },
-            ) catch return ToolResult.ok("Message sent");
+            ) catch return ToolResult.ok("Message queued");
         };
 
         return ToolResult.ok(result);
@@ -278,7 +278,7 @@ pub const MessageTool = struct {
 
         if (std.fmt.allocPrint(
             allocator,
-            "Message sent to telegram:{s} ({d} chars)",
+            "Message delivered to telegram:{s} ({d} chars)",
             .{
                 resolved_chat_id,
                 content.len,
@@ -286,7 +286,7 @@ pub const MessageTool = struct {
         )) |msg| {
             return ToolResult.ok(msg);
         } else |_| {
-            return ToolResult.ok("Message sent to telegram");
+            return ToolResult.ok("Message delivered to telegram");
         }
     }
 

@@ -1878,6 +1878,12 @@ fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init
             cfg.agent.tool_dispatcher,
         });
     }
+    if (cfg.agent.parallel_tools and cfg.agent.parallel_tools_rollout_percent < 100) {
+        log.info(
+            "agent.parallel_tools canary active rollout_percent={d} dispatcher={s}",
+            .{ cfg.agent.parallel_tools_rollout_percent, tool_dispatcher.effectiveMode(cfg.agent.parallel_tools, dispatch_mode.mode).toSlice() },
+        );
+    }
 }
 
 fn logStartupSelfCheck(state: *const GatewayState) void {

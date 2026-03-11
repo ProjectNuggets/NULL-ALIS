@@ -137,6 +137,37 @@ Checks:
 - Composio toolkit availability for `gmail`, `googledrive`, `googlecalendar`
 - per-entity connected-account readiness probe for Gmail/Drive/Calendar
 
+### 7. Multi-user burst validation (20/50/100)
+Use the built-in SSE burst checker against `/api/v1/chat/stream`.
+
+```bash
+# 20 distinct users, one request each
+./scripts/load-burst.py --token <TOKEN> --mode multi-user --users 20 --requests 20
+
+# 50 distinct users, one request each
+./scripts/load-burst.py --token <TOKEN> --mode multi-user --users 50 --requests 50
+
+# 100 distinct users, one request each
+./scripts/load-burst.py --token <TOKEN> --mode multi-user --users 100 --requests 100
+```
+
+Comparison profile (single-user burst, mostly diagnostic):
+```bash
+./scripts/load-burst.py --token <TOKEN> --mode single-user --users 1 --requests 20
+```
+
+Expected output:
+- success/error counts
+- wall-clock runtime
+- latency `p50/p95/p99/mean/min/max`
+
+Runbook rule:
+- evaluate multi-user profile as primary production signal
+- use single-user burst only as queue-pressure diagnostic
+- default script behavior uses per-user `main` session keys (realistic lane contention)
+- for isolated-per-request lane tests, pass:
+  - `--session-key-template 'agent:zaki-bot:user:{user_id}:bench:{request_id}'`
+
 ## Prod Checks
 
 ### 1. Health + readiness

@@ -621,6 +621,7 @@ pub const Config = struct {
             .max_tool_iterations = self.agent.max_tool_iterations,
             .max_history_messages = self.agent.max_history_messages,
             .parallel_tools = self.agent.parallel_tools,
+            .parallel_tools_rollout_percent = self.agent.parallel_tools_rollout_percent,
             .tool_dispatcher = self.agent.tool_dispatcher,
             .session_idle_timeout_secs = self.agent.session_idle_timeout_secs,
             .compaction_keep_recent = self.agent.compaction_keep_recent,
@@ -1238,6 +1239,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.agent.max_tool_iterations = 7;
     cfg.agent.max_history_messages = 21;
     cfg.agent.parallel_tools = true;
+    cfg.agent.parallel_tools_rollout_percent = 35;
     cfg.agent.tool_dispatcher = "parallel";
     cfg.agent.session_idle_timeout_secs = 90;
     cfg.agent.compaction_keep_recent = 12;
@@ -1354,6 +1356,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("docker", loaded.runtime.kind);
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expect(loaded.agent.parallel_tools);
+    try std.testing.expectEqual(@as(u8, 35), loaded.agent.parallel_tools_rollout_percent);
 
     try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
     try std.testing.expect(loaded.memory.response_cache.enabled);
@@ -1589,7 +1592,7 @@ test "json parse scheduler section" {
 test "json parse agent section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000}}
+        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "parallel_tools_rollout_percent": 60, "tool_dispatcher": "xml", "token_limit": 64000}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -1597,10 +1600,22 @@ test "json parse agent section" {
     try std.testing.expectEqual(@as(u32, 20), cfg.agent.max_tool_iterations);
     try std.testing.expectEqual(@as(u32, 80), cfg.agent.max_history_messages);
     try std.testing.expect(cfg.agent.parallel_tools);
+    try std.testing.expectEqual(@as(u8, 60), cfg.agent.parallel_tools_rollout_percent);
     try std.testing.expectEqualStrings("xml", cfg.agent.tool_dispatcher);
     try std.testing.expectEqual(@as(u64, 64_000), cfg.agent.token_limit);
     try std.testing.expect(cfg.agent.token_limit_explicit);
     allocator.free(cfg.agent.tool_dispatcher);
+}
+
+test "json parse agent parallel rollout percent clamps to bounds" {
+    const allocator = std.testing.allocator;
+    var cfg_low = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg_low.parseJson("{\"agent\":{\"parallel_tools_rollout_percent\":-1}}");
+    try std.testing.expectEqual(@as(u8, 0), cfg_low.agent.parallel_tools_rollout_percent);
+
+    var cfg_high = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg_high.parseJson("{\"agent\":{\"parallel_tools_rollout_percent\":200}}");
+    try std.testing.expectEqual(@as(u8, 100), cfg_high.agent.parallel_tools_rollout_percent);
 }
 
 test "json parse agent token_limit explicit remains false when omitted" {

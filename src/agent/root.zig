@@ -239,6 +239,7 @@ pub const Agent = struct {
     max_tool_iterations: u32,
     max_history_messages: u32,
     parallel_tools: bool = false,
+    parallel_tools_rollout_percent: u8 = 100,
     tool_dispatcher_mode: ToolDispatcherMode = .auto,
     auto_save: bool,
     token_limit: u64 = 0,
@@ -370,6 +371,7 @@ pub const Agent = struct {
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .parallel_tools = cfg.agent.parallel_tools,
+            .parallel_tools_rollout_percent = cfg.agent.parallel_tools_rollout_percent,
             .tool_dispatcher_mode = tool_dispatcher.parseMode(cfg.agent.tool_dispatcher).mode,
             .auto_save = cfg.memory.auto_save,
             .token_limit = resolved_token_limit,
@@ -612,10 +614,24 @@ pub const Agent = struct {
     fn shouldParallelDispatch(self: *const Agent, parsed_calls: []const ParsedToolCall) bool {
         if (parsed_calls.len < 2) return false;
         if (self.effectiveToolDispatcherMode() != .parallel) return false;
+        if (!self.parallelDispatchCanaryAllowsSession()) return false;
         for (parsed_calls) |call| {
             if (!self.isParallelSafeToolCall(call)) return false;
         }
         return true;
+    }
+
+    fn parallelDispatchCanaryAllowsSession(self: *const Agent) bool {
+        if (self.parallel_tools_rollout_percent >= 100) return true;
+        if (self.parallel_tools_rollout_percent == 0) return false;
+        const bucket = self.parallelDispatchSessionBucket();
+        return bucket < self.parallel_tools_rollout_percent;
+    }
+
+    fn parallelDispatchSessionBucket(self: *const Agent) u8 {
+        const seed = self.memory_session_id orelse self.workspace_dir;
+        const hash = std.hash.Wyhash.hash(0, seed);
+        return @intCast(hash % 100);
     }
 
     fn toolCallHasAction(allocator: std.mem.Allocator, arguments_json: []const u8, expected_action: []const u8) bool {
@@ -1551,7 +1567,8 @@ pub const Agent = struct {
                 arena,
                 "{s}\n\nReflect on the tool results above and decide your next steps. " ++
                     "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
-                    "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
+                    "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up. " ++
+                    "If a tool reports queued/async delivery, state it as queued (not confirmed delivered) unless a later tool confirms delivery.",
                 .{scrubbed_results},
             );
             try self.history.append(self.allocator, .{
@@ -4206,6 +4223,42 @@ test "Agent dispatcher stays serial when parallel tools are disabled" {
 
     try std.testing.expectEqualStrings("done", response);
     try std.testing.expectEqual(@as(u32, 1), probe_state.max_active);
+}
+
+test "Agent parallel dispatcher rollout canary gates by session bucket" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .parallel_tools = true,
+        .parallel_tools_rollout_percent = 0,
+        .tool_dispatcher_mode = .parallel,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .memory_session_id = "agent:zaki-bot:user:1:thread:rollout",
+    };
+    defer agent.deinit();
+
+    try std.testing.expect(!agent.parallelDispatchCanaryAllowsSession());
+
+    agent.parallel_tools_rollout_percent = 100;
+    try std.testing.expect(agent.parallelDispatchCanaryAllowsSession());
+
+    agent.parallel_tools_rollout_percent = 1;
+    const bucket = agent.parallelDispatchSessionBucket();
+    try std.testing.expectEqual(bucket < 1, agent.parallelDispatchCanaryAllowsSession());
 }
 
 test "Agent streaming fields can be set" {

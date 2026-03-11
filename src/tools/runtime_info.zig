@@ -152,6 +152,8 @@ pub const RuntimeInfoTool = struct {
         try json_util.appendJsonKey(&buf, allocator, "parallel_tools");
         try buf.appendSlice(allocator, if (self.config.agent.parallel_tools) "true" else "false");
         try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "parallel_tools_rollout_percent", self.config.agent.parallel_tools_rollout_percent);
+        try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "context_incomplete");
         try buf.appendSlice(allocator, if (context_incomplete) "true" else "false");
         try buf.appendSlice(allocator, ",");
@@ -897,6 +899,7 @@ test "runtime info summary includes state backend keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"embedding_provider_effective\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"provider_data_source\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"deferred_controls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"parallel_tools_rollout_percent\"") != null);
 }
 
 test "runtime info parseToolkitAvailability supports object items" {
@@ -965,6 +968,7 @@ test "runtime info summary surfaces active dispatcher state" {
         .allocator = std.testing.allocator,
     };
     cfg.agent.parallel_tools = true;
+    cfg.agent.parallel_tools_rollout_percent = 40;
     cfg.agent.tool_dispatcher = "parallel";
     var tool_impl = RuntimeInfoTool{ .config = &cfg };
     const t = tool_impl.tool();
@@ -981,6 +985,7 @@ test "runtime info summary surfaces active dispatcher state" {
     defer std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"parallel_tools\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"parallel_tools_rollout_percent\":40") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"tool_dispatcher_effective\":\"parallel\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"deferred_controls\":[]") != null);
 }
