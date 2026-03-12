@@ -495,6 +495,7 @@ fn processTelegramMessages(
             var key_buf: [128]u8 = undefined;
             var routed_session_key: ?[]const u8 = null;
             defer if (routed_session_key) |key| allocator.free(key);
+            const tenant_user_id = telegramTenantUserId(config, tg_ptr.account_id);
             const session_key = blk: {
                 if (telegramTenantMainSessionKey(config, tg_ptr.account_id, &key_buf)) |tenant_session_key| {
                     break :blk tenant_session_key;
@@ -532,6 +533,9 @@ fn processTelegramMessages(
             const typing_target = msg.sender;
             tg_ptr.startTyping(typing_target) catch {};
             defer tg_ptr.stopTyping(typing_target) catch {};
+            _ = tenant_user_id;
+            setTenantContextForSessionKey(config, session_key);
+            defer tools_mod.clearTenantContext();
 
             const reply = session_mgr.processMessageWithToolContext(session_key, msg.content, null, .{
                 .channel = "telegram",
@@ -559,13 +563,34 @@ fn processTelegramMessages(
     }
 }
 
-fn telegramTenantMainSessionKey(config: *const Config, account_id: []const u8, buf: []u8) ?[]const u8 {
+fn telegramTenantUserId(config: *const Config, account_id: []const u8) ?[]const u8 {
     for (config.channels.telegram) |tg_cfg| {
         if (!std.mem.eql(u8, tg_cfg.account_id, account_id)) continue;
-        const user_id = tg_cfg.tenant_user_id orelse continue;
+        return tg_cfg.tenant_user_id;
+    }
+    return null;
+}
+
+fn telegramTenantMainSessionKey(config: *const Config, account_id: []const u8, buf: []u8) ?[]const u8 {
+    if (telegramTenantUserId(config, account_id)) |user_id| {
         return zaki_session.userMainSessionKey(buf, user_id);
     }
     return null;
+}
+
+fn setTenantContextForSessionKey(config: *const Config, session_key: []const u8) void {
+    const tenant_user_id = zaki_session.parseUserIdFromSessionKey(session_key);
+    const numeric_tenant_user_id = if (tenant_user_id) |user_id|
+        std.fmt.parseInt(i64, user_id, 10) catch null
+    else
+        null;
+    const expect_postgres_state = config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres");
+    tools_mod.setTenantContext(.{
+        .user_id = tenant_user_id,
+        .numeric_user_id = numeric_tenant_user_id,
+        .session_key = session_key,
+        .expect_postgres_state = expect_postgres_state and tenant_user_id != null,
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -776,6 +801,8 @@ pub fn runSignalLoop(
             const typing_target = msg.reply_target;
             if (typing_target) |target| sg_ptr.startTyping(target) catch {};
             defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
+            setTenantContextForSessionKey(config, session_key);
+            defer tools_mod.clearTenantContext();
 
             // Build conversation context for Signal
             const conversation_context: ?ConversationContext = .{
@@ -1017,6 +1044,8 @@ pub fn runMatrixLoop(
             const typing_target = matrix_target;
             mx_ptr.startTyping(typing_target) catch {};
             defer mx_ptr.stopTyping(typing_target) catch {};
+            setTenantContextForSessionKey(config, session_key);
+            defer tools_mod.clearTenantContext();
 
             const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, null, .{
                 .channel = "matrix",
@@ -1364,6 +1393,29 @@ test "processTelegramMessages uses canonical tenant main session when telegram a
 
     const session = try session_mgr.getOrCreate("agent:zaki-bot:user:42:main");
     try std.testing.expectEqual(@as(u64, 1), session.turn_count);
+}
+
+test "telegramTenantUserId resolves tenant binding by account id" {
+    const tg_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "123:ABC",
+            .tenant_user_id = "42",
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "456:DEF",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .channels = .{ .telegram = &tg_accounts },
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqualStrings("42", telegramTenantUserId(&cfg, "main").?);
+    try std.testing.expect(telegramTenantUserId(&cfg, "backup") == null);
+    try std.testing.expect(telegramTenantUserId(&cfg, "missing") == null);
 }
 
 test "ProviderHolder tagged union fields" {

@@ -16,6 +16,15 @@ pub fn fallbackCronSessionKey() []const u8 {
     return "agent:zaki-bot:cron";
 }
 
+pub fn parseUserIdFromSessionKey(session_key: []const u8) ?[]const u8 {
+    const prefix = "agent:zaki-bot:user:";
+    if (!std.mem.startsWith(u8, session_key, prefix)) return null;
+    const rest = session_key[prefix.len..];
+    const suffix_idx = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    if (suffix_idx == 0) return null;
+    return rest[0..suffix_idx];
+}
+
 test "userMainSessionKey formats canonical main session" {
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("agent:zaki-bot:user:42:main", userMainSessionKey(&buf, "42"));
@@ -29,4 +38,14 @@ test "userCronSessionKey formats canonical cron session" {
 test "fallback session keys remain stable" {
     try std.testing.expectEqualStrings("agent:zaki-bot:main", fallbackMainSessionKey());
     try std.testing.expectEqualStrings("agent:zaki-bot:cron", fallbackCronSessionKey());
+}
+
+test "parseUserIdFromSessionKey extracts canonical user id" {
+    try std.testing.expectEqualStrings("42", parseUserIdFromSessionKey("agent:zaki-bot:user:42:main").?);
+    try std.testing.expectEqualStrings("7", parseUserIdFromSessionKey("agent:zaki-bot:user:7:thread:abc").?);
+}
+
+test "parseUserIdFromSessionKey rejects non-canonical keys" {
+    try std.testing.expect(parseUserIdFromSessionKey("agent:zaki-bot:main") == null);
+    try std.testing.expect(parseUserIdFromSessionKey("agent:zaki-bot:user::main") == null);
 }

@@ -1820,6 +1820,19 @@ fn inboundDispatcherThread(
         );
         defer if (routed_session_key) |key| allocator.free(key);
         const session_key = routed_session_key orelse msg.session_key;
+        const tenant_user_id = zaki_session.parseUserIdFromSessionKey(session_key);
+        const numeric_tenant_user_id = if (tenant_user_id) |user_id|
+            std.fmt.parseInt(i64, user_id, 10) catch null
+        else
+            null;
+        const expect_postgres_state = runtime.config.tenant.enabled and std.mem.eql(u8, runtime.config.state.backend, "postgres");
+        tools_mod.setTenantContext(.{
+            .user_id = tenant_user_id,
+            .numeric_user_id = numeric_tenant_user_id,
+            .session_key = session_key,
+            .expect_postgres_state = expect_postgres_state and tenant_user_id != null,
+        });
+        defer tools_mod.clearTenantContext();
 
         const typing_recipient = sendInboundProcessingIndicator(
             allocator,

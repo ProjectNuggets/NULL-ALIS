@@ -13,6 +13,11 @@ const JsonObjectMap = root.JsonObjectMap;
 const COMPOSIO_API_BASE_V1 = "https://backend.composio.dev/api/v1";
 const COMPOSIO_API_BASE_V3 = "https://backend.composio.dev/api/v3";
 
+const ComposioEntityResolution = struct {
+    entity_id: []const u8,
+    source: []const u8,
+};
+
 const ComposioReadiness = struct {
     connected_accounts_state: []const u8 = "unknown",
     api_reachable: ?bool = null,
@@ -87,7 +92,7 @@ pub const RuntimeInfoTool = struct {
         const chat_fallback_chain = try allocNormalizedFallbackChain(allocator, self.config.reliability.fallback_providers);
         defer allocator.free(chat_fallback_chain);
         const user_id = user_id_override orelse tenant_ctx.user_id;
-        const entity_id = resolveComposioEntityId(self.config, tenant_ctx, user_id_override);
+        const entity_resolution = resolveComposioEntity(self.config, tenant_ctx, user_id_override);
         var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx, user_id_override);
         defer telegram_state.deinit(allocator);
 
@@ -188,7 +193,9 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, if (self.config.composio.api_key != null and self.config.composio.enabled) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "entity_id");
-        try json_util.appendJsonString(&buf, allocator, entity_id);
+        try json_util.appendJsonString(&buf, allocator, entity_resolution.entity_id);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "entity_scope_source", entity_resolution.source);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "auth_flow_requires_user_turn");
         try buf.appendSlice(allocator, "true");
@@ -239,11 +246,11 @@ pub const RuntimeInfoTool = struct {
         const embedding_provider_effective = normalizeProviderAlias(self.config.memory.search.provider);
         const chat_fallback_chain = try allocNormalizedFallbackChain(allocator, self.config.reliability.fallback_providers);
         defer allocator.free(chat_fallback_chain);
-        const entity_id = resolveComposioEntityId(self.config, tenant_ctx, user_id_override);
+        const entity_resolution = resolveComposioEntity(self.config, tenant_ctx, user_id_override);
         var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx, user_id_override);
         defer telegram_state.deinit(allocator);
         const telegram_configured = isTelegramConfigured(self.config, telegram_state.state);
-        const composio_readiness = self.resolveComposioReadiness(allocator, entity_id);
+        const composio_readiness = self.resolveComposioReadiness(allocator, entity_resolution.entity_id);
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(allocator);
@@ -296,7 +303,9 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, if (self.config.composio.enabled and self.config.composio.api_key != null) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "entity_id");
-        try json_util.appendJsonString(&buf, allocator, entity_id);
+        try json_util.appendJsonString(&buf, allocator, entity_resolution.entity_id);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "entity_scope_source", entity_resolution.source);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "per_user_scope");
         try buf.appendSlice(allocator, if (tenant_ctx.user_id != null) "true" else "false");
@@ -491,10 +500,16 @@ fn resolveScopedNumericUserId(tenant_ctx: root.ToolTenantContext, user_id_overri
     return tenant_ctx.numeric_user_id;
 }
 
-fn resolveComposioEntityId(config: *const config_mod.Config, tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) []const u8 {
-    if (user_id_override) |user_id| return user_id;
-    if (tenant_ctx.user_id) |user_id| return user_id;
-    return config.composio.entity_id;
+fn resolveComposioEntity(config: *const config_mod.Config, tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) ComposioEntityResolution {
+    if (user_id_override) |user_id| {
+        const trimmed = std.mem.trim(u8, user_id, " \t\r\n");
+        if (trimmed.len > 0) return .{ .entity_id = trimmed, .source = "user_id_override" };
+    }
+    if (tenant_ctx.user_id) |user_id| {
+        const trimmed = std.mem.trim(u8, user_id, " \t\r\n");
+        if (trimmed.len > 0) return .{ .entity_id = trimmed, .source = "tenant_context" };
+    }
+    return .{ .entity_id = config.composio.entity_id, .source = "config_default" };
 }
 
 fn normalizeComposioToolkitSlug(name: []const u8) []const u8 {
@@ -900,6 +915,7 @@ test "runtime info summary includes state backend keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"provider_data_source\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"deferred_controls\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"parallel_tools_rollout_percent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"entity_scope_source\":\"config_default\"") != null);
 }
 
 test "runtime info parseToolkitAvailability supports object items" {
@@ -959,6 +975,38 @@ test "runtime info telegram snapshot marks context missing for expected postgres
     defer snapshot_mut.deinit(std.testing.allocator);
     try std.testing.expect(snapshot.context_incomplete);
     try std.testing.expectEqualStrings("context_missing", snapshot.data_source);
+}
+
+test "runtime info integrations composio entity scope uses override and tenant context" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.composio.enabled = true;
+    cfg.composio.entity_id = "default-entity";
+
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+
+    root.setTenantContext(.{ .user_id = "42" });
+    defer root.clearTenantContext();
+
+    const parsed_tenant = try root.parseTestArgs("{\"section\":\"integrations\"}");
+    defer parsed_tenant.deinit();
+    const tenant_result = try t.execute(std.testing.allocator, parsed_tenant.value.object);
+    defer std.testing.allocator.free(tenant_result.output);
+    try std.testing.expect(tenant_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_result.output, "\"entity_id\":\"42\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_result.output, "\"entity_scope_source\":\"tenant_context\"") != null);
+
+    const parsed_override = try root.parseTestArgs("{\"section\":\"integrations\",\"user_id\":\"7\"}");
+    defer parsed_override.deinit();
+    const override_result = try t.execute(std.testing.allocator, parsed_override.value.object);
+    defer std.testing.allocator.free(override_result.output);
+    try std.testing.expect(override_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"entity_id\":\"7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"entity_scope_source\":\"user_id_override\"") != null);
 }
 
 test "runtime info summary surfaces active dispatcher state" {

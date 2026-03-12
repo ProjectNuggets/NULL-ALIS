@@ -41,6 +41,12 @@ pub const ComposioTool = struct {
             return ToolResult.fail("Composio API key not configured. Set composio.api_key in config.");
         }
 
+        if (std.mem.eql(u8, action, "execute") or std.mem.eql(u8, action, "connect")) {
+            if (validateTenantScopedEntity(args)) |validation_error| {
+                return validation_error;
+            }
+        }
+
         if (std.mem.eql(u8, action, "list")) {
             return self.listActions(allocator, args);
         } else if (std.mem.eql(u8, action, "execute")) {
@@ -93,15 +99,64 @@ pub const ComposioTool = struct {
 
     // ── v3 execute action ──────────────────────────────────────────
 
-    fn executeActionV3(self: *ComposioTool, allocator: std.mem.Allocator, action_name: []const u8, args: JsonObjectMap, entity_id: ?[]const u8, connected_account_id: ?[]const u8) !ToolResult {
+    const EntityResolution = struct {
+        entity_id: []const u8,
+        source: []const u8,
+    };
+
+    fn explicitEntityArg(args: JsonObjectMap) ?[]const u8 {
+        const entity_id = root.getString(args, "entity_id") orelse return null;
+        const trimmed = std.mem.trim(u8, entity_id, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return trimmed;
+    }
+
+    fn validateTenantScopedEntity(args: JsonObjectMap) ?ToolResult {
+        const tenant_ctx = root.getTenantContext();
+        if (!tenant_ctx.expect_postgres_state) return null;
+
+        const tenant_user_id = tenant_ctx.user_id;
+        const explicit_entity = explicitEntityArg(args);
+
+        // Tenant-postgres mode must have authoritative tenant user context.
+        if (tenant_user_id == null) {
+            return ToolResult.fail("Composio execute/connect requires tenant user context. Use canonical session key agent:zaki-bot:user:<id>:...");
+        }
+
+        if (explicit_entity) |eid| {
+            if (!std.mem.eql(u8, eid, tenant_user_id.?)) {
+                return ToolResult.fail("Composio entity_id must match tenant user scope for this turn.");
+            }
+        }
+        return null;
+    }
+
+    fn resolveExecutionEntityId(self: *ComposioTool, args: JsonObjectMap) EntityResolution {
+        if (explicitEntityArg(args)) |trimmed| {
+            return .{ .entity_id = trimmed, .source = "args" };
+        }
+
+        const tenant_ctx = root.getTenantContext();
+        if (tenant_ctx.user_id) |tenant_user_id| {
+            const trimmed = std.mem.trim(u8, tenant_user_id, " \t\r\n");
+            if (trimmed.len > 0) {
+                return .{ .entity_id = trimmed, .source = "tenant_ctx" };
+            }
+        }
+
+        return .{
+            .entity_id = normalizeEntityId(self.entity_id),
+            .source = "tool_default",
+        };
+    }
+
+    fn executeActionV3(self: *ComposioTool, allocator: std.mem.Allocator, action_name: []const u8, args: JsonObjectMap, entity_id: []const u8, connected_account_id: ?[]const u8) !ToolResult {
         const slug = try normalizeToolSlug(allocator, action_name);
         defer allocator.free(slug);
 
         var url_buf: [512]u8 = undefined;
         const url = buildExecuteToolUrlV3(&url_buf, slug) catch
             return ToolResult.fail("URL too long");
-
-        const eid = normalizeEntityId(entity_id);
 
         // Build JSON body with arguments, user_id, and optional connected_account_id
         const params_json: ?[]const u8 = blk: {
@@ -116,7 +171,7 @@ pub const ComposioTool = struct {
         try out.appendSlice(allocator, "{\"arguments\":");
         try out.appendSlice(allocator, params_json orelse "{}");
         try out.appendSlice(allocator, ",\"user_id\":\"");
-        try appendJsonEscaped(&out, allocator, eid);
+        try appendJsonEscaped(&out, allocator, entity_id);
         try out.appendSlice(allocator, "\"");
         if (connected_account_id) |caid| {
             try out.appendSlice(allocator, ",\"connected_account_id\":\"");
@@ -132,13 +187,27 @@ pub const ComposioTool = struct {
 
     // ── v2 execute action (fallback) ───────────────────────────────
 
-    fn executeActionV2(self: *ComposioTool, allocator: std.mem.Allocator, action_name: []const u8, args: JsonObjectMap) !ToolResult {
+    fn executeActionV2(self: *ComposioTool, allocator: std.mem.Allocator, action_name: []const u8, args: JsonObjectMap, resolved_entity_id: []const u8) !ToolResult {
         var url_buf: [512]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, COMPOSIO_API_BASE_V2 ++ "/actions/{s}/execute", .{action_name}) catch
             return ToolResult.fail("URL too long");
 
-        // Re-serialize ObjectMap to JSON for the HTTP body
-        const json_val = std.json.Value{ .object = args };
+        // Ensure entity_id is present for user-scoped execution parity.
+        var body_obj = std.json.ObjectMap.init(allocator);
+        defer body_obj.deinit();
+        var it = args.iterator();
+        while (it.next()) |entry| {
+            try body_obj.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        const has_explicit_entity = blk: {
+            break :blk explicitEntityArg(args) != null;
+        };
+        if (!has_explicit_entity) {
+            try body_obj.put("entity_id", .{ .string = resolved_entity_id });
+        }
+
+        // Re-serialize ObjectMap to JSON for the HTTP body.
+        const json_val = std.json.Value{ .object = body_obj };
         const body = std.json.Stringify.valueAlloc(allocator, json_val, .{}) catch
             return ToolResult.fail("Failed to serialize args");
         defer allocator.free(body);
@@ -151,18 +220,18 @@ pub const ComposioTool = struct {
             root.getString(args, "action_name") orelse
             return ToolResult.fail("Missing 'action_name' (or 'tool_slug') for execute");
 
-        const entity_id = root.getString(args, "entity_id");
+        const entity_resolution = self.resolveExecutionEntityId(args);
         const connected_account_id = root.getString(args, "connected_account_id");
 
         // Try v3 first, fall back to v2
-        const v3_result = try self.executeActionV3(allocator, action_name, args, entity_id, connected_account_id);
+        const v3_result = try self.executeActionV3(allocator, action_name, args, entity_resolution.entity_id, connected_account_id);
         if (v3_result.success) return v3_result;
 
         // Free v3 error resources before fallback
         if (v3_result.error_msg) |e| allocator.free(e);
         if (v3_result.output.len > 0) allocator.free(v3_result.output);
 
-        return self.executeActionV2(allocator, action_name, args);
+        return self.executeActionV2(allocator, action_name, args, entity_resolution.entity_id);
     }
 
     // ── v3 connect ─────────────────────────────────────────────────
@@ -229,8 +298,7 @@ pub const ComposioTool = struct {
             return ToolResult.fail("Missing 'app' or 'auth_config_id' for connect");
         }
 
-        const entity_raw = root.getString(args, "entity_id");
-        const entity = if (entity_raw) |e| e else self.entity_id;
+        const entity_resolution = self.resolveExecutionEntityId(args);
 
         var auth_config_id_owned: ?[]u8 = null;
         defer if (auth_config_id_owned) |owned| allocator.free(owned);
@@ -255,7 +323,7 @@ pub const ComposioTool = struct {
             break :blk auth_config_id_owned.?;
         };
 
-        return self.connectActionV3(allocator, entity, auth_config_id, args);
+        return self.connectActionV3(allocator, entity_resolution.entity_id, auth_config_id, args);
     }
 
     // ── HTTP helpers ───────────────────────────────────────────────
@@ -697,6 +765,35 @@ test "composio connect with app invokes curl" {
     try std.testing.expect(result.output.len > 0 or result.error_msg != null);
 }
 
+test "composio execute fails closed when tenant context missing in tenant-postgres mode" {
+    var ct = ComposioTool{ .api_key = "test-key", .entity_id = "default" };
+    const t = ct.tool();
+    root.setTenantContext(.{
+        .expect_postgres_state = true,
+    });
+    defer root.clearTenantContext();
+    const parsed = try root.parseTestArgs("{\"action\": \"execute\", \"action_name\": \"GMAIL_SEND\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "requires tenant user context") != null);
+}
+
+test "composio execute rejects mismatched explicit entity in tenant-postgres mode" {
+    var ct = ComposioTool{ .api_key = "test-key", .entity_id = "default" };
+    const t = ct.tool();
+    root.setTenantContext(.{
+        .expect_postgres_state = true,
+        .user_id = "42",
+    });
+    defer root.clearTenantContext();
+    const parsed = try root.parseTestArgs("{\"action\": \"execute\", \"action_name\": \"GMAIL_SEND\", \"entity_id\":\"7\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "must match tenant user scope") != null);
+}
+
 // ── v3 helper tests ─────────────────────────────────────────────────
 
 test "composio v3 api base url" {
@@ -803,6 +900,31 @@ test "composio normalizeEntityId defaults to default" {
 test "composio normalizeEntityId trims whitespace" {
     try std.testing.expectEqualStrings("workspace-user", normalizeEntityId("  workspace-user  "));
     try std.testing.expectEqualStrings("my-entity", normalizeEntityId("my-entity"));
+}
+
+test "composio resolveExecutionEntityId priority args tenant default" {
+    var ct = ComposioTool{ .api_key = "test-key", .entity_id = "default-entity" };
+
+    const parsed_args = try root.parseTestArgs("{\"action\":\"execute\",\"action_name\":\"gmail-list-labels\",\"entity_id\":\" 7 \"}");
+    defer parsed_args.deinit();
+    const from_args = ct.resolveExecutionEntityId(parsed_args.value.object);
+    try std.testing.expectEqualStrings("7", from_args.entity_id);
+    try std.testing.expectEqualStrings("args", from_args.source);
+
+    root.setTenantContext(.{ .user_id = "42" });
+    defer root.clearTenantContext();
+    const parsed_tenant = try root.parseTestArgs("{\"action\":\"execute\",\"action_name\":\"gmail-list-labels\"}");
+    defer parsed_tenant.deinit();
+    const from_tenant = ct.resolveExecutionEntityId(parsed_tenant.value.object);
+    try std.testing.expectEqualStrings("42", from_tenant.entity_id);
+    try std.testing.expectEqualStrings("tenant_ctx", from_tenant.source);
+
+    root.clearTenantContext();
+    const parsed_default = try root.parseTestArgs("{\"action\":\"execute\",\"action_name\":\"gmail-list-labels\"}");
+    defer parsed_default.deinit();
+    const from_default = ct.resolveExecutionEntityId(parsed_default.value.object);
+    try std.testing.expectEqualStrings("default-entity", from_default.entity_id);
+    try std.testing.expectEqualStrings("tool_default", from_default.source);
 }
 
 test "composio extractApiErrorMessage parses message format" {
