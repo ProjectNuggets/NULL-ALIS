@@ -225,7 +225,7 @@ Active phase:
 3. `Q2` complete
 4. `Q3` complete
 5. `Q4` complete
-6. `Q5` complete (promotion decision: HOLD)
+6. `Q5` complete (decision: controlled rollout GO, scale-claim NO-GO)
 7. `Q6` complete (capacity/cost refresh updated)
 8. next implementation cycle: latency-focused tuning + staged multi-cell canary reruns
 
@@ -278,6 +278,9 @@ No-go if any are true:
 4. benchmark evidence incomplete for claimed tier.
 
 ## 12. Source of Truth Links
+
+Primary operational source:
+1. `docs/v0.2-single-source-of-truth.md`
 
 1. Workstation execution spec:
 - `docs/v0.2-sota-agent-workstation.md`

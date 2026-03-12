@@ -47,6 +47,7 @@ Operational reading:
 
 ## Recommended Next Step
 
-1. Keep rollout at HOLD until canary latency gates improve.
-2. Run Q5 in staged cell rollout environments (10→25→50→75→100%) with same JSON schema.
-3. Recompute this report with real `C_cell_month` from your cloud bill and observed `U_paid_cell` at gate-passing latency.
+1. Proceed with controlled rollout under profile-B guardrails and fixed caps.
+2. Keep scale-ready claim gate closed until profile-A latency + isolation gates pass.
+3. Run staged cell rollout canaries (10→25→50→75→100%) with same JSON schema.
+4. Recompute this report with real `C_cell_month` from your cloud bill and observed `U_paid_cell` at gate-passing latency.

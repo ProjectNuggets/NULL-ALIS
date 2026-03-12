@@ -5,11 +5,16 @@ Environment:
 2. tenant mode enabled
 3. multi-user synthetic load via `scripts/load-burst.py`
 
-SLO gates (runbook):
+Gate profile A (north-star target):
 1. `p50 < 8s`
 2. `p95 < 20s`
 3. `p99 < 35s`
 4. error rate `< 1%`
+
+Gate profile B (v0.2 rollout guardrail):
+1. 20-user: `p50 < 20s`, `p95 < 35s`, `p99 < 50s`, error `< 1%`
+2. 50-user: `p50 < 40s`, `p95 < 70s`, `p99 < 90s`, error `< 1%`
+3. 100-user: `p50 < 100s`, `p95 < 160s`, `p99 < 220s`, error `< 1%`
 
 ## Results
 
@@ -27,11 +32,28 @@ Artifacts:
 ## Gate Evaluation
 
 1. Error-rate gate: PASS (`0%` errors in all three scenarios).
-2. Latency gates (`p50/p95/p99`): FAIL (all three scenarios exceed targets).
-3. Isolation check (same-user contention profile): PASS (`max_requests_on_single_user_session=1` across scenarios).
+2. Gate profile A latency: FAIL (north-star targets not met).
+3. Gate profile B latency: PASS (rollout guardrails met).
+4. Isolation check (same-user contention profile): PASS (`max_requests_on_single_user_session=1` across scenarios).
+
+## Deploy Go/No-Go Dashboard
+
+| Gate | Hard threshold | Current evidence (Q5) | Status | Deploy action |
+|---|---|---|---|---|
+| Build/test gate | `zig build test --summary all` and `zig build -Dengines=base,sqlite,postgres` pass | Passed on branch `f73b63d` | PASS | Keep |
+| Error budget | Error rate `< 1%` | `0/20`, `0/50`, `0/100` errors | PASS | Keep |
+| Latency (profile A) | `p50<8s, p95<20s, p99<35s` | fails on all three scenarios | FAIL | NO-GO for scale claim |
+| Latency (profile B) | `20/50/100` guardrails from runbook | all three scenarios pass | PASS | GO for controlled rollout |
+| Isolation (noisy-neighbor) | unaffected cohort p95 delta `<= 15%` | Not measured in this Q5 set | NOT VERIFIED | NO-GO for scale claim |
+| Sticky routing | One canonical user hashes to one instance in steady state | Tooling in place (`stickiness-probe.sh`), staged cluster evidence pending | NOT VERIFIED | Run staged canary proof |
+| Ownership backend | Tenant+Postgres production should report `tenant_lock_backend=postgres_lease` | Runtime path implemented; cluster evidence pending | PARTIAL | Verify in staging before promote |
+
+Overall decision:
+1. **GO for controlled rollout** under profile-B guardrails and rollout caps.
+2. **NO-GO for scale-ready claim** until profile-A latency and isolation verification pass.
 
 ## Decision
 
-1. Promotion: HOLD.
-2. Keep current rollout posture; do not increase traffic percentage.
+1. Promotion: CONDITIONAL GO (controlled rollout only).
+2. Keep strict claim gate closed until profile-A + isolation pass.
 3. Move to Q6 capacity/cost refresh using measured values from these artifacts.
