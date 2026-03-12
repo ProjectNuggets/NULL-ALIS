@@ -57,6 +57,11 @@ Expected sections:
 - scheduler counters (`scheduler_executed_total`, `scheduler_blocked_burst_total`, `scheduler_blocked_cooldown_total`)
 - `recent_events` with `source`, `action`, `reason`
 
+Ownership fields should include:
+- `tenant_lock_backend` (`postgres_lease`, `file_lock`, `disabled`)
+- `owned_users_count`
+- `tenant_lock_lease_secs`
+
 ### 2b. Validate CLI runtime truth alignment
 ```bash
 nullalis doctor
@@ -166,7 +171,7 @@ Runbook rule:
 - use single-user burst only as queue-pressure diagnostic
 - default script behavior uses per-user `main` session keys (realistic lane contention)
 - for isolated-per-request lane tests, pass:
-  - `--session-key-template 'agent:zaki-bot:user:{user_id}:bench:{request_id}'`
+  - `--session-key-template 'agent:zaki-bot:user:{user_id}:task:{request_id}'`
 
 ## Prod Checks
 
@@ -185,15 +190,40 @@ curl -s http://<gateway>/metrics | rg "nullalis_gateway_|nullalis_http_transport
 - alert if `state_configured=postgres` and `state_effective=file`
 - alert on repeated `gateway degraded state persists` warnings
 
+### 3b. Ownership backend audit
+- tenant+postgres production should show `tenant_lock_backend=postgres_lease`.
+- if `tenant_lock_backend=file_lock` in tenant+postgres production, hold rollout and fix state backend before scaling.
+- monitor `ownership_lock_conflict` responses and `tenant_lock_conflicts_total`; sustained growth indicates routing/stickiness issues or underprovisioned cells.
+
 ### 4. Scheduler safety audit
 - monitor `scheduler_blocked_burst_total`
 - monitor `scheduler_blocked_cooldown_total`
 - monitor reminder delivery success/failure trend
 
+### 4b. Gateway overload/backpressure audit
+- monitor `nullalis_gateway_overload_rejected_total` and `nullalis_gateway_drain_rejected_total` separately.
+- verify overload responses include `Retry-After` and `retry_hint`.
+- tune:
+  - `gateway.max_workers`
+  - `gateway.max_queued_requests`
+  - `gateway.overload_retry_after_secs`
+
 ### 5. Proactive spam audit
 - monitor `proactive_blocked_rate_total`
 - monitor `proactive_blocked_dedupe_total`
 - inspect `/internal/diagnostics` `recent_events` for noisy sources
+
+## Ownership Lease Migration / Rollback
+
+Forward (preferred):
+1. ensure tenant mode + Postgres state are active (`state_effective=postgres`).
+2. verify `/internal/diagnostics` reports `tenant_lock_backend=postgres_lease`.
+3. run canary load and confirm no duplicate ownership execution.
+
+Rollback (safe fallback):
+1. disable/lose Postgres state (intentional or failure), runtime falls back to `file_lock`.
+2. for multi-instance correctness in fallback, require shared `tenant.data_root`.
+3. hold traffic promotion until `tenant_lock_backend=postgres_lease` is restored.
 
 ## Incident Triage
 

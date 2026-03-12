@@ -221,7 +221,13 @@ Execution control documents:
 
 Active phase:
 1. bootstrap complete
-2. next implementation item: `Q1 — Gateway-enforced session_key lane policy`
+2. `Q1` complete
+3. `Q2` complete
+4. `Q3` complete
+5. `Q4` complete
+6. `Q5` complete (promotion decision: HOLD)
+7. `Q6` complete (capacity/cost refresh updated)
+8. next implementation cycle: latency-focused tuning + staged multi-cell canary reruns
 
 Execution rule:
 1. no feature-expansion beyond current queue item

@@ -1,4 +1,4 @@
-# Session Key Policy (Client-Enforced, No Core Rewrite)
+# Session Key Policy (Client + Gateway Enforced)
 
 ## Goal
 Increase effective concurrency immediately by avoiding unnecessary lock contention on the same session lane, while preserving conversational continuity.
@@ -13,6 +13,18 @@ If independent requests are routed to different valid session keys, they can run
 1. In tenant mode, every key must start with: `agent:zaki-bot:user:<user_id>:`  
 2. Session keys must be stable for ongoing context.  
 3. Do not generate a random key per message (destroys thread continuity and increases context churn).
+4. Gateway accepts only tenant lane classes for chat stream keys:
+- `main`
+- `thread:<id>`
+- `task:<id>`
+- `cron:<id>`
+
+## Gateway enforcement
+1. Ownership is validated server-side (`session_key` must belong to authenticated user).
+2. Lane class is validated server-side in tenant mode.
+3. Optional strict mode can require explicit `session_key`:
+- config key: `gateway.require_explicit_chat_stream_session_key`
+- default: `false` (fallback to canonical `:main`)
 
 ## Key formats
 Use only these key classes:

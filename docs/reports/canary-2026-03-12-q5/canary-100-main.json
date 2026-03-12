@@ -1,0 +1,30 @@
+{
+  "distinct_session_keys": 100,
+  "distinct_users": 100,
+  "error_reasons": {},
+  "errors": 0,
+  "lane_counts": {
+    "main": 100
+  },
+  "lane_strategy": "main_only",
+  "latency_ms": {
+    "max": 224265,
+    "mean": 80581,
+    "min": 6137,
+    "p50": 82834,
+    "p95": 134275,
+    "p99": 144389
+  },
+  "mode": "multi-user",
+  "requested_users": 100,
+  "requests": 100,
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 100,
+  "wall_ms": 224269,
+  "workers": 100
+}

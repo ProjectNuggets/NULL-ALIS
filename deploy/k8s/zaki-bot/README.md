@@ -38,6 +38,7 @@ It includes:
 - `15-pgbouncer-pdb.yaml`
 - `kustomization.yaml`
 - `smoke.sh`
+- `stickiness-probe.sh`
 - `restore-drill.sh`
 - `ZAKI_BACKEND_HANDOFF.md`
 - `ZAKI_FRONTEND_HANDOFF.md`
@@ -74,6 +75,11 @@ Planning envelope (validate with your own traffic replay):
 3. TLS secret exists for `agent-staging.zaki.com`.
 4. ZAKI backend can call nullALIS internal APIs with `X-Internal-Token`.
 5. ZAKI backend sends canonical `X-Zaki-User-Id` for app chat calls.
+
+Sticky routing contract:
+1. precedence is `X-Zaki-User-Id` (app/API) then `user_id` query arg (Telegram webhook path).
+2. if upstream auth is used, edge router must derive canonical user id and inject `X-Zaki-User-Id` before forwarding.
+3. missing canonical user identity is a routing contract violation.
 
 ## Required value replacement
 Update these fields before apply:
@@ -145,7 +151,18 @@ TELEGRAM_WEBHOOK_SECRET=... \
 PGBOUNCER_EXPECTED=true \
 ./deploy/k8s/zaki-bot/smoke.sh
 ```
-4. Run restore drill for sampled users.
+4. Run stickiness probe.
+```bash
+BASE_URL=https://agent-staging.zaki.com \
+INTERNAL_TOKEN=... \
+USER_ID=test-user-1 \
+SAMPLES=30 \
+./deploy/k8s/zaki-bot/stickiness-probe.sh
+```
+Expected result:
+1. `PASS` with one observed `instance_id`.
+
+5. Run restore drill for sampled users.
 ```bash
 NAMESPACE=zaki-bot-staging \
 LITESTREAM_S3_BUCKET=... \
@@ -176,14 +193,17 @@ USER_IDS=test-user-1,test-user-2 \
 - Tenant cron deliveries can use this state for proactive Telegram sends.
 
 5. Tenant ownership lock is enabled for write paths.
-- Lock file: `/data/users/{user_id}/.nullalis-owner.lock`
+- tenant+postgres mode uses Postgres leases (`tenant_user_leases`).
+- file-mode fallback uses lock file: `/data/users/{user_id}/.nullalis-owner.lock`
 - Lock conflicts return HTTP `409` with retry semantics.
-- Conflict metric: `nullclaw_gateway_tenant_lock_conflicts_total`
+- Conflict metric: `nullalis_gateway_tenant_lock_conflicts_total`
+- Diagnostics surface active backend as `tenant_lock_backend`.
 
 6. Gateway concurrency is bounded and backpressure-safe.
 - One acceptor thread + worker pool (`gateway.max_workers`).
 - Bounded queue (`gateway.max_queued_requests`).
-- Saturation returns `503 {"error":"overloaded","retry_hint":"retry shortly"}`.
+- Saturation returns `503 {"error":"overloaded","retry_hint":"retry shortly"}` with `Retry-After`.
+- Backpressure hint window is configurable via `gateway.overload_retry_after_secs`.
 
 7. SQLite backup/restore is Litestream-backed.
 - Sidecar replicates all `memory.db` files under `${TENANT_DATA_ROOT}` using directory watcher mode.
@@ -191,10 +211,11 @@ USER_IDS=test-user-1,test-user-2 \
 - `restore-drill.sh` verifies sampled user replicas are restorable.
 
 8. Alert rules are included for production signals.
-- Lock conflict rate (`nullclaw_gateway_tenant_lock_conflicts_total`)
-- Drain reject rate (`nullclaw_gateway_drain_rejected_total`)
-- Telegram webhook reject spikes (`nullclaw_gateway_telegram_webhook_rejected_total`)
-- Chat stream error ratio (`nullclaw_gateway_chat_stream_errors_total / _total`)
+- Lock conflict rate (`nullalis_gateway_tenant_lock_conflicts_total`)
+- Drain reject rate (`nullalis_gateway_drain_rejected_total`)
+- Overload reject rate (`nullalis_gateway_overload_rejected_total`)
+- Telegram webhook reject spikes (`nullalis_gateway_telegram_webhook_rejected_total`)
+- Chat stream error ratio (`nullalis_gateway_chat_stream_errors_total / _total`)
 - Litestream lag (`litestream_replica_lag_seconds`)
 
 9. PgBouncer is the recommended production connection path.

@@ -416,6 +416,7 @@ pub const GatewayState = struct {
     tenant_lock_conflicts_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     in_flight_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     drain_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    overload_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     state_backend_configured: []const u8 = "file",
     state_backend_effective: []const u8 = "file",
@@ -1495,15 +1496,49 @@ fn resolveTenantTelegramBotTokenForSend(
 fn maybeAcquireTenantOwnershipLock(
     allocator: std.mem.Allocator,
     state: *const GatewayState,
+    user_id: []const u8,
     user_root: []const u8,
-) !?tenant_lock.UserOwnershipLock {
+) !?TenantOwnershipLock {
     if (!state.tenant_enabled) return null;
     if (!state.ownership_lock_enabled) return null;
     if (state.owner_instance_id.len == 0) return null;
 
+    if (tenantOwnershipUsesPostgresLease(state)) {
+        const mgr = state.zaki_state orelse return error.PostgresNotEnabled;
+        const numeric_user_id = try parseNumericUserId(user_id);
+        var attempts_pg: u8 = 0;
+        while (attempts_pg < 3) : (attempts_pg += 1) {
+            const now_s = std.time.timestamp();
+            const lease_token = mgr.acquireUserOwnershipLease(
+                allocator,
+                numeric_user_id,
+                state.owner_instance_id,
+                now_s,
+                state.ownership_lock_lease_secs,
+            ) catch |err| switch (err) {
+                error.LockHeld => {
+                    if (attempts_pg + 1 >= 3) return err;
+                    std.Thread.sleep(20 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+            return .{
+                .postgres = .{
+                    .allocator = allocator,
+                    .state_mgr = mgr,
+                    .user_id = numeric_user_id,
+                    .owner_id = state.owner_instance_id,
+                    .lease_token = lease_token,
+                },
+            };
+        }
+        return error.LockHeld;
+    }
+
     var attempts: u8 = 0;
     while (attempts < 3) : (attempts += 1) {
-        return tenant_lock.acquireUserOwnershipLock(
+        const file_lock = tenant_lock.acquireUserOwnershipLock(
             allocator,
             user_root,
             state.owner_instance_id,
@@ -1516,10 +1551,49 @@ fn maybeAcquireTenantOwnershipLock(
             },
             else => return err,
         };
+        return .{ .file = file_lock };
     }
 
     return error.LockHeld;
 }
+
+fn tenantOwnershipUsesPostgresLease(state: *const GatewayState) bool {
+    return state.zaki_state != null and std.mem.eql(u8, state.state_backend_effective, "postgres");
+}
+
+const PostgresUserOwnershipLease = struct {
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state_mod.Manager,
+    user_id: i64,
+    owner_id: []const u8,
+    lease_token: []u8,
+    released: bool = false,
+
+    fn release(self: *PostgresUserOwnershipLease) void {
+        if (self.released) return;
+        self.state_mgr.releaseUserOwnershipLease(self.user_id, self.owner_id, self.lease_token) catch |err| {
+            log.warn("failed to release postgres ownership lease for user={d}: {}", .{ self.user_id, err });
+        };
+        self.allocator.free(self.lease_token);
+        self.released = true;
+    }
+
+    fn deinit(self: *PostgresUserOwnershipLease) void {
+        self.release();
+    }
+};
+
+const TenantOwnershipLock = union(enum) {
+    file: tenant_lock.UserOwnershipLock,
+    postgres: PostgresUserOwnershipLease,
+
+    fn deinit(self: *TenantOwnershipLock) void {
+        switch (self.*) {
+            .file => |*lock| lock.deinit(),
+            .postgres => |*lease| lease.deinit(),
+        }
+    }
+};
 
 const TenantTelegramAsyncJob = struct {
     allocator: std.mem.Allocator,
@@ -1549,9 +1623,10 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
     };
     defer user_ctx.deinit(job.allocator);
 
-    var user_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(
+    var user_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(
         job.allocator,
         job.state,
+        user_ctx.user_id,
         user_ctx.user_root,
     ) catch |err| {
         log.warn("tenant telegram async ownership lock failed: {}", .{err});
@@ -2914,6 +2989,7 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
     const tenant_lock_conflicts_total = state.tenant_lock_conflicts_total.load(.monotonic);
     const in_flight_requests = state.in_flight_requests.load(.monotonic);
     const drain_rejected_total = state.drain_rejected_total.load(.monotonic);
+    const overload_rejected_total = state.overload_rejected_total.load(.monotonic);
     const draining = state.draining.load(.acquire);
     const shutdown_requested = state.shutdown_requested.load(.acquire);
     return std.fmt.allocPrint(
@@ -2942,6 +3018,9 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\# HELP nullalis_gateway_drain_rejected_total Total requests rejected while draining.
         \\# TYPE nullalis_gateway_drain_rejected_total counter
         \\nullalis_gateway_drain_rejected_total {d}
+        \\# HELP nullalis_gateway_overload_rejected_total Total requests rejected due to queue overload.
+        \\# TYPE nullalis_gateway_overload_rejected_total counter
+        \\nullalis_gateway_overload_rejected_total {d}
         \\# HELP nullalis_gateway_drain_mode Current drain mode status.
         \\# TYPE nullalis_gateway_drain_mode gauge
         \\nullalis_gateway_drain_mode {d}
@@ -2986,6 +3065,7 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             tenant_lock_conflicts_total,
             in_flight_requests,
             drain_rejected_total,
+            overload_rejected_total,
             if (draining) @as(u8, 1) else @as(u8, 0),
             if (shutdown_requested) @as(u8, 1) else @as(u8, 0),
             transport_stats.tools_native_total,
@@ -3291,8 +3371,20 @@ fn internalDiagnosticsPayload(
     const bus_inbound_len: usize = if (state.event_bus) |eb| eb.inboundLen() else 0;
     const bus_outbound_len: usize = if (state.event_bus) |eb| eb.outboundLen() else 0;
     const bus_capacity: usize = if (state.event_bus) |eb| eb.queueCapacity() else bus_mod.QUEUE_CAPACITY;
+    const tenant_lock_backend: []const u8 = blk: {
+        if (!state.tenant_enabled or !state.ownership_lock_enabled or state.owner_instance_id.len == 0) break :blk "disabled";
+        if (tenantOwnershipUsesPostgresLease(state)) break :blk "postgres_lease";
+        break :blk "file_lock";
+    };
     const owned_users_count: usize = blk: {
         if (!state.tenant_enabled or !state.ownership_lock_enabled or state.owner_instance_id.len == 0) break :blk 0;
+        if (tenantOwnershipUsesPostgresLease(state)) {
+            const now_s = std.time.timestamp();
+            if (state.zaki_state) |mgr| {
+                break :blk mgr.countOwnedUserLeases(now_s, state.owner_instance_id) catch 0;
+            }
+            break :blk 0;
+        }
         break :blk tenant_lock.countOwnedUserLocks(
             allocator,
             state.tenant_data_root,
@@ -3308,6 +3400,10 @@ fn internalDiagnosticsPayload(
     try json_util.appendJsonInt(&buf, allocator, "requests_total", @intCast(state.requests_total.load(.monotonic)));
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "in_flight_requests", @intCast(state.in_flight_requests.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "drain_rejected_total", @intCast(state.drain_rejected_total.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "overload_rejected_total", @intCast(state.overload_rejected_total.load(.monotonic)));
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(&buf, allocator, "draining");
     try buf.appendSlice(allocator, if (state.draining.load(.acquire)) "true" else "false");
@@ -3325,6 +3421,9 @@ fn internalDiagnosticsPayload(
     try buf.appendSlice(allocator, ",");
 
     try json_util.appendJsonInt(&buf, allocator, "owned_users_count", @intCast(owned_users_count));
+    try buf.appendSlice(allocator, ",");
+
+    try json_util.appendJsonKeyValue(&buf, allocator, "tenant_lock_backend", tenant_lock_backend);
     try buf.appendSlice(allocator, ",");
 
     const tenant_lock_lease_secs_i64: i64 = @intCast(@min(state.ownership_lock_lease_secs, @as(u64, std.math.maxInt(i64))));
@@ -3771,6 +3870,8 @@ fn sendSseErrorFrames(stream: anytype, allocator: std.mem.Allocator, code: []con
 const ChatStreamSessionKeyError = error{
     InvalidSessionKey,
     SessionKeyUserMismatch,
+    InvalidSessionLane,
+    MissingSessionKey,
 };
 
 fn sessionKeyOwnedByUser(session_key: []const u8, user_id: []const u8) bool {
@@ -3779,15 +3880,37 @@ fn sessionKeyOwnedByUser(session_key: []const u8, user_id: []const u8) bool {
     return std.mem.startsWith(u8, session_key, prefix);
 }
 
-fn resolveChatStreamSessionKey(body: []const u8, user_id: []const u8, tenant_enabled: bool, fallback_buf: []u8) ChatStreamSessionKeyError![]const u8 {
+fn sessionKeyHasAllowedTenantLane(session_key: []const u8, user_id: []const u8) bool {
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "agent:zaki-bot:user:{s}:", .{user_id}) catch return false;
+    if (!std.mem.startsWith(u8, session_key, prefix)) return false;
+    const lane = session_key[prefix.len..];
+    if (std.mem.eql(u8, lane, "main")) return true;
+    if (std.mem.startsWith(u8, lane, "thread:")) return lane.len > "thread:".len;
+    if (std.mem.startsWith(u8, lane, "task:")) return lane.len > "task:".len;
+    if (std.mem.startsWith(u8, lane, "cron:")) return lane.len > "cron:".len;
+    return false;
+}
+
+fn resolveChatStreamSessionKey(
+    body: []const u8,
+    user_id: []const u8,
+    tenant_enabled: bool,
+    require_explicit_session_key: bool,
+    fallback_buf: []u8,
+) ChatStreamSessionKeyError![]const u8 {
     const requested = jsonStringField(body, "session_key");
     if (requested) |raw| {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (trimmed.len == 0 or trimmed.len > 255) return error.InvalidSessionKey;
         if (std.mem.indexOfAny(u8, trimmed, "\r\n") != null) return error.InvalidSessionKey;
-        if (tenant_enabled and !sessionKeyOwnedByUser(trimmed, user_id)) return error.SessionKeyUserMismatch;
+        if (tenant_enabled) {
+            if (!sessionKeyOwnedByUser(trimmed, user_id)) return error.SessionKeyUserMismatch;
+            if (!sessionKeyHasAllowedTenantLane(trimmed, user_id)) return error.InvalidSessionLane;
+        }
         return trimmed;
     }
+    if (require_explicit_session_key) return error.MissingSessionKey;
     return zaki_session.userMainSessionKey(fallback_buf, user_id);
 }
 
@@ -3849,7 +3972,7 @@ fn handleApiChatStreamSseConnection(
         return true;
     };
 
-    var ownership_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
+    var ownership_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
         error.LockHeld => {
             _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
             sendSseErrorResponse(stream, req_allocator, "409 Conflict", "ownership_lock_conflict", "user is active on another node, retry shortly");
@@ -3875,14 +3998,19 @@ fn handleApiChatStreamSseConnection(
     };
 
     var session_buf: [256]u8 = undefined;
-    const session_key = resolveChatStreamSessionKey(body, user_id, state.tenant_enabled, &session_buf) catch |err| {
+    const require_explicit_session_key = if (config_opt) |cfg| cfg.gateway.require_explicit_chat_stream_session_key else false;
+    const session_key = resolveChatStreamSessionKey(body, user_id, state.tenant_enabled, require_explicit_session_key, &session_buf) catch |err| {
         const code: []const u8 = switch (err) {
             error.InvalidSessionKey => "invalid_session_key",
             error.SessionKeyUserMismatch => "session_key_user_mismatch",
+            error.InvalidSessionLane => "invalid_session_lane",
+            error.MissingSessionKey => "missing_session_key",
         };
         const msg: []const u8 = switch (err) {
             error.InvalidSessionKey => "invalid session_key",
             error.SessionKeyUserMismatch => "session_key must belong to the authenticated user",
+            error.InvalidSessionLane => "session_key must use lane main|thread:<id>|task:<id>|cron:<id>",
+            error.MissingSessionKey => "session_key is required",
         };
         sendSseErrorResponse(stream, req_allocator, "400 Bad Request", code, msg);
         return true;
@@ -4098,7 +4226,7 @@ fn handleApiRoute(
         ensureUserDirectories(&user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user provisioning failed\"}" };
         };
-        var ownership_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
+        var ownership_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
                 _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
                 const body_locked = sseErrorEvent(req_allocator, "ownership_lock_conflict", "user is active on another node, retry shortly") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"ownership lock conflict\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
@@ -4125,14 +4253,19 @@ fn handleApiRoute(
         const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing message\"}" };
         var session_buf: [256]u8 = undefined;
-        const session_key = resolveChatStreamSessionKey(body, user_id, state.tenant_enabled, &session_buf) catch |err| {
+        const require_explicit_session_key = if (config_opt) |cfg| cfg.gateway.require_explicit_chat_stream_session_key else false;
+        const session_key = resolveChatStreamSessionKey(body, user_id, state.tenant_enabled, require_explicit_session_key, &session_buf) catch |err| {
             const code: []const u8 = switch (err) {
                 error.InvalidSessionKey => "invalid_session_key",
                 error.SessionKeyUserMismatch => "session_key_user_mismatch",
+                error.InvalidSessionLane => "invalid_session_lane",
+                error.MissingSessionKey => "missing_session_key",
             };
             const msg: []const u8 = switch (err) {
                 error.InvalidSessionKey => "invalid session_key",
                 error.SessionKeyUserMismatch => "session_key must belong to the authenticated user",
+                error.InvalidSessionLane => "session_key must use lane main|thread:<id>|task:<id>|cron:<id>",
+                error.MissingSessionKey => "session_key is required",
             };
             const err_sse = sseErrorEvent(req_allocator, code, msg) catch "event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_session_key\",\"message\":\"invalid session_key\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
             return .{
@@ -4247,7 +4380,7 @@ fn handleApiRoute(
         ensureUserDirectories(&user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
         };
-        var provision_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
+        var provision_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
                 _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
                 return .{ .status = "409 Conflict", .body = "{\"error\":\"user currently owned by another node\"}" };
@@ -4278,9 +4411,9 @@ fn handleApiRoute(
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
     };
     const needs_write_lock = !std.mem.eql(u8, method, "GET");
-    var user_write_lock_opt: ?tenant_lock.UserOwnershipLock = null;
+    var user_write_lock_opt: ?TenantOwnershipLock = null;
     if (needs_write_lock) {
-        user_write_lock_opt = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_root) catch |err| switch (err) {
+        user_write_lock_opt = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
                 _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
                 return .{ .status = "409 Conflict", .body = "{\"error\":\"user currently owned by another node\"}" };
@@ -4868,7 +5001,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             };
             const user_ctx = &tenant_user_ctx.?;
             tenant_channel_state_path = ctx.req_allocator.dupe(u8, user_ctx.channel_state_path) catch null;
-            var user_lock_opt: ?tenant_lock.UserOwnershipLock = maybeAcquireTenantOwnershipLock(ctx.req_allocator, ctx.state, user_ctx.user_root) catch |err| switch (err) {
+            var user_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(ctx.req_allocator, ctx.state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
                 error.LockHeld => {
                     _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                     _ = ctx.state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
@@ -5823,6 +5956,23 @@ fn sendHttpResponse(stream: anytype, status: []const u8, content_type: []const u
     if (body.len > 0) try stream.writeAll(body);
 }
 
+fn sendHttpResponseRetryAfter(
+    stream: anytype,
+    status: []const u8,
+    content_type: []const u8,
+    body: []const u8,
+    retry_after_secs: u16,
+) !void {
+    var header_buf: [640]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nRetry-After: {d}\r\nConnection: close\r\n\r\n",
+        .{ status, content_type, body.len, @max(@as(u16, 1), retry_after_secs) },
+    );
+    try stream.writeAll(header);
+    if (body.len > 0) try stream.writeAll(body);
+}
+
 fn setListenerNonBlocking(server: *std.net.Server) void {
     const flags = std.posix.fcntl(server.stream.handle, std.posix.F.GETFL, 0) catch return;
     _ = std.posix.fcntl(server.stream.handle, std.posix.F.SETFL, flags | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }))) catch {};
@@ -5901,13 +6051,18 @@ fn handleAcceptedConnection(
         std.mem.eql(u8, base_path, "/metrics") or
         is_chat_stream_path or
         is_internal_path;
+    const overload_retry_after_secs: u16 = if (config_opt) |cfg|
+        @max(@as(u16, 1), cfg.gateway.overload_retry_after_secs)
+    else
+        2;
     if (state.draining.load(.acquire) and !is_ops_path) {
         _ = state.drain_rejected_total.fetchAdd(1, .monotonic);
-        sendHttpResponse(
+        sendHttpResponseRetryAfter(
             conn.stream,
             "503 Service Unavailable",
             "application/json",
             "{\"error\":\"draining\",\"retry_hint\":\"retry shortly\"}",
+            overload_retry_after_secs,
         ) catch {};
         return;
     }
@@ -6478,6 +6633,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         @intCast(@max(@as(u32, 1), cfg.gateway.max_queued_requests))
     else
         1024;
+    const overload_retry_after_secs: u16 = if (config_opt) |cfg|
+        @max(@as(u16, 1), cfg.gateway.overload_retry_after_secs)
+    else
+        2;
 
     var request_queue = RequestQueue.init(allocator, max_queued_requests);
     defer request_queue.deinit();
@@ -6523,12 +6682,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             else => continue,
         };
         if (!request_queue.push(conn)) {
-            _ = state.drain_rejected_total.fetchAdd(1, .monotonic);
-            sendHttpResponse(
+            _ = state.overload_rejected_total.fetchAdd(1, .monotonic);
+            sendHttpResponseRetryAfter(
                 conn.stream,
                 "503 Service Unavailable",
                 "application/json",
                 "{\"error\":\"overloaded\",\"retry_hint\":\"retry shortly\"}",
+                overload_retry_after_secs,
             ) catch {};
             conn.stream.close();
         }
@@ -8372,6 +8532,7 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"runtime_mode\":\"threaded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"instance_id\":\"diag-owner\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"owned_users_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_backend\":\"file_lock\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_lease_secs\":300") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"bus\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"inbound_len\":0") != null);
@@ -8563,7 +8724,7 @@ test "sseChatPayload emits token deltas and done metadata" {
 
 test "resolveChatStreamSessionKey falls back to canonical user main key" {
     var fallback_buf: [256]u8 = undefined;
-    const session_key = try resolveChatStreamSessionKey("{\"message\":\"hi\"}", "42", true, &fallback_buf);
+    const session_key = try resolveChatStreamSessionKey("{\"message\":\"hi\"}", "42", true, false, &fallback_buf);
     try std.testing.expectEqualStrings("agent:zaki-bot:user:42:main", session_key);
 }
 
@@ -8573,6 +8734,7 @@ test "resolveChatStreamSessionKey accepts tenant-owned override" {
         "{\"message\":\"hi\",\"session_key\":\"agent:zaki-bot:user:42:thread:abc\"}",
         "42",
         true,
+        false,
         &fallback_buf,
     );
     try std.testing.expectEqualStrings("agent:zaki-bot:user:42:thread:abc", session_key);
@@ -8586,9 +8748,50 @@ test "resolveChatStreamSessionKey rejects cross-user override in tenant mode" {
             "{\"message\":\"hi\",\"session_key\":\"agent:zaki-bot:user:43:main\"}",
             "42",
             true,
+            false,
             &fallback_buf,
         ),
     );
+}
+
+test "resolveChatStreamSessionKey rejects invalid tenant lane override" {
+    var fallback_buf: [256]u8 = undefined;
+    try std.testing.expectError(
+        error.InvalidSessionLane,
+        resolveChatStreamSessionKey(
+            "{\"message\":\"hi\",\"session_key\":\"agent:zaki-bot:user:42:bench:abc\"}",
+            "42",
+            true,
+            false,
+            &fallback_buf,
+        ),
+    );
+}
+
+test "resolveChatStreamSessionKey requires explicit key when strict mode is enabled" {
+    var fallback_buf: [256]u8 = undefined;
+    try std.testing.expectError(
+        error.MissingSessionKey,
+        resolveChatStreamSessionKey(
+            "{\"message\":\"hi\"}",
+            "42",
+            true,
+            true,
+            &fallback_buf,
+        ),
+    );
+}
+
+test "resolveChatStreamSessionKey allows non-tenant custom lanes" {
+    var fallback_buf: [256]u8 = undefined;
+    const session_key = try resolveChatStreamSessionKey(
+        "{\"message\":\"hi\",\"session_key\":\"local:bench:1\"}",
+        "42",
+        false,
+        false,
+        &fallback_buf,
+    );
+    try std.testing.expectEqualStrings("local:bench:1", session_key);
 }
 
 test "tenant semantic memory defaults enable postgres_hybrid safely" {

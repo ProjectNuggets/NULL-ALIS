@@ -95,6 +95,22 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn recordTelegramUpdate(_: *@This(), _: i64, _: i64) !bool {
         return error.PostgresNotEnabled;
     }
+    pub fn acquireUserOwnershipLease(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: i64,
+        _: []const u8,
+        _: i64,
+        _: u64,
+    ) error{ PostgresNotEnabled, LockHeld, InvalidOwnerId }![]u8 {
+        return error.PostgresNotEnabled;
+    }
+    pub fn releaseUserOwnershipLease(_: *@This(), _: i64, _: []const u8, _: []const u8) error{PostgresNotEnabled}!void {
+        return error.PostgresNotEnabled;
+    }
+    pub fn countOwnedUserLeases(_: *@This(), _: i64, _: []const u8) error{PostgresNotEnabled}!usize {
+        return error.PostgresNotEnabled;
+    }
     pub const ClaimedJob = struct {
         id: []u8,
         user_id: i64,
@@ -425,6 +441,15 @@ const ManagerImpl = struct {
             \\    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             \\)
             ,
+            \\CREATE TABLE IF NOT EXISTS {schema}.tenant_user_leases (
+            \\    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    owner_id TEXT NOT NULL,
+            \\    lease_token TEXT NOT NULL,
+            \\    lease_until TIMESTAMPTZ NOT NULL,
+            \\    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_tenant_user_leases_owner_until ON {schema}.tenant_user_leases(owner_id, lease_until DESC)",
             \\CREATE TABLE IF NOT EXISTS {schema}.jobs (
             \\    id TEXT PRIMARY KEY,
             \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
@@ -1021,6 +1046,91 @@ const ManagerImpl = struct {
         return !std.mem.eql(u8, std.mem.span(affected), "0");
     }
 
+    pub fn acquireUserOwnershipLease(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        owner_id: []const u8,
+        now_s: i64,
+        lease_secs: u64,
+    ) ![]u8 {
+        if (owner_id.len == 0) return error.InvalidOwnerId;
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.tenant_user_leases (user_id, owner_id, lease_token, lease_until, updated_at) " ++
+                "VALUES ($1, $2, $3, TO_TIMESTAMP(($4::bigint + $5::bigint)), NOW()) " ++
+                "ON CONFLICT (user_id) DO UPDATE SET owner_id = EXCLUDED.owner_id, lease_token = EXCLUDED.lease_token, lease_until = EXCLUDED.lease_until, updated_at = NOW() " ++
+                "WHERE {schema}.tenant_user_leases.lease_until < TO_TIMESTAMP($4::bigint) OR {schema}.tenant_user_leases.owner_id = $2 " ++
+                "RETURNING lease_token",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const owner_z = try self.allocator.dupeZ(u8, owner_id);
+        defer self.allocator.free(owner_z);
+        const lease_token = try generateLeaseToken(allocator);
+        errdefer allocator.free(lease_token);
+        const token_z = try self.allocator.dupeZ(u8, lease_token);
+        defer self.allocator.free(token_z);
+        var now_buf: [32]u8 = undefined;
+        const now_s_z = try std.fmt.bufPrintZ(&now_buf, "{d}", .{now_s});
+        var lease_buf: [32]u8 = undefined;
+        const lease_s_z = try std.fmt.bufPrintZ(&lease_buf, "{d}", .{lease_secs});
+        const params = [_]?[*:0]const u8{ user_s.ptr, owner_z, token_z, now_s_z.ptr, lease_s_z.ptr };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(owner_id.len),
+            @intCast(lease_token.len),
+            @intCast(now_s_z.len),
+            @intCast(lease_s_z.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return error.LockHeld;
+        return lease_token;
+    }
+
+    pub fn releaseUserOwnershipLease(
+        self: *Self,
+        user_id: i64,
+        owner_id: []const u8,
+        lease_token: []const u8,
+    ) !void {
+        const q = try self.buildQuery(
+            "DELETE FROM {schema}.tenant_user_leases WHERE user_id = $1 AND owner_id = $2 AND lease_token = $3",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const owner_z = try self.allocator.dupeZ(u8, owner_id);
+        defer self.allocator.free(owner_z);
+        const token_z = try self.allocator.dupeZ(u8, lease_token);
+        defer self.allocator.free(token_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, owner_z, token_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(owner_id.len), @intCast(lease_token.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    pub fn countOwnedUserLeases(self: *Self, now_s: i64, owner_id: []const u8) !usize {
+        if (owner_id.len == 0) return 0;
+        const q = try self.buildQuery(
+            "SELECT COUNT(*) FROM {schema}.tenant_user_leases WHERE owner_id = $1 AND lease_until > TO_TIMESTAMP($2::bigint)",
+        );
+        defer self.allocator.free(q);
+        const owner_z = try self.allocator.dupeZ(u8, owner_id);
+        defer self.allocator.free(owner_z);
+        var now_buf: [32]u8 = undefined;
+        const now_s_z = try std.fmt.bufPrintZ(&now_buf, "{d}", .{now_s});
+        const params = [_]?[*:0]const u8{ owner_z, now_s_z.ptr };
+        const lengths = [_]c_int{ @intCast(owner_id.len), @intCast(now_s_z.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const text = try dupeResultValue(self.allocator, result, 0, 0);
+        defer self.allocator.free(text);
+        return try std.fmt.parseInt(usize, text, 10);
+    }
+
     pub fn claimDueJobs(self: *Self, allocator: std.mem.Allocator, owner_id: []const u8, now_s: i64, lease_secs: u64, limit: usize) ![]ClaimedJob {
         const q = try self.buildQuery(
             "WITH due AS (" ++
@@ -1358,6 +1468,17 @@ const ManagerImpl = struct {
         const out = try allocator.alloc(u8, bytes_len * 2);
         _ = security_secrets.hexEncode(raw, out);
         return out;
+    }
+
+    fn generateLeaseToken(allocator: std.mem.Allocator) ![]u8 {
+        const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        var random_bytes: [20]u8 = undefined;
+        std.crypto.random.bytes(&random_bytes);
+        var out: [20]u8 = undefined;
+        for (random_bytes, 0..) |b, i| {
+            out[i] = alphabet[@as(usize, b) % alphabet.len];
+        }
+        return allocator.dupe(u8, out[0..]);
     }
 
     fn exec(self: *Self, query: []const u8) !*c.PGresult {

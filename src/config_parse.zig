@@ -1310,11 +1310,17 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (gw.object.get("allow_public_bind")) |v| {
                 if (v == .bool) self.gateway.allow_public_bind = v.bool;
             }
+            if (gw.object.get("require_explicit_chat_stream_session_key")) |v| {
+                if (v == .bool) self.gateway.require_explicit_chat_stream_session_key = v.bool;
+            }
             if (gw.object.get("max_workers")) |v| {
                 if (v == .integer) self.gateway.max_workers = @intCast(v.integer);
             }
             if (gw.object.get("max_queued_requests")) |v| {
                 if (v == .integer) self.gateway.max_queued_requests = @intCast(v.integer);
+            }
+            if (gw.object.get("overload_retry_after_secs")) |v| {
+                if (v == .integer) self.gateway.overload_retry_after_secs = @intCast(v.integer);
             }
             if (gw.object.get("inbound_workers")) |v| {
                 if (v == .integer) self.gateway.inbound_workers = @intCast(v.integer);
