@@ -1,0 +1,26 @@
+{
+  "timestamp": "2026-03-12",
+  "tenant": {
+    "enabled": true,
+    "identity_mapping_enforcement": "staged_strict",
+    "identity_mapping_strict_channels": [
+      "telegram",
+      "slack"
+    ]
+  },
+  "slack": [
+    {
+      "account_id": "stage2a",
+      "mode": "http",
+      "bot_token": "xoxb-stage2a-dummy-token",
+      "signing_secret": "stage2a-signing-secret",
+      "webhook_path": "/slack/events",
+      "allow_from": [
+        "U_STAGE2A_MAPPED",
+        "U_STAGE2A_UNMAPPED"
+      ],
+      "dm_policy": "open",
+      "group_policy": "mention_only"
+    }
+  ]
+}

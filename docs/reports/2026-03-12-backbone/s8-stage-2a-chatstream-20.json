@@ -1,0 +1,234 @@
+{
+  "diagnostics": {
+    "after": {
+      "bus": {
+        "capacity": 1024,
+        "inbound_len": 0,
+        "outbound_len": 0
+      },
+      "gateway": {
+        "drain_rejected_total": 0,
+        "draining": false,
+        "in_flight_requests": 1,
+        "overload_rejected_total": 0,
+        "requests_total": 32
+      },
+      "heartbeat_runtime": {
+        "available": false,
+        "last_reason": null,
+        "last_run_s": null,
+        "last_status": null,
+        "user_id": null
+      },
+      "heartbeat_wake": {
+        "coalesced_total": 0,
+        "dropped_total": 0,
+        "pending": 0
+      },
+      "identity_mapping": {
+        "cache_hit": 0,
+        "cache_miss": 4,
+        "cache_stale": 1,
+        "db_lookup_count": 4,
+        "db_lookup_ms_total": 8,
+        "degraded_compat": 0,
+        "mapped": 2,
+        "strict_rejected": 2,
+        "unmapped": 2
+      },
+      "instance_id": "pid-83609-1773352756",
+      "integrations": {
+        "telegram": {
+          "account_id": null,
+          "chat_id": null,
+          "configured": false,
+          "connected": null,
+          "data_source": "global"
+        }
+      },
+      "last_trigger": null,
+      "ops": {
+        "last_event": null,
+        "proactive_blocked_dedupe_total": 0,
+        "proactive_blocked_rate_total": 0,
+        "proactive_send_errors_total": 0,
+        "proactive_sent_total": 0,
+        "recent_events": [],
+        "scheduler_blocked_burst_total": 0,
+        "scheduler_blocked_cooldown_total": 0,
+        "scheduler_executed_total": 0
+      },
+      "owned_users_count": 0,
+      "pool": {
+        "hits": 0,
+        "idle": 0,
+        "misses": 0
+      },
+      "runtime_mode": "threaded",
+      "startup_self_check": {
+        "chat_fallback_chain": "together",
+        "chat_provider_effective": "openrouter",
+        "config_path": "/Users/nova/.nullalis/config.json",
+        "degraded": false,
+        "degraded_reason": "",
+        "embedding_provider_effective": "together",
+        "heartbeat_enabled": true,
+        "heartbeat_interval_minutes": 30,
+        "postgres_host": "127.0.0.1",
+        "postgres_port": 5432,
+        "postgres_schema": "zaki_bot",
+        "provider_data_source": "config",
+        "scheduler_backend": "postgres",
+        "state_backend_configured": "postgres",
+        "state_backend_effective": "postgres",
+        "tenant_enabled": true,
+        "webhook_mode": "none"
+      },
+      "tenant_lease_probe": null,
+      "tenant_lock_backend": "postgres_lease",
+      "tenant_lock_conflicts_by_route": {
+        "api": 0,
+        "chat_stream_http": 0,
+        "chat_stream_sse": 0,
+        "daemon": 0,
+        "webhook": 0
+      },
+      "tenant_lock_lease_secs": 300
+    },
+    "after_error": null,
+    "before": {
+      "bus": {
+        "capacity": 1024,
+        "inbound_len": 0,
+        "outbound_len": 0
+      },
+      "gateway": {
+        "drain_rejected_total": 0,
+        "draining": false,
+        "in_flight_requests": 1,
+        "overload_rejected_total": 0,
+        "requests_total": 11
+      },
+      "heartbeat_runtime": {
+        "available": false,
+        "last_reason": null,
+        "last_run_s": null,
+        "last_status": null,
+        "user_id": null
+      },
+      "heartbeat_wake": {
+        "coalesced_total": 0,
+        "dropped_total": 0,
+        "pending": 0
+      },
+      "identity_mapping": {
+        "cache_hit": 0,
+        "cache_miss": 4,
+        "cache_stale": 1,
+        "db_lookup_count": 4,
+        "db_lookup_ms_total": 8,
+        "degraded_compat": 0,
+        "mapped": 2,
+        "strict_rejected": 2,
+        "unmapped": 2
+      },
+      "instance_id": "pid-83609-1773352756",
+      "integrations": {
+        "telegram": {
+          "account_id": null,
+          "chat_id": null,
+          "configured": false,
+          "connected": null,
+          "data_source": "global"
+        }
+      },
+      "last_trigger": null,
+      "ops": {
+        "last_event": null,
+        "proactive_blocked_dedupe_total": 0,
+        "proactive_blocked_rate_total": 0,
+        "proactive_send_errors_total": 0,
+        "proactive_sent_total": 0,
+        "recent_events": [],
+        "scheduler_blocked_burst_total": 0,
+        "scheduler_blocked_cooldown_total": 0,
+        "scheduler_executed_total": 0
+      },
+      "owned_users_count": 0,
+      "pool": {
+        "hits": 0,
+        "idle": 0,
+        "misses": 0
+      },
+      "runtime_mode": "threaded",
+      "startup_self_check": {
+        "chat_fallback_chain": "together",
+        "chat_provider_effective": "openrouter",
+        "config_path": "/Users/nova/.nullalis/config.json",
+        "degraded": false,
+        "degraded_reason": "",
+        "embedding_provider_effective": "together",
+        "heartbeat_enabled": true,
+        "heartbeat_interval_minutes": 30,
+        "postgres_host": "127.0.0.1",
+        "postgres_port": 5432,
+        "postgres_schema": "zaki_bot",
+        "provider_data_source": "config",
+        "scheduler_backend": "postgres",
+        "state_backend_configured": "postgres",
+        "state_backend_effective": "postgres",
+        "tenant_enabled": true,
+        "webhook_mode": "none"
+      },
+      "tenant_lease_probe": null,
+      "tenant_lock_backend": "postgres_lease",
+      "tenant_lock_conflicts_by_route": {
+        "api": 0,
+        "chat_stream_http": 0,
+        "chat_stream_sse": 0,
+        "daemon": 0,
+        "webhook": 0
+      },
+      "tenant_lock_lease_secs": 300
+    },
+    "before_error": null,
+    "url": "http://127.0.0.1:3000/internal/diagnostics?user_id=1"
+  },
+  "distinct_session_keys": 20,
+  "distinct_users": 20,
+  "error_details": {
+    "detail_counts": {},
+    "exception_classes": {},
+    "status_codes": {}
+  },
+  "error_reasons": {},
+  "errors": 0,
+  "failure_samples": [],
+  "lane_counts": {
+    "main": 20
+  },
+  "lane_strategy": "main_only",
+  "latency_ms": {
+    "max": 69635,
+    "mean": 35927,
+    "min": 11147,
+    "p50": 34057,
+    "p95": 54144,
+    "p99": 69635
+  },
+  "mode": "multi-user",
+  "requested_users": 20,
+  "requests": 20,
+  "run_finished_utc": "2026-03-12T22:01:09.442808+00:00",
+  "run_label": "s8_stage2a_chatstream_20",
+  "run_started_utc": "2026-03-12T21:59:59.753220+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 20,
+  "wall_ms": 69689,
+  "workers": 20
+}

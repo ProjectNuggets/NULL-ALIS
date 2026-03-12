@@ -1,0 +1,50 @@
+{
+  "account_id": "stage2a",
+  "binding_upsert": {
+    "body": "{\"status\":\"upserted\",\"id\":\"a33942a18b2f7a040da537c8466e5edd\"}",
+    "json": {
+      "id": "a33942a18b2f7a040da537c8466e5edd",
+      "status": "upserted"
+    },
+    "ok": true,
+    "status_code": 200
+  },
+  "gateway_base": "http://127.0.0.1:3000",
+  "mapped": {
+    "accepted": true,
+    "principal": "U_STAGE2A_MAPPED",
+    "response": {
+      "body": "{\"status\":\"ok\"}",
+      "json": {
+        "status": "ok"
+      },
+      "ok": true,
+      "signature": "v0=a566d9bb260ac64aa28a7efec7172d760cf0973252b6dfc15f33ad73b9107e8e",
+      "status_code": 200
+    },
+    "scope": "D_STAGE2A_MAPPED"
+  },
+  "run_started_utc": "2026-03-12T21:59:53.737373+00:00",
+  "strict_observability": {
+    "strict_identity_reject_observed": false,
+    "strict_rejected_after": 2,
+    "strict_rejected_before": 1,
+    "strict_rejected_delta": 1
+  },
+  "unmapped": {
+    "principal": "U_STAGE2A_UNMAPPED",
+    "response": {
+      "body": "{\"status\":\"ok\"}",
+      "json": {
+        "status": "ok"
+      },
+      "ok": true,
+      "signature": "v0=ab89577e99c04d2511b2d16b62bedb8e6e7df56a0bf63f0aed887793496c3283",
+      "status_code": 200
+    },
+    "scope": "D_STAGE2A_UNMAPPED",
+    "strict_reject_detected": false
+  },
+  "user_id": "1",
+  "webhook_path": "/slack/events"
+}

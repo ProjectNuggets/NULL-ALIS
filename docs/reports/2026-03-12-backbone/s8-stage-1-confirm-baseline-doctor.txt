@@ -1,0 +1,45 @@
+nullALIS Doctor (enhanced)
+
+  [config]
+    [ok] provider: openrouter
+    [ok] API key configured
+    [ok] default model: moonshotai/kimi-k2.5
+    [ok] temperature 0.7 (valid range 0.0-2.0)
+    [ok] gateway port: 3000
+    [ok] tenant-scoped channel connected via runtime state
+  [workspace]
+    [ok] directory exists: /Users/nova/.nullalis/workspace
+    [ok] directory is writable
+    [ok] disk space: 1259300 MB available
+    [ok] SOUL.md present
+    [ok] AGENTS.md present
+  [daemon]
+    [ok] state file: /Users/nova/.nullalis/daemon_state.json
+    [ok] daemon reports running
+  [env]
+    [ok] git: git version 2.50.1 (Apple Git-155)
+    [ok] curl: curl 8.7.1 (x86_64-apple-darwin24.0) libcurl/8.7.1 (SecureTr
+    [ok] shell: /bin/zsh
+    [ok] home directory env set
+  [runtime]
+    [ok] source: gateway_internal
+    [ok] state backend: configured=postgres effective=postgres
+    [ok] scheduler backend: postgres
+    [ok] providers: chat=openrouter fallbacks=together embedding=together source=config
+    [ok] scheduler limits: configured max_tasks=64 max_concurrent=4
+    [ok] scheduler effective max_tasks: 64
+    [ok] heartbeat: enabled=true interval=30m tenant=true
+    [ok] telegram runtime: configured=true connected=true source=postgres
+    [ok] identity mapping: mapped=1 unmapped=1 strict_rejected=1 degraded=0 cache_hit=0 cache_miss=2
+    [ok] tenant lock conflicts by route: sse=0 http=0 webhook=0 daemon=0 api=0
+    [ok] tenant lease probe: user=1 source=postgres_lease owner=none lease_until_s=-1 updated_at_s=-1
+    [ok] runtime not degraded
+  [sandbox]
+    [ok] sandbox: disabled
+  [cron_store_local]
+    [warn] local cron store is informational only; runtime scheduler source is gateway/internal diagnostics
+    [ok] local cron store: 237 jobs (237 active, 0 paused)
+  [channels]
+    [ok] CLI always available
+
+Summary: 32 ok, 1 warnings, 0 errors
