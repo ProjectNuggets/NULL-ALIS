@@ -5,6 +5,12 @@ Owner: Codex (runtime/platform)
 Stage: 1  
 Channel set: `telegram`
 
+## Update (P1 Re-run)
+
+- Follow-up recovery rerun recorded in:
+- `docs/reports/2026-03-12-backbone/s8-stage-1-rerun.md`
+- Current promotion state remains: **HOLD/ROLLBACK** pending strict-ingress precondition fix and revalidation.
+
 ## Config Change
 
 Before stage:
