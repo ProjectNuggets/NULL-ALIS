@@ -208,6 +208,25 @@ This runbook is agent-executable and is the source of truth for:
 3. promotion/rollback SLO gates
 4. premium dedicated tenant activation
 
+## 8.2 Current Execution State (Clean Bootstrap)
+
+Execution branch:
+1. `v0.2-scale-exec-swisswatch`
+
+Execution control documents:
+1. unfinished ledger: `docs/v0.2-unfinished-ledger.md`
+2. strict queue: `docs/v0.2-execution-queue.md`
+3. working agreement: `docs/v0.2-working-agreement.md`
+4. operational model runbook: `docs/v0.2-operational-model-agent-runbook.md`
+
+Active phase:
+1. bootstrap complete
+2. next implementation item: `Q1 — Gateway-enforced session_key lane policy`
+
+Execution rule:
+1. no feature-expansion beyond current queue item
+2. no promotion claims without canary evidence artifacts
+
 ## 9. KPIs (Product + Revenue)
 
 Product KPIs:
@@ -262,3 +281,9 @@ No-go if any are true:
 - `docs/reliability-ops-runbook.md`
 4. API contract:
 - `docs/openapi-v1.yaml`
+5. execution queue:
+- `docs/v0.2-execution-queue.md`
+6. unfinished ledger:
+- `docs/v0.2-unfinished-ledger.md`
+7. working agreement:
+- `docs/v0.2-working-agreement.md`
