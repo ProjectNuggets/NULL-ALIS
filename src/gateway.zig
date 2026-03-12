@@ -40,6 +40,8 @@ const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
 const runtime_resolver = @import("delivery/runtime_resolver.zig");
 const tool_dispatcher = @import("tool_dispatcher.zig");
+const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
+const channel_identity_key = @import("channel_identity_key.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -2704,6 +2706,20 @@ fn telegramChatId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
     return id_val.integer;
 }
 
+fn telegramThreadKey(allocator: std.mem.Allocator, body: []const u8, buf: []u8) ?[]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const msg_obj = parsed.value.object.get("message") orelse
+        parsed.value.object.get("edited_message") orelse return null;
+    if (msg_obj != .object) return null;
+
+    const thread_val = msg_obj.object.get("message_thread_id") orelse return null;
+    if (thread_val != .integer) return null;
+    return std.fmt.bufPrint(buf, "{d}", .{thread_val.integer}) catch null;
+}
+
 fn telegramSenderIdentity(
     allocator: std.mem.Allocator,
     body: []const u8,
@@ -5182,10 +5198,102 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
 
                 var kb: [256]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg_opt| cfg_opt else null;
-                const sk = if (use_shared_main)
+                const fallback_session_key = if (use_shared_main)
                     zaki_session.userMainSessionKey(&kb, scoped_user_id.?)
                 else
                     telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
+                var thread_buf: [32]u8 = undefined;
+                const thread_raw = telegramThreadKey(ctx.req_allocator, b, &thread_buf);
+                var identity_keys = channel_identity_key.build(
+                    ctx.req_allocator,
+                    "telegram",
+                    sender,
+                    cid_str,
+                    thread_raw,
+                ) catch {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"invalid telegram identity\"}";
+                    return;
+                };
+                defer identity_keys.deinit(ctx.req_allocator);
+
+                if (ctx.state.zaki_state != null and scoped_user_id != null and !is_group) {
+                    const user_id_numeric = numeric_user_id_opt orelse parseNumericUserId(scoped_user_id.?) catch {
+                        ctx.response_status = "400 Bad Request";
+                        ctx.response_body = "{\"error\":\"invalid user\"}";
+                        return;
+                    };
+                    const upsert_binding = ctx.state.zaki_state.?.upsertChannelIdentityBinding(
+                        ctx.req_allocator,
+                        user_id_numeric,
+                        "telegram",
+                        tg_account_id,
+                        identity_keys.principal_key,
+                        identity_keys.scope_key,
+                        identity_keys.thread_key,
+                        peer_kind,
+                        cid_str,
+                        "{\"source\":\"telegram_webhook\"}",
+                    );
+                    if (upsert_binding) |binding_id| {
+                        ctx.req_allocator.free(binding_id);
+                    } else |err| {
+                        log.warn("telegram binding upsert failed: {}", .{err});
+                    }
+                    inbound_canonicalizer.invalidateCacheForIdentity(.{
+                        .channel = "telegram",
+                        .account_id = tg_account_id,
+                        .principal_key = identity_keys.principal_key,
+                        .scope_key = identity_keys.scope_key,
+                        .thread_key = identity_keys.thread_key,
+                        .fallback_session_key = "",
+                    });
+                }
+
+                var canonical_decision = inbound_canonicalizer.canonicalizeInboundTurn(
+                    ctx.req_allocator,
+                    ctx.state.zaki_state,
+                    cfg,
+                    .{
+                        .channel = "telegram",
+                        .account_id = tg_account_id,
+                        .principal_key = identity_keys.principal_key,
+                        .scope_key = identity_keys.scope_key,
+                        .thread_key = identity_keys.thread_key,
+                        .fallback_session_key = fallback_session_key,
+                        .lane = if (use_shared_main) .main else if (identity_keys.thread_key != null) .thread else .main,
+                    },
+                ) catch |err| {
+                    log.warn("telegram canonicalization failed: {}", .{err});
+                    ctx.response_status = "500 Internal Server Error";
+                    ctx.response_body = "{\"error\":\"canonicalization_failed\"}";
+                    return;
+                };
+                defer canonical_decision.deinit(ctx.req_allocator);
+
+                const sk = blk: {
+                    switch (canonical_decision.kind) {
+                        .strict_reject => {
+                            sendTelegramReply(
+                                ctx.req_allocator,
+                                tg_bot_token,
+                                chat_id.?,
+                                "This Telegram chat is not mapped to your tenant user yet. Reconnect Telegram from the app, then retry.",
+                            ) catch |err| {
+                                log.warn("telegram strict reject reply send failed: {}", .{err});
+                            };
+                            const reject_body = std.fmt.allocPrint(
+                                ctx.req_allocator,
+                                "{{\"error\":\"strict_identity_reject\",\"code\":\"{s}\"}}",
+                                .{canonical_decision.reason_code},
+                            ) catch "{\"error\":\"strict_identity_reject\"}";
+                            ctx.response_status = "403 Forbidden";
+                            ctx.response_body = reject_body;
+                            return;
+                        },
+                        .canonical, .degraded_compat => break :blk canonical_decision.session_key.?,
+                    }
+                };
                 const tenant_runtime = getTenantRuntime(ctx.state, cfg, &tenant_user_ctx.?) catch {
                     ctx.response_status = "500 Internal Server Error";
                     ctx.response_body = "{\"error\":\"tenant runtime init failed\"}";

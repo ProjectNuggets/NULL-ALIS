@@ -1180,12 +1180,15 @@ const ManagerImpl = struct {
         const thread_norm = thread_text;
         const thread_z = if (thread_key) |value| try self.allocator.dupeZ(u8, value) else null;
         defer if (thread_z) |value| self.allocator.free(value);
+        const thread_param: ?[*:0]const u8 = if (thread_z) |value| value.ptr else null;
         const thread_norm_z = try self.allocator.dupeZ(u8, thread_norm);
         defer self.allocator.free(thread_norm_z);
         const peer_kind_z = if (peer_kind) |value| try self.allocator.dupeZ(u8, value) else null;
         defer if (peer_kind_z) |value| self.allocator.free(value);
+        const peer_kind_param: ?[*:0]const u8 = if (peer_kind_z) |value| value.ptr else null;
         const peer_id_z = if (peer_id) |value| try self.allocator.dupeZ(u8, value) else null;
         defer if (peer_id_z) |value| self.allocator.free(value);
+        const peer_id_param: ?[*:0]const u8 = if (peer_id_z) |value| value.ptr else null;
         const metadata_text = metadata_json orelse "{}";
         const metadata_z = try self.allocator.dupeZ(u8, metadata_text);
         defer self.allocator.free(metadata_z);
@@ -1197,10 +1200,10 @@ const ManagerImpl = struct {
             account_z,
             principal_z,
             scope_z,
-            thread_z,
+            thread_param,
             thread_norm_z,
-            peer_kind_z,
-            peer_id_z,
+            peer_kind_param,
+            peer_id_param,
             metadata_z,
         };
         const lengths = [_]c_int{
