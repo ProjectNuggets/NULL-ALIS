@@ -9,13 +9,16 @@
 //! sessions are processed in parallel.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
+const config_types = @import("config_types.zig");
 const Agent = @import("agent/root.zig").Agent;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
 const memory_mod = @import("memory/root.zig");
+const zaki_state_mod = @import("zaki_state.zig");
 const Memory = memory_mod.Memory;
 const observability = @import("observability.zig");
 const Observer = observability.Observer;
@@ -1101,6 +1104,105 @@ test "concurrent processMessage with sqlite memory does not panic" {
 
     const count = try mem.count();
     try testing.expect(count > 0);
+}
+
+test "postgres session restore under concurrent getOrCreate same and mixed keys does not panic" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+
+    const test_url = std.process.getEnvVarOwned(testing.allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer testing.allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_session_restore_{d}", .{std.time.microTimestamp()});
+    const state_cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var state_mgr = try zaki_state_mod.Manager.init(testing.allocator, state_cfg);
+    defer state_mgr.deinit();
+    try state_mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    var seed_store = try zaki_state_mod.Manager.UserSessionStore.init(testing.allocator, &state_mgr, 2);
+    defer seed_store.deinit();
+    const seed_session_store = seed_store.sessionStore();
+
+    try seed_session_store.saveMessage("agent:zaki-bot:user:2:main", "user", "seed user");
+    try seed_session_store.saveMessage("agent:zaki-bot:user:2:main", "assistant", "seed assistant");
+
+    const mixed_keys = 24;
+    for (0..mixed_keys) |idx| {
+        var key_buf: [96]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "agent:zaki-bot:user:2:thread:load-{d}", .{idx});
+        try seed_session_store.saveMessage(key, "user", "seed mixed user");
+        try seed_session_store.saveMessage(key, "assistant", "seed mixed assistant");
+    }
+
+    const num_managers = 4;
+    var mocks: [num_managers]MockProvider = undefined;
+    var stores: [num_managers]zaki_state_mod.Manager.UserSessionStore = undefined;
+    var managers: [num_managers]SessionManager = undefined;
+    defer {
+        for (&managers) |*sm| sm.deinit();
+        for (&stores) |*store| store.deinit();
+    }
+
+    const cfg = testConfig();
+    for (0..num_managers) |idx| {
+        mocks[idx] = .{ .response = "ok" };
+        stores[idx] = try zaki_state_mod.Manager.UserSessionStore.init(testing.allocator, &state_mgr, 2);
+        managers[idx] = SessionManager.init(
+            testing.allocator,
+            &cfg,
+            mocks[idx].provider(),
+            &.{},
+            null,
+            test_noop_observer_impl.observer(),
+            stores[idx].sessionStore(),
+            null,
+        );
+    }
+
+    const iterations = 40;
+    var failed = std.atomic.Value(bool).init(false);
+    var handles: [num_managers]std.Thread = undefined;
+    for (0..num_managers) |idx| {
+        handles[idx] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, struct {
+            fn run(
+                mgr: *SessionManager,
+                manager_index: usize,
+                mixed_count: usize,
+                rounds: usize,
+                failed_flag: *std.atomic.Value(bool),
+            ) void {
+                for (0..rounds) |iter| {
+                    _ = mgr.getOrCreate("agent:zaki-bot:user:2:main") catch {
+                        failed_flag.store(true, .release);
+                        return;
+                    };
+                    const mixed_slot = (manager_index * rounds + iter) % mixed_count;
+                    var key_buf: [96]u8 = undefined;
+                    const mixed_key = std.fmt.bufPrint(&key_buf, "agent:zaki-bot:user:2:thread:load-{d}", .{mixed_slot}) catch {
+                        failed_flag.store(true, .release);
+                        return;
+                    };
+                    _ = mgr.getOrCreate(mixed_key) catch {
+                        failed_flag.store(true, .release);
+                        return;
+                    };
+                }
+            }
+        }.run, .{ &managers[idx], idx, mixed_keys, iterations, &failed });
+    }
+    for (handles) |handle| handle.join();
+
+    try testing.expect(!failed.load(.acquire));
+    for (&managers) |*sm| {
+        try testing.expect(sm.sessionCount() >= 2);
+    }
 }
 
 // ---------------------------------------------------------------------------

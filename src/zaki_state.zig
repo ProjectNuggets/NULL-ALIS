@@ -905,8 +905,9 @@ const ManagerImpl = struct {
 
         const rows: usize = @intCast(c.PQntuples(result));
         const out = try allocator.alloc(memory_root.MessageEntry, rows);
+        var initialized: usize = 0;
         errdefer {
-            for (out[0..rows]) |entry| {
+            for (out[0..initialized]) |entry| {
                 allocator.free(entry.role);
                 allocator.free(entry.content);
             }
@@ -915,10 +916,14 @@ const ManagerImpl = struct {
 
         for (0..rows) |i| {
             const row: c_int = @intCast(i);
+            const role = try dupeResultValue(allocator, result, row, 0);
+            errdefer allocator.free(role);
+            const content = try dupeResultValue(allocator, result, row, 1);
             out[i] = .{
-                .role = try dupeResultValue(allocator, result, row, 0),
-                .content = try dupeResultValue(allocator, result, row, 1),
+                .role = role,
+                .content = content,
             };
+            initialized += 1;
         }
         return out;
     }
