@@ -52,6 +52,16 @@ pub const TelegramBackfillCandidate = struct {
     }
 };
 
+pub const UserOwnershipLeaseSnapshot = struct {
+    owner_id: []u8,
+    lease_until_s: i64,
+    updated_at_s: i64,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.owner_id);
+    }
+};
+
 pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn init(_: std.mem.Allocator, _: config_types.StateConfig) !@This() {
         return error.PostgresNotEnabled;
@@ -183,6 +193,9 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         return error.PostgresNotEnabled;
     }
     pub fn countOwnedUserLeases(_: *@This(), _: i64, _: []const u8) error{PostgresNotEnabled}!usize {
+        return error.PostgresNotEnabled;
+    }
+    pub fn getUserOwnershipLeaseSnapshot(_: *@This(), _: std.mem.Allocator, _: i64) error{PostgresNotEnabled}!?UserOwnershipLeaseSnapshot {
         return error.PostgresNotEnabled;
     }
     pub const ClaimedJob = struct {
@@ -1465,6 +1478,37 @@ const ManagerImpl = struct {
         return try std.fmt.parseInt(usize, text, 10);
     }
 
+    pub fn getUserOwnershipLeaseSnapshot(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+    ) !?UserOwnershipLeaseSnapshot {
+        const q = try self.buildQuery(
+            "SELECT owner_id, EXTRACT(EPOCH FROM lease_until)::bigint, EXTRACT(EPOCH FROM updated_at)::bigint " ++
+                "FROM {schema}.tenant_user_leases WHERE user_id = $1 LIMIT 1",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+
+        const owner_id = try dupeResultValue(allocator, result, 0, 0);
+        errdefer allocator.free(owner_id);
+        const lease_until_text = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(lease_until_text);
+        const updated_at_text = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(updated_at_text);
+        return .{
+            .owner_id = owner_id,
+            .lease_until_s = try std.fmt.parseInt(i64, lease_until_text, 10),
+            .updated_at_s = try std.fmt.parseInt(i64, updated_at_text, 10),
+        };
+    }
+
     pub fn claimDueJobs(self: *Self, allocator: std.mem.Allocator, owner_id: []const u8, now_s: i64, lease_secs: u64, limit: usize) ![]ClaimedJob {
         const q = try self.buildQuery(
             "WITH due AS (" ++
@@ -2374,4 +2418,49 @@ test "postgres channel identity bindings upsert resolve list delete and backfill
         allocator.free(backfill);
     }
     try std.testing.expect(backfill.len >= 1);
+}
+
+test "postgres ownership lease snapshot returns null and active lease values" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    try std.testing.expect((try mgr.getUserOwnershipLeaseSnapshot(allocator, 2)) == null);
+
+    const now_s = std.time.timestamp();
+    const lease_token = try mgr.acquireUserOwnershipLease(allocator, 2, "instance-a", now_s, 120);
+    defer allocator.free(lease_token);
+
+    var snapshot = (try mgr.getUserOwnershipLeaseSnapshot(allocator, 2)).?;
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("instance-a", snapshot.owner_id);
+    try std.testing.expect(snapshot.lease_until_s >= now_s);
+    try std.testing.expect(snapshot.updated_at_s > 0);
+
+    try mgr.releaseUserOwnershipLease(2, "instance-a", lease_token);
+    try std.testing.expect((try mgr.getUserOwnershipLeaseSnapshot(allocator, 2)) == null);
 }

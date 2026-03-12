@@ -48,6 +48,16 @@ pub const RuntimeSnapshot = struct {
     identity_cache_stale: ?u64 = null,
     identity_db_lookup_count: ?u64 = null,
     identity_db_lookup_ms_total: ?u64 = null,
+    tenant_lock_conflicts_chat_stream_sse: ?u64 = null,
+    tenant_lock_conflicts_chat_stream_http: ?u64 = null,
+    tenant_lock_conflicts_webhook: ?u64 = null,
+    tenant_lock_conflicts_daemon: ?u64 = null,
+    tenant_lock_conflicts_api: ?u64 = null,
+    tenant_lease_probe_user_id: ?[]u8 = null,
+    tenant_lease_probe_data_source: ?[]u8 = null,
+    tenant_lease_probe_owner_id: ?[]u8 = null,
+    tenant_lease_probe_lease_until_s: ?i64 = null,
+    tenant_lease_probe_updated_at_s: ?i64 = null,
 
     pub fn deinit(self: *RuntimeSnapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.state_backend_configured);
@@ -60,6 +70,9 @@ pub const RuntimeSnapshot = struct {
         allocator.free(self.provider_data_source);
         if (self.telegram_account_id) |value| allocator.free(value);
         if (self.telegram_data_source) |value| allocator.free(value);
+        if (self.tenant_lease_probe_user_id) |value| allocator.free(value);
+        if (self.tenant_lease_probe_data_source) |value| allocator.free(value);
+        if (self.tenant_lease_probe_owner_id) |value| allocator.free(value);
     }
 };
 
@@ -182,6 +195,19 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
     var identity_cache_stale: ?u64 = null;
     var identity_db_lookup_count: ?u64 = null;
     var identity_db_lookup_ms_total: ?u64 = null;
+    var tenant_lock_conflicts_chat_stream_sse: ?u64 = null;
+    var tenant_lock_conflicts_chat_stream_http: ?u64 = null;
+    var tenant_lock_conflicts_webhook: ?u64 = null;
+    var tenant_lock_conflicts_daemon: ?u64 = null;
+    var tenant_lock_conflicts_api: ?u64 = null;
+    var tenant_lease_probe_user_id: ?[]u8 = null;
+    errdefer if (tenant_lease_probe_user_id) |value| allocator.free(value);
+    var tenant_lease_probe_data_source: ?[]u8 = null;
+    errdefer if (tenant_lease_probe_data_source) |value| allocator.free(value);
+    var tenant_lease_probe_owner_id: ?[]u8 = null;
+    errdefer if (tenant_lease_probe_owner_id) |value| allocator.free(value);
+    var tenant_lease_probe_lease_until_s: ?i64 = null;
+    var tenant_lease_probe_updated_at_s: ?i64 = null;
 
     if (parsed.value.object.get("integrations")) |integrations_value| {
         if (integrations_value == .object) {
@@ -222,6 +248,34 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
         }
     }
 
+    if (parsed.value.object.get("tenant_lock_conflicts_by_route")) |route_value| {
+        if (route_value == .object) {
+            tenant_lock_conflicts_chat_stream_sse = readObjectU64(route_value.object, "chat_stream_sse");
+            tenant_lock_conflicts_chat_stream_http = readObjectU64(route_value.object, "chat_stream_http");
+            tenant_lock_conflicts_webhook = readObjectU64(route_value.object, "webhook");
+            tenant_lock_conflicts_daemon = readObjectU64(route_value.object, "daemon");
+            tenant_lock_conflicts_api = readObjectU64(route_value.object, "api");
+        }
+    }
+
+    if (parsed.value.object.get("tenant_lease_probe")) |lease_probe_value| {
+        if (lease_probe_value == .object) {
+            if (readObjectString(lease_probe_value.object, "user_id")) |value| {
+                tenant_lease_probe_user_id = try allocator.dupe(u8, value);
+            }
+            if (readObjectString(lease_probe_value.object, "data_source")) |value| {
+                tenant_lease_probe_data_source = try allocator.dupe(u8, value);
+            }
+            if (readObjectString(lease_probe_value.object, "owner_id")) |value| {
+                if (!std.mem.eql(u8, value, "null")) {
+                    tenant_lease_probe_owner_id = try allocator.dupe(u8, value);
+                }
+            }
+            tenant_lease_probe_lease_until_s = readObjectI64(lease_probe_value.object, "lease_until_s");
+            tenant_lease_probe_updated_at_s = readObjectI64(lease_probe_value.object, "updated_at_s");
+        }
+    }
+
     return .{
         .source = .gateway_internal,
         .state_backend_configured = try allocator.dupe(u8, configured),
@@ -252,6 +306,16 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
         .identity_cache_stale = identity_cache_stale,
         .identity_db_lookup_count = identity_db_lookup_count,
         .identity_db_lookup_ms_total = identity_db_lookup_ms_total,
+        .tenant_lock_conflicts_chat_stream_sse = tenant_lock_conflicts_chat_stream_sse,
+        .tenant_lock_conflicts_chat_stream_http = tenant_lock_conflicts_chat_stream_http,
+        .tenant_lock_conflicts_webhook = tenant_lock_conflicts_webhook,
+        .tenant_lock_conflicts_daemon = tenant_lock_conflicts_daemon,
+        .tenant_lock_conflicts_api = tenant_lock_conflicts_api,
+        .tenant_lease_probe_user_id = tenant_lease_probe_user_id,
+        .tenant_lease_probe_data_source = tenant_lease_probe_data_source,
+        .tenant_lease_probe_owner_id = tenant_lease_probe_owner_id,
+        .tenant_lease_probe_lease_until_s = tenant_lease_probe_lease_until_s,
+        .tenant_lease_probe_updated_at_s = tenant_lease_probe_updated_at_s,
     };
 }
 
@@ -400,6 +464,20 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
         \\    "cache_stale": 1,
         \\    "db_lookup_count": 5,
         \\    "db_lookup_ms_total": 41
+        \\  },
+        \\  "tenant_lock_conflicts_by_route": {
+        \\    "chat_stream_sse": 4,
+        \\    "chat_stream_http": 3,
+        \\    "webhook": 2,
+        \\    "daemon": 1,
+        \\    "api": 5
+        \\  },
+        \\  "tenant_lease_probe": {
+        \\    "user_id": "7",
+        \\    "data_source": "postgres_lease",
+        \\    "owner_id": "node-a",
+        \\    "lease_until_s": 1800000000,
+        \\    "updated_at_s": 1799999990
         \\  }
         \\}
     ;
@@ -428,6 +506,16 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
     try std.testing.expectEqual(@as(?u64, 1), snapshot.identity_cache_stale);
     try std.testing.expectEqual(@as(?u64, 5), snapshot.identity_db_lookup_count);
     try std.testing.expectEqual(@as(?u64, 41), snapshot.identity_db_lookup_ms_total);
+    try std.testing.expectEqual(@as(?u64, 4), snapshot.tenant_lock_conflicts_chat_stream_sse);
+    try std.testing.expectEqual(@as(?u64, 3), snapshot.tenant_lock_conflicts_chat_stream_http);
+    try std.testing.expectEqual(@as(?u64, 2), snapshot.tenant_lock_conflicts_webhook);
+    try std.testing.expectEqual(@as(?u64, 1), snapshot.tenant_lock_conflicts_daemon);
+    try std.testing.expectEqual(@as(?u64, 5), snapshot.tenant_lock_conflicts_api);
+    try std.testing.expectEqualStrings("7", snapshot.tenant_lease_probe_user_id.?);
+    try std.testing.expectEqualStrings("postgres_lease", snapshot.tenant_lease_probe_data_source.?);
+    try std.testing.expectEqualStrings("node-a", snapshot.tenant_lease_probe_owner_id.?);
+    try std.testing.expectEqual(@as(?i64, 1800000000), snapshot.tenant_lease_probe_lease_until_s);
+    try std.testing.expectEqual(@as(?i64, 1799999990), snapshot.tenant_lease_probe_updated_at_s);
 }
 
 test "collectLocalFallbackSnapshot marks unknown effective backend when runtime probe is unavailable" {

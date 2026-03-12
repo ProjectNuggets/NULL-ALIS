@@ -122,6 +122,36 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
             optionalU64Text(&miss_buf, snapshot.identity_cache_miss),
         });
     }
+    if (snapshot.tenant_lock_conflicts_chat_stream_sse != null or
+        snapshot.tenant_lock_conflicts_chat_stream_http != null or
+        snapshot.tenant_lock_conflicts_webhook != null or
+        snapshot.tenant_lock_conflicts_daemon != null or
+        snapshot.tenant_lock_conflicts_api != null)
+    {
+        var sse_buf: [24]u8 = undefined;
+        var http_buf: [24]u8 = undefined;
+        var webhook_buf: [24]u8 = undefined;
+        var daemon_buf: [24]u8 = undefined;
+        var api_buf: [24]u8 = undefined;
+        try w.print("Runtime Lock: sse={s} http={s} webhook={s} daemon={s} api={s}\n", .{
+            optionalU64Text(&sse_buf, snapshot.tenant_lock_conflicts_chat_stream_sse),
+            optionalU64Text(&http_buf, snapshot.tenant_lock_conflicts_chat_stream_http),
+            optionalU64Text(&webhook_buf, snapshot.tenant_lock_conflicts_webhook),
+            optionalU64Text(&daemon_buf, snapshot.tenant_lock_conflicts_daemon),
+            optionalU64Text(&api_buf, snapshot.tenant_lock_conflicts_api),
+        });
+    }
+    if (snapshot.tenant_lease_probe_data_source != null) {
+        var lease_until_buf: [24]u8 = undefined;
+        var updated_buf: [24]u8 = undefined;
+        try w.print("Runtime Lease: user={s} source={s} owner={s} lease_until_s={s} updated_at_s={s}\n", .{
+            snapshot.tenant_lease_probe_user_id orelse "unknown",
+            snapshot.tenant_lease_probe_data_source.?,
+            snapshot.tenant_lease_probe_owner_id orelse "none",
+            optionalI64Text(&lease_until_buf, snapshot.tenant_lease_probe_lease_until_s),
+            optionalI64Text(&updated_buf, snapshot.tenant_lease_probe_updated_at_s),
+        });
+    }
 
     // Cost tracking
     try w.print("Cost:        {s}\n", .{
@@ -168,6 +198,13 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
 }
 
 fn optionalU64Text(buf: []u8, value: ?u64) []const u8 {
+    if (value) |resolved| {
+        return std.fmt.bufPrint(buf, "{d}", .{resolved}) catch "0";
+    }
+    return "unknown";
+}
+
+fn optionalI64Text(buf: []u8, value: ?i64) []const u8 {
     if (value) |resolved| {
         return std.fmt.bufPrint(buf, "{d}", .{resolved}) catch "0";
     }

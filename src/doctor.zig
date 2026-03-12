@@ -715,6 +715,36 @@ fn checkRuntimeSnapshot(
             .{ mapped, unmapped, strict_rejected, degraded_compat, cache_hit, cache_miss },
         )));
     }
+    if (snapshot.tenant_lock_conflicts_chat_stream_sse != null or
+        snapshot.tenant_lock_conflicts_chat_stream_http != null or
+        snapshot.tenant_lock_conflicts_webhook != null or
+        snapshot.tenant_lock_conflicts_daemon != null or
+        snapshot.tenant_lock_conflicts_api != null)
+    {
+        const conflicts_sse = snapshot.tenant_lock_conflicts_chat_stream_sse orelse 0;
+        const conflicts_http = snapshot.tenant_lock_conflicts_chat_stream_http orelse 0;
+        const conflicts_webhook = snapshot.tenant_lock_conflicts_webhook orelse 0;
+        const conflicts_daemon = snapshot.tenant_lock_conflicts_daemon orelse 0;
+        const conflicts_api = snapshot.tenant_lock_conflicts_api orelse 0;
+        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+            allocator,
+            "tenant lock conflicts by route: sse={d} http={d} webhook={d} daemon={d} api={d}",
+            .{ conflicts_sse, conflicts_http, conflicts_webhook, conflicts_daemon, conflicts_api },
+        )));
+    }
+    if (snapshot.tenant_lease_probe_data_source) |lease_source| {
+        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+            allocator,
+            "tenant lease probe: user={s} source={s} owner={s} lease_until_s={d} updated_at_s={d}",
+            .{
+                snapshot.tenant_lease_probe_user_id orelse "unknown",
+                lease_source,
+                snapshot.tenant_lease_probe_owner_id orelse "none",
+                snapshot.tenant_lease_probe_lease_until_s orelse -1,
+                snapshot.tenant_lease_probe_updated_at_s orelse -1,
+            },
+        )));
+    }
 
     if (snapshot.context_incomplete) {
         try items.append(allocator, DiagItem.warn(cat, "runtime context incomplete; values may be fallback-only"));

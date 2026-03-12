@@ -96,6 +96,8 @@ pub const RuntimeInfoTool = struct {
         const entity_resolution = resolveComposioEntity(self.config, tenant_ctx, user_id_override);
         var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx, user_id_override);
         defer telegram_state.deinit(allocator);
+        var ownership_lease = try readOwnershipLeaseState(allocator, tenant_ctx, user_id_override);
+        defer ownership_lease.deinit(allocator);
 
         var configured_channels: std.ArrayListUnmanaged([]const u8) = .empty;
         defer configured_channels.deinit(allocator);
@@ -187,6 +189,8 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, ",");
         try appendIdentityMapping(&buf, allocator, self.config);
         try buf.appendSlice(allocator, ",");
+        try appendOwnershipLease(&buf, allocator, ownership_lease);
+        try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "composio");
         try buf.appendSlice(allocator, "{");
         try json_util.appendJsonKey(&buf, allocator, "enabled");
@@ -252,6 +256,8 @@ pub const RuntimeInfoTool = struct {
         const entity_resolution = resolveComposioEntity(self.config, tenant_ctx, user_id_override);
         var telegram_state = try readTelegramState(allocator, self.config, tenant_ctx, user_id_override);
         defer telegram_state.deinit(allocator);
+        var ownership_lease = try readOwnershipLeaseState(allocator, tenant_ctx, user_id_override);
+        defer ownership_lease.deinit(allocator);
         const telegram_configured = isTelegramConfigured(self.config, telegram_state.state);
         const composio_readiness = self.resolveComposioReadiness(allocator, entity_resolution.entity_id);
 
@@ -272,6 +278,8 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, if (context_incomplete) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try appendIdentityMapping(&buf, allocator, self.config);
+        try buf.appendSlice(allocator, ",");
+        try appendOwnershipLease(&buf, allocator, ownership_lease);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "telegram");
         try buf.appendSlice(allocator, "{");
@@ -466,6 +474,18 @@ const TelegramStateSnapshot = struct {
     }
 };
 
+const OwnershipLeaseSnapshot = struct {
+    data_source: []const u8 = "unavailable",
+    context_incomplete: bool = false,
+    owner_id: ?[]u8 = null,
+    lease_until_s: ?i64 = null,
+    updated_at_s: ?i64 = null,
+
+    fn deinit(self: *OwnershipLeaseSnapshot, allocator: std.mem.Allocator) void {
+        if (self.owner_id) |owner_id| allocator.free(owner_id);
+    }
+};
+
 fn runtimeDataSourceLabel(tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) []const u8 {
     const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
     if (tenant_ctx.state_mgr != null and scoped_numeric_user_id != null) return "postgres";
@@ -503,6 +523,34 @@ fn resolveScopedNumericUserId(tenant_ctx: root.ToolTenantContext, user_id_overri
         return std.fmt.parseInt(i64, trimmed, 10) catch null;
     }
     return tenant_ctx.numeric_user_id;
+}
+
+fn readOwnershipLeaseState(
+    allocator: std.mem.Allocator,
+    tenant_ctx: root.ToolTenantContext,
+    user_id_override: ?[]const u8,
+) !OwnershipLeaseSnapshot {
+    const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
+    if (tenant_ctx.state_mgr) |state_mgr| {
+        if (scoped_numeric_user_id) |numeric_user_id| {
+            var snapshot = OwnershipLeaseSnapshot{ .data_source = "postgres_lease" };
+            if (try state_mgr.getUserOwnershipLeaseSnapshot(allocator, numeric_user_id)) |lease_snapshot| {
+                snapshot.owner_id = lease_snapshot.owner_id;
+                snapshot.lease_until_s = lease_snapshot.lease_until_s;
+                snapshot.updated_at_s = lease_snapshot.updated_at_s;
+            }
+            return snapshot;
+        }
+    }
+    if (tenant_ctx.expect_postgres_state) {
+        return .{
+            .data_source = "context_missing",
+            .context_incomplete = true,
+        };
+    }
+    return .{
+        .data_source = "unavailable",
+    };
 }
 
 fn resolveComposioEntity(config: *const config_mod.Config, tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) ComposioEntityResolution {
@@ -790,6 +838,31 @@ fn appendIdentityMapping(
     try buf.appendSlice(allocator, "}");
 }
 
+fn appendOwnershipLease(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    snapshot: OwnershipLeaseSnapshot,
+) !void {
+    try json_util.appendJsonKey(buf, allocator, "ownership_lease");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(buf, allocator, "data_source", snapshot.data_source);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "context_incomplete");
+    try buf.appendSlice(allocator, if (snapshot.context_incomplete) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "owner_id");
+    if (snapshot.owner_id) |owner_id| {
+        try json_util.appendJsonString(buf, allocator, owner_id);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try appendOptionalInt(buf, allocator, "lease_until_s", snapshot.lease_until_s);
+    try buf.appendSlice(allocator, ",");
+    try appendOptionalInt(buf, allocator, "updated_at_s", snapshot.updated_at_s);
+    try buf.appendSlice(allocator, "}");
+}
+
 fn appendOptionalInt(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, key: []const u8, value: ?i64) !void {
     try json_util.appendJsonKey(buf, allocator, key);
     if (value) |resolved| {
@@ -953,6 +1026,7 @@ test "runtime info summary includes state backend keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"provider_data_source\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"deferred_controls\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"identity_mapping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"ownership_lease\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"parallel_tools_rollout_percent\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"entity_scope_source\":\"config_default\"") != null);
 }
@@ -1047,6 +1121,7 @@ test "runtime info integrations composio entity scope uses override and tenant c
     try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"entity_id\":\"7\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"entity_scope_source\":\"user_id_override\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"identity_mapping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"ownership_lease\"") != null);
 }
 
 test "runtime info summary surfaces active dispatcher state" {

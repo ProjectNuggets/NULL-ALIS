@@ -416,6 +416,11 @@ pub const GatewayState = struct {
     telegram_webhook_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     telegram_webhook_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     tenant_lock_conflicts_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    tenant_lock_conflicts_chat_stream_sse_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    tenant_lock_conflicts_chat_stream_http_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    tenant_lock_conflicts_webhook_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    tenant_lock_conflicts_daemon_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    tenant_lock_conflicts_api_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     in_flight_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     drain_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     overload_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -2995,6 +3000,25 @@ const RouteResponse = struct {
     content_type: []const u8 = "application/json",
 };
 
+const TenantLockConflictRoute = enum {
+    chat_stream_sse,
+    chat_stream_http,
+    webhook,
+    daemon,
+    api,
+};
+
+fn recordTenantLockConflict(state: *GatewayState, route: TenantLockConflictRoute) void {
+    _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
+    switch (route) {
+        .chat_stream_sse => _ = state.tenant_lock_conflicts_chat_stream_sse_total.fetchAdd(1, .monotonic),
+        .chat_stream_http => _ = state.tenant_lock_conflicts_chat_stream_http_total.fetchAdd(1, .monotonic),
+        .webhook => _ = state.tenant_lock_conflicts_webhook_total.fetchAdd(1, .monotonic),
+        .daemon => _ = state.tenant_lock_conflicts_daemon_total.fetchAdd(1, .monotonic),
+        .api => _ = state.tenant_lock_conflicts_api_total.fetchAdd(1, .monotonic),
+    }
+}
+
 fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
     const transport_stats = http_util.transport_stats_snapshot();
     const requests_total = state.requests_total.load(.monotonic);
@@ -3003,6 +3027,11 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
     const telegram_webhook_total = state.telegram_webhook_total.load(.monotonic);
     const telegram_webhook_rejected_total = state.telegram_webhook_rejected_total.load(.monotonic);
     const tenant_lock_conflicts_total = state.tenant_lock_conflicts_total.load(.monotonic);
+    const tenant_lock_conflicts_chat_stream_sse_total = state.tenant_lock_conflicts_chat_stream_sse_total.load(.monotonic);
+    const tenant_lock_conflicts_chat_stream_http_total = state.tenant_lock_conflicts_chat_stream_http_total.load(.monotonic);
+    const tenant_lock_conflicts_webhook_total = state.tenant_lock_conflicts_webhook_total.load(.monotonic);
+    const tenant_lock_conflicts_daemon_total = state.tenant_lock_conflicts_daemon_total.load(.monotonic);
+    const tenant_lock_conflicts_api_total = state.tenant_lock_conflicts_api_total.load(.monotonic);
     const in_flight_requests = state.in_flight_requests.load(.monotonic);
     const drain_rejected_total = state.drain_rejected_total.load(.monotonic);
     const overload_rejected_total = state.overload_rejected_total.load(.monotonic);
@@ -3028,6 +3057,13 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\# HELP nullalis_gateway_tenant_lock_conflicts_total Total tenant ownership-lock conflicts.
         \\# TYPE nullalis_gateway_tenant_lock_conflicts_total counter
         \\nullalis_gateway_tenant_lock_conflicts_total {d}
+        \\# HELP nullalis_gateway_tenant_lock_conflicts_by_route_total Tenant ownership-lock conflicts by route.
+        \\# TYPE nullalis_gateway_tenant_lock_conflicts_by_route_total counter
+        \\nullalis_gateway_tenant_lock_conflicts_by_route_total{{route="chat_stream_sse"}} {d}
+        \\nullalis_gateway_tenant_lock_conflicts_by_route_total{{route="chat_stream_http"}} {d}
+        \\nullalis_gateway_tenant_lock_conflicts_by_route_total{{route="webhook"}} {d}
+        \\nullalis_gateway_tenant_lock_conflicts_by_route_total{{route="daemon"}} {d}
+        \\nullalis_gateway_tenant_lock_conflicts_by_route_total{{route="api"}} {d}
         \\# HELP nullalis_gateway_in_flight_requests Current in-flight requests.
         \\# TYPE nullalis_gateway_in_flight_requests gauge
         \\nullalis_gateway_in_flight_requests {d}
@@ -3079,6 +3115,11 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             telegram_webhook_total,
             telegram_webhook_rejected_total,
             tenant_lock_conflicts_total,
+            tenant_lock_conflicts_chat_stream_sse_total,
+            tenant_lock_conflicts_chat_stream_http_total,
+            tenant_lock_conflicts_webhook_total,
+            tenant_lock_conflicts_daemon_total,
+            tenant_lock_conflicts_api_total,
             in_flight_requests,
             drain_rejected_total,
             overload_rejected_total,
@@ -3407,6 +3448,34 @@ fn internalDiagnosticsPayload(
             state.owner_instance_id,
         ) catch 0;
     };
+    const tenant_lock_conflicts_chat_stream_sse_total = state.tenant_lock_conflicts_chat_stream_sse_total.load(.monotonic);
+    const tenant_lock_conflicts_chat_stream_http_total = state.tenant_lock_conflicts_chat_stream_http_total.load(.monotonic);
+    const tenant_lock_conflicts_webhook_total = state.tenant_lock_conflicts_webhook_total.load(.monotonic);
+    const tenant_lock_conflicts_daemon_total = state.tenant_lock_conflicts_daemon_total.load(.monotonic);
+    const tenant_lock_conflicts_api_total = state.tenant_lock_conflicts_api_total.load(.monotonic);
+
+    var lease_probe_snapshot: ?zaki_state_mod.UserOwnershipLeaseSnapshot = null;
+    defer if (lease_probe_snapshot) |*value| value.deinit(allocator);
+    var lease_probe_data_source: ?[]const u8 = null;
+    if (user_id_opt) |user_id_raw| {
+        if (!tenantOwnershipUsesPostgresLease(state) or state.zaki_state == null) {
+            lease_probe_data_source = "unavailable";
+        } else {
+            const numeric_user_id_opt = parseNumericUserId(user_id_raw) catch null;
+            if (numeric_user_id_opt) |numeric_user_id| {
+                lease_probe_data_source = "postgres_lease";
+                lease_probe_snapshot = probe: {
+                    const snapshot = state.zaki_state.?.getUserOwnershipLeaseSnapshot(allocator, numeric_user_id) catch {
+                        lease_probe_data_source = "probe_error";
+                        break :probe null;
+                    };
+                    break :probe snapshot;
+                };
+            } else {
+                lease_probe_data_source = "invalid_user_id";
+            }
+        }
+    }
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
@@ -3445,6 +3514,55 @@ fn internalDiagnosticsPayload(
     const tenant_lock_lease_secs_i64: i64 = @intCast(@min(state.ownership_lock_lease_secs, @as(u64, std.math.maxInt(i64))));
     try json_util.appendJsonInt(&buf, allocator, "tenant_lock_lease_secs", tenant_lock_lease_secs_i64);
     try buf.appendSlice(allocator, ",");
+
+    try json_util.appendJsonKey(&buf, allocator, "tenant_lock_conflicts_by_route");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "chat_stream_sse", @intCast(tenant_lock_conflicts_chat_stream_sse_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "chat_stream_http", @intCast(tenant_lock_conflicts_chat_stream_http_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "webhook", @intCast(tenant_lock_conflicts_webhook_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "daemon", @intCast(tenant_lock_conflicts_daemon_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "api", @intCast(tenant_lock_conflicts_api_total));
+    try buf.appendSlice(allocator, "},");
+
+    try json_util.appendJsonKey(&buf, allocator, "tenant_lease_probe");
+    if (user_id_opt) |user_id_raw| {
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKeyValue(&buf, allocator, "user_id", user_id_raw);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "data_source", lease_probe_data_source orelse "unknown");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "owner_id");
+        if (lease_probe_snapshot) |snapshot| {
+            try json_util.appendJsonString(&buf, allocator, snapshot.owner_id);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "lease_until_s");
+        if (lease_probe_snapshot) |snapshot| {
+            var lease_buf: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&lease_buf, "{d}", .{snapshot.lease_until_s}) catch "0";
+            try buf.appendSlice(allocator, text);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "updated_at_s");
+        if (lease_probe_snapshot) |snapshot| {
+            var updated_buf: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&updated_buf, "{d}", .{snapshot.updated_at_s}) catch "0";
+            try buf.appendSlice(allocator, text);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, "},");
+    } else {
+        try buf.appendSlice(allocator, "null,");
+    }
 
     try json_util.appendJsonKey(&buf, allocator, "bus");
     try buf.appendSlice(allocator, "{");
@@ -4013,7 +4131,7 @@ fn handleApiChatStreamSseConnection(
 
     var ownership_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
         error.LockHeld => {
-            _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
+            recordTenantLockConflict(state, .chat_stream_sse);
             sendSseErrorResponse(stream, req_allocator, "409 Conflict", "ownership_lock_conflict", "user is active on another node, retry shortly");
             return true;
         },
@@ -4294,7 +4412,7 @@ fn handleApiRoute(
         };
         var ownership_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
-                _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
+                recordTenantLockConflict(state, .chat_stream_http);
                 const body_locked = sseErrorEvent(req_allocator, "ownership_lock_conflict", "user is active on another node, retry shortly") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"ownership lock conflict\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                 return .{
                     .status = "409 Conflict",
@@ -4448,7 +4566,7 @@ fn handleApiRoute(
         };
         var provision_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
-                _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
+                recordTenantLockConflict(state, .api);
                 return .{ .status = "409 Conflict", .body = "{\"error\":\"user currently owned by another node\"}" };
             },
             else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"tenant ownership lock failed\"}" },
@@ -4481,7 +4599,7 @@ fn handleApiRoute(
     if (needs_write_lock) {
         user_write_lock_opt = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
             error.LockHeld => {
-                _ = state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
+                recordTenantLockConflict(state, .api);
                 return .{ .status = "409 Conflict", .body = "{\"error\":\"user currently owned by another node\"}" };
             },
             else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"tenant ownership lock failed\"}" },
@@ -5200,7 +5318,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             var user_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(ctx.req_allocator, ctx.state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
                 error.LockHeld => {
                     _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                    _ = ctx.state.tenant_lock_conflicts_total.fetchAdd(1, .monotonic);
+                    recordTenantLockConflict(ctx.state, .webhook);
                     ctx.response_status = "409 Conflict";
                     ctx.response_body = "{\"error\":\"user currently owned by another node\"}";
                     return;
@@ -8813,6 +8931,8 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     gs.ownership_lock_enabled = true;
     gs.ownership_lock_lease_secs = 300;
     gs.owner_instance_id = "diag-owner";
+    recordTenantLockConflict(&gs, .chat_stream_sse);
+    recordTenantLockConflict(&gs, .webhook);
 
     const payload = try internalDiagnosticsPayload(allocator, &gs, null);
     defer allocator.free(payload);
@@ -8826,6 +8946,29 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"inbound_len\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"outbound_len\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"capacity\":1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_conflicts_by_route\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"chat_stream_sse\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"webhook\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lease_probe\":null") != null);
+}
+
+test "recordTenantLockConflict increments route counters and total" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    recordTenantLockConflict(&gs, .chat_stream_sse);
+    recordTenantLockConflict(&gs, .chat_stream_http);
+    recordTenantLockConflict(&gs, .webhook);
+    recordTenantLockConflict(&gs, .daemon);
+    recordTenantLockConflict(&gs, .api);
+
+    try std.testing.expectEqual(@as(u64, 5), gs.tenant_lock_conflicts_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.tenant_lock_conflicts_chat_stream_sse_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.tenant_lock_conflicts_chat_stream_http_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.tenant_lock_conflicts_webhook_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.tenant_lock_conflicts_daemon_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.tenant_lock_conflicts_api_total.load(.monotonic));
 }
 
 // ── jsonEscapeInto tests ────────────────────────────────────────
