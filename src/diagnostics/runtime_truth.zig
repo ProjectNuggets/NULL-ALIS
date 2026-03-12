@@ -39,6 +39,15 @@ pub const RuntimeSnapshot = struct {
     telegram_chat_id: ?i64 = null,
     telegram_data_source: ?[]u8 = null,
     context_incomplete: bool = false,
+    identity_mapped: ?u64 = null,
+    identity_unmapped: ?u64 = null,
+    identity_strict_rejected: ?u64 = null,
+    identity_degraded_compat: ?u64 = null,
+    identity_cache_hit: ?u64 = null,
+    identity_cache_miss: ?u64 = null,
+    identity_cache_stale: ?u64 = null,
+    identity_db_lookup_count: ?u64 = null,
+    identity_db_lookup_ms_total: ?u64 = null,
 
     pub fn deinit(self: *RuntimeSnapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.state_backend_configured);
@@ -164,6 +173,15 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
     var telegram_chat_id: ?i64 = null;
     var telegram_data_source: ?[]u8 = null;
     errdefer if (telegram_data_source) |value| allocator.free(value);
+    var identity_mapped: ?u64 = null;
+    var identity_unmapped: ?u64 = null;
+    var identity_strict_rejected: ?u64 = null;
+    var identity_degraded_compat: ?u64 = null;
+    var identity_cache_hit: ?u64 = null;
+    var identity_cache_miss: ?u64 = null;
+    var identity_cache_stale: ?u64 = null;
+    var identity_db_lookup_count: ?u64 = null;
+    var identity_db_lookup_ms_total: ?u64 = null;
 
     if (parsed.value.object.get("integrations")) |integrations_value| {
         if (integrations_value == .object) {
@@ -190,6 +208,20 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
         }
     }
 
+    if (parsed.value.object.get("identity_mapping")) |identity_value| {
+        if (identity_value == .object) {
+            identity_mapped = readObjectU64(identity_value.object, "mapped");
+            identity_unmapped = readObjectU64(identity_value.object, "unmapped");
+            identity_strict_rejected = readObjectU64(identity_value.object, "strict_rejected");
+            identity_degraded_compat = readObjectU64(identity_value.object, "degraded_compat");
+            identity_cache_hit = readObjectU64(identity_value.object, "cache_hit");
+            identity_cache_miss = readObjectU64(identity_value.object, "cache_miss");
+            identity_cache_stale = readObjectU64(identity_value.object, "cache_stale");
+            identity_db_lookup_count = readObjectU64(identity_value.object, "db_lookup_count");
+            identity_db_lookup_ms_total = readObjectU64(identity_value.object, "db_lookup_ms_total");
+        }
+    }
+
     return .{
         .source = .gateway_internal,
         .state_backend_configured = try allocator.dupe(u8, configured),
@@ -211,6 +243,15 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
         .telegram_account_id = telegram_account_id,
         .telegram_chat_id = telegram_chat_id,
         .telegram_data_source = telegram_data_source,
+        .identity_mapped = identity_mapped,
+        .identity_unmapped = identity_unmapped,
+        .identity_strict_rejected = identity_strict_rejected,
+        .identity_degraded_compat = identity_degraded_compat,
+        .identity_cache_hit = identity_cache_hit,
+        .identity_cache_miss = identity_cache_miss,
+        .identity_cache_stale = identity_cache_stale,
+        .identity_db_lookup_count = identity_db_lookup_count,
+        .identity_db_lookup_ms_total = identity_db_lookup_ms_total,
     };
 }
 
@@ -309,6 +350,15 @@ fn readObjectU32(obj: std.json.ObjectMap, key: []const u8) ?u32 {
     };
 }
 
+fn readObjectU64(obj: std.json.ObjectMap, key: []const u8) ?u64 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .integer => std.math.cast(u64, v.integer),
+        .string => std.fmt.parseInt(u64, v.string, 10) catch null,
+        else => null,
+    };
+}
+
 fn readObjectI64(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     const v = obj.get(key) orelse return null;
     return switch (v) {
@@ -339,6 +389,17 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
         \\      "chat_id": 1110331014,
         \\      "data_source": "postgres"
         \\    }
+        \\  },
+        \\  "identity_mapping": {
+        \\    "mapped": 11,
+        \\    "unmapped": 2,
+        \\    "strict_rejected": 1,
+        \\    "degraded_compat": 3,
+        \\    "cache_hit": 8,
+        \\    "cache_miss": 5,
+        \\    "cache_stale": 1,
+        \\    "db_lookup_count": 5,
+        \\    "db_lookup_ms_total": 41
         \\  }
         \\}
     ;
@@ -358,6 +419,15 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
     try std.testing.expectEqualStrings("none", snapshot.chat_fallback_chain);
     try std.testing.expectEqualStrings("none", snapshot.embedding_provider_effective);
     try std.testing.expectEqualStrings("gateway_internal", snapshot.provider_data_source);
+    try std.testing.expectEqual(@as(?u64, 11), snapshot.identity_mapped);
+    try std.testing.expectEqual(@as(?u64, 2), snapshot.identity_unmapped);
+    try std.testing.expectEqual(@as(?u64, 1), snapshot.identity_strict_rejected);
+    try std.testing.expectEqual(@as(?u64, 3), snapshot.identity_degraded_compat);
+    try std.testing.expectEqual(@as(?u64, 8), snapshot.identity_cache_hit);
+    try std.testing.expectEqual(@as(?u64, 5), snapshot.identity_cache_miss);
+    try std.testing.expectEqual(@as(?u64, 1), snapshot.identity_cache_stale);
+    try std.testing.expectEqual(@as(?u64, 5), snapshot.identity_db_lookup_count);
+    try std.testing.expectEqual(@as(?u64, 41), snapshot.identity_db_lookup_ms_total);
 }
 
 test "collectLocalFallbackSnapshot marks unknown effective backend when runtime probe is unavailable" {

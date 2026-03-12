@@ -728,6 +728,100 @@ paths:
         "502":
           description: Telegram API rejected connect operation
 
+  /api/v1/users/{user_id}/channels/{channel}/bindings:
+    get:
+      tags: [user]
+      summary: List channel identity bindings for user/channel
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - $ref: "#/components/parameters/ChannelPath"
+      responses:
+        "200":
+          description: Binding list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [channel, items]
+                properties:
+                  channel:
+                    type: string
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        account_id: { type: string }
+                        principal_key: { type: string }
+                        scope_key: { type: string }
+                        thread_key:
+                          type: string
+                          nullable: true
+    post:
+      tags: [user]
+      summary: Upsert channel identity binding for user/channel
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - $ref: "#/components/parameters/ChannelPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_id, principal_key, scope_key]
+              properties:
+                account_id: { type: string }
+                principal_key: { type: string }
+                scope_key: { type: string }
+                thread_key:
+                  type: string
+                  nullable: true
+                peer_kind:
+                  type: string
+                  nullable: true
+                peer_id:
+                  type: string
+                  nullable: true
+                metadata_json:
+                  type: string
+      responses:
+        "200":
+          description: Upserted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, id]
+                properties:
+                  status: { type: string }
+                  id: { type: string }
+
+  /api/v1/users/{user_id}/channels/{channel}/bindings/{binding_id}:
+    delete:
+      tags: [user]
+      summary: Delete channel identity binding
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - $ref: "#/components/parameters/ChannelPath"
+        - $ref: "#/components/parameters/BindingIdPath"
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "404":
+          description: Binding not found
+
   /api/v1/users/{user_id}/channels/telegram/disconnect:
     delete:
       tags: [user]
@@ -767,6 +861,20 @@ components:
       schema:
         type: string
       description: Tenant user identifier.
+    ChannelPath:
+      in: path
+      name: channel
+      required: true
+      schema:
+        type: string
+      description: Channel identifier (for example `telegram`, `slack`, `line`).
+    BindingIdPath:
+      in: path
+      name: binding_id
+      required: true
+      schema:
+        type: string
+      description: Channel identity binding record id.
 
   securitySchemes:
     InternalToken:

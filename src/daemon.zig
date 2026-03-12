@@ -30,6 +30,8 @@ const json_util = @import("json_util.zig");
 const tools_mod = @import("tools/root.zig");
 const runtime_resolver = @import("delivery/runtime_resolver.zig");
 const morning_brief = @import("morning_brief.zig");
+const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
+const channel_identity_key = @import("channel_identity_key.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 
 const log = std.log.scoped(.daemon);
@@ -1694,6 +1696,80 @@ fn resolveInboundRouteSessionKey(
     return resolveInboundRouteSessionKeyWithMetadata(allocator, config, msg, parsed_meta.fields);
 }
 
+const InboundCanonicalResult = struct {
+    session_key: ?[]u8 = null,
+    strict_reject_reason: ?[]const u8 = null,
+
+    fn deinit(self: *InboundCanonicalResult, allocator: std.mem.Allocator) void {
+        if (self.session_key) |value| allocator.free(value);
+    }
+};
+
+fn resolveInboundAccountId(config: *const Config, msg: *const bus_mod.InboundMessage, meta: channel_adapters.InboundMetadata) []const u8 {
+    if (meta.account_id) |account_id| return account_id;
+    if (channel_adapters.findInboundRouteDescriptor(config, msg.channel)) |desc| {
+        if (desc.default_account_id(config, msg.channel)) |account_id| return account_id;
+    }
+    return "default";
+}
+
+fn resolveInboundCanonicalSessionKey(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    state_mgr_opt: ?*zaki_state.Manager,
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+    fallback_session_key: []const u8,
+) !InboundCanonicalResult {
+    var result = InboundCanonicalResult{};
+    const account_id = resolveInboundAccountId(config, msg, meta);
+    var identity_keys_opt: ?channel_identity_key.IdentityKeys = null;
+    if (channel_identity_key.build(
+        allocator,
+        msg.channel,
+        msg.sender_id,
+        msg.chat_id,
+        meta.thread_id,
+    )) |identity_keys| {
+        identity_keys_opt = identity_keys;
+    } else |_| {}
+    defer if (identity_keys_opt) |*identity_keys| identity_keys.deinit(allocator);
+
+    var decision = inbound_canonicalizer.canonicalizeInboundTurn(
+        allocator,
+        state_mgr_opt,
+        config,
+        .{
+            .channel = msg.channel,
+            .account_id = account_id,
+            .principal_key = if (identity_keys_opt) |identity_keys| identity_keys.principal_key else "",
+            .scope_key = if (identity_keys_opt) |identity_keys| identity_keys.scope_key else "",
+            .thread_key = if (identity_keys_opt) |identity_keys| identity_keys.thread_key else null,
+            .message_id = meta.message_id,
+            .fallback_session_key = fallback_session_key,
+            .lane = if (meta.thread_id != null) .thread else .main,
+        },
+    ) catch |err| {
+        log.warn("inbound canonicalization failed channel={s}: {}", .{ msg.channel, err });
+        return result;
+    };
+    defer decision.deinit(allocator);
+
+    switch (decision.kind) {
+        .strict_reject => {
+            result.strict_reject_reason = decision.reason_code;
+            return result;
+        },
+        .canonical, .degraded_compat => {
+            if (decision.session_key) |session_key| {
+                result.session_key = session_key;
+                decision.session_key = null;
+            }
+            return result;
+        },
+    }
+}
+
 const SlackStatusTarget = struct {
     channel_id: []const u8,
     thread_ts: []const u8,
@@ -1803,6 +1879,16 @@ fn inboundDispatcherThread(
     runtime: *channel_loop.ChannelRuntime,
     state: *DaemonState,
 ) void {
+    var inbound_state_mgr: ?zaki_state.Manager = null;
+    if (runtime.config.tenant.enabled and std.mem.eql(u8, runtime.config.state.backend, "postgres")) {
+        inbound_state_mgr = zaki_state.Manager.init(allocator, runtime.config.state) catch |err| blk: {
+            log.warn("inbound dispatcher postgres state init failed: {}", .{err});
+            break :blk null;
+        };
+    }
+    defer if (inbound_state_mgr) |*mgr| mgr.deinit();
+    const inbound_state_mgr_ptr: ?*zaki_state.Manager = if (inbound_state_mgr) |*mgr| mgr else null;
+
     var evict_counter: u32 = 0;
 
     while (event_bus.consumeInbound()) |msg| {
@@ -1819,7 +1905,32 @@ fn inboundDispatcherThread(
             parsed_meta.fields,
         );
         defer if (routed_session_key) |key| allocator.free(key);
-        const session_key = routed_session_key orelse msg.session_key;
+        const fallback_session_key = routed_session_key orelse msg.session_key;
+        var canonical = resolveInboundCanonicalSessionKey(
+            allocator,
+            runtime.config,
+            inbound_state_mgr_ptr,
+            &msg,
+            parsed_meta.fields,
+            fallback_session_key,
+        ) catch |err| {
+            log.warn("inbound canonical session resolve failed: {}", .{err});
+            .{};
+        };
+        defer canonical.deinit(allocator);
+        if (canonical.strict_reject_reason) |reason_code| {
+            const reject_text = "This channel is not mapped to a tenant user yet. Reconnect in app and retry.";
+            const reject_out = if (outbound_account_id) |aid|
+                bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, reject_text) catch continue
+            else
+                bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, reject_text) catch continue;
+            event_bus.publishOutbound(reject_out) catch {
+                reject_out.deinit(allocator);
+            };
+            log.warn("inbound strict identity reject channel={s} reason={s}", .{ msg.channel, reason_code });
+            continue;
+        }
+        const session_key = canonical.session_key orelse fallback_session_key;
         const tenant_user_id = zaki_session.parseUserIdFromSessionKey(session_key);
         const numeric_tenant_user_id = if (tenant_user_id) |user_id|
             std.fmt.parseInt(i64, user_id, 10) catch null
@@ -1830,6 +1941,7 @@ fn inboundDispatcherThread(
             .user_id = tenant_user_id,
             .numeric_user_id = numeric_tenant_user_id,
             .session_key = session_key,
+            .state_mgr = inbound_state_mgr_ptr,
             .expect_postgres_state = expect_postgres_state and tenant_user_id != null,
         });
         defer tools_mod.clearTenantContext();
@@ -3301,6 +3413,81 @@ test "makeHeartbeatDedupeKey normalizes morning brief schedule variants" {
     const key_b = try makeHeartbeatDedupeKey(std.testing.allocator, "1", "1110331014", "Created morning-brief cron job (08:00 CET daily).");
     defer std.testing.allocator.free(key_b);
     try std.testing.expectEqualStrings(key_a, key_b);
+}
+
+test "resolveInboundCanonicalSessionKey returns fallback in non-tenant mode" {
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = false;
+
+    var msg = try bus_mod.makeInboundFull(
+        std.testing.allocator,
+        "telegram",
+        "sender-1",
+        "1110331014",
+        "hello",
+        "telegram:legacy",
+        &.{},
+        "{\"account_id\":\"default\"}",
+    );
+    defer msg.deinit(std.testing.allocator);
+
+    const canonical = try resolveInboundCanonicalSessionKey(
+        std.testing.allocator,
+        &cfg,
+        null,
+        &msg,
+        .{ .account_id = "default" },
+        msg.session_key,
+    );
+    var canonical_mut = canonical;
+    defer canonical_mut.deinit(std.testing.allocator);
+
+    try std.testing.expect(canonical_mut.strict_reject_reason == null);
+    try std.testing.expect(canonical_mut.session_key != null);
+    try std.testing.expectEqualStrings("telegram:legacy", canonical_mut.session_key.?);
+}
+
+test "resolveInboundCanonicalSessionKey strict rejects unmapped telegram when manager missing" {
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = true;
+    cfg.state.backend = "postgres";
+    cfg.tenant.identity_mapping_enforcement = "staged_strict";
+    cfg.tenant.identity_mapping_strict_channels = &[_][]const u8{"telegram"};
+
+    var msg = try bus_mod.makeInboundFull(
+        std.testing.allocator,
+        "telegram",
+        "sender-1",
+        "1110331014",
+        "hello",
+        "telegram:legacy",
+        &.{},
+        "{\"account_id\":\"default\"}",
+    );
+    defer msg.deinit(std.testing.allocator);
+
+    const canonical = try resolveInboundCanonicalSessionKey(
+        std.testing.allocator,
+        &cfg,
+        null,
+        &msg,
+        .{ .account_id = "default" },
+        msg.session_key,
+    );
+    var canonical_mut = canonical;
+    defer canonical_mut.deinit(std.testing.allocator);
+
+    try std.testing.expect(canonical_mut.session_key == null);
+    try std.testing.expect(canonical_mut.strict_reject_reason != null);
+    try std.testing.expectEqualStrings("state_manager_missing", canonical_mut.strict_reject_reason.?);
 }
 
 test "channelSupervisorThread respects shutdown" {

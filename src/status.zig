@@ -102,6 +102,26 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
         }
         try w.print("\n", .{});
     }
+    if (snapshot.identity_mapped != null or
+        snapshot.identity_unmapped != null or
+        snapshot.identity_strict_rejected != null or
+        snapshot.identity_degraded_compat != null)
+    {
+        var mapped_buf: [24]u8 = undefined;
+        var unmapped_buf: [24]u8 = undefined;
+        var strict_buf: [24]u8 = undefined;
+        var degraded_buf: [24]u8 = undefined;
+        var hit_buf: [24]u8 = undefined;
+        var miss_buf: [24]u8 = undefined;
+        try w.print("Runtime ID:  mapped={s} unmapped={s} strict_rejected={s} degraded={s} cache_hit={s} cache_miss={s}\n", .{
+            optionalU64Text(&mapped_buf, snapshot.identity_mapped),
+            optionalU64Text(&unmapped_buf, snapshot.identity_unmapped),
+            optionalU64Text(&strict_buf, snapshot.identity_strict_rejected),
+            optionalU64Text(&degraded_buf, snapshot.identity_degraded_compat),
+            optionalU64Text(&hit_buf, snapshot.identity_cache_hit),
+            optionalU64Text(&miss_buf, snapshot.identity_cache_miss),
+        });
+    }
 
     // Cost tracking
     try w.print("Cost:        {s}\n", .{
@@ -145,4 +165,11 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
     }
 
     try w.flush();
+}
+
+fn optionalU64Text(buf: []u8, value: ?u64) []const u8 {
+    if (value) |resolved| {
+        return std.fmt.bufPrint(buf, "{d}", .{resolved}) catch "0";
+    }
+    return "unknown";
 }

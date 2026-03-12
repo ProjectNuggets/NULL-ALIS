@@ -1,6 +1,7 @@
 const std = @import("std");
 const channel_catalog = @import("../channel_catalog.zig");
 const config_mod = @import("../config.zig");
+const inbound_canonicalizer = @import("../inbound_canonicalizer.zig");
 const json_util = @import("../json_util.zig");
 const tool_dispatcher = @import("../tool_dispatcher.zig");
 const process_util = @import("process_util.zig");
@@ -184,6 +185,8 @@ pub const RuntimeInfoTool = struct {
         try json_util.appendJsonKey(&buf, allocator, "deferred_controls");
         try appendDeferredControls(&buf, allocator, self.config);
         try buf.appendSlice(allocator, ",");
+        try appendIdentityMapping(&buf, allocator, self.config);
+        try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "composio");
         try buf.appendSlice(allocator, "{");
         try json_util.appendJsonKey(&buf, allocator, "enabled");
@@ -267,6 +270,8 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "context_incomplete");
         try buf.appendSlice(allocator, if (context_incomplete) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try appendIdentityMapping(&buf, allocator, self.config);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "telegram");
         try buf.appendSlice(allocator, "{");
@@ -752,6 +757,39 @@ fn appendDeferredControls(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.A
     try buf.appendSlice(allocator, "]");
 }
 
+fn appendIdentityMapping(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    config: *const config_mod.Config,
+) !void {
+    const metrics = inbound_canonicalizer.metricsSnapshot();
+    try json_util.appendJsonKey(buf, allocator, "identity_mapping");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(buf, allocator, "mapped", @intCast(metrics.mapped));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "unmapped", @intCast(metrics.unmapped));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "strict_rejected", @intCast(metrics.strict_rejected));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "degraded_compat", @intCast(metrics.degraded_compat));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "cache_hit", @intCast(metrics.cache_hit));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "cache_miss", @intCast(metrics.cache_miss));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "cache_stale", @intCast(metrics.cache_stale));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "db_lookup_count", @intCast(metrics.db_lookup_count));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "db_lookup_ms_total", @intCast(metrics.db_lookup_ms_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "enforcement", config.tenant.identity_mapping_enforcement);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "strict_channels");
+    try appendStringArray(buf, allocator, config.tenant.identity_mapping_strict_channels);
+    try buf.appendSlice(allocator, "}");
+}
+
 fn appendOptionalInt(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, key: []const u8, value: ?i64) !void {
     try json_util.appendJsonKey(buf, allocator, key);
     if (value) |resolved| {
@@ -914,6 +952,7 @@ test "runtime info summary includes state backend keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"embedding_provider_effective\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"provider_data_source\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"deferred_controls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"identity_mapping\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"parallel_tools_rollout_percent\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"entity_scope_source\":\"config_default\"") != null);
 }
@@ -1007,6 +1046,7 @@ test "runtime info integrations composio entity scope uses override and tenant c
     try std.testing.expect(override_result.success);
     try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"entity_id\":\"7\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"entity_scope_source\":\"user_id_override\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"identity_mapping\"") != null);
 }
 
 test "runtime info summary surfaces active dispatcher state" {

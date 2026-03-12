@@ -3558,6 +3558,29 @@ fn internalDiagnosticsPayload(
     try buf.appendSlice(allocator, ",");
     try appendIntegrationsSummaryJson(&buf, allocator, state, user_id_opt);
     try buf.appendSlice(allocator, ",");
+    {
+        const identity_metrics = inbound_canonicalizer.metricsSnapshot();
+        try json_util.appendJsonKey(&buf, allocator, "identity_mapping");
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonInt(&buf, allocator, "mapped", @intCast(identity_metrics.mapped));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "unmapped", @intCast(identity_metrics.unmapped));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "strict_rejected", @intCast(identity_metrics.strict_rejected));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "degraded_compat", @intCast(identity_metrics.degraded_compat));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "cache_hit", @intCast(identity_metrics.cache_hit));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "cache_miss", @intCast(identity_metrics.cache_miss));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "cache_stale", @intCast(identity_metrics.cache_stale));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "db_lookup_count", @intCast(identity_metrics.db_lookup_count));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "db_lookup_ms_total", @intCast(identity_metrics.db_lookup_ms_total));
+        try buf.appendSlice(allocator, "},");
+    }
 
     try json_util.appendJsonKey(&buf, allocator, "ops");
     try buf.appendSlice(allocator, ops_json);
@@ -4138,6 +4161,33 @@ fn parseUserPath(base_path: []const u8) ?struct { user_id: []const u8, subpath: 
     };
 }
 
+fn parseUserChannelBindingsSubpath(subpath: []const u8) ?struct {
+    channel: []const u8,
+    binding_id: ?[]const u8,
+} {
+    const prefix = "channels/";
+    if (!std.mem.startsWith(u8, subpath, prefix)) return null;
+    const rest = subpath[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const channel = rest[0..slash];
+    if (!isValidIdentifier(channel)) return null;
+    const tail = rest[slash + 1 ..];
+    if (std.mem.eql(u8, tail, "bindings")) {
+        return .{
+            .channel = channel,
+            .binding_id = null,
+        };
+    }
+    const bindings_prefix = "bindings/";
+    if (!std.mem.startsWith(u8, tail, bindings_prefix)) return null;
+    const binding_id = tail[bindings_prefix.len..];
+    if (!isValidIdentifier(binding_id)) return null;
+    return .{
+        .channel = channel,
+        .binding_id = binding_id,
+    };
+}
+
 fn resolveSecretPath(allocator: std.mem.Allocator, secrets_dir: []const u8, key: []const u8) ![]u8 {
     if (!isValidIdentifier(key)) return error.InvalidSecretKey;
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ secrets_dir, key });
@@ -4701,6 +4751,136 @@ fn handleApiRoute(
             }
             return .{ .body = "{\"status\":\"deleted\"}" };
         }
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+
+    if (parseUserChannelBindingsSubpath(parsed.subpath)) |bindings_path| {
+        const mgr = state.zaki_state orelse return .{
+            .status = "501 Not Implemented",
+            .body = "{\"error\":\"state backend does not support channel bindings\"}",
+        };
+        const user_id_numeric = parseNumericUserId(parsed.user_id) catch return .{
+            .status = "400 Bad Request",
+            .body = "{\"error\":\"invalid user\"}",
+        };
+
+        if (std.mem.eql(u8, method, "GET")) {
+            if (bindings_path.binding_id != null) {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"GET requires bindings collection path\"}" };
+            }
+            const bindings = mgr.listChannelIdentityBindings(req_allocator, user_id_numeric, bindings_path.channel) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"list bindings failed\"}" };
+            };
+            defer {
+                for (bindings) |*entry| entry.deinit(req_allocator);
+                req_allocator.free(bindings);
+            }
+
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            defer resp.deinit(req_allocator);
+            const w = resp.writer(req_allocator);
+            w.writeAll("{\"channel\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            jsonEscapeInto(w, bindings_path.channel) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            w.writeAll("\",\"items\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            for (bindings, 0..) |entry, idx| {
+                if (idx > 0) {
+                    w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                }
+                w.writeAll("{\"id\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, entry.id) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\",\"account_id\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, entry.account_id) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\",\"principal_key\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, entry.principal_key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\",\"scope_key\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, entry.scope_key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\",\"thread_key\":") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                if (entry.thread_key) |thread_key| {
+                    w.writeAll("\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                    jsonEscapeInto(w, thread_key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                    w.writeAll("\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                } else {
+                    w.writeAll("null") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                }
+                w.writeAll("}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            }
+            w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"response build failed\"}" };
+        }
+
+        if (std.mem.eql(u8, method, "POST")) {
+            if (bindings_path.binding_id != null) {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"POST requires bindings collection path\"}" };
+            }
+            const body = extractBody(raw_request) orelse return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"missing body\"}",
+            };
+            const account_id = jsonStringField(body, "account_id") orelse return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"missing account_id\"}",
+            };
+            const principal_key = jsonStringField(body, "principal_key") orelse return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"missing principal_key\"}",
+            };
+            const scope_key = jsonStringField(body, "scope_key") orelse return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"missing scope_key\"}",
+            };
+            const thread_key = jsonStringField(body, "thread_key");
+            const peer_kind = jsonStringField(body, "peer_kind");
+            const peer_id = jsonStringField(body, "peer_id");
+            const metadata_json = jsonStringField(body, "metadata_json") orelse "{}";
+            if (account_id.len == 0 or principal_key.len == 0 or scope_key.len == 0) {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid binding fields\"}" };
+            }
+            const binding_id = mgr.upsertChannelIdentityBinding(
+                req_allocator,
+                user_id_numeric,
+                bindings_path.channel,
+                account_id,
+                principal_key,
+                scope_key,
+                thread_key,
+                peer_kind,
+                peer_id,
+                metadata_json,
+            ) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"upsert binding failed\"}" };
+            };
+            defer req_allocator.free(binding_id);
+            inbound_canonicalizer.invalidateCacheForIdentity(.{
+                .channel = bindings_path.channel,
+                .account_id = account_id,
+                .principal_key = principal_key,
+                .scope_key = scope_key,
+                .thread_key = thread_key,
+                .fallback_session_key = "",
+            });
+
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            defer resp.deinit(req_allocator);
+            const rw = resp.writer(req_allocator);
+            rw.writeAll("{\"status\":\"upserted\",\"id\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            jsonEscapeInto(rw, binding_id) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            rw.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"response build failed\"}" };
+        }
+
+        if (std.mem.eql(u8, method, "DELETE")) {
+            const binding_id = bindings_path.binding_id orelse return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"DELETE requires binding id\"}",
+            };
+            const deleted = mgr.deleteChannelIdentityBinding(user_id_numeric, binding_id) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete binding failed\"}" };
+            };
+            if (!deleted) return .{ .status = "404 Not Found", .body = "{\"error\":\"binding not found\"}" };
+            inbound_canonicalizer.invalidateAllCache();
+            return .{ .body = "{\"status\":\"deleted\"}" };
+        }
+
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
 
@@ -8900,6 +9080,18 @@ test "resolveChatStreamSessionKey allows non-tenant custom lanes" {
         &fallback_buf,
     );
     try std.testing.expectEqualStrings("local:bench:1", session_key);
+}
+
+test "parseUserChannelBindingsSubpath parses bindings collection route" {
+    const parsed = parseUserChannelBindingsSubpath("channels/telegram/bindings") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("telegram", parsed.channel);
+    try std.testing.expect(parsed.binding_id == null);
+}
+
+test "parseUserChannelBindingsSubpath parses binding item route" {
+    const parsed = parseUserChannelBindingsSubpath("channels/slack/bindings/bnd_123") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("slack", parsed.channel);
+    try std.testing.expectEqualStrings("bnd_123", parsed.binding_id.?);
 }
 
 test "tenant semantic memory defaults enable postgres_hybrid safely" {

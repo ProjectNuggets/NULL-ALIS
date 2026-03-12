@@ -698,6 +698,23 @@ fn checkRuntimeSnapshot(
             },
         )));
     }
+    if (snapshot.identity_mapped != null or
+        snapshot.identity_unmapped != null or
+        snapshot.identity_strict_rejected != null or
+        snapshot.identity_degraded_compat != null)
+    {
+        const mapped = snapshot.identity_mapped orelse 0;
+        const unmapped = snapshot.identity_unmapped orelse 0;
+        const strict_rejected = snapshot.identity_strict_rejected orelse 0;
+        const degraded_compat = snapshot.identity_degraded_compat orelse 0;
+        const cache_hit = snapshot.identity_cache_hit orelse 0;
+        const cache_miss = snapshot.identity_cache_miss orelse 0;
+        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+            allocator,
+            "identity mapping: mapped={d} unmapped={d} strict_rejected={d} degraded={d} cache_hit={d} cache_miss={d}",
+            .{ mapped, unmapped, strict_rejected, degraded_compat, cache_hit, cache_miss },
+        )));
+    }
 
     if (snapshot.context_incomplete) {
         try items.append(allocator, DiagItem.warn(cat, "runtime context incomplete; values may be fallback-only"));

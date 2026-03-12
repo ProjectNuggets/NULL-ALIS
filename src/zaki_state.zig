@@ -1889,7 +1889,7 @@ fn dupeResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int
 
 fn dupeNullableResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) !?[]u8 {
     if (c.PQgetisnull(result, row, col) != 0) return null;
-    return dupeResultValue(allocator, result, row, col);
+    return try dupeResultValue(allocator, result, row, col);
 }
 
 fn categoryToMemoryType(category: memory_root.MemoryCategory) []const u8 {
