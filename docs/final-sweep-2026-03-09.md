@@ -1,5 +1,7 @@
 # v0.1 Final Sweep — 2026-03-09
 
+> Update (March 12, 2026): `wake` and `proactive` origins are now wired in active daemon paths. The origin status notes below are historical for the March 9 sweep.
+
 ## Scope
 
 Final pass on `v0.1` for runtime stability, stress behavior, subagent execution, turn-origin wiring, and SOTA DTaaS open ends.
@@ -62,10 +64,9 @@ Regression tests added:
 1. Startup log noise:
    - repeated Postgres `NOTICE ... already exists` remains high.
    - Not breaking correctness, but hurts operator UX and startup readability.
-2. Turn origins reserved but unwired:
-   - `wake`
-   - `proactive`
-   - Defined in runtime origin enum but not assigned by active execution paths.
+2. Turn-origin wiring (historical at sweep time):
+   - At the time of this sweep, `wake` and `proactive` were reserved but not assigned by active execution paths.
+   - Current status is tracked in `docs/v0.2-origin-roadmap.md`.
 3. Subagent product limitations (by design in v0.1):
    - tasks are non-interruptible while running
    - no interactive tool loop inside subagent thread; completion-only worker path
@@ -79,14 +80,12 @@ Regression tests added:
 Defined in `TurnOrigin`:
 - `user`, `heartbeat`, `scheduler`, `wake`, `proactive`
 
-Wired in runtime:
+Wired in runtime (current):
 - `user`: normal message turns
 - `heartbeat`: heartbeat job turns
 - `scheduler`: non-heartbeat scheduled jobs
-
-Defined but not wired:
-- `wake`
-- `proactive`
+- `wake`: explicit wake-triggered heartbeat/scheduler flows
+- `proactive`: scheduler delivery-mode turns
 
 Reference:
 - `docs/v0.2-origin-roadmap.md`
@@ -105,7 +104,7 @@ Still required for DTaaS-grade evolution:
 2. Snapshot-based memory inheritance productization:
    - export/import UX + provenance controls
 3. Strong proactive orchestration by origin:
-   - wire `wake` and `proactive` with distinct policy and observability
+   - expand `wake`/`proactive` beyond scheduler/heartbeat wiring with richer autonomous policies and observability
 4. Operator/client UX for conflicts and async flows:
    - ownership-lock UX, subagent lifecycle visibility, and deterministic retries
 
@@ -120,4 +119,3 @@ What is ready:
 
 What is not ready as a default:
 - unconstrained arbitrary external API execution without a tool adapter/MCP server and policy constraints.
-

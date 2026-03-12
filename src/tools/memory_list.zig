@@ -12,7 +12,7 @@ pub const MemoryListTool = struct {
     pub const tool_name = "memory_list";
     pub const tool_description = "List memory entries in recency order. Use for requests like 'show first N memory records' without shell/sqlite access.";
     pub const tool_params =
-        \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"session_id":{"type":"string","description":"Optional session filter"},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys (default: false)"}}}
+        \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"scope":{"type":"string","enum":["session","global"],"description":"List scope (default: session lane)"},"session_id":{"type":"string","description":"Optional explicit session filter override"},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys (default: false)"}}}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -38,10 +38,10 @@ pub const MemoryListTool = struct {
         else
             null;
 
-        const session_id_opt: ?[]const u8 = if (root.getString(args, "session_id")) |sid_raw|
-            if (sid_raw.len > 0) sid_raw else null
-        else
-            null;
+        const session_id_opt = resolveSessionId(args) catch |err| switch (err) {
+            error.InvalidScope => return ToolResult.fail("Invalid 'scope' parameter. Expected 'session' or 'global'."),
+            error.InvalidSessionId => return ToolResult.fail("Invalid 'session_id' parameter. Must be non-empty when provided."),
+        };
 
         const include_content = root.getBool(args, "include_content") orelse true;
         const include_internal = root.getBool(args, "include_internal") orelse false;
@@ -85,6 +85,21 @@ pub const MemoryListTool = struct {
         }
 
         return ToolResult{ .success = true, .output = try out.toOwnedSlice(allocator) };
+    }
+
+    fn resolveSessionId(args: JsonObjectMap) error{ InvalidScope, InvalidSessionId }!?[]const u8 {
+        if (root.getString(args, "session_id")) |sid_raw| {
+            const sid = std.mem.trim(u8, sid_raw, " \t\r\n");
+            if (sid.len == 0) return error.InvalidSessionId;
+            return sid;
+        }
+
+        const scope_raw = root.getString(args, "scope") orelse "session";
+        const scope = std.mem.trim(u8, scope_raw, " \t\r\n");
+        if (scope.len == 0) return error.InvalidScope;
+        if (std.ascii.eqlIgnoreCase(scope, "global")) return null;
+        if (std.ascii.eqlIgnoreCase(scope, "session")) return root.getTurnContext().session_key;
+        return error.InvalidScope;
     }
 
     fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
@@ -195,4 +210,52 @@ test "memory_list filters bootstrap internal keys by default" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "user_topic") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "__bootstrap.prompt.AGENTS.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-agents") == null);
+}
+
+test "memory_list defaults to current turn session scope" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("global_only", "visible globally", .core, null);
+    try mem.store("session_only", "visible in session", .core, "agent:zaki-bot:user:1:main");
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:main" });
+    defer root.clearTurnContext();
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "session_only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_only") == null);
+}
+
+test "memory_list supports explicit global scope" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("global_only", "visible globally", .core, null);
+    try mem.store("session_only", "visible in session", .core, "agent:zaki-bot:user:1:main");
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:main" });
+    defer root.clearTurnContext();
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10,\"scope\":\"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "session_only") != null);
 }

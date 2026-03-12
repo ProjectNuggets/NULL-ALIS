@@ -18,7 +18,7 @@ pub const MemoryRecallTool = struct {
     pub const tool_name = "memory_recall";
     pub const tool_description = "Search long-term memory for relevant facts, preferences, or context.";
     pub const tool_params =
-        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"}},"required":["query"]}
+        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: session lane)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -37,6 +37,10 @@ pub const MemoryRecallTool = struct {
 
         const limit_raw = root.getInt(args, "limit") orelse 5;
         const limit: usize = if (limit_raw > 0 and limit_raw <= 100) @intCast(limit_raw) else 5;
+        const session_id = resolveSessionId(args) catch |err| switch (err) {
+            error.InvalidScope => return ToolResult.fail("Invalid 'scope' parameter. Expected 'session' or 'global'."),
+            error.InvalidSessionId => return ToolResult.fail("Invalid 'session_id' parameter. Must be non-empty when provided."),
+        };
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot search for: {s}", .{query});
@@ -46,7 +50,7 @@ pub const MemoryRecallTool = struct {
         // Use retrieval engine (hybrid pipeline) when MemoryRuntime is available,
         // fall back to raw mem.recall() otherwise.
         if (self.mem_rt) |rt| {
-            const candidates = rt.search(allocator, query, limit, null) catch |err| {
+            const candidates = rt.search(allocator, query, limit, session_id) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to search memories for '{s}': {s}", .{ query, @errorName(err) });
                 return ToolResult{ .success = false, .output = msg };
             };
@@ -61,7 +65,7 @@ pub const MemoryRecallTool = struct {
             return formatCandidates(allocator, candidates, visible_candidates);
         }
 
-        const entries = m.recall(allocator, query, limit, null) catch |err| {
+        const entries = m.recall(allocator, query, limit, session_id) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to recall memories for '{s}': {s}", .{ query, @errorName(err) });
             return ToolResult{ .success = false, .output = msg };
         };
@@ -122,6 +126,21 @@ pub const MemoryRecallTool = struct {
         }
 
         return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+    }
+
+    fn resolveSessionId(args: JsonObjectMap) error{ InvalidScope, InvalidSessionId }!?[]const u8 {
+        if (root.getString(args, "session_id")) |sid_raw| {
+            const sid = std.mem.trim(u8, sid_raw, " \t\r\n");
+            if (sid.len == 0) return error.InvalidSessionId;
+            return sid;
+        }
+
+        const scope_raw = root.getString(args, "scope") orelse "session";
+        const scope = std.mem.trim(u8, scope_raw, " \t\r\n");
+        if (scope.len == 0) return error.InvalidScope;
+        if (std.ascii.eqlIgnoreCase(scope, "global")) return null;
+        if (std.ascii.eqlIgnoreCase(scope, "session")) return root.getTurnContext().session_key;
+        return error.InvalidScope;
     }
 
     fn formatCandidates(
@@ -267,4 +286,64 @@ test "memory_recall filters markdown encoded internal keys" {
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "last_hygiene_at") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "**Name**: User") != null);
+}
+
+test "memory_recall defaults to current turn session scope" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("global_fact", "banana global", .core, null);
+    try mem.store("session_fact", "banana session", .core, "agent:zaki-bot:user:1:main");
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:main" });
+    defer root.clearTurnContext();
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\":\"banana\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "session_fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_fact") == null);
+}
+
+test "memory_recall supports explicit global scope" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("global_fact", "banana global", .core, null);
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:main" });
+    defer root.clearTurnContext();
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\":\"banana\",\"scope\":\"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_fact") != null);
+}
+
+test "memory_recall rejects invalid scope value" {
+    const NoneMemory = mem_root.NoneMemory;
+    var backend = NoneMemory.init();
+    defer backend.deinit();
+
+    var mt = MemoryRecallTool{ .memory = backend.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\":\"banana\",\"scope\":\"tenant\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid 'scope'") != null);
 }

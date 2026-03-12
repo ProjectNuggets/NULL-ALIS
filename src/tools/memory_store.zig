@@ -16,7 +16,7 @@ pub const MemoryStoreTool = struct {
     pub const tool_name = "memory_store";
     pub const tool_description = "Store durable user facts, preferences, and decisions in long-term memory. Use category 'core' for stable facts, 'daily' for session notes, 'conversation' for important context only. Do not store routine greetings or every chat message.";
     pub const tool_params =
-        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"}},"required":["key","content"]}
+        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"},"scope":{"type":"string","enum":["session","global"],"description":"Memory scope (default: session lane)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["key","content"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -39,13 +39,17 @@ pub const MemoryStoreTool = struct {
 
         const category_str = root.getString(args, "category") orelse "core";
         const category = MemoryCategory.fromString(category_str);
+        const session_id = resolveSessionId(args) catch |err| switch (err) {
+            error.InvalidScope => return ToolResult.fail("Invalid 'scope' parameter. Expected 'session' or 'global'."),
+            error.InvalidSessionId => return ToolResult.fail("Invalid 'session_id' parameter. Must be non-empty when provided."),
+        };
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot store: {s} = {s}", .{ key, content });
             return ToolResult{ .success = false, .output = msg };
         };
 
-        m.store(key, content, category, null) catch |err| {
+        m.store(key, content, category, session_id) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to store memory '{s}': {s}", .{ key, @errorName(err) });
             return ToolResult{ .success = false, .output = msg };
         };
@@ -57,6 +61,21 @@ pub const MemoryStoreTool = struct {
 
         const msg = try std.fmt.allocPrint(allocator, "Stored memory: {s} ({s})", .{ key, category.toString() });
         return ToolResult{ .success = true, .output = msg };
+    }
+
+    fn resolveSessionId(args: JsonObjectMap) error{ InvalidScope, InvalidSessionId }!?[]const u8 {
+        if (root.getString(args, "session_id")) |sid_raw| {
+            const sid = std.mem.trim(u8, sid_raw, " \t\r\n");
+            if (sid.len == 0) return error.InvalidSessionId;
+            return sid;
+        }
+
+        const scope_raw = root.getString(args, "scope") orelse "session";
+        const scope = std.mem.trim(u8, scope_raw, " \t\r\n");
+        if (scope.len == 0) return error.InvalidScope;
+        if (std.ascii.eqlIgnoreCase(scope, "global")) return null;
+        if (std.ascii.eqlIgnoreCase(scope, "session")) return root.getTurnContext().session_key;
+        return error.InvalidScope;
     }
 };
 
@@ -150,4 +169,63 @@ test "memory_store with daily category" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "daily") != null);
+}
+
+test "memory_store defaults to current turn session scope" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:main" });
+    defer root.clearTurnContext();
+
+    var mt = MemoryStoreTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\":\"lane_pref\",\"content\":\"session scoped\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    try std.testing.expect(result.success);
+
+    const entry = (try mem.get(allocator, "lane_pref")) orelse return error.TestUnexpectedResult;
+    defer entry.deinit(allocator);
+    try std.testing.expect(entry.session_id != null);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:main", entry.session_id.?);
+}
+
+test "memory_store supports explicit global scope" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:main" });
+    defer root.clearTurnContext();
+
+    var mt = MemoryStoreTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\":\"global_pref\",\"content\":\"all lanes\",\"scope\":\"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    try std.testing.expect(result.success);
+
+    const entry = (try mem.get(allocator, "global_pref")) orelse return error.TestUnexpectedResult;
+    defer entry.deinit(allocator);
+    try std.testing.expect(entry.session_id == null);
+}
+
+test "memory_store rejects invalid scope value" {
+    const NoneMemory = mem_root.NoneMemory;
+    var backend = NoneMemory.init();
+    defer backend.deinit();
+
+    var mt = MemoryStoreTool{ .memory = backend.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\":\"x\",\"content\":\"y\",\"scope\":\"tenant\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid 'scope'") != null);
 }
