@@ -1,0 +1,43 @@
+{
+  "account_id": "main",
+  "binding_upsert": {
+    "body": "{\"error\":\"upsert binding failed\"}",
+    "error": "http_error",
+    "json": {
+      "error": "upsert binding failed"
+    },
+    "ok": false,
+    "status_code": 500
+  },
+  "gateway_base": "http://127.0.0.1:3000",
+  "mapped": {
+    "accepted": false,
+    "principal": "Feddy267",
+    "response": {
+      "body": "{\"error\":\"invalid telegram secret token\"}",
+      "error": "http_error",
+      "json": {
+        "error": "invalid telegram secret token"
+      },
+      "ok": false,
+      "status_code": 403
+    },
+    "scope": "1110331014"
+  },
+  "run_started_utc": "2026-03-12T21:02:37.570466+00:00",
+  "unmapped": {
+    "principal": "canary-unmapped-9100",
+    "response": {
+      "body": "{\"error\":\"invalid telegram secret token\"}",
+      "error": "http_error",
+      "json": {
+        "error": "invalid telegram secret token"
+      },
+      "ok": false,
+      "status_code": 403
+    },
+    "scope": "1110331014",
+    "strict_reject_detected": false
+  },
+  "user_id": "1"
+}
