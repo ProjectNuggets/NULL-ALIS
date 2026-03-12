@@ -1,0 +1,16 @@
+{
+  "before": {
+    "identity_mapping_enforcement": "null",
+    "identity_mapping_strict_channels": null
+  },
+  "stage": {
+    "identity_mapping_enforcement": "staged_strict",
+    "identity_mapping_strict_channels": [
+      "telegram"
+    ]
+  },
+  "after_rollback": {
+    "identity_mapping_enforcement": "null",
+    "identity_mapping_strict_channels": null
+  }
+}

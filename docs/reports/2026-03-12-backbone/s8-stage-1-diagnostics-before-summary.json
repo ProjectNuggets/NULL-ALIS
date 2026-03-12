@@ -1,0 +1,33 @@
+{
+  "tenant": null,
+  "startup_self_check": {
+    "config_path": "/Users/nova/.nullalis/config.json",
+    "state_backend_configured": "postgres",
+    "state_backend_effective": "postgres",
+    "heartbeat_enabled": true,
+    "heartbeat_interval_minutes": 30,
+    "tenant_enabled": true,
+    "degraded": false,
+    "degraded_reason": "",
+    "postgres_host": "127.0.0.1",
+    "postgres_port": 5432,
+    "postgres_schema": "zaki_bot",
+    "scheduler_backend": "postgres",
+    "webhook_mode": "none",
+    "chat_provider_effective": "openrouter",
+    "chat_fallback_chain": "together",
+    "embedding_provider_effective": "together",
+    "provider_data_source": "config"
+  },
+  "identity_mapping": {
+    "mapped": 3,
+    "unmapped": 0,
+    "strict_rejected": 0,
+    "degraded_compat": 0,
+    "cache_hit": 0,
+    "cache_miss": 3,
+    "cache_stale": 0,
+    "db_lookup_count": 3,
+    "db_lookup_ms_total": 2
+  }
+}
