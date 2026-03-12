@@ -784,6 +784,15 @@ pub const TenantConfig = struct {
     data_root: []const u8 = "/data/users",
     runtime_cache_max_users: u32 = 2048,
     runtime_idle_ttl_secs: u32 = 1800,
+    /// Identity mapping enforcement policy for inbound canonicalization.
+    /// - compat: never reject; use degraded fallback when unmapped
+    /// - staged_strict: reject unmapped traffic for channels listed in strict_channels
+    identity_mapping_enforcement: []const u8 = "compat",
+    identity_mapping_strict_channels: []const []const u8 = &.{},
+    /// TTL for positive cache entries in canonicalizer (seconds).
+    identity_mapping_positive_ttl_secs: u32 = 300,
+    /// TTL for negative cache entries in canonicalizer (seconds).
+    identity_mapping_negative_ttl_secs: u32 = 30,
 };
 
 pub const StateSecretsStoreConfig = struct {

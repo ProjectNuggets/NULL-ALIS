@@ -17,6 +17,41 @@ threadlocal var tls_pg_conn_key: ?[*:0]const u8 = null;
 threadlocal var tls_pg_statement_timeout_ms: u32 = 0;
 threadlocal var tls_pg_lock_timeout_ms: u32 = 0;
 
+pub const ChannelIdentityBinding = struct {
+    id: []u8,
+    user_id: i64,
+    channel: []u8,
+    account_id: []u8,
+    principal_key: []u8,
+    scope_key: []u8,
+    thread_key: ?[]u8,
+    peer_kind: ?[]u8,
+    peer_id: ?[]u8,
+    metadata_json: []u8,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.channel);
+        allocator.free(self.account_id);
+        allocator.free(self.principal_key);
+        allocator.free(self.scope_key);
+        if (self.thread_key) |value| allocator.free(value);
+        if (self.peer_kind) |value| allocator.free(value);
+        if (self.peer_id) |value| allocator.free(value);
+        allocator.free(self.metadata_json);
+    }
+};
+
+pub const TelegramBackfillCandidate = struct {
+    user_id: i64,
+    account_id: []u8,
+    chat_id: i64,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.account_id);
+    }
+};
+
 pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn init(_: std.mem.Allocator, _: config_types.StateConfig) !@This() {
         return error.PostgresNotEnabled;
@@ -94,6 +129,45 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     }
     pub fn recordTelegramUpdate(_: *@This(), _: i64, _: i64) !bool {
         return error.PostgresNotEnabled;
+    }
+    pub fn upsertChannelIdentityBinding(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: i64,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: ?[]const u8,
+        _: ?[]const u8,
+        _: ?[]const u8,
+        _: ?[]const u8,
+    ) ![]u8 {
+        return error.PostgresNotEnabled;
+    }
+    pub fn resolveUserByChannelIdentity(
+        _: *@This(),
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: ?[]const u8,
+    ) !?i64 {
+        return error.PostgresNotEnabled;
+    }
+    pub fn listChannelIdentityBindings(
+        _: *@This(),
+        allocator: std.mem.Allocator,
+        _: i64,
+        _: ?[]const u8,
+    ) ![]ChannelIdentityBinding {
+        return allocator.alloc(ChannelIdentityBinding, 0);
+    }
+    pub fn deleteChannelIdentityBinding(_: *@This(), _: i64, _: []const u8) !bool {
+        return error.PostgresNotEnabled;
+    }
+    pub fn listTelegramBackfillCandidates(_: *@This(), allocator: std.mem.Allocator) ![]TelegramBackfillCandidate {
+        return allocator.alloc(TelegramBackfillCandidate, 0);
     }
     pub fn acquireUserOwnershipLease(
         _: *@This(),
@@ -427,6 +501,25 @@ const ManagerImpl = struct {
             \\    PRIMARY KEY (user_id, update_id)
             \\)
             ,
+            \\CREATE TABLE IF NOT EXISTS {schema}.channel_identity_bindings (
+            \\    id TEXT PRIMARY KEY,
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    channel TEXT NOT NULL,
+            \\    account_id TEXT NOT NULL,
+            \\    principal_key TEXT NOT NULL,
+            \\    scope_key TEXT NOT NULL,
+            \\    thread_key TEXT,
+            \\    thread_key_norm TEXT NOT NULL DEFAULT '',
+            \\    peer_kind TEXT,
+            \\    peer_id TEXT,
+            \\    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            \\    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            \\    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            \\)
+            ,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_identity_unique ON {schema}.channel_identity_bindings(channel, account_id, principal_key, scope_key, thread_key_norm)",
+            "CREATE INDEX IF NOT EXISTS idx_channel_identity_user_channel ON {schema}.channel_identity_bindings(user_id, channel)",
+            "CREATE INDEX IF NOT EXISTS idx_channel_identity_lookup ON {schema}.channel_identity_bindings(channel, account_id, principal_key, scope_key, thread_key_norm)",
             \\CREATE TABLE IF NOT EXISTS {schema}.heartbeat (
             \\    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
             \\    config JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -1046,6 +1139,239 @@ const ManagerImpl = struct {
         return !std.mem.eql(u8, std.mem.span(affected), "0");
     }
 
+    pub fn upsertChannelIdentityBinding(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        channel: []const u8,
+        account_id: []const u8,
+        principal_key: []const u8,
+        scope_key: []const u8,
+        thread_key: ?[]const u8,
+        peer_kind: ?[]const u8,
+        peer_id: ?[]const u8,
+        metadata_json: ?[]const u8,
+    ) ![]u8 {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.channel_identity_bindings " ++
+                "(id, user_id, channel, account_id, principal_key, scope_key, thread_key, thread_key_norm, peer_kind, peer_id, metadata, updated_at) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW()) " ++
+                "ON CONFLICT (channel, account_id, principal_key, scope_key, thread_key_norm) DO UPDATE " ++
+                "SET user_id = EXCLUDED.user_id, thread_key = EXCLUDED.thread_key, peer_kind = EXCLUDED.peer_kind, peer_id = EXCLUDED.peer_id, metadata = EXCLUDED.metadata, updated_at = NOW() " ++
+                "RETURNING id",
+        );
+        defer self.allocator.free(q);
+
+        const binding_id = try self.randomHexId(allocator, 16);
+        defer allocator.free(binding_id);
+        const binding_id_z = try self.allocator.dupeZ(u8, binding_id);
+        defer self.allocator.free(binding_id_z);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const channel_z = try self.allocator.dupeZ(u8, channel);
+        defer self.allocator.free(channel_z);
+        const account_z = try self.allocator.dupeZ(u8, account_id);
+        defer self.allocator.free(account_z);
+        const principal_z = try self.allocator.dupeZ(u8, principal_key);
+        defer self.allocator.free(principal_z);
+        const scope_z = try self.allocator.dupeZ(u8, scope_key);
+        defer self.allocator.free(scope_z);
+        const thread_text = if (thread_key) |value| value else "";
+        const thread_norm = thread_text;
+        const thread_z = if (thread_key) |value| try self.allocator.dupeZ(u8, value) else null;
+        defer if (thread_z) |value| self.allocator.free(value);
+        const thread_norm_z = try self.allocator.dupeZ(u8, thread_norm);
+        defer self.allocator.free(thread_norm_z);
+        const peer_kind_z = if (peer_kind) |value| try self.allocator.dupeZ(u8, value) else null;
+        defer if (peer_kind_z) |value| self.allocator.free(value);
+        const peer_id_z = if (peer_id) |value| try self.allocator.dupeZ(u8, value) else null;
+        defer if (peer_id_z) |value| self.allocator.free(value);
+        const metadata_text = metadata_json orelse "{}";
+        const metadata_z = try self.allocator.dupeZ(u8, metadata_text);
+        defer self.allocator.free(metadata_z);
+
+        const params = [_]?[*:0]const u8{
+            binding_id_z,
+            user_s.ptr,
+            channel_z,
+            account_z,
+            principal_z,
+            scope_z,
+            thread_z,
+            thread_norm_z,
+            peer_kind_z,
+            peer_id_z,
+            metadata_z,
+        };
+        const lengths = [_]c_int{
+            @intCast(binding_id.len),
+            @intCast(user_s.len),
+            @intCast(channel.len),
+            @intCast(account_id.len),
+            @intCast(principal_key.len),
+            @intCast(scope_key.len),
+            @intCast(thread_text.len),
+            @intCast(thread_norm.len),
+            @intCast(if (peer_kind) |value| value.len else 0),
+            @intCast(if (peer_id) |value| value.len else 0),
+            @intCast(metadata_text.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        return dupeResultValue(allocator, result, 0, 0);
+    }
+
+    pub fn resolveUserByChannelIdentity(
+        self: *Self,
+        channel: []const u8,
+        account_id: []const u8,
+        principal_key: []const u8,
+        scope_key: []const u8,
+        thread_key: ?[]const u8,
+    ) !?i64 {
+        const q = try self.buildQuery(
+            "SELECT user_id FROM {schema}.channel_identity_bindings " ++
+                "WHERE channel = $1 AND account_id = $2 AND principal_key = $3 AND scope_key = $4 AND thread_key_norm = $5 " ++
+                "LIMIT 1",
+        );
+        defer self.allocator.free(q);
+        const channel_z = try self.allocator.dupeZ(u8, channel);
+        defer self.allocator.free(channel_z);
+        const account_z = try self.allocator.dupeZ(u8, account_id);
+        defer self.allocator.free(account_z);
+        const principal_z = try self.allocator.dupeZ(u8, principal_key);
+        defer self.allocator.free(principal_z);
+        const scope_z = try self.allocator.dupeZ(u8, scope_key);
+        defer self.allocator.free(scope_z);
+        const thread_norm = if (thread_key) |value| value else "";
+        const thread_norm_z = try self.allocator.dupeZ(u8, thread_norm);
+        defer self.allocator.free(thread_norm_z);
+        const params = [_]?[*:0]const u8{ channel_z, account_z, principal_z, scope_z, thread_norm_z };
+        const lengths = [_]c_int{
+            @intCast(channel.len),
+            @intCast(account_id.len),
+            @intCast(principal_key.len),
+            @intCast(scope_key.len),
+            @intCast(thread_norm.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+        const user_text = try dupeResultValue(self.allocator, result, 0, 0);
+        defer self.allocator.free(user_text);
+        return std.fmt.parseInt(i64, user_text, 10) catch null;
+    }
+
+    pub fn listChannelIdentityBindings(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        channel: ?[]const u8,
+    ) ![]ChannelIdentityBinding {
+        const q = try self.buildQuery(
+            "SELECT id, user_id, channel, account_id, principal_key, scope_key, thread_key, peer_kind, peer_id, metadata::text " ++
+                "FROM {schema}.channel_identity_bindings " ++
+                "WHERE user_id = $1 AND ($2::text = '' OR channel = $2::text) " ++
+                "ORDER BY channel ASC, account_id ASC, principal_key ASC, scope_key ASC, thread_key_norm ASC",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const channel_text = channel orelse "";
+        const channel_z = try self.allocator.dupeZ(u8, channel_text);
+        defer self.allocator.free(channel_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, channel_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(channel_text.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const rows: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc(ChannelIdentityBinding, rows);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*row| row.deinit(allocator);
+            allocator.free(out);
+        }
+        for (0..rows) |i| {
+            const row_idx: c_int = @intCast(i);
+            const id = try dupeResultValue(allocator, result, row_idx, 0);
+            const user_text = try dupeResultValue(allocator, result, row_idx, 1);
+            defer allocator.free(user_text);
+            const parsed_user = try std.fmt.parseInt(i64, user_text, 10);
+            const channel_value = try dupeResultValue(allocator, result, row_idx, 2);
+            const account_value = try dupeResultValue(allocator, result, row_idx, 3);
+            const principal_value = try dupeResultValue(allocator, result, row_idx, 4);
+            const scope_value = try dupeResultValue(allocator, result, row_idx, 5);
+            const thread_nullable = try dupeNullableResultValue(allocator, result, row_idx, 6);
+            const peer_kind_nullable = try dupeNullableResultValue(allocator, result, row_idx, 7);
+            const peer_id_nullable = try dupeNullableResultValue(allocator, result, row_idx, 8);
+            const metadata_value = try dupeResultValue(allocator, result, row_idx, 9);
+            out[i] = .{
+                .id = id,
+                .user_id = parsed_user,
+                .channel = channel_value,
+                .account_id = account_value,
+                .principal_key = principal_value,
+                .scope_key = scope_value,
+                .thread_key = thread_nullable,
+                .peer_kind = peer_kind_nullable,
+                .peer_id = peer_id_nullable,
+                .metadata_json = metadata_value,
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    pub fn deleteChannelIdentityBinding(self: *Self, user_id: i64, binding_id: []const u8) !bool {
+        const q = try self.buildQuery(
+            "DELETE FROM {schema}.channel_identity_bindings WHERE user_id = $1 AND id = $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const binding_z = try self.allocator.dupeZ(u8, binding_id);
+        defer self.allocator.free(binding_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, binding_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(binding_id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const affected = c.PQcmdTuples(result);
+        if (affected == null) return false;
+        return !std.mem.eql(u8, std.mem.span(affected), "0");
+    }
+
+    pub fn listTelegramBackfillCandidates(self: *Self, allocator: std.mem.Allocator) ![]TelegramBackfillCandidate {
+        const q = try self.buildQuery(
+            "SELECT user_id, COALESCE(telegram->>'account_id', 'default') AS account_id, (telegram->>'chat_id')::bigint AS chat_id " ++
+                "FROM {schema}.channel_state " ++
+                "WHERE telegram ? 'chat_id' AND COALESCE(telegram->>'chat_id', '') ~ '^-?[0-9]+$'",
+        );
+        defer self.allocator.free(q);
+        const result = try self.exec(q);
+        defer c.PQclear(result);
+        const rows: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc(TelegramBackfillCandidate, rows);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*row| row.deinit(allocator);
+            allocator.free(out);
+        }
+        for (0..rows) |i| {
+            const row_idx: c_int = @intCast(i);
+            const user_text = try dupeResultValue(allocator, result, row_idx, 0);
+            defer allocator.free(user_text);
+            const chat_text = try dupeResultValue(allocator, result, row_idx, 2);
+            defer allocator.free(chat_text);
+            out[i] = .{
+                .user_id = try std.fmt.parseInt(i64, user_text, 10),
+                .account_id = try dupeResultValue(allocator, result, row_idx, 1),
+                .chat_id = try std.fmt.parseInt(i64, chat_text, 10),
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
     pub fn acquireUserOwnershipLease(
         self: *Self,
         allocator: std.mem.Allocator,
@@ -1558,6 +1884,11 @@ fn dupeResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int
     return allocator.dupe(u8, val[0..len]);
 }
 
+fn dupeNullableResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) !?[]u8 {
+    if (c.PQgetisnull(result, row, col) != 0) return null;
+    return dupeResultValue(allocator, result, row, col);
+}
+
 fn categoryToMemoryType(category: memory_root.MemoryCategory) []const u8 {
     return switch (category) {
         .core => "core",
@@ -1926,4 +2257,113 @@ test "postgres memory upsert recall list and forget stay user-scoped" {
     try std.testing.expect(try mgr.forgetMemory(2, "favorite_snack"));
     const count_after = try mgr.countMemories(2);
     try std.testing.expectEqual(@as(usize, 0), count_after);
+}
+
+test "postgres channel identity bindings upsert resolve list delete and backfill candidates" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+    try mgr.provisionUser(3, "/tmp/nullalis-zaki-bot-test-user-3/workspace");
+
+    const first_binding_id = try mgr.upsertChannelIdentityBinding(
+        allocator,
+        2,
+        "telegram",
+        "default",
+        "telegram:principal:111",
+        "telegram:scope:111",
+        null,
+        "direct",
+        "111",
+        "{\"source\":\"test\"}",
+    );
+    defer allocator.free(first_binding_id);
+    try std.testing.expect(first_binding_id.len > 0);
+
+    const resolved_first = try mgr.resolveUserByChannelIdentity(
+        "telegram",
+        "default",
+        "telegram:principal:111",
+        "telegram:scope:111",
+        null,
+    );
+    try std.testing.expectEqual(@as(?i64, 2), resolved_first);
+
+    const conflict_binding_id = try mgr.upsertChannelIdentityBinding(
+        allocator,
+        3,
+        "telegram",
+        "default",
+        "telegram:principal:111",
+        "telegram:scope:111",
+        null,
+        "direct",
+        "111",
+        "{\"source\":\"conflict\"}",
+    );
+    defer allocator.free(conflict_binding_id);
+    try std.testing.expectEqualStrings(first_binding_id, conflict_binding_id);
+
+    const resolved_conflict = try mgr.resolveUserByChannelIdentity(
+        "telegram",
+        "default",
+        "telegram:principal:111",
+        "telegram:scope:111",
+        null,
+    );
+    try std.testing.expectEqual(@as(?i64, 3), resolved_conflict);
+
+    const listed = try mgr.listChannelIdentityBindings(allocator, 3, "telegram");
+    defer {
+        for (listed) |*entry| entry.deinit(allocator);
+        allocator.free(listed);
+    }
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("telegram", listed[0].channel);
+    try std.testing.expectEqualStrings("telegram:principal:111", listed[0].principal_key);
+
+    const deleted = try mgr.deleteChannelIdentityBinding(3, listed[0].id);
+    try std.testing.expect(deleted);
+
+    const resolved_after_delete = try mgr.resolveUserByChannelIdentity(
+        "telegram",
+        "default",
+        "telegram:principal:111",
+        "telegram:scope:111",
+        null,
+    );
+    try std.testing.expectEqual(@as(?i64, null), resolved_after_delete);
+
+    try mgr.putTelegramStateJson(2, "{\"chat_id\":12345,\"account_id\":\"default\",\"connected\":true}");
+    const backfill = try mgr.listTelegramBackfillCandidates(allocator);
+    defer {
+        for (backfill) |*entry| entry.deinit(allocator);
+        allocator.free(backfill);
+    }
+    try std.testing.expect(backfill.len >= 1);
 }

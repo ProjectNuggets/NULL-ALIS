@@ -1361,6 +1361,18 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ten.object.get("runtime_idle_ttl_secs")) |v| {
                 if (v == .integer) self.tenant.runtime_idle_ttl_secs = @intCast(v.integer);
             }
+            if (ten.object.get("identity_mapping_enforcement")) |v| {
+                if (v == .string) self.tenant.identity_mapping_enforcement = try self.allocator.dupe(u8, v.string);
+            }
+            if (ten.object.get("identity_mapping_strict_channels")) |v| {
+                if (v == .array) self.tenant.identity_mapping_strict_channels = try parseStringArray(self.allocator, v.array);
+            }
+            if (ten.object.get("identity_mapping_positive_ttl_secs")) |v| {
+                if (v == .integer) self.tenant.identity_mapping_positive_ttl_secs = @intCast(v.integer);
+            }
+            if (ten.object.get("identity_mapping_negative_ttl_secs")) |v| {
+                if (v == .integer) self.tenant.identity_mapping_negative_ttl_secs = @intCast(v.integer);
+            }
         }
     }
 

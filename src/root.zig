@@ -80,6 +80,9 @@ pub const skillforge = @import("skillforge.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const voice = @import("voice.zig");
 pub const zaki_state = @import("zaki_state.zig");
+pub const channel_identity_key = @import("channel_identity_key.zig");
+pub const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
+pub const channel_identity_backfill = @import("channel_identity_backfill.zig");
 
 test {
     // Run tests from all imported modules
