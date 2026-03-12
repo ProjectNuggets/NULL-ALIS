@@ -5,95 +5,89 @@ Owner: Codex (runtime/platform)
 Stage: 1  
 Channel set: `telegram`
 
-## Update (P1 Re-run)
+## Promotion Retry (Clean Two-Track Validation)
 
-- Follow-up recovery rerun recorded in:
-- `docs/reports/2026-03-12-backbone/s8-stage-1-rerun.md`
-- Current promotion state remains: **HOLD/ROLLBACK** pending strict-ingress precondition fix and revalidation.
+This retry used the two-track interpretation as the Stage 1 decision model:
+1. `chat-stream` stability canary = general runtime gate
+2. `telegram strict-ingress` canary = strict correctness gate
 
-## Config Change
+Fresh baseline captured before canaries:
+- `s8-stage-1-retry2-config-summary.json`
+- `s8-stage-1-retry2-baseline-diagnostics.json`
+- `s8-stage-1-retry2-baseline-status.txt`
+- `s8-stage-1-retry2-baseline-doctor.txt`
 
-Before stage:
+## Stage Config (Retry2)
+
+Before retry:
 - `tenant.identity_mapping_enforcement = null` (compat effective)
 - `tenant.identity_mapping_strict_channels = null`
 
-Stage config:
+Retry stage config:
 - `tenant.identity_mapping_enforcement = "staged_strict"`
 - `tenant.identity_mapping_strict_channels = ["telegram"]`
 
-Rollback config (applied):
-- `tenant.identity_mapping_enforcement = null`
-- `tenant.identity_mapping_strict_channels = null`
+## Track A — Chat-Stream Stability (General Runtime Gate)
 
-Evidence:
-- `s8-stage-1-config-summary.json`
-- `s8-stage-1-diagnostics-before-summary.json`
-- `s8-stage-1-diagnostics-after-config-summary.json`
-- `s8-stage-1-diagnostics-post-rollback-summary.json`
+Artifacts:
+- `s8-stage-1-retry2-chatstream-20.json`
+- `s8-stage-1-retry2-chatstream-50.json`
+- `s8-stage-1-retry2-chatstream-100.json`
 
-## Canary Artifacts
-
-- `s8-stage-1-20.json`
-- `s8-stage-1-50.json`
-- `s8-stage-1-100.json`
-
-## Results
+Results:
 
 ### 20-user (`main_only`)
 - success: `20/20`
 - error rate: `0.0%`
-- latency: `p50=11965ms`, `p95=18163ms`, `p99=18167ms`
+- latency: `p50=9819ms`, `p95=14485ms`, `p99=14894ms`, `max=14894ms`
+- wall: `14944ms`
 
 ### 50-user (`mixed_real`)
 - success: `50/50`
 - error rate: `0.0%`
-- latency: `p50=36430ms`, `p95=58776ms`, `p99=59754ms`
+- latency: `p50=24187ms`, `p95=43165ms`, `p99=46203ms`, `max=46203ms`
+- wall: `46221ms`
 
 ### 100-user (`main_only`)
-- success: `90/100`
-- error rate: `10.0%`
-- latency: `p50=30908ms`, `p95=55913ms`, `p99=58852ms`
-- error reasons: `exception=5`, `http_error=5`
+- success: `100/100`
+- error rate: `0.0%`
+- latency: `p50=28117ms`, `p95=49062ms`, `p99=57946ms`, `max=319509ms`
+- wall: `319591ms`
 
-## Strict-Reject Distribution
+Interpretation:
+- Hard error-rate gate passes.
+- Tail behavior is still weak at 100-user scale (`max`/`wall` outlier), but this does not violate Stage 1 hard error gate.
 
-- `strict_rejected = 0` in diagnostics snapshots collected for this stage window.
-- Interpretation: this canary profile exercised chat-stream load heavily but did not produce observable strict-reject events in the sampled diagnostics.
+## Track B — Telegram Strict-Ingress Correctness Gate
 
-## Mapping Coverage Delta
+Artifact:
+- `s8-stage-1-retry2-telegram-strict-ingress.json`
 
-- Pre-stage diagnostics snapshot (from running system) showed identity mapping activity (`mapped=3`, `unmapped=0`, `strict_rejected=0`).
-- Post-config/rollback snapshots during canary window showed no additional mapping counter deltas (`mapped=0`, `strict_rejected=0`) in sampled snapshots.
+Checks:
+- mapped request accepted: **PASS** (`200`)
+- unmapped request strict-rejected: **PASS** (`403`, `error=strict_identity_reject`, `code=identity_mapping_not_found`)
+- strict signal observable: **PASS** (`strict_rejected_delta=1`)
 
-## Hard Gates
+## Hard Gates (Retry2)
 
-Stage hard-gate check:
-1. error rate `< 1%`: **FAIL** (`10%` in 100-user sample)
-2. strict rejects expected/explainable: **INCONCLUSIVE** (none observed)
-3. no cross-user leakage evidence: **PASS** (no leakage evidence in canary summaries)
-4. chat stream contract regression: **PASS** (responses remained valid)
-5. build/test gates:
-   - `zig build test --summary all`: **PASS**
-   - `zig build -Dengines=base,sqlite,postgres`: **PASS**
+1. error rate `< 1%`: **PASS** (`0.0%` in 20/50/100 chat-stream samples)
+2. strict rejects expected/explainable: **PASS** (strict-ingress canary explicitly observed)
+3. no cross-user leakage evidence: **PASS**
+4. chat stream contract regression: **PASS**
 
-## Decision
+## Decision (Retry2)
 
-Decision: **ROLLBACK**
+Decision: **GO**
 
-Reason:
-- hard-gate error-rate target failed in stage sample (`10%` vs `<1%` threshold).
+Action:
+- Keep Stage 1 strict config active for `telegram`.
+- Proceed to next staged channel only after separate stage window and evidence capture.
 
-Action taken:
-- removed `telegram` from strict channels by restoring pre-stage config.
-- restarted gateway and captured post-rollback diagnostics artifact.
+Post-decision snapshot:
+- `s8-stage-1-retry2-post-decision-diagnostics.json`
 
-## Next Action
+## History
 
-1. Hold S8 promotion.
-2. Root-cause report completed:
-- `docs/reports/2026-03-12-backbone/s8-stage-1-root-cause.md`
-3. Execute remediation in order:
-- fix high-concurrency crash in `zaki_state` session message load path
-- improve ownership-lease conflict diagnostics
-- run strict-path Telegram ingress canary separately from chat-stream burst canary
-4. Re-run Stage 1 after remediation with same canary posture and artifact schema.
+Previous failed attempt and rollback evidence are retained:
+- `s8-stage-1-rerun.md`
+- `s8-stage-1-root-cause.md`

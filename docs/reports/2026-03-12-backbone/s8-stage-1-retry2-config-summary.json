@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-03-12",
+  "tenant": {
+    "enabled": true,
+    "identity_mapping_enforcement": "staged_strict",
+    "identity_mapping_strict_channels": [
+      "telegram"
+    ]
+  },
+  "gateway": {
+    "internal_service_tokens_count": 1
+  }
+}

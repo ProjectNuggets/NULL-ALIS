@@ -1,0 +1,51 @@
+{
+  "account_id": "main",
+  "binding_upsert": {
+    "body": "{\"status\":\"upserted\",\"id\":\"18ca219ad155351aee8af0b1696d08ca\"}",
+    "json": {
+      "id": "18ca219ad155351aee8af0b1696d08ca",
+      "status": "upserted"
+    },
+    "ok": true,
+    "status_code": 200
+  },
+  "gateway_base": "http://127.0.0.1:3000",
+  "mapped": {
+    "accepted": true,
+    "principal": "Feddy267",
+    "response": {
+      "body": "{\"status\":\"ok\"}",
+      "json": {
+        "status": "ok"
+      },
+      "ok": true,
+      "status_code": 200
+    },
+    "scope": "1110331014"
+  },
+  "run_started_utc": "2026-03-12T21:39:04.193929+00:00",
+  "secret_source": "cli_arg",
+  "strict_observability": {
+    "strict_identity_reject_observed": true,
+    "strict_rejected_after": 1,
+    "strict_rejected_before": 0,
+    "strict_rejected_delta": 1
+  },
+  "unmapped": {
+    "chat_type": "group",
+    "principal": "Feddy267",
+    "response": {
+      "body": "{\"error\":\"strict_identity_reject\",\"code\":\"identity_mapping_not_found\"}",
+      "error": "http_error",
+      "json": {
+        "code": "identity_mapping_not_found",
+        "error": "strict_identity_reject"
+      },
+      "ok": false,
+      "status_code": 403
+    },
+    "scope": "1110331015",
+    "strict_reject_detected": true
+  },
+  "user_id": "1"
+}
