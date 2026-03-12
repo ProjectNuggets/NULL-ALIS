@@ -11,6 +11,7 @@
 //! Uses std.http.Server (built-in, no external deps).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
@@ -1111,6 +1112,11 @@ fn expectedHttpRequestSize(raw: []const u8) !?usize {
 }
 
 fn configureRequestReadTimeout(stream: std.net.Stream) void {
+    // Zig 0.15.x on Darwin can panic inside std.posix.setsockopt for
+    // SO_RCVTIMEO (EINVAL mapped to unreachable). Keep gateway stable by
+    // skipping this socket-level timeout there; request timeout is still
+    // enforced at higher layers.
+    if (builtin.os.tag == .macos) return;
     if (!@hasDecl(std.posix.SO, "RCVTIMEO")) return;
 
     const timeout = std.posix.timeval{
@@ -2646,6 +2652,11 @@ fn telegramSenderIdentity(
         }
     }
     return "unknown";
+}
+
+fn tenantTelegramUsesSharedMain(cfg_opt: ?*const Config) bool {
+    if (cfg_opt) |cfg| return cfg.session.cross_channel_shared_main;
+    return true;
 }
 
 fn lineSessionKey(buf: []u8, evt: channels.line.LineEvent) []const u8 {
@@ -4847,7 +4858,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 return;
             }
             scoped_user_id = user_id;
-            use_shared_main = true;
+            use_shared_main = tenantTelegramUsesSharedMain(ctx.config_opt);
 
             tenant_user_ctx = resolveUserContext(ctx.req_allocator, ctx.state, user_id) catch {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
@@ -5026,7 +5037,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             const is_group = telegramChatIsGroup(ctx.req_allocator, b);
             const peer_kind = if (is_group) "group" else "direct";
 
-            if (use_shared_main and tenant_user_ctx != null) {
+            if (tenant_user_ctx != null) {
                 const cfg = ctx.config_opt orelse {
                     ctx.response_status = "500 Internal Server Error";
                     ctx.response_body = "{\"error\":\"tenant config missing\"}";
@@ -5037,7 +5048,11 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 // failures silently drop replies.
 
                 var kb: [256]u8 = undefined;
-                const sk = zaki_session.userMainSessionKey(&kb, scoped_user_id.?);
+                const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg_opt| cfg_opt else null;
+                const sk = if (use_shared_main)
+                    zaki_session.userMainSessionKey(&kb, scoped_user_id.?)
+                else
+                    telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
                 const tenant_runtime = getTenantRuntime(ctx.state, cfg, &tenant_user_ctx.?) catch {
                     ctx.response_status = "500 Internal Server Error";
                     ctx.response_body = "{\"error\":\"tenant runtime init failed\"}";
@@ -7520,6 +7535,24 @@ test "telegramSessionKeyRouted applies session dm_scope for direct chats" {
 
     const key = telegramSessionKeyRouted(allocator, &key_buf, 4242, body, &cfg, "tg-main");
     try std.testing.expectEqualStrings("agent:tg-dm-agent:direct:4242", key);
+}
+
+test "tenantTelegramUsesSharedMain defaults true without config" {
+    try std.testing.expect(tenantTelegramUsesSharedMain(null));
+}
+
+test "tenantTelegramUsesSharedMain follows session cross_channel_shared_main" {
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    cfg.session.cross_channel_shared_main = false;
+    try std.testing.expect(!tenantTelegramUsesSharedMain(&cfg));
+
+    cfg.session.cross_channel_shared_main = true;
+    try std.testing.expect(tenantTelegramUsesSharedMain(&cfg));
 }
 
 test "lineSessionKeyRouted uses group id for group events" {

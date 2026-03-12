@@ -1,0 +1,19 @@
+{
+  "distinct_users": 50,
+  "error_reasons": {},
+  "errors": 0,
+  "latency_ms": {
+    "max": 263706,
+    "mean": 76880,
+    "min": 1041,
+    "p50": 16885,
+    "p95": 262837,
+    "p99": 263706
+  },
+  "mode": "multi-user",
+  "requested_users": 50,
+  "requests": 50,
+  "success": 50,
+  "wall_ms": 263717,
+  "workers": 50
+}

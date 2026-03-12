@@ -197,6 +197,17 @@ Note:
 - Monetization can begin in private beta after A1–A4 stabilize.
 - Broad paid rollout waits for A5/A6 gates.
 
+## 8.1 Runtime Operating Model Execution Doc
+
+For production-scale operational rollout (cell routing, quotas, canary gates, premium dedicated mode), execute:
+1. `docs/v0.2-operational-model-agent-runbook.md`
+
+This runbook is agent-executable and is the source of truth for:
+1. standard tier cell architecture
+2. noisy-neighbor containment
+3. promotion/rollback SLO gates
+4. premium dedicated tenant activation
+
 ## 9. KPIs (Product + Revenue)
 
 Product KPIs:

@@ -14,6 +14,7 @@ import argparse
 import concurrent.futures
 import json
 import statistics
+from collections import Counter, defaultdict
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +40,41 @@ def percentile(values: list[int], pct: float) -> int:
     idx = int(round((pct / 100.0) * (len(ordered) - 1)))
     idx = max(0, min(idx, len(ordered) - 1))
     return ordered[idx]
+
+
+def lane_from_session_key(session_key: str | None) -> str:
+    if not session_key:
+        return "none"
+    marker = ":thread:"
+    idx = session_key.rfind(marker)
+    if idx >= 0:
+        return "thread"
+    parts = session_key.split(":")
+    if not parts:
+        return "unknown"
+    tail = parts[-2] if len(parts) >= 2 else parts[-1]
+    if tail in {"main", "task", "cron", "bench"}:
+        return tail
+    return parts[-1] if parts[-1] in {"main", "task", "cron", "bench"} else "custom"
+
+
+def build_lane_strategy_session_key(strategy: str, user_id: str, request_id: int) -> tuple[str | None, str]:
+    if strategy == "main_only":
+        return f"agent:zaki-bot:user:{user_id}:main", "main"
+    if strategy == "thread_per_request":
+        return f"agent:zaki-bot:user:{user_id}:thread:req-{request_id}", "thread"
+    if strategy == "task_per_request":
+        return f"agent:zaki-bot:user:{user_id}:task:req-{request_id}", "task"
+    if strategy == "cron_per_request":
+        return f"agent:zaki-bot:user:{user_id}:cron:req-{request_id}", "cron"
+    if strategy == "mixed_real":
+        bucket = request_id % 20
+        if bucket < 16:
+            return f"agent:zaki-bot:user:{user_id}:thread:mix-{request_id}", "thread"
+        if bucket < 19:
+            return f"agent:zaki-bot:user:{user_id}:task:mix-{request_id}", "task"
+        return f"agent:zaki-bot:user:{user_id}:cron:mix-{request_id}", "cron"
+    raise ValueError(f"unsupported lane strategy: {strategy}")
 
 
 def run_one(
@@ -115,11 +151,28 @@ def main() -> int:
     parser.add_argument("--timeout-secs", type=int, default=240)
     parser.add_argument("--message", default="health check")
     parser.add_argument(
+        "--lane-strategy",
+        choices=[
+            "template",
+            "main_only",
+            "thread_per_request",
+            "task_per_request",
+            "cron_per_request",
+            "mixed_real",
+        ],
+        default="template",
+        help=(
+            "Session lane strategy. 'template' uses --session-key-template exactly. "
+            "All other modes derive deterministic session_key values."
+        ),
+    )
+    parser.add_argument(
         "--session-key-template",
         default="agent:zaki-bot:user:{user_id}:main",
         help=(
             "Session key template. Default targets each user's main lane. "
-            "Use empty string to omit session_key, or include {request_id} for isolated-per-request lanes."
+            "Use empty string to omit session_key, or include {request_id} for isolated-per-request lanes. "
+            "Only used when --lane-strategy=template."
         ),
     )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON summary")
@@ -143,10 +196,17 @@ def main() -> int:
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = []
+        request_plan: list[tuple[str, str | None, str]] = []
         for req_id, user_id in enumerate(user_ids):
-            session_key = None
-            if args.session_key_template:
-                session_key = args.session_key_template.format(user_id=user_id, request_id=req_id)
+            session_key: str | None = None
+            lane = "none"
+            if args.lane_strategy == "template":
+                if args.session_key_template:
+                    session_key = args.session_key_template.format(user_id=user_id, request_id=req_id)
+                lane = lane_from_session_key(session_key)
+            else:
+                session_key, lane = build_lane_strategy_session_key(args.lane_strategy, user_id, req_id)
+            request_plan.append((user_id, session_key, lane))
             futures.append(
                 pool.submit(
                     run_one,
@@ -169,10 +229,27 @@ def main() -> int:
     latencies = [r.elapsed_ms for r in success]
 
     distinct_users = len(set(user_ids))
+    distinct_session_keys = len({sk for _, sk, _ in request_plan if sk})
+    lane_counts = Counter([lane for _, _, lane in request_plan])
+    per_user_session_counts: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    for user_id, session_key, _ in request_plan:
+        key = session_key if session_key is not None else "<none>"
+        per_user_session_counts[user_id][key] += 1
+    all_user_session_counts = [count for sessions in per_user_session_counts.values() for count in sessions.values()]
+    sessions_per_user = [len(sessions) for sessions in per_user_session_counts.values()]
+    same_user_contention_profile = {
+        "max_requests_on_single_user_session": max(all_user_session_counts) if all_user_session_counts else 0,
+        "users_with_multi_sessions": sum(1 for v in sessions_per_user if v > 1),
+        "mean_sessions_per_user": round(statistics.mean(sessions_per_user), 2) if sessions_per_user else 0.0,
+        "mean_requests_per_user_session": round(statistics.mean(all_user_session_counts), 2) if all_user_session_counts else 0.0,
+    }
+
     summary = {
         "mode": args.mode,
+        "lane_strategy": args.lane_strategy,
         "requested_users": args.users,
         "distinct_users": distinct_users,
+        "distinct_session_keys": distinct_session_keys,
         "requests": total_requests,
         "workers": workers,
         "success": len(success),
@@ -187,6 +264,8 @@ def main() -> int:
             "max": max(latencies) if latencies else 0,
         },
         "error_reasons": {},
+        "lane_counts": dict(sorted(lane_counts.items())),
+        "same_user_contention_profile": same_user_contention_profile,
     }
     for err in failures:
         summary["error_reasons"][err.reason] = summary["error_reasons"].get(err.reason, 0) + 1
@@ -196,9 +275,10 @@ def main() -> int:
     else:
         print(
             f"[load-burst] mode={summary['mode']} requested_users={summary['requested_users']} "
-            f"distinct_users={summary['distinct_users']} "
+            f"distinct_users={summary['distinct_users']} distinct_session_keys={summary['distinct_session_keys']} "
             f"requests={summary['requests']} workers={summary['workers']}"
         )
+        print(f"[load-burst] lane_strategy={summary['lane_strategy']} lane_counts={summary['lane_counts']}")
         print(
             f"[load-burst] success={summary['success']} errors={summary['errors']} "
             f"wall_ms={summary['wall_ms']}"
