@@ -1,0 +1,346 @@
+{
+  "diagnostics": {
+    "after": null,
+    "after_error": "URLError:<urlopen error [Errno 61] Connection refused>",
+    "before": {
+      "bus": {
+        "capacity": 1024,
+        "inbound_len": 0,
+        "outbound_len": 0
+      },
+      "gateway": {
+        "drain_rejected_total": 0,
+        "draining": false,
+        "in_flight_requests": 1,
+        "overload_rejected_total": 0,
+        "requests_total": 1
+      },
+      "heartbeat_runtime": {
+        "available": false,
+        "last_reason": null,
+        "last_run_s": null,
+        "last_status": null,
+        "user_id": null
+      },
+      "heartbeat_wake": {
+        "coalesced_total": 0,
+        "dropped_total": 0,
+        "pending": 0
+      },
+      "identity_mapping": {
+        "cache_hit": 0,
+        "cache_miss": 0,
+        "cache_stale": 0,
+        "db_lookup_count": 0,
+        "db_lookup_ms_total": 0,
+        "degraded_compat": 0,
+        "mapped": 0,
+        "strict_rejected": 0,
+        "unmapped": 0
+      },
+      "instance_id": "pid-56538-1773333588",
+      "integrations": {
+        "telegram": {
+          "account_id": null,
+          "chat_id": null,
+          "configured": false,
+          "connected": null,
+          "data_source": "global"
+        }
+      },
+      "last_trigger": null,
+      "ops": {
+        "last_event": null,
+        "proactive_blocked_dedupe_total": 0,
+        "proactive_blocked_rate_total": 0,
+        "proactive_send_errors_total": 0,
+        "proactive_sent_total": 0,
+        "recent_events": [],
+        "scheduler_blocked_burst_total": 0,
+        "scheduler_blocked_cooldown_total": 0,
+        "scheduler_executed_total": 0
+      },
+      "owned_users_count": 0,
+      "pool": {
+        "hits": 0,
+        "idle": 0,
+        "misses": 0
+      },
+      "runtime_mode": "threaded",
+      "startup_self_check": {
+        "chat_fallback_chain": "together",
+        "chat_provider_effective": "openrouter",
+        "config_path": "/Users/nova/.nullalis/config.json",
+        "degraded": false,
+        "degraded_reason": "",
+        "embedding_provider_effective": "together",
+        "heartbeat_enabled": true,
+        "heartbeat_interval_minutes": 30,
+        "postgres_host": "127.0.0.1",
+        "postgres_port": 5432,
+        "postgres_schema": "zaki_bot",
+        "provider_data_source": "config",
+        "scheduler_backend": "postgres",
+        "state_backend_configured": "postgres",
+        "state_backend_effective": "postgres",
+        "tenant_enabled": true,
+        "webhook_mode": "none"
+      },
+      "tenant_lock_backend": "postgres_lease",
+      "tenant_lock_lease_secs": 300
+    },
+    "before_error": null,
+    "url": "http://127.0.0.1:3000/internal/diagnostics"
+  },
+  "distinct_session_keys": 100,
+  "distinct_users": 100,
+  "error_details": {
+    "detail_counts": {
+      "[Errno 54] Connection reset by peer": 73,
+      "chat_failed: chat failed": 11,
+      "stream_closed_without_terminal_done": 16
+    },
+    "exception_classes": {
+      "ConnectionResetError": 73,
+      "SSE": 27
+    },
+    "status_codes": {
+      "200": 27
+    }
+  },
+  "error_reasons": {
+    "exception": 73,
+    "sse_error_done": 11,
+    "stream_no_done": 16
+  },
+  "errors": 100,
+  "failure_samples": [
+    {
+      "elapsed_ms": 13494,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 2,
+      "status_code": 200,
+      "user_id": "3"
+    },
+    {
+      "elapsed_ms": 13541,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 1,
+      "status_code": 200,
+      "user_id": "2"
+    },
+    {
+      "elapsed_ms": 13585,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 5,
+      "status_code": 200,
+      "user_id": "6"
+    },
+    {
+      "elapsed_ms": 13700,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 9,
+      "status_code": 200,
+      "user_id": "10"
+    },
+    {
+      "elapsed_ms": 13738,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 3,
+      "status_code": 200,
+      "user_id": "4"
+    },
+    {
+      "elapsed_ms": 13783,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 7,
+      "status_code": 200,
+      "user_id": "8"
+    },
+    {
+      "elapsed_ms": 13807,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 4,
+      "status_code": 200,
+      "user_id": "5"
+    },
+    {
+      "elapsed_ms": 13820,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 10,
+      "status_code": 200,
+      "user_id": "11"
+    },
+    {
+      "elapsed_ms": 13826,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 14,
+      "status_code": 200,
+      "user_id": "15"
+    },
+    {
+      "elapsed_ms": 13891,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 13,
+      "status_code": 200,
+      "user_id": "14"
+    },
+    {
+      "elapsed_ms": 13918,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 8,
+      "status_code": 200,
+      "user_id": "9"
+    },
+    {
+      "elapsed_ms": 14110,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 99,
+      "status_code": null,
+      "user_id": "100"
+    },
+    {
+      "elapsed_ms": 14112,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 86,
+      "status_code": null,
+      "user_id": "87"
+    },
+    {
+      "elapsed_ms": 14113,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 82,
+      "status_code": null,
+      "user_id": "83"
+    },
+    {
+      "elapsed_ms": 14115,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 64,
+      "status_code": null,
+      "user_id": "65"
+    },
+    {
+      "elapsed_ms": 14111,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 94,
+      "status_code": null,
+      "user_id": "95"
+    },
+    {
+      "elapsed_ms": 14118,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 49,
+      "status_code": null,
+      "user_id": "50"
+    },
+    {
+      "elapsed_ms": 14120,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 33,
+      "status_code": null,
+      "user_id": "34"
+    },
+    {
+      "elapsed_ms": 14122,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 25,
+      "status_code": 200,
+      "user_id": "26"
+    },
+    {
+      "elapsed_ms": 14115,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 68,
+      "status_code": null,
+      "user_id": "69"
+    }
+  ],
+  "lane_counts": {
+    "main": 100
+  },
+  "lane_strategy": "main_only",
+  "latency_ms": {
+    "max": 0,
+    "mean": 0,
+    "min": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0
+  },
+  "mode": "multi-user",
+  "requested_users": 100,
+  "requests": 100,
+  "run_finished_utc": "2026-03-12T16:40:10.861068+00:00",
+  "run_label": "s8_rca_strict_telegram_100",
+  "run_started_utc": "2026-03-12T16:39:56.707145+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 0,
+  "wall_ms": 14153,
+  "workers": 100
+}

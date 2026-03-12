@@ -1,0 +1,431 @@
+{
+  "diagnostics": {
+    "after": {
+      "bus": {
+        "capacity": 1024,
+        "inbound_len": 0,
+        "outbound_len": 0
+      },
+      "gateway": {
+        "drain_rejected_total": 0,
+        "draining": false,
+        "in_flight_requests": 1,
+        "overload_rejected_total": 0,
+        "requests_total": 204
+      },
+      "heartbeat_runtime": {
+        "available": false,
+        "last_reason": null,
+        "last_run_s": null,
+        "last_status": null,
+        "user_id": null
+      },
+      "heartbeat_wake": {
+        "coalesced_total": 0,
+        "dropped_total": 0,
+        "pending": 0
+      },
+      "identity_mapping": {
+        "cache_hit": 0,
+        "cache_miss": 0,
+        "cache_stale": 0,
+        "db_lookup_count": 0,
+        "db_lookup_ms_total": 0,
+        "degraded_compat": 0,
+        "mapped": 0,
+        "strict_rejected": 0,
+        "unmapped": 0
+      },
+      "instance_id": "pid-53478-1773333339",
+      "integrations": {
+        "telegram": {
+          "account_id": null,
+          "chat_id": null,
+          "configured": false,
+          "connected": null,
+          "data_source": "global"
+        }
+      },
+      "last_trigger": null,
+      "ops": {
+        "last_event": null,
+        "proactive_blocked_dedupe_total": 0,
+        "proactive_blocked_rate_total": 0,
+        "proactive_send_errors_total": 0,
+        "proactive_sent_total": 0,
+        "recent_events": [],
+        "scheduler_blocked_burst_total": 0,
+        "scheduler_blocked_cooldown_total": 0,
+        "scheduler_executed_total": 0
+      },
+      "owned_users_count": 0,
+      "pool": {
+        "hits": 0,
+        "idle": 0,
+        "misses": 0
+      },
+      "runtime_mode": "threaded",
+      "startup_self_check": {
+        "chat_fallback_chain": "together",
+        "chat_provider_effective": "openrouter",
+        "config_path": "/Users/nova/.nullalis/config.json",
+        "degraded": false,
+        "degraded_reason": "",
+        "embedding_provider_effective": "together",
+        "heartbeat_enabled": true,
+        "heartbeat_interval_minutes": 30,
+        "postgres_host": "127.0.0.1",
+        "postgres_port": 5432,
+        "postgres_schema": "zaki_bot",
+        "provider_data_source": "config",
+        "scheduler_backend": "postgres",
+        "state_backend_configured": "postgres",
+        "state_backend_effective": "postgres",
+        "tenant_enabled": true,
+        "webhook_mode": "none"
+      },
+      "tenant_lock_backend": "postgres_lease",
+      "tenant_lock_lease_secs": 300
+    },
+    "after_error": null,
+    "before": {
+      "bus": {
+        "capacity": 1024,
+        "inbound_len": 0,
+        "outbound_len": 0
+      },
+      "gateway": {
+        "drain_rejected_total": 0,
+        "draining": false,
+        "in_flight_requests": 1,
+        "overload_rejected_total": 0,
+        "requests_total": 103
+      },
+      "heartbeat_runtime": {
+        "available": false,
+        "last_reason": null,
+        "last_run_s": null,
+        "last_status": null,
+        "user_id": null
+      },
+      "heartbeat_wake": {
+        "coalesced_total": 0,
+        "dropped_total": 0,
+        "pending": 0
+      },
+      "identity_mapping": {
+        "cache_hit": 0,
+        "cache_miss": 0,
+        "cache_stale": 0,
+        "db_lookup_count": 0,
+        "db_lookup_ms_total": 0,
+        "degraded_compat": 0,
+        "mapped": 0,
+        "strict_rejected": 0,
+        "unmapped": 0
+      },
+      "instance_id": "pid-53478-1773333339",
+      "integrations": {
+        "telegram": {
+          "account_id": null,
+          "chat_id": null,
+          "configured": false,
+          "connected": null,
+          "data_source": "global"
+        }
+      },
+      "last_trigger": null,
+      "ops": {
+        "last_event": null,
+        "proactive_blocked_dedupe_total": 0,
+        "proactive_blocked_rate_total": 0,
+        "proactive_send_errors_total": 0,
+        "proactive_sent_total": 0,
+        "recent_events": [],
+        "scheduler_blocked_burst_total": 0,
+        "scheduler_blocked_cooldown_total": 0,
+        "scheduler_executed_total": 0
+      },
+      "owned_users_count": 0,
+      "pool": {
+        "hits": 0,
+        "idle": 0,
+        "misses": 0
+      },
+      "runtime_mode": "threaded",
+      "startup_self_check": {
+        "chat_fallback_chain": "together",
+        "chat_provider_effective": "openrouter",
+        "config_path": "/Users/nova/.nullalis/config.json",
+        "degraded": false,
+        "degraded_reason": "",
+        "embedding_provider_effective": "together",
+        "heartbeat_enabled": true,
+        "heartbeat_interval_minutes": 30,
+        "postgres_host": "127.0.0.1",
+        "postgres_port": 5432,
+        "postgres_schema": "zaki_bot",
+        "provider_data_source": "config",
+        "scheduler_backend": "postgres",
+        "state_backend_configured": "postgres",
+        "state_backend_effective": "postgres",
+        "tenant_enabled": true,
+        "webhook_mode": "none"
+      },
+      "tenant_lock_backend": "postgres_lease",
+      "tenant_lock_lease_secs": 300
+    },
+    "before_error": null,
+    "url": "http://127.0.0.1:3000/internal/diagnostics"
+  },
+  "distinct_session_keys": 100,
+  "distinct_users": 100,
+  "error_details": {
+    "detail_counts": {
+      "chat_failed: chat failed": 84,
+      "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}": 16
+    },
+    "exception_classes": {
+      "HTTPError": 16,
+      "SSE": 84
+    },
+    "status_codes": {
+      "200": 84,
+      "409": 16
+    }
+  },
+  "error_reasons": {
+    "http_error": 16,
+    "sse_error_done": 84
+  },
+  "errors": 100,
+  "failure_samples": [
+    {
+      "elapsed_ms": 98,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 2,
+      "status_code": 409,
+      "user_id": "3"
+    },
+    {
+      "elapsed_ms": 97,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 13,
+      "status_code": 409,
+      "user_id": "14"
+    },
+    {
+      "elapsed_ms": 99,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 3,
+      "status_code": 409,
+      "user_id": "4"
+    },
+    {
+      "elapsed_ms": 97,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 14,
+      "status_code": 409,
+      "user_id": "15"
+    },
+    {
+      "elapsed_ms": 98,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 8,
+      "status_code": 409,
+      "user_id": "9"
+    },
+    {
+      "elapsed_ms": 98,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 10,
+      "status_code": 409,
+      "user_id": "11"
+    },
+    {
+      "elapsed_ms": 99,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 0,
+      "status_code": 409,
+      "user_id": "1"
+    },
+    {
+      "elapsed_ms": 97,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 15,
+      "status_code": 409,
+      "user_id": "16"
+    },
+    {
+      "elapsed_ms": 99,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 5,
+      "status_code": 409,
+      "user_id": "6"
+    },
+    {
+      "elapsed_ms": 99,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 11,
+      "status_code": 409,
+      "user_id": "12"
+    },
+    {
+      "elapsed_ms": 100,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 6,
+      "status_code": 409,
+      "user_id": "7"
+    },
+    {
+      "elapsed_ms": 102,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 1,
+      "status_code": 409,
+      "user_id": "2"
+    },
+    {
+      "elapsed_ms": 101,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 9,
+      "status_code": 409,
+      "user_id": "10"
+    },
+    {
+      "elapsed_ms": 101,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 7,
+      "status_code": 409,
+      "user_id": "8"
+    },
+    {
+      "elapsed_ms": 100,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 12,
+      "status_code": 409,
+      "user_id": "13"
+    },
+    {
+      "elapsed_ms": 102,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 4,
+      "status_code": 409,
+      "user_id": "5"
+    },
+    {
+      "elapsed_ms": 9710,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 20,
+      "status_code": 200,
+      "user_id": "21"
+    },
+    {
+      "elapsed_ms": 9715,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 26,
+      "status_code": 200,
+      "user_id": "27"
+    },
+    {
+      "elapsed_ms": 9765,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 30,
+      "status_code": 200,
+      "user_id": "31"
+    },
+    {
+      "elapsed_ms": 9822,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 21,
+      "status_code": 200,
+      "user_id": "22"
+    }
+  ],
+  "lane_counts": {
+    "main": 100
+  },
+  "lane_strategy": "main_only",
+  "latency_ms": {
+    "max": 0,
+    "mean": 0,
+    "min": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0
+  },
+  "mode": "multi-user",
+  "requested_users": 100,
+  "requests": 100,
+  "run_finished_utc": "2026-03-12T16:39:19.173426+00:00",
+  "run_label": "s8_rca_compat_100_v2",
+  "run_started_utc": "2026-03-12T16:38:24.150066+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 0,
+  "wall_ms": 55023,
+  "workers": 100
+}

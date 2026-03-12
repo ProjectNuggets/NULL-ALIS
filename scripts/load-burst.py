@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime
 import json
 import statistics
 from collections import Counter, defaultdict
@@ -29,6 +30,9 @@ class RequestResult:
     elapsed_ms: int
     reason: str
     status_code: int | None = None
+    error_class: str | None = None
+    error_detail: str | None = None
+    error_body: str | None = None
 
 
 def percentile(values: list[int], pct: float) -> int:
@@ -77,6 +81,63 @@ def build_lane_strategy_session_key(strategy: str, user_id: str, request_id: int
     raise ValueError(f"unsupported lane strategy: {strategy}")
 
 
+def compact_detail(raw: str | None, *, limit: int = 240) -> str | None:
+    if not raw:
+        return None
+    text = " ".join(raw.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def extract_sse_error_detail(payload: str | None) -> str | None:
+    if not payload:
+        return None
+    text = payload.strip()
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            code = obj.get("code")
+            message = obj.get("message")
+            if isinstance(code, str) and isinstance(message, str):
+                return f"{code}: {message}"
+            if isinstance(code, str):
+                return code
+            if isinstance(message, str):
+                return message
+    except Exception:
+        pass
+    return compact_detail(text)
+
+
+def fetch_diagnostics(*, url: str, token: str, timeout_secs: int) -> tuple[dict | None, str | None]:
+    req = urllib.request.Request(
+        url=url,
+        method="GET",
+        headers={
+            "X-Internal-Token": token,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
+            if resp.getcode() < 200 or resp.getcode() >= 300:
+                return None, f"http_status:{resp.getcode()}"
+            data = resp.read().decode("utf-8", errors="replace")
+            return json.loads(data), None
+    except urllib.error.HTTPError as err:
+        detail = None
+        try:
+            detail = compact_detail(err.read().decode("utf-8", errors="replace"))
+        except Exception:
+            detail = None
+        suffix = f" body={detail}" if detail else ""
+        return None, f"http_error:{err.code}{suffix}"
+    except Exception as err:
+        return None, f"{err.__class__.__name__}:{compact_detail(str(err), limit=120) or ''}"
+
+
 def run_one(
     *,
     url: str,
@@ -108,36 +169,135 @@ def run_one(
             status = resp.getcode()
             if status < 200 or status >= 300:
                 elapsed_ms = int((time.time() - started) * 1000)
-                return RequestResult(False, user_id, request_id, elapsed_ms, "http_status", status)
+                return RequestResult(
+                    False,
+                    user_id,
+                    request_id,
+                    elapsed_ms,
+                    "http_status",
+                    status,
+                    "HTTPStatus",
+                    f"non_2xx_status:{status}",
+                )
 
             saw_done = False
             saw_error = False
+            current_event: str | None = None
+            current_data: list[str] = []
+            first_error_payload: str | None = None
             for raw in resp:
                 line = raw.decode("utf-8", errors="replace").strip()
-                if not line.startswith("event:"):
+                if not line:
+                    if current_event == "error":
+                        saw_error = True
+                        if first_error_payload is None and current_data:
+                            first_error_payload = "\n".join(current_data)
+                    if current_event == "done":
+                        saw_done = True
+                        break
+                    current_event = None
+                    current_data.clear()
                     continue
-                event_name = line.split(":", 1)[1].strip()
-                if event_name == "error":
-                    saw_error = True
-                if event_name == "done":
-                    saw_done = True
-                    break
+                if line.startswith("event:"):
+                    current_event = line.split(":", 1)[1].strip()
+                    continue
+                if line.startswith("data:"):
+                    current_data.append(line.split(":", 1)[1].strip())
+                    continue
 
             elapsed_ms = int((time.time() - started) * 1000)
             if saw_done and not saw_error:
                 return RequestResult(True, user_id, request_id, elapsed_ms, "ok", status)
             if saw_done and saw_error:
-                return RequestResult(False, user_id, request_id, elapsed_ms, "sse_error_done", status)
-            return RequestResult(False, user_id, request_id, elapsed_ms, "stream_no_done", status)
+                sse_detail = extract_sse_error_detail(first_error_payload)
+                return RequestResult(
+                    False,
+                    user_id,
+                    request_id,
+                    elapsed_ms,
+                    "sse_error_done",
+                    status,
+                    "SSE",
+                    sse_detail or "received_done_after_error_event",
+                    compact_detail(first_error_payload, limit=1000),
+                )
+            return RequestResult(
+                False,
+                user_id,
+                request_id,
+                elapsed_ms,
+                "stream_no_done",
+                status,
+                "SSE",
+                "stream_closed_without_terminal_done",
+            )
     except urllib.error.HTTPError as err:
         elapsed_ms = int((time.time() - started) * 1000)
-        return RequestResult(False, user_id, request_id, elapsed_ms, "http_error", err.code)
-    except TimeoutError:
+        error_body: str | None = None
+        try:
+            error_body = compact_detail(err.read().decode("utf-8", errors="replace"), limit=1000)
+        except Exception:
+            error_body = None
+        error_detail = error_body
+        if error_body:
+            try:
+                payload = json.loads(error_body)
+                if isinstance(payload, dict):
+                    if isinstance(payload.get("error"), str):
+                        error_detail = payload["error"]
+                    elif isinstance(payload.get("message"), str):
+                        error_detail = payload["message"]
+            except Exception:
+                pass
+        return RequestResult(
+            False,
+            user_id,
+            request_id,
+            elapsed_ms,
+            "http_error",
+            err.code,
+            err.__class__.__name__,
+            compact_detail(error_detail),
+            error_body,
+        )
+    except TimeoutError as err:
         elapsed_ms = int((time.time() - started) * 1000)
-        return RequestResult(False, user_id, request_id, elapsed_ms, "timeout", None)
-    except Exception:
+        return RequestResult(
+            False,
+            user_id,
+            request_id,
+            elapsed_ms,
+            "timeout",
+            None,
+            err.__class__.__name__,
+            compact_detail(str(err)),
+        )
+    except urllib.error.URLError as err:
         elapsed_ms = int((time.time() - started) * 1000)
-        return RequestResult(False, user_id, request_id, elapsed_ms, "exception", None)
+        reason = err.reason
+        reason_class = reason.__class__.__name__ if reason is not None else err.__class__.__name__
+        return RequestResult(
+            False,
+            user_id,
+            request_id,
+            elapsed_ms,
+            "url_error",
+            None,
+            reason_class,
+            compact_detail(str(reason)),
+        )
+    except Exception as err:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return RequestResult(
+            False,
+            user_id,
+            request_id,
+            elapsed_ms,
+            "exception",
+            None,
+            err.__class__.__name__,
+            compact_detail(str(err)),
+        )
 
 
 def main() -> int:
@@ -150,6 +310,23 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=0, help="Thread workers; 0 means requests count")
     parser.add_argument("--timeout-secs", type=int, default=240)
     parser.add_argument("--message", default="health check")
+    parser.add_argument("--run-label", default="", help="Optional run label included in JSON output")
+    parser.add_argument(
+        "--capture-diagnostics",
+        action="store_true",
+        help="Capture /internal/diagnostics snapshots before and after the run",
+    )
+    parser.add_argument(
+        "--diagnostics-url",
+        default="http://127.0.0.1:3000/internal/diagnostics",
+        help="Diagnostics endpoint used when --capture-diagnostics is set",
+    )
+    parser.add_argument(
+        "--failure-samples-limit",
+        type=int,
+        default=20,
+        help="Max failed-request sample rows to include in JSON output",
+    )
     parser.add_argument(
         "--lane-strategy",
         choices=[
@@ -181,6 +358,7 @@ def main() -> int:
     total_requests = args.requests if args.requests > 0 else args.users
     workers = args.workers if args.workers > 0 else total_requests
     workers = max(1, workers)
+    run_started_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     user_ids: list[str] = []
     if args.mode == "single-user":
@@ -193,6 +371,12 @@ def main() -> int:
 
     started = time.time()
     results: list[RequestResult] = []
+    diagnostics_before = None
+    diagnostics_before_error = None
+    if args.capture_diagnostics:
+        diagnostics_before, diagnostics_before_error = fetch_diagnostics(
+            url=args.diagnostics_url, token=args.token, timeout_secs=args.timeout_secs
+        )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = []
@@ -224,9 +408,16 @@ def main() -> int:
             results.append(f.result())
 
     wall_ms = int((time.time() - started) * 1000)
+    run_finished_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
     success = [r for r in results if r.ok]
     failures = [r for r in results if not r.ok]
     latencies = [r.elapsed_ms for r in success]
+    diagnostics_after = None
+    diagnostics_after_error = None
+    if args.capture_diagnostics:
+        diagnostics_after, diagnostics_after_error = fetch_diagnostics(
+            url=args.diagnostics_url, token=args.token, timeout_secs=args.timeout_secs
+        )
 
     distinct_users = len(set(user_ids))
     distinct_session_keys = len({sk for _, sk, _ in request_plan if sk})
@@ -245,6 +436,9 @@ def main() -> int:
     }
 
     summary = {
+        "run_label": args.run_label,
+        "run_started_utc": run_started_utc,
+        "run_finished_utc": run_finished_utc,
         "mode": args.mode,
         "lane_strategy": args.lane_strategy,
         "requested_users": args.users,
@@ -264,11 +458,50 @@ def main() -> int:
             "max": max(latencies) if latencies else 0,
         },
         "error_reasons": {},
+        "error_details": {
+            "status_codes": {},
+            "exception_classes": {},
+            "detail_counts": {},
+        },
+        "failure_samples": [],
         "lane_counts": dict(sorted(lane_counts.items())),
         "same_user_contention_profile": same_user_contention_profile,
     }
+    status_code_counts: Counter[str] = Counter()
+    exception_class_counts: Counter[str] = Counter()
+    detail_counts: Counter[str] = Counter()
     for err in failures:
         summary["error_reasons"][err.reason] = summary["error_reasons"].get(err.reason, 0) + 1
+        if err.status_code is not None:
+            status_code_counts[str(err.status_code)] += 1
+        if err.error_class:
+            exception_class_counts[err.error_class] += 1
+        if err.error_detail:
+            detail_counts[err.error_detail] += 1
+        if len(summary["failure_samples"]) < args.failure_samples_limit:
+            summary["failure_samples"].append(
+                {
+                    "request_id": err.request_id,
+                    "user_id": err.user_id,
+                    "reason": err.reason,
+                    "status_code": err.status_code,
+                    "error_class": err.error_class,
+                    "error_detail": err.error_detail,
+                    "error_body": err.error_body,
+                    "elapsed_ms": err.elapsed_ms,
+                }
+            )
+    summary["error_details"]["status_codes"] = dict(sorted(status_code_counts.items()))
+    summary["error_details"]["exception_classes"] = dict(sorted(exception_class_counts.items()))
+    summary["error_details"]["detail_counts"] = dict(sorted(detail_counts.items(), key=lambda item: (-item[1], item[0])))
+    if args.capture_diagnostics:
+        summary["diagnostics"] = {
+            "url": args.diagnostics_url,
+            "before_error": diagnostics_before_error,
+            "after_error": diagnostics_after_error,
+            "before": diagnostics_before,
+            "after": diagnostics_after,
+        }
 
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
@@ -291,6 +524,18 @@ def main() -> int:
         )
         if summary["error_reasons"]:
             print(f"[load-burst] errors_by_reason={summary['error_reasons']}")
+        if summary["error_details"]["status_codes"]:
+            print(f"[load-burst] errors_by_status={summary['error_details']['status_codes']}")
+        if summary["error_details"]["exception_classes"]:
+            print(f"[load-burst] errors_by_exception={summary['error_details']['exception_classes']}")
+        if summary["error_details"]["detail_counts"]:
+            top_detail = next(iter(summary["error_details"]["detail_counts"].items()))
+            print(f"[load-burst] top_error_detail={top_detail[0]!r} count={top_detail[1]}")
+        if args.capture_diagnostics:
+            print(
+                "[load-burst] diagnostics_capture "
+                f"before_error={diagnostics_before_error} after_error={diagnostics_after_error}"
+            )
 
     # CI-friendly: non-zero when any request failed.
     return 0 if len(failures) == 0 else 1

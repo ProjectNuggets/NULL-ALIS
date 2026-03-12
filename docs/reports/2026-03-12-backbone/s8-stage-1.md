@@ -84,5 +84,10 @@ Action taken:
 ## Next Action
 
 1. Hold S8 promotion.
-2. Root-cause 100-user error reasons (`exception`/`http_error`) under this posture.
-3. Re-run Stage 1 after remediation with same canary posture and artifact schema.
+2. Root-cause report completed:
+- `docs/reports/2026-03-12-backbone/s8-stage-1-root-cause.md`
+3. Execute remediation in order:
+- fix high-concurrency crash in `zaki_state` session message load path
+- improve ownership-lease conflict diagnostics
+- run strict-path Telegram ingress canary separately from chat-stream burst canary
+4. Re-run Stage 1 after remediation with same canary posture and artifact schema.
