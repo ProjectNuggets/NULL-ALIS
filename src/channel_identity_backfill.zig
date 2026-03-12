@@ -174,3 +174,119 @@ test "buildTelegramCandidateKey is deterministic" {
     defer std.testing.allocator.free(key);
     try std.testing.expectEqualStrings("default:12345", key);
 }
+
+fn hasBackfillRow(
+    rows: []const BackfillRow,
+    account_id: []const u8,
+    chat_id: i64,
+    reason: []const u8,
+) bool {
+    for (rows) |row| {
+        if (!std.mem.eql(u8, row.account_id, account_id)) continue;
+        if (row.chat_id != chat_id) continue;
+        if (!std.mem.eql(u8, row.reason, reason)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn countBindingsForAccount(
+    allocator: std.mem.Allocator,
+    mgr: *zaki_state.Manager,
+    user_id: i64,
+    account_id: []const u8,
+) !usize {
+    const bindings = try mgr.listChannelIdentityBindings(allocator, user_id, "telegram");
+    defer {
+        for (bindings) |*row| row.deinit(allocator);
+        allocator.free(bindings);
+    }
+    var count: usize = 0;
+    for (bindings) |row| {
+        if (std.mem.eql(u8, row.account_id, account_id)) count += 1;
+    }
+    return count;
+}
+
+test "runTelegramBackfill flags conflicting candidate users as ambiguous" {
+    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
+        error.PostgresNotEnabled => return error.SkipZigTest,
+        else => return err,
+    };
+    defer mgr.deinit();
+
+    const account_id = "bf-ambiguous-conflict";
+    const chat_id: i64 = 990201;
+    try mgr.recordTelegramChat(9902011, account_id, chat_id);
+    try mgr.recordTelegramChat(9902012, account_id, chat_id);
+
+    var report = try runTelegramBackfill(std.testing.allocator, &mgr);
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expect(hasBackfillRow(report.ambiguous, account_id, chat_id, "conflicting_candidate_users"));
+}
+
+test "runTelegramBackfill flags existing binding conflict as ambiguous" {
+    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
+        error.PostgresNotEnabled => return error.SkipZigTest,
+        else => return err,
+    };
+    defer mgr.deinit();
+
+    const account_id = "bf-existing-binding-conflict";
+    const chat_id: i64 = 990202;
+    var chat_buf: [32]u8 = undefined;
+    const chat_text = try std.fmt.bufPrint(&chat_buf, "{d}", .{chat_id});
+    var identity_keys = try channel_identity_key.build(
+        std.testing.allocator,
+        "telegram",
+        chat_text,
+        chat_text,
+        null,
+    );
+    defer identity_keys.deinit(std.testing.allocator);
+
+    const owner_user_id: i64 = 9902021;
+    const candidate_user_id: i64 = 9902022;
+    const binding_id = try mgr.upsertChannelIdentityBinding(
+        std.testing.allocator,
+        owner_user_id,
+        "telegram",
+        account_id,
+        identity_keys.principal_key,
+        identity_keys.scope_key,
+        null,
+        "direct",
+        chat_text,
+        "{\"source\":\"backfill_test\"}",
+    );
+    defer std.testing.allocator.free(binding_id);
+
+    try mgr.recordTelegramChat(candidate_user_id, account_id, chat_id);
+
+    var report = try runTelegramBackfill(std.testing.allocator, &mgr);
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expect(hasBackfillRow(report.ambiguous, account_id, chat_id, "binding_conflict_existing_user"));
+}
+
+test "runTelegramBackfill remains idempotent for migrated bindings" {
+    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
+        error.PostgresNotEnabled => return error.SkipZigTest,
+        else => return err,
+    };
+    defer mgr.deinit();
+
+    const account_id = "bf-idempotent";
+    const chat_id: i64 = 990203;
+    const user_id: i64 = 9902031;
+    try mgr.recordTelegramChat(user_id, account_id, chat_id);
+
+    var first = try runTelegramBackfill(std.testing.allocator, &mgr);
+    defer first.deinit(std.testing.allocator);
+    var second = try runTelegramBackfill(std.testing.allocator, &mgr);
+    defer second.deinit(std.testing.allocator);
+
+    const binding_count = try countBindingsForAccount(std.testing.allocator, &mgr, user_id, account_id);
+    try std.testing.expectEqual(@as(usize, 1), binding_count);
+}
