@@ -1,0 +1,52 @@
+{
+  "account_id": "stage2a",
+  "binding_upsert": {
+    "body": "{\"status\":\"upserted\",\"id\":\"a33942a18b2f7a040da537c8466e5edd\"}",
+    "json": {
+      "id": "a33942a18b2f7a040da537c8466e5edd",
+      "status": "upserted"
+    },
+    "ok": true,
+    "status_code": 200
+  },
+  "gateway_base": "http://127.0.0.1:3000",
+  "mapped": {
+    "accepted": true,
+    "principal": "U_STAGE2A_MAPPED",
+    "response": {
+      "body": "{\"status\":\"ok\"}",
+      "json": {
+        "status": "ok"
+      },
+      "ok": true,
+      "signature": "v0=c0d0209d77760cf75f8c3e009cce1dba575ac7f3fe1b8669961371d752ad1191",
+      "status_code": 200
+    },
+    "scope": "D_STAGE2A_MAPPED"
+  },
+  "run_started_utc": "2026-03-12T23:23:51.053618+00:00",
+  "strict_observability": {
+    "strict_identity_reject_observed": true,
+    "strict_rejected_after": 1,
+    "strict_rejected_before": 0,
+    "strict_rejected_delta": 1
+  },
+  "unmapped": {
+    "principal": "U_STAGE2A_UNMAPPED",
+    "response": {
+      "body": "{\"error\":\"strict_identity_reject\",\"code\":\"identity_mapping_not_found\"}",
+      "error": "http_error",
+      "json": {
+        "code": "identity_mapping_not_found",
+        "error": "strict_identity_reject"
+      },
+      "ok": false,
+      "signature": "v0=58e6db22f4c52e114cfe959a0752bcc6861acdb90432c1f7ac8b05f68bfc5488",
+      "status_code": 403
+    },
+    "scope": "D_STAGE2A_UNMAPPED",
+    "strict_reject_detected": true
+  },
+  "user_id": "1",
+  "webhook_path": "/slack/events"
+}

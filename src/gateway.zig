@@ -6049,6 +6049,81 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         break :blk channel_id.len > 0 and channel_id[0] == 'D';
     };
 
+    var key_buf: [256]u8 = undefined;
+    const fallback_session_key = slackSessionKeyRouted(
+        ctx.req_allocator,
+        &key_buf,
+        slack_cfg.account_id,
+        sender_id,
+        channel_id,
+        is_dm,
+        ctx.config_opt,
+    );
+    var effective_session_key = fallback_session_key;
+    var canonical_decision_opt: ?inbound_canonicalizer.CanonicalizationDecision = null;
+    defer if (canonical_decision_opt) |*decision| decision.deinit(ctx.req_allocator);
+
+    if (ctx.config_opt) |cfg| {
+        const thread_raw = blk: {
+            if (event_obj.get("thread_ts")) |thread_val| {
+                if (thread_val == .string and std.mem.trim(u8, thread_val.string, " \t\r\n").len > 0) {
+                    break :blk thread_val.string;
+                }
+            }
+            break :blk null;
+        };
+        var identity_keys = channel_identity_key.build(
+            ctx.req_allocator,
+            "slack",
+            sender_id,
+            channel_id,
+            thread_raw,
+        ) catch {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid slack identity\"}";
+            return;
+        };
+        defer identity_keys.deinit(ctx.req_allocator);
+
+        canonical_decision_opt = inbound_canonicalizer.canonicalizeInboundTurn(
+            ctx.req_allocator,
+            ctx.state.zaki_state,
+            cfg,
+            .{
+                .channel = "slack",
+                .account_id = slack_cfg.account_id,
+                .principal_key = identity_keys.principal_key,
+                .scope_key = identity_keys.scope_key,
+                .thread_key = identity_keys.thread_key,
+                .fallback_session_key = fallback_session_key,
+                .lane = if (identity_keys.thread_key != null) .thread else .main,
+            },
+        ) catch |err| {
+            log.warn("slack canonicalization failed: {}", .{err});
+            ctx.response_status = "500 Internal Server Error";
+            ctx.response_body = "{\"error\":\"canonicalization_failed\"}";
+            return;
+        };
+
+        switch (canonical_decision_opt.?.kind) {
+            .strict_reject => {
+                const reject_body = std.fmt.allocPrint(
+                    ctx.req_allocator,
+                    "{{\"error\":\"strict_identity_reject\",\"code\":\"{s}\"}}",
+                    .{canonical_decision_opt.?.reason_code},
+                ) catch "{\"error\":\"strict_identity_reject\"}";
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = reject_body;
+                return;
+            },
+            .canonical, .degraded_compat => {
+                if (canonical_decision_opt.?.session_key) |canonical_session_key| {
+                    effective_session_key = canonical_session_key;
+                }
+            },
+        }
+    }
+
     var policy_channel = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
     const envelope_bot_user_id = slackEnvelopeBotUserId(parsed.value.object);
     var allowed = policy_channel.shouldHandle(sender_id, is_dm, text, envelope_bot_user_id);
@@ -6059,17 +6134,6 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"status\":\"ok\"}";
         return;
     }
-
-    var key_buf: [256]u8 = undefined;
-    const sk = slackSessionKeyRouted(
-        ctx.req_allocator,
-        &key_buf,
-        slack_cfg.account_id,
-        sender_id,
-        channel_id,
-        is_dm,
-        ctx.config_opt,
-    );
 
     if (ctx.state.event_bus) |eb| {
         var meta_buf: [384]u8 = undefined;
@@ -6086,9 +6150,9 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                 peer_id,
             },
         ) catch null;
-        _ = publishToBus(eb, ctx.state.allocator, "slack", sender_id, channel_id, text, sk, metadata);
+        _ = publishToBus(eb, ctx.state.allocator, "slack", sender_id, channel_id, text, effective_session_key, metadata);
     } else if (ctx.session_mgr_opt) |sm| {
-        const reply: ?[]const u8 = sm.processMessage(sk, text, null) catch |err| blk: {
+        const reply: ?[]const u8 = sm.processMessage(effective_session_key, text, null) catch |err| blk: {
             var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
             outbound_ch.sendMessage(channel_id, userFacingAgentError(err)) catch {};
             break :blk null;
@@ -8619,6 +8683,144 @@ test "verifySlackSignature accepts valid signature" {
     }
 
     try std.testing.expect(verifySlackSignature(std.testing.allocator, body, ts, &sig_buf, secret));
+}
+
+fn buildSignedSlackWebhookRequest(
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    body: []const u8,
+    signing_secret: []const u8,
+) ![]u8 {
+    var ts_buf: [32]u8 = undefined;
+    const ts = try std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()});
+
+    var signed: std.ArrayListUnmanaged(u8) = .empty;
+    defer signed.deinit(allocator);
+    const sw = signed.writer(allocator);
+    try sw.print("v0:{s}:", .{ts});
+    try sw.writeAll(body);
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, signed.items, signing_secret);
+
+    var sig_buf: [67]u8 = undefined; // "v0=" + 64 hex
+    @memcpy(sig_buf[0..3], "v0=");
+    for (0..32) |i| {
+        const byte = mac[i];
+        sig_buf[3 + i * 2] = "0123456789abcdef"[byte >> 4];
+        sig_buf[3 + i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "POST {s} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-Slack-Request-Timestamp: {s}\r\nX-Slack-Signature: {s}\r\n\r\n{s}",
+        .{ target, ts, sig_buf, body },
+    );
+}
+
+test "handleSlackWebhookRoute strict rejects unmapped ingress when channel is strict" {
+    if (!build_options.enable_channel_slack) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const signing_secret = "strict_slack_secret";
+    const body =
+        \\{"type":"event_callback","event":{"type":"message","user":"U_STRICT","text":"hello","channel":"D_STRICT","channel_type":"im","event_ts":"1700000000","ts":"1700000000"}}
+    ;
+    const raw = try buildSignedSlackWebhookRequest(allocator, "/slack/events", body, signing_secret);
+
+    const slack_accounts = [_]config_types.SlackConfig{
+        .{
+            .account_id = "stage2a",
+            .mode = .http,
+            .bot_token = "xoxb-stage2a",
+            .signing_secret = signing_secret,
+            .webhook_path = "/slack/events",
+        },
+    };
+    const strict_channels = [_][]const u8{"slack"};
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{ .slack = &slack_accounts },
+    };
+    cfg.tenant.enabled = true;
+    cfg.tenant.identity_mapping_enforcement = "staged_strict";
+    cfg.tenant.identity_mapping_strict_channels = &strict_channels;
+    cfg.state.backend = "postgres";
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/slack/events",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleSlackWebhookRoute(&ctx);
+
+    try std.testing.expectEqualStrings("403 Forbidden", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "strict_identity_reject") != null);
+}
+
+test "handleSlackWebhookRoute compat mode accepts unmapped ingress" {
+    if (!build_options.enable_channel_slack) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const signing_secret = "compat_slack_secret";
+    const body =
+        \\{"type":"event_callback","event":{"type":"message","user":"U_COMPAT","text":"hello","channel":"D_COMPAT","channel_type":"im","event_ts":"1700000001","ts":"1700000001"}}
+    ;
+    const raw = try buildSignedSlackWebhookRequest(allocator, "/slack/events", body, signing_secret);
+
+    const slack_accounts = [_]config_types.SlackConfig{
+        .{
+            .account_id = "stage2a",
+            .mode = .http,
+            .bot_token = "xoxb-stage2a",
+            .signing_secret = signing_secret,
+            .webhook_path = "/slack/events",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{ .slack = &slack_accounts },
+    };
+    cfg.tenant.enabled = true;
+    cfg.tenant.identity_mapping_enforcement = "compat";
+    cfg.state.backend = "postgres";
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/slack/events",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleSlackWebhookRoute(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"status\":\"ok\"}", ctx.response_body);
 }
 
 test "verifySlackSignature rejects stale timestamp" {

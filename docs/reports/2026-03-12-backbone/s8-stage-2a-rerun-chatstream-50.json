@@ -1,0 +1,41 @@
+{
+  "distinct_session_keys": 50,
+  "distinct_users": 50,
+  "error_details": {
+    "detail_counts": {},
+    "exception_classes": {},
+    "status_codes": {}
+  },
+  "error_reasons": {},
+  "errors": 0,
+  "failure_samples": [],
+  "lane_counts": {
+    "cron": 2,
+    "task": 6,
+    "thread": 42
+  },
+  "lane_strategy": "mixed_real",
+  "latency_ms": {
+    "max": 120433,
+    "mean": 74158,
+    "min": 23161,
+    "p50": 73474,
+    "p95": 114107,
+    "p99": 120433
+  },
+  "mode": "multi-user",
+  "requested_users": 50,
+  "requests": 50,
+  "run_finished_utc": "2026-03-12T23:23:46.759004+00:00",
+  "run_label": "s8-stage-2a-rerun-chatstream-50",
+  "run_started_utc": "2026-03-12T23:21:46.312874+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 50,
+  "wall_ms": 120445,
+  "workers": 50
+}

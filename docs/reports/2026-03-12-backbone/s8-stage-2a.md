@@ -62,3 +62,8 @@ Rollback action:
 Before Stage 2A re-attempt:
 1. Wire Slack webhook ingress through canonicalizer/strict decision path (same enforcement model as Telegram path).
 2. Re-run this exact two-track Stage 2A canary set.
+
+## Follow-up
+
+Rerun evidence and decision are recorded in:
+- `docs/reports/2026-03-12-backbone/s8-stage-2a-rerun.md`
