@@ -9,11 +9,17 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
+const http_util = @import("../../http_util.zig");
 const GeminiEmbedding = @import("embeddings_gemini.zig").GeminiEmbedding;
 const VoyageEmbedding = @import("embeddings_voyage.zig").VoyageEmbedding;
 const OllamaEmbedding = @import("embeddings_ollama.zig").OllamaEmbedding;
 const net_security = @import("../../net_security.zig");
 const log = std.log.scoped(.embeddings);
+
+fn openai_embedding_transport_config() http_util.TransportConfig {
+    // Force curl for embedding providers to avoid known native TLS aborts under load.
+    return .{ .mode = .curl_only };
+}
 
 // ── Embedding provider vtable ─────────────────────────────────────
 
@@ -296,41 +302,37 @@ pub const OpenAiEmbedding = struct {
         const url = try self_.embeddingsUrl(allocator);
         defer allocator.free(url);
 
-        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self_.api_key});
+        const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{self_.api_key});
         defer allocator.free(auth_header);
 
-        var client = std.http.Client{ .allocator = allocator };
-        defer client.deinit();
-
-        var aw: std.Io.Writer.Allocating = .init(allocator);
-        defer aw.deinit();
-
-        var headers: [4]std.http.Header = undefined;
+        var headers: [4][]const u8 = undefined;
         var header_count: usize = 0;
-        headers[header_count] = .{ .name = "Authorization", .value = auth_header };
+        headers[header_count] = auth_header;
         header_count += 1;
-        headers[header_count] = .{ .name = "Content-Type", .value = "application/json" };
+        headers[header_count] = "Content-Type: application/json";
         header_count += 1;
         if (std.mem.indexOf(u8, self_.base_url, "openrouter.ai") != null) {
             // OpenRouter embedding requests use OpenAI-compatible payloads but benefit from
             // explicit client identity headers for policy/routing.
-            headers[header_count] = .{ .name = "HTTP-Referer", .value = "https://nullalis.local" };
+            headers[header_count] = "HTTP-Referer: https://nullalis.local";
             header_count += 1;
-            headers[header_count] = .{ .name = "X-Title", .value = "nullalis" };
+            headers[header_count] = "X-Title: nullalis";
             header_count += 1;
         }
 
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body_buf.items,
-            .extra_headers = headers[0..header_count],
-            .response_writer = &aw.writer,
+        const response = http_util.request_with_mode(allocator, openai_embedding_transport_config(), .{
+            .method = "POST",
+            .url = url,
+            .headers = headers[0..header_count],
+            .body = body_buf.items,
+            .timeout_ms = 60_000,
+            .subsystem = .providers,
         }) catch return error.EmbeddingApiError;
+        defer allocator.free(response.body);
 
-        if (result.status != .ok) {
-            const status_code: u16 = @intFromEnum(result.status);
-            const resp_body = aw.writer.buffer[0..aw.writer.end];
+        if (response.status_code != 200) {
+            const status_code = response.status_code;
+            const resp_body = response.body;
             if (resp_body.len > 0) {
                 log.warn("embedding request failed status={d} provider={s} body={s}", .{
                     status_code,
@@ -359,7 +361,7 @@ pub const OpenAiEmbedding = struct {
             return error.EmbeddingApiError;
         }
 
-        const resp_body = aw.writer.buffer[0..aw.writer.end];
+        const resp_body = response.body;
         if (resp_body.len == 0) return error.EmbeddingApiError;
 
         // Parse JSON to extract embedding array
@@ -838,6 +840,11 @@ test "OpenAiEmbedding embeddingsUrl already has embeddings" {
     const url = try impl_.embeddingsUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://my-api.example.com/api/v2/embeddings", url);
+}
+
+test "openai embedding transport is curl_only" {
+    const cfg = openai_embedding_transport_config();
+    try std.testing.expectEqual(http_util.TransportMode.curl_only, cfg.mode);
 }
 
 // Regression test: createEmbeddingProvider("none") must heap-allocate NoopEmbedding
