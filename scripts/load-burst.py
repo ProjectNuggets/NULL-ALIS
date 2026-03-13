@@ -16,6 +16,7 @@ import datetime
 import json
 import statistics
 from collections import Counter, defaultdict
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -136,6 +137,59 @@ def fetch_diagnostics(*, url: str, token: str, timeout_secs: int) -> tuple[dict 
         return None, f"http_error:{err.code}{suffix}"
     except Exception as err:
         return None, f"{err.__class__.__name__}:{compact_detail(str(err), limit=120) or ''}"
+
+
+def run_probe_series(
+    *,
+    url: str,
+    token: str,
+    timeout_secs: int,
+    message: str,
+    user_id: str,
+    session_key: str | None,
+    count: int,
+    interval_ms: int,
+    request_id_offset: int,
+) -> list[RequestResult]:
+    results: list[RequestResult] = []
+    for idx in range(count):
+        results.append(
+            run_one(
+                url=url,
+                token=token,
+                timeout_secs=timeout_secs,
+                message=message,
+                user_id=user_id,
+                request_id=request_id_offset + idx,
+                session_key=session_key,
+            )
+        )
+        if idx + 1 < count and interval_ms > 0:
+            time.sleep(interval_ms / 1000.0)
+    return results
+
+
+def summarize_probe_results(results: list[RequestResult]) -> dict:
+    success = [r for r in results if r.ok]
+    failures = [r for r in results if not r.ok]
+    latencies = [r.elapsed_ms for r in success]
+    error_reasons: Counter[str] = Counter()
+    for row in failures:
+        error_reasons[row.reason] += 1
+    return {
+        "count": len(results),
+        "success": len(success),
+        "errors": len(failures),
+        "latency_ms": {
+            "p50": percentile(latencies, 50),
+            "p95": percentile(latencies, 95),
+            "p99": percentile(latencies, 99),
+            "mean": int(statistics.mean(latencies)) if latencies else 0,
+            "min": min(latencies) if latencies else 0,
+            "max": max(latencies) if latencies else 0,
+        },
+        "error_reasons": dict(sorted(error_reasons.items())),
+    }
 
 
 def run_one(
@@ -352,6 +406,39 @@ def main() -> int:
             "Only used when --lane-strategy=template."
         ),
     )
+    parser.add_argument(
+        "--isolation-probe-user-id",
+        default="",
+        help="Optional unaffected cohort probe user id. When set with --isolation-probe-count>0, records baseline and under-load probe latencies.",
+    )
+    parser.add_argument(
+        "--isolation-probe-count",
+        type=int,
+        default=0,
+        help="Number of probe requests to send for baseline and under-load phases.",
+    )
+    parser.add_argument(
+        "--isolation-probe-interval-ms",
+        type=int,
+        default=250,
+        help="Delay between probe requests in each phase.",
+    )
+    parser.add_argument(
+        "--isolation-probe-session-key-template",
+        default="agent:zaki-bot:user:{user_id}:main",
+        help="Session key template for isolation probes; set empty string to omit session_key.",
+    )
+    parser.add_argument(
+        "--isolation-probe-message",
+        default="isolation probe",
+        help="Message payload used by isolation probes.",
+    )
+    parser.add_argument(
+        "--isolation-gate-p95-max-degradation-pct",
+        type=float,
+        default=15.0,
+        help="Maximum allowed unaffected cohort p95 degradation percentage.",
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON summary")
     args = parser.parse_args()
 
@@ -369,6 +456,28 @@ def main() -> int:
         for i in range(total_requests):
             user_ids.append(str((i % user_count) + 1))
 
+    isolation_probe_enabled = bool(args.isolation_probe_user_id) and args.isolation_probe_count > 0
+    isolation_probe_session_key = None
+    if isolation_probe_enabled and args.isolation_probe_session_key_template:
+        isolation_probe_session_key = args.isolation_probe_session_key_template.format(
+            user_id=args.isolation_probe_user_id
+        )
+    isolation_probe_baseline_results: list[RequestResult] = []
+    isolation_probe_under_load_results: list[RequestResult] = []
+
+    if isolation_probe_enabled:
+        isolation_probe_baseline_results = run_probe_series(
+            url=args.url,
+            token=args.token,
+            timeout_secs=args.timeout_secs,
+            message=args.isolation_probe_message,
+            user_id=args.isolation_probe_user_id,
+            session_key=isolation_probe_session_key,
+            count=args.isolation_probe_count,
+            interval_ms=args.isolation_probe_interval_ms,
+            request_id_offset=1_000_000,
+        )
+
     started = time.time()
     results: list[RequestResult] = []
     diagnostics_before = None
@@ -378,9 +487,34 @@ def main() -> int:
             url=args.diagnostics_url, token=args.token, timeout_secs=args.timeout_secs
         )
 
+    isolation_probe_done = threading.Event()
+
+    def run_under_load_probe() -> None:
+        nonlocal isolation_probe_under_load_results
+        isolation_probe_under_load_results = run_probe_series(
+            url=args.url,
+            token=args.token,
+            timeout_secs=args.timeout_secs,
+            message=args.isolation_probe_message,
+            user_id=args.isolation_probe_user_id,
+            session_key=isolation_probe_session_key,
+            count=args.isolation_probe_count,
+            interval_ms=args.isolation_probe_interval_ms,
+            request_id_offset=2_000_000,
+        )
+        isolation_probe_done.set()
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = []
         request_plan: list[tuple[str, str | None, str]] = []
+        isolation_probe_thread: threading.Thread | None = None
+        if isolation_probe_enabled:
+            isolation_probe_thread = threading.Thread(
+                target=run_under_load_probe,
+                name="isolation-probe-under-load",
+                daemon=True,
+            )
+            isolation_probe_thread.start()
         for req_id, user_id in enumerate(user_ids):
             session_key: str | None = None
             lane = "none"
@@ -406,6 +540,8 @@ def main() -> int:
 
         for f in concurrent.futures.as_completed(futures):
             results.append(f.result())
+        if isolation_probe_thread is not None and not isolation_probe_done.is_set():
+            isolation_probe_thread.join()
 
     wall_ms = int((time.time() - started) * 1000)
     run_finished_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -467,6 +603,37 @@ def main() -> int:
         "lane_counts": dict(sorted(lane_counts.items())),
         "same_user_contention_profile": same_user_contention_profile,
     }
+    if isolation_probe_enabled:
+        baseline_probe = summarize_probe_results(isolation_probe_baseline_results)
+        under_load_probe = summarize_probe_results(isolation_probe_under_load_results)
+        baseline_p95 = baseline_probe["latency_ms"]["p95"]
+        under_load_p95 = under_load_probe["latency_ms"]["p95"]
+        degradation_pct_p95 = None
+        gate_pass = False
+        gate_status = "inconclusive"
+        if baseline_probe["errors"] == 0 and under_load_probe["errors"] == 0 and baseline_p95 > 0:
+            degradation_pct_p95 = round(((under_load_p95 - baseline_p95) * 100.0) / baseline_p95, 2)
+            gate_pass = degradation_pct_p95 <= args.isolation_gate_p95_max_degradation_pct
+            gate_status = "pass" if gate_pass else "fail"
+        isolation_probe_overlap_with_load_users = args.isolation_probe_user_id in set(user_ids)
+        summary["isolation_probe"] = {
+            "enabled": True,
+            "user_id": args.isolation_probe_user_id,
+            "session_key": isolation_probe_session_key,
+            "count_per_phase": args.isolation_probe_count,
+            "interval_ms": args.isolation_probe_interval_ms,
+            "gate_max_p95_degradation_pct": args.isolation_gate_p95_max_degradation_pct,
+            "overlap_with_load_users": isolation_probe_overlap_with_load_users,
+            "baseline": baseline_probe,
+            "under_load": under_load_probe,
+            "degradation_pct_p95": degradation_pct_p95,
+            "gate_pass": gate_pass,
+            "gate_status": gate_status,
+        }
+    else:
+        summary["isolation_probe"] = {
+            "enabled": False,
+        }
     status_code_counts: Counter[str] = Counter()
     exception_class_counts: Counter[str] = Counter()
     detail_counts: Counter[str] = Counter()
@@ -535,6 +702,15 @@ def main() -> int:
             print(
                 "[load-burst] diagnostics_capture "
                 f"before_error={diagnostics_before_error} after_error={diagnostics_after_error}"
+            )
+        if summary["isolation_probe"]["enabled"]:
+            probe = summary["isolation_probe"]
+            print(
+                "[load-burst] isolation_probe "
+                f"user_id={probe['user_id']} overlap_with_load_users={probe['overlap_with_load_users']} "
+                f"baseline_p95={probe['baseline']['latency_ms']['p95']} "
+                f"under_load_p95={probe['under_load']['latency_ms']['p95']} "
+                f"degradation_pct_p95={probe['degradation_pct_p95']} gate_pass={probe['gate_pass']}"
             )
 
     # CI-friendly: non-zero when any request failed.
