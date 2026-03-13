@@ -240,6 +240,18 @@ def run_one(
             current_data: list[str] = []
             first_error_payload: str | None = None
             for raw in resp:
+                if (time.time() - started) > timeout_secs:
+                    elapsed_ms = int((time.time() - started) * 1000)
+                    return RequestResult(
+                        False,
+                        user_id,
+                        request_id,
+                        elapsed_ms,
+                        "stream_timeout",
+                        status,
+                        "TimeoutError",
+                        f"stream_exceeded_timeout_secs:{timeout_secs}",
+                    )
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     if current_event == "error":
