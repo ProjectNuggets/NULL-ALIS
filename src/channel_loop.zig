@@ -541,6 +541,8 @@ fn processTelegramMessages(
                 .channel = "telegram",
                 .account_id = tg_ptr.account_id,
                 .chat_id = msg.sender,
+                .is_group = msg.is_group,
+                .is_dm = !msg.is_group,
             }) catch |err| {
                 log.err("Agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
@@ -613,18 +615,21 @@ pub fn runTelegramLoop(
 ) void {
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;
-    if (config.getProviderKey(trans.provider)) |key| {
-        const wt = allocator.create(voice.WhisperTranscriber) catch {
-            log.warn("Failed to allocate WhisperTranscriber", .{});
-            return;
-        };
-        wt.* = .{
-            .endpoint = voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url),
-            .api_key = key,
-            .model = trans.model,
-            .language = trans.language,
-        };
-        tg_ptr.transcriber = wt.transcriber();
+    if (trans.enabled) {
+        if (config.getProviderKey(trans.provider)) |key| {
+            const wt = allocator.create(voice.WhisperTranscriber) catch {
+                log.warn("Failed to allocate WhisperTranscriber", .{});
+                return;
+            };
+            wt.* = .{
+                .endpoint = voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url),
+                .api_key = key,
+                .model = trans.model,
+                .language = trans.language,
+            };
+            tg_ptr.transcriber = wt.transcriber();
+            voice.markTelegramTranscriberConfigured();
+        }
     }
 
     if (loadTelegramUpdateOffset(allocator, config, tg_ptr.account_id, tg_ptr.bot_token)) |saved_update_id| {
@@ -817,6 +822,8 @@ pub fn runSignalLoop(
                 .channel = "signal",
                 .account_id = sg_ptr.account_id,
                 .chat_id = signal_target,
+                .is_group = msg.is_group,
+                .is_dm = !msg.is_group,
             }) catch |err| {
                 log.err("Signal agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
@@ -1051,6 +1058,8 @@ pub fn runMatrixLoop(
                 .channel = "matrix",
                 .account_id = mx_ptr.account_id,
                 .chat_id = matrix_target,
+                .is_group = msg.is_group,
+                .is_dm = !msg.is_group,
             }) catch |err| {
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {

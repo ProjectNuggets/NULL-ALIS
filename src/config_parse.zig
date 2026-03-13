@@ -724,6 +724,42 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
             }
+            if (ag.object.get("session_ttl_secs")) |v| {
+                if (v == .integer and v.integer >= 0) self.agent.session_ttl_secs = @intCast(v.integer);
+            }
+            if (ag.object.get("activation_mode")) |v| {
+                if (v == .string) self.agent.activation_mode = try self.allocator.dupe(u8, v.string);
+            }
+            if (ag.object.get("send_mode")) |v| {
+                if (v == .string) self.agent.send_mode = try self.allocator.dupe(u8, v.string);
+            }
+            if (ag.object.get("queue_mode")) |v| {
+                if (v == .string) self.agent.queue_mode = try self.allocator.dupe(u8, v.string);
+            }
+            if (ag.object.get("queue_debounce_ms")) |v| {
+                if (v == .integer and v.integer >= 0) self.agent.queue_debounce_ms = @intCast(v.integer);
+            }
+            if (ag.object.get("queue_cap")) |v| {
+                if (v == .integer and v.integer >= 0) self.agent.queue_cap = @intCast(v.integer);
+            }
+            if (ag.object.get("queue_drop")) |v| {
+                if (v == .string) self.agent.queue_drop = try self.allocator.dupe(u8, v.string);
+            }
+            if (ag.object.get("tts_mode")) |v| {
+                if (v == .string) self.agent.tts_mode = try self.allocator.dupe(u8, v.string);
+            }
+            if (ag.object.get("tts_provider")) |v| {
+                if (v == .string) self.agent.tts_provider = try self.allocator.dupe(u8, v.string);
+            }
+            if (ag.object.get("tts_limit_chars")) |v| {
+                if (v == .integer and v.integer >= 0) self.agent.tts_limit_chars = @intCast(v.integer);
+            }
+            if (ag.object.get("tts_summary")) |v| {
+                if (v == .bool) self.agent.tts_summary = v.bool;
+            }
+            if (ag.object.get("tts_audio")) |v| {
+                if (v == .bool) self.agent.tts_audio = v.bool;
+            }
         }
     }
 

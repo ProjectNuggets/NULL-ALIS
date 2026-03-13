@@ -247,6 +247,7 @@ pub const Agent = struct {
     max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
     max_tokens_override: ?u32 = null,
     reasoning_effort: ?[]const u8 = null,
+    compact_context_enabled: bool = false,
     verbose_level: VerboseLevel = .off,
     reasoning_mode: ReasoningMode = .off,
     usage_mode: UsageMode = .off,
@@ -379,6 +380,20 @@ pub const Agent = struct {
             .max_tokens = resolved_max_tokens,
             .max_tokens_override = cfg.max_tokens,
             .reasoning_effort = cfg.reasoning_effort,
+            .compact_context_enabled = cfg.agent.compact_context,
+            .queue_mode = parseQueueModeFromConfig(cfg.agent.queue_mode),
+            .queue_debounce_ms = cfg.agent.queue_debounce_ms,
+            .queue_cap = cfg.agent.queue_cap,
+            .queue_drop = parseQueueDropFromConfig(cfg.agent.queue_drop),
+            .tts_mode = parseTtsModeFromConfig(cfg.agent.tts_mode),
+            .tts_provider = cfg.agent.tts_provider,
+            .tts_provider_owned = false,
+            .tts_limit_chars = cfg.agent.tts_limit_chars,
+            .tts_summary = cfg.agent.tts_summary,
+            .tts_audio = cfg.agent.tts_audio,
+            .session_ttl_secs = cfg.agent.session_ttl_secs,
+            .activation_mode = parseActivationModeFromConfig(cfg.agent.activation_mode),
+            .send_mode = parseSendModeFromConfig(cfg.agent.send_mode),
             .message_timeout_secs = cfg.agent.message_timeout_secs,
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
@@ -388,6 +403,37 @@ pub const Agent = struct {
             .has_system_prompt = false,
             .last_turn_compacted = false,
         };
+    }
+
+    fn parseQueueModeFromConfig(raw: []const u8) QueueMode {
+        if (std.ascii.eqlIgnoreCase(raw, "serial")) return .serial;
+        if (std.ascii.eqlIgnoreCase(raw, "latest")) return .latest;
+        if (std.ascii.eqlIgnoreCase(raw, "debounce")) return .debounce;
+        return .off;
+    }
+
+    fn parseQueueDropFromConfig(raw: []const u8) QueueDrop {
+        if (std.ascii.eqlIgnoreCase(raw, "oldest")) return .oldest;
+        if (std.ascii.eqlIgnoreCase(raw, "newest")) return .newest;
+        return .summarize;
+    }
+
+    fn parseTtsModeFromConfig(raw: []const u8) TtsMode {
+        if (std.ascii.eqlIgnoreCase(raw, "always")) return .always;
+        if (std.ascii.eqlIgnoreCase(raw, "inbound")) return .inbound;
+        if (std.ascii.eqlIgnoreCase(raw, "tagged")) return .tagged;
+        return .off;
+    }
+
+    fn parseActivationModeFromConfig(raw: []const u8) ActivationMode {
+        if (std.ascii.eqlIgnoreCase(raw, "always")) return .always;
+        return .mention;
+    }
+
+    fn parseSendModeFromConfig(raw: []const u8) SendMode {
+        if (std.ascii.eqlIgnoreCase(raw, "on")) return .on;
+        if (std.ascii.eqlIgnoreCase(raw, "off")) return .off;
+        return .inherit;
     }
 
     pub fn deinit(self: *Agent) void {
@@ -473,6 +519,42 @@ pub const Agent = struct {
 
     fn composeFinalReply(self: *const Agent, base_text: []const u8, reasoning_content: ?[]const u8, usage: providers.TokenUsage) ![]const u8 {
         return commands.composeFinalReply(self, base_text, reasoning_content, usage);
+    }
+
+    fn ttsModeEnabledForTurn(self: *const Agent, user_message: []const u8) bool {
+        return switch (self.tts_mode) {
+            .off => false,
+            .always => true,
+            .inbound => containsAsciiIgnoreCase(user_message, "[voice:") or containsAsciiIgnoreCase(user_message, "[audio:"),
+            .tagged => containsAsciiIgnoreCase(user_message, "#tts") or containsAsciiIgnoreCase(user_message, "[tts]"),
+        };
+    }
+
+    fn ttsProviderName(self: *const Agent) []const u8 {
+        return self.tts_provider orelse self.default_provider;
+    }
+
+    fn ttsTrimUtf8Boundary(text: []const u8, max_chars: usize) []const u8 {
+        if (text.len <= max_chars) return text;
+        var end = max_chars;
+        while (end > 0 and (text[end] & 0xC0) == 0x80) : (end -= 1) {}
+        return text[0..end];
+    }
+
+    fn prepareTtsPayload(self: *const Agent, allocator: std.mem.Allocator, user_message: []const u8, final_text: []const u8) !?[]u8 {
+        if (!self.ttsModeEnabledForTurn(user_message)) return null;
+        if (final_text.len == 0) return null;
+
+        var payload = final_text;
+        if (self.tts_limit_chars > 0 and payload.len > self.tts_limit_chars) {
+            payload = ttsTrimUtf8Boundary(payload, self.tts_limit_chars);
+        }
+
+        if (self.tts_summary and payload.len < final_text.len) {
+            const summarized = try std.fmt.allocPrint(allocator, "{s}...", .{payload});
+            return @as(?[]u8, summarized);
+        }
+        return @as(?[]u8, try allocator.dupe(u8, payload));
     }
 
     fn shouldForceActionFollowThrough(text: []const u8) bool {
@@ -1030,6 +1112,18 @@ pub const Agent = struct {
             .content = enriched,
         });
 
+        if (self.compact_context_enabled) {
+            const compact_start_ms = std.time.milliTimestamp();
+            _ = self.autoCompactHistory() catch false;
+            const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
+            log.info("turn.stage stage=compact_pre_provider duration_ms={d}", .{compact_duration_ms});
+            const compact_stage_event = ObserverEvent{ .turn_stage = .{
+                .stage = "compact_pre_provider",
+                .duration_ms = compact_duration_ms,
+            } };
+            self.observer.recordEvent(&compact_stage_event);
+        }
+
         // ── Response/Semantic cache check ──
         var key_buf: [16]u8 = undefined;
         const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
@@ -1402,6 +1496,34 @@ pub const Agent = struct {
                 self.observer.recordEvent(&compose_stage_event);
                 errdefer self.allocator.free(final_text);
 
+                const tts_start_ms = std.time.milliTimestamp();
+                if (try self.prepareTtsPayload(self.allocator, user_message, final_text)) |tts_payload| {
+                    defer self.allocator.free(tts_payload);
+                    const tts_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - tts_start_ms));
+                    log.info("turn.stage stage=tts_prepare iteration={d} duration_ms={d} chars={d} provider={s} audio={s}", .{
+                        iteration,
+                        tts_duration_ms,
+                        tts_payload.len,
+                        self.ttsProviderName(),
+                        if (self.tts_audio) "on" else "off",
+                    });
+                    const tts_stage_event = ObserverEvent{ .turn_stage = .{
+                        .stage = "tts_prepare",
+                        .iteration = iteration,
+                        .duration_ms = tts_duration_ms,
+                        .count = @intCast(@min(tts_payload.len, std.math.maxInt(u32))),
+                    } };
+                    self.observer.recordEvent(&tts_stage_event);
+                } else {
+                    const tts_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - tts_start_ms));
+                    log.info("turn.stage stage=tts_prepare iteration={d} duration_ms={d} chars=0 provider={s} audio={s}", .{
+                        iteration,
+                        tts_duration_ms,
+                        self.ttsProviderName(),
+                        if (self.tts_audio) "on" else "off",
+                    });
+                }
+
                 // Dupe from display_text directly (not from final_text) to avoid double-dupe
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
@@ -1673,6 +1795,18 @@ pub const Agent = struct {
     }
 
     fn executeToolUnchecked(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
+        if (std.mem.eql(u8, call.name, tools_mod.message.MessageTool.tool_name)) {
+            const turn_ctx = tools_mod.getTurnContext();
+            if (tools_mod.isBackgroundTurnOrigin(turn_ctx.origin) and self.send_mode == .off) {
+                return .{
+                    .name = call.name,
+                    .output = "Proactive sends are disabled (send_mode=off)",
+                    .success = false,
+                    .tool_call_id = call.tool_call_id,
+                };
+            }
+        }
+
         for (self.tools) |t| {
             if (std.mem.eql(u8, t.name(), call.name)) {
                 // Parse arguments JSON to ObjectMap ONCE
@@ -2774,6 +2908,46 @@ test "Agent.fromConfig clamps max_tokens to token_limit" {
 
     try std.testing.expectEqual(@as(u64, 4096), agent.token_limit);
     try std.testing.expectEqual(@as(u32, 4096), agent.max_tokens);
+}
+
+test "Agent.fromConfig applies queue ttl activation send and tts knobs" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.queue_mode = "debounce";
+    cfg.agent.queue_debounce_ms = 250;
+    cfg.agent.queue_cap = 9;
+    cfg.agent.queue_drop = "newest";
+    cfg.agent.session_ttl_secs = 3600;
+    cfg.agent.activation_mode = "always";
+    cfg.agent.send_mode = "off";
+    cfg.agent.tts_mode = "always";
+    cfg.agent.tts_provider = "openai";
+    cfg.agent.tts_limit_chars = 777;
+    cfg.agent.tts_summary = true;
+    cfg.agent.tts_audio = true;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.queue_mode == .debounce);
+    try std.testing.expectEqual(@as(u32, 250), agent.queue_debounce_ms);
+    try std.testing.expectEqual(@as(u32, 9), agent.queue_cap);
+    try std.testing.expect(agent.queue_drop == .newest);
+    try std.testing.expectEqual(@as(?u64, 3600), agent.session_ttl_secs);
+    try std.testing.expect(agent.activation_mode == .always);
+    try std.testing.expect(agent.send_mode == .off);
+    try std.testing.expect(agent.tts_mode == .always);
+    try std.testing.expect(agent.tts_provider != null);
+    try std.testing.expectEqualStrings("openai", agent.tts_provider.?);
+    try std.testing.expectEqual(@as(u32, 777), agent.tts_limit_chars);
+    try std.testing.expect(agent.tts_summary);
+    try std.testing.expect(agent.tts_audio);
 }
 
 test "slash /new clears history" {
@@ -4372,4 +4546,154 @@ test "Agent startsWithToolCallMarkup detects malformed tool output" {
 test "Agent startsWithToolCallMarkup ignores normal text" {
     try std.testing.expect(!Agent.startsWithToolCallMarkup("Here is the result."));
     try std.testing.expect(!Agent.startsWithToolCallMarkup("Use <tool_call> tags like this in docs."));
+}
+
+test "tts_audio_enabled_does_not_mutate_assistant_text" {
+    const allocator = std.testing.allocator;
+    const ProviderState = struct {
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{ .content = try allocator_.dupe(u8, "plain response") };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "tts-test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var state: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = ProviderState.chatWithSystem,
+        .chat = ProviderState.chat,
+        .supportsNativeTools = ProviderState.supportsNativeTools,
+        .getName = ProviderState.getName,
+        .deinit = ProviderState.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .tts_mode = .always,
+        .tts_audio = true,
+        .tts_provider = "openai",
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("plain response", response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "[TTS prepared via") == null);
+}
+
+test "tts_prepare_stage_emitted_when_mode_matches" {
+    const allocator = std.testing.allocator;
+    const ProviderState = struct {
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{ .content = try allocator_.dupe(u8, "stage check") };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "tts-stage-test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    const StageObserver = struct {
+        const Self = @This();
+        tts_stage_count: u32 = 0,
+        const vtable = Observer.VTable{
+            .record_event = recordEvent,
+            .record_metric = recordMetric,
+            .flush = flush,
+            .name = name,
+        };
+
+        fn observer(self: *Self) Observer {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn recordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            switch (event.*) {
+                .turn_stage => |stage| {
+                    if (std.mem.eql(u8, stage.stage, "tts_prepare")) self.tts_stage_count += 1;
+                },
+                else => {},
+            }
+        }
+
+        fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+        fn flush(_: *anyopaque) void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "tts-stage-observer";
+        }
+    };
+
+    var state: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = ProviderState.chatWithSystem,
+        .chat = ProviderState.chat,
+        .supportsNativeTools = ProviderState.supportsNativeTools,
+        .getName = ProviderState.getName,
+        .deinit = ProviderState.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &vtable };
+
+    var stage_observer = StageObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = stage_observer.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .tts_mode = .always,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("stage check", response);
+    try std.testing.expect(stage_observer.tts_stage_count > 0);
 }

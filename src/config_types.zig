@@ -154,6 +154,18 @@ pub const AgentConfig = struct {
     compaction_max_source_chars: u32 = 12_000,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
     message_timeout_secs: u64 = 300,
+    session_ttl_secs: ?u64 = null,
+    activation_mode: []const u8 = "mention",
+    send_mode: []const u8 = "inherit",
+    queue_mode: []const u8 = "off",
+    queue_debounce_ms: u32 = 0,
+    queue_cap: u32 = 0,
+    queue_drop: []const u8 = "summarize",
+    tts_mode: []const u8 = "off",
+    tts_provider: ?[]const u8 = null,
+    tts_limit_chars: u32 = 0,
+    tts_summary: bool = false,
+    tts_audio: bool = false,
 };
 
 pub const ToolsConfig = struct {

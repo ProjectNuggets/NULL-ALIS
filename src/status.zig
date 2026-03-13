@@ -141,6 +141,25 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
             optionalU64Text(&api_buf, snapshot.tenant_lock_conflicts_api),
         });
     }
+    if (snapshot.stt_transcriber_configured != null or
+        snapshot.stt_transcription_attempted != null or
+        snapshot.stt_transcription_succeeded != null or
+        snapshot.stt_transcription_failed != null or
+        snapshot.stt_transcription_skipped_no_transcriber != null)
+    {
+        var configured_buf: [24]u8 = undefined;
+        var attempted_buf: [24]u8 = undefined;
+        var succeeded_buf: [24]u8 = undefined;
+        var failed_buf: [24]u8 = undefined;
+        var skipped_buf: [24]u8 = undefined;
+        try w.print("Runtime STT: configured={s} attempted={s} succeeded={s} failed={s} skipped_no_transcriber={s}\n", .{
+            optionalU64Text(&configured_buf, snapshot.stt_transcriber_configured),
+            optionalU64Text(&attempted_buf, snapshot.stt_transcription_attempted),
+            optionalU64Text(&succeeded_buf, snapshot.stt_transcription_succeeded),
+            optionalU64Text(&failed_buf, snapshot.stt_transcription_failed),
+            optionalU64Text(&skipped_buf, snapshot.stt_transcription_skipped_no_transcriber),
+        });
+    }
     if (snapshot.tenant_lease_probe_data_source != null) {
         var lease_until_buf: [24]u8 = undefined;
         var updated_buf: [24]u8 = undefined;

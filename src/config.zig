@@ -628,6 +628,18 @@ pub const Config = struct {
             .compaction_max_summary_chars = self.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
             .message_timeout_secs = self.agent.message_timeout_secs,
+            .session_ttl_secs = self.agent.session_ttl_secs,
+            .activation_mode = self.agent.activation_mode,
+            .send_mode = self.agent.send_mode,
+            .queue_mode = self.agent.queue_mode,
+            .queue_debounce_ms = self.agent.queue_debounce_ms,
+            .queue_cap = self.agent.queue_cap,
+            .queue_drop = self.agent.queue_drop,
+            .tts_mode = self.agent.tts_mode,
+            .tts_provider = self.agent.tts_provider,
+            .tts_limit_chars = self.agent.tts_limit_chars,
+            .tts_summary = self.agent.tts_summary,
+            .tts_audio = self.agent.tts_audio,
         }, .{})});
 
         // Channels
@@ -1594,7 +1606,7 @@ test "json parse scheduler section" {
 test "json parse agent section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "parallel_tools_rollout_percent": 60, "tool_dispatcher": "xml", "token_limit": 64000}}
+        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "parallel_tools_rollout_percent": 60, "tool_dispatcher": "xml", "token_limit": 64000, "session_ttl_secs": 600, "activation_mode": "always", "send_mode": "off", "queue_mode": "latest", "queue_debounce_ms": 250, "queue_cap": 12, "queue_drop": "newest", "tts_mode": "always", "tts_provider": "openai", "tts_limit_chars": 1200, "tts_summary": true, "tts_audio": true}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -1606,7 +1618,26 @@ test "json parse agent section" {
     try std.testing.expectEqualStrings("xml", cfg.agent.tool_dispatcher);
     try std.testing.expectEqual(@as(u64, 64_000), cfg.agent.token_limit);
     try std.testing.expect(cfg.agent.token_limit_explicit);
+    try std.testing.expectEqual(@as(?u64, 600), cfg.agent.session_ttl_secs);
+    try std.testing.expectEqualStrings("always", cfg.agent.activation_mode);
+    try std.testing.expectEqualStrings("off", cfg.agent.send_mode);
+    try std.testing.expectEqualStrings("latest", cfg.agent.queue_mode);
+    try std.testing.expectEqual(@as(u32, 250), cfg.agent.queue_debounce_ms);
+    try std.testing.expectEqual(@as(u32, 12), cfg.agent.queue_cap);
+    try std.testing.expectEqualStrings("newest", cfg.agent.queue_drop);
+    try std.testing.expectEqualStrings("always", cfg.agent.tts_mode);
+    try std.testing.expect(cfg.agent.tts_provider != null);
+    try std.testing.expectEqualStrings("openai", cfg.agent.tts_provider.?);
+    try std.testing.expectEqual(@as(u32, 1200), cfg.agent.tts_limit_chars);
+    try std.testing.expect(cfg.agent.tts_summary);
+    try std.testing.expect(cfg.agent.tts_audio);
     allocator.free(cfg.agent.tool_dispatcher);
+    allocator.free(cfg.agent.activation_mode);
+    allocator.free(cfg.agent.send_mode);
+    allocator.free(cfg.agent.queue_mode);
+    allocator.free(cfg.agent.queue_drop);
+    allocator.free(cfg.agent.tts_mode);
+    allocator.free(cfg.agent.tts_provider.?);
 }
 
 test "json parse agent parallel rollout percent clamps to bounds" {

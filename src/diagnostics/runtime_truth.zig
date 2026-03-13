@@ -53,6 +53,11 @@ pub const RuntimeSnapshot = struct {
     tenant_lock_conflicts_webhook: ?u64 = null,
     tenant_lock_conflicts_daemon: ?u64 = null,
     tenant_lock_conflicts_api: ?u64 = null,
+    stt_transcriber_configured: ?u64 = null,
+    stt_transcription_attempted: ?u64 = null,
+    stt_transcription_succeeded: ?u64 = null,
+    stt_transcription_failed: ?u64 = null,
+    stt_transcription_skipped_no_transcriber: ?u64 = null,
     tenant_lease_probe_user_id: ?[]u8 = null,
     tenant_lease_probe_data_source: ?[]u8 = null,
     tenant_lease_probe_owner_id: ?[]u8 = null,
@@ -200,6 +205,11 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
     var tenant_lock_conflicts_webhook: ?u64 = null;
     var tenant_lock_conflicts_daemon: ?u64 = null;
     var tenant_lock_conflicts_api: ?u64 = null;
+    var stt_transcriber_configured: ?u64 = null;
+    var stt_transcription_attempted: ?u64 = null;
+    var stt_transcription_succeeded: ?u64 = null;
+    var stt_transcription_failed: ?u64 = null;
+    var stt_transcription_skipped_no_transcriber: ?u64 = null;
     var tenant_lease_probe_user_id: ?[]u8 = null;
     errdefer if (tenant_lease_probe_user_id) |value| allocator.free(value);
     var tenant_lease_probe_data_source: ?[]u8 = null;
@@ -257,6 +267,15 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
             tenant_lock_conflicts_api = readObjectU64(route_value.object, "api");
         }
     }
+    if (parsed.value.object.get("stt")) |stt_value| {
+        if (stt_value == .object) {
+            stt_transcriber_configured = readObjectU64(stt_value.object, "transcriber_configured");
+            stt_transcription_attempted = readObjectU64(stt_value.object, "transcription_attempted");
+            stt_transcription_succeeded = readObjectU64(stt_value.object, "transcription_succeeded");
+            stt_transcription_failed = readObjectU64(stt_value.object, "transcription_failed");
+            stt_transcription_skipped_no_transcriber = readObjectU64(stt_value.object, "transcription_skipped_no_transcriber");
+        }
+    }
 
     if (parsed.value.object.get("tenant_lease_probe")) |lease_probe_value| {
         if (lease_probe_value == .object) {
@@ -311,6 +330,11 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
         .tenant_lock_conflicts_webhook = tenant_lock_conflicts_webhook,
         .tenant_lock_conflicts_daemon = tenant_lock_conflicts_daemon,
         .tenant_lock_conflicts_api = tenant_lock_conflicts_api,
+        .stt_transcriber_configured = stt_transcriber_configured,
+        .stt_transcription_attempted = stt_transcription_attempted,
+        .stt_transcription_succeeded = stt_transcription_succeeded,
+        .stt_transcription_failed = stt_transcription_failed,
+        .stt_transcription_skipped_no_transcriber = stt_transcription_skipped_no_transcriber,
         .tenant_lease_probe_user_id = tenant_lease_probe_user_id,
         .tenant_lease_probe_data_source = tenant_lease_probe_data_source,
         .tenant_lease_probe_owner_id = tenant_lease_probe_owner_id,
@@ -360,6 +384,11 @@ fn collectLocalFallbackSnapshot(allocator: std.mem.Allocator, cfg: *const config
         .telegram_chat_id = null,
         .telegram_data_source = try allocator.dupe(u8, "local_fallback"),
         .context_incomplete = context_incomplete,
+        .stt_transcriber_configured = null,
+        .stt_transcription_attempted = null,
+        .stt_transcription_succeeded = null,
+        .stt_transcription_failed = null,
+        .stt_transcription_skipped_no_transcriber = null,
     };
 }
 
@@ -472,6 +501,13 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
         \\    "daemon": 1,
         \\    "api": 5
         \\  },
+        \\  "stt": {
+        \\    "transcriber_configured": 2,
+        \\    "transcription_attempted": 9,
+        \\    "transcription_succeeded": 7,
+        \\    "transcription_failed": 2,
+        \\    "transcription_skipped_no_transcriber": 3
+        \\  },
         \\  "tenant_lease_probe": {
         \\    "user_id": "7",
         \\    "data_source": "postgres_lease",
@@ -511,6 +547,11 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
     try std.testing.expectEqual(@as(?u64, 2), snapshot.tenant_lock_conflicts_webhook);
     try std.testing.expectEqual(@as(?u64, 1), snapshot.tenant_lock_conflicts_daemon);
     try std.testing.expectEqual(@as(?u64, 5), snapshot.tenant_lock_conflicts_api);
+    try std.testing.expectEqual(@as(?u64, 2), snapshot.stt_transcriber_configured);
+    try std.testing.expectEqual(@as(?u64, 9), snapshot.stt_transcription_attempted);
+    try std.testing.expectEqual(@as(?u64, 7), snapshot.stt_transcription_succeeded);
+    try std.testing.expectEqual(@as(?u64, 2), snapshot.stt_transcription_failed);
+    try std.testing.expectEqual(@as(?u64, 3), snapshot.stt_transcription_skipped_no_transcriber);
     try std.testing.expectEqualStrings("7", snapshot.tenant_lease_probe_user_id.?);
     try std.testing.expectEqualStrings("postgres_lease", snapshot.tenant_lease_probe_data_source.?);
     try std.testing.expectEqualStrings("node-a", snapshot.tenant_lease_probe_owner_id.?);

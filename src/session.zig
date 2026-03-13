@@ -31,6 +31,13 @@ const log = std.log.scoped(.session);
 const SESSION_LOCK_WAIT_STAGE = "session_lock_wait";
 const SESSION_LOCK_WAIT_WARN_MS: u64 = 50;
 
+const DEFAULT_QUEUE_DROP_MESSAGE = "Queue policy dropped this queued turn.";
+const QUEUE_NEWEST_DROP_MESSAGE = "Queue overflow: dropped newest queued turn.";
+const QUEUE_SUMMARIZE_DROP_MESSAGE = "Queue overflow: dropped and coalesced queued turns. Please resend your latest request.";
+const QUEUE_LATEST_SUPERSEDED_MESSAGE = "Queue mode latest: this older queued turn was superseded by a newer request.";
+const QUEUE_OLDEST_DROPPED_MESSAGE = "Queue overflow: this older queued turn was dropped.";
+const QUEUE_SUMMARY_PREFIX_TEMPLATE = "[Queue notice: {d} queued turn(s) were dropped due to overflow. Prioritize the latest request.]";
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Session
 // ═══════════════════════════════════════════════════════════════════════════
@@ -45,6 +52,12 @@ pub const Session = struct {
     turn_observers: [2]Observer,
     turn_observer_multi: MultiObserver,
     mutex: std.Thread.Mutex,
+    queue_mutex: std.Thread.Mutex = .{},
+    queue_waiting: u32 = 0,
+    queue_sequence: u64 = 0,
+    queue_latest_sequence: u64 = 0,
+    queue_drop_oldest_before_sequence: u64 = 0,
+    queue_summarize_pending_count: u32 = 0,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
@@ -118,7 +131,6 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
 
         if (self.sessions.get(session_key)) |session| {
-            session.last_active = std.time.timestamp();
             return session;
         }
 
@@ -129,19 +141,7 @@ pub const SessionManager = struct {
         const session = try self.allocator.create(Session);
         errdefer self.allocator.destroy(session);
 
-        var agent = try Agent.fromConfig(
-            self.allocator,
-            self.config,
-            self.provider,
-            self.tools,
-            self.mem,
-            self.observer,
-        );
-        agent.policy = self.policy;
-        agent.session_store = self.session_store;
-        agent.response_cache = self.response_cache;
-        agent.mem_rt = self.mem_rt;
-        agent.memory_session_id = owned_key;
+        const agent = try self.buildSessionAgent(owned_key);
 
         session.* = .{
             .agent = agent,
@@ -173,6 +173,162 @@ pub const SessionManager = struct {
 
         try self.sessions.put(self.allocator, owned_key, session);
         return session;
+    }
+
+    fn buildSessionAgent(self: *SessionManager, memory_session_id: []const u8) !Agent {
+        var agent = try Agent.fromConfig(
+            self.allocator,
+            self.config,
+            self.provider,
+            self.tools,
+            self.mem,
+            self.observer,
+        );
+        agent.policy = self.policy;
+        agent.session_store = self.session_store;
+        agent.response_cache = self.response_cache;
+        agent.mem_rt = self.mem_rt;
+        agent.memory_session_id = memory_session_id;
+        return agent;
+    }
+
+    fn sessionIsTtlExpired(session: *const Session, now: i64) bool {
+        const ttl = session.agent.session_ttl_secs orelse return false;
+        if (ttl == 0) return false;
+        const idle_secs: u64 = @intCast(@max(0, now - session.last_active));
+        return idle_secs >= ttl;
+    }
+
+    fn recycleSessionInPlace(self: *SessionManager, session: *Session, now: i64) !void {
+        var replacement_agent = try self.buildSessionAgent(session.session_key);
+        errdefer replacement_agent.deinit();
+
+        var previous_agent = session.agent;
+        session.agent = replacement_agent;
+        previous_agent.deinit();
+
+        session.created_at = now;
+        session.last_active = now;
+        session.last_consolidated = 0;
+        session.turn_count = 0;
+        session.turn_observers = .{ self.observer, self.observer };
+        session.turn_observer_multi = .{ .observers = &.{} };
+
+        session.queue_mutex.lock();
+        defer session.queue_mutex.unlock();
+        session.queue_drop_oldest_before_sequence = 0;
+        session.queue_summarize_pending_count = 0;
+        if (session.queue_waiting == 0) {
+            session.queue_sequence = 0;
+            session.queue_latest_sequence = 0;
+        }
+    }
+
+    const QueueWaitRegistration = struct {
+        sequence: u64,
+        dropped_message: ?[]const u8 = null,
+    };
+
+    fn queueRegisterWaiter(session: *Session) QueueWaitRegistration {
+        session.queue_mutex.lock();
+        defer session.queue_mutex.unlock();
+
+        session.queue_sequence += 1;
+        const sequence = session.queue_sequence;
+        session.queue_waiting += 1;
+        if (session.agent.queue_mode == .latest) {
+            session.queue_latest_sequence = sequence;
+        }
+
+        const cap = session.agent.queue_cap;
+        if (cap == 0 or session.queue_waiting <= cap) {
+            return .{ .sequence = sequence };
+        }
+
+        const overflow = session.queue_waiting - cap;
+        return switch (session.agent.queue_drop) {
+            .newest => blk: {
+                if (session.queue_waiting > 0) session.queue_waiting -= 1;
+                break :blk .{
+                    .sequence = sequence,
+                    .dropped_message = QUEUE_NEWEST_DROP_MESSAGE,
+                };
+            },
+            .summarize => blk: {
+                if (session.queue_summarize_pending_count < std.math.maxInt(u32)) {
+                    session.queue_summarize_pending_count += 1;
+                }
+                if (session.queue_waiting > 0) session.queue_waiting -= 1;
+                break :blk .{
+                    .sequence = sequence,
+                    .dropped_message = QUEUE_SUMMARIZE_DROP_MESSAGE,
+                };
+            },
+            .oldest => blk: {
+                const oldest_sequence_to_drop = if (sequence > overflow) sequence - overflow else 1;
+                if (oldest_sequence_to_drop > session.queue_drop_oldest_before_sequence) {
+                    session.queue_drop_oldest_before_sequence = oldest_sequence_to_drop;
+                }
+                break :blk .{ .sequence = sequence };
+            },
+        };
+    }
+
+    fn queueUnregisterWaiter(session: *Session, sequence: u64) void {
+        session.queue_mutex.lock();
+        defer session.queue_mutex.unlock();
+        if (session.queue_waiting > 0) session.queue_waiting -= 1;
+        if (session.queue_waiting == 0 and sequence >= session.queue_latest_sequence) {
+            session.queue_drop_oldest_before_sequence = 0;
+        }
+    }
+
+    fn queueDropAfterAcquire(session: *Session, sequence: u64) ?[]const u8 {
+        session.queue_mutex.lock();
+        defer session.queue_mutex.unlock();
+        if (sequence == 0) return null;
+        if (session.agent.queue_mode == .latest and sequence < session.queue_latest_sequence) {
+            return QUEUE_LATEST_SUPERSEDED_MESSAGE;
+        }
+        if (session.queue_drop_oldest_before_sequence != 0 and sequence <= session.queue_drop_oldest_before_sequence) {
+            return QUEUE_OLDEST_DROPPED_MESSAGE;
+        }
+        return null;
+    }
+
+    fn queueDebounceSleepIfNeeded(session: *const Session) void {
+        if (session.agent.queue_mode != .debounce) return;
+        if (session.agent.queue_debounce_ms == 0) return;
+        const ns = @as(u64, session.agent.queue_debounce_ms) * std.time.ns_per_ms;
+        std.Thread.sleep(ns);
+    }
+
+    fn takeQueueSummaryPrefix(self: *SessionManager, session: *Session) !?[]u8 {
+        session.queue_mutex.lock();
+        const pending = session.queue_summarize_pending_count;
+        session.queue_summarize_pending_count = 0;
+        session.queue_mutex.unlock();
+        if (pending == 0) return null;
+        return @as(?[]u8, try std.fmt.allocPrint(self.allocator, QUEUE_SUMMARY_PREFIX_TEMPLATE, .{pending}));
+    }
+
+    fn activationBlockedMessage(
+        session: *const Session,
+        message_turn_context: ?tools_mod.MessageTurnContext,
+    ) ?[]const u8 {
+        if (session.agent.activation_mode != .mention) return null;
+        const ctx = message_turn_context orelse return null;
+        if (ctx.is_dm == true) return null;
+        if (ctx.is_group == true) {
+            if (ctx.mentioned) |mentioned| {
+                if (!mentioned) return "Mention mode active: mention the bot in group chats to trigger a turn.";
+            }
+        }
+        return null;
+    }
+
+    fn stableDropMessageOrDefault(value: ?[]const u8) []const u8 {
+        return value orelse DEFAULT_QUEUE_DROP_MESSAGE;
     }
 
     fn slashCommandName(message: []const u8) ?[]const u8 {
@@ -224,10 +380,57 @@ pub const SessionManager = struct {
         const total_start_ms = std.time.milliTimestamp();
         const session = try self.getOrCreate(session_key);
 
-        const lock_wait_start_ms = std.time.milliTimestamp();
-        session.mutex.lock();
-        const lock_wait_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - lock_wait_start_ms));
+        var lock_wait_ms: u64 = 0;
+        var waiter_registered = false;
+        var waiter_sequence: u64 = 0;
+
+        if (!session.mutex.tryLock()) {
+            const lock_wait_start_ms = std.time.milliTimestamp();
+            if (session.agent.queue_mode == .off) {
+                session.mutex.lock();
+                lock_wait_ms = @intCast(@max(0, std.time.milliTimestamp() - lock_wait_start_ms));
+            } else {
+                const queue_registration = queueRegisterWaiter(session);
+                if (queue_registration.dropped_message) |drop_msg| {
+                    return try self.allocator.dupe(u8, stableDropMessageOrDefault(drop_msg));
+                }
+                waiter_registered = true;
+                waiter_sequence = queue_registration.sequence;
+
+                queueDebounceSleepIfNeeded(session);
+
+                session.mutex.lock();
+                lock_wait_ms = @intCast(@max(0, std.time.milliTimestamp() - lock_wait_start_ms));
+            }
+        }
         defer session.mutex.unlock();
+        defer if (waiter_registered) queueUnregisterWaiter(session, waiter_sequence);
+
+        if (waiter_registered) {
+            if (queueDropAfterAcquire(session, waiter_sequence)) |drop_msg| {
+                return try self.allocator.dupe(u8, stableDropMessageOrDefault(drop_msg));
+            }
+        }
+
+        const now = std.time.timestamp();
+        if (sessionIsTtlExpired(session, now)) {
+            try self.recycleSessionInPlace(session, now);
+        }
+
+        const queue_summary_prefix: ?[]u8 = try self.takeQueueSummaryPrefix(session);
+        defer if (queue_summary_prefix) |value| self.allocator.free(value);
+        var effective_content = content;
+        var effective_content_owned: ?[]u8 = null;
+        defer if (effective_content_owned) |value| self.allocator.free(value);
+        if (queue_summary_prefix) |prefix| {
+            const merged = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}\n\nLatest user message:\n{s}",
+                .{ prefix, content },
+            );
+            effective_content_owned = merged;
+            effective_content = merged;
+        }
 
         tools_mod.setMessageTurnContext(options.message_turn_context);
         defer tools_mod.clearMessageTurnContext();
@@ -238,6 +441,11 @@ pub const SessionManager = struct {
             .model = session.agent.model_name,
         });
         defer tools_mod.clearTurnContext();
+
+        if (activationBlockedMessage(session, options.message_turn_context)) |blocked_msg| {
+            session.last_active = std.time.timestamp();
+            return try self.allocator.dupe(u8, blocked_msg);
+        }
 
         // Set conversation context for this turn (Signal-specific for now)
         session.agent.conversation_context = conversation_context;
@@ -268,7 +476,7 @@ pub const SessionManager = struct {
         }
 
         const agent_start_ms = std.time.milliTimestamp();
-        const response = try (&session.agent).turn(content);
+        const response = try (&session.agent).turn(effective_content);
         const agent_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - agent_start_ms));
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
@@ -327,8 +535,10 @@ pub const SessionManager = struct {
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
+            if (!session.mutex.tryLock()) continue;
+            defer session.mutex.unlock();
             const idle_secs: u64 = @intCast(@max(0, now - session.last_active));
-            if (idle_secs > max_idle_secs) {
+            if (idle_secs > max_idle_secs or sessionIsTtlExpired(session, now)) {
                 to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
@@ -1205,6 +1415,293 @@ test "postgres session restore under concurrent getOrCreate same and mixed keys 
     for (&managers) |*sm| {
         try testing.expect(sm.sessionCount() >= 2);
     }
+}
+
+test "ttl_expired_session_recycles_in_place_under_lock" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const first = try sm.getOrCreate("ttl:1");
+    first.agent.session_ttl_secs = 1;
+    first.last_active = std.time.timestamp() - 5;
+    first.turn_count = 99;
+    try first.agent.history.append(testing.allocator, .{
+        .role = .user,
+        .content = try testing.allocator.dupe(u8, "stale"),
+    });
+
+    const reply = try sm.processMessage("ttl:1", "fresh", null);
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("ok", reply);
+
+    const second = try sm.getOrCreate("ttl:1");
+    try testing.expect(first == second);
+    try testing.expectEqual(@as(u64, 1), second.turn_count);
+    try testing.expect(second.agent.historyLen() <= 3);
+}
+
+test "activation_mode mention blocks unmentioned group turn" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("activation:mention");
+    session.agent.activation_mode = .mention;
+
+    const blocked = try sm.processMessageWithToolContext("activation:mention", "hello", null, .{
+        .channel = "telegram",
+        .chat_id = "chat",
+        .is_group = true,
+        .is_dm = false,
+        .mentioned = false,
+    });
+    defer testing.allocator.free(blocked);
+    try testing.expectEqualStrings("Mention mode active: mention the bot in group chats to trigger a turn.", blocked);
+    try testing.expectEqual(@as(u64, 0), session.turn_count);
+}
+
+test "queue_mode latest supersedes older waiting turn" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("queue:latest");
+    session.agent.queue_mode = .latest;
+    session.agent.queue_cap = 8;
+    session.agent.queue_drop = .oldest;
+
+    session.mutex.lock();
+
+    var out_a: ?[]const u8 = null;
+    var out_b: ?[]const u8 = null;
+
+    const thread_fn = struct {
+        fn run(mgr: *SessionManager, key: []const u8, out: *?[]const u8) void {
+            out.* = mgr.processMessage(key, "queued", null) catch null;
+        }
+    }.run;
+
+    const ta = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, thread_fn, .{ &sm, "queue:latest", &out_a });
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    const tb = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, thread_fn, .{ &sm, "queue:latest", &out_b });
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+
+    session.mutex.unlock();
+
+    ta.join();
+    tb.join();
+
+    defer if (out_a) |v| testing.allocator.free(v);
+    defer if (out_b) |v| testing.allocator.free(v);
+
+    try testing.expect(out_a != null);
+    try testing.expect(out_b != null);
+    const a = out_a.?;
+    const b = out_b.?;
+    const a_dropped = std.mem.eql(u8, a, QUEUE_LATEST_SUPERSEDED_MESSAGE);
+    const b_dropped = std.mem.eql(u8, b, QUEUE_LATEST_SUPERSEDED_MESSAGE);
+    try testing.expect(a_dropped != b_dropped);
+}
+
+test "queue_cap newest drop rejects overflowing waiter deterministically" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("queue:cap");
+    session.agent.queue_mode = .serial;
+    session.agent.queue_cap = 1;
+    session.agent.queue_drop = .newest;
+
+    session.mutex.lock();
+
+    var out_waiter: ?[]const u8 = null;
+    const waiter = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        fn run(mgr: *SessionManager, out: *?[]const u8) void {
+            out.* = mgr.processMessage("queue:cap", "first", null) catch null;
+        }
+    }.run, .{ &sm, &out_waiter });
+    std.Thread.sleep(25 * std.time.ns_per_ms);
+
+    const dropped = try sm.processMessage("queue:cap", "second", null);
+    defer testing.allocator.free(dropped);
+    try testing.expectEqualStrings(QUEUE_NEWEST_DROP_MESSAGE, dropped);
+
+    session.mutex.unlock();
+    waiter.join();
+    defer if (out_waiter) |v| testing.allocator.free(v);
+    try testing.expect(out_waiter != null);
+    try testing.expectEqualStrings("ok", out_waiter.?);
+}
+
+test "queue_mode_off_bypasses_queue_cap_and_drop" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("queue:off");
+    session.agent.queue_mode = .off;
+    session.agent.queue_cap = 1;
+    session.agent.queue_drop = .newest;
+
+    session.mutex.lock();
+
+    var out_a: ?[]const u8 = null;
+    var out_b: ?[]const u8 = null;
+    const worker = struct {
+        fn run(mgr: *SessionManager, out: *?[]const u8) void {
+            out.* = mgr.processMessage("queue:off", "hello", null) catch null;
+        }
+    }.run;
+
+    const ta = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, worker, .{ &sm, &out_a });
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    const tb = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, worker, .{ &sm, &out_b });
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    session.mutex.unlock();
+
+    ta.join();
+    tb.join();
+
+    defer if (out_a) |value| testing.allocator.free(value);
+    defer if (out_b) |value| testing.allocator.free(value);
+    try testing.expect(out_a != null);
+    try testing.expect(out_b != null);
+    try testing.expectEqualStrings("ok", out_a.?);
+    try testing.expectEqualStrings("ok", out_b.?);
+}
+
+test "queue_drop_summarize_injects_single_synthetic_summary_on_next_turn" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("queue:summarize");
+    session.agent.queue_mode = .serial;
+    session.agent.queue_cap = 1;
+    session.agent.queue_drop = .summarize;
+
+    session.mutex.lock();
+    var waiter_output: ?[]const u8 = null;
+    const waiter = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        fn run(mgr: *SessionManager, out: *?[]const u8) void {
+            out.* = mgr.processMessage("queue:summarize", "first", null) catch null;
+        }
+    }.run, .{ &sm, &waiter_output });
+    std.Thread.sleep(25 * std.time.ns_per_ms);
+
+    const dropped = try sm.processMessage("queue:summarize", "second", null);
+    defer testing.allocator.free(dropped);
+    try testing.expectEqualStrings(QUEUE_SUMMARIZE_DROP_MESSAGE, dropped);
+    session.mutex.unlock();
+
+    waiter.join();
+    defer if (waiter_output) |value| testing.allocator.free(value);
+    try testing.expect(waiter_output != null);
+    try testing.expectEqualStrings("ok", waiter_output.?);
+
+    const next_reply = try sm.processMessage("queue:summarize", "third", null);
+    defer testing.allocator.free(next_reply);
+    try testing.expectEqualStrings("ok", next_reply);
+
+    var saw_summary_prefix = false;
+    for (session.agent.history.items) |msg| {
+        if (msg.role == .user and std.mem.indexOf(u8, msg.content, "[Queue notice:") != null) {
+            saw_summary_prefix = true;
+        }
+    }
+    try testing.expect(saw_summary_prefix);
+    try testing.expectEqual(@as(u32, 0), session.queue_summarize_pending_count);
+}
+
+test "queue_drop_oldest_still_holds" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("queue:oldest");
+    session.agent.queue_mode = .serial;
+    session.agent.queue_cap = 1;
+    session.agent.queue_drop = .oldest;
+
+    session.mutex.lock();
+    var out_a: ?[]const u8 = null;
+    var out_b: ?[]const u8 = null;
+    const worker = struct {
+        fn run(mgr: *SessionManager, out: *?[]const u8) void {
+            out.* = mgr.processMessage("queue:oldest", "queued", null) catch null;
+        }
+    }.run;
+
+    const ta = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, worker, .{ &sm, &out_a });
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    const tb = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, worker, .{ &sm, &out_b });
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    session.mutex.unlock();
+
+    ta.join();
+    tb.join();
+
+    defer if (out_a) |value| testing.allocator.free(value);
+    defer if (out_b) |value| testing.allocator.free(value);
+    try testing.expect(out_a != null);
+    try testing.expect(out_b != null);
+    const a_dropped = std.mem.eql(u8, out_a.?, QUEUE_OLDEST_DROPPED_MESSAGE);
+    const b_dropped = std.mem.eql(u8, out_b.?, QUEUE_OLDEST_DROPPED_MESSAGE);
+    try testing.expect(a_dropped != b_dropped);
+}
+
+test "concurrent_waiters_do_not_observe_destroyed_session_on_ttl_expiry" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("ttl:waiters");
+    session.agent.session_ttl_secs = 1;
+    session.last_active = std.time.timestamp() - 60;
+    session.mutex.lock();
+
+    var waiter_output: ?[]const u8 = null;
+    const waiter = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        fn run(mgr: *SessionManager, out: *?[]const u8) void {
+            out.* = mgr.processMessage("ttl:waiters", "after-expiry", null) catch null;
+        }
+    }.run, .{ &sm, &waiter_output });
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    session.mutex.unlock();
+    waiter.join();
+
+    defer if (waiter_output) |value| testing.allocator.free(value);
+    try testing.expect(waiter_output != null);
+    try testing.expectEqualStrings("ok", waiter_output.?);
+}
+
+test "cleanup_skips_locked_expired_session_and_evicts_later" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("cleanup:ttl");
+    session.last_active = std.time.timestamp() - 100;
+    session.agent.session_ttl_secs = 1;
+
+    session.mutex.lock();
+    const first_evict = sm.evictIdle(1);
+    try testing.expectEqual(@as(usize, 0), first_evict);
+    session.mutex.unlock();
+
+    const second_evict = sm.evictIdle(1);
+    try testing.expectEqual(@as(usize, 1), second_evict);
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,50 @@ const http_util = @import("http_util.zig");
 
 const log = std.log.scoped(.voice);
 
+pub const TelegramSttMetrics = struct {
+    transcriber_configured: u64,
+    transcription_attempted: u64,
+    transcription_succeeded: u64,
+    transcription_failed: u64,
+    transcription_skipped_no_transcriber: u64,
+};
+
+var telegram_stt_transcriber_configured_total = std.atomic.Value(u64).init(0);
+var telegram_stt_transcription_attempted_total = std.atomic.Value(u64).init(0);
+var telegram_stt_transcription_succeeded_total = std.atomic.Value(u64).init(0);
+var telegram_stt_transcription_failed_total = std.atomic.Value(u64).init(0);
+var telegram_stt_transcription_skipped_no_transcriber_total = std.atomic.Value(u64).init(0);
+
+pub fn markTelegramTranscriberConfigured() void {
+    _ = telegram_stt_transcriber_configured_total.fetchAdd(1, .monotonic);
+}
+
+pub fn telegramSttMetricsSnapshot() TelegramSttMetrics {
+    return .{
+        .transcriber_configured = telegram_stt_transcriber_configured_total.load(.monotonic),
+        .transcription_attempted = telegram_stt_transcription_attempted_total.load(.monotonic),
+        .transcription_succeeded = telegram_stt_transcription_succeeded_total.load(.monotonic),
+        .transcription_failed = telegram_stt_transcription_failed_total.load(.monotonic),
+        .transcription_skipped_no_transcriber = telegram_stt_transcription_skipped_no_transcriber_total.load(.monotonic),
+    };
+}
+
+fn markTelegramSttAttempted() void {
+    _ = telegram_stt_transcription_attempted_total.fetchAdd(1, .monotonic);
+}
+
+fn markTelegramSttSucceeded() void {
+    _ = telegram_stt_transcription_succeeded_total.fetchAdd(1, .monotonic);
+}
+
+fn markTelegramSttFailed() void {
+    _ = telegram_stt_transcription_failed_total.fetchAdd(1, .monotonic);
+}
+
+fn markTelegramSttSkippedNoTranscriber() void {
+    _ = telegram_stt_transcription_skipped_no_transcriber_total.fetchAdd(1, .monotonic);
+}
+
 fn getPid() i32 {
     if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
     if (builtin.os.tag == .macos) return std.c.getpid();
@@ -331,18 +375,27 @@ pub fn transcribeTelegramVoice(
     file_id: []const u8,
     t: ?Transcriber,
 ) ?[]const u8 {
-    const transcr = t orelse return null;
+    const transcr = t orelse {
+        markTelegramSttSkippedNoTranscriber();
+        log.info("telegram.stt.skip reason=no_transcriber", .{});
+        return null;
+    };
+    markTelegramSttAttempted();
 
     // 1. Call getFile to get file_path
     const tg_file_path = getFilePath(allocator, bot_token, file_id) catch |err| {
+        markTelegramSttFailed();
         log.err("getFile failed: {}", .{err});
+        log.warn("telegram.stt.fail reason=get_file_failed", .{});
         return null;
     };
     defer allocator.free(tg_file_path);
 
     // 2. Download file via Telegram API
     const local_path = downloadTelegramFile(allocator, bot_token, tg_file_path) catch |err| {
+        markTelegramSttFailed();
         log.err("download failed: {}", .{err});
+        log.warn("telegram.stt.fail reason=download_failed", .{});
         return null;
     };
     defer {
@@ -353,9 +406,18 @@ pub fn transcribeTelegramVoice(
 
     // 3. Transcribe via vtable
     const text = transcr.transcribe(allocator, local_path) catch |err| {
+        markTelegramSttFailed();
         log.err("transcription failed: {}", .{err});
+        log.warn("telegram.stt.fail reason=transcriber_failed", .{});
         return null;
     };
+    if (text != null) {
+        markTelegramSttSucceeded();
+        log.info("telegram.stt.success", .{});
+    } else {
+        markTelegramSttFailed();
+        log.warn("telegram.stt.fail reason=empty_transcript", .{});
+    }
 
     return text;
 }

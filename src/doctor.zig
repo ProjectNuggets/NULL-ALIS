@@ -732,6 +732,23 @@ fn checkRuntimeSnapshot(
             .{ conflicts_sse, conflicts_http, conflicts_webhook, conflicts_daemon, conflicts_api },
         )));
     }
+    if (snapshot.stt_transcriber_configured != null or
+        snapshot.stt_transcription_attempted != null or
+        snapshot.stt_transcription_succeeded != null or
+        snapshot.stt_transcription_failed != null or
+        snapshot.stt_transcription_skipped_no_transcriber != null)
+    {
+        const configured = snapshot.stt_transcriber_configured orelse 0;
+        const attempted = snapshot.stt_transcription_attempted orelse 0;
+        const succeeded = snapshot.stt_transcription_succeeded orelse 0;
+        const failed = snapshot.stt_transcription_failed orelse 0;
+        const skipped = snapshot.stt_transcription_skipped_no_transcriber orelse 0;
+        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+            allocator,
+            "stt: configured={d} attempted={d} succeeded={d} failed={d} skipped_no_transcriber={d}",
+            .{ configured, attempted, succeeded, failed, skipped },
+        )));
+    }
     if (snapshot.tenant_lease_probe_data_source) |lease_source| {
         try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
             allocator,

@@ -2532,18 +2532,25 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;
-    const whisper_ptr: ?*yc.voice.WhisperTranscriber = if (config.getProviderKey(trans.provider)) |key| blk: {
-        const wt = try allocator.create(yc.voice.WhisperTranscriber);
-        wt.* = .{
-            .endpoint = yc.voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url),
-            .api_key = key,
-            .model = trans.model,
-            .language = trans.language,
-        };
-        break :blk wt;
-    } else null;
+    const whisper_ptr: ?*yc.voice.WhisperTranscriber = blk: {
+        if (!trans.enabled) break :blk null;
+        if (config.getProviderKey(trans.provider)) |key| {
+            const wt = try allocator.create(yc.voice.WhisperTranscriber);
+            wt.* = .{
+                .endpoint = yc.voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url),
+                .api_key = key,
+                .model = trans.model,
+                .language = trans.language,
+            };
+            break :blk wt;
+        }
+        break :blk null;
+    };
     defer if (whisper_ptr) |wt| allocator.destroy(wt);
-    if (whisper_ptr) |wt| tg.transcriber = wt.transcriber();
+    if (whisper_ptr) |wt| {
+        tg.transcriber = wt.transcriber();
+        yc.voice.markTelegramTranscriberConfigured();
+    }
 
     // Initialize MCP tools from config
     const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)

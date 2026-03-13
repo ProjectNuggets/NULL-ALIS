@@ -42,6 +42,7 @@ const runtime_resolver = @import("delivery/runtime_resolver.zig");
 const tool_dispatcher = @import("tool_dispatcher.zig");
 const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
 const channel_identity_key = @import("channel_identity_key.zig");
+const voice = @import("voice.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -3699,6 +3700,21 @@ fn internalDiagnosticsPayload(
         try json_util.appendJsonInt(&buf, allocator, "db_lookup_ms_total", @intCast(identity_metrics.db_lookup_ms_total));
         try buf.appendSlice(allocator, "},");
     }
+    {
+        const stt_metrics = voice.telegramSttMetricsSnapshot();
+        try json_util.appendJsonKey(&buf, allocator, "stt");
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonInt(&buf, allocator, "transcriber_configured", @intCast(stt_metrics.transcriber_configured));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "transcription_attempted", @intCast(stt_metrics.transcription_attempted));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "transcription_succeeded", @intCast(stt_metrics.transcription_succeeded));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "transcription_failed", @intCast(stt_metrics.transcription_failed));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "transcription_skipped_no_transcriber", @intCast(stt_metrics.transcription_skipped_no_transcriber));
+        try buf.appendSlice(allocator, "},");
+    }
 
     try json_util.appendJsonKey(&buf, allocator, "ops");
     try buf.appendSlice(allocator, ops_json);
@@ -4204,7 +4220,11 @@ fn handleApiChatStreamSseConnection(
                     .channel = "zaki_app",
                     .is_group = false,
                 },
-                null,
+                .{
+                    .channel = "zaki_app",
+                    .is_group = false,
+                    .is_dm = true,
+                },
                 progress_observer,
             ) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
@@ -4488,7 +4508,11 @@ fn handleApiRoute(
                         .channel = "zaki_app",
                         .is_group = false,
                     },
-                    null,
+                    .{
+                        .channel = "zaki_app",
+                        .is_group = false,
+                        .is_dm = true,
+                    },
                     null,
                 ) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
@@ -5617,6 +5641,8 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         .channel = "telegram",
                         .account_id = tg_account_id,
                         .chat_id = cid_str,
+                        .is_group = is_group,
+                        .is_dm = !is_group,
                     },
                     null,
                 ) catch |err| blk: {
@@ -5830,7 +5856,13 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                 _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_id, wa_chat_target, mt, wa_session_key, meta);
                 ctx.response_body = "{\"status\":\"received\"}";
             } else if (ctx.session_mgr_opt) |sm| {
-                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, null) catch |err| blk: {
+                const reply: ?[]const u8 = sm.processMessageWithToolContext(wa_session_key, mt, null, .{
+                    .channel = "whatsapp",
+                    .account_id = wa_account_id,
+                    .chat_id = wa_chat_target,
+                    .is_group = wa_is_group,
+                    .is_dm = !wa_is_group,
+                }) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
                 };
@@ -5886,7 +5918,13 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                 _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_ns, wa_chat_target_ns, mt, wa_session_key, meta);
                 ctx.response_body = "{\"status\":\"received\"}";
             } else if (ctx.session_mgr_opt) |sm| {
-                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, null) catch |err| blk: {
+                const reply: ?[]const u8 = sm.processMessageWithToolContext(wa_session_key, mt, null, .{
+                    .channel = "whatsapp",
+                    .account_id = wa_account_id,
+                    .chat_id = wa_chat_target_ns,
+                    .is_group = wa_is_group,
+                    .is_dm = !wa_is_group,
+                }) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
                 };
@@ -6152,7 +6190,14 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         ) catch null;
         _ = publishToBus(eb, ctx.state.allocator, "slack", sender_id, channel_id, text, effective_session_key, metadata);
     } else if (ctx.session_mgr_opt) |sm| {
-        const reply: ?[]const u8 = sm.processMessage(effective_session_key, text, null) catch |err| blk: {
+        const reply: ?[]const u8 = sm.processMessageWithToolContext(effective_session_key, text, null, .{
+            .channel = "slack",
+            .account_id = slack_cfg.account_id,
+            .chat_id = if (is_dm) sender_id else channel_id,
+            .is_group = !is_dm,
+            .is_dm = is_dm,
+            .mentioned = std.mem.eql(u8, event_type, "app_mention"),
+        }) catch |err| blk: {
             var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
             outbound_ch.sendMessage(channel_id, userFacingAgentError(err)) catch {};
             break :blk null;

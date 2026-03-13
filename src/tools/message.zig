@@ -39,6 +39,9 @@ pub const MessageTool = struct {
         channel: ?[]const u8 = null,
         account_id: ?[]const u8 = null,
         chat_id: ?[]const u8 = null,
+        is_group: ?bool = null,
+        is_dm: ?bool = null,
+        mentioned: ?bool = null,
     };
 
     threadlocal var current_turn_context: TurnContext = .{};

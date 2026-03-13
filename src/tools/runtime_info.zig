@@ -5,6 +5,7 @@ const inbound_canonicalizer = @import("../inbound_canonicalizer.zig");
 const json_util = @import("../json_util.zig");
 const tool_dispatcher = @import("../tool_dispatcher.zig");
 const process_util = @import("process_util.zig");
+const voice = @import("../voice.zig");
 const root = @import("root.zig");
 
 const Tool = root.Tool;
@@ -189,6 +190,8 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, ",");
         try appendIdentityMapping(&buf, allocator, self.config);
         try buf.appendSlice(allocator, ",");
+        try appendSttMetrics(&buf, allocator);
+        try buf.appendSlice(allocator, ",");
         try appendOwnershipLease(&buf, allocator, ownership_lease);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "composio");
@@ -278,6 +281,8 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, if (context_incomplete) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try appendIdentityMapping(&buf, allocator, self.config);
+        try buf.appendSlice(allocator, ",");
+        try appendSttMetrics(&buf, allocator);
         try buf.appendSlice(allocator, ",");
         try appendOwnershipLease(&buf, allocator, ownership_lease);
         try buf.appendSlice(allocator, ",");
@@ -835,6 +840,25 @@ fn appendIdentityMapping(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(buf, allocator, "strict_channels");
     try appendStringArray(buf, allocator, config.tenant.identity_mapping_strict_channels);
+    try buf.appendSlice(allocator, "}");
+}
+
+fn appendSttMetrics(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+) !void {
+    const stt = voice.telegramSttMetricsSnapshot();
+    try json_util.appendJsonKey(buf, allocator, "stt");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(buf, allocator, "transcriber_configured", @intCast(stt.transcriber_configured));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "transcription_attempted", @intCast(stt.transcription_attempted));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "transcription_succeeded", @intCast(stt.transcription_succeeded));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "transcription_failed", @intCast(stt.transcription_failed));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "transcription_skipped_no_transcriber", @intCast(stt.transcription_skipped_no_transcriber));
     try buf.appendSlice(allocator, "}");
 }
 
