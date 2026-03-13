@@ -76,6 +76,12 @@ pub const DecisionHubInstallResult = struct {
     resolved_version: []const u8,
 };
 
+fn decisionHubTransportConfig() http_util.TransportConfig {
+    // Keep Decision Hub network path on curl transport.
+    // Native TLS can trap under real-world cert verification on macOS/Zig 0.15.
+    return .{ .mode = .curl_only };
+}
+
 const RequestHeaders = struct {
     headers: []const []const u8,
     owned_auth: ?[]u8,
@@ -355,7 +361,7 @@ pub fn searchDecisionHubSkills(
     const header_bundle = try buildRequestHeaders(allocator, token);
     defer freeRequestHeaders(allocator, header_bundle);
 
-    const response = try http_util.request_with_mode(allocator, .{}, .{
+    const response = try http_util.request_with_mode(allocator, decisionHubTransportConfig(), .{
         .method = "GET",
         .url = url,
         .headers = header_bundle.headers,
@@ -436,7 +442,7 @@ fn resolveDecisionHubSkill(
     const header_bundle = try buildRequestHeaders(allocator, token);
     defer freeRequestHeaders(allocator, header_bundle);
 
-    const response = try http_util.request_with_mode(allocator, .{}, .{
+    const response = try http_util.request_with_mode(allocator, decisionHubTransportConfig(), .{
         .method = "GET",
         .url = url,
         .headers = header_bundle.headers,
@@ -581,7 +587,7 @@ fn installResolvedDecisionHubSkill(
     workspace_dir: []const u8,
     resolved: ResolvedDecisionHubSkill,
 ) !DecisionHubInstallResult {
-    const response = try http_util.request_with_mode(allocator, .{}, .{
+    const response = try http_util.request_with_mode(allocator, decisionHubTransportConfig(), .{
         .method = "GET",
         .url = resolved.download_url,
         .headers = &.{},
@@ -2317,6 +2323,11 @@ test "parseDecisionHubSkillRef splits org and skill" {
     const parsed = try parseDecisionHubSkillRef("pymc-labs/causalpy");
     try std.testing.expectEqualStrings("pymc-labs", parsed.org_slug);
     try std.testing.expectEqualStrings("causalpy", parsed.skill_name);
+}
+
+test "decision hub transport uses curl_only mode" {
+    const cfg = decisionHubTransportConfig();
+    try std.testing.expectEqual(http_util.TransportMode.curl_only, cfg.mode);
 }
 
 test "verifySha256Hex validates expected digest" {
