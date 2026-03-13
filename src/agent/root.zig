@@ -1918,9 +1918,11 @@ pub const Agent = struct {
                 .system
             else
                 .user;
+            const content_copy = try dupeHistoryBytes(self.allocator, entry.content);
+            errdefer self.allocator.free(content_copy);
             try self.history.append(self.allocator, .{
                 .role = role,
-                .content = try self.allocator.dupe(u8, entry.content),
+                .content = content_copy,
             });
         }
     }
@@ -1944,6 +1946,14 @@ pub const Agent = struct {
         return result;
     }
 };
+
+fn dupeHistoryBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    if (source.len == 0) return allocator.alloc(u8, 0);
+    const out = try allocator.alloc(u8, source.len);
+    const src: [*]align(1) const u8 = @ptrCast(source.ptr);
+    std.mem.copyForwards(u8, out, src[0..source.len]);
+    return out;
+}
 
 pub const cli = @import("cli.zig");
 
@@ -2068,6 +2078,54 @@ test "Agent clear history" {
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     try std.testing.expect(!agent.has_system_prompt);
     try std.testing.expect(agent.workspace_prompt_fingerprint == null);
+}
+
+test "Agent loadHistory handles zero-length content safely" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const user_role = try allocator.dupe(u8, "user");
+    defer allocator.free(user_role);
+    const empty_content = try allocator.alloc(u8, 0);
+    defer allocator.free(empty_content);
+    const assistant_role = try allocator.dupe(u8, "assistant");
+    defer allocator.free(assistant_role);
+    const assistant_content = try allocator.dupe(u8, "persisted reply");
+    defer allocator.free(assistant_content);
+
+    const Entry = struct {
+        role: []const u8,
+        content: []const u8,
+    };
+    const entries = [_]Entry{
+        .{ .role = user_role, .content = empty_content },
+        .{ .role = assistant_role, .content = assistant_content },
+    };
+
+    try agent.loadHistory(entries[0..]);
+    try std.testing.expectEqual(@as(usize, 2), agent.historyLen());
+    try std.testing.expect(agent.history.items[0].role == .user);
+    try std.testing.expectEqual(@as(usize, 0), agent.history.items[0].content.len);
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expectEqualStrings("persisted reply", agent.history.items[1].content);
 }
 
 test "dispatcher module reexport" {

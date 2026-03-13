@@ -1,0 +1,42 @@
+{
+  "distinct_session_keys": 20,
+  "distinct_users": 20,
+  "error_details": {
+    "detail_counts": {},
+    "exception_classes": {},
+    "status_codes": {}
+  },
+  "error_reasons": {},
+  "errors": 0,
+  "failure_samples": [],
+  "isolation_probe": {
+    "enabled": false
+  },
+  "lane_counts": {
+    "main": 20
+  },
+  "lane_strategy": "main_only",
+  "latency_ms": {
+    "max": 25570,
+    "mean": 15897,
+    "min": 7612,
+    "p50": 14438,
+    "p95": 24301,
+    "p99": 25570
+  },
+  "mode": "multi-user",
+  "requested_users": 20,
+  "requests": 20,
+  "run_finished_utc": "2026-03-13T02:08:57.278785+00:00",
+  "run_label": "2026-03-13-final-20",
+  "run_started_utc": "2026-03-13T02:08:31.703534+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 20,
+  "wall_ms": 25575,
+  "workers": 20
+}

@@ -1,0 +1,298 @@
+{
+  "distinct_session_keys": 50,
+  "distinct_users": 50,
+  "error_details": {
+    "detail_counts": {
+      "[Errno 54] Connection reset by peer": 35,
+      "stream_closed_without_terminal_done": 15
+    },
+    "exception_classes": {
+      "ConnectionResetError": 35,
+      "SSE": 15
+    },
+    "status_codes": {
+      "200": 15
+    }
+  },
+  "error_reasons": {
+    "exception": 35,
+    "stream_no_done": 15
+  },
+  "errors": 50,
+  "failure_samples": [
+    {
+      "elapsed_ms": 449,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 49,
+      "status_code": null,
+      "user_id": "50"
+    },
+    {
+      "elapsed_ms": 450,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 46,
+      "status_code": null,
+      "user_id": "47"
+    },
+    {
+      "elapsed_ms": 450,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 44,
+      "status_code": null,
+      "user_id": "45"
+    },
+    {
+      "elapsed_ms": 450,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 42,
+      "status_code": null,
+      "user_id": "43"
+    },
+    {
+      "elapsed_ms": 450,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 43,
+      "status_code": null,
+      "user_id": "44"
+    },
+    {
+      "elapsed_ms": 450,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 47,
+      "status_code": null,
+      "user_id": "48"
+    },
+    {
+      "elapsed_ms": 450,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 45,
+      "status_code": null,
+      "user_id": "46"
+    },
+    {
+      "elapsed_ms": 452,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 34,
+      "status_code": null,
+      "user_id": "35"
+    },
+    {
+      "elapsed_ms": 453,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 27,
+      "status_code": null,
+      "user_id": "28"
+    },
+    {
+      "elapsed_ms": 452,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 38,
+      "status_code": null,
+      "user_id": "39"
+    },
+    {
+      "elapsed_ms": 452,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 37,
+      "status_code": null,
+      "user_id": "38"
+    },
+    {
+      "elapsed_ms": 454,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 24,
+      "status_code": null,
+      "user_id": "25"
+    },
+    {
+      "elapsed_ms": 452,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 35,
+      "status_code": null,
+      "user_id": "36"
+    },
+    {
+      "elapsed_ms": 456,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 16,
+      "status_code": null,
+      "user_id": "17"
+    },
+    {
+      "elapsed_ms": 453,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 31,
+      "status_code": null,
+      "user_id": "32"
+    },
+    {
+      "elapsed_ms": 455,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 20,
+      "status_code": null,
+      "user_id": "21"
+    },
+    {
+      "elapsed_ms": 452,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 41,
+      "status_code": null,
+      "user_id": "42"
+    },
+    {
+      "elapsed_ms": 456,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 14,
+      "status_code": null,
+      "user_id": "15"
+    },
+    {
+      "elapsed_ms": 454,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 25,
+      "status_code": null,
+      "user_id": "26"
+    },
+    {
+      "elapsed_ms": 452,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 39,
+      "status_code": null,
+      "user_id": "40"
+    }
+  ],
+  "isolation_probe": {
+    "baseline": {
+      "count": 3,
+      "error_reasons": {
+        "sse_error_done": 3
+      },
+      "errors": 3,
+      "latency_ms": {
+        "max": 0,
+        "mean": 0,
+        "min": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "success": 0
+    },
+    "count_per_phase": 3,
+    "degradation_pct_p95": null,
+    "enabled": true,
+    "gate_max_p95_degradation_pct": 15.0,
+    "gate_pass": false,
+    "gate_status": "inconclusive",
+    "interval_ms": 250,
+    "overlap_with_load_users": false,
+    "session_key": "agent:zaki-bot:user:1000:main",
+    "under_load": {
+      "count": 3,
+      "error_reasons": {
+        "stream_no_done": 1,
+        "url_error": 2
+      },
+      "errors": 3,
+      "latency_ms": {
+        "max": 0,
+        "mean": 0,
+        "min": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "success": 0
+    },
+    "user_id": "1000"
+  },
+  "lane_counts": {
+    "cron": 2,
+    "task": 6,
+    "thread": 42
+  },
+  "lane_strategy": "mixed_real",
+  "latency_ms": {
+    "max": 0,
+    "mean": 0,
+    "min": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0
+  },
+  "mode": "multi-user",
+  "requested_users": 50,
+  "requests": 50,
+  "run_finished_utc": "2026-03-13T01:32:25.379653+00:00",
+  "run_label": "2026-03-13-set7-50-iso-ping",
+  "run_started_utc": "2026-03-13T01:31:49.902685+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 0,
+  "wall_ms": 974,
+  "workers": 50
+}

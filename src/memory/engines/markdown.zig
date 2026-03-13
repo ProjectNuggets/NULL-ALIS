@@ -95,6 +95,51 @@ pub const MarkdownMemory = struct {
         try file.writeAll(line);
     }
 
+    fn dupeEntryBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+        if (source.len == 0) return allocator.alloc(u8, 0);
+        const out = try allocator.alloc(u8, source.len);
+        const src: [*]align(1) const u8 = @ptrCast(source.ptr);
+        std.mem.copyForwards(u8, out, src[0..source.len]);
+        return out;
+    }
+
+    fn cloneCategory(allocator: std.mem.Allocator, category: MemoryCategory) !MemoryCategory {
+        return switch (category) {
+            .custom => |name| MemoryCategory{ .custom = try dupeEntryBytes(allocator, name) },
+            else => category,
+        };
+    }
+
+    fn cloneEntry(allocator: std.mem.Allocator, entry: MemoryEntry) !MemoryEntry {
+        const id = try dupeEntryBytes(allocator, entry.id);
+        errdefer allocator.free(id);
+        const key = try dupeEntryBytes(allocator, entry.key);
+        errdefer allocator.free(key);
+        const content = try dupeEntryBytes(allocator, entry.content);
+        errdefer allocator.free(content);
+        const timestamp = try dupeEntryBytes(allocator, entry.timestamp);
+        errdefer allocator.free(timestamp);
+        const category = try cloneCategory(allocator, entry.category);
+        errdefer switch (category) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        };
+        const session_id = if (entry.session_id) |sid|
+            try dupeEntryBytes(allocator, sid)
+        else
+            null;
+        errdefer if (session_id) |sid| allocator.free(sid);
+        return MemoryEntry{
+            .id = id,
+            .key = key,
+            .content = content,
+            .category = category,
+            .timestamp = timestamp,
+            .session_id = session_id,
+            .score = entry.score,
+        };
+    }
+
     fn parseEntries(text: []const u8, filename: []const u8, category: MemoryCategory, allocator: std.mem.Allocator) ![]MemoryEntry {
         var entries: std.ArrayList(MemoryEntry) = .empty;
         errdefer {
@@ -129,22 +174,22 @@ pub const MarkdownMemory = struct {
             }
 
             const id = if (parsed_key) |key_slice|
-                try allocator.dupe(u8, key_slice)
+                try dupeEntryBytes(allocator, key_slice)
             else
                 try std.fmt.allocPrint(allocator, "{s}:{d}", .{ filename, line_idx });
             errdefer allocator.free(id);
             const key = if (parsed_key) |key_slice|
-                try allocator.dupe(u8, key_slice)
+                try dupeEntryBytes(allocator, key_slice)
             else
-                try allocator.dupe(u8, id);
+                try dupeEntryBytes(allocator, id);
             errdefer allocator.free(key);
-            const content_dup = try allocator.dupe(u8, parsed_content);
+            const content_dup = try dupeEntryBytes(allocator, parsed_content);
             errdefer allocator.free(content_dup);
-            const timestamp = try allocator.dupe(u8, filename);
+            const timestamp = try dupeEntryBytes(allocator, filename);
             errdefer allocator.free(timestamp);
 
             const cat = switch (category) {
-                .custom => |name| MemoryCategory{ .custom = try allocator.dupe(u8, name) },
+                .custom => |name| MemoryCategory{ .custom = try dupeEntryBytes(allocator, name) },
                 else => category,
             };
 
@@ -169,31 +214,39 @@ pub const MarkdownMemory = struct {
             all.deinit(allocator);
         }
 
-        const cp = try self.corePath(allocator);
-        defer allocator.free(cp);
-        if (std.fs.cwd().readFileAlloc(allocator, cp, 1024 * 1024)) |content| {
-            defer allocator.free(content);
-            const entries = try parseEntries(content, "MEMORY", .core, allocator);
-            defer allocator.free(entries);
-            for (entries) |e| try all.append(allocator, e);
+        // Parse using a page-backed arena to avoid cross-thread allocator contention
+        // in high-concurrency markdown scans. Final entries are cloned into caller allocator.
+        var parse_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer parse_arena.deinit();
+        const parse_allocator = parse_arena.allocator();
+
+        const cp = try self.corePath(parse_allocator);
+        defer parse_allocator.free(cp);
+        if (std.fs.cwd().readFileAlloc(parse_allocator, cp, 1024 * 1024)) |content| {
+            const entries = try parseEntries(content, "MEMORY", .core, parse_allocator);
+            for (entries) |entry| {
+                const cloned = try cloneEntry(allocator, entry);
+                try all.append(allocator, cloned);
+            }
         } else |_| {}
 
-        const md = try self.memoryDir(allocator);
-        defer allocator.free(md);
+        const md = try self.memoryDir(parse_allocator);
+        defer parse_allocator.free(md);
         if (std.fs.cwd().openDir(md, .{ .iterate = true })) |*dir_handle| {
             var dir = dir_handle.*;
             defer dir.close();
             var it = dir.iterate();
             while (try it.next()) |entry| {
                 if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
-                const fpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ md, entry.name });
-                defer allocator.free(fpath);
-                if (std.fs.cwd().readFileAlloc(allocator, fpath, 1024 * 1024)) |content| {
-                    defer allocator.free(content);
+                const fpath = try std.fmt.allocPrint(parse_allocator, "{s}/{s}", .{ md, entry.name });
+                defer parse_allocator.free(fpath);
+                if (std.fs.cwd().readFileAlloc(parse_allocator, fpath, 1024 * 1024)) |content| {
                     const fname = entry.name[0 .. entry.name.len - 3];
-                    const entries = try parseEntries(content, fname, .daily, allocator);
-                    defer allocator.free(entries);
-                    for (entries) |e| try all.append(allocator, e);
+                    const entries = try parseEntries(content, fname, .daily, parse_allocator);
+                    for (entries) |parsed| {
+                        const cloned = try cloneEntry(allocator, parsed);
+                        try all.append(allocator, cloned);
+                    }
                 } else |_| {}
             }
         } else |_| {}
@@ -209,16 +262,17 @@ pub const MarkdownMemory = struct {
 
     fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, _: ?[]const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
-        const entry_text = try std.fmt.allocPrint(self_.allocator, "- **{s}**: {s}", .{ key, content });
-        defer self_.allocator.free(entry_text);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const scratch_allocator = scratch.allocator();
+
+        const entry_text = try std.fmt.allocPrint(scratch_allocator, "- **{s}**: {s}", .{ key, content });
 
         const path = switch (category) {
-            .core => try self_.corePath(self_.allocator),
-            else => try self_.dailyPath(self_.allocator),
+            .core => try self_.corePath(scratch_allocator),
+            else => try self_.dailyPath(scratch_allocator),
         };
-        defer self_.allocator.free(path);
-
-        try appendToFile(path, entry_text, self_.allocator);
+        try appendToFile(path, entry_text, scratch_allocator);
     }
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, _: ?[]const u8) anyerror![]MemoryEntry {
@@ -334,13 +388,10 @@ pub const MarkdownMemory = struct {
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self_: *Self = @ptrCast(@alignCast(ptr));
-        const all = try self_.readAllEntries(self_.allocator);
-        defer {
-            for (all) |*entry| {
-                @constCast(entry).deinit(self_.allocator);
-            }
-            self_.allocator.free(all);
-        }
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const scratch_allocator = scratch.allocator();
+        const all = try self_.readAllEntries(scratch_allocator);
         return all.len;
     }
 
@@ -501,4 +552,96 @@ test "markdown accepts session_id param" {
         for (listed) |*e| e.deinit(std.testing.allocator);
         std.testing.allocator.free(listed);
     }
+}
+
+test "markdown concurrent count does not panic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+    const memory = mem.memory();
+
+    for (0..32) |idx| {
+        const key = try std.fmt.allocPrint(std.testing.allocator, "count_key_{d}", .{idx});
+        defer std.testing.allocator.free(key);
+        const content = try std.fmt.allocPrint(std.testing.allocator, "count_value_{d}", .{idx});
+        defer std.testing.allocator.free(content);
+        try memory.store(key, content, .core, null);
+    }
+
+    const worker_count = 8;
+    var failed = std.atomic.Value(bool).init(false);
+    var handles: [worker_count]std.Thread = undefined;
+
+    for (0..worker_count) |idx| {
+        handles[idx] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, struct {
+            fn run(mem_i: Memory, failed_flag: *std.atomic.Value(bool)) void {
+                for (0..64) |_| {
+                    _ = mem_i.count() catch {
+                        failed_flag.store(true, .release);
+                        return;
+                    };
+                }
+            }
+        }.run, .{ memory, &failed });
+    }
+
+    for (handles) |handle| handle.join();
+    try std.testing.expect(!failed.load(.acquire));
+}
+
+test "markdown concurrent recall list get does not panic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+    const memory = mem.memory();
+
+    for (0..32) |idx| {
+        const key = try std.fmt.allocPrint(std.testing.allocator, "lookup_key_{d}", .{idx});
+        defer std.testing.allocator.free(key);
+        const content = try std.fmt.allocPrint(std.testing.allocator, "lookup_value_{d}", .{idx});
+        defer std.testing.allocator.free(content);
+        try memory.store(key, content, .core, null);
+    }
+
+    const worker_count = 8;
+    var failed = std.atomic.Value(bool).init(false);
+    var handles: [worker_count]std.Thread = undefined;
+
+    for (0..worker_count) |idx| {
+        handles[idx] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, struct {
+            fn run(mem_i: Memory, failed_flag: *std.atomic.Value(bool)) void {
+                const alloc = std.heap.smp_allocator;
+                for (0..32) |_| {
+                    const recalled = mem_i.recall(alloc, "lookup_value", 10, null) catch {
+                        failed_flag.store(true, .release);
+                        return;
+                    };
+                    root.freeEntries(alloc, recalled);
+
+                    const listed = mem_i.list(alloc, null, null) catch {
+                        failed_flag.store(true, .release);
+                        return;
+                    };
+                    root.freeEntries(alloc, listed);
+
+                    const got = mem_i.get(alloc, "lookup_key_1") catch {
+                        failed_flag.store(true, .release);
+                        return;
+                    };
+                    if (got) |entry| entry.deinit(alloc);
+                }
+            }
+        }.run, .{ memory, &failed });
+    }
+
+    for (handles) |handle| handle.join();
+    try std.testing.expect(!failed.load(.acquire));
 }

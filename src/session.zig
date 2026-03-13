@@ -1131,6 +1131,7 @@ test "postgres session restore under concurrent getOrCreate same and mixed keys 
     const seed_session_store = seed_store.sessionStore();
 
     try seed_session_store.saveMessage("agent:zaki-bot:user:2:main", "user", "seed user");
+    try seed_session_store.saveMessage("agent:zaki-bot:user:2:main", "assistant", "");
     try seed_session_store.saveMessage("agent:zaki-bot:user:2:main", "assistant", "seed assistant");
 
     const mixed_keys = 24;
@@ -1138,6 +1139,7 @@ test "postgres session restore under concurrent getOrCreate same and mixed keys 
         var key_buf: [96]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "agent:zaki-bot:user:2:thread:load-{d}", .{idx});
         try seed_session_store.saveMessage(key, "user", "seed mixed user");
+        try seed_session_store.saveMessage(key, "assistant", "");
         try seed_session_store.saveMessage(key, "assistant", "seed mixed assistant");
     }
 

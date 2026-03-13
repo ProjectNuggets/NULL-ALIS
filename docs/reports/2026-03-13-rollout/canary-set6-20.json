@@ -1,0 +1,296 @@
+{
+  "distinct_session_keys": 20,
+  "distinct_users": 20,
+  "error_details": {
+    "detail_counts": {
+      "[Errno 54] Connection reset by peer": 5,
+      "stream_closed_without_terminal_done": 15
+    },
+    "exception_classes": {
+      "ConnectionResetError": 5,
+      "SSE": 15
+    },
+    "status_codes": {
+      "200": 15
+    }
+  },
+  "error_reasons": {
+    "exception": 5,
+    "stream_no_done": 15
+  },
+  "errors": 20,
+  "failure_samples": [
+    {
+      "elapsed_ms": 484,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 18,
+      "status_code": null,
+      "user_id": "19"
+    },
+    {
+      "elapsed_ms": 489,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 0,
+      "status_code": 200,
+      "user_id": "1"
+    },
+    {
+      "elapsed_ms": 485,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 13,
+      "status_code": 200,
+      "user_id": "14"
+    },
+    {
+      "elapsed_ms": 484,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 19,
+      "status_code": null,
+      "user_id": "20"
+    },
+    {
+      "elapsed_ms": 488,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 4,
+      "status_code": 200,
+      "user_id": "5"
+    },
+    {
+      "elapsed_ms": 489,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 1,
+      "status_code": 200,
+      "user_id": "2"
+    },
+    {
+      "elapsed_ms": 487,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 7,
+      "status_code": 200,
+      "user_id": "8"
+    },
+    {
+      "elapsed_ms": 489,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 2,
+      "status_code": 200,
+      "user_id": "3"
+    },
+    {
+      "elapsed_ms": 485,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 16,
+      "status_code": null,
+      "user_id": "17"
+    },
+    {
+      "elapsed_ms": 486,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 12,
+      "status_code": 200,
+      "user_id": "13"
+    },
+    {
+      "elapsed_ms": 489,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 3,
+      "status_code": 200,
+      "user_id": "4"
+    },
+    {
+      "elapsed_ms": 485,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 17,
+      "status_code": null,
+      "user_id": "18"
+    },
+    {
+      "elapsed_ms": 487,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 9,
+      "status_code": 200,
+      "user_id": "10"
+    },
+    {
+      "elapsed_ms": 487,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 10,
+      "status_code": 200,
+      "user_id": "11"
+    },
+    {
+      "elapsed_ms": 488,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 6,
+      "status_code": 200,
+      "user_id": "7"
+    },
+    {
+      "elapsed_ms": 488,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 5,
+      "status_code": 200,
+      "user_id": "6"
+    },
+    {
+      "elapsed_ms": 487,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 8,
+      "status_code": 200,
+      "user_id": "9"
+    },
+    {
+      "elapsed_ms": 486,
+      "error_body": null,
+      "error_class": "ConnectionResetError",
+      "error_detail": "[Errno 54] Connection reset by peer",
+      "reason": "exception",
+      "request_id": 14,
+      "status_code": null,
+      "user_id": "15"
+    },
+    {
+      "elapsed_ms": 487,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 11,
+      "status_code": 200,
+      "user_id": "12"
+    },
+    {
+      "elapsed_ms": 486,
+      "error_body": null,
+      "error_class": "SSE",
+      "error_detail": "stream_closed_without_terminal_done",
+      "reason": "stream_no_done",
+      "request_id": 15,
+      "status_code": 200,
+      "user_id": "16"
+    }
+  ],
+  "isolation_probe": {
+    "baseline": {
+      "count": 3,
+      "error_reasons": {
+        "sse_error_done": 3
+      },
+      "errors": 3,
+      "latency_ms": {
+        "max": 0,
+        "mean": 0,
+        "min": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "success": 0
+    },
+    "count_per_phase": 3,
+    "degradation_pct_p95": null,
+    "enabled": true,
+    "gate_max_p95_degradation_pct": 15.0,
+    "gate_pass": false,
+    "gate_status": "inconclusive",
+    "interval_ms": 250,
+    "overlap_with_load_users": false,
+    "session_key": "agent:zaki-bot:user:1000:main",
+    "under_load": {
+      "count": 3,
+      "error_reasons": {
+        "stream_no_done": 1,
+        "url_error": 2
+      },
+      "errors": 3,
+      "latency_ms": {
+        "max": 0,
+        "mean": 0,
+        "min": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "success": 0
+    },
+    "user_id": "1000"
+  },
+  "lane_counts": {
+    "main": 20
+  },
+  "lane_strategy": "main_only",
+  "latency_ms": {
+    "max": 0,
+    "mean": 0,
+    "min": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0
+  },
+  "mode": "multi-user",
+  "requested_users": 20,
+  "requests": 20,
+  "run_finished_utc": "2026-03-13T01:20:30.427662+00:00",
+  "run_label": "2026-03-13-set6-20-iso-ping",
+  "run_started_utc": "2026-03-13T01:19:53.596223+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 0,
+  "wall_ms": 1001,
+  "workers": 20
+}

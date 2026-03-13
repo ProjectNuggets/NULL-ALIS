@@ -176,6 +176,10 @@ fn purgeOldArchives(allocator: std.mem.Allocator, config: HygieneConfig) !u64 {
 /// Prune conversation rows older than retention_days via the Memory interface.
 /// Searches for conversation-tagged entries and deletes those whose timestamp is old.
 pub fn pruneConversationRows(allocator: std.mem.Allocator, mem: Memory, retention_days: u32) !u64 {
+    // Markdown backend has append-only files and forget() is a no-op,
+    // so conversation pruning via search/forget is not applicable.
+    if (std.mem.eql(u8, mem.name(), "markdown")) return 0;
+
     const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(retention_days)) * 24 * 60 * 60;
 
     // Search for conversation-tagged entries
@@ -242,6 +246,70 @@ test "runIfDue no memory first run" {
     const report = runIfDue(std.testing.allocator, cfg, null);
     // Should run but all operations disabled or paths don't exist
     try std.testing.expectEqual(@as(u64, 0), report.totalActions());
+}
+
+test "pruneConversationRows skips markdown backend search path" {
+    const MockMarkdownMemory = struct {
+        called_recall: *bool,
+
+        fn memory(self: *@This()) Memory {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn implName(_: *anyopaque) []const u8 {
+            return "markdown";
+        }
+
+        fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: root.MemoryCategory, _: ?[]const u8) anyerror!void {
+            return;
+        }
+
+        fn implRecall(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]root.MemoryEntry {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.called_recall.* = true;
+            return error.TestUnexpectedRecall;
+        }
+
+        fn implGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?root.MemoryEntry {
+            return null;
+        }
+
+        fn implList(_: *anyopaque, _: std.mem.Allocator, _: ?root.MemoryCategory, _: ?[]const u8) anyerror![]root.MemoryEntry {
+            return std.testing.allocator.alloc(root.MemoryEntry, 0);
+        }
+
+        fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
+            return false;
+        }
+
+        fn implCount(_: *anyopaque) anyerror!usize {
+            return 0;
+        }
+
+        fn implHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn implDeinit(_: *anyopaque) void {}
+
+        const vtable = Memory.VTable{
+            .name = &implName,
+            .store = &implStore,
+            .recall = &implRecall,
+            .get = &implGet,
+            .list = &implList,
+            .forget = &implForget,
+            .count = &implCount,
+            .healthCheck = &implHealthCheck,
+            .deinit = &implDeinit,
+        };
+    };
+
+    var called = false;
+    var mock = MockMarkdownMemory{ .called_recall = &called };
+    const pruned = try pruneConversationRows(std.testing.allocator, mock.memory(), 30);
+    try std.testing.expectEqual(@as(u64, 0), pruned);
+    try std.testing.expect(!called);
 }
 
 test "shouldRunNow returns true with no memory" {

@@ -1,0 +1,42 @@
+{
+  "distinct_session_keys": 100,
+  "distinct_users": 100,
+  "error_details": {
+    "detail_counts": {},
+    "exception_classes": {},
+    "status_codes": {}
+  },
+  "error_reasons": {},
+  "errors": 0,
+  "failure_samples": [],
+  "isolation_probe": {
+    "enabled": false
+  },
+  "lane_counts": {
+    "main": 100
+  },
+  "lane_strategy": "main_only",
+  "latency_ms": {
+    "max": 73610,
+    "mean": 39430,
+    "min": 7250,
+    "p50": 39856,
+    "p95": 71324,
+    "p99": 73236
+  },
+  "mode": "multi-user",
+  "requested_users": 100,
+  "requests": 100,
+  "run_finished_utc": "2026-03-13T02:29:33.688497+00:00",
+  "run_label": "final-100-fresh-after-markdown-fix",
+  "run_started_utc": "2026-03-13T02:28:20.043857+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 100,
+  "wall_ms": 73644,
+  "workers": 100
+}

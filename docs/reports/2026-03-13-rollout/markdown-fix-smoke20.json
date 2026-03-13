@@ -1,0 +1,251 @@
+{
+  "distinct_session_keys": 20,
+  "distinct_users": 20,
+  "error_details": {
+    "detail_counts": {
+      "chat_failed: chat failed": 20
+    },
+    "exception_classes": {
+      "SSE": 20
+    },
+    "status_codes": {
+      "200": 20
+    }
+  },
+  "error_reasons": {
+    "sse_error_done": 20
+  },
+  "errors": 20,
+  "failure_samples": [
+    {
+      "elapsed_ms": 12217,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 18,
+      "status_code": 200,
+      "user_id": "19"
+    },
+    {
+      "elapsed_ms": 12256,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 13,
+      "status_code": 200,
+      "user_id": "14"
+    },
+    {
+      "elapsed_ms": 12352,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 3,
+      "status_code": 200,
+      "user_id": "4"
+    },
+    {
+      "elapsed_ms": 12501,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 2,
+      "status_code": 200,
+      "user_id": "3"
+    },
+    {
+      "elapsed_ms": 12538,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 16,
+      "status_code": 200,
+      "user_id": "17"
+    },
+    {
+      "elapsed_ms": 12600,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 1,
+      "status_code": 200,
+      "user_id": "2"
+    },
+    {
+      "elapsed_ms": 12611,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 12,
+      "status_code": 200,
+      "user_id": "13"
+    },
+    {
+      "elapsed_ms": 12681,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 5,
+      "status_code": 200,
+      "user_id": "6"
+    },
+    {
+      "elapsed_ms": 12748,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 10,
+      "status_code": 200,
+      "user_id": "11"
+    },
+    {
+      "elapsed_ms": 12770,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 6,
+      "status_code": 200,
+      "user_id": "7"
+    },
+    {
+      "elapsed_ms": 12785,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 4,
+      "status_code": 200,
+      "user_id": "5"
+    },
+    {
+      "elapsed_ms": 12936,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 7,
+      "status_code": 200,
+      "user_id": "8"
+    },
+    {
+      "elapsed_ms": 12948,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 14,
+      "status_code": 200,
+      "user_id": "15"
+    },
+    {
+      "elapsed_ms": 13129,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 11,
+      "status_code": 200,
+      "user_id": "12"
+    },
+    {
+      "elapsed_ms": 13482,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 15,
+      "status_code": 200,
+      "user_id": "16"
+    },
+    {
+      "elapsed_ms": 13758,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 0,
+      "status_code": 200,
+      "user_id": "1"
+    },
+    {
+      "elapsed_ms": 24531,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 8,
+      "status_code": 200,
+      "user_id": "9"
+    },
+    {
+      "elapsed_ms": 24534,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 19,
+      "status_code": 200,
+      "user_id": "20"
+    },
+    {
+      "elapsed_ms": 24541,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 9,
+      "status_code": 200,
+      "user_id": "10"
+    },
+    {
+      "elapsed_ms": 24751,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 17,
+      "status_code": 200,
+      "user_id": "18"
+    }
+  ],
+  "isolation_probe": {
+    "enabled": false
+  },
+  "lane_counts": {
+    "main": 20
+  },
+  "lane_strategy": "main_only",
+  "latency_ms": {
+    "max": 0,
+    "mean": 0,
+    "min": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0
+  },
+  "mode": "multi-user",
+  "requested_users": 20,
+  "requests": 20,
+  "run_finished_utc": "2026-03-13T01:39:55.372867+00:00",
+  "run_label": "2026-03-13-markdown-fix-smoke20",
+  "run_started_utc": "2026-03-13T01:39:30.616948+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 0,
+  "wall_ms": 24755,
+  "workers": 20
+}

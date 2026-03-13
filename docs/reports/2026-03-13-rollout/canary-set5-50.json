@@ -1,0 +1,493 @@
+{
+  "diagnostics": {
+    "after": {
+      "bus": {
+        "capacity": 1024,
+        "inbound_len": 0,
+        "outbound_len": 0
+      },
+      "gateway": {
+        "drain_rejected_total": 0,
+        "draining": false,
+        "in_flight_requests": 1,
+        "overload_rejected_total": 0,
+        "requests_total": 87
+      },
+      "heartbeat_runtime": {
+        "available": false,
+        "last_reason": null,
+        "last_run_s": null,
+        "last_status": null,
+        "user_id": null
+      },
+      "heartbeat_wake": {
+        "coalesced_total": 0,
+        "dropped_total": 0,
+        "pending": 0
+      },
+      "identity_mapping": {
+        "cache_hit": 0,
+        "cache_miss": 0,
+        "cache_stale": 0,
+        "db_lookup_count": 0,
+        "db_lookup_ms_total": 0,
+        "degraded_compat": 0,
+        "mapped": 0,
+        "strict_rejected": 0,
+        "unmapped": 0
+      },
+      "instance_id": "pid-18697-1773364325",
+      "integrations": {
+        "telegram": {
+          "account_id": null,
+          "chat_id": null,
+          "configured": false,
+          "connected": null,
+          "data_source": "global"
+        }
+      },
+      "last_trigger": null,
+      "ops": {
+        "last_event": null,
+        "proactive_blocked_dedupe_total": 0,
+        "proactive_blocked_rate_total": 0,
+        "proactive_send_errors_total": 0,
+        "proactive_sent_total": 0,
+        "recent_events": [],
+        "scheduler_blocked_burst_total": 0,
+        "scheduler_blocked_cooldown_total": 0,
+        "scheduler_executed_total": 0
+      },
+      "owned_users_count": 0,
+      "pool": {
+        "hits": 0,
+        "idle": 0,
+        "misses": 0
+      },
+      "runtime_mode": "threaded",
+      "startup_self_check": {
+        "chat_fallback_chain": "together",
+        "chat_provider_effective": "openrouter",
+        "config_path": "/Users/nova/.nullalis/config.json",
+        "degraded": true,
+        "degraded_reason": "ConnectionFailed",
+        "embedding_provider_effective": "together",
+        "heartbeat_enabled": true,
+        "heartbeat_interval_minutes": 30,
+        "postgres_host": "127.0.0.1",
+        "postgres_port": 5432,
+        "postgres_schema": "zaki_bot",
+        "provider_data_source": "config",
+        "scheduler_backend": "file",
+        "state_backend_configured": "postgres",
+        "state_backend_effective": "file",
+        "tenant_enabled": true,
+        "webhook_mode": "none"
+      },
+      "tenant_lease_probe": null,
+      "tenant_lock_backend": "file_lock",
+      "tenant_lock_conflicts_by_route": {
+        "api": 0,
+        "chat_stream_http": 0,
+        "chat_stream_sse": 1,
+        "daemon": 0,
+        "webhook": 0
+      },
+      "tenant_lock_lease_secs": 300
+    },
+    "after_error": null,
+    "before": {
+      "bus": {
+        "capacity": 1024,
+        "inbound_len": 0,
+        "outbound_len": 0
+      },
+      "gateway": {
+        "drain_rejected_total": 0,
+        "draining": false,
+        "in_flight_requests": 1,
+        "overload_rejected_total": 0,
+        "requests_total": 33
+      },
+      "heartbeat_runtime": {
+        "available": false,
+        "last_reason": null,
+        "last_run_s": null,
+        "last_status": null,
+        "user_id": null
+      },
+      "heartbeat_wake": {
+        "coalesced_total": 0,
+        "dropped_total": 0,
+        "pending": 0
+      },
+      "identity_mapping": {
+        "cache_hit": 0,
+        "cache_miss": 0,
+        "cache_stale": 0,
+        "db_lookup_count": 0,
+        "db_lookup_ms_total": 0,
+        "degraded_compat": 0,
+        "mapped": 0,
+        "strict_rejected": 0,
+        "unmapped": 0
+      },
+      "instance_id": "pid-18697-1773364325",
+      "integrations": {
+        "telegram": {
+          "account_id": null,
+          "chat_id": null,
+          "configured": false,
+          "connected": null,
+          "data_source": "global"
+        }
+      },
+      "last_trigger": null,
+      "ops": {
+        "last_event": null,
+        "proactive_blocked_dedupe_total": 0,
+        "proactive_blocked_rate_total": 0,
+        "proactive_send_errors_total": 0,
+        "proactive_sent_total": 0,
+        "recent_events": [],
+        "scheduler_blocked_burst_total": 0,
+        "scheduler_blocked_cooldown_total": 0,
+        "scheduler_executed_total": 0
+      },
+      "owned_users_count": 0,
+      "pool": {
+        "hits": 0,
+        "idle": 0,
+        "misses": 0
+      },
+      "runtime_mode": "threaded",
+      "startup_self_check": {
+        "chat_fallback_chain": "together",
+        "chat_provider_effective": "openrouter",
+        "config_path": "/Users/nova/.nullalis/config.json",
+        "degraded": true,
+        "degraded_reason": "ConnectionFailed",
+        "embedding_provider_effective": "together",
+        "heartbeat_enabled": true,
+        "heartbeat_interval_minutes": 30,
+        "postgres_host": "127.0.0.1",
+        "postgres_port": 5432,
+        "postgres_schema": "zaki_bot",
+        "provider_data_source": "config",
+        "scheduler_backend": "file",
+        "state_backend_configured": "postgres",
+        "state_backend_effective": "file",
+        "tenant_enabled": true,
+        "webhook_mode": "none"
+      },
+      "tenant_lease_probe": null,
+      "tenant_lock_backend": "file_lock",
+      "tenant_lock_conflicts_by_route": {
+        "api": 0,
+        "chat_stream_http": 0,
+        "chat_stream_sse": 0,
+        "daemon": 0,
+        "webhook": 0
+      },
+      "tenant_lock_lease_secs": 300
+    },
+    "before_error": null,
+    "url": "http://127.0.0.1:3000/internal/diagnostics?user_id=1"
+  },
+  "distinct_session_keys": 50,
+  "distinct_users": 50,
+  "error_details": {
+    "detail_counts": {
+      "chat_failed: chat failed": 49,
+      "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}": 1
+    },
+    "exception_classes": {
+      "HTTPError": 1,
+      "SSE": 49
+    },
+    "status_codes": {
+      "200": 49,
+      "409": 1
+    }
+  },
+  "error_reasons": {
+    "http_error": 1,
+    "sse_error_done": 49
+  },
+  "errors": 50,
+  "failure_samples": [
+    {
+      "elapsed_ms": 101,
+      "error_body": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "error_class": "HTTPError",
+      "error_detail": "event: error data: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\"} event: done data: {\"type\":\"done\"}",
+      "reason": "http_error",
+      "request_id": 0,
+      "status_code": 409,
+      "user_id": "1"
+    },
+    {
+      "elapsed_ms": 8244,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 1,
+      "status_code": 200,
+      "user_id": "2"
+    },
+    {
+      "elapsed_ms": 8497,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 7,
+      "status_code": 200,
+      "user_id": "8"
+    },
+    {
+      "elapsed_ms": 8501,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 10,
+      "status_code": 200,
+      "user_id": "11"
+    },
+    {
+      "elapsed_ms": 8549,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 6,
+      "status_code": 200,
+      "user_id": "7"
+    },
+    {
+      "elapsed_ms": 8573,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 8,
+      "status_code": 200,
+      "user_id": "9"
+    },
+    {
+      "elapsed_ms": 8603,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 12,
+      "status_code": 200,
+      "user_id": "13"
+    },
+    {
+      "elapsed_ms": 8810,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 3,
+      "status_code": 200,
+      "user_id": "4"
+    },
+    {
+      "elapsed_ms": 8825,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 11,
+      "status_code": 200,
+      "user_id": "12"
+    },
+    {
+      "elapsed_ms": 8827,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 2,
+      "status_code": 200,
+      "user_id": "3"
+    },
+    {
+      "elapsed_ms": 8857,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 4,
+      "status_code": 200,
+      "user_id": "5"
+    },
+    {
+      "elapsed_ms": 8888,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 9,
+      "status_code": 200,
+      "user_id": "10"
+    },
+    {
+      "elapsed_ms": 8913,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 5,
+      "status_code": 200,
+      "user_id": "6"
+    },
+    {
+      "elapsed_ms": 8911,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 13,
+      "status_code": 200,
+      "user_id": "14"
+    },
+    {
+      "elapsed_ms": 8951,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 16,
+      "status_code": 200,
+      "user_id": "17"
+    },
+    {
+      "elapsed_ms": 9367,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 18,
+      "status_code": 200,
+      "user_id": "19"
+    },
+    {
+      "elapsed_ms": 16622,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 14,
+      "status_code": 200,
+      "user_id": "15"
+    },
+    {
+      "elapsed_ms": 16998,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 17,
+      "status_code": 200,
+      "user_id": "18"
+    },
+    {
+      "elapsed_ms": 17097,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 19,
+      "status_code": 200,
+      "user_id": "20"
+    },
+    {
+      "elapsed_ms": 17100,
+      "error_body": "{\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}",
+      "error_class": "SSE",
+      "error_detail": "chat_failed: chat failed",
+      "reason": "sse_error_done",
+      "request_id": 20,
+      "status_code": 200,
+      "user_id": "21"
+    }
+  ],
+  "isolation_probe": {
+    "baseline": {
+      "count": 3,
+      "error_reasons": {
+        "sse_error_done": 3
+      },
+      "errors": 3,
+      "latency_ms": {
+        "max": 0,
+        "mean": 0,
+        "min": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "success": 0
+    },
+    "count_per_phase": 3,
+    "degradation_pct_p95": null,
+    "enabled": true,
+    "gate_max_p95_degradation_pct": 15.0,
+    "gate_pass": false,
+    "gate_status": "inconclusive",
+    "interval_ms": 250,
+    "overlap_with_load_users": false,
+    "session_key": "agent:zaki-bot:user:1000:main",
+    "under_load": {
+      "count": 3,
+      "error_reasons": {
+        "sse_error_done": 3
+      },
+      "errors": 3,
+      "latency_ms": {
+        "max": 0,
+        "mean": 0,
+        "min": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "success": 0
+    },
+    "user_id": "1000"
+  },
+  "lane_counts": {
+    "cron": 2,
+    "task": 6,
+    "thread": 42
+  },
+  "lane_strategy": "mixed_real",
+  "latency_ms": {
+    "max": 0,
+    "mean": 0,
+    "min": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0
+  },
+  "mode": "multi-user",
+  "requested_users": 50,
+  "requests": 50,
+  "run_finished_utc": "2026-03-13T01:16:09.936722+00:00",
+  "run_label": "2026-03-13-set5-50",
+  "run_started_utc": "2026-03-13T01:14:54.461316+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 0,
+  "wall_ms": 46261,
+  "workers": 50
+}
