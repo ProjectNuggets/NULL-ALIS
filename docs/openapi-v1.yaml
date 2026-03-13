@@ -823,6 +823,37 @@ paths:
           description: Binding not found
 
   /api/v1/users/{user_id}/channels/telegram/disconnect:
+    post:
+      tags: [user]
+      summary: Disconnect Telegram channel for user (action-style alias)
+      description: |
+        Supports action-style callers that prefer POST for disconnect operations.
+        Behavior is identical to DELETE.
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bot_token:
+                  type: string
+                drop_pending_updates:
+                  type: boolean
+      responses:
+        "200":
+          description: Disconnected
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "502":
+          description: Telegram API rejected disconnect operation
     delete:
       tags: [user]
       summary: Disconnect Telegram channel for user

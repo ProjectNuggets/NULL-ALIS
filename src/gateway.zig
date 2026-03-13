@@ -5170,7 +5170,8 @@ fn handleApiRoute(
     }
 
     if (std.mem.eql(u8, parsed.subpath, "channels/telegram/disconnect")) {
-        if (!std.mem.eql(u8, method, "DELETE")) {
+        const method_allowed = std.mem.eql(u8, method, "DELETE") or std.mem.eql(u8, method, "POST");
+        if (!method_allowed) {
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         }
         const body = extractBody(raw_request) orelse "{}";
@@ -7586,6 +7587,44 @@ test "GatewayState init has empty verify token" {
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
     try std.testing.expectEqualStrings("", state.whatsapp_verify_token);
+}
+
+test "handleApiRoute accepts POST alias for telegram disconnect" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/users/1/channels/telegram/disconnect HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "POST",
+        "/api/v1/users/1/channels/telegram/disconnect",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    try std.testing.expectEqualStrings("{\"status\":\"disconnected\",\"channel\":\"telegram\"}", response.body);
 }
 
 // ── Bearer Token Validation tests ───────────────────────────────
