@@ -19,6 +19,25 @@ Use this order when values disagree:
 Operational rule:
 - In tenant+Postgres deployments, treat file cron state as informational only.
 
+## Tool Sandbox (V1)
+
+V1 scope:
+1. `shell`
+2. `git_operations`
+
+Behavior matrix:
+1. `security.sandbox.enabled=false`:
+- tools run unsandboxed (current legacy behavior)
+2. `security.sandbox.enabled=true` + backend available:
+- `shell`/`git_operations` execute through configured sandbox backend
+3. `security.sandbox.enabled=true` + backend unavailable (or resolves to `none`):
+- `shell`/`git_operations` fail closed with explicit sandbox-unavailable error
+
+Operational notes:
+1. V1 is opt-in through existing config knobs (`security.sandbox.enabled`, `security.sandbox.backend`).
+2. Fail-closed applies only when sandbox is explicitly enabled.
+3. Other process-spawning tools are intentionally out of scope for V1.
+
 ## Dev Checks
 
 ### 1. Start gateway and verify startup self-check

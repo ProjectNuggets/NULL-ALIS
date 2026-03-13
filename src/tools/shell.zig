@@ -6,6 +6,8 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const config_types = @import("../config_types.zig");
+const tool_sandbox_v1 = @import("tool_sandbox_v1.zig");
 const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullalis_workspace_unavailable__";
 
 /// Default maximum shell command execution time (nanoseconds).
@@ -24,6 +26,8 @@ pub const ShellTool = struct {
     timeout_ns: u64 = DEFAULT_SHELL_TIMEOUT_NS,
     max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
     policy: ?*const SecurityPolicy = null,
+    sandbox_enabled: bool = false,
+    sandbox_backend: config_types.SandboxBackend = .auto,
 
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
@@ -91,12 +95,26 @@ pub const ShellTool = struct {
         }
 
         // Execute via platform shell
-        const proc = @import("process_util.zig");
-        const result = try proc.run(allocator, &.{ platform.getShell(), platform.getShellFlag(), command }, .{
-            .cwd = effective_cwd,
-            .env_map = &env,
-            .max_output_bytes = self.max_output_bytes,
-        });
+        const result = tool_sandbox_v1.run_with_optional_sandbox(
+            allocator,
+            .{
+                .enabled = self.sandbox_enabled,
+                .backend = self.sandbox_backend,
+                .workspace_dir = self.workspace_dir,
+            },
+            &.{ platform.getShell(), platform.getShellFlag(), command },
+            .{
+                .cwd = effective_cwd,
+                .env_map = &env,
+                .max_output_bytes = self.max_output_bytes,
+            },
+        ) catch |err| {
+            return switch (err) {
+                error.SandboxUnavailable => ToolResult.fail("Sandbox unavailable for shell execution"),
+                error.SandboxArgvTooLong => ToolResult.fail("Sandbox argv exceeds fixed tool limit"),
+                else => ToolResult.fail("Shell execution failed in sandbox"),
+            };
+        };
         defer allocator.free(result.stderr);
 
         if (result.success) {
@@ -339,4 +357,18 @@ test "shell cwd with allowed_paths runs in cwd" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, tmp_path) != null);
+}
+
+test "shell fail closed when sandbox backend resolves to none" {
+    var st = ShellTool{
+        .workspace_dir = "/tmp",
+        .sandbox_enabled = true,
+        .sandbox_backend = .none,
+    };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"command\": \"echo hello\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Sandbox unavailable") != null);
 }

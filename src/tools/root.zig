@@ -298,6 +298,8 @@ pub fn allTools(
 
     // Core tools with workspace_dir + allowed_paths + tools_config limits
     const tc = opts.tools_config;
+    const sandbox_enabled = if (opts.config) |cfg| cfg.security.sandbox.enabled orelse false else false;
+    const sandbox_backend = if (opts.config) |cfg| cfg.security.sandbox.backend else @import("../config_types.zig").SandboxBackend.auto;
 
     const st = try allocator.create(shell.ShellTool);
     st.* = .{
@@ -306,6 +308,8 @@ pub fn allTools(
         .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
+        .sandbox_enabled = sandbox_enabled,
+        .sandbox_backend = sandbox_backend,
     };
     try list.append(allocator, st.tool());
 
@@ -330,7 +334,12 @@ pub fn allTools(
     try list.append(allocator, fat.tool());
 
     const gt = try allocator.create(git.GitTool);
-    gt.* = .{ .workspace_dir = workspace_dir };
+    gt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .sandbox_enabled = sandbox_enabled,
+        .sandbox_backend = sandbox_backend,
+    };
     try list.append(allocator, gt.tool());
 
     // Tools without workspace_dir
@@ -1066,6 +1075,44 @@ test "all tools excludes extras when disabled" {
     // shell + file_read + file_write + file_edit + file_append + git + image_info
     // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule + runtime_info + skill_registry + spawn = 16
     try std.testing.expectEqual(@as(usize, 16), tools.len);
+}
+
+test "all tools propagates sandbox config to shell and git" {
+    const Config = @import("../config.zig").Config;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.security.sandbox.enabled = true;
+    cfg.security.sandbox.backend = .none;
+
+    const allowed_paths = [_][]const u8{"/tmp/yc_allowed"};
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
+        .allowed_paths = &allowed_paths,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_shell = false;
+    var saw_git = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "shell")) {
+            const st: *shell.ShellTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expect(st.sandbox_enabled);
+            try std.testing.expectEqual(@as(@import("../config_types.zig").SandboxBackend, .none), st.sandbox_backend);
+            saw_shell = true;
+        } else if (std.mem.eql(u8, t.name(), "git_operations")) {
+            const gt: *git.GitTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expect(gt.sandbox_enabled);
+            try std.testing.expectEqual(@as(@import("../config_types.zig").SandboxBackend, .none), gt.sandbox_backend);
+            try std.testing.expectEqual(@as(usize, 1), gt.allowed_paths.len);
+            try std.testing.expectEqualStrings("/tmp/yc_allowed", gt.allowed_paths[0]);
+            saw_git = true;
+        }
+    }
+    try std.testing.expect(saw_shell);
+    try std.testing.expect(saw_git);
 }
 
 test "all tools binds runtime_info to finalized tool slice" {

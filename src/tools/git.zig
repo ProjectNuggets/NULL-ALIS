@@ -4,12 +4,16 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const config_types = @import("../config_types.zig");
+const tool_sandbox_v1 = @import("tool_sandbox_v1.zig");
 const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullalis_workspace_unavailable__";
 
 /// Git operations tool for structured repository management.
 pub const GitTool = struct {
     workspace_dir: []const u8,
     allowed_paths: []const []const u8 = &.{},
+    sandbox_enabled: bool = false,
+    sandbox_backend: config_types.SandboxBackend = .auto,
 
     pub const tool_name = "git_operations";
     pub const tool_description = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash).";
@@ -143,22 +147,31 @@ pub const GitTool = struct {
             .{ "stash", .stash },
         });
 
-        if (op_map.get(operation)) |op| return switch (op) {
-            .status => self.runGitOp(allocator, effective_cwd, &.{ "status", "--porcelain=2", "--branch" }),
-            .diff => self.gitDiff(allocator, effective_cwd, args),
-            .log => self.gitLog(allocator, effective_cwd, args),
-            .branch => self.runGitOp(allocator, effective_cwd, &.{ "branch", "--format=%(refname:short)|%(HEAD)" }),
-            .commit => self.gitCommit(allocator, effective_cwd, args),
-            .add => self.gitAdd(allocator, effective_cwd, args),
-            .checkout => self.gitCheckout(allocator, effective_cwd, args),
-            .stash => self.gitStash(allocator, effective_cwd, args),
-        };
+        if (op_map.get(operation)) |op| {
+            const op_result = switch (op) {
+                .status => self.runGitOp(allocator, effective_cwd, &.{ "status", "--porcelain=2", "--branch" }),
+                .diff => self.gitDiff(allocator, effective_cwd, args),
+                .log => self.gitLog(allocator, effective_cwd, args),
+                .branch => self.runGitOp(allocator, effective_cwd, &.{ "branch", "--format=%(refname:short)|%(HEAD)" }),
+                .commit => self.gitCommit(allocator, effective_cwd, args),
+                .add => self.gitAdd(allocator, effective_cwd, args),
+                .checkout => self.gitCheckout(allocator, effective_cwd, args),
+                .stash => self.gitStash(allocator, effective_cwd, args),
+            } catch |err| {
+                switch (err) {
+                    error.SandboxUnavailable => return ToolResult.fail("Sandbox unavailable for git execution"),
+                    error.SandboxArgvTooLong => return ToolResult.fail("Sandbox argv exceeds fixed tool limit"),
+                    else => return err,
+                }
+            };
+            return op_result;
+        }
 
         const msg = try std.fmt.allocPrint(allocator, "Unknown operation: {s}", .{operation});
         return ToolResult{ .success = false, .output = "", .error_msg = msg };
     }
 
-    fn runGit(_: *GitTool, allocator: std.mem.Allocator, git_cwd: []const u8, args: []const []const u8) !struct { stdout: []u8, stderr: []u8, success: bool } {
+    fn runGit(self: *GitTool, allocator: std.mem.Allocator, git_cwd: []const u8, args: []const []const u8) !struct { stdout: []u8, stderr: []u8, success: bool } {
         var argv_buf: [32][]const u8 = undefined;
         argv_buf[0] = "git";
         const arg_count = @min(args.len, argv_buf.len - 1);
@@ -166,8 +179,16 @@ pub const GitTool = struct {
             argv_buf[i] = a;
         }
 
-        const proc = @import("process_util.zig");
-        const result = try proc.run(allocator, argv_buf[0 .. arg_count + 1], .{ .cwd = git_cwd });
+        const result = try tool_sandbox_v1.run_with_optional_sandbox(
+            allocator,
+            .{
+                .enabled = self.sandbox_enabled,
+                .backend = self.sandbox_backend,
+                .workspace_dir = self.workspace_dir,
+            },
+            argv_buf[0 .. arg_count + 1],
+            .{ .cwd = git_cwd },
+        );
         return .{ .stdout = result.stdout, .stderr = result.stderr, .success = result.success };
     }
 
@@ -517,6 +538,20 @@ test "sanitizeGitArgs allows safe branch names" {
     try std.testing.expect(GitTool.sanitizeGitArgs("feature/test-branch"));
     try std.testing.expect(GitTool.sanitizeGitArgs("src/main.zig"));
     try std.testing.expect(GitTool.sanitizeGitArgs("."));
+}
+
+test "git fail closed when sandbox backend resolves to none" {
+    var gt = GitTool{
+        .workspace_dir = "/tmp",
+        .sandbox_enabled = true,
+        .sandbox_backend = .none,
+    };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"status\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Sandbox unavailable") != null);
 }
 
 test "sanitizeGitArgs allows --cached (not blocked by -c check)" {
