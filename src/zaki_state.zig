@@ -12,11 +12,6 @@ const c = if (build_options.enable_postgres) @cImport({
     @cInclude("libpq-fe.h");
 }) else struct {};
 
-threadlocal var tls_pg_conn: ?*c.PGconn = null;
-threadlocal var tls_pg_conn_key: ?[*:0]const u8 = null;
-threadlocal var tls_pg_statement_timeout_ms: u32 = 0;
-threadlocal var tls_pg_lock_timeout_ms: u32 = 0;
-
 pub const ChannelIdentityBinding = struct {
     id: []u8,
     user_id: i64,
@@ -230,12 +225,39 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
 };
 
 const ManagerImpl = struct {
+    const PoolEntry = struct {
+        conn: *c.PGconn,
+        in_use: bool,
+        last_used_s: i64,
+    };
+
+    const ConnLease = struct {
+        conn: *c.PGconn,
+        entry_index: usize,
+        released: bool = false,
+    };
+
+    pub const PoolDebugSnapshot = struct {
+        pool_max: u32,
+        open_conns: u32,
+        in_use: u32,
+        waiters: u32,
+        acquire_timeouts: u64,
+    };
+
     allocator: std.mem.Allocator,
     conn_string_z: [:0]u8,
     schema_raw_buf: [64]u8,
     schema_raw_len: usize,
     secrets_enabled: bool,
     master_key: ?[security_secrets.KEY_LEN]u8,
+    pool_entries: std.ArrayListUnmanaged(PoolEntry),
+    pool_mutex: std.Thread.Mutex,
+    pool_cond: std.Thread.Condition,
+    pool_max: u32,
+    pool_opening: u32,
+    pool_waiters: u32,
+    pool_acquire_timeouts: u64,
     statement_timeout_ms: u32,
     lock_timeout_ms: u32,
 
@@ -323,29 +345,43 @@ const ManagerImpl = struct {
             .schema_raw_len = cfg.postgres.schema.len,
             .secrets_enabled = true,
             .master_key = null,
+            .pool_entries = .empty,
+            .pool_mutex = .{},
+            .pool_cond = .{},
+            .pool_max = std.math.clamp(cfg.postgres.pool_max, 1, 256),
+            .pool_opening = 0,
+            .pool_waiters = 0,
+            .pool_acquire_timeouts = 0,
             .statement_timeout_ms = cfg.postgres.statement_timeout_ms,
             .lock_timeout_ms = cfg.postgres.lock_timeout_ms,
         };
 
         manager.secrets_enabled = true;
         manager.master_key = try loadMasterKey(allocator, cfg.secrets.master_key_env);
-
-        _ = try manager.currentConn();
         try manager.migrate();
         return manager;
     }
 
     pub fn deinit(self: *Self) void {
-        if (tls_pg_conn) |conn| {
-            if (tls_pg_conn_key == self.conn_string_z.ptr) {
-                c.PQfinish(conn);
-                tls_pg_conn = null;
-                tls_pg_conn_key = null;
-                tls_pg_statement_timeout_ms = 0;
-                tls_pg_lock_timeout_ms = 0;
-            }
-        }
+        self.closeAllPoolConns();
+        self.pool_entries.deinit(self.allocator);
         self.allocator.free(self.conn_string_z);
+    }
+
+    pub fn debugPoolSnapshot(self: *Self) PoolDebugSnapshot {
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+        var in_use: u32 = 0;
+        for (self.pool_entries.items) |entry| {
+            if (entry.in_use) in_use += 1;
+        }
+        return .{
+            .pool_max = self.pool_max,
+            .open_conns = @intCast(self.pool_entries.items.len),
+            .in_use = in_use,
+            .waiters = self.pool_waiters,
+            .acquire_timeouts = self.pool_acquire_timeouts,
+        };
     }
 
     fn schemaRaw(self: *const Self) []const u8 {
@@ -375,30 +411,138 @@ const ManagerImpl = struct {
         }
     }
 
-    fn currentConn(self: *Self) !*c.PGconn {
-        if (tls_pg_conn) |conn| {
-            if (tls_pg_conn_key == self.conn_string_z.ptr and
-                tls_pg_statement_timeout_ms == self.statement_timeout_ms and
-                tls_pg_lock_timeout_ms == self.lock_timeout_ms)
-            {
-                return conn;
-            }
-            c.PQfinish(conn);
-            tls_pg_conn = null;
-            tls_pg_conn_key = null;
-            tls_pg_statement_timeout_ms = 0;
-            tls_pg_lock_timeout_ms = 0;
-        }
-
+    fn openConn(self: *Self) !*c.PGconn {
         const conn = c.PQconnectdb(self.conn_string_z.ptr) orelse return error.ConnectionFailed;
         errdefer c.PQfinish(conn);
         if (c.PQstatus(conn) != c.CONNECTION_OK) return error.ConnectionFailed;
         try self.applySessionSettingsToConn(conn);
-        tls_pg_conn = conn;
-        tls_pg_conn_key = self.conn_string_z.ptr;
-        tls_pg_statement_timeout_ms = self.statement_timeout_ms;
-        tls_pg_lock_timeout_ms = self.lock_timeout_ms;
         return conn;
+    }
+
+    fn acquireConn(self: *Self, wait_ms: u32) !ConnLease {
+        const start_ms = std.time.milliTimestamp();
+        while (true) {
+            self.pool_mutex.lock();
+
+            for (self.pool_entries.items, 0..) |*entry, idx| {
+                if (!entry.in_use) {
+                    entry.in_use = true;
+                    entry.last_used_s = std.time.timestamp();
+                    self.pool_mutex.unlock();
+                    return .{ .conn = entry.conn, .entry_index = idx };
+                }
+            }
+
+            if (self.pool_entries.items.len + self.pool_opening < self.pool_max) {
+                self.pool_opening += 1;
+                self.pool_mutex.unlock();
+
+                const conn = self.openConn() catch |err| {
+                    self.pool_mutex.lock();
+                    self.pool_opening -= 1;
+                    self.pool_cond.signal();
+                    self.pool_mutex.unlock();
+                    return err;
+                };
+
+                self.pool_mutex.lock();
+                self.pool_opening -= 1;
+
+                if (self.pool_entries.items.len >= self.pool_max) {
+                    c.PQfinish(conn);
+                    self.pool_cond.signal();
+                    self.pool_mutex.unlock();
+                    continue;
+                }
+
+                const entry_idx = self.pool_entries.items.len;
+                try self.pool_entries.append(self.allocator, .{
+                    .conn = conn,
+                    .in_use = true,
+                    .last_used_s = std.time.timestamp(),
+                });
+                self.pool_mutex.unlock();
+                return .{ .conn = conn, .entry_index = entry_idx };
+            }
+
+            if (wait_ms == 0) {
+                self.pool_waiters += 1;
+                self.pool_cond.wait(&self.pool_mutex);
+                self.pool_waiters -= 1;
+                self.pool_mutex.unlock();
+                continue;
+            }
+
+            const now_ms = std.time.milliTimestamp();
+            const elapsed_ms: u64 = @intCast(@max(0, now_ms - start_ms));
+            if (elapsed_ms >= wait_ms) {
+                self.pool_acquire_timeouts += 1;
+                self.pool_mutex.unlock();
+                return error.ConnectionPoolBusy;
+            }
+            const remaining_ms = wait_ms - elapsed_ms;
+
+            self.pool_waiters += 1;
+            self.pool_cond.timedWait(&self.pool_mutex, remaining_ms * std.time.ns_per_ms) catch |err| switch (err) {
+                error.Timeout => {
+                    self.pool_waiters -= 1;
+                    self.pool_acquire_timeouts += 1;
+                    self.pool_mutex.unlock();
+                    return error.ConnectionPoolBusy;
+                },
+            };
+            self.pool_waiters -= 1;
+            self.pool_mutex.unlock();
+        }
+    }
+
+    fn releaseConn(self: *Self, lease: *ConnLease, healthy: bool) void {
+        if (lease.released) return;
+
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+
+        if (self.pool_entries.items.len == 0) {
+            lease.released = true;
+            return;
+        }
+
+        var idx = if (lease.entry_index < self.pool_entries.items.len) lease.entry_index else self.pool_entries.items.len - 1;
+        if (self.pool_entries.items[idx].conn != lease.conn) {
+            var found = false;
+            for (self.pool_entries.items, 0..) |entry, entry_idx| {
+                if (entry.conn == lease.conn) {
+                    idx = entry_idx;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                lease.released = true;
+                return;
+            }
+        }
+
+        const conn_ok = c.PQstatus(lease.conn) == c.CONNECTION_OK;
+        if (!healthy or !conn_ok) {
+            c.PQfinish(self.pool_entries.items[idx].conn);
+            _ = self.pool_entries.swapRemove(idx);
+        } else {
+            self.pool_entries.items[idx].in_use = false;
+            self.pool_entries.items[idx].last_used_s = std.time.timestamp();
+        }
+
+        lease.released = true;
+        self.pool_cond.signal();
+    }
+
+    fn closeAllPoolConns(self: *Self) void {
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+        for (self.pool_entries.items) |entry| {
+            c.PQfinish(entry.conn);
+        }
+        self.pool_entries.clearRetainingCapacity();
     }
 
     fn migrate(self: *Self) !void {
@@ -1860,12 +2004,23 @@ const ManagerImpl = struct {
     }
 
     fn exec(self: *Self, query: []const u8) !*c.PGresult {
-        const conn = try self.currentConn();
+        var lease = self.acquireConn(self.lock_timeout_ms) catch |err| switch (err) {
+            error.ConnectionPoolBusy => return error.ConnectionFailed,
+            else => return err,
+        };
+        var conn_healthy = true;
+        defer self.releaseConn(&lease, conn_healthy);
+
+        const conn = lease.conn;
         const query_z = try self.allocator.dupeZ(u8, query);
         defer self.allocator.free(query_z);
-        const result = c.PQexec(conn, query_z) orelse return error.ExecFailed;
+        const result = c.PQexec(conn, query_z) orelse {
+            conn_healthy = false;
+            return error.ExecFailed;
+        };
         const status = c.PQresultStatus(result);
         if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
+            if (c.PQstatus(conn) != c.CONNECTION_OK) conn_healthy = false;
             log.err("postgres exec failed: {s}", .{c.PQerrorMessage(conn)});
             c.PQclear(result);
             return error.ExecFailed;
@@ -1874,15 +2029,26 @@ const ManagerImpl = struct {
     }
 
     fn execMigrateStatement(self: *Self, template: []const u8, query: []const u8) !?*c.PGresult {
-        const conn = try self.currentConn();
+        var lease = self.acquireConn(self.lock_timeout_ms) catch |err| switch (err) {
+            error.ConnectionPoolBusy => return error.ConnectionFailed,
+            else => return err,
+        };
+        var conn_healthy = true;
+        defer self.releaseConn(&lease, conn_healthy);
+
+        const conn = lease.conn;
         const query_z = try self.allocator.dupeZ(u8, query);
         defer self.allocator.free(query_z);
-        const result = c.PQexec(conn, query_z) orelse return error.ExecFailed;
+        const result = c.PQexec(conn, query_z) orelse {
+            conn_healthy = false;
+            return error.ExecFailed;
+        };
         const status = c.PQresultStatus(result);
         if (status == c.PGRES_COMMAND_OK or status == c.PGRES_TUPLES_OK) {
             return result;
         }
 
+        if (c.PQstatus(conn) != c.CONNECTION_OK) conn_healthy = false;
         if (canIgnoreMigrateError(template, c.PQerrorMessage(conn))) {
             c.PQclear(result);
             return null;
@@ -1894,7 +2060,14 @@ const ManagerImpl = struct {
     }
 
     fn execParams(self: *Self, query: []const u8, params: []const ?[*:0]const u8, lengths: []const c_int) !*c.PGresult {
-        const conn = try self.currentConn();
+        var lease = self.acquireConn(self.lock_timeout_ms) catch |err| switch (err) {
+            error.ConnectionPoolBusy => return error.ConnectionFailed,
+            else => return err,
+        };
+        var conn_healthy = true;
+        defer self.releaseConn(&lease, conn_healthy);
+
+        const conn = lease.conn;
         const query_z = try self.allocator.dupeZ(u8, query);
         defer self.allocator.free(query_z);
         const n: c_int = @intCast(params.len);
@@ -1908,12 +2081,14 @@ const ManagerImpl = struct {
             null,
             0,
         ) orelse {
+            conn_healthy = false;
             log.err("postgres exec params returned null status={d}: {s}; query={s}", .{ c.PQstatus(conn), c.PQerrorMessage(conn), query });
             return error.ExecFailed;
         };
 
         const status = c.PQresultStatus(result);
         if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
+            if (c.PQstatus(conn) != c.CONNECTION_OK) conn_healthy = false;
             log.err("postgres exec params failed: {s}", .{c.PQerrorMessage(conn)});
             c.PQclear(result);
             return error.ExecFailed;
@@ -2110,6 +2285,35 @@ test "canIgnoreMigrateError tolerates create unique index duplicate race" {
     const tpl = "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_user_key ON {schema}.memories(user_id, key)";
     const err_text: [:0]const u8 = "ERROR:  duplicate key value violates unique constraint \"pg_class_relname_nsp_index\"";
     try std.testing.expect(canIgnoreMigrateError(tpl, err_text.ptr));
+}
+
+fn initPostgresTestManagerWithPool(allocator: std.mem.Allocator, pool_max: u32, lock_timeout_ms: u32) !ManagerImpl {
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+            .pool_max = pool_max,
+            .lock_timeout_ms = lock_timeout_ms,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    return mgr;
 }
 
 test "postgres claimed job one-shot completion preserves run history and hides job" {
@@ -2478,4 +2682,120 @@ test "postgres ownership lease snapshot returns null and active lease values" {
 
     try mgr.releaseUserOwnershipLease(2, "instance-a", lease_token);
     try std.testing.expect((try mgr.getUserOwnershipLeaseSnapshot(allocator, 2)) == null);
+}
+
+test "postgres_pool_enforces_cap_under_concurrency" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try initPostgresTestManagerWithPool(allocator, 2, 500);
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const WorkerCtx = struct {
+        mgr: *ManagerImpl,
+        user_id: i64,
+        worker_id: usize,
+    };
+    const Worker = struct {
+        fn run(ctx: *WorkerCtx) void {
+            var session_buf: [96]u8 = undefined;
+            const session_id = std.fmt.bufPrint(&session_buf, "agent:zaki-bot:user:{d}:task:pool-{d}", .{ ctx.user_id, ctx.worker_id }) catch return;
+            for (0..20) |i| {
+                var content_buf: [96]u8 = undefined;
+                const content = std.fmt.bufPrint(&content_buf, "pool-test-{d}-{d}", .{ ctx.worker_id, i }) catch continue;
+                ctx.mgr.saveSessionMessage(ctx.user_id, session_id, "user", content) catch continue;
+                if (i % 5 == 0) {
+                    const messages = ctx.mgr.loadSessionMessages(std.heap.page_allocator, ctx.user_id, session_id) catch continue;
+                    memory_root.freeMessages(std.heap.page_allocator, messages);
+                }
+            }
+        }
+    };
+
+    var worker_ctx: [8]WorkerCtx = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (0..threads.len) |idx| {
+        worker_ctx[idx] = .{
+            .mgr = &mgr,
+            .user_id = 2,
+            .worker_id = idx,
+        };
+        threads[idx] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Worker.run, .{&worker_ctx[idx]});
+    }
+    for (threads) |thread| thread.join();
+
+    const snapshot = mgr.debugPoolSnapshot();
+    try std.testing.expect(snapshot.open_conns <= snapshot.pool_max);
+    try std.testing.expectEqual(@as(u32, 2), snapshot.pool_max);
+}
+
+test "postgres_pool_reuses_connections" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try initPostgresTestManagerWithPool(allocator, 2, 500);
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const session_id = "agent:zaki-bot:user:2:main";
+    try mgr.saveSessionMessage(2, session_id, "user", "first");
+    const first_snapshot = mgr.debugPoolSnapshot();
+
+    for (0..25) |i| {
+        var content_buf: [64]u8 = undefined;
+        const content = try std.fmt.bufPrint(&content_buf, "reuse-{d}", .{i});
+        try mgr.saveSessionMessage(2, session_id, "user", content);
+        const messages = try mgr.loadSessionMessages(allocator, 2, session_id);
+        memory_root.freeMessages(allocator, messages);
+    }
+
+    const final_snapshot = mgr.debugPoolSnapshot();
+    try std.testing.expect(first_snapshot.open_conns >= 1);
+    try std.testing.expect(final_snapshot.open_conns >= 1);
+    try std.testing.expect(final_snapshot.open_conns <= 2);
+    try std.testing.expect(final_snapshot.open_conns <= first_snapshot.open_conns + 1);
+}
+
+test "postgres_pool_timeout_when_exhausted" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try initPostgresTestManagerWithPool(allocator, 2, 30);
+    defer mgr.deinit();
+
+    var lease_a = try mgr.acquireConn(0);
+    defer mgr.releaseConn(&lease_a, true);
+    var lease_b = try mgr.acquireConn(0);
+    defer mgr.releaseConn(&lease_b, true);
+
+    const start_ms = std.time.milliTimestamp();
+    try std.testing.expectError(error.ConnectionPoolBusy, mgr.acquireConn(30));
+    const elapsed_ms = std.time.milliTimestamp() - start_ms;
+    try std.testing.expect(elapsed_ms >= 0);
+
+    const snapshot = mgr.debugPoolSnapshot();
+    try std.testing.expectEqual(@as(u32, 2), snapshot.in_use);
+    try std.testing.expect(snapshot.open_conns <= snapshot.pool_max);
+}
+
+test "postgres_pool_releases_on_exec_error" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try initPostgresTestManagerWithPool(allocator, 2, 500);
+    defer mgr.deinit();
+
+    try std.testing.expectError(error.ExecFailed, mgr.exec("SELECT * FROM this_relation_does_not_exist"));
+
+    const after_error = mgr.debugPoolSnapshot();
+    try std.testing.expectEqual(@as(u32, 0), after_error.in_use);
+    try std.testing.expect(after_error.open_conns <= after_error.pool_max);
+
+    const ok_result = try mgr.exec("SELECT 1");
+    c.PQclear(ok_result);
+
+    const after_recovery = mgr.debugPoolSnapshot();
+    try std.testing.expectEqual(@as(u32, 0), after_recovery.in_use);
+    try std.testing.expect(after_recovery.open_conns <= after_recovery.pool_max);
 }
