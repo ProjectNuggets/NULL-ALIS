@@ -21,6 +21,7 @@ const Memory = memory_mod.Memory;
 const capabilities_mod = @import("../capabilities.zig");
 const multimodal = @import("../multimodal.zig");
 const platform = @import("../platform.zig");
+const voice_mod = @import("../voice.zig");
 const observability = @import("../observability.zig");
 const tool_dispatcher = @import("../tool_dispatcher.zig");
 const Observer = observability.Observer;
@@ -53,6 +54,14 @@ const DEFAULT_MAX_HISTORY: u32 = 50;
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Agent = struct {
+    const TtsSynthesizeFn = *const fn (
+        allocator: std.mem.Allocator,
+        provider: []const u8,
+        api_key: []const u8,
+        text: []const u8,
+        opts: voice_mod.SynthesizeOptions,
+    ) voice_mod.SynthesizeError![]u8;
+
     const VerboseLevel = enum {
         off,
         on,
@@ -266,6 +275,7 @@ pub const Agent = struct {
     tts_limit_chars: u32 = 0,
     tts_summary: bool = false,
     tts_audio: bool = false,
+    tts_synthesize_fn: TtsSynthesizeFn = voice_mod.synthesizeTextToTempAudio,
     pending_exec_command: ?[]const u8 = null,
     pending_exec_command_owned: bool = false,
     pending_exec_id: u64 = 0,
@@ -534,6 +544,11 @@ pub const Agent = struct {
         return self.tts_provider orelse self.default_provider;
     }
 
+    fn ttsAudioChannelSupported(message_ctx: tools_mod.MessageTurnContext) bool {
+        const channel = message_ctx.channel orelse return false;
+        return std.ascii.eqlIgnoreCase(channel, "telegram");
+    }
+
     fn ttsTrimUtf8Boundary(text: []const u8, max_chars: usize) []const u8 {
         if (text.len <= max_chars) return text;
         var end = max_chars;
@@ -555,6 +570,44 @@ pub const Agent = struct {
             return @as(?[]u8, summarized);
         }
         return @as(?[]u8, try allocator.dupe(u8, payload));
+    }
+
+    fn maybeBuildTtsAudioReply(
+        self: *const Agent,
+        allocator: std.mem.Allocator,
+        tts_payload: []const u8,
+        final_text: []const u8,
+    ) !?[]u8 {
+        if (!self.tts_audio) return null;
+
+        const message_ctx = tools_mod.message.MessageTool.getTurnContext();
+        if (!ttsAudioChannelSupported(message_ctx)) return null;
+
+        const provider_name = self.ttsProviderName();
+        const maybe_api_key = providers.resolveApiKeyFromConfig(
+            allocator,
+            provider_name,
+            self.configured_providers,
+        ) catch null;
+        defer if (maybe_api_key) |key| allocator.free(key);
+        const api_key = maybe_api_key orelse {
+            log.warn("tts audio skipped: provider={s} reason=missing_api_key", .{provider_name});
+            return null;
+        };
+
+        const synthesized_path = self.tts_synthesize_fn(
+            allocator,
+            provider_name,
+            api_key,
+            tts_payload,
+            .{},
+        ) catch |err| {
+            log.warn("tts audio synth failed: provider={s} reason={s}", .{ provider_name, @errorName(err) });
+            return null;
+        };
+        defer allocator.free(synthesized_path);
+
+        return try std.fmt.allocPrint(allocator, "[AUDIO:{s}]\n{s}", .{ synthesized_path, final_text });
     }
 
     fn shouldForceActionFollowThrough(text: []const u8) bool {
@@ -1496,6 +1549,8 @@ pub const Agent = struct {
                 self.observer.recordEvent(&compose_stage_event);
                 errdefer self.allocator.free(final_text);
 
+                var tts_audio_reply_text: ?[]u8 = null;
+                errdefer if (tts_audio_reply_text) |value| self.allocator.free(value);
                 const tts_start_ms = std.time.milliTimestamp();
                 if (try self.prepareTtsPayload(self.allocator, user_message, final_text)) |tts_payload| {
                     defer self.allocator.free(tts_payload);
@@ -1514,6 +1569,10 @@ pub const Agent = struct {
                         .count = @intCast(@min(tts_payload.len, std.math.maxInt(u32))),
                     } };
                     self.observer.recordEvent(&tts_stage_event);
+
+                    if (try self.maybeBuildTtsAudioReply(self.allocator, tts_payload, final_text)) |audio_reply| {
+                        tts_audio_reply_text = audio_reply;
+                    }
                 } else {
                     const tts_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - tts_start_ms));
                     log.info("turn.stage stage=tts_prepare iteration={d} duration_ms={d} chars=0 provider={s} audio={s}", .{
@@ -1633,6 +1692,10 @@ pub const Agent = struct {
                 } };
                 self.observer.recordEvent(&finalize_stage_event);
 
+                if (tts_audio_reply_text) |audio_reply| {
+                    self.allocator.free(final_text);
+                    return audio_reply;
+                }
                 return final_text;
             }
 
@@ -4607,6 +4670,93 @@ test "tts_audio_enabled_does_not_mutate_assistant_text" {
     defer allocator.free(response);
     try std.testing.expectEqualStrings("plain response", response);
     try std.testing.expect(std.mem.indexOf(u8, response, "[TTS prepared via") == null);
+}
+
+test "tts_audio_enabled_telegram_turn_adds_audio_attachment_marker" {
+    const allocator = std.testing.allocator;
+    const ProviderState = struct {
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{ .content = try allocator_.dupe(u8, "plain response") };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "tts-telegram-test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const FakeTts = struct {
+        fn synth(
+            allocator_: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: voice_mod.SynthesizeOptions,
+        ) voice_mod.SynthesizeError![]u8 {
+            return allocator_.dupe(u8, "/tmp/nullalis_tts_test.mp3");
+        }
+    };
+
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "openai", .api_key = "test-openai-key" },
+    };
+
+    var state: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = ProviderState.chatWithSystem,
+        .chat = ProviderState.chat,
+        .supportsNativeTools = ProviderState.supportsNativeTools,
+        .getName = ProviderState.getName,
+        .deinit = ProviderState.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .configured_providers = &configured_providers,
+        .tts_mode = .always,
+        .tts_audio = true,
+        .tts_provider = "openai",
+        .tts_synthesize_fn = FakeTts.synth,
+    };
+    defer agent.deinit();
+
+    tools_mod.setMessageTurnContext(.{
+        .channel = "telegram",
+        .chat_id = "12345",
+        .is_group = false,
+        .is_dm = true,
+    });
+    defer tools_mod.clearMessageTurnContext();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.startsWith(u8, response, "[AUDIO:/tmp/nullalis_tts_test.mp3]"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "plain response") != null);
 }
 
 test "tts_prepare_stage_emitted_when_mode_matches" {

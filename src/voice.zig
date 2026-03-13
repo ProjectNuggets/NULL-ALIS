@@ -67,11 +67,26 @@ pub const TranscribeOptions = struct {
     language: ?[]const u8 = null,
 };
 
+pub const SynthesizeOptions = struct {
+    endpoint: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    voice: []const u8 = "alloy",
+    format: []const u8 = "mp3",
+    timeout_ms: u32 = 60_000,
+};
+
 pub const TranscribeError = error{
     FileReadFailed,
     BoundaryGenerationFailed,
     ApiRequestFailed,
     InvalidResponse,
+} || std.mem.Allocator.Error;
+
+pub const SynthesizeError = error{
+    UnsupportedProvider,
+    ApiRequestFailed,
+    InvalidResponse,
+    WriteFailed,
 } || std.mem.Allocator.Error;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -122,6 +137,88 @@ pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]
     if (std.mem.eql(u8, provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
     // For unknown providers, try OpenAI-compatible endpoint
     return "https://api.groq.com/openai/v1/audio/transcriptions";
+}
+
+/// Resolve text-to-speech endpoint for OpenAI-compatible providers.
+pub fn resolveSynthesisEndpoint(provider: []const u8, explicit_endpoint: ?[]const u8) ?[]const u8 {
+    if (explicit_endpoint) |ep| return ep;
+    if (std.mem.eql(u8, provider, "openai")) return "https://api.openai.com/v1/audio/speech";
+    if (std.mem.eql(u8, provider, "openrouter")) return "https://openrouter.ai/api/v1/audio/speech";
+    if (std.mem.eql(u8, provider, "together") or std.mem.eql(u8, provider, "together-ai")) {
+        return "https://api.together.xyz/v1/audio/speech";
+    }
+    return null;
+}
+
+/// Synthesize text into a temporary audio file. Caller owns returned path.
+pub fn synthesizeTextToTempAudio(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    api_key: []const u8,
+    text: []const u8,
+    opts: SynthesizeOptions,
+) SynthesizeError![]u8 {
+    const endpoint = resolveSynthesisEndpoint(provider, opts.endpoint) orelse return error.UnsupportedProvider;
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.InvalidResponse;
+
+    const model = opts.model orelse defaultSynthesisModel(provider);
+    if (model.len == 0) return error.UnsupportedProvider;
+
+    const format = sanitizeSynthesisFormat(opts.format);
+
+    const body = buildSynthesisRequestBody(allocator, model, opts.voice, format, text) catch return error.ApiRequestFailed;
+    defer allocator.free(body);
+
+    var auth_buf: [256]u8 = undefined;
+    const auth_hdr = std.fmt.bufPrint(&auth_buf, "Authorization: Bearer {s}", .{api_key}) catch
+        return error.ApiRequestFailed;
+    const headers = [_][]const u8{
+        auth_hdr,
+        "Content-Type: application/json",
+    };
+
+    const response = http_util.request_with_mode(
+        allocator,
+        .{ .mode = .curl_only },
+        .{
+            .subsystem = .providers,
+            .method = "POST",
+            .url = endpoint,
+            .headers = &headers,
+            .body = body,
+            .timeout_ms = opts.timeout_ms,
+            .max_response_bytes = 8 * 1024 * 1024,
+        },
+    ) catch return error.ApiRequestFailed;
+    defer allocator.free(response.body);
+
+    if (response.status_code < 200 or response.status_code >= 300) {
+        return error.ApiRequestFailed;
+    }
+    if (response.body.len == 0) return error.InvalidResponse;
+    if (looksLikeJsonError(response.body)) return error.ApiRequestFailed;
+
+    const tmp_dir = platform.getTempDir(allocator) catch return error.WriteFailed;
+    defer allocator.free(tmp_dir);
+    const ts = std.time.milliTimestamp();
+    var path_buf: [512]u8 = undefined;
+    const audio_path = std.fmt.bufPrint(
+        &path_buf,
+        "{s}/nullalis_tts_{d}_{d}.{s}",
+        .{ tmp_dir, getPid(), ts, format },
+    ) catch return error.WriteFailed;
+
+    var path_z_buf: [512]u8 = undefined;
+    if (audio_path.len + 1 > path_z_buf.len) return error.WriteFailed;
+    @memcpy(path_z_buf[0..audio_path.len], audio_path);
+    path_z_buf[audio_path.len] = 0;
+    const audio_path_z: [:0]const u8 = path_z_buf[0..audio_path.len :0];
+
+    const out_file = std.fs.createFileAbsolute(audio_path_z, .{}) catch return error.WriteFailed;
+    defer out_file.close();
+    out_file.writeAll(response.body) catch return error.WriteFailed;
+
+    return try allocator.dupe(u8, audio_path);
 }
 
 /// Transcribe an audio file using the Groq Whisper API.
@@ -192,6 +289,51 @@ fn generateBoundary() ![32]u8 {
         boundary[i * 2 + 1] = hex[b & 0x0f];
     }
     return boundary;
+}
+
+fn defaultSynthesisModel(provider: []const u8) []const u8 {
+    if (std.mem.eql(u8, provider, "openai") or
+        std.mem.eql(u8, provider, "openrouter") or
+        std.mem.eql(u8, provider, "together") or
+        std.mem.eql(u8, provider, "together-ai"))
+    {
+        return "gpt-4o-mini-tts";
+    }
+    return "";
+}
+
+fn sanitizeSynthesisFormat(format: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(format, "wav")) return "wav";
+    if (std.ascii.eqlIgnoreCase(format, "ogg")) return "ogg";
+    if (std.ascii.eqlIgnoreCase(format, "m4a")) return "m4a";
+    return "mp3";
+}
+
+fn buildSynthesisRequestBody(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    voice_name: []const u8,
+    format: []const u8,
+    text: []const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+    try body.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(&body, allocator, "model", model);
+    try body.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&body, allocator, "voice", voice_name);
+    try body.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&body, allocator, "response_format", format);
+    try body.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&body, allocator, "input", text);
+    try body.appendSlice(allocator, "}");
+    return try body.toOwnedSlice(allocator);
+}
+
+fn looksLikeJsonError(body: []const u8) bool {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[0] != '{') return false;
+    return std.mem.indexOf(u8, trimmed, "\"error\"") != null;
 }
 
 /// Build the multipart/form-data body.
@@ -654,4 +796,41 @@ test "voice resolveTranscriptionEndpoint unknown falls back to groq" {
         "https://api.groq.com/openai/v1/audio/transcriptions",
         resolveTranscriptionEndpoint("some-unknown-provider", null),
     );
+}
+
+test "voice resolveSynthesisEndpoint openai" {
+    try std.testing.expectEqualStrings(
+        "https://api.openai.com/v1/audio/speech",
+        resolveSynthesisEndpoint("openai", null).?,
+    );
+}
+
+test "voice resolveSynthesisEndpoint unknown returns null" {
+    try std.testing.expect(resolveSynthesisEndpoint("unknown-provider", null) == null);
+}
+
+test "voice sanitizeSynthesisFormat defaults to mp3" {
+    try std.testing.expectEqualStrings("mp3", sanitizeSynthesisFormat("random"));
+}
+
+test "voice buildSynthesisRequestBody contains required fields" {
+    const allocator = std.testing.allocator;
+    const body = try buildSynthesisRequestBody(
+        allocator,
+        "gpt-4o-mini-tts",
+        "alloy",
+        "mp3",
+        "Hello from test",
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-4o-mini-tts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"voice\":\"alloy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"response_format\":\"mp3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":\"Hello from test\"") != null);
+}
+
+test "voice looksLikeJsonError detects api error payloads" {
+    try std.testing.expect(looksLikeJsonError("{\"error\":{\"message\":\"bad key\"}}"));
+    try std.testing.expect(!looksLikeJsonError("audio-bytes"));
 }

@@ -2751,6 +2751,88 @@ fn telegramSenderIdentity(
     return "unknown";
 }
 
+const TelegramWebhookTranscriber = struct {
+    whisper: ?*voice.WhisperTranscriber = null,
+    transcriber: ?voice.Transcriber = null,
+
+    fn deinit(self: *TelegramWebhookTranscriber, allocator: std.mem.Allocator) void {
+        if (self.whisper) |ptr| allocator.destroy(ptr);
+        self.* = .{};
+    }
+};
+
+fn buildTelegramWebhookTranscriber(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+) TelegramWebhookTranscriber {
+    if (!cfg.audio_media.enabled) return .{};
+    const provider_name = cfg.audio_media.provider;
+    const api_key = cfg.getProviderKey(provider_name) orelse return .{};
+    const whisper = allocator.create(voice.WhisperTranscriber) catch return .{};
+    whisper.* = .{
+        .endpoint = voice.resolveTranscriptionEndpoint(provider_name, cfg.audio_media.base_url),
+        .api_key = api_key,
+        .model = cfg.audio_media.model,
+        .language = cfg.audio_media.language,
+    };
+    voice.markTelegramTranscriberConfigured();
+    return .{
+        .whisper = whisper,
+        .transcriber = whisper.transcriber(),
+    };
+}
+
+fn telegramWebhookExtractInboundText(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    bot_token: []const u8,
+    transcriber: ?voice.Transcriber,
+) ?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const msg_obj = parsed.value.object.get("message") orelse
+        parsed.value.object.get("edited_message") orelse return null;
+    if (msg_obj != .object) return null;
+
+    if (msg_obj.object.get("text")) |text_val| {
+        if (text_val == .string) return allocator.dupe(u8, text_val.string) catch null;
+    }
+
+    if (msg_obj.object.get("voice")) |voice_val| {
+        if (voice_val == .object) {
+            if (voice_val.object.get("file_id")) |file_id_val| {
+                if (file_id_val == .string) {
+                    if (voice.transcribeTelegramVoice(allocator, bot_token, file_id_val.string, transcriber)) |transcribed| {
+                        defer allocator.free(transcribed);
+                        return std.fmt.allocPrint(allocator, "[Voice]: {s}", .{transcribed}) catch null;
+                    }
+                }
+            }
+        }
+    }
+
+    if (msg_obj.object.get("audio")) |audio_val| {
+        if (audio_val == .object) {
+            if (audio_val.object.get("file_id")) |file_id_val| {
+                if (file_id_val == .string) {
+                    if (voice.transcribeTelegramVoice(allocator, bot_token, file_id_val.string, transcriber)) |transcribed| {
+                        defer allocator.free(transcribed);
+                        return std.fmt.allocPrint(allocator, "[Voice]: {s}", .{transcribed}) catch null;
+                    }
+                }
+            }
+        }
+    }
+
+    if (msg_obj.object.get("caption")) |caption_val| {
+        if (caption_val == .string) return allocator.dupe(u8, caption_val.string) catch null;
+    }
+
+    return null;
+}
+
 fn tenantTelegramUsesSharedMain(cfg_opt: ?*const Config) bool {
     if (cfg_opt) |cfg| return cfg.session.cross_channel_shared_main;
     return true;
@@ -2880,6 +2962,19 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
         return error.CurlFailed;
     }
 
+    if (telegramReplyContainsMediaMarkers(text)) {
+        var chat_id_buf: [32]u8 = undefined;
+        const chat_id_str = std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id}) catch return error.CurlFailed;
+        var tg_channel = channels.telegram.TelegramChannel.init(
+            allocator,
+            normalized_bot_token,
+            &.{"*"},
+            &.{},
+            "open",
+        );
+        return tg_channel.sendMessageWithReply(chat_id_str, text, null);
+    }
+
     var body_buf: std.ArrayList(u8) = .empty;
     defer body_buf.deinit(allocator);
     const w = body_buf.writer(allocator);
@@ -2905,6 +3000,14 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
         log.warn("telegram sendMessage api returned non-ok; retrying via curl fallback", .{});
         return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
     }
+}
+
+fn telegramReplyContainsMediaMarkers(text: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(text, "[AUDIO:") != null or
+        std.ascii.indexOfIgnoreCase(text, "[VOICE:") != null or
+        std.ascii.indexOfIgnoreCase(text, "[IMAGE:") != null or
+        std.ascii.indexOfIgnoreCase(text, "[VIDEO:") != null or
+        std.ascii.indexOfIgnoreCase(text, "[DOCUMENT:") != null;
 }
 
 fn sendTelegramReplyViaCurlFallback(allocator: std.mem.Allocator, bot_token: []const u8, body: []const u8) !void {
@@ -5482,7 +5585,19 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             }
         }
 
-        const msg_text = jsonStringField(b, "text");
+        var webhook_transcriber = if (ctx.config_opt) |cfg|
+            buildTelegramWebhookTranscriber(ctx.req_allocator, cfg)
+        else
+            TelegramWebhookTranscriber{};
+        defer webhook_transcriber.deinit(ctx.req_allocator);
+
+        const msg_text = telegramWebhookExtractInboundText(
+            ctx.req_allocator,
+            b,
+            tg_bot_token,
+            webhook_transcriber.transcriber,
+        );
+        defer if (msg_text) |mt| ctx.req_allocator.free(mt);
         const chat_id = telegramChatId(ctx.req_allocator, b);
         const tg_authorized = telegramSenderAllowed(ctx.req_allocator, tg_allow_from, b);
         if (!tg_authorized) {
@@ -8014,6 +8129,34 @@ test "telegramChatId falls back to flat chat_id for backward compatibility" {
     try std.testing.expectEqual(@as(i64, 12345), telegramChatId(allocator, body).?);
 }
 
+test "telegramWebhookExtractInboundText returns nested text" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"update_id":1,"message":{"chat":{"id":123},"from":{"id":1},"text":"hello from tg"}}
+    ;
+    const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null) orelse return error.TestUnexpectedResult;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("hello from tg", text);
+}
+
+test "telegramWebhookExtractInboundText falls back to caption" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"update_id":1,"message":{"chat":{"id":123},"from":{"id":1},"caption":"voice caption only"}}
+    ;
+    const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null) orelse return error.TestUnexpectedResult;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("voice caption only", text);
+}
+
+test "telegramWebhookExtractInboundText voice without transcriber returns null" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"update_id":1,"message":{"chat":{"id":123},"from":{"id":1},"voice":{"file_id":"abc123"}}}
+    ;
+    try std.testing.expect(telegramWebhookExtractInboundText(allocator, body, "123:bot", null) == null);
+}
+
 test "telegramSenderAllowed matches numeric sender id from nested from object" {
     const allocator = std.testing.allocator;
     const allow_from = [_][]const u8{"12345"};
@@ -9574,4 +9717,9 @@ test "tenant semantic memory defaults preserve explicit overrides" {
     try std.testing.expectEqualStrings("canary", cfg.memory.reliability.rollout_mode);
     try std.testing.expectEqualStrings("postgresql://zaki:zaki@127.0.0.1:5432/zaki", cfg.memory.postgres.url);
     try std.testing.expectEqualStrings("zaki_bot", cfg.memory.postgres.schema);
+}
+
+test "telegramReplyContainsMediaMarkers detects audio marker" {
+    try std.testing.expect(telegramReplyContainsMediaMarkers("[AUDIO:/tmp/nullalis_tts_1.mp3]\nHello"));
+    try std.testing.expect(!telegramReplyContainsMediaMarkers("Plain text reply"));
 }

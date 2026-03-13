@@ -277,6 +277,19 @@ fn sweepTempMediaFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) 
     }
 }
 
+fn isManagedTempTtsPath(path: []const u8) bool {
+    const file_name = std.fs.path.basename(path);
+    return std.mem.startsWith(u8, file_name, "nullalis_tts_");
+}
+
+fn deletePathBestEffort(path: []const u8) void {
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.deleteFileAbsolute(path) catch {};
+        return;
+    }
+    std.fs.cwd().deleteFile(path) catch {};
+}
+
 /// Parse attachment markers from LLM response text.
 /// Scans for [IMAGE:...], [DOCUMENT:...], [VIDEO:...], [AUDIO:...], [VOICE:...] markers.
 /// Returns extracted attachments and the remaining text with markers removed.
@@ -840,6 +853,7 @@ pub const TelegramChannel = struct {
         else
             try std.fs.cwd().readFileAlloc(allocator, media_path, 32 * 1024 * 1024);
         defer if (!remote_media) allocator.free(file_bytes);
+        defer if (!remote_media and isManagedTempTtsPath(media_path)) deletePathBestEffort(media_path);
 
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(allocator);
@@ -3055,6 +3069,11 @@ test "telegram resolveAttachmentPath keeps absolute local path unchanged" {
 
     try std.testing.expect(resolved.owned == null);
     try std.testing.expectEqualStrings(input, resolved.path);
+}
+
+test "telegram isManagedTempTtsPath true for generated tts file names" {
+    try std.testing.expect(isManagedTempTtsPath("/tmp/nullalis_tts_123_456.mp3"));
+    try std.testing.expect(!isManagedTempTtsPath("/tmp/song.mp3"));
 }
 
 test "telegram bot command payload includes memory and doctor commands" {

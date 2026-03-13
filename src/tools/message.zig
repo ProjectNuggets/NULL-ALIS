@@ -14,6 +14,7 @@ const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
 const runtime_resolver = @import("../delivery/runtime_resolver.zig");
 const ops_guard = @import("../ops_guard.zig");
+const log = std.log.scoped(.message_tool);
 
 /// Message tool — sends a message to a specific channel/chat via the bus.
 pub const MessageTool = struct {
@@ -275,6 +276,12 @@ pub const MessageTool = struct {
             }
             return ToolResult.fail("Telegram send failed");
         }
+        if (!telegramApiResponseOk(allocator, response.body)) {
+            if (is_background_origin) {
+                ops_guard.recordProactiveSendError("tool", proactive_user_id, "telegram", resolved_chat_id, "api_rejected", std.time.timestamp());
+            }
+            return ToolResult.fail("Telegram API rejected message");
+        }
         if (is_background_origin) {
             ops_guard.recordProactiveSent("tool", proactive_user_id, "telegram", resolved_chat_id, std.time.timestamp());
         }
@@ -311,6 +318,32 @@ pub const MessageTool = struct {
             .blocked_rate => "Telegram send blocked by background rate guard",
             .blocked_dedupe => "Telegram send blocked by background dedupe guard",
         };
+    }
+
+    fn telegramApiResponseOk(allocator: std.mem.Allocator, body: []const u8) bool {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+            log.warn("telegram send rejected: non-json response", .{});
+            return false;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value != .object) {
+            log.warn("telegram send rejected: invalid JSON shape", .{});
+            return false;
+        }
+        const ok_val = parsed.value.object.get("ok") orelse {
+            log.warn("telegram send rejected: missing ok field", .{});
+            return false;
+        };
+        if (ok_val != .bool or !ok_val.bool) {
+            if (parsed.value.object.get("description")) |desc_val| {
+                if (desc_val == .string and desc_val.string.len > 0) {
+                    log.warn("telegram send rejected: {s}", .{desc_val.string});
+                }
+            }
+            return false;
+        }
+        return true;
     }
 };
 
@@ -368,6 +401,14 @@ test "MessageTool execute with empty content fails" {
     const result = try mt.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
     try testing.expectEqualStrings("'content' must not be empty", result.error_msg.?);
+}
+
+test "telegramApiResponseOk accepts ok true payload" {
+    try testing.expect(MessageTool.telegramApiResponseOk(testing.allocator, "{\"ok\":true,\"result\":{}}"));
+}
+
+test "telegramApiResponseOk rejects ok false payload" {
+    try testing.expect(!MessageTool.telegramApiResponseOk(testing.allocator, "{\"ok\":false,\"description\":\"Bad Request: chat not found\"}"));
 }
 
 test "MessageTool execute without channel uses default" {
