@@ -1931,14 +1931,29 @@ const ManagerImpl = struct {
 
 fn dupeResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) ![]u8 {
     if (c.PQgetisnull(result, row, col) != 0) return allocator.dupe(u8, "");
+    const len_raw = c.PQgetlength(result, row, col);
+    if (len_raw <= 0) return allocator.dupe(u8, "");
+    const len: usize = @intCast(len_raw);
     const val = c.PQgetvalue(result, row, col);
-    const len: usize = @intCast(c.PQgetlength(result, row, col));
-    return allocator.dupe(u8, val[0..len]);
+    const src: [*]align(1) const u8 = @ptrCast(val);
+    const out = try allocator.alloc(u8, len);
+    @memcpy(out, src[0..len]);
+    return out;
 }
 
 fn dupeNullableResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) !?[]u8 {
     if (c.PQgetisnull(result, row, col) != 0) return null;
     return try dupeResultValue(allocator, result, row, col);
+}
+
+test "dupeResultValue byte-copy path tolerates misaligned source pointers" {
+    const allocator = std.testing.allocator;
+    const src_buf = [_]u8{ 9, 11, 13, 15, 17 };
+    const misaligned_src: [*]align(1) const u8 = @ptrCast(&src_buf[1]);
+    const out = try allocator.alloc(u8, 3);
+    defer allocator.free(out);
+    @memcpy(out, misaligned_src[0..3]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 11, 13, 15 }, out);
 }
 
 fn categoryToMemoryType(category: memory_root.MemoryCategory) []const u8 {
