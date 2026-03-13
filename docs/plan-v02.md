@@ -210,6 +210,11 @@ This runbook is agent-executable and is the source of truth for:
 
 ## 8.2 Current Execution State (Clean Bootstrap)
 
+Documentation rule for v0.2 execution:
+1. canonical ops/status doc: `docs/v0.2-single-source-of-truth.md`
+2. active branch execution log: `docs/branches/v0.2-scale-exec-swisswatch.md`
+3. `docs/reports/**` are evidence artifacts only
+
 Execution branch:
 1. `v0.2-scale-exec-swisswatch`
 
