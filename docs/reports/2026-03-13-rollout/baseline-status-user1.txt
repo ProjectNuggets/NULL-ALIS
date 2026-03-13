@@ -1,0 +1,51 @@
+nullALIS Status
+
+Version:     2026.2.25
+Workspace:   /Users/nova/.nullalis/workspace
+Config:      /Users/nova/.nullalis/config.json
+
+Provider:    openrouter
+Model:       moonshotai/kimi-k2.5
+Temperature: 0.7
+
+Memory:      markdown (auto-save: on)
+Heartbeat:   enabled
+Security:    workspace_only=yes, max_actions/hr=20
+
+Diagnostics:   none
+Runtime:     native
+Gateway:     127.0.0.1:3000
+Scheduler:   enabled (max_tasks=64, max_concurrent=4)
+Runtime:     source=gateway_internal, state configured=postgres, effective=postgres, scheduler_backend=postgres
+Runtime LLM: chat_provider=openrouter, fallbacks=together, embedding_provider=together, source=config
+Runtime:     scoped_user_id=1
+Runtime HB:  enabled=true, interval=30m, tenant=true, degraded=false
+Runtime TG:  configured=true, connected=true, chat_id=1110331014, source=postgres
+Runtime ID:  mapped=0 unmapped=0 strict_rejected=0 degraded=0 cache_hit=0 cache_miss=0
+Runtime Lock: sse=0 http=0 webhook=0 daemon=0 api=0
+Runtime Lease: user=1 source=postgres_lease owner=pid-93440-1773359514 lease_until_s=1773360481 updated_at_s=1773360181
+Cost:        disabled
+Hardware:    disabled
+Peripherals: disabled (0 boards)
+Sandbox:     disabled
+Audit:       enabled
+
+Channels:
+  CLI: always
+  Telegram: connected (runtime)
+  Discord: not configured
+  Slack: not configured
+  Webhook: not configured
+  iMessage: not configured
+  Matrix: not configured
+  Mattermost: not configured
+  WhatsApp: not configured
+  IRC: not configured
+  Lark: not configured
+  DingTalk: not configured
+  Signal: not configured
+  Email: not configured
+  Line: not configured
+  QQ: not configured
+  OneBot: not configured
+  MaixCam: not configured
