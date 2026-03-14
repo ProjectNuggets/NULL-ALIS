@@ -58,6 +58,11 @@ pub const RuntimeSnapshot = struct {
     stt_transcription_succeeded: ?u64 = null,
     stt_transcription_failed: ?u64 = null,
     stt_transcription_skipped_no_transcriber: ?u64 = null,
+    multimodal_image_markers_detected: ?u64 = null,
+    multimodal_messages_with_image_markers: ?u64 = null,
+    multimodal_image_parts_prepared: ?u64 = null,
+    multimodal_image_parts_failed: ?u64 = null,
+    multimodal_image_markers_ignored: ?u64 = null,
     tenant_lease_probe_user_id: ?[]u8 = null,
     tenant_lease_probe_data_source: ?[]u8 = null,
     tenant_lease_probe_owner_id: ?[]u8 = null,
@@ -210,6 +215,11 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
     var stt_transcription_succeeded: ?u64 = null;
     var stt_transcription_failed: ?u64 = null;
     var stt_transcription_skipped_no_transcriber: ?u64 = null;
+    var multimodal_image_markers_detected: ?u64 = null;
+    var multimodal_messages_with_image_markers: ?u64 = null;
+    var multimodal_image_parts_prepared: ?u64 = null;
+    var multimodal_image_parts_failed: ?u64 = null;
+    var multimodal_image_markers_ignored: ?u64 = null;
     var tenant_lease_probe_user_id: ?[]u8 = null;
     errdefer if (tenant_lease_probe_user_id) |value| allocator.free(value);
     var tenant_lease_probe_data_source: ?[]u8 = null;
@@ -276,6 +286,15 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
             stt_transcription_skipped_no_transcriber = readObjectU64(stt_value.object, "transcription_skipped_no_transcriber");
         }
     }
+    if (parsed.value.object.get("multimodal")) |multimodal_value| {
+        if (multimodal_value == .object) {
+            multimodal_image_markers_detected = readObjectU64(multimodal_value.object, "image_markers_detected");
+            multimodal_messages_with_image_markers = readObjectU64(multimodal_value.object, "messages_with_image_markers");
+            multimodal_image_parts_prepared = readObjectU64(multimodal_value.object, "image_parts_prepared");
+            multimodal_image_parts_failed = readObjectU64(multimodal_value.object, "image_parts_failed");
+            multimodal_image_markers_ignored = readObjectU64(multimodal_value.object, "image_markers_ignored");
+        }
+    }
 
     if (parsed.value.object.get("tenant_lease_probe")) |lease_probe_value| {
         if (lease_probe_value == .object) {
@@ -335,6 +354,11 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
         .stt_transcription_succeeded = stt_transcription_succeeded,
         .stt_transcription_failed = stt_transcription_failed,
         .stt_transcription_skipped_no_transcriber = stt_transcription_skipped_no_transcriber,
+        .multimodal_image_markers_detected = multimodal_image_markers_detected,
+        .multimodal_messages_with_image_markers = multimodal_messages_with_image_markers,
+        .multimodal_image_parts_prepared = multimodal_image_parts_prepared,
+        .multimodal_image_parts_failed = multimodal_image_parts_failed,
+        .multimodal_image_markers_ignored = multimodal_image_markers_ignored,
         .tenant_lease_probe_user_id = tenant_lease_probe_user_id,
         .tenant_lease_probe_data_source = tenant_lease_probe_data_source,
         .tenant_lease_probe_owner_id = tenant_lease_probe_owner_id,
@@ -508,6 +532,13 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
         \\    "transcription_failed": 2,
         \\    "transcription_skipped_no_transcriber": 3
         \\  },
+        \\  "multimodal": {
+        \\    "image_markers_detected": 6,
+        \\    "messages_with_image_markers": 4,
+        \\    "image_parts_prepared": 5,
+        \\    "image_parts_failed": 1,
+        \\    "image_markers_ignored": 2
+        \\  },
         \\  "tenant_lease_probe": {
         \\    "user_id": "7",
         \\    "data_source": "postgres_lease",
@@ -552,6 +583,11 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
     try std.testing.expectEqual(@as(?u64, 7), snapshot.stt_transcription_succeeded);
     try std.testing.expectEqual(@as(?u64, 2), snapshot.stt_transcription_failed);
     try std.testing.expectEqual(@as(?u64, 3), snapshot.stt_transcription_skipped_no_transcriber);
+    try std.testing.expectEqual(@as(?u64, 6), snapshot.multimodal_image_markers_detected);
+    try std.testing.expectEqual(@as(?u64, 4), snapshot.multimodal_messages_with_image_markers);
+    try std.testing.expectEqual(@as(?u64, 5), snapshot.multimodal_image_parts_prepared);
+    try std.testing.expectEqual(@as(?u64, 1), snapshot.multimodal_image_parts_failed);
+    try std.testing.expectEqual(@as(?u64, 2), snapshot.multimodal_image_markers_ignored);
     try std.testing.expectEqualStrings("7", snapshot.tenant_lease_probe_user_id.?);
     try std.testing.expectEqualStrings("postgres_lease", snapshot.tenant_lease_probe_data_source.?);
     try std.testing.expectEqualStrings("node-a", snapshot.tenant_lease_probe_owner_id.?);

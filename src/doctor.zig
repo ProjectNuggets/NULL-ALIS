@@ -749,6 +749,23 @@ fn checkRuntimeSnapshot(
             .{ configured, attempted, succeeded, failed, skipped },
         )));
     }
+    if (snapshot.multimodal_image_markers_detected != null or
+        snapshot.multimodal_messages_with_image_markers != null or
+        snapshot.multimodal_image_parts_prepared != null or
+        snapshot.multimodal_image_parts_failed != null or
+        snapshot.multimodal_image_markers_ignored != null)
+    {
+        const markers = snapshot.multimodal_image_markers_detected orelse 0;
+        const messages = snapshot.multimodal_messages_with_image_markers orelse 0;
+        const prepared = snapshot.multimodal_image_parts_prepared orelse 0;
+        const failed = snapshot.multimodal_image_parts_failed orelse 0;
+        const ignored = snapshot.multimodal_image_markers_ignored orelse 0;
+        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
+            allocator,
+            "vision: markers={d} messages={d} prepared={d} failed={d} ignored={d}",
+            .{ markers, messages, prepared, failed, ignored },
+        )));
+    }
     if (snapshot.tenant_lease_probe_data_source) |lease_source| {
         try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
             allocator,

@@ -42,6 +42,7 @@ const runtime_resolver = @import("delivery/runtime_resolver.zig");
 const tool_dispatcher = @import("tool_dispatcher.zig");
 const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
 const channel_identity_key = @import("channel_identity_key.zig");
+const multimodal = @import("multimodal.zig");
 const voice = @import("voice.zig");
 const telegram_token = @import("telegram_token.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
@@ -3827,6 +3828,21 @@ fn internalDiagnosticsPayload(
         try json_util.appendJsonInt(&buf, allocator, "failure_transcriber", @intCast(stt_metrics.failure_transcriber));
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonInt(&buf, allocator, "failure_empty_transcript", @intCast(stt_metrics.failure_empty_transcript));
+        try buf.appendSlice(allocator, "},");
+    }
+    {
+        const image_metrics = multimodal.imageFlowMetricsSnapshot();
+        try json_util.appendJsonKey(&buf, allocator, "multimodal");
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonInt(&buf, allocator, "image_markers_detected", @intCast(image_metrics.image_markers_detected));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "messages_with_image_markers", @intCast(image_metrics.messages_with_image_markers));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "image_parts_prepared", @intCast(image_metrics.image_parts_prepared));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "image_parts_failed", @intCast(image_metrics.image_parts_failed));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "image_markers_ignored", @intCast(image_metrics.image_markers_ignored));
         try buf.appendSlice(allocator, "},");
     }
 

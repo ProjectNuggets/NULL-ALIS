@@ -3,6 +3,7 @@ const channel_catalog = @import("../channel_catalog.zig");
 const config_mod = @import("../config.zig");
 const inbound_canonicalizer = @import("../inbound_canonicalizer.zig");
 const json_util = @import("../json_util.zig");
+const multimodal = @import("../multimodal.zig");
 const tool_dispatcher = @import("../tool_dispatcher.zig");
 const process_util = @import("process_util.zig");
 const voice = @import("../voice.zig");
@@ -192,6 +193,8 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, ",");
         try appendSttMetrics(&buf, allocator);
         try buf.appendSlice(allocator, ",");
+        try appendMultimodalMetrics(&buf, allocator);
+        try buf.appendSlice(allocator, ",");
         try appendOwnershipLease(&buf, allocator, ownership_lease);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "composio");
@@ -283,6 +286,8 @@ pub const RuntimeInfoTool = struct {
         try appendIdentityMapping(&buf, allocator, self.config);
         try buf.appendSlice(allocator, ",");
         try appendSttMetrics(&buf, allocator);
+        try buf.appendSlice(allocator, ",");
+        try appendMultimodalMetrics(&buf, allocator);
         try buf.appendSlice(allocator, ",");
         try appendOwnershipLease(&buf, allocator, ownership_lease);
         try buf.appendSlice(allocator, ",");
@@ -862,6 +867,25 @@ fn appendSttMetrics(
     try buf.appendSlice(allocator, "}");
 }
 
+fn appendMultimodalMetrics(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+) !void {
+    const image_metrics = multimodal.imageFlowMetricsSnapshot();
+    try json_util.appendJsonKey(buf, allocator, "multimodal");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(buf, allocator, "image_markers_detected", @intCast(image_metrics.image_markers_detected));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "messages_with_image_markers", @intCast(image_metrics.messages_with_image_markers));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "image_parts_prepared", @intCast(image_metrics.image_parts_prepared));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "image_parts_failed", @intCast(image_metrics.image_parts_failed));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "image_markers_ignored", @intCast(image_metrics.image_markers_ignored));
+    try buf.appendSlice(allocator, "}");
+}
+
 fn appendOwnershipLease(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -1050,6 +1074,7 @@ test "runtime info summary includes state backend keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"provider_data_source\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"deferred_controls\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"identity_mapping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"multimodal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"ownership_lease\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"parallel_tools_rollout_percent\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"entity_scope_source\":\"config_default\"") != null);
@@ -1145,6 +1170,7 @@ test "runtime info integrations composio entity scope uses override and tenant c
     try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"entity_id\":\"7\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"entity_scope_source\":\"user_id_override\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"identity_mapping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"multimodal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, override_result.output, "\"ownership_lease\"") != null);
 }
 

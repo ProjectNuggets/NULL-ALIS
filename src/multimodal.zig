@@ -15,6 +15,52 @@ const path_security = @import("tools/path_security.zig");
 
 const log = std.log.scoped(.multimodal);
 
+pub const ImageFlowMetrics = struct {
+    image_markers_detected: u64,
+    messages_with_image_markers: u64,
+    image_parts_prepared: u64,
+    image_parts_failed: u64,
+    image_markers_ignored: u64,
+};
+
+var image_markers_detected_total = std.atomic.Value(u64).init(0);
+var messages_with_image_markers_total = std.atomic.Value(u64).init(0);
+var image_parts_prepared_total = std.atomic.Value(u64).init(0);
+var image_parts_failed_total = std.atomic.Value(u64).init(0);
+var image_markers_ignored_total = std.atomic.Value(u64).init(0);
+
+pub fn imageFlowMetricsSnapshot() ImageFlowMetrics {
+    return .{
+        .image_markers_detected = image_markers_detected_total.load(.monotonic),
+        .messages_with_image_markers = messages_with_image_markers_total.load(.monotonic),
+        .image_parts_prepared = image_parts_prepared_total.load(.monotonic),
+        .image_parts_failed = image_parts_failed_total.load(.monotonic),
+        .image_markers_ignored = image_markers_ignored_total.load(.monotonic),
+    };
+}
+
+fn markImageMarkersDetected(count: usize) void {
+    if (count == 0) return;
+    _ = image_markers_detected_total.fetchAdd(@intCast(count), .monotonic);
+}
+
+fn markMessageWithImageMarkers() void {
+    _ = messages_with_image_markers_total.fetchAdd(1, .monotonic);
+}
+
+fn markImagePartPrepared() void {
+    _ = image_parts_prepared_total.fetchAdd(1, .monotonic);
+}
+
+fn markImagePartFailed() void {
+    _ = image_parts_failed_total.fetchAdd(1, .monotonic);
+}
+
+fn markImageMarkersIgnored(count: usize) void {
+    if (count == 0) return;
+    _ = image_markers_ignored_total.fetchAdd(@intCast(count), .monotonic);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Configuration
 // ════════════════════════════════════════════════════════════════════════════
@@ -312,6 +358,8 @@ pub fn prepareMessagesForProvider(
             result[i] = msg;
             continue;
         }
+        markMessageWithImageMarkers();
+        markImageMarkersDetected(parsed.refs.len);
 
         // Build content_parts: text part + image parts
         var parts: std.ArrayListUnmanaged(ContentPart) = .empty;
@@ -323,6 +371,7 @@ pub fn prepareMessagesForProvider(
         const max_images = @min(parsed.refs.len, config.max_images);
         if (parsed.refs.len > max_images) {
             const dropped = parsed.refs.len - max_images;
+            markImageMarkersIgnored(dropped);
             const note = try std.fmt.allocPrint(
                 arena,
                 "[Only {d} image(s) were processed (max_images={d}); {d} additional image(s) ignored]",
@@ -338,6 +387,7 @@ pub fn prepareMessagesForProvider(
             if (isDataUrl(ref)) {
                 const data_uri = parseDataUriImage(ref, config.max_image_size_bytes) catch |err| {
                     log.warn("failed to parse data URI image: {}", .{err});
+                    markImagePartFailed();
                     const note = try std.fmt.allocPrint(arena, "[Failed to load image: {s}...]", .{display_ref});
                     try parts.append(arena, .{ .text = note });
                     continue;
@@ -346,27 +396,33 @@ pub fn prepareMessagesForProvider(
                     .data = data_uri.data,
                     .media_type = data_uri.mime_type,
                 } });
+                markImagePartPrepared();
             } else if (isHttpUrl(ref) or isHttpsUrl(ref)) {
                 if (!config.allow_remote_fetch) {
+                    markImagePartFailed();
                     const note = try std.fmt.allocPrint(arena, "[Remote image URLs are disabled: {s}]", .{display_ref});
                     try parts.append(arena, .{ .text = note });
                     continue;
                 }
                 if (!isHttpsUrl(ref)) {
+                    markImagePartFailed();
                     const note = try std.fmt.allocPrint(arena, "[Remote image URL must use HTTPS: {s}]", .{display_ref});
                     try parts.append(arena, .{ .text = note });
                     continue;
                 }
                 try parts.append(arena, .{ .image_url = .{ .url = ref } });
+                markImagePartPrepared();
             } else {
                 // Local file — read + base64 encode
                 const img = readLocalImage(arena, ref, config) catch |err| {
                     log.warn("failed to read image '{s}': {}", .{ ref, err });
+                    markImagePartFailed();
                     const note = try std.fmt.allocPrint(arena, "[Failed to load image: {s}]", .{display_ref});
                     try parts.append(arena, .{ .text = note });
                     continue;
                 };
                 const b64 = encodeBase64(arena, img.data) catch {
+                    markImagePartFailed();
                     const note = try std.fmt.allocPrint(arena, "[Failed to encode image: {s}]", .{display_ref});
                     try parts.append(arena, .{ .text = note });
                     continue;
@@ -375,6 +431,7 @@ pub fn prepareMessagesForProvider(
                     .data = b64,
                     .media_type = img.mime_type,
                 } });
+                markImagePartPrepared();
             }
         }
 
@@ -885,4 +942,28 @@ test "countImageMarkersInLastUser only counts latest user message" {
         ChatMessage.user("No image here"),
     };
     try std.testing.expectEqual(@as(usize, 0), countImageMarkersInLastUser(&msgs));
+}
+
+test "imageFlowMetricsSnapshot tracks detected and prepared image parts" {
+    const before = imageFlowMetricsSnapshot();
+
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    var msgs = [_]ChatMessage{
+        ChatMessage.user("Check [IMAGE:https://example.com/a.jpg] and [IMAGE:https://example.com/b.jpg]"),
+    };
+
+    _ = try prepareMessagesForProvider(arena, &msgs, .{
+        .allow_remote_fetch = true,
+        .max_images = 1,
+    });
+
+    const after = imageFlowMetricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 2), after.image_markers_detected - before.image_markers_detected);
+    try std.testing.expectEqual(@as(u64, 1), after.messages_with_image_markers - before.messages_with_image_markers);
+    try std.testing.expectEqual(@as(u64, 1), after.image_parts_prepared - before.image_parts_prepared);
+    try std.testing.expectEqual(@as(u64, 1), after.image_markers_ignored - before.image_markers_ignored);
 }

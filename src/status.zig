@@ -160,6 +160,25 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
             optionalU64Text(&skipped_buf, snapshot.stt_transcription_skipped_no_transcriber),
         });
     }
+    if (snapshot.multimodal_image_markers_detected != null or
+        snapshot.multimodal_messages_with_image_markers != null or
+        snapshot.multimodal_image_parts_prepared != null or
+        snapshot.multimodal_image_parts_failed != null or
+        snapshot.multimodal_image_markers_ignored != null)
+    {
+        var detected_buf: [24]u8 = undefined;
+        var messages_buf: [24]u8 = undefined;
+        var prepared_buf: [24]u8 = undefined;
+        var failed_buf: [24]u8 = undefined;
+        var ignored_buf: [24]u8 = undefined;
+        try w.print("Runtime Vision: markers={s} messages={s} prepared={s} failed={s} ignored={s}\n", .{
+            optionalU64Text(&detected_buf, snapshot.multimodal_image_markers_detected),
+            optionalU64Text(&messages_buf, snapshot.multimodal_messages_with_image_markers),
+            optionalU64Text(&prepared_buf, snapshot.multimodal_image_parts_prepared),
+            optionalU64Text(&failed_buf, snapshot.multimodal_image_parts_failed),
+            optionalU64Text(&ignored_buf, snapshot.multimodal_image_markers_ignored),
+        });
+    }
     if (snapshot.tenant_lease_probe_data_source != null) {
         var lease_until_buf: [24]u8 = undefined;
         var updated_buf: [24]u8 = undefined;

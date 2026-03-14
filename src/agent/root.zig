@@ -1946,16 +1946,11 @@ pub const Agent = struct {
     }
 
     /// Build provider-ready ChatMessage slice from owned history.
-    /// Applies multimodal preprocessing and vision capability checks.
+    /// Applies multimodal preprocessing.
     fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator) ![]ChatMessage {
         const m = try arena.alloc(ChatMessage, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
             m[i] = msg.toChatMessage();
-        }
-
-        const image_marker_count = multimodal.countImageMarkersInLastUser(m);
-        if (image_marker_count > 0 and !self.provider.supportsVisionForModel(self.model_name)) {
-            return error.ProviderDoesNotSupportVision;
         }
 
         // Allow local multimodal reads from:
@@ -2596,7 +2591,7 @@ test "Agent buildMessageSlice" {
     try std.testing.expectEqualStrings("hello", messages[1].content);
 }
 
-test "Agent buildProviderMessages uses model-aware vision capability" {
+test "Agent buildProviderMessages does not pre-gate non-vision models" {
     const DummyProvider = struct {
         fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
             return allocator.dupe(u8, "");
@@ -2661,12 +2656,17 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    try std.testing.expectError(error.ProviderDoesNotSupportVision, agent.buildProviderMessages(arena));
-
-    agent.model_name = "vision-model";
+    const before_metrics = multimodal.imageFlowMetricsSnapshot();
     const messages = try agent.buildProviderMessages(arena);
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(messages[0].content_parts != null);
+    const after_metrics = multimodal.imageFlowMetricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), after_metrics.messages_with_image_markers - before_metrics.messages_with_image_markers);
+
+    agent.model_name = "vision-model";
+    const vision_messages = try agent.buildProviderMessages(arena);
+    try std.testing.expectEqual(@as(usize, 1), vision_messages.len);
+    try std.testing.expect(vision_messages[0].content_parts != null);
 }
 
 test "Agent buildProviderMessages allows workspace image paths" {
