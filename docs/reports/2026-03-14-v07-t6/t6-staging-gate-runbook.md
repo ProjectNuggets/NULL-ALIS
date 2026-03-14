@@ -10,9 +10,13 @@ Goal: execute final T6 GO/HOLD gate with evidence.
 3. Environment variables set:
    - `BFF_BASE_URL`
    - `BFF_AUTH_TOKEN`
-   - `NULLCLAW_BASE_URL`
-   - `NULLCLAW_INTERNAL_TOKEN`
+   - `NULLALIS_BASE_URL`
+   - `NULLALIS_INTERNAL_TOKEN`
 4. One test user account with valid auth token.
+
+## Naming Note
+1. This runbook uses `NULLALIS_*` variable names for operator clarity.
+2. Some runtime internals still use historical `NULLCLAW_*` env prefixes; that is legacy naming in code, not a product rename.
 
 ## Evidence Directory
 Create local evidence directory:
@@ -82,8 +86,8 @@ curl -i -sS \
   | tee /tmp/t6-staging-evidence/06c-bff-retry-metrics.txt || true
 
 curl -i -sS \
-  -H "X-Internal-Token: $NULLCLAW_INTERNAL_TOKEN" \
-  "$NULLCLAW_BASE_URL/internal/diagnostics" \
+  -H "X-Internal-Token: $NULLALIS_INTERNAL_TOKEN" \
+  "$NULLALIS_BASE_URL/internal/diagnostics" \
   | tee /tmp/t6-staging-evidence/06d-nullalis-diagnostics.json
 ```
 

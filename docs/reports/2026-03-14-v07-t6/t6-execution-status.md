@@ -83,8 +83,8 @@ Artifact:
 Status: `BLOCKED (not runnable from this session)`
 
 Blockers:
-1. `NULLCLAW_BASE_URL` unavailable in this session.
-2. `NULLCLAW_INTERNAL_TOKEN` unavailable in this session.
+1. `NULLALIS_BASE_URL` unavailable in this session.
+2. `NULLALIS_INTERNAL_TOKEN` unavailable in this session.
 3. Staging BFF base URL/token not configured in this workspace.
 
 Unblock path:
