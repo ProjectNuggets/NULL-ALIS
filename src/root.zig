@@ -67,6 +67,7 @@ pub const auth = @import("auth.zig");
 
 // Phase 4d: Multimodal
 pub const multimodal = @import("multimodal.zig");
+pub const user_settings = @import("user_settings.zig");
 
 // Phase 4e: Agent Routing
 pub const agent_routing = @import("agent_routing.zig");
