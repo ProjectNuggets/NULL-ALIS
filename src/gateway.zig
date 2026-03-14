@@ -43,6 +43,7 @@ const tool_dispatcher = @import("tool_dispatcher.zig");
 const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
 const channel_identity_key = @import("channel_identity_key.zig");
 const voice = @import("voice.zig");
+const telegram_token = @import("telegram_token.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -1776,65 +1777,8 @@ fn normalizeTelegramSecretToken(value: []const u8) []const u8 {
     return std.mem.trim(u8, value, " \t\r\n\"");
 }
 
-fn isTelegramBotTokenChar(ch: u8) bool {
-    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
-}
-
-fn isTelegramBotTokenShape(value: []const u8) bool {
-    if (value.len < 16) return false;
-    const colon_idx = std.mem.indexOfScalar(u8, value, ':') orelse return false;
-    if (colon_idx == 0 or colon_idx + 1 >= value.len) return false;
-
-    for (value[0..colon_idx]) |ch| {
-        if (ch < '0' or ch > '9') return false;
-    }
-    for (value[colon_idx + 1 ..]) |ch| {
-        if (!isTelegramBotTokenChar(ch)) return false;
-    }
-    return true;
-}
-
-fn findTelegramBotTokenCandidate(value: []const u8) ?[]const u8 {
-    var idx: usize = 0;
-    while (idx < value.len) : (idx += 1) {
-        if (value[idx] != ':') continue;
-        if (idx == 0 or idx + 1 >= value.len) continue;
-
-        var left_start = idx;
-        while (left_start > 0) {
-            const ch = value[left_start - 1];
-            if (ch < '0' or ch > '9') break;
-            left_start -= 1;
-        }
-
-        const left_len = idx - left_start;
-        if (left_len < 5) continue;
-
-        var right_end = idx + 1;
-        while (right_end < value.len and isTelegramBotTokenChar(value[right_end])) {
-            right_end += 1;
-        }
-        const right_len = right_end - (idx + 1);
-        if (right_len < 10) continue;
-
-        const candidate = value[left_start..right_end];
-        if (isTelegramBotTokenShape(candidate)) return candidate;
-    }
-    return null;
-}
-
 fn normalizeTelegramBotToken(value: []const u8) []const u8 {
-    var trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (trimmed.len >= 2) {
-        const first = trimmed[0];
-        const last = trimmed[trimmed.len - 1];
-        if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
-            trimmed = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
-        }
-    }
-    if (isTelegramBotTokenShape(trimmed)) return trimmed;
-    if (findTelegramBotTokenCandidate(trimmed)) |candidate| return candidate;
-    return trimmed;
+    return telegram_token.normalize_bot_token(value);
 }
 
 fn copyIntoBuf(buf: []u8, value: []const u8) usize {
@@ -4478,8 +4422,7 @@ fn buildWebhookUrlForUser(allocator: std.mem.Allocator, base_url: []const u8, us
 }
 
 fn isLikelyTelegramBotToken(token: []const u8) bool {
-    const trimmed = normalizeTelegramBotToken(token);
-    return isTelegramBotTokenShape(trimmed);
+    return telegram_token.is_likely_bot_token(token);
 }
 
 fn telegramApiUrl(allocator: std.mem.Allocator, bot_token: []const u8, method: []const u8) ![]u8 {
