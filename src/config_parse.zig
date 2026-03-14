@@ -1433,6 +1433,18 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ten.object.get("runtime_idle_ttl_secs")) |v| {
                 if (v == .integer) self.tenant.runtime_idle_ttl_secs = @intCast(v.integer);
             }
+            if (ten.object.get("ownership_lock_lease_secs")) |v| {
+                if (v == .integer) self.tenant.ownership_lock_lease_secs = @intCast(v.integer);
+            }
+            if (ten.object.get("ownership_lock_wait_ms")) |v| {
+                if (v == .integer) self.tenant.ownership_lock_wait_ms = @intCast(v.integer);
+            }
+            if (ten.object.get("ownership_lock_retry_min_ms")) |v| {
+                if (v == .integer) self.tenant.ownership_lock_retry_min_ms = @intCast(v.integer);
+            }
+            if (ten.object.get("ownership_lock_retry_max_ms")) |v| {
+                if (v == .integer) self.tenant.ownership_lock_retry_max_ms = @intCast(v.integer);
+            }
             if (ten.object.get("identity_mapping_enforcement")) |v| {
                 if (v == .string) self.tenant.identity_mapping_enforcement = try self.allocator.dupe(u8, v.string);
             }

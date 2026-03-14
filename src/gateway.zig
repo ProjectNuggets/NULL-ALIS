@@ -45,6 +45,7 @@ const channel_identity_key = @import("channel_identity_key.zig");
 const multimodal = @import("multimodal.zig");
 const voice = @import("voice.zig");
 const telegram_token = @import("telegram_token.zig");
+const user_settings = @import("user_settings.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -71,6 +72,15 @@ const DEFAULT_TENANT_DATA_ROOT: []const u8 = "/data/users";
 
 /// Ownership lock TTL for per-user writer fencing in tenant mode.
 const TENANT_OWNERSHIP_LOCK_LEASE_SECS: u64 = 300;
+const TENANT_OWNERSHIP_LOCK_LEASE_SECS_MIN: u32 = 30;
+const TENANT_OWNERSHIP_LOCK_LEASE_SECS_MAX: u32 = 900;
+const TENANT_OWNERSHIP_LOCK_WAIT_MS_DEFAULT: u32 = 750;
+const TENANT_OWNERSHIP_LOCK_WAIT_MS_MIN: u32 = 50;
+const TENANT_OWNERSHIP_LOCK_WAIT_MS_MAX: u32 = 5000;
+const TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN_DEFAULT: u32 = 20;
+const TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX_DEFAULT: u32 = 80;
+const TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN: u32 = 5;
+const TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX: u32 = 250;
 
 // ── Rate Limiter ─────────────────────────────────────────────────
 
@@ -404,6 +414,9 @@ pub const GatewayState = struct {
     tenant_runtime_idle_ttl_secs: u32 = 1800,
     ownership_lock_enabled: bool = false,
     ownership_lock_lease_secs: u64 = TENANT_OWNERSHIP_LOCK_LEASE_SECS,
+    ownership_lock_wait_ms: u32 = TENANT_OWNERSHIP_LOCK_WAIT_MS_DEFAULT,
+    ownership_lock_retry_min_ms: u32 = TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN_DEFAULT,
+    ownership_lock_retry_max_ms: u32 = TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX_DEFAULT,
     owner_instance_id: []const u8 = "",
     owner_instance_id_owned: bool = false,
     user_preparation_gate: UserPreparationGate,
@@ -424,6 +437,7 @@ pub const GatewayState = struct {
     tenant_lock_conflicts_webhook_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     tenant_lock_conflicts_daemon_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     tenant_lock_conflicts_api_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    tenant_lock_conflict_retries_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     in_flight_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     drain_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     overload_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -1505,19 +1519,21 @@ fn resolveTenantTelegramBotTokenForSend(
 
 fn maybeAcquireTenantOwnershipLock(
     allocator: std.mem.Allocator,
-    state: *const GatewayState,
+    state: *GatewayState,
     user_id: []const u8,
     user_root: []const u8,
-) !?TenantOwnershipLock {
-    if (!state.tenant_enabled) return null;
-    if (!state.ownership_lock_enabled) return null;
-    if (state.owner_instance_id.len == 0) return null;
+) !OwnershipLockAcquireResult {
+    if (!state.tenant_enabled) return .disabled;
+    if (!state.ownership_lock_enabled) return .disabled;
+    if (state.owner_instance_id.len == 0) return .disabled;
+
+    const deadline_ms = std.time.milliTimestamp() + @as(i64, @intCast(state.ownership_lock_wait_ms));
+    var retries: u32 = 0;
 
     if (tenantOwnershipUsesPostgresLease(state)) {
         const mgr = state.zaki_state orelse return error.PostgresNotEnabled;
         const numeric_user_id = try parseNumericUserId(user_id);
-        var attempts_pg: u8 = 0;
-        while (attempts_pg < 3) : (attempts_pg += 1) {
+        while (true) {
             const now_s = std.time.timestamp();
             const lease_token = mgr.acquireUserOwnershipLease(
                 allocator,
@@ -1527,13 +1543,19 @@ fn maybeAcquireTenantOwnershipLock(
                 state.ownership_lock_lease_secs,
             ) catch |err| switch (err) {
                 error.LockHeld => {
-                    if (attempts_pg + 1 >= 3) return err;
-                    std.Thread.sleep(20 * std.time.ns_per_ms);
+                    retries += 1;
+                    const sleep_ms = nextOwnershipRetryDelayMs(state, deadline_ms);
+                    if (sleep_ms == 0) {
+                        recordTenantLockConflictRetries(state, retries);
+                        return .{ .conflict = try buildOwnershipLockConflictInfo(allocator, state, user_id, retries) };
+                    }
+                    std.Thread.sleep(@as(u64, sleep_ms) * std.time.ns_per_ms);
                     continue;
                 },
                 else => return err,
             };
-            return .{
+            recordTenantLockConflictRetries(state, retries);
+            return .{ .acquired = .{
                 .postgres = .{
                     .allocator = allocator,
                     .state_mgr = mgr,
@@ -1541,13 +1563,11 @@ fn maybeAcquireTenantOwnershipLock(
                     .owner_id = state.owner_instance_id,
                     .lease_token = lease_token,
                 },
-            };
+            } };
         }
-        return error.LockHeld;
     }
 
-    var attempts: u8 = 0;
-    while (attempts < 3) : (attempts += 1) {
+    while (true) {
         const file_lock = tenant_lock.acquireUserOwnershipLock(
             allocator,
             user_root,
@@ -1555,20 +1575,118 @@ fn maybeAcquireTenantOwnershipLock(
             state.ownership_lock_lease_secs,
         ) catch |err| switch (err) {
             error.LockHeld => {
-                if (attempts + 1 >= 3) return err;
-                std.Thread.sleep(20 * std.time.ns_per_ms);
+                retries += 1;
+                const sleep_ms = nextOwnershipRetryDelayMs(state, deadline_ms);
+                if (sleep_ms == 0) {
+                    recordTenantLockConflictRetries(state, retries);
+                    return .{ .conflict = try buildOwnershipLockConflictInfo(allocator, state, user_id, retries) };
+                }
+                std.Thread.sleep(@as(u64, sleep_ms) * std.time.ns_per_ms);
                 continue;
             },
             else => return err,
         };
-        return .{ .file = file_lock };
+        recordTenantLockConflictRetries(state, retries);
+        return .{ .acquired = .{ .file = file_lock } };
     }
-
-    return error.LockHeld;
 }
 
 fn tenantOwnershipUsesPostgresLease(state: *const GatewayState) bool {
     return state.zaki_state != null and std.mem.eql(u8, state.state_backend_effective, "postgres");
+}
+
+const OwnershipLockConflictInfo = struct {
+    allocator: std.mem.Allocator,
+    retry_after_ms: u32,
+    owner_instance_id: ?[]u8 = null,
+    lease_until_s: ?i64 = null,
+    retries: u32 = 0,
+
+    fn retryAfterSecs(self: *const OwnershipLockConflictInfo) u16 {
+        const ms: u64 = self.retry_after_ms;
+        const secs: u64 = (ms + 999) / 1000;
+        return @intCast(@max(@as(u64, 1), @min(secs, std.math.maxInt(u16))));
+    }
+
+    fn deinit(self: *OwnershipLockConflictInfo) void {
+        if (self.owner_instance_id) |value| self.allocator.free(value);
+        self.owner_instance_id = null;
+    }
+};
+
+const OwnershipLockAcquireResult = union(enum) {
+    disabled,
+    acquired: TenantOwnershipLock,
+    conflict: OwnershipLockConflictInfo,
+
+    fn deinit(self: *OwnershipLockAcquireResult) void {
+        switch (self.*) {
+            .disabled => {},
+            .acquired => |*lock| lock.deinit(),
+            .conflict => |*conflict| conflict.deinit(),
+        }
+    }
+};
+
+fn ownershipLockRetryAfterMs(state: *const GatewayState, lease_until_s: ?i64) u32 {
+    var retry_ms: u32 = state.ownership_lock_retry_max_ms * 3 + 10;
+    retry_ms = std.math.clamp(retry_ms, @as(u32, 100), @as(u32, 1500));
+    if (lease_until_s) |lease_until| {
+        const now_s = std.time.timestamp();
+        if (lease_until > now_s) {
+            const remaining_s: i64 = lease_until - now_s;
+            const bounded_s: i64 = @min(remaining_s, @as(i64, 2));
+            if (bounded_s > 0) {
+                const lease_ms: u32 = @intCast(bounded_s * 1000);
+                if (lease_ms > retry_ms) retry_ms = lease_ms;
+            }
+        }
+    }
+    return retry_ms;
+}
+
+fn nextOwnershipRetryDelayMs(state: *const GatewayState, deadline_ms: i64) u32 {
+    const now_ms = std.time.milliTimestamp();
+    if (now_ms >= deadline_ms) return 0;
+
+    const remaining_i64 = deadline_ms - now_ms;
+    const remaining_ms: u32 = @intCast(@min(remaining_i64, @as(i64, std.math.maxInt(u32))));
+
+    var min_ms = state.ownership_lock_retry_min_ms;
+    var max_ms = state.ownership_lock_retry_max_ms;
+    if (min_ms > max_ms) std.mem.swap(u32, &min_ms, &max_ms);
+    min_ms = @min(min_ms, remaining_ms);
+    max_ms = @min(max_ms, remaining_ms);
+    if (max_ms < min_ms) max_ms = min_ms;
+    if (max_ms == 0) return 0;
+    if (max_ms == min_ms) return min_ms;
+
+    const span: u32 = (max_ms - min_ms) + 1;
+    const mod_i64: i64 = @mod(now_ms, @as(i64, span));
+    const jitter: u32 = @intCast(mod_i64);
+    return min_ms + jitter;
+}
+
+fn buildOwnershipLockConflictInfo(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    user_id: []const u8,
+    retries: u32,
+) !OwnershipLockConflictInfo {
+    var info = OwnershipLockConflictInfo{
+        .allocator = allocator,
+        .retry_after_ms = ownershipLockRetryAfterMs(state, null),
+        .retries = retries,
+    };
+    if (!tenantOwnershipUsesPostgresLease(state)) return info;
+    const mgr = state.zaki_state orelse return info;
+    const numeric_user_id = parseNumericUserId(user_id) catch return info;
+    if (try mgr.getUserOwnershipLeaseSnapshot(allocator, numeric_user_id)) |snapshot| {
+        info.owner_instance_id = snapshot.owner_id;
+        info.lease_until_s = snapshot.lease_until_s;
+        info.retry_after_ms = ownershipLockRetryAfterMs(state, snapshot.lease_until_s);
+    }
+    return info;
 }
 
 const PostgresUserOwnershipLease = struct {
@@ -1633,7 +1751,7 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
     };
     defer user_ctx.deinit(job.allocator);
 
-    var user_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(
+    var user_lock = maybeAcquireTenantOwnershipLock(
         job.allocator,
         job.state,
         user_ctx.user_id,
@@ -1642,7 +1760,15 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
         log.warn("tenant telegram async ownership lock failed: {}", .{err});
         return;
     };
-    defer if (user_lock_opt) |*lock| lock.deinit();
+    defer user_lock.deinit();
+    switch (user_lock) {
+        .disabled => {},
+        .acquired => {},
+        .conflict => |conflict| {
+            log.warn("tenant telegram async ownership lock conflict retry_after_ms={d}", .{conflict.retry_after_ms});
+            return;
+        },
+    }
 
     const tenant_runtime = getTenantRuntime(job.state, job.config, &user_ctx) catch |err| {
         log.warn("tenant telegram async runtime init failed: {}", .{err});
@@ -3106,6 +3232,7 @@ const RouteResponse = struct {
     status: []const u8 = "200 OK",
     body: []const u8 = "",
     content_type: []const u8 = "application/json",
+    retry_after_secs: ?u16 = null,
 };
 
 const TenantLockConflictRoute = enum {
@@ -3127,6 +3254,46 @@ fn recordTenantLockConflict(state: *GatewayState, route: TenantLockConflictRoute
     }
 }
 
+fn recordTenantLockConflictRetries(state: *GatewayState, retries: u32) void {
+    if (retries == 0) return;
+    _ = state.tenant_lock_conflict_retries_total.fetchAdd(retries, .monotonic);
+}
+
+const TenantOwnershipLockConfig = struct {
+    lease_secs: u64 = TENANT_OWNERSHIP_LOCK_LEASE_SECS,
+    wait_ms: u32 = TENANT_OWNERSHIP_LOCK_WAIT_MS_DEFAULT,
+    retry_min_ms: u32 = TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN_DEFAULT,
+    retry_max_ms: u32 = TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX_DEFAULT,
+};
+
+fn normalizeTenantOwnershipLockConfig(cfg: config_types.TenantConfig) TenantOwnershipLockConfig {
+    var out = TenantOwnershipLockConfig{};
+    out.lease_secs = @intCast(std.math.clamp(
+        cfg.ownership_lock_lease_secs,
+        TENANT_OWNERSHIP_LOCK_LEASE_SECS_MIN,
+        TENANT_OWNERSHIP_LOCK_LEASE_SECS_MAX,
+    ));
+    out.wait_ms = std.math.clamp(
+        cfg.ownership_lock_wait_ms,
+        TENANT_OWNERSHIP_LOCK_WAIT_MS_MIN,
+        TENANT_OWNERSHIP_LOCK_WAIT_MS_MAX,
+    );
+    out.retry_min_ms = std.math.clamp(
+        cfg.ownership_lock_retry_min_ms,
+        TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN,
+        TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX,
+    );
+    out.retry_max_ms = std.math.clamp(
+        cfg.ownership_lock_retry_max_ms,
+        TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN,
+        TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX,
+    );
+    if (out.retry_min_ms > out.retry_max_ms) {
+        std.mem.swap(u32, &out.retry_min_ms, &out.retry_max_ms);
+    }
+    return out;
+}
+
 fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
     const transport_stats = http_util.transport_stats_snapshot();
     const requests_total = state.requests_total.load(.monotonic);
@@ -3140,6 +3307,7 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
     const tenant_lock_conflicts_webhook_total = state.tenant_lock_conflicts_webhook_total.load(.monotonic);
     const tenant_lock_conflicts_daemon_total = state.tenant_lock_conflicts_daemon_total.load(.monotonic);
     const tenant_lock_conflicts_api_total = state.tenant_lock_conflicts_api_total.load(.monotonic);
+    const tenant_lock_conflict_retries_total = state.tenant_lock_conflict_retries_total.load(.monotonic);
     const in_flight_requests = state.in_flight_requests.load(.monotonic);
     const drain_rejected_total = state.drain_rejected_total.load(.monotonic);
     const overload_rejected_total = state.overload_rejected_total.load(.monotonic);
@@ -3172,6 +3340,9 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\nullalis_gateway_tenant_lock_conflicts_by_route_total{{route="webhook"}} {d}
         \\nullalis_gateway_tenant_lock_conflicts_by_route_total{{route="daemon"}} {d}
         \\nullalis_gateway_tenant_lock_conflicts_by_route_total{{route="api"}} {d}
+        \\# HELP nullalis_gateway_tenant_lock_conflict_retries_total Total lock-acquire retry attempts before conflicts/success.
+        \\# TYPE nullalis_gateway_tenant_lock_conflict_retries_total counter
+        \\nullalis_gateway_tenant_lock_conflict_retries_total {d}
         \\# HELP nullalis_gateway_in_flight_requests Current in-flight requests.
         \\# TYPE nullalis_gateway_in_flight_requests gauge
         \\nullalis_gateway_in_flight_requests {d}
@@ -3228,6 +3399,7 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             tenant_lock_conflicts_webhook_total,
             tenant_lock_conflicts_daemon_total,
             tenant_lock_conflicts_api_total,
+            tenant_lock_conflict_retries_total,
             in_flight_requests,
             drain_rejected_total,
             overload_rejected_total,
@@ -3561,6 +3733,7 @@ fn internalDiagnosticsPayload(
     const tenant_lock_conflicts_webhook_total = state.tenant_lock_conflicts_webhook_total.load(.monotonic);
     const tenant_lock_conflicts_daemon_total = state.tenant_lock_conflicts_daemon_total.load(.monotonic);
     const tenant_lock_conflicts_api_total = state.tenant_lock_conflicts_api_total.load(.monotonic);
+    const tenant_lock_conflict_retries_total = state.tenant_lock_conflict_retries_total.load(.monotonic);
 
     var lease_probe_snapshot: ?zaki_state_mod.UserOwnershipLeaseSnapshot = null;
     defer if (lease_probe_snapshot) |*value| value.deinit(allocator);
@@ -3621,6 +3794,14 @@ fn internalDiagnosticsPayload(
 
     const tenant_lock_lease_secs_i64: i64 = @intCast(@min(state.ownership_lock_lease_secs, @as(u64, std.math.maxInt(i64))));
     try json_util.appendJsonInt(&buf, allocator, "tenant_lock_lease_secs", tenant_lock_lease_secs_i64);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "tenant_lock_wait_ms", state.ownership_lock_wait_ms);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "tenant_lock_retry_min_ms", state.ownership_lock_retry_min_ms);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "tenant_lock_retry_max_ms", state.ownership_lock_retry_max_ms);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "tenant_lock_conflict_retries_total", @intCast(tenant_lock_conflict_retries_total));
     try buf.appendSlice(allocator, ",");
 
     try json_util.appendJsonKey(&buf, allocator, "tenant_lock_conflicts_by_route");
@@ -3864,6 +4045,111 @@ fn sseErrorEvent(allocator: std.mem.Allocator, code: []const u8, msg: []const u8
     try w.writeAll(error_frame);
     try w.writeAll(done_frame);
     return buf.toOwnedSlice(allocator);
+}
+
+fn ownershipLockConflictJsonPayload(allocator: std.mem.Allocator, conflict: *const OwnershipLockConflictInfo) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"error\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\",\"retry_after_ms\":");
+    try w.print("{d}", .{conflict.retry_after_ms});
+    try w.writeAll(",\"owner_instance_id\":");
+    if (conflict.owner_instance_id) |owner_id| {
+        try w.writeByte('"');
+        try jsonEscapeInto(w, owner_id);
+        try w.writeByte('"');
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"lease_until_s\":");
+    if (conflict.lease_until_s) |lease_until_s| {
+        try w.print("{d}", .{lease_until_s});
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll("}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn sseOwnershipLockConflictEvent(allocator: std.mem.Allocator, conflict: *const OwnershipLockConflictInfo) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: error\ndata: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\",\"retry_after_ms\":");
+    try w.print("{d}", .{conflict.retry_after_ms});
+    try w.writeAll(",\"owner_instance_id\":");
+    if (conflict.owner_instance_id) |owner_id| {
+        try w.writeByte('"');
+        try jsonEscapeInto(w, owner_id);
+        try w.writeByte('"');
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"lease_until_s\":");
+    if (conflict.lease_until_s) |lease_until_s| {
+        try w.print("{d}", .{lease_until_s});
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll("}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn sendSseOwnershipLockConflictResponse(stream: anytype, allocator: std.mem.Allocator, conflict: *const OwnershipLockConflictInfo) void {
+    sendChunkedSseHeaderRetryAfter(stream, "409 Conflict", conflict.retryAfterSecs()) catch return;
+    const error_fallback = "event: error\ndata: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\",\"retry_after_ms\":250,\"owner_instance_id\":null,\"lease_until_s\":null}\n\n";
+    const error_owned = sseOwnershipLockConflictEvent(allocator, conflict) catch null;
+    defer if (error_owned) |frame| allocator.free(frame);
+    const error_frame: []const u8 = if (error_owned) |frame| frame else error_fallback;
+    sendChunkedSseFrame(stream, error_frame) catch return;
+
+    const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
+    const done_owned = sseDoneFrame(allocator, null, null) catch null;
+    defer if (done_owned) |frame| allocator.free(frame);
+    const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
+    sendChunkedSseFrame(stream, done_frame) catch return;
+    finishChunkedSse(stream) catch {};
+}
+
+fn ownershipLockConflictJsonRouteResponse(allocator: std.mem.Allocator, conflict: *const OwnershipLockConflictInfo) RouteResponse {
+    const body = ownershipLockConflictJsonPayload(allocator, conflict) catch
+        "{\"error\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\",\"retry_after_ms\":250,\"owner_instance_id\":null,\"lease_until_s\":null}";
+    return .{
+        .status = "409 Conflict",
+        .body = body,
+        .retry_after_secs = conflict.retryAfterSecs(),
+    };
+}
+
+fn ownershipLockConflictSseRouteResponse(allocator: std.mem.Allocator, conflict: *const OwnershipLockConflictInfo) RouteResponse {
+    const fallback = "event: error\ndata: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"ownership lock conflict\",\"retry_after_ms\":250,\"owner_instance_id\":null,\"lease_until_s\":null}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
+    const event_owned = sseOwnershipLockConflictEvent(allocator, conflict) catch null;
+    defer if (event_owned) |value| allocator.free(value);
+    const done_owned = sseDoneFrame(allocator, null, null) catch null;
+    defer if (done_owned) |value| allocator.free(value);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    w.writeAll(if (event_owned) |value| value else "event: error\ndata: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\",\"retry_after_ms\":250,\"owner_instance_id\":null,\"lease_until_s\":null}\n\n") catch return .{
+        .status = "409 Conflict",
+        .body = fallback,
+        .content_type = "text/event-stream; charset=utf-8",
+        .retry_after_secs = conflict.retryAfterSecs(),
+    };
+    w.writeAll(if (done_owned) |value| value else "event: done\ndata: {\"type\":\"done\"}\n\n") catch return .{
+        .status = "409 Conflict",
+        .body = fallback,
+        .content_type = "text/event-stream; charset=utf-8",
+        .retry_after_secs = conflict.retryAfterSecs(),
+    };
+    const owned = buf.toOwnedSlice(allocator) catch fallback;
+    return .{
+        .status = "409 Conflict",
+        .body = owned,
+        .content_type = "text/event-stream; charset=utf-8",
+        .retry_after_secs = conflict.retryAfterSecs(),
+    };
 }
 
 const SSE_TOKEN_CHUNK_SIZE: usize = 96;
@@ -4137,6 +4423,16 @@ fn sendChunkedSseHeader(stream: anytype, status: []const u8) !void {
     try stream.writeAll(header);
 }
 
+fn sendChunkedSseHeaderRetryAfter(stream: anytype, status: []const u8, retry_after_secs: u16) !void {
+    var header_buf: [640]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {s}\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nX-Accel-Buffering: no\r\nRetry-After: {d}\r\n\r\n",
+        .{ status, @max(@as(u16, 1), retry_after_secs) },
+    );
+    try stream.writeAll(header);
+}
+
 fn sendChunkedSseFrame(stream: anytype, frame: []const u8) !void {
     var prefix_buf: [32]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&prefix_buf, "{x}\r\n", .{frame.len});
@@ -4275,18 +4571,20 @@ fn handleApiChatStreamSseConnection(
         return true;
     };
 
-    var ownership_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
-        error.LockHeld => {
-            recordTenantLockConflict(state, .chat_stream_sse);
-            sendSseErrorResponse(stream, req_allocator, "409 Conflict", "ownership_lock_conflict", "user is active on another node, retry shortly");
-            return true;
-        },
-        else => {
-            sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "tenant_lock_failed", "tenant ownership lock failed");
-            return true;
-        },
+    var ownership_lock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch {
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "tenant_lock_failed", "tenant ownership lock failed");
+        return true;
     };
-    defer if (ownership_lock_opt) |*lock| lock.deinit();
+    defer ownership_lock.deinit();
+    switch (ownership_lock) {
+        .disabled => {},
+        .acquired => {},
+        .conflict => |*conflict| {
+            recordTenantLockConflict(state, .chat_stream_sse);
+            sendSseOwnershipLockConflictResponse(stream, req_allocator, conflict);
+            return true;
+        },
+    }
 
     ensureUserProvisioned(state, &user_ctx) catch {
         sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
@@ -4559,24 +4857,21 @@ fn handleApiRoute(
         ensureUserDirectories(&user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user provisioning failed\"}" };
         };
-        var ownership_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
-            error.LockHeld => {
-                recordTenantLockConflict(state, .chat_stream_http);
-                const body_locked = sseErrorEvent(req_allocator, "ownership_lock_conflict", "user is active on another node, retry shortly") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"ownership lock conflict\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
-                return .{
-                    .status = "409 Conflict",
-                    .body = body_locked,
-                    .content_type = "text/event-stream; charset=utf-8",
-                };
-            },
-            else => {
-                return .{
-                    .status = "500 Internal Server Error",
-                    .body = "{\"error\":\"tenant ownership lock failed\"}",
-                };
-            },
+        var ownership_lock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch {
+            return .{
+                .status = "500 Internal Server Error",
+                .body = "{\"error\":\"tenant ownership lock failed\"}",
+            };
         };
-        defer if (ownership_lock_opt) |*lock| lock.deinit();
+        defer ownership_lock.deinit();
+        switch (ownership_lock) {
+            .disabled => {},
+            .acquired => {},
+            .conflict => |*conflict| {
+                recordTenantLockConflict(state, .chat_stream_http);
+                return ownershipLockConflictSseRouteResponse(req_allocator, conflict);
+            },
+        }
         ensureUserProvisioned(state, &user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user provisioning failed\"}" };
         };
@@ -4717,14 +5012,18 @@ fn handleApiRoute(
         ensureUserDirectories(&user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
         };
-        var provision_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
-            error.LockHeld => {
-                recordTenantLockConflict(state, .api);
-                return .{ .status = "409 Conflict", .body = "{\"error\":\"user currently owned by another node\"}" };
-            },
-            else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"tenant ownership lock failed\"}" },
+        var provision_lock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"tenant ownership lock failed\"}" };
         };
-        defer if (provision_lock_opt) |*lock| lock.deinit();
+        defer provision_lock.deinit();
+        switch (provision_lock) {
+            .disabled => {},
+            .acquired => {},
+            .conflict => |*conflict| {
+                recordTenantLockConflict(state, .api);
+                return ownershipLockConflictJsonRouteResponse(req_allocator, conflict);
+            },
+        }
         ensureUserProvisioned(state, &user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
         };
@@ -4748,17 +5047,23 @@ fn handleApiRoute(
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
     };
     const needs_write_lock = !std.mem.eql(u8, method, "GET");
-    var user_write_lock_opt: ?TenantOwnershipLock = null;
+    var user_write_lock: ?OwnershipLockAcquireResult = null;
     if (needs_write_lock) {
-        user_write_lock_opt = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
-            error.LockHeld => {
-                recordTenantLockConflict(state, .api);
-                return .{ .status = "409 Conflict", .body = "{\"error\":\"user currently owned by another node\"}" };
-            },
-            else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"tenant ownership lock failed\"}" },
+        var acquired = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"tenant ownership lock failed\"}" };
         };
+        switch (acquired) {
+            .disabled => {},
+            .acquired => {},
+            .conflict => |*conflict| {
+                recordTenantLockConflict(state, .api);
+                defer acquired.deinit();
+                return ownershipLockConflictJsonRouteResponse(req_allocator, conflict);
+            },
+        }
+        user_write_lock = acquired;
     }
-    defer if (user_write_lock_opt) |*lock| lock.deinit();
+    defer if (user_write_lock) |*lock| lock.deinit();
     ensureUserProvisioned(state, &user_ctx) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
     };
@@ -4885,6 +5190,61 @@ fn handleApiRoute(
             removeTenantRuntime(state, parsed.user_id);
             return .{ .body = "{\"status\":\"updated\"}" };
         }
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+
+    if (std.mem.eql(u8, parsed.subpath, "settings")) {
+        const existing_config = if (state.zaki_state) |mgr| blk: {
+            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            break :blk mgr.getConfigJson(req_allocator, user_id) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+            };
+        } else blk: {
+            break :blk readFileOrDefault(req_allocator, user_ctx.config_path, "{}\n") catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+            };
+        };
+        defer req_allocator.free(existing_config);
+
+        if (std.mem.eql(u8, method, "GET")) {
+            const settings = user_settings.resolveSettingsFromConfigJson(req_allocator, existing_config) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"settings resolution failed\"}" };
+            };
+            const body = user_settings.renderSettingsJson(req_allocator, settings) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            };
+            return .{ .body = body };
+        }
+
+        if (std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "PUT")) {
+            const body = extractBody(raw_request) orelse "{}";
+            const base_settings = user_settings.resolveSettingsFromConfigJson(req_allocator, existing_config) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"settings resolution failed\"}" };
+            };
+            const updated_settings = user_settings.applyPatchToSettingsJson(req_allocator, base_settings, body) catch |err| {
+                const code = user_settings.errorCode(err);
+                const err_body = std.fmt.allocPrint(req_allocator, "{{\"error\":\"{s}\"}}", .{code}) catch "{\"error\":\"invalid_payload\"}";
+                return .{ .status = "400 Bad Request", .body = err_body };
+            };
+            const merged = user_settings.mergeSettingsIntoConfigJson(req_allocator, existing_config, updated_settings) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"merge failed\"}" };
+            };
+            defer req_allocator.free(merged);
+            if (state.zaki_state) |mgr| {
+                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                mgr.putConfigJson(user_id, merged) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            } else {
+                writeFile(user_ctx.config_path, merged) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+            }
+            removeTenantRuntime(state, parsed.user_id);
+            const response = user_settings.renderSettingsJson(req_allocator, updated_settings) catch "{\"status\":\"updated\"}";
+            return .{ .body = response };
+        }
+
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
 
@@ -5397,6 +5757,7 @@ const WebhookHandlerContext = struct {
     session_mgr_opt: ?*session_mod.SessionManager,
     response_status: []const u8 = "200 OK",
     response_body: []const u8 = "",
+    response_retry_after_secs: ?u16 = null,
 };
 
 const WebhookHandlerFn = *const fn (ctx: *WebhookHandlerContext) void;
@@ -5501,14 +5862,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             };
             const user_ctx = &tenant_user_ctx.?;
             tenant_channel_state_path = ctx.req_allocator.dupe(u8, user_ctx.channel_state_path) catch null;
-            var user_lock_opt: ?TenantOwnershipLock = maybeAcquireTenantOwnershipLock(ctx.req_allocator, ctx.state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
-                error.LockHeld => {
-                    _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
-                    recordTenantLockConflict(ctx.state, .webhook);
-                    ctx.response_status = "409 Conflict";
-                    ctx.response_body = "{\"error\":\"user currently owned by another node\"}";
-                    return;
-                },
+            var user_lock = maybeAcquireTenantOwnershipLock(ctx.req_allocator, ctx.state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
                 error.FileNotFound => {
                     _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                     ctx.response_status = "403 Forbidden";
@@ -5522,7 +5876,20 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     return;
                 },
             };
-            defer if (user_lock_opt) |*lock| lock.deinit();
+            defer user_lock.deinit();
+            switch (user_lock) {
+                .disabled => {},
+                .acquired => {},
+                .conflict => |*conflict| {
+                    _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
+                    recordTenantLockConflict(ctx.state, .webhook);
+                    ctx.response_status = "409 Conflict";
+                    ctx.response_retry_after_secs = conflict.retryAfterSecs();
+                    ctx.response_body = ownershipLockConflictJsonPayload(ctx.req_allocator, conflict) catch
+                        "{\"error\":\"ownership_lock_conflict\",\"message\":\"user is active on another node, retry shortly\",\"retry_after_ms\":250,\"owner_instance_id\":null,\"lease_until_s\":null}";
+                    return;
+                },
+            }
 
             const user_state = blk: {
                 if (ctx.state.zaki_state) |mgr| {
@@ -6733,6 +7100,7 @@ fn handleAcceptedConnection(
     var response_status: []const u8 = "200 OK";
     var response_body: []const u8 = "";
     var response_content_type: []const u8 = "application/json";
+    var response_retry_after_secs: ?u16 = null;
     var pair_response_buf: [256]u8 = undefined;
 
     const is_internal_path = std.mem.startsWith(u8, base_path, "/internal/");
@@ -6784,6 +7152,7 @@ fn handleAcceptedConnection(
         response_status = api_resp.status;
         response_body = api_resp.body;
         response_content_type = api_resp.content_type;
+        response_retry_after_secs = api_resp.retry_after_secs;
     } else if (findWebhookRouteDescriptor(base_path)) |desc| {
         var webhook_ctx = WebhookHandlerContext{
             .root_allocator = allocator,
@@ -6798,6 +7167,7 @@ fn handleAcceptedConnection(
         desc.handler(&webhook_ctx);
         response_status = webhook_ctx.response_status;
         response_body = webhook_ctx.response_body;
+        response_retry_after_secs = webhook_ctx.response_retry_after_secs;
     } else if (hasSlackHttpEndpoint(config_opt, base_path)) {
         var webhook_ctx = WebhookHandlerContext{
             .root_allocator = allocator,
@@ -7036,7 +7406,11 @@ fn handleAcceptedConnection(
         response_body = "{\"error\":\"not found\"}";
     }
 
-    sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+    if (response_retry_after_secs) |retry_secs| {
+        sendHttpResponseRetryAfter(conn.stream, response_status, response_content_type, response_body, retry_secs) catch {};
+    } else {
+        sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+    }
 }
 
 const RequestQueue = struct {
@@ -7202,11 +7576,15 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
         if (cfg.tenant.enabled) {
             const owner_id = tenant_lock.resolveOwnerId(allocator) catch null;
+            const lock_cfg = normalizeTenantOwnershipLockConfig(cfg.tenant);
             if (owner_id) |oid| {
                 state.owner_instance_id = oid;
                 state.owner_instance_id_owned = true;
                 state.ownership_lock_enabled = true;
-                state.ownership_lock_lease_secs = TENANT_OWNERSHIP_LOCK_LEASE_SECS;
+                state.ownership_lock_lease_secs = lock_cfg.lease_secs;
+                state.ownership_lock_wait_ms = lock_cfg.wait_ms;
+                state.ownership_lock_retry_min_ms = lock_cfg.retry_min_ms;
+                state.ownership_lock_retry_max_ms = lock_cfg.retry_max_ms;
             } else {
                 log.warn("tenant ownership lock disabled: failed to resolve owner id", .{});
                 state.ownership_lock_enabled = false;
@@ -7799,6 +8177,448 @@ test "handleApiRoute accepts POST alias for telegram disconnect" {
 
     try std.testing.expectEqualStrings("200 OK", response.status);
     try std.testing.expectEqualStrings("{\"status\":\"disconnected\",\"channel\":\"telegram\"}", response.body);
+}
+
+test "handleApiRoute GET settings returns defaults when no profile exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/settings HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "GET",
+        "/api/v1/users/1/settings",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("balanced", parsed.value.object.get("assistant_mode").?.string);
+    try std.testing.expectEqualStrings("mention", parsed.value.object.get("group_activation").?.string);
+    try std.testing.expectEqual(true, parsed.value.object.get("proactive_updates").?.bool);
+    try std.testing.expectEqual(false, parsed.value.object.get("voice_replies").?.bool);
+    try std.testing.expectEqual(@as(i64, 30), parsed.value.object.get("session_timeout_minutes").?.integer);
+}
+
+test "handleApiRoute PATCH settings writes mapped config and preserves unknown keys" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const user_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_dir);
+    try std.fs.makeDirAbsolute(user_dir);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{user_dir});
+    defer std.testing.allocator.free(config_path);
+    try writeFile(config_path, "{\"foo\":\"bar\",\"agent\":{\"max_tool_iterations\":9}}\n");
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const patch_body =
+        \\{"assistant_mode":"deep","group_activation":"always","proactive_updates":false,"voice_replies":true,"session_timeout_minutes":45}
+    ;
+    const patch_request = try std.fmt.allocPrint(
+        req_allocator,
+        "PATCH /api/v1/users/1/settings HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ patch_body.len, patch_body },
+    );
+
+    const patch_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        patch_request,
+        "PATCH",
+        "/api/v1/users/1/settings",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", patch_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, patch_response.body, "\"assistant_mode\":\"deep\"") != null);
+
+    const get_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/config HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const get_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        get_request,
+        "GET",
+        "/api/v1/users/1/config",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", get_response.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, get_response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("bar", parsed.value.object.get("foo").?.string);
+    const product = parsed.value.object.get("product_settings").?.object;
+    try std.testing.expectEqualStrings("deep", product.get("assistant_mode").?.string);
+    const agent = parsed.value.object.get("agent").?.object;
+    try std.testing.expectEqual(@as(i64, 9), agent.get("max_tool_iterations").?.integer);
+    try std.testing.expectEqualStrings("serial", agent.get("queue_mode").?.string);
+    try std.testing.expectEqual(@as(i64, 20), agent.get("queue_cap").?.integer);
+    try std.testing.expectEqualStrings("summarize", agent.get("queue_drop").?.string);
+    try std.testing.expectEqualStrings("always", agent.get("activation_mode").?.string);
+    try std.testing.expectEqualStrings("off", agent.get("send_mode").?.string);
+    try std.testing.expectEqualStrings("inbound", agent.get("tts_mode").?.string);
+    try std.testing.expectEqual(true, agent.get("tts_audio").?.bool);
+    try std.testing.expectEqual(@as(i64, 2700), agent.get("session_ttl_secs").?.integer);
+}
+
+test "handleApiRoute PATCH settings rejects invalid assistant mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"assistant_mode\":\"turbo\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "PATCH /api/v1/users/1/settings HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "PATCH",
+        "/api/v1/users/1/settings",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("400 Bad Request", response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"invalid_assistant_mode\"}", response.body);
+}
+
+test "handleApiRoute PATCH settings clamps huge timeout without crashing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"session_timeout_minutes\":9223372036854775807}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "PATCH /api/v1/users/1/settings HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "PATCH",
+        "/api/v1/users/1/settings",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"session_timeout_minutes\":180") != null);
+}
+
+test "ownership_lock_conflict_http_returns_structured_payload_and_retry_after" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const user_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_root);
+    try std.fs.makeDirAbsolute(user_root);
+
+    var held_lock = try tenant_lock.acquireUserOwnershipLock(std.testing.allocator, user_root, "owner-b", 300);
+    defer held_lock.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.ownership_lock_enabled = true;
+    state.owner_instance_id = "owner-a";
+    state.tenant_data_root = tenant_root;
+    state.ownership_lock_wait_ms = 120;
+    state.ownership_lock_retry_min_ms = 20;
+    state.ownership_lock_retry_max_ms = 20;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "PATCH /api/v1/users/1/config HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "PATCH",
+        "/api/v1/users/1/config",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("409 Conflict", response.status);
+    try std.testing.expect(response.retry_after_secs != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("ownership_lock_conflict", parsed.value.object.get("error").?.string);
+    try std.testing.expect(parsed.value.object.get("retry_after_ms").? == .integer);
+}
+
+test "ownership_lock_conflict_sse_contains_retry_after_ms" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const user_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_root);
+    try std.fs.makeDirAbsolute(user_root);
+
+    var held_lock = try tenant_lock.acquireUserOwnershipLock(std.testing.allocator, user_root, "owner-b", 300);
+    defer held_lock.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.ownership_lock_enabled = true;
+    state.owner_instance_id = "owner-a";
+    state.tenant_data_root = tenant_root;
+    state.ownership_lock_wait_ms = 120;
+    state.ownership_lock_retry_min_ms = 20;
+    state.ownership_lock_retry_max_ms = 20;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"message\":\"hello\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/chat/stream HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "POST",
+        "/api/v1/chat/stream",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("409 Conflict", response.status);
+    try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", response.content_type);
+    try std.testing.expect(response.retry_after_secs != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"code\":\"ownership_lock_conflict\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"retry_after_ms\":") != null);
+}
+
+test "ownership_lock_wait_budget_retries_then_conflicts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const user_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/7", .{tenant_root});
+    defer std.testing.allocator.free(user_root);
+    try std.fs.makeDirAbsolute(user_root);
+
+    var held_lock = try tenant_lock.acquireUserOwnershipLock(std.testing.allocator, user_root, "owner-b", 300);
+    defer held_lock.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.ownership_lock_enabled = true;
+    state.owner_instance_id = "owner-a";
+    state.ownership_lock_wait_ms = 60;
+    state.ownership_lock_retry_min_ms = 20;
+    state.ownership_lock_retry_max_ms = 20;
+
+    var acquired = try maybeAcquireTenantOwnershipLock(std.testing.allocator, &state, "7", user_root);
+    defer acquired.deinit();
+
+    switch (acquired) {
+        .conflict => |conflict| {
+            try std.testing.expect(conflict.retries >= 1);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(state.tenant_lock_conflict_retries_total.load(.monotonic) > 0);
+}
+
+test "ownership_lock_wait_succeeds_within_budget_when_lease_released" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const user_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/9", .{tenant_root});
+    defer std.testing.allocator.free(user_root);
+    try std.fs.makeDirAbsolute(user_root);
+
+    var held_lock = try tenant_lock.acquireUserOwnershipLock(std.testing.allocator, user_root, "owner-b", 1);
+    defer held_lock.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.ownership_lock_enabled = true;
+    state.owner_instance_id = "owner-a";
+    state.ownership_lock_wait_ms = 1500;
+    state.ownership_lock_retry_min_ms = 100;
+    state.ownership_lock_retry_max_ms = 100;
+
+    var acquired = try maybeAcquireTenantOwnershipLock(std.testing.allocator, &state, "9", user_root);
+    defer acquired.deinit();
+
+    switch (acquired) {
+        .acquired => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(state.tenant_lock_conflict_retries_total.load(.monotonic) > 0);
+}
+
+test "tenant_lock_config_clamps_invalid_values" {
+    const cfg = config_types.TenantConfig{
+        .ownership_lock_lease_secs = 5,
+        .ownership_lock_wait_ms = 99999,
+        .ownership_lock_retry_min_ms = 250,
+        .ownership_lock_retry_max_ms = 5,
+    };
+    const normalized = normalizeTenantOwnershipLockConfig(cfg);
+    try std.testing.expectEqual(@as(u64, TENANT_OWNERSHIP_LOCK_LEASE_SECS_MIN), normalized.lease_secs);
+    try std.testing.expectEqual(@as(u32, TENANT_OWNERSHIP_LOCK_WAIT_MS_MAX), normalized.wait_ms);
+    try std.testing.expectEqual(@as(u32, TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN), normalized.retry_min_ms);
+    try std.testing.expectEqual(@as(u32, TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX), normalized.retry_max_ms);
+}
+
+test "handleApiRoute config endpoint remains backward compatible with settings endpoint" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const raw_cfg = "{\"agent\":{\"queue_mode\":\"latest\",\"queue_cap\":8,\"queue_drop\":\"newest\",\"max_history_messages\":40}}\n";
+    const patch_config_request = try std.fmt.allocPrint(
+        req_allocator,
+        "PATCH /api/v1/users/1/config HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ raw_cfg.len, raw_cfg },
+    );
+    const config_patch_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        patch_config_request,
+        "PATCH",
+        "/api/v1/users/1/config",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", config_patch_response.status);
+
+    const settings_get_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/settings HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const settings_get_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        settings_get_request,
+        "GET",
+        "/api/v1/users/1/settings",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", settings_get_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, settings_get_response.body, "\"assistant_mode\":\"fast\"") != null);
 }
 
 // ── Bearer Token Validation tests ───────────────────────────────

@@ -796,6 +796,10 @@ pub const TenantConfig = struct {
     data_root: []const u8 = "/data/users",
     runtime_cache_max_users: u32 = 2048,
     runtime_idle_ttl_secs: u32 = 1800,
+    ownership_lock_lease_secs: u32 = 300,
+    ownership_lock_wait_ms: u32 = 750,
+    ownership_lock_retry_min_ms: u32 = 20,
+    ownership_lock_retry_max_ms: u32 = 80,
     /// Identity mapping enforcement policy for inbound canonicalization.
     /// - compat: never reject; use degraded fallback when unmapped
     /// - staged_strict: reject unmapped traffic for channels listed in strict_channels

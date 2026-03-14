@@ -322,7 +322,7 @@ paths:
               schema:
                 type: string
         "409":
-          description: Tenant ownership lock conflict
+          description: Tenant ownership lock conflict (`event:error` includes `retry_after_ms`, optional `owner_instance_id`, optional `lease_until_s`)
           content:
             text/event-stream:
               schema:
@@ -360,6 +360,10 @@ paths:
           description: Missing/invalid user_id
         "409":
           description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
 
   /api/v1/users/{user_id}/onboarding:
     get:
@@ -405,6 +409,12 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
 
   /api/v1/users/{user_id}/config:
     get:
@@ -443,6 +453,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
     put:
       tags: [user]
       summary: Replace user config JSON
@@ -464,6 +480,134 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
+
+  /api/v1/users/{user_id}/settings:
+    get:
+      tags: [user]
+      summary: Get user-facing product settings
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Product settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductSettings"
+    patch:
+      tags: [user]
+      summary: Patch user-facing product settings
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                assistant_mode:
+                  type: string
+                  enum: [fast, balanced, deep]
+                group_activation:
+                  type: string
+                  enum: [mention, always]
+                proactive_updates:
+                  type: boolean
+                voice_replies:
+                  type: boolean
+                session_timeout_minutes:
+                  type: integer
+                  minimum: 5
+                  maximum: 180
+              additionalProperties: false
+      responses:
+        "200":
+          description: Updated product settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductSettings"
+        "400":
+          description: Invalid settings payload
+          content:
+            application/json:
+              examples:
+                invalid_assistant_mode:
+                  value: { error: invalid_assistant_mode }
+                invalid_session_timeout_minutes:
+                  value: { error: invalid_session_timeout_minutes }
+                invalid_payload:
+                  value: { error: invalid_payload }
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
+    put:
+      tags: [user]
+      summary: Update user-facing product settings
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                assistant_mode:
+                  type: string
+                  enum: [fast, balanced, deep]
+                group_activation:
+                  type: string
+                  enum: [mention, always]
+                proactive_updates:
+                  type: boolean
+                voice_replies:
+                  type: boolean
+                session_timeout_minutes:
+                  type: integer
+                  minimum: 5
+                  maximum: 180
+              additionalProperties: false
+      responses:
+        "200":
+          description: Updated product settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductSettings"
+        "400":
+          description: Invalid settings payload
+          content:
+            application/json:
+              examples:
+                invalid_assistant_mode:
+                  value: { error: invalid_assistant_mode }
+                invalid_session_timeout_minutes:
+                  value: { error: invalid_session_timeout_minutes }
+                invalid_payload:
+                  value: { error: invalid_payload }
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
 
   /api/v1/users/{user_id}/heartbeat:
     get:
@@ -502,6 +646,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
 
   /api/v1/users/{user_id}/cron:
     get:
@@ -544,6 +694,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
     patch:
       tags: [user]
       summary: Replace cron/jobs payload
@@ -567,6 +723,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
     put:
       tags: [user]
       summary: Replace cron/jobs payload
@@ -590,6 +752,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
     delete:
       tags: [user]
       summary: Clear user cron/jobs
@@ -604,6 +772,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
 
   /api/v1/users/{user_id}/secrets/{key}:
     get:
@@ -924,3 +1098,46 @@ components:
         status:
           type: string
       additionalProperties: true
+    ProductSettings:
+      type: object
+      properties:
+        assistant_mode:
+          type: string
+          enum: [fast, balanced, deep]
+        group_activation:
+          type: string
+          enum: [mention, always]
+        proactive_updates:
+          type: boolean
+        voice_replies:
+          type: boolean
+        session_timeout_minutes:
+          type: integer
+          minimum: 5
+          maximum: 180
+      required:
+        - assistant_mode
+        - group_activation
+        - proactive_updates
+        - voice_replies
+        - session_timeout_minutes
+      additionalProperties: false
+    OwnershipLockConflictResponse:
+      type: object
+      required: [error, message, retry_after_ms, owner_instance_id, lease_until_s]
+      properties:
+        error:
+          type: string
+          enum: [ownership_lock_conflict]
+        message:
+          type: string
+        retry_after_ms:
+          type: integer
+          minimum: 1
+        owner_instance_id:
+          type: string
+          nullable: true
+        lease_until_s:
+          type: integer
+          nullable: true
+      additionalProperties: false
