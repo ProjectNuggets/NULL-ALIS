@@ -2787,7 +2787,9 @@ fn telegramWebhookExtractInboundText(
     body: []const u8,
     bot_token: []const u8,
     transcriber: ?voice.Transcriber,
+    proxy: ?[]const u8,
 ) ?[]u8 {
+    const VOICE_FALLBACK = "[Voice]: (transcription unavailable)";
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
     defer parsed.deinit();
     if (parsed.value != .object) return null;
@@ -2795,16 +2797,18 @@ fn telegramWebhookExtractInboundText(
     const msg_obj = parsed.value.object.get("message") orelse
         parsed.value.object.get("edited_message") orelse return null;
     if (msg_obj != .object) return null;
+    var saw_voice_or_audio = false;
 
     if (msg_obj.object.get("text")) |text_val| {
         if (text_val == .string) return allocator.dupe(u8, text_val.string) catch null;
     }
 
     if (msg_obj.object.get("voice")) |voice_val| {
+        saw_voice_or_audio = true;
         if (voice_val == .object) {
             if (voice_val.object.get("file_id")) |file_id_val| {
                 if (file_id_val == .string) {
-                    if (voice.transcribeTelegramVoice(allocator, bot_token, file_id_val.string, transcriber)) |transcribed| {
+                    if (voice.transcribeTelegramVoice(allocator, bot_token, file_id_val.string, transcriber, proxy)) |transcribed| {
                         defer allocator.free(transcribed);
                         return std.fmt.allocPrint(allocator, "[Voice]: {s}", .{transcribed}) catch null;
                     }
@@ -2814,10 +2818,11 @@ fn telegramWebhookExtractInboundText(
     }
 
     if (msg_obj.object.get("audio")) |audio_val| {
+        saw_voice_or_audio = true;
         if (audio_val == .object) {
             if (audio_val.object.get("file_id")) |file_id_val| {
                 if (file_id_val == .string) {
-                    if (voice.transcribeTelegramVoice(allocator, bot_token, file_id_val.string, transcriber)) |transcribed| {
+                    if (voice.transcribeTelegramVoice(allocator, bot_token, file_id_val.string, transcriber, proxy)) |transcribed| {
                         defer allocator.free(transcribed);
                         return std.fmt.allocPrint(allocator, "[Voice]: {s}", .{transcribed}) catch null;
                     }
@@ -2828,6 +2833,10 @@ fn telegramWebhookExtractInboundText(
 
     if (msg_obj.object.get("caption")) |caption_val| {
         if (caption_val == .string) return allocator.dupe(u8, caption_val.string) catch null;
+    }
+
+    if (saw_voice_or_audio) {
+        return allocator.dupe(u8, VOICE_FALLBACK) catch null;
     }
 
     return null;
@@ -3816,6 +3825,14 @@ fn internalDiagnosticsPayload(
         try json_util.appendJsonInt(&buf, allocator, "transcription_failed", @intCast(stt_metrics.transcription_failed));
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonInt(&buf, allocator, "transcription_skipped_no_transcriber", @intCast(stt_metrics.transcription_skipped_no_transcriber));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "failure_get_file", @intCast(stt_metrics.failure_get_file));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "failure_download", @intCast(stt_metrics.failure_download));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "failure_transcriber", @intCast(stt_metrics.failure_transcriber));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "failure_empty_transcript", @intCast(stt_metrics.failure_empty_transcript));
         try buf.appendSlice(allocator, "},");
     }
 
@@ -4945,13 +4962,18 @@ fn handleApiRoute(
         defer req_allocator.free(secret_path);
 
         if (std.mem.eql(u8, method, "GET")) {
+            var owned_secret: ?[]u8 = null;
+            defer if (owned_secret) |v| req_allocator.free(v);
             const value_text: []const u8 = if (state.zaki_state) |mgr| blk: {
                 const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 const secret_value = mgr.getSecret(req_allocator, user_id, secret_key) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
                 };
-                defer if (secret_value) |v| req_allocator.free(v);
-                break :blk secret_value orelse "";
+                if (secret_value) |v| {
+                    owned_secret = v;
+                    break :blk v;
+                }
+                break :blk "";
             } else blk: {
                 break :blk readFileOrDefault(req_allocator, secret_path, "") catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
@@ -4969,13 +4991,27 @@ fn handleApiRoute(
         if (std.mem.eql(u8, method, "PUT")) {
             const body = extractBody(raw_request) orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
             const value = jsonStringField(body, "value") orelse body;
+            if (std.mem.eql(u8, secret_key, "telegram_bot_token")) {
+                const normalized = normalizeTelegramBotToken(value);
+                if (!isLikelyTelegramBotToken(normalized)) {
+                    return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid telegram bot token\"}" };
+                }
+            }
             if (state.zaki_state) |mgr| {
                 const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                mgr.putSecret(user_id, secret_key, value) catch {
+                const write_value = if (std.mem.eql(u8, secret_key, "telegram_bot_token"))
+                    normalizeTelegramBotToken(value)
+                else
+                    value;
+                mgr.putSecret(user_id, secret_key, write_value) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
             } else {
-                writeFile(secret_path, value) catch {
+                const write_value = if (std.mem.eql(u8, secret_key, "telegram_bot_token"))
+                    normalizeTelegramBotToken(value)
+                else
+                    value;
+                writeFile(secret_path, write_value) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
             }
@@ -5145,15 +5181,19 @@ fn handleApiRoute(
 
         const input_bot_token = jsonStringField(body, "bot_token");
         if (input_bot_token) |tok| {
+            const normalized_tok = normalizeTelegramBotToken(tok);
+            if (!isLikelyTelegramBotToken(normalized_tok)) {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid bot_token\"}" };
+            }
             if (state.zaki_state) |mgr| {
                 const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                mgr.putSecret(user_id, "telegram_bot_token", tok) catch {
+                mgr.putSecret(user_id, "telegram_bot_token", normalized_tok) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
                 };
                 // Keep file secret in sync for local tenant runtime fallback.
-                writeFile(secret_path, tok) catch {};
+                writeFile(secret_path, normalized_tok) catch {};
             } else {
-                writeFile(secret_path, tok) catch {
+                writeFile(secret_path, normalized_tok) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
                 };
             }
@@ -5173,7 +5213,12 @@ fn handleApiRoute(
         if (!isValidIdentifier(account_id)) {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid account_id\"}" };
         }
-        const allow_from = if (allow_from_override) |items| items else state.telegram_allow_from;
+        const allow_from: []const []const u8 = if (allow_from_override) |items|
+            items
+        else if (state.telegram_allow_from.len > 0)
+            state.telegram_allow_from
+        else
+            &.{"*"};
 
         const webhook_url = blk: {
             if (jsonStringField(body, "webhook_url")) |url| break :blk req_allocator.dupe(u8, url) catch {
@@ -5405,10 +5450,13 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         var tg_allow_from = ctx.state.telegram_allow_from;
         var tg_account_id = ctx.state.telegram_account_id;
         var tg_webhook_secret_token = ctx.state.telegram_webhook_secret_token;
+        var tg_bot_token_owned: ?[]const u8 = null;
+        var tg_proxy: ?[]const u8 = null;
         var scoped_user_id: ?[]const u8 = null;
         var use_shared_main = false;
         var tenant_channel_state_path: ?[]const u8 = null;
         var numeric_user_id_opt: ?i64 = null;
+        defer if (tg_bot_token_owned) |tok| ctx.req_allocator.free(tok);
         defer if (tenant_channel_state_path) |p| ctx.req_allocator.free(p);
         var tenant_user_ctx: ?UserContext = null;
         defer if (tenant_user_ctx) |*value| value.deinit(ctx.req_allocator);
@@ -5417,6 +5465,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             tg_allow_from = tg_cfg.allow_from;
             tg_account_id = tg_cfg.account_id;
             tg_webhook_secret_token = tg_cfg.webhook_secret_token orelse "";
+            tg_proxy = tg_cfg.proxy;
         }
 
         if (ctx.state.tenant_enabled) {
@@ -5524,7 +5573,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing telegram bot token\"}";
                 return;
             };
-            defer if (tenant_bot_token.len > 0) ctx.req_allocator.free(tenant_bot_token);
+            tg_bot_token_owned = tenant_bot_token;
             tg_bot_token = tenant_bot_token;
 
             if (tg_webhook_secret_token.len == 0) {
@@ -5596,6 +5645,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             b,
             tg_bot_token,
             webhook_transcriber.transcriber,
+            tg_proxy,
         );
         defer if (msg_text) |mt| ctx.req_allocator.free(mt);
         const chat_id = telegramChatId(ctx.req_allocator, b);
@@ -8134,7 +8184,7 @@ test "telegramWebhookExtractInboundText returns nested text" {
     const body =
         \\{"update_id":1,"message":{"chat":{"id":123},"from":{"id":1},"text":"hello from tg"}}
     ;
-    const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null) orelse return error.TestUnexpectedResult;
+    const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null, null) orelse return error.TestUnexpectedResult;
     defer allocator.free(text);
     try std.testing.expectEqualStrings("hello from tg", text);
 }
@@ -8144,17 +8194,19 @@ test "telegramWebhookExtractInboundText falls back to caption" {
     const body =
         \\{"update_id":1,"message":{"chat":{"id":123},"from":{"id":1},"caption":"voice caption only"}}
     ;
-    const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null) orelse return error.TestUnexpectedResult;
+    const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null, null) orelse return error.TestUnexpectedResult;
     defer allocator.free(text);
     try std.testing.expectEqualStrings("voice caption only", text);
 }
 
-test "telegramWebhookExtractInboundText voice without transcriber returns null" {
+test "telegramWebhookExtractInboundText voice without transcriber returns fallback marker" {
     const allocator = std.testing.allocator;
     const body =
         \\{"update_id":1,"message":{"chat":{"id":123},"from":{"id":1},"voice":{"file_id":"abc123"}}}
     ;
-    try std.testing.expect(telegramWebhookExtractInboundText(allocator, body, "123:bot", null) == null);
+    const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null, null) orelse return error.TestUnexpectedResult;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("[Voice]: (transcription unavailable)", text);
 }
 
 test "telegramSenderAllowed matches numeric sender id from nested from object" {

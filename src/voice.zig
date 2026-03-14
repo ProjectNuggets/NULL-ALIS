@@ -18,6 +18,10 @@ pub const TelegramSttMetrics = struct {
     transcription_succeeded: u64,
     transcription_failed: u64,
     transcription_skipped_no_transcriber: u64,
+    failure_get_file: u64,
+    failure_download: u64,
+    failure_transcriber: u64,
+    failure_empty_transcript: u64,
 };
 
 var telegram_stt_transcriber_configured_total = std.atomic.Value(u64).init(0);
@@ -25,6 +29,10 @@ var telegram_stt_transcription_attempted_total = std.atomic.Value(u64).init(0);
 var telegram_stt_transcription_succeeded_total = std.atomic.Value(u64).init(0);
 var telegram_stt_transcription_failed_total = std.atomic.Value(u64).init(0);
 var telegram_stt_transcription_skipped_no_transcriber_total = std.atomic.Value(u64).init(0);
+var telegram_stt_failure_get_file_total = std.atomic.Value(u64).init(0);
+var telegram_stt_failure_download_total = std.atomic.Value(u64).init(0);
+var telegram_stt_failure_transcriber_total = std.atomic.Value(u64).init(0);
+var telegram_stt_failure_empty_transcript_total = std.atomic.Value(u64).init(0);
 
 pub fn markTelegramTranscriberConfigured() void {
     _ = telegram_stt_transcriber_configured_total.fetchAdd(1, .monotonic);
@@ -37,6 +45,10 @@ pub fn telegramSttMetricsSnapshot() TelegramSttMetrics {
         .transcription_succeeded = telegram_stt_transcription_succeeded_total.load(.monotonic),
         .transcription_failed = telegram_stt_transcription_failed_total.load(.monotonic),
         .transcription_skipped_no_transcriber = telegram_stt_transcription_skipped_no_transcriber_total.load(.monotonic),
+        .failure_get_file = telegram_stt_failure_get_file_total.load(.monotonic),
+        .failure_download = telegram_stt_failure_download_total.load(.monotonic),
+        .failure_transcriber = telegram_stt_failure_transcriber_total.load(.monotonic),
+        .failure_empty_transcript = telegram_stt_failure_empty_transcript_total.load(.monotonic),
     };
 }
 
@@ -54,6 +66,204 @@ fn markTelegramSttFailed() void {
 
 fn markTelegramSttSkippedNoTranscriber() void {
     _ = telegram_stt_transcription_skipped_no_transcriber_total.fetchAdd(1, .monotonic);
+}
+
+fn markTelegramSttFailedGetFile() void {
+    _ = telegram_stt_failure_get_file_total.fetchAdd(1, .monotonic);
+}
+
+fn markTelegramSttFailedDownload() void {
+    _ = telegram_stt_failure_download_total.fetchAdd(1, .monotonic);
+}
+
+fn markTelegramSttFailedTranscriber() void {
+    _ = telegram_stt_failure_transcriber_total.fetchAdd(1, .monotonic);
+}
+
+fn markTelegramSttFailedEmptyTranscript() void {
+    _ = telegram_stt_failure_empty_transcript_total.fetchAdd(1, .monotonic);
+}
+
+fn parseTelegramFilePathFromResponse(allocator: std.mem.Allocator, resp: []const u8) ![]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch
+        return error.InvalidResponse;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidResponse;
+
+    if (parsed.value.object.get("ok")) |ok_val| {
+        if (ok_val == .bool and !ok_val.bool) {
+            if (parsed.value.object.get("description")) |description| {
+                if (description == .string) {
+                    log.warn("telegram getFile rejected: {s}", .{description.string});
+                    const lowered = description.string;
+                    if (std.mem.indexOf(u8, lowered, "file is too big") != null) {
+                        return error.TelegramFileTooBig;
+                    }
+                }
+            }
+            return error.TelegramApiRejected;
+        }
+    }
+
+    const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
+    if (result != .object) return error.InvalidResponse;
+    const fp_val = result.object.get("file_path") orelse return error.InvalidResponse;
+    if (fp_val != .string) return error.InvalidResponse;
+    return try allocator.dupe(u8, fp_val.string);
+}
+
+fn isUnreservedQueryByte(ch: u8) bool {
+    return (ch >= 'A' and ch <= 'Z') or
+        (ch >= 'a' and ch <= 'z') or
+        (ch >= '0' and ch <= '9') or
+        ch == '-' or ch == '_' or ch == '.' or ch == '~';
+}
+
+fn appendPercentEncodedQueryValue(
+    list: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: []const u8,
+) !void {
+    const hex = "0123456789ABCDEF";
+    for (value) |ch| {
+        if (isUnreservedQueryByte(ch)) {
+            try list.append(allocator, ch);
+        } else {
+            try list.append(allocator, '%');
+            try list.append(allocator, hex[(ch >> 4) & 0x0F]);
+            try list.append(allocator, hex[ch & 0x0F]);
+        }
+    }
+}
+
+fn isTelegramBotTokenChar(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or
+        (ch >= 'A' and ch <= 'Z') or
+        (ch >= '0' and ch <= '9') or
+        ch == '_' or
+        ch == '-';
+}
+
+fn isTelegramBotTokenShape(value: []const u8) bool {
+    if (value.len < 16) return false;
+    const colon_idx = std.mem.indexOfScalar(u8, value, ':') orelse return false;
+    if (colon_idx == 0 or colon_idx + 1 >= value.len) return false;
+
+    for (value[0..colon_idx]) |ch| {
+        if (ch < '0' or ch > '9') return false;
+    }
+    for (value[colon_idx + 1 ..]) |ch| {
+        if (!isTelegramBotTokenChar(ch)) return false;
+    }
+    return true;
+}
+
+fn findTelegramBotTokenCandidate(value: []const u8) ?[]const u8 {
+    var idx: usize = 0;
+    while (idx < value.len) : (idx += 1) {
+        if (value[idx] != ':') continue;
+        if (idx == 0 or idx + 1 >= value.len) continue;
+
+        var left_start = idx;
+        while (left_start > 0) {
+            const ch = value[left_start - 1];
+            if (ch < '0' or ch > '9') break;
+            left_start -= 1;
+        }
+        if (idx - left_start < 5) continue;
+
+        var right_end = idx + 1;
+        while (right_end < value.len and isTelegramBotTokenChar(value[right_end])) {
+            right_end += 1;
+        }
+        if (right_end - (idx + 1) < 10) continue;
+
+        const candidate = value[left_start..right_end];
+        if (isTelegramBotTokenShape(candidate)) return candidate;
+    }
+    return null;
+}
+
+fn normalizeTelegramBotToken(value: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len >= 2) {
+        const first = trimmed[0];
+        const last = trimmed[trimmed.len - 1];
+        if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
+            trimmed = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+        }
+    }
+    if (isTelegramBotTokenShape(trimmed)) return trimmed;
+    if (findTelegramBotTokenCandidate(trimmed)) |candidate| return candidate;
+    return trimmed;
+}
+
+fn logTelegramTokenShapeFailure(token: []const u8) void {
+    const colon_idx_opt = std.mem.indexOfScalar(u8, token, ':');
+    const colon_pos: isize = if (colon_idx_opt) |idx| @intCast(idx) else -1;
+
+    var first_bad_idx: isize = -1;
+    var first_bad_byte: u8 = 0;
+    var found_bad = false;
+
+    if (colon_idx_opt) |colon_idx| {
+        for (token[0..colon_idx], 0..) |ch, i| {
+            if (ch < '0' or ch > '9') {
+                first_bad_idx = @intCast(i);
+                first_bad_byte = ch;
+                found_bad = true;
+                break;
+            }
+        }
+        if (!found_bad and colon_idx + 1 < token.len) {
+            for (token[colon_idx + 1 ..], 0..) |ch, rel_i| {
+                if (!isTelegramBotTokenChar(ch)) {
+                    first_bad_idx = @intCast(colon_idx + 1 + rel_i);
+                    first_bad_byte = ch;
+                    found_bad = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        for (token, 0..) |ch, i| {
+            if (!(isTelegramBotTokenChar(ch) or (ch >= '0' and ch <= '9'))) {
+                first_bad_idx = @intCast(i);
+                first_bad_byte = ch;
+                found_bad = true;
+                break;
+            }
+        }
+    }
+
+    if (found_bad) {
+        log.warn("telegram token shape invalid len={d} colon_pos={d} bad_idx={d} bad_byte=0x{x}", .{
+            token.len,
+            colon_pos,
+            first_bad_idx,
+            first_bad_byte,
+        });
+    } else {
+        log.warn("telegram token shape invalid len={d} colon_pos={d} bad_idx={d}", .{
+            token.len,
+            colon_pos,
+            first_bad_idx,
+        });
+    }
+}
+
+fn buildTelegramGetFileQueryUrl(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    file_id: []const u8,
+) ![]u8 {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer list.deinit(allocator);
+    try list.appendSlice(allocator, "https://api.telegram.org/bot");
+    try list.appendSlice(allocator, bot_token);
+    try list.appendSlice(allocator, "/getFile?file_id=");
+    try appendPercentEncodedQueryValue(&list, allocator, file_id);
+    return try list.toOwnedSlice(allocator);
 }
 
 fn getPid() i32 {
@@ -309,6 +519,14 @@ fn sanitizeSynthesisFormat(format: []const u8) []const u8 {
     return "mp3";
 }
 
+fn normalizeTranscriptionLanguage(language: ?[]const u8) ?[]const u8 {
+    const raw = language orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return null;
+    return trimmed;
+}
+
 fn buildSynthesisRequestBody(
     allocator: std.mem.Allocator,
     model: []const u8,
@@ -361,7 +579,7 @@ fn buildMultipartBody(
     try body.appendSlice(allocator, "\r\n");
 
     // Part: language (optional)
-    if (opts.language) |lang| {
+    if (normalizeTranscriptionLanguage(opts.language)) |lang| {
         try body.appendSlice(allocator, "--");
         try body.appendSlice(allocator, boundary);
         try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n");
@@ -415,7 +633,7 @@ fn writeMultipartToTempFile(
     try tmp_file.writeAll("\r\n");
 
     // Write language part (optional)
-    if (opts.language) |lang| {
+    if (normalizeTranscriptionLanguage(opts.language)) |lang| {
         try tmp_file.writeAll("--");
         try tmp_file.writeAll(boundary);
         try tmp_file.writeAll("\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n");
@@ -516,6 +734,7 @@ pub fn transcribeTelegramVoice(
     bot_token: []const u8,
     file_id: []const u8,
     t: ?Transcriber,
+    proxy: ?[]const u8,
 ) ?[]const u8 {
     const transcr = t orelse {
         markTelegramSttSkippedNoTranscriber();
@@ -524,20 +743,26 @@ pub fn transcribeTelegramVoice(
     };
     markTelegramSttAttempted();
 
+    // Own token bytes for the full STT flow to avoid caller-lifetime issues.
+    const bot_token_owned = allocator.dupe(u8, bot_token) catch return null;
+    defer allocator.free(bot_token_owned);
+
     // 1. Call getFile to get file_path
-    const tg_file_path = getFilePath(allocator, bot_token, file_id) catch |err| {
+    const tg_file_path = getFilePathWithRetry(allocator, bot_token_owned, file_id, proxy) catch |err| {
         markTelegramSttFailed();
+        markTelegramSttFailedGetFile();
         log.err("getFile failed: {}", .{err});
-        log.warn("telegram.stt.fail reason=get_file_failed", .{});
+        log.warn("telegram.stt.fail reason=get_file_failed err={}", .{err});
         return null;
     };
     defer allocator.free(tg_file_path);
 
     // 2. Download file via Telegram API
-    const local_path = downloadTelegramFile(allocator, bot_token, tg_file_path) catch |err| {
+    const local_path = downloadTelegramFile(allocator, bot_token_owned, tg_file_path, proxy) catch |err| {
         markTelegramSttFailed();
+        markTelegramSttFailedDownload();
         log.err("download failed: {}", .{err});
-        log.warn("telegram.stt.fail reason=download_failed", .{});
+        log.warn("telegram.stt.fail reason=download_failed err={}", .{err});
         return null;
     };
     defer {
@@ -549,8 +774,9 @@ pub fn transcribeTelegramVoice(
     // 3. Transcribe via vtable
     const text = transcr.transcribe(allocator, local_path) catch |err| {
         markTelegramSttFailed();
+        markTelegramSttFailedTranscriber();
         log.err("transcription failed: {}", .{err});
-        log.warn("telegram.stt.fail reason=transcriber_failed", .{});
+        log.warn("telegram.stt.fail reason=transcriber_failed err={}", .{err});
         return null;
     };
     if (text != null) {
@@ -558,6 +784,7 @@ pub fn transcribeTelegramVoice(
         log.info("telegram.stt.success", .{});
     } else {
         markTelegramSttFailed();
+        markTelegramSttFailedEmptyTranscript();
         log.warn("telegram.stt.fail reason=empty_transcript", .{});
     }
 
@@ -565,11 +792,20 @@ pub fn transcribeTelegramVoice(
 }
 
 /// Call Telegram getFile API and extract the file_path from the response.
-fn getFilePath(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8) ![]u8 {
-    var url_buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&url_buf);
-    try fbs.writer().print("https://api.telegram.org/bot{s}/getFile", .{bot_token});
-    const url = fbs.getWritten();
+fn getFilePathOnce(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    file_id: []const u8,
+    proxy: ?[]const u8,
+) ![]u8 {
+    const normalized_bot_token = normalizeTelegramBotToken(bot_token);
+    if (!isTelegramBotTokenShape(normalized_bot_token)) {
+        logTelegramTokenShapeFailure(normalized_bot_token);
+        log.warn("telegram getFile refused: invalid bot token shape len={d}", .{normalized_bot_token.len});
+        return error.CurlFailed;
+    }
+    const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/getFile", .{normalized_bot_token});
+    defer allocator.free(url);
 
     // Build request body
     var body_list: std.ArrayListUnmanaged(u8) = .empty;
@@ -578,28 +814,134 @@ fn getFilePath(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []c
     try json_util.appendJsonString(&body_list, allocator, file_id);
     try body_list.appendSlice(allocator, "}");
 
-    const resp = try http_util.curlPost(allocator, url, body_list.items, &.{});
-    defer allocator.free(resp);
+    const post_resp = http_util.curlRequest(
+        allocator,
+        "POST",
+        url,
+        &.{"Content-Type: application/json"},
+        body_list.items,
+        proxy,
+        "15",
+    ) catch |post_err| {
+        log.warn("telegram getFile post request failed: {}; trying query fallback", .{post_err});
+        return getFilePathViaQuery(allocator, normalized_bot_token, file_id, proxy);
+    };
+    defer allocator.free(post_resp.body);
 
-    // Parse response
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch
-        return error.InvalidResponse;
+    if (post_resp.status_code < 200 or post_resp.status_code >= 300) {
+        const preview_len: usize = @min(post_resp.body.len, 220);
+        log.warn("telegram getFile post status={d} body_len={d} body_preview={s}; trying query fallback", .{
+            post_resp.status_code,
+            post_resp.body.len,
+            post_resp.body[0..preview_len],
+        });
+        return getFilePathViaQuery(allocator, normalized_bot_token, file_id, proxy);
+    }
+
+    return parseTelegramFilePathFromResponse(allocator, post_resp.body) catch |post_parse_err| {
+        log.warn("telegram getFile post parse failed: {}; trying query fallback", .{post_parse_err});
+        return getFilePathViaQuery(allocator, normalized_bot_token, file_id, proxy);
+    };
+}
+
+fn shouldRetryGetFileError(err: anyerror) bool {
+    return switch (err) {
+        error.TelegramApiRejected,
+        error.TelegramFileTooBig,
+        => false,
+        else => true,
+    };
+}
+
+fn classifyTelegramGetFileFailure(allocator: std.mem.Allocator, body: []const u8) anyerror {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        const preview_len: usize = @min(body.len, 220);
+        log.warn("telegram getFile rejected (non-json body preview): {s}", .{body[0..preview_len]});
+        return error.TelegramApiRejected;
+    };
     defer parsed.deinit();
+    if (parsed.value != .object) return error.TelegramApiRejected;
 
-    const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
-    const fp_val = result.object.get("file_path") orelse return error.InvalidResponse;
-    if (fp_val != .string) return error.InvalidResponse;
-    return try allocator.dupe(u8, fp_val.string);
+    if (parsed.value.object.get("description")) |description| {
+        if (description == .string) {
+            log.warn("telegram getFile rejected: {s}", .{description.string});
+            if (std.mem.indexOf(u8, description.string, "file is too big") != null) {
+                return error.TelegramFileTooBig;
+            }
+        }
+    }
+    return error.TelegramApiRejected;
+}
+
+fn getFilePathViaQuery(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    file_id: []const u8,
+    proxy: ?[]const u8,
+) ![]u8 {
+    const normalized_bot_token = normalizeTelegramBotToken(bot_token);
+    if (!isTelegramBotTokenShape(normalized_bot_token)) {
+        logTelegramTokenShapeFailure(normalized_bot_token);
+        return error.CurlFailed;
+    }
+    const get_url = try buildTelegramGetFileQueryUrl(allocator, normalized_bot_token, file_id);
+    defer allocator.free(get_url);
+
+    const resp = try http_util.curlRequest(allocator, "GET", get_url, &.{}, null, proxy, "15");
+    defer allocator.free(resp.body);
+
+    if (resp.status_code < 200 or resp.status_code >= 300) {
+        const preview_len: usize = @min(resp.body.len, 220);
+        log.warn("telegram getFile query status={d} body_len={d} body_preview={s}", .{
+            resp.status_code,
+            resp.body.len,
+            resp.body[0..preview_len],
+        });
+        return classifyTelegramGetFileFailure(allocator, resp.body);
+    }
+    return parseTelegramFilePathFromResponse(allocator, resp.body);
+}
+
+fn getFilePathWithRetry(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    file_id: []const u8,
+    proxy: ?[]const u8,
+) ![]u8 {
+    const max_attempts: u8 = 3;
+    var attempt: u8 = 1;
+    while (attempt <= max_attempts) : (attempt += 1) {
+        const file_path = getFilePathOnce(allocator, bot_token, file_id, proxy) catch |err| {
+            if (attempt >= max_attempts or !shouldRetryGetFileError(err)) {
+                return err;
+            }
+            log.warn("telegram getFile transient failure attempt={d}/{d}: {}; retrying", .{ attempt, max_attempts, err });
+            std.Thread.sleep(@as(u64, attempt) * 200 * std.time.ns_per_ms);
+            continue;
+        };
+        return file_path;
+    }
+    return error.TelegramApiRejected;
 }
 
 /// Download a file from Telegram and save to temp dir. Returns the local path (owned).
-fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, tg_file_path: []const u8) ![]u8 {
+fn downloadTelegramFile(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    tg_file_path: []const u8,
+    proxy: ?[]const u8,
+) ![]u8 {
+    const normalized_bot_token = normalizeTelegramBotToken(bot_token);
+    if (!isTelegramBotTokenShape(normalized_bot_token)) {
+        logTelegramTokenShapeFailure(normalized_bot_token);
+        return error.CurlFailed;
+    }
     var url_buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&url_buf);
-    try fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path });
+    try fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ normalized_bot_token, tg_file_path });
     const url = fbs.getWritten();
 
-    const data = try http_util.curlGet(allocator, url, &.{}, "30");
+    const data = try http_util.curlGetWithProxy(allocator, url, &.{}, "30", proxy);
     defer allocator.free(data);
 
     // Save to temp file (platform-aware temp dir)
@@ -702,6 +1044,16 @@ test "voice buildMultipartBody without language" {
     try std.testing.expect(std.mem.indexOf(u8, body, "name=\"language\"") == null);
 }
 
+test "voice buildMultipartBody language auto omits language field" {
+    const allocator = std.testing.allocator;
+    const boundary = "abcdef0123456789abcdef0123456789";
+
+    const body = try buildMultipartBody(allocator, boundary, "data", .{ .language = "auto" });
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "name=\"language\"") == null);
+}
+
 test "voice parseTranscriptionText valid" {
     const allocator = std.testing.allocator;
     const json = "{\"text\":\"Hello, world!\"}";
@@ -743,6 +1095,32 @@ test "voice parseTranscriptionText empty text" {
     try std.testing.expectEqualStrings("", text);
 }
 
+test "voice shouldRetryGetFileError classifies retryable and permanent failures" {
+    try std.testing.expect(shouldRetryGetFileError(error.CurlFailed));
+    try std.testing.expect(!shouldRetryGetFileError(error.TelegramApiRejected));
+    try std.testing.expect(shouldRetryGetFileError(error.InvalidResponse));
+}
+
+test "voice buildTelegramGetFileQueryUrl percent-encodes file id" {
+    const allocator = std.testing.allocator;
+    const url = try buildTelegramGetFileQueryUrl(allocator, "123:ABC", "A/B+C=");
+    defer allocator.free(url);
+    try std.testing.expect(std.mem.indexOf(u8, url, "file_id=A%2FB%2BC%3D") != null);
+}
+
+test "voice normalizeTelegramBotToken unwraps quoted token" {
+    const token = normalizeTelegramBotToken(" \"8622705808:AAFVrWAamFu8Q3Av4V_OdInaJr_7Qn-26CA\" ");
+    try std.testing.expectEqualStrings("8622705808:AAFVrWAamFu8Q3Av4V_OdInaJr_7Qn-26CA", token);
+    try std.testing.expect(isTelegramBotTokenShape(token));
+}
+
+test "voice normalizeTelegramBotToken extracts candidate from wrapped content" {
+    const wrapped = "{\"key\":\"telegram_bot_token\",\"value\":\"8622705808:AAFVrWAamFu8Q3Av4V_OdInaJr_7Qn-26CA\"}";
+    const token = normalizeTelegramBotToken(wrapped);
+    try std.testing.expectEqualStrings("8622705808:AAFVrWAamFu8Q3Av4V_OdInaJr_7Qn-26CA", token);
+    try std.testing.expect(isTelegramBotTokenShape(token));
+}
+
 test "voice transcribeFile returns error for nonexistent file" {
     const allocator = std.testing.allocator;
     const result = transcribeFile(allocator, "fake_key", "https://api.groq.com/openai/v1/audio/transcriptions", "/nonexistent/path/audio.ogg", .{});
@@ -751,7 +1129,7 @@ test "voice transcribeFile returns error for nonexistent file" {
 
 test "voice transcribeTelegramVoice returns null without transcriber" {
     // No transcriber configured, so should return null
-    const result = transcribeTelegramVoice(std.testing.allocator, "fake:token", "fake_file_id", null);
+    const result = transcribeTelegramVoice(std.testing.allocator, "fake:token", "fake_file_id", null, null);
     try std.testing.expect(result == null);
 }
 

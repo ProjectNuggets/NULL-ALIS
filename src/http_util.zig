@@ -20,6 +20,23 @@ pub const CurlResponse = struct {
 
 const STATUS_MARKER = "\n__NULLCLAW_STATUS__:";
 
+fn curlExitHint(code: u8) []const u8 {
+    return switch (code) {
+        3 => "url_malformed",
+        5 => "proxy_resolve_failed",
+        6 => "host_resolve_failed",
+        7 => "connect_failed",
+        22 => "http_error_with_fail_flag",
+        28 => "operation_timeout",
+        35 => "tls_connect_failed",
+        47 => "too_many_redirects",
+        52 => "empty_reply",
+        56 => "recv_failed",
+        60 => "tls_cert_verify_failed",
+        else => "curl_failed",
+    };
+}
+
 pub const TransportStats = struct {
     tools_native_total: u64,
     tools_curl_total: u64,
@@ -173,7 +190,7 @@ pub fn curlPostWithProxy(
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
 
@@ -227,6 +244,8 @@ pub fn curlGetWithProxy(
     argc += 1;
     argv_buf[argc] = "-sf";
     argc += 1;
+    argv_buf[argc] = "-L";
+    argc += 1;
     argv_buf[argc] = "--max-time";
     argc += 1;
     argv_buf[argc] = timeout_secs;
@@ -252,20 +271,40 @@ pub fn curlGetWithProxy(
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
+    const stderr = child.stderr.?.readToEndAlloc(allocator, 64 * 1024) catch {
+        allocator.free(stdout);
+        return error.CurlReadError;
+    };
+    defer allocator.free(stderr);
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch {
+        allocator.free(stdout);
+        return error.CurlWaitError;
+    };
     switch (term) {
         .Exited => |code| if (code != 0) {
             allocator.free(stdout);
+            const hint = curlExitHint(code);
+            if (stderr.len > 0) {
+                const preview_len: usize = @min(stderr.len, 220);
+                log.warn("curlGetWithProxy failed exit_code={d} reason={s} stderr={s}", .{
+                    code,
+                    hint,
+                    stderr[0..preview_len],
+                });
+            } else {
+                log.warn("curlGetWithProxy failed exit_code={d} reason={s}", .{ code, hint });
+            }
             return error.CurlFailed;
         },
         else => {
             allocator.free(stdout);
+            log.warn("curlGetWithProxy failed: abnormal termination", .{});
             return error.CurlFailed;
         },
     }
@@ -346,7 +385,7 @@ pub fn curlRequestResolved(
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = if (body != null) .Pipe else .Ignore;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
 
@@ -373,8 +412,14 @@ pub fn curlRequestResolved(
 
     const term = child.wait() catch return error.CurlWaitError;
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            log.warn("curlRequest failed exit_code={d} reason={s} method={s}", .{ code, curlExitHint(code), method });
+            return error.CurlFailed;
+        },
+        else => {
+            log.warn("curlRequest failed: abnormal termination method={s}", .{method});
+            return error.CurlFailed;
+        },
     }
 
     const marker_index = std.mem.lastIndexOf(u8, stdout, STATUS_MARKER) orelse return error.CurlReadError;
@@ -447,7 +492,7 @@ pub fn curlRequest(
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = if (body != null) .Pipe else .Ignore;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
 
@@ -471,11 +516,51 @@ pub fn curlRequest(
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
     errdefer allocator.free(stdout);
+    var stderr_bytes: ?[]u8 = null;
+    if (child.stderr) |stderr_file| {
+        stderr_bytes = stderr_file.readToEndAlloc(allocator, 64 * 1024) catch null;
+    }
+    defer if (stderr_bytes) |bytes| allocator.free(bytes);
 
     const term = child.wait() catch return error.CurlWaitError;
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            const hint = curlExitHint(code);
+            if (stderr_bytes) |stderr| {
+                if (stderr.len == 0) {
+                    log.warn("curlRequest failed exit_code={d} reason={s} method={s} url_len={d} proxy={s}", .{
+                        code,
+                        hint,
+                        method,
+                        url.len,
+                        if (proxy != null) "set" else "none",
+                    });
+                    return error.CurlFailed;
+                }
+                const preview_len: usize = @min(stderr.len, 220);
+                log.warn("curlRequest failed exit_code={d} reason={s} method={s} url_len={d} proxy={s} stderr={s}", .{
+                    code,
+                    hint,
+                    method,
+                    url.len,
+                    if (proxy != null) "set" else "none",
+                    stderr[0..preview_len],
+                });
+            } else {
+                log.warn("curlRequest failed exit_code={d} reason={s} method={s} url_len={d} proxy={s}", .{
+                    code,
+                    hint,
+                    method,
+                    url.len,
+                    if (proxy != null) "set" else "none",
+                });
+            }
+            return error.CurlFailed;
+        },
+        else => {
+            log.warn("curlRequest failed: abnormal termination method={s}", .{method});
+            return error.CurlFailed;
+        },
     }
 
     const marker_index = std.mem.lastIndexOf(u8, stdout, STATUS_MARKER) orelse return error.CurlReadError;
