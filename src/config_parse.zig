@@ -20,6 +20,56 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
     return try list.toOwnedSlice(allocator);
 }
 
+fn parseAudioMediaConfigObject(self: *Config, audio: std.json.Value) !void {
+    if (audio != .object) return;
+    const has_models = blk: {
+        const models = audio.object.get("models") orelse break :blk false;
+        break :blk (models == .array and models.array.items.len > 0);
+    };
+
+    if (audio.object.get("enabled")) |v| {
+        if (v == .bool) self.audio_media.enabled = v.bool;
+    }
+    if (!has_models) {
+        if (audio.object.get("provider")) |v| {
+            if (v == .string) self.audio_media.provider = try self.allocator.dupe(u8, v.string);
+        }
+        if (audio.object.get("model")) |v| {
+            if (v == .string) self.audio_media.model = try self.allocator.dupe(u8, v.string);
+        }
+        if (audio.object.get("base_url")) |v| {
+            if (v == .string) self.audio_media.base_url = try self.allocator.dupe(u8, v.string);
+        }
+    }
+    if (audio.object.get("language")) |v| {
+        if (v == .string) self.audio_media.language = try self.allocator.dupe(u8, v.string);
+    }
+    // models[0] -> provider, model, base_url, language (override)
+    if (audio.object.get("models")) |models| {
+        if (models == .array and models.array.items.len > 0) {
+            const m0 = models.array.items[0];
+            if (m0 == .object) {
+                if (m0.object.get("provider")) |v| {
+                    if (v == .string) self.audio_media.provider = try self.allocator.dupe(u8, v.string);
+                }
+                if (m0.object.get("model")) |v| {
+                    if (v == .string) self.audio_media.model = try self.allocator.dupe(u8, v.string);
+                }
+                if (m0.object.get("base_url")) |v| {
+                    if (v == .string) self.audio_media.base_url = try self.allocator.dupe(u8, v.string);
+                }
+                if (m0.object.get("language")) |v| {
+                    if (v == .string) {
+                        // Free prior allocation from audio.language if it was set above
+                        if (self.audio_media.language) |prev| self.allocator.free(prev);
+                        self.audio_media.language = try self.allocator.dupe(u8, v.string);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
     const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
     if (slash == 0 or slash + 1 >= primary.len) return null;
@@ -764,6 +814,23 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     }
 
     // Tools (including tools.media.audio)
+    const has_tools_audio = blk: {
+        const tools_val = root.get("tools") orelse break :blk false;
+        if (tools_val != .object) break :blk false;
+        const media_val = tools_val.object.get("media") orelse break :blk false;
+        if (media_val != .object) break :blk false;
+        const audio_val = media_val.object.get("audio") orelse break :blk false;
+        break :blk audio_val == .object;
+    };
+
+    // Backward-compatible top-level alias: "audio_media"
+    // Canonical config remains tools.media.audio.
+    if (!has_tools_audio) {
+        if (root.get("audio_media")) |audio_media| {
+            try parseAudioMediaConfigObject(self, audio_media);
+        }
+    }
+
     if (root.get("tools")) |tl| {
         if (tl == .object) {
             if (tl.object.get("shell_timeout_secs")) |v| {
@@ -791,38 +858,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tl.object.get("media")) |media| {
                 if (media == .object) {
                     if (media.object.get("audio")) |audio| {
-                        if (audio == .object) {
-                            if (audio.object.get("enabled")) |v| {
-                                if (v == .bool) self.audio_media.enabled = v.bool;
-                            }
-                            if (audio.object.get("language")) |v| {
-                                if (v == .string) self.audio_media.language = try self.allocator.dupe(u8, v.string);
-                            }
-                            // models[0] → provider, model, base_url, language (override)
-                            if (audio.object.get("models")) |models| {
-                                if (models == .array and models.array.items.len > 0) {
-                                    const m0 = models.array.items[0];
-                                    if (m0 == .object) {
-                                        if (m0.object.get("provider")) |v| {
-                                            if (v == .string) self.audio_media.provider = try self.allocator.dupe(u8, v.string);
-                                        }
-                                        if (m0.object.get("model")) |v| {
-                                            if (v == .string) self.audio_media.model = try self.allocator.dupe(u8, v.string);
-                                        }
-                                        if (m0.object.get("base_url")) |v| {
-                                            if (v == .string) self.audio_media.base_url = try self.allocator.dupe(u8, v.string);
-                                        }
-                                        if (m0.object.get("language")) |v| {
-                                            if (v == .string) {
-                                                // Free prior allocation from audio.language if it was set above
-                                                if (self.audio_media.language) |prev| self.allocator.free(prev);
-                                                self.audio_media.language = try self.allocator.dupe(u8, v.string);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        try parseAudioMediaConfigObject(self, audio);
                     }
                 }
             }

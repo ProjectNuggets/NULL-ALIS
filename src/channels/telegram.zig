@@ -1370,7 +1370,7 @@ pub const TelegramChannel = struct {
                 const file_id_val = vobj.object.get("file_id") orelse break :blk_content null;
                 const file_id = if (file_id_val == .string) file_id_val.string else break :blk_content null;
 
-                if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id, self.transcriber)) |transcribed| {
+                if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id, self.transcriber, self.proxy)) |transcribed| {
                     defer allocator.free(transcribed);
                     var result: std.ArrayListUnmanaged(u8) = .empty;
                     result.appendSlice(allocator, "[Voice]: ") catch break :blk_content null;
@@ -1383,7 +1383,12 @@ pub const TelegramChannel = struct {
                         break :blk_content null;
                     };
                 }
-                break :blk_content null;
+                if (message.object.get("caption")) |cap_val| {
+                    if (cap_val == .string) {
+                        break :blk_content allocator.dupe(u8, cap_val.string) catch null;
+                    }
+                }
+                break :blk_content allocator.dupe(u8, "[Voice]: (transcription unavailable)") catch null;
             }
 
             // Check for photo messages

@@ -2734,6 +2734,7 @@ fn telegramWebhookExtractInboundText(
     proxy: ?[]const u8,
 ) ?[]u8 {
     const VOICE_FALLBACK = "[Voice]: (transcription unavailable)";
+    const IMAGE_FALLBACK = "[Image]: (caption unavailable)";
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
     defer parsed.deinit();
     if (parsed.value != .object) return null;
@@ -2742,6 +2743,7 @@ fn telegramWebhookExtractInboundText(
         parsed.value.object.get("edited_message") orelse return null;
     if (msg_obj != .object) return null;
     var saw_voice_or_audio = false;
+    var saw_photo = false;
 
     if (msg_obj.object.get("text")) |text_val| {
         if (text_val == .string) return allocator.dupe(u8, text_val.string) catch null;
@@ -2775,12 +2777,21 @@ fn telegramWebhookExtractInboundText(
         }
     }
 
+    if (msg_obj.object.get("photo")) |photo_val| {
+        if (photo_val == .array and photo_val.array.items.len > 0) {
+            saw_photo = true;
+        }
+    }
+
     if (msg_obj.object.get("caption")) |caption_val| {
         if (caption_val == .string) return allocator.dupe(u8, caption_val.string) catch null;
     }
 
     if (saw_voice_or_audio) {
         return allocator.dupe(u8, VOICE_FALLBACK) catch null;
+    }
+    if (saw_photo) {
+        return allocator.dupe(u8, IMAGE_FALLBACK) catch null;
     }
 
     return null;
@@ -8150,6 +8161,26 @@ test "telegramWebhookExtractInboundText voice without transcriber returns fallba
     const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null, null) orelse return error.TestUnexpectedResult;
     defer allocator.free(text);
     try std.testing.expectEqualStrings("[Voice]: (transcription unavailable)", text);
+}
+
+test "telegramWebhookExtractInboundText photo without caption returns fallback marker" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"update_id":1,"message":{"chat":{"id":123},"from":{"id":1},"photo":[{"file_id":"a"},{"file_id":"b"}]}}
+    ;
+    const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null, null) orelse return error.TestUnexpectedResult;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("[Image]: (caption unavailable)", text);
+}
+
+test "telegramWebhookExtractInboundText photo with caption returns caption" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"update_id":1,"message":{"chat":{"id":123},"from":{"id":1},"photo":[{"file_id":"a"}],"caption":"look at this"}}
+    ;
+    const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null, null) orelse return error.TestUnexpectedResult;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("look at this", text);
 }
 
 test "telegramSenderAllowed matches numeric sender id from nested from object" {

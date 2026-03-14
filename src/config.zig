@@ -2260,6 +2260,40 @@ test "json parse tools.media.audio section" {
     allocator.free(cfg.audio_media.language.?);
 }
 
+test "json parse top-level audio_media alias section" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"audio_media": {"enabled": true, "provider": "together", "model": "openai/whisper-large-v3", "base_url": "https://api.together.xyz/v1/audio/transcriptions", "language": "en"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.audio_media.enabled);
+    try std.testing.expectEqualStrings("together", cfg.audio_media.provider);
+    try std.testing.expectEqualStrings("openai/whisper-large-v3", cfg.audio_media.model);
+    try std.testing.expectEqualStrings("https://api.together.xyz/v1/audio/transcriptions", cfg.audio_media.base_url.?);
+    try std.testing.expectEqualStrings("en", cfg.audio_media.language.?);
+    allocator.free(cfg.audio_media.provider);
+    allocator.free(cfg.audio_media.model);
+    allocator.free(cfg.audio_media.base_url.?);
+    allocator.free(cfg.audio_media.language.?);
+}
+
+test "json parse top-level audio_media alias models override direct fields" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"audio_media": {"enabled": true, "provider": "openai", "model": "whisper-1", "base_url": "https://api.openai.com/v1/audio/transcriptions", "models": [{"provider": "together", "model": "openai/whisper-large-v3", "base_url": "https://api.together.xyz/v1/audio/transcriptions"}]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.audio_media.enabled);
+    try std.testing.expectEqualStrings("together", cfg.audio_media.provider);
+    try std.testing.expectEqualStrings("openai/whisper-large-v3", cfg.audio_media.model);
+    try std.testing.expectEqualStrings("https://api.together.xyz/v1/audio/transcriptions", cfg.audio_media.base_url.?);
+    allocator.free(cfg.audio_media.provider);
+    allocator.free(cfg.audio_media.model);
+    allocator.free(cfg.audio_media.base_url.?);
+}
+
 test "getProviderKey returns null for missing provider" {
     const cfg = Config{
         .workspace_dir = "/tmp/yc",
