@@ -2744,6 +2744,12 @@ fn telegramWebhookExtractInboundText(
     if (msg_obj != .object) return null;
     var saw_voice_or_audio = false;
     var saw_photo = false;
+    const caption_text: ?[]const u8 = blk: {
+        if (msg_obj.object.get("caption")) |caption_val| {
+            if (caption_val == .string) break :blk caption_val.string;
+        }
+        break :blk null;
+    };
 
     if (msg_obj.object.get("text")) |text_val| {
         if (text_val == .string) return allocator.dupe(u8, text_val.string) catch null;
@@ -2780,11 +2786,44 @@ fn telegramWebhookExtractInboundText(
     if (msg_obj.object.get("photo")) |photo_val| {
         if (photo_val == .array and photo_val.array.items.len > 0) {
             saw_photo = true;
+            const last_photo = photo_val.array.items[photo_val.array.items.len - 1];
+            if (last_photo == .object) {
+                if (last_photo.object.get("file_id")) |photo_fid_val| {
+                    if (photo_fid_val == .string) {
+                        if (channels.telegram.downloadTelegramPhoto(allocator, bot_token, photo_fid_val.string, proxy)) |local_path| {
+                            var result: std.ArrayListUnmanaged(u8) = .empty;
+                            result.appendSlice(allocator, "[IMAGE:") catch {
+                                allocator.free(local_path);
+                                return null;
+                            };
+                            result.appendSlice(allocator, local_path) catch {
+                                allocator.free(local_path);
+                                result.deinit(allocator);
+                                return null;
+                            };
+                            result.appendSlice(allocator, "]") catch {
+                                allocator.free(local_path);
+                                result.deinit(allocator);
+                                return null;
+                            };
+                            allocator.free(local_path);
+                            if (caption_text) |caption| {
+                                result.appendSlice(allocator, " ") catch {};
+                                result.appendSlice(allocator, caption) catch {};
+                            }
+                            return result.toOwnedSlice(allocator) catch {
+                                result.deinit(allocator);
+                                return null;
+                            };
+                        }
+                    }
+                }
+            }
         }
     }
 
-    if (msg_obj.object.get("caption")) |caption_val| {
-        if (caption_val == .string) return allocator.dupe(u8, caption_val.string) catch null;
+    if (caption_text) |caption| {
+        return allocator.dupe(u8, caption) catch null;
     }
 
     if (saw_voice_or_audio) {
@@ -8181,6 +8220,16 @@ test "telegramWebhookExtractInboundText photo with caption returns caption" {
     const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null, null) orelse return error.TestUnexpectedResult;
     defer allocator.free(text);
     try std.testing.expectEqualStrings("look at this", text);
+}
+
+test "telegramWebhookExtractInboundText photo without caption does not return null" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"update_id":1,"message":{"chat":{"id":123},"from":{"id":1},"photo":[{"file_id":"a"},{"file_id":"b"}]}}
+    ;
+    const text = telegramWebhookExtractInboundText(allocator, body, "123:bot", null, null) orelse return error.TestUnexpectedResult;
+    defer allocator.free(text);
+    try std.testing.expect(text.len > 0);
 }
 
 test "telegramSenderAllowed matches numeric sender id from nested from object" {

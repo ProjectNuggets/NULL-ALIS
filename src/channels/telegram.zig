@@ -1894,7 +1894,7 @@ fn mergeMediaGroups(
 }
 
 /// Download a photo from Telegram by file_id. Returns the local temp file path (caller-owned).
-fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8, proxy: ?[]const u8) ?[]u8 {
+pub fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8, proxy: ?[]const u8) ?[]u8 {
     // 1. Call getFile to get file_path
     var url_buf: [512]u8 = undefined;
     var url_fbs = std.io.fixedBufferStream(&url_buf);
