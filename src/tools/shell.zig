@@ -359,6 +359,37 @@ test "shell cwd with allowed_paths runs in cwd" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, tmp_path) != null);
 }
 
+test "shell cwd outside explicit tenant allowed_paths is rejected" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // pwd not available on Windows
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("users/1/workspace");
+    try tmp_dir.dir.makePath("users/2/workspace");
+
+    const root_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const tenant_one_ws = try std.fs.path.join(std.testing.allocator, &.{ root_path, "users", "1", "workspace" });
+    defer std.testing.allocator.free(tenant_one_ws);
+    const tenant_two_ws = try std.fs.path.join(std.testing.allocator, &.{ root_path, "users", "2", "workspace" });
+    defer std.testing.allocator.free(tenant_two_ws);
+
+    var args_buf: [1024]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"command\": \"pwd\", \"cwd\": \"{s}\"}}", .{tenant_two_ws});
+
+    var st = ShellTool{
+        .workspace_dir = tenant_one_ws,
+        .allowed_paths = &.{tenant_one_ws},
+    };
+    const parsed = try root.parseTestArgs(args);
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
+}
+
 test "shell fail closed when sandbox backend resolves to none" {
     var st = ShellTool{
         .workspace_dir = "/tmp",

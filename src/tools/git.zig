@@ -83,6 +83,20 @@ pub const GitTool = struct {
         return true;
     }
 
+    fn isSafeRepoPathArg(path_arg: []const u8) bool {
+        if (path_arg.len == 0) return false;
+        if (std.mem.indexOfScalar(u8, path_arg, 0) != null) return false;
+        if (std.fs.path.isAbsolute(path_arg)) return false;
+        // Block git pathspec magic forms like :(glob)foo which can broaden scope.
+        if (std.mem.startsWith(u8, path_arg, ":(")) return false;
+
+        var it = std.mem.tokenizeAny(u8, path_arg, "/\\");
+        while (it.next()) |segment| {
+            if (std.mem.eql(u8, segment, "..")) return false;
+        }
+        return true;
+    }
+
     /// Truncate a commit message to max_bytes, respecting UTF-8 boundaries.
     fn truncateCommitMessage(msg: []const u8, max_bytes: usize) []const u8 {
         if (msg.len <= max_bytes) return msg;
@@ -148,6 +162,20 @@ pub const GitTool = struct {
         });
 
         if (op_map.get(operation)) |op| {
+            switch (op) {
+                .add => {
+                    if (root.getString(args, "paths")) |paths| {
+                        if (!isSafeRepoPathArg(paths))
+                            return ToolResult.fail("Git path must be repository-relative and inside workspace");
+                    }
+                },
+                .diff => {
+                    const files = root.getString(args, "files") orelse ".";
+                    if (!isSafeRepoPathArg(files))
+                        return ToolResult.fail("Git path must be repository-relative and inside workspace");
+                },
+                else => {},
+            }
             const op_result = switch (op) {
                 .status => self.runGitOp(allocator, effective_cwd, &.{ "status", "--porcelain=2", "--branch" }),
                 .diff => self.gitDiff(allocator, effective_cwd, args),
@@ -435,6 +463,34 @@ test "git cwd outside workspace without allowed_paths is rejected" {
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
 }
 
+test "git cwd outside explicit tenant allowed_paths is rejected" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("users/1/workspace");
+    try tmp_dir.dir.makePath("users/2/workspace");
+
+    const root_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const tenant_one_ws = try std.fs.path.join(std.testing.allocator, &.{ root_path, "users", "1", "workspace" });
+    defer std.testing.allocator.free(tenant_one_ws);
+    const tenant_two_ws = try std.fs.path.join(std.testing.allocator, &.{ root_path, "users", "2", "workspace" });
+    defer std.testing.allocator.free(tenant_two_ws);
+
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"operation\":\"status\",\"cwd\":{f}}}", .{std.json.fmt(tenant_two_ws, .{})});
+    defer std.testing.allocator.free(args);
+
+    var gt = GitTool{
+        .workspace_dir = tenant_one_ws,
+        .allowed_paths = &.{tenant_one_ws},
+    };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs(args);
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
+}
+
 test "git checkout blocks injection" {
     var gt = GitTool{ .workspace_dir = "/tmp" };
     const t = gt.tool();
@@ -540,6 +596,19 @@ test "sanitizeGitArgs allows safe branch names" {
     try std.testing.expect(GitTool.sanitizeGitArgs("."));
 }
 
+test "isSafeRepoPathArg allows relative repo paths" {
+    try std.testing.expect(GitTool.isSafeRepoPathArg("."));
+    try std.testing.expect(GitTool.isSafeRepoPathArg("src/main.zig"));
+    try std.testing.expect(GitTool.isSafeRepoPathArg("./docs/README.md"));
+}
+
+test "isSafeRepoPathArg rejects traversal absolute and pathspec magic" {
+    try std.testing.expect(!GitTool.isSafeRepoPathArg("../secret.txt"));
+    try std.testing.expect(!GitTool.isSafeRepoPathArg("a/../../b"));
+    try std.testing.expect(!GitTool.isSafeRepoPathArg("/etc/passwd"));
+    try std.testing.expect(!GitTool.isSafeRepoPathArg(":(glob)**/*.zig"));
+}
+
 test "git fail closed when sandbox backend resolves to none" {
     var gt = GitTool{
         .workspace_dir = "/tmp",
@@ -628,4 +697,24 @@ test "git execute blocks unsafe args in paths" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unsafe") != null);
+}
+
+test "git execute blocks traversal in paths parameter" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"add\", \"paths\": \"../outside.txt\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "repository-relative") != null);
+}
+
+test "git execute blocks absolute path in files parameter" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"diff\", \"files\": \"/etc/passwd\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "repository-relative") != null);
 }

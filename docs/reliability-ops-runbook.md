@@ -192,6 +192,23 @@ Runbook rule:
 - for isolated-per-request lane tests, pass:
   - `--session-key-template 'agent:zaki-bot:user:{user_id}:task:{request_id}'`
 
+### 8. Tenant tool-isolation acceptance (shell + git)
+Run deterministic isolation tests via full gates:
+```bash
+zig build test --summary all
+zig build -Dengines=base,sqlite,postgres
+```
+
+Expected:
+1. `shell` rejects `cwd` that points at another tenant workspace with `outside allowed areas`.
+2. `git_operations` rejects `cwd` that points at another tenant workspace with `outside allowed areas`.
+3. `git_operations` rejects traversal/absolute/pathspec-magic path arguments with `repository-relative` error.
+4. Coverage is enforced by tests:
+- `shell cwd outside explicit tenant allowed_paths is rejected`
+- `git cwd outside explicit tenant allowed_paths is rejected`
+- `git execute blocks traversal in paths parameter`
+- `git execute blocks absolute path in files parameter`
+
 ## Prod Checks
 
 ### 1. Health + readiness
