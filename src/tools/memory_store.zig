@@ -16,7 +16,7 @@ pub const MemoryStoreTool = struct {
     pub const tool_name = "memory_store";
     pub const tool_description = "Store durable user facts, preferences, and decisions in long-term memory. Use category 'core' for stable facts, 'daily' for session notes, 'conversation' for important context only. Do not store routine greetings or every chat message.";
     pub const tool_params =
-        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"},"scope":{"type":"string","enum":["session","global"],"description":"Memory scope (default: session lane)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["key","content"]}
+        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"},"scope":{"type":"string","enum":["session","global"],"description":"Memory scope (default: global)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["key","content"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -70,11 +70,15 @@ pub const MemoryStoreTool = struct {
             return sid;
         }
 
-        const scope_raw = root.getString(args, "scope") orelse "session";
+        const scope_raw = root.getString(args, "scope") orelse "global";
         const scope = std.mem.trim(u8, scope_raw, " \t\r\n");
         if (scope.len == 0) return error.InvalidScope;
         if (std.ascii.eqlIgnoreCase(scope, "global")) return null;
-        if (std.ascii.eqlIgnoreCase(scope, "session")) return root.getTurnContext().session_key;
+        if (std.ascii.eqlIgnoreCase(scope, "session")) {
+            const session_key = root.getTurnContext().session_key orelse return error.InvalidSessionId;
+            if (session_key.len == 0) return error.InvalidSessionId;
+            return session_key;
+        }
         return error.InvalidScope;
     }
 };
@@ -171,7 +175,7 @@ test "memory_store with daily category" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "daily") != null);
 }
 
-test "memory_store defaults to current turn session scope" {
+test "memory_store defaults to global scope" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
     defer sqlite_mem.deinit();
@@ -190,8 +194,7 @@ test "memory_store defaults to current turn session scope" {
 
     const entry = (try mem.get(allocator, "lane_pref")) orelse return error.TestUnexpectedResult;
     defer entry.deinit(allocator);
-    try std.testing.expect(entry.session_id != null);
-    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:main", entry.session_id.?);
+    try std.testing.expect(entry.session_id == null);
 }
 
 test "memory_store supports explicit global scope" {

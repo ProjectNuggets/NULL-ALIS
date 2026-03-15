@@ -4,6 +4,7 @@
 //! Uses curl to avoid Zig 0.15 std.http.Client segfaults.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const http_native = @import("http_native/root.zig");
 
@@ -103,7 +104,11 @@ fn subsystem_supports_native(subsystem: TransportSubsystem) bool {
     return switch (subsystem) {
         // Provider traffic is still routed via curl because the native TLS path
         // can abort the process under real HTTPS workloads on macOS/Zig 0.15.
-        .tools, .channels => true,
+        .tools => true,
+        // Channel traffic (Telegram send/getFile/webhook-side calls) has shown
+        // the same native TLS abort signature on macOS under load, so keep it
+        // on curl there until std/http-native is stable for this workload.
+        .channels => builtin.os.tag != .macos,
         .providers => false,
         .system => false,
     };
@@ -738,6 +743,10 @@ test "request_with_mode curl_only uses curl compatibility path" {
 test "subsystem_supports_native disables providers" {
     try std.testing.expect(subsystem_supports_native(.tools));
     try std.testing.expect(!subsystem_supports_native(.providers));
-    try std.testing.expect(subsystem_supports_native(.channels));
+    if (builtin.os.tag == .macos) {
+        try std.testing.expect(!subsystem_supports_native(.channels));
+    } else {
+        try std.testing.expect(subsystem_supports_native(.channels));
+    }
     try std.testing.expect(!subsystem_supports_native(.system));
 }

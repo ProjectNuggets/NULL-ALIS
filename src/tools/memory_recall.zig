@@ -18,7 +18,7 @@ pub const MemoryRecallTool = struct {
     pub const tool_name = "memory_recall";
     pub const tool_description = "Search long-term memory for relevant facts, preferences, or context.";
     pub const tool_params =
-        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: session lane)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}
+        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: global)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -135,11 +135,15 @@ pub const MemoryRecallTool = struct {
             return sid;
         }
 
-        const scope_raw = root.getString(args, "scope") orelse "session";
+        const scope_raw = root.getString(args, "scope") orelse "global";
         const scope = std.mem.trim(u8, scope_raw, " \t\r\n");
         if (scope.len == 0) return error.InvalidScope;
         if (std.ascii.eqlIgnoreCase(scope, "global")) return null;
-        if (std.ascii.eqlIgnoreCase(scope, "session")) return root.getTurnContext().session_key;
+        if (std.ascii.eqlIgnoreCase(scope, "session")) {
+            const session_key = root.getTurnContext().session_key orelse return error.InvalidSessionId;
+            if (session_key.len == 0) return error.InvalidSessionId;
+            return session_key;
+        }
         return error.InvalidScope;
     }
 
@@ -288,7 +292,7 @@ test "memory_recall filters markdown encoded internal keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "**Name**: User") != null);
 }
 
-test "memory_recall defaults to current turn session scope" {
+test "memory_recall defaults to global scope" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
     defer sqlite_mem.deinit();
@@ -309,7 +313,7 @@ test "memory_recall defaults to current turn session scope" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "session_fact") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_fact") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_fact") != null);
 }
 
 test "memory_recall supports explicit global scope" {

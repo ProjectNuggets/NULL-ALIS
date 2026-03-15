@@ -82,6 +82,35 @@ const TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX_DEFAULT: u32 = 80;
 const TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN: u32 = 5;
 const TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX: u32 = 250;
 
+const TELEGRAM_REQUIRED_INPUTS = [_][]const u8{
+    "bot_token",
+    "webhook_base_url",
+};
+const TELEGRAM_CONNECT_INSTRUCTIONS = [_][]const u8{
+    "Create a bot with @BotFather and copy the bot token.",
+    "Paste the bot token in Connect Telegram in the app.",
+    "Use your app HTTPS host as webhook_base_url.",
+    "Send /start to the bot once to bind and verify delivery.",
+};
+const SLACK_REQUIRED_INPUTS = [_][]const u8{
+    "workspace_bot_installation",
+    "events_subscription",
+};
+const SLACK_CONNECT_INSTRUCTIONS = [_][]const u8{
+    "Install the workspace bot and enable Events API with /slack/events.",
+    "Invite the bot to a channel or open a DM.",
+    "Send a first message to establish user routing/binding.",
+};
+const DISCORD_REQUIRED_INPUTS = [_][]const u8{
+    "bot_invite",
+    "message_content_intent",
+};
+const DISCORD_CONNECT_INSTRUCTIONS = [_][]const u8{
+    "Invite the bot to your server with message permissions.",
+    "Enable Message Content intent in the Discord developer portal.",
+    "Send a DM or mention the bot in the target channel.",
+};
+
 // ── Rate Limiter ─────────────────────────────────────────────────
 
 /// Sliding-window rate limiter. Tracks timestamps per key.
@@ -682,6 +711,8 @@ const TenantRuntime = struct {
             pg_store.* = try zaki_state_mod.Manager.UserSessionStore.init(allocator, state_mgr.?, numeric_user_id);
             runtime.pg_session_store = pg_store;
         }
+        // User config JSON must never override the per-tenant workspace root.
+        runtime.config.workspace_dir = runtime.workspace_path;
 
         runtime.provider_bundle = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &runtime.config);
         errdefer runtime.provider_bundle.deinit();
@@ -1460,6 +1491,182 @@ fn loadTelegramUserState(allocator: std.mem.Allocator, path: []const u8) !Telegr
     const content = try file.readToEndAlloc(allocator, MAX_BODY_SIZE);
     defer allocator.free(content);
     return parseTelegramUserState(allocator, content);
+}
+
+const OnboardingStateSummary = struct {
+    completed: bool = false,
+    completed_at_s: ?i64 = null,
+};
+
+fn parseOnboardingStateSummary(content: []const u8) OnboardingStateSummary {
+    return .{
+        .completed = jsonBoolField(content, "completed") orelse false,
+        .completed_at_s = jsonIntField(content, "completed_at_s"),
+    };
+}
+
+fn manualConnectStatus(available: bool, configured_by_operator: bool) []const u8 {
+    if (!available) return "disabled_in_build";
+    if (!configured_by_operator) return "not_configured_by_operator";
+    return "ready_for_user_binding";
+}
+
+fn buildUserRoutePath(
+    allocator: std.mem.Allocator,
+    user_id: []const u8,
+    suffix: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "/api/v1/users/{s}/{s}", .{ user_id, suffix });
+}
+
+fn writeOnboardingChannelGuide(
+    writer: anytype,
+    channel_name: []const u8,
+    available: bool,
+    connect_supported: bool,
+    status: []const u8,
+    connected: ?bool,
+    required_inputs: []const []const u8,
+    instructions: []const []const u8,
+    connect_endpoint: ?[]const u8,
+    disconnect_endpoint: ?[]const u8,
+) !void {
+    try writer.writeByte('"');
+    try jsonEscapeInto(writer, channel_name);
+    try writer.writeAll("\":{");
+    try writer.print("\"available\":{s}", .{if (available) "true" else "false"});
+    try writer.print(",\"connect_supported\":{s}", .{if (connect_supported) "true" else "false"});
+    try writer.writeAll(",\"status\":\"");
+    try jsonEscapeInto(writer, status);
+    try writer.writeByte('"');
+    try writer.writeAll(",\"connected\":");
+    if (connected) |value| {
+        try writer.writeAll(if (value) "true" else "false");
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"required_inputs\":");
+    try jsonWriteStringArray(writer, required_inputs);
+    try writer.writeAll(",\"instructions\":");
+    try jsonWriteStringArray(writer, instructions);
+    try writer.writeAll(",\"connect_endpoint\":");
+    if (connect_endpoint) |endpoint| {
+        try writer.writeByte('"');
+        try jsonEscapeInto(writer, endpoint);
+        try writer.writeByte('"');
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"disconnect_endpoint\":");
+    if (disconnect_endpoint) |endpoint| {
+        try writer.writeByte('"');
+        try jsonEscapeInto(writer, endpoint);
+        try writer.writeByte('"');
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeByte('}');
+}
+
+fn buildOnboardingSetupResponse(
+    allocator: std.mem.Allocator,
+    user_id: []const u8,
+    summary: OnboardingStateSummary,
+    telegram_state: TelegramUserState,
+    config_opt: ?*const Config,
+) ![]u8 {
+    const settings_defaults = user_settings.defaults();
+    const settings_defaults_json = try user_settings.renderSettingsJson(allocator, settings_defaults);
+    defer allocator.free(settings_defaults_json);
+
+    const settings_endpoint = try buildUserRoutePath(allocator, user_id, "settings");
+    defer allocator.free(settings_endpoint);
+    const telegram_connect_endpoint = try buildUserRoutePath(allocator, user_id, "channels/telegram/connect");
+    defer allocator.free(telegram_connect_endpoint);
+    const telegram_disconnect_endpoint = try buildUserRoutePath(allocator, user_id, "channels/telegram/disconnect");
+    defer allocator.free(telegram_disconnect_endpoint);
+    const slack_bindings_endpoint = try buildUserRoutePath(allocator, user_id, "channels/slack/bindings");
+    defer allocator.free(slack_bindings_endpoint);
+    const discord_bindings_endpoint = try buildUserRoutePath(allocator, user_id, "channels/discord/bindings");
+    defer allocator.free(discord_bindings_endpoint);
+
+    const slack_configured_by_operator = if (config_opt) |cfg| cfg.channels.slack.len > 0 else false;
+    const discord_configured_by_operator = if (config_opt) |cfg| cfg.channels.discord.len > 0 else false;
+    const telegram_status: []const u8 = if (!build_options.enable_channel_telegram)
+        "disabled_in_build"
+    else if (telegram_state.connected)
+        "connected"
+    else
+        "not_connected";
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    try w.writeAll("{\"completed\":");
+    try w.writeAll(if (summary.completed) "true" else "false");
+    try w.writeAll(",\"completed_at_s\":");
+    if (summary.completed_at_s) |value| {
+        try w.print("{d}", .{value});
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"setup\":{");
+    try w.writeAll("\"can_start_chat_now\":true");
+    try w.writeAll(",\"minimum_required\":[]");
+    try w.writeAll(",\"settings\":{");
+    try w.writeAll("\"endpoint\":\"");
+    try jsonEscapeInto(w, settings_endpoint);
+    try w.writeAll("\",\"required_to_start\":false");
+    try w.writeAll(",\"defaults\":");
+    try w.writeAll(settings_defaults_json);
+    try w.writeAll(",\"fields\":[");
+    try w.writeAll("{\"key\":\"assistant_mode\",\"type\":\"enum\",\"required\":false,\"description\":\"Controls speed vs depth preset\",\"options\":[\"fast\",\"balanced\",\"deep\"]}");
+    try w.writeAll(",{\"key\":\"group_activation\",\"type\":\"enum\",\"required\":false,\"description\":\"When to respond in group chats\",\"options\":[\"mention\",\"always\"]}");
+    try w.writeAll(",{\"key\":\"proactive_updates\",\"type\":\"boolean\",\"required\":false,\"description\":\"Allow proactive updates outside direct prompts\"}");
+    try w.writeAll(",{\"key\":\"voice_replies\",\"type\":\"boolean\",\"required\":false,\"description\":\"Enable voice output responses\"}");
+    try w.writeAll(",{\"key\":\"session_timeout_minutes\",\"type\":\"integer\",\"required\":false,\"description\":\"Session TTL in minutes (5-180)\",\"minimum\":5,\"maximum\":180}");
+    try w.writeAll("]}");
+    try w.writeAll(",\"channel_guides\":{");
+    try writeOnboardingChannelGuide(
+        w,
+        "telegram",
+        build_options.enable_channel_telegram,
+        true,
+        telegram_status,
+        telegram_state.connected,
+        &TELEGRAM_REQUIRED_INPUTS,
+        &TELEGRAM_CONNECT_INSTRUCTIONS,
+        telegram_connect_endpoint,
+        telegram_disconnect_endpoint,
+    );
+    try w.writeByte(',');
+    try writeOnboardingChannelGuide(
+        w,
+        "slack",
+        build_options.enable_channel_slack,
+        false,
+        manualConnectStatus(build_options.enable_channel_slack, slack_configured_by_operator),
+        null,
+        &SLACK_REQUIRED_INPUTS,
+        &SLACK_CONNECT_INSTRUCTIONS,
+        slack_bindings_endpoint,
+        null,
+    );
+    try w.writeByte(',');
+    try writeOnboardingChannelGuide(
+        w,
+        "discord",
+        build_options.enable_channel_discord,
+        false,
+        manualConnectStatus(build_options.enable_channel_discord, discord_configured_by_operator),
+        null,
+        &DISCORD_REQUIRED_INPUTS,
+        &DISCORD_CONNECT_INSTRUCTIONS,
+        discord_bindings_endpoint,
+        null,
+    );
+    try w.writeAll("}}}");
+    return out.toOwnedSlice(allocator);
 }
 
 fn readTrimmedSecretFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -5107,21 +5314,47 @@ fn handleApiRoute(
 
     if (std.mem.eql(u8, parsed.subpath, "onboarding")) {
         if (std.mem.eql(u8, method, "GET")) {
+            var onboarding_content: []u8 = undefined;
             if (state.zaki_state) |mgr| {
                 const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                const content = mgr.getOnboardingJson(req_allocator, user_id) catch {
+                onboarding_content = mgr.getOnboardingJson(req_allocator, user_id) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
                 };
-                return .{ .body = content };
+            } else {
+                const onboarding_path = onboardingStatePath(req_allocator, user_ctx.user_root) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path failed\"}" };
+                };
+                defer req_allocator.free(onboarding_path);
+                onboarding_content = readFileOrDefault(req_allocator, onboarding_path, "{\"completed\":false,\"completed_at_s\":null}\n") catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+                };
             }
-            const onboarding_path = onboardingStatePath(req_allocator, user_ctx.user_root) catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path failed\"}" };
+            defer req_allocator.free(onboarding_content);
+            const summary = parseOnboardingStateSummary(onboarding_content);
+            var telegram_state = TelegramUserState{};
+            defer telegram_state.deinit(req_allocator);
+            if (build_options.enable_channel_telegram) {
+                if (state.zaki_state) |mgr| {
+                    const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                    const raw_telegram_state = mgr.getTelegramStateJson(req_allocator, user_id) catch {
+                        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+                    };
+                    defer req_allocator.free(raw_telegram_state);
+                    telegram_state = parseTelegramUserState(req_allocator, raw_telegram_state) catch .{};
+                } else {
+                    telegram_state = loadTelegramUserState(req_allocator, user_ctx.telegram_path) catch .{};
+                }
+            }
+            const setup = buildOnboardingSetupResponse(
+                req_allocator,
+                parsed.user_id,
+                summary,
+                telegram_state,
+                config_opt,
+            ) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
             };
-            defer req_allocator.free(onboarding_path);
-            const content = readFileOrDefault(req_allocator, onboarding_path, "{\"completed\":false,\"completed_at_s\":null}\n") catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
-            };
-            return .{ .body = content };
+            return .{ .body = setup };
         }
 
         if (std.mem.eql(u8, method, "PUT")) {
@@ -8212,6 +8445,116 @@ test "handleApiRoute accepts POST alias for telegram disconnect" {
 
     try std.testing.expectEqualStrings("200 OK", response.status);
     try std.testing.expectEqualStrings("{\"status\":\"disconnected\",\"channel\":\"telegram\"}", response.body);
+}
+
+test "handleApiRoute GET onboarding returns setup contract for settings panel" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/onboarding HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "GET",
+        "/api/v1/users/1/onboarding",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", response.status);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqual(false, parsed.value.object.get("completed").?.bool);
+    try std.testing.expect(parsed.value.object.get("completed_at_s").? == .null);
+
+    const setup = parsed.value.object.get("setup").?.object;
+    try std.testing.expectEqual(true, setup.get("can_start_chat_now").?.bool);
+    const settings = setup.get("settings").?.object;
+    try std.testing.expectEqualStrings("/api/v1/users/1/settings", settings.get("endpoint").?.string);
+    const defaults = settings.get("defaults").?.object;
+    try std.testing.expectEqualStrings("balanced", defaults.get("assistant_mode").?.string);
+
+    const guides = setup.get("channel_guides").?.object;
+    const telegram = guides.get("telegram").?.object;
+    try std.testing.expectEqual(build_options.enable_channel_telegram, telegram.get("available").?.bool);
+    try std.testing.expectEqual(true, telegram.get("connect_supported").?.bool);
+    try std.testing.expectEqualStrings("/api/v1/users/1/channels/telegram/connect", telegram.get("connect_endpoint").?.string);
+
+    const slack = guides.get("slack").?.object;
+    try std.testing.expectEqual(build_options.enable_channel_slack, slack.get("available").?.bool);
+    try std.testing.expectEqual(false, slack.get("connect_supported").?.bool);
+
+    const discord = guides.get("discord").?.object;
+    try std.testing.expectEqual(build_options.enable_channel_discord, discord.get("available").?.bool);
+    try std.testing.expectEqual(false, discord.get("connect_supported").?.bool);
+}
+
+test "handleApiRoute GET onboarding reflects connected telegram status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const user_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_dir);
+    try std.fs.makeDirAbsolute(user_dir);
+    const telegram_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram.json", .{user_dir});
+    defer std.testing.allocator.free(telegram_path);
+    try writeFile(telegram_path, "{\"connected\":true,\"account_id\":\"main\"}\n");
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/onboarding HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "GET",
+        "/api/v1/users/1/onboarding",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    const guides = parsed.value.object.get("setup").?.object.get("channel_guides").?.object;
+    const telegram = guides.get("telegram").?.object;
+    try std.testing.expectEqual(true, telegram.get("connected").?.bool);
+    try std.testing.expectEqualStrings("connected", telegram.get("status").?.string);
 }
 
 test "handleApiRoute GET settings returns defaults when no profile exists" {

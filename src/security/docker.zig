@@ -16,7 +16,7 @@ pub const DockerSandbox = struct {
     mount_arg_buf: [MAX_WORKSPACE_LEN * 2 + 1]u8 = undefined,
     mount_arg_len: usize = 0,
 
-    pub const default_image = "alpine:latest";
+    pub const default_image = "alpine/git:latest";
 
     pub const sandbox_vtable = Sandbox.VTable{
         .wrapCommand = wrapCommand,
@@ -40,24 +40,27 @@ pub const DockerSandbox = struct {
         const self = resolve(ptr);
         // docker run --rm --memory 512m --cpus 1.0 --network none -v WORKSPACE:WORKSPACE IMAGE <argv...>
         const prefix = [_][]const u8{
-            "docker",   "run",       "--rm",
-            "--memory", "512m",      "--cpus",
-            "1.0",      "--network", "none",
-            "-v",
+            "docker",        "run",       "--rm",
+            "--memory",      "512m",      "--cpus",
+            "1.0",           "--network", "none",
+            "--entrypoint=",
         };
-        // We need: prefix (10) + mount_arg (1) + image (1) + argv.len
+        // We need: prefix (10) + "-w" + workdir + "-v" + mount_arg + image + argv.len
         const prefix_len = prefix.len;
-        const total = prefix_len + 2 + argv.len;
+        const total = prefix_len + 5 + argv.len;
 
         if (buf.len < total) return error.BufferTooSmall;
 
         for (prefix, 0..) |p, i| {
             buf[i] = p;
         }
-        buf[prefix_len] = self.mount_arg_buf[0..self.mount_arg_len];
-        buf[prefix_len + 1] = self.image;
+        buf[prefix_len] = "-w";
+        buf[prefix_len + 1] = self.workspace_dir;
+        buf[prefix_len + 2] = "-v";
+        buf[prefix_len + 3] = self.mount_arg_buf[0..self.mount_arg_len];
+        buf[prefix_len + 4] = self.image;
         for (argv, 0..) |arg, i| {
-            buf[prefix_len + 2 + i] = arg;
+            buf[prefix_len + 5 + i] = arg;
         }
         return buf[0..total];
     }
@@ -273,16 +276,19 @@ test "docker sandbox wrap command prepends docker run" {
     try std.testing.expectEqualStrings("--rm", result[2]);
     try std.testing.expectEqualStrings("--network", result[7]);
     try std.testing.expectEqualStrings("none", result[8]);
+    try std.testing.expectEqualStrings("--entrypoint=", result[9]);
+    try std.testing.expectEqualStrings("-w", result[10]);
+    try std.testing.expectEqualStrings("/tmp/workspace", result[11]);
     // Volume mount flag
-    try std.testing.expectEqualStrings("-v", result[9]);
+    try std.testing.expectEqualStrings("-v", result[12]);
     // Mount arg: workspace_dir:workspace_dir
-    try std.testing.expectEqualStrings("/tmp/workspace:/tmp/workspace", result[10]);
+    try std.testing.expectEqualStrings("/tmp/workspace:/tmp/workspace", result[13]);
     // Image
-    try std.testing.expectEqualStrings("alpine:latest", result[11]);
+    try std.testing.expectEqualStrings("alpine/git:latest", result[14]);
     // Original command
-    try std.testing.expectEqualStrings("echo", result[12]);
-    try std.testing.expectEqualStrings("hello", result[13]);
-    try std.testing.expectEqual(@as(usize, 14), result.len);
+    try std.testing.expectEqualStrings("echo", result[15]);
+    try std.testing.expectEqualStrings("hello", result[16]);
+    try std.testing.expectEqual(@as(usize, 17), result.len);
 }
 
 test "docker sandbox wrap with custom image" {
@@ -293,10 +299,13 @@ test "docker sandbox wrap with custom image" {
     var buf: [32][]const u8 = undefined;
     const result = try sb.wrapCommand(&argv, &buf);
 
-    try std.testing.expectEqualStrings("-v", result[9]);
-    try std.testing.expectEqualStrings("/tmp/workspace:/tmp/workspace", result[10]);
-    try std.testing.expectEqualStrings("ubuntu:22.04", result[11]);
-    try std.testing.expectEqualStrings("ls", result[12]);
+    try std.testing.expectEqualStrings("--entrypoint=", result[9]);
+    try std.testing.expectEqualStrings("-w", result[10]);
+    try std.testing.expectEqualStrings("/tmp/workspace", result[11]);
+    try std.testing.expectEqualStrings("-v", result[12]);
+    try std.testing.expectEqualStrings("/tmp/workspace:/tmp/workspace", result[13]);
+    try std.testing.expectEqualStrings("ubuntu:22.04", result[14]);
+    try std.testing.expectEqualStrings("ls", result[15]);
 }
 
 test "docker sandbox wrap empty argv" {
@@ -307,8 +316,8 @@ test "docker sandbox wrap empty argv" {
     var buf: [32][]const u8 = undefined;
     const result = try sb.wrapCommand(&argv, &buf);
 
-    // prefix (10) + mount_arg (1) + image (1)
-    try std.testing.expectEqual(@as(usize, 12), result.len);
+    // prefix (12) + workdir (1) + mount_arg (1) + image (1)
+    try std.testing.expectEqual(@as(usize, 15), result.len);
 }
 
 test "docker buffer too small returns error" {
@@ -329,8 +338,11 @@ test "docker sandbox workspace is mounted correctly" {
     var buf: [32][]const u8 = undefined;
     const result = try sb.wrapCommand(&argv, &buf);
 
-    try std.testing.expectEqualStrings("-v", result[9]);
-    try std.testing.expectEqualStrings("/home/user/myproject:/home/user/myproject", result[10]);
+    try std.testing.expectEqualStrings("--entrypoint=", result[9]);
+    try std.testing.expectEqualStrings("-w", result[10]);
+    try std.testing.expectEqualStrings("/home/user/myproject", result[11]);
+    try std.testing.expectEqualStrings("-v", result[12]);
+    try std.testing.expectEqualStrings("/home/user/myproject:/home/user/myproject", result[13]);
 }
 
 // ── Workspace Mount Validation Tests ───────────────────────────────────

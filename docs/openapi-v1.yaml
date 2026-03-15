@@ -379,8 +379,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: "#/components/schemas/OnboardingState"
     put:
       tags: [user]
       summary: Update onboarding and workspace scaffolding fields
@@ -1121,6 +1120,80 @@ components:
         - proactive_updates
         - voice_replies
         - session_timeout_minutes
+      additionalProperties: false
+    OnboardingState:
+      type: object
+      required: [completed, completed_at_s, setup]
+      properties:
+        completed:
+          type: boolean
+        completed_at_s:
+          type: integer
+          nullable: true
+        setup:
+          type: object
+          required: [can_start_chat_now, minimum_required, settings, channel_guides]
+          properties:
+            can_start_chat_now:
+              type: boolean
+            minimum_required:
+              type: array
+              items:
+                type: string
+            settings:
+              type: object
+              required: [endpoint, required_to_start, defaults, fields]
+              properties:
+                endpoint:
+                  type: string
+                required_to_start:
+                  type: boolean
+                defaults:
+                  $ref: "#/components/schemas/ProductSettings"
+                fields:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: true
+            channel_guides:
+              type: object
+              properties:
+                telegram:
+                  $ref: "#/components/schemas/OnboardingChannelGuide"
+                slack:
+                  $ref: "#/components/schemas/OnboardingChannelGuide"
+                discord:
+                  $ref: "#/components/schemas/OnboardingChannelGuide"
+              additionalProperties: false
+          additionalProperties: false
+      additionalProperties: false
+    OnboardingChannelGuide:
+      type: object
+      required: [available, connect_supported, status, connected, required_inputs, instructions, connect_endpoint, disconnect_endpoint]
+      properties:
+        available:
+          type: boolean
+        connect_supported:
+          type: boolean
+        status:
+          type: string
+        connected:
+          type: boolean
+          nullable: true
+        required_inputs:
+          type: array
+          items:
+            type: string
+        instructions:
+          type: array
+          items:
+            type: string
+        connect_endpoint:
+          type: string
+          nullable: true
+        disconnect_endpoint:
+          type: string
+          nullable: true
       additionalProperties: false
     OwnershipLockConflictResponse:
       type: object
