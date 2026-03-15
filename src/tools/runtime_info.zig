@@ -4,6 +4,7 @@ const config_mod = @import("../config.zig");
 const inbound_canonicalizer = @import("../inbound_canonicalizer.zig");
 const json_util = @import("../json_util.zig");
 const multimodal = @import("../multimodal.zig");
+const ops_guard = @import("../ops_guard.zig");
 const tool_dispatcher = @import("../tool_dispatcher.zig");
 const process_util = @import("process_util.zig");
 const voice = @import("../voice.zig");
@@ -384,6 +385,49 @@ pub const RuntimeInfoTool = struct {
 
     fn buildHeartbeatJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator) ![]u8 {
         const turn_ctx = root.getTurnContext();
+        const tenant_ctx = root.getTenantContext();
+
+        var runtime_available = false;
+        var runtime_last_run_s: ?i64 = null;
+        var runtime_last_status: ?[]u8 = null;
+        defer if (runtime_last_status) |value| allocator.free(value);
+        var runtime_last_reason: ?[]u8 = null;
+        defer if (runtime_last_reason) |value| allocator.free(value);
+
+        if (self.config.tenant.enabled and tenant_ctx.user_id != null) {
+            const user_id = tenant_ctx.user_id.?;
+            const path = std.fmt.allocPrint(allocator, "{s}/{s}/heartbeat_runtime.json", .{
+                self.config.tenant.data_root,
+                user_id,
+            }) catch null;
+            if (path) |runtime_path| {
+                defer allocator.free(runtime_path);
+                const file = std.fs.openFileAbsolute(runtime_path, .{}) catch null;
+                if (file) |f| {
+                    defer f.close();
+                    const raw = f.readToEndAlloc(allocator, 64 * 1024) catch null;
+                    if (raw) |body| {
+                        defer allocator.free(body);
+                        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch null;
+                        if (parsed) |p| {
+                            defer p.deinit();
+                            if (p.value == .object) {
+                                runtime_available = true;
+                                if (p.value.object.get("last_run_s")) |v| {
+                                    if (v == .integer) runtime_last_run_s = v.integer;
+                                }
+                                if (p.value.object.get("last_status")) |v| {
+                                    if (v == .string) runtime_last_status = allocator.dupe(u8, v.string) catch null;
+                                }
+                                if (p.value.object.get("last_reason")) |v| {
+                                    if (v == .string) runtime_last_reason = allocator.dupe(u8, v.string) catch null;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(allocator);
@@ -394,6 +438,32 @@ pub const RuntimeInfoTool = struct {
         try json_util.appendJsonInt(&buf, allocator, "interval_minutes", self.config.heartbeat.interval_minutes);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKeyValue(&buf, allocator, "current_turn_origin", turn_ctx.origin.toSlice());
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "runtime_available");
+        try buf.appendSlice(allocator, if (runtime_available) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "runtime_last_run_s");
+        if (runtime_last_run_s) |value| {
+            var int_buf: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&int_buf, "{d}", .{value}) catch "0";
+            try buf.appendSlice(allocator, text);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "runtime_last_status");
+        if (runtime_last_status) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "runtime_last_reason");
+        if (runtime_last_reason) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
         try buf.appendSlice(allocator, "}");
         return try buf.toOwnedSlice(allocator);
     }
@@ -402,6 +472,8 @@ pub const RuntimeInfoTool = struct {
         const tenant_ctx = root.getTenantContext();
         const turn_ctx = root.getTurnContext();
         const degraded_reason = root.degradedReason(self.config, tenant_ctx);
+        const ops_json = try ops_guard.diagnosticsJson(allocator);
+        defer allocator.free(ops_json);
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(allocator);
@@ -416,6 +488,9 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, if (degraded_reason.len > 0) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKeyValue(&buf, allocator, "degraded_reason", degraded_reason);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "proactive_guard");
+        try buf.appendSlice(allocator, ops_json);
         try buf.appendSlice(allocator, "}");
         return try buf.toOwnedSlice(allocator);
     }

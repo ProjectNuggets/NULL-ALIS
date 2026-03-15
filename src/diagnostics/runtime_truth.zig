@@ -63,6 +63,15 @@ pub const RuntimeSnapshot = struct {
     multimodal_image_parts_prepared: ?u64 = null,
     multimodal_image_parts_failed: ?u64 = null,
     multimodal_image_markers_ignored: ?u64 = null,
+    proactive_last_status: ?[]u8 = null,
+    proactive_last_reason: ?[]u8 = null,
+    proactive_policy_dedupe_window_secs: ?u64 = null,
+    proactive_policy_rate_window_secs: ?u64 = null,
+    proactive_policy_rate_limit_per_window: ?u64 = null,
+    heartbeat_runtime_available: ?bool = null,
+    heartbeat_runtime_last_run_s: ?i64 = null,
+    heartbeat_runtime_last_status: ?[]u8 = null,
+    heartbeat_runtime_last_reason: ?[]u8 = null,
     tenant_lease_probe_user_id: ?[]u8 = null,
     tenant_lease_probe_data_source: ?[]u8 = null,
     tenant_lease_probe_owner_id: ?[]u8 = null,
@@ -80,6 +89,10 @@ pub const RuntimeSnapshot = struct {
         allocator.free(self.provider_data_source);
         if (self.telegram_account_id) |value| allocator.free(value);
         if (self.telegram_data_source) |value| allocator.free(value);
+        if (self.proactive_last_status) |value| allocator.free(value);
+        if (self.proactive_last_reason) |value| allocator.free(value);
+        if (self.heartbeat_runtime_last_status) |value| allocator.free(value);
+        if (self.heartbeat_runtime_last_reason) |value| allocator.free(value);
         if (self.tenant_lease_probe_user_id) |value| allocator.free(value);
         if (self.tenant_lease_probe_data_source) |value| allocator.free(value);
         if (self.tenant_lease_probe_owner_id) |value| allocator.free(value);
@@ -220,6 +233,19 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
     var multimodal_image_parts_prepared: ?u64 = null;
     var multimodal_image_parts_failed: ?u64 = null;
     var multimodal_image_markers_ignored: ?u64 = null;
+    var proactive_last_status: ?[]u8 = null;
+    errdefer if (proactive_last_status) |value| allocator.free(value);
+    var proactive_last_reason: ?[]u8 = null;
+    errdefer if (proactive_last_reason) |value| allocator.free(value);
+    var proactive_policy_dedupe_window_secs: ?u64 = null;
+    var proactive_policy_rate_window_secs: ?u64 = null;
+    var proactive_policy_rate_limit_per_window: ?u64 = null;
+    var heartbeat_runtime_available: ?bool = null;
+    var heartbeat_runtime_last_run_s: ?i64 = null;
+    var heartbeat_runtime_last_status: ?[]u8 = null;
+    errdefer if (heartbeat_runtime_last_status) |value| allocator.free(value);
+    var heartbeat_runtime_last_reason: ?[]u8 = null;
+    errdefer if (heartbeat_runtime_last_reason) |value| allocator.free(value);
     var tenant_lease_probe_user_id: ?[]u8 = null;
     errdefer if (tenant_lease_probe_user_id) |value| allocator.free(value);
     var tenant_lease_probe_data_source: ?[]u8 = null;
@@ -295,6 +321,42 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
             multimodal_image_markers_ignored = readObjectU64(multimodal_value.object, "image_markers_ignored");
         }
     }
+    if (parsed.value.object.get("ops_guard")) |ops_value| {
+        if (ops_value == .object) {
+            if (ops_value.object.get("last_event")) |last_event| {
+                if (last_event == .object) {
+                    if (readObjectString(last_event.object, "action")) |value| {
+                        proactive_last_status = try allocator.dupe(u8, value);
+                    }
+                    if (readObjectString(last_event.object, "reason")) |value| {
+                        proactive_last_reason = try allocator.dupe(u8, value);
+                    }
+                }
+            }
+            if (ops_value.object.get("proactive_policy")) |policy_value| {
+                if (policy_value == .object) {
+                    proactive_policy_dedupe_window_secs = readObjectU64(policy_value.object, "dedupe_window_secs");
+                    proactive_policy_rate_window_secs = readObjectU64(policy_value.object, "rate_window_secs");
+                    proactive_policy_rate_limit_per_window = readObjectU64(policy_value.object, "rate_limit_per_window");
+                }
+            }
+        }
+    }
+
+    if (parsed.value.object.get("heartbeat_runtime")) |heartbeat_runtime_value| {
+        if (heartbeat_runtime_value == .object) {
+            heartbeat_runtime_available = readObjectBool(heartbeat_runtime_value.object, "available");
+            if (readObjectU64(heartbeat_runtime_value.object, "last_run_s")) |value| {
+                heartbeat_runtime_last_run_s = @intCast(value);
+            }
+            if (readObjectString(heartbeat_runtime_value.object, "last_status")) |value| {
+                heartbeat_runtime_last_status = try allocator.dupe(u8, value);
+            }
+            if (readObjectString(heartbeat_runtime_value.object, "last_reason")) |value| {
+                heartbeat_runtime_last_reason = try allocator.dupe(u8, value);
+            }
+        }
+    }
 
     if (parsed.value.object.get("tenant_lease_probe")) |lease_probe_value| {
         if (lease_probe_value == .object) {
@@ -359,6 +421,15 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
         .multimodal_image_parts_prepared = multimodal_image_parts_prepared,
         .multimodal_image_parts_failed = multimodal_image_parts_failed,
         .multimodal_image_markers_ignored = multimodal_image_markers_ignored,
+        .proactive_last_status = proactive_last_status,
+        .proactive_last_reason = proactive_last_reason,
+        .proactive_policy_dedupe_window_secs = proactive_policy_dedupe_window_secs,
+        .proactive_policy_rate_window_secs = proactive_policy_rate_window_secs,
+        .proactive_policy_rate_limit_per_window = proactive_policy_rate_limit_per_window,
+        .heartbeat_runtime_available = heartbeat_runtime_available,
+        .heartbeat_runtime_last_run_s = heartbeat_runtime_last_run_s,
+        .heartbeat_runtime_last_status = heartbeat_runtime_last_status,
+        .heartbeat_runtime_last_reason = heartbeat_runtime_last_reason,
         .tenant_lease_probe_user_id = tenant_lease_probe_user_id,
         .tenant_lease_probe_data_source = tenant_lease_probe_data_source,
         .tenant_lease_probe_owner_id = tenant_lease_probe_owner_id,
@@ -539,6 +610,23 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
         \\    "image_parts_failed": 1,
         \\    "image_markers_ignored": 2
         \\  },
+        \\  "ops_guard": {
+        \\    "last_event": {
+        \\      "action": "blocked_rate",
+        \\      "reason": "rate_limit"
+        \\    },
+        \\    "proactive_policy": {
+        \\      "dedupe_window_secs": 120,
+        \\      "rate_window_secs": 300,
+        \\      "rate_limit_per_window": 12
+        \\    }
+        \\  },
+        \\  "heartbeat_runtime": {
+        \\    "available": true,
+        \\    "last_run_s": 1760001111,
+        \\    "last_status": "sent",
+        \\    "last_reason": "sent"
+        \\  },
         \\  "tenant_lease_probe": {
         \\    "user_id": "7",
         \\    "data_source": "postgres_lease",
@@ -588,6 +676,15 @@ test "parseGatewayDiagnosticsPayload reads startup self check" {
     try std.testing.expectEqual(@as(?u64, 5), snapshot.multimodal_image_parts_prepared);
     try std.testing.expectEqual(@as(?u64, 1), snapshot.multimodal_image_parts_failed);
     try std.testing.expectEqual(@as(?u64, 2), snapshot.multimodal_image_markers_ignored);
+    try std.testing.expectEqualStrings("blocked_rate", snapshot.proactive_last_status.?);
+    try std.testing.expectEqualStrings("rate_limit", snapshot.proactive_last_reason.?);
+    try std.testing.expectEqual(@as(?u64, 120), snapshot.proactive_policy_dedupe_window_secs);
+    try std.testing.expectEqual(@as(?u64, 300), snapshot.proactive_policy_rate_window_secs);
+    try std.testing.expectEqual(@as(?u64, 12), snapshot.proactive_policy_rate_limit_per_window);
+    try std.testing.expectEqual(@as(?bool, true), snapshot.heartbeat_runtime_available);
+    try std.testing.expectEqual(@as(?i64, 1760001111), snapshot.heartbeat_runtime_last_run_s);
+    try std.testing.expectEqualStrings("sent", snapshot.heartbeat_runtime_last_status.?);
+    try std.testing.expectEqualStrings("sent", snapshot.heartbeat_runtime_last_reason.?);
     try std.testing.expectEqualStrings("7", snapshot.tenant_lease_probe_user_id.?);
     try std.testing.expectEqualStrings("postgres_lease", snapshot.tenant_lease_probe_data_source.?);
     try std.testing.expectEqualStrings("node-a", snapshot.tenant_lease_probe_owner_id.?);

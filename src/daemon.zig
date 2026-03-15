@@ -23,7 +23,6 @@ const channel_adapters = @import("channel_adapters.zig");
 const onboard = @import("onboard.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const zaki_state = @import("zaki_state.zig");
-const telegram = @import("channels/telegram.zig");
 const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
 const json_util = @import("json_util.zig");
@@ -199,7 +198,7 @@ fn sendGatewayControlCommand(host: []const u8, port: u16, path: []const u8, inte
 }
 
 const HEARTBEAT_PROMPT_DEFAULT =
-    "Read HEARTBEAT.md if it exists (workspace context) and follow it strictly. Use runtime_info and schedule before other tools. Trust schedule state over memory for whether jobs exist. Trust delivery or run history over memory for whether something already happened today. Do not use shell, composio, or exploratory discovery. If nothing needs user-visible action, reply HEARTBEAT_OK. If you remediate something, reply with one concise sentence only.";
+    "Read HEARTBEAT.md if it exists (workspace context) and follow it strictly. Use runtime_info and schedule before other tools. Trust schedule state over memory for whether jobs exist. Trust delivery or run history over memory for whether something already happened today. Do not use shell, composio, message, or exploratory discovery. Reply in exactly one of these forms only: HEARTBEAT_OK or HEARTBEAT_SEND: <single concise user-facing sentence>. Do not output lists, markdown, diagnostics, or explanatory narration.";
 const HEARTBEAT_RUNTIME_FILENAME = "heartbeat_runtime.json";
 const CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX = "cron.next_heartbeat:";
 const HEARTBEAT_SWEEP_INTERVAL_SECS: i64 = 30;
@@ -428,6 +427,39 @@ fn saveHeartbeatRuntimeState(
     file.writeAll(body.items) catch {};
 }
 
+const HeartbeatOutcomeState = struct {
+    status: []const u8,
+    reason: []const u8,
+};
+
+fn mapHeartbeatOutcomeState(action: []const u8, reason: []const u8) HeartbeatOutcomeState {
+    if (std.mem.eql(u8, action, "sent")) {
+        return .{ .status = "sent", .reason = if (reason.len > 0) reason else "sent" };
+    }
+    if (std.mem.eql(u8, action, "blocked_rate")) {
+        return .{ .status = "blocked_rate", .reason = if (reason.len > 0) reason else "rate_limit" };
+    }
+    if (std.mem.eql(u8, action, "blocked_dedupe")) {
+        return .{ .status = "blocked_dedupe", .reason = if (reason.len > 0) reason else "dedupe_window" };
+    }
+    return .{ .status = "send_failed", .reason = if (reason.len > 0) reason else "delivery_error" };
+}
+
+fn deliveryOutcomeThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
+    _ = state;
+    while (event_bus.consumeDeliveryOutcome()) |outcome| {
+        defer outcome.deinit(allocator);
+        if (!config.tenant.enabled) continue;
+        const source = outcome.source orelse continue;
+        if (!std.mem.eql(u8, source, "heartbeat")) continue;
+        const user_id = outcome.user_id orelse continue;
+        const user_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tenant.data_root, user_id }) catch continue;
+        defer allocator.free(user_root);
+        const mapped = mapHeartbeatOutcomeState(outcome.action, outcome.reason);
+        saveHeartbeatRuntimeState(allocator, user_root, outcome.ts_s, mapped.status, mapped.reason);
+    }
+}
+
 fn readTrimmedFileOwned(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -531,81 +563,29 @@ fn isHeartbeatAck(reply: []const u8) bool {
     return found_token;
 }
 
-fn isHeartbeatActionableText(content: []const u8) bool {
-    for (content) |c| {
-        if (c < 128 and std.ascii.isAlphanumeric(c)) return true;
-    }
-    return false;
-}
+const HeartbeatReplyDirective = union(enum) {
+    ok,
+    send: []const u8,
+    invalid: []const u8,
+};
 
-fn heartbeatLooksRoutineNarration(reply: []const u8) bool {
-    var lowered: [512]u8 = undefined;
-    const clipped_len = @min(reply.len, lowered.len);
-    _ = std.ascii.lowerString(lowered[0..clipped_len], reply[0..clipped_len]);
-    const content = lowered[0..clipped_len];
-
-    if (std.mem.indexOf(u8, content, "not 08:00") != null) return true;
-    if (std.mem.indexOf(u8, content, "not 8:00") != null) return true;
-    if (std.mem.indexOf(u8, content, "outside the scheduled window") != null) return true;
-    if (std.mem.indexOf(u8, content, "outside the window") != null) return true;
-    if (std.mem.indexOf(u8, content, "not the scheduled time") != null) return true;
-    if (std.mem.indexOf(u8, content, "job does not exist") != null) return true;
-    if (std.mem.indexOf(u8, content, "job doesn't exist") != null) return true;
-    if (std.mem.indexOf(u8, content, "job is missing") != null) return true;
-    if (std.mem.indexOf(u8, content, "current time is") != null) return true;
-    if (std.mem.indexOf(u8, content, "window has passed") != null) return true;
-    if (std.mem.indexOf(u8, content, "nothing needs attention") != null) return true;
-    if (std.mem.indexOf(u8, content, "nothing requires attention") != null) return true;
-    if (std.mem.indexOf(u8, content, "no action needed") != null) return true;
-    return false;
-}
-
-fn heartbeatLooksVerboseDigest(reply: []const u8) bool {
+fn parseHeartbeatReplyDirective(reply: []const u8) HeartbeatReplyDirective {
     const trimmed = std.mem.trim(u8, reply, " \t\r\n");
-    if (trimmed.len == 0) return false;
-    if (trimmed.len > 240) return true;
+    if (trimmed.len == 0) return .{ .invalid = "invalid_heartbeat_reply_format" };
+    if (isHeartbeatAck(trimmed)) return .ok;
 
-    var newline_count: usize = 0;
-    var sentence_count: usize = 0;
-    for (trimmed) |c| {
-        if (c == '\n') newline_count += 1;
-        if (c == '.' or c == '!' or c == '?') sentence_count += 1;
+    const send_prefix = "HEARTBEAT_SEND:";
+    if (!asciiStartsWithIgnoreCaseAt(trimmed, 0, send_prefix)) {
+        return .{ .invalid = "invalid_heartbeat_reply_format" };
     }
-    if (newline_count > 0) return true;
-    if (sentence_count > 2) return true;
 
-    var lowered: [512]u8 = undefined;
-    const clipped_len = @min(trimmed.len, lowered.len);
-    _ = std.ascii.lowerString(lowered[0..clipped_len], trimmed[0..clipped_len]);
-    const content = lowered[0..clipped_len];
-
-    if (std.mem.indexOf(u8, content, "##") != null) return true;
-    if (std.mem.indexOf(u8, content, "your schedule") != null) return true;
-    if (std.mem.indexOf(u8, content, "top middle east news") != null) return true;
-    if (std.mem.indexOf(u8, content, "weather:") != null) return true;
-
-    const has_morning_brief = std.mem.indexOf(u8, content, "morning-brief") != null or std.mem.indexOf(u8, content, "morning brief") != null;
-    if (has_morning_brief) {
-        const has_short_status = std.mem.indexOf(u8, content, "created") != null or
-            std.mem.indexOf(u8, content, "scheduled") != null or
-            std.mem.indexOf(u8, content, "delivered") != null or
-            std.mem.indexOf(u8, content, "sent") != null or
-            std.mem.indexOf(u8, content, "failed") != null or
-            std.mem.indexOf(u8, content, "error") != null or
-            std.mem.indexOf(u8, content, "blocked") != null;
-        if (!has_short_status) return true;
+    const payload = std.mem.trim(u8, trimmed[send_prefix.len..], " \t\r\n");
+    if (payload.len == 0) return .{ .invalid = "invalid_heartbeat_reply_format" };
+    if (std.mem.indexOfScalar(u8, payload, '\n') != null or std.mem.indexOfScalar(u8, payload, '\r') != null) {
+        return .{ .invalid = "invalid_heartbeat_reply_format" };
     }
-    return false;
-}
-
-fn heartbeatActionableReplySlice(reply: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trim(u8, reply, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    if (isHeartbeatAck(trimmed)) return null;
-    if (heartbeatLooksRoutineNarration(trimmed)) return null;
-    if (heartbeatLooksVerboseDigest(trimmed)) return null;
-    if (!isHeartbeatActionableText(trimmed)) return null;
-    return trimmed;
+    if (payload.len > 280) return .{ .invalid = "invalid_heartbeat_reply_format" };
+    return .{ .send = payload };
 }
 
 fn heartbeatDedupeBucket(content: []const u8) ?[]const u8 {
@@ -733,8 +713,8 @@ fn selfHealMorningBriefJob(
         job.job_type = .agent;
         changed = true;
     }
-    if (job.session_target != .main) {
-        job.session_target = .main;
+    if (job.session_target != .isolated) {
+        job.session_target = .isolated;
         changed = true;
     }
     if (job.wake_mode != .now) {
@@ -773,25 +753,41 @@ fn selfHealMorningBriefJob(
     return changed;
 }
 
-fn sendHeartbeatTelegramMessage(
+fn enqueueHeartbeatOutboundMessage(
     allocator: std.mem.Allocator,
-    bot_token: []const u8,
-    chat_id: i64,
+    event_bus: *bus_mod.Bus,
+    user_id: []const u8,
+    account_id_opt: ?[]const u8,
+    chat_id: []const u8,
     content: []const u8,
+    dedupe_key: ?[]const u8,
 ) !void {
-    var tg = telegram.TelegramChannel.init(allocator, bot_token, &.{"*"}, &.{}, "open");
-    var chat_id_buf: [32]u8 = undefined;
-    const chat_id_text = std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id}) catch return error.InvalidChatId;
+    const msg = if (account_id_opt) |account_id|
+        try bus_mod.makeOutboundWithAccountAnnotated(
+            allocator,
+            "telegram",
+            account_id,
+            chat_id,
+            content,
+            "heartbeat",
+            user_id,
+            dedupe_key,
+        )
+    else
+        try bus_mod.makeOutboundAnnotated(
+            allocator,
+            "telegram",
+            chat_id,
+            content,
+            "heartbeat",
+            user_id,
+            dedupe_key,
+        );
 
-    var attempt: u8 = 0;
-    while (attempt < 3) : (attempt += 1) {
-        tg.sendMessage(chat_id_text, content) catch |err| {
-            if (attempt + 1 >= 3) return err;
-            std.Thread.sleep(@as(u64, attempt + 1) * 300 * std.time.ns_per_ms);
-            continue;
-        };
-        return;
-    }
+    event_bus.publishOutbound(msg) catch |err| {
+        msg.deinit(allocator);
+        return err;
+    };
 }
 
 fn runHeartbeatAgentTurn(
@@ -811,7 +807,7 @@ fn runHeartbeatAgentTurn(
         .id = "heartbeat",
         .expression = "* * * * *",
         .command = if (turn_origin == .wake) HEARTBEAT_WAKE_COMMAND else "heartbeat",
-        .session_target = .main,
+        .session_target = .isolated,
     };
     return runCronAgentTurn(@ptrCast(@constCast(config)), allocator, &scheduler, &heartbeat_job, prompt);
 }
@@ -819,6 +815,7 @@ fn runHeartbeatAgentTurn(
 fn runTenantHeartbeatForUser(
     allocator: std.mem.Allocator,
     config: *const Config,
+    event_bus: *bus_mod.Bus,
     user_id: []const u8,
     user_id_numeric: ?i64,
     user_root: []const u8,
@@ -853,9 +850,20 @@ fn runTenantHeartbeatForUser(
     defer if (heartbeat_content) |content| allocator.free(content);
     if (heartbeat_content) |content| {
         if (isHeartbeatContentEffectivelyEmpty(content)) {
-            saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_empty", reason);
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "idle", "heartbeat_template_empty");
             return;
         }
+    }
+
+    // Interval lane only triggers wake work; the wake lane performs the model turn.
+    if (!forced) {
+        heartbeat_wake.enqueue(user_id, "heartbeat.interval_due") catch |err| {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", @errorName(err));
+            return;
+        };
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "triggered", reason);
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "enqueued", "wake_enqueued");
+        return;
     }
 
     const turn_origin: tools_mod.TurnOrigin = if (forced and !std.mem.eql(u8, reason, "interval"))
@@ -865,15 +873,23 @@ fn runTenantHeartbeatForUser(
 
     const reply = runHeartbeatAgentTurn(allocator, config, user_id, user_root, workspace_path, hb_cfg.prompt, turn_origin) catch |err| {
         log.warn("heartbeat agent turn failed for user={s}: {}", .{ user_id, err });
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_turn", @errorName(err));
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "turn_error");
         return;
     };
     defer allocator.free(reply);
 
-    const actionable_reply = heartbeatActionableReplySlice(reply) orelse {
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "ok_ack", reason);
-        return;
+    const actionable_reply = switch (parseHeartbeatReplyDirective(reply)) {
+        .ok => {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "idle", "no_actionable_output");
+            return;
+        },
+        .invalid => |invalid_reason| {
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", invalid_reason);
+            return;
+        },
+        .send => |payload| payload,
     };
+    saveHeartbeatRuntimeState(allocator, user_root, now_s, "triggered", reason);
 
     var delivery_ctx = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
         .channel = "telegram",
@@ -885,77 +901,69 @@ fn runTenantHeartbeatForUser(
         .user_root = user_root,
     }) catch |err| switch (err) {
         error.MissingTenantContext => {
-            saveHeartbeatRuntimeState(allocator, user_root, now_s, "context_incomplete", reason);
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "context_incomplete");
             return;
         },
         error.NotConnected, error.InvalidTarget => {
-            saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_target", reason);
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "no_target");
             return;
         },
         error.MissingCredential => {
-            saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_token", reason);
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "no_token");
             return;
         },
         error.UnsupportedChannel => {
-            saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_target", @errorName(err));
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", @errorName(err));
             return;
         },
         else => {
-            saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_target", @errorName(err));
+            saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", @errorName(err));
             return;
         },
     };
     defer delivery_ctx.deinit(allocator);
 
     if (delivery_ctx.context_incomplete) {
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "context_incomplete", reason);
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "context_incomplete");
         return;
     }
 
     runtime_resolver.requireConnectedTarget(&delivery_ctx) catch {
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_target", reason);
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "no_target");
         return;
     };
 
-    const token = runtime_resolver.requireCredential(&delivery_ctx) catch {
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_token", reason);
+    _ = runtime_resolver.requireCredential(&delivery_ctx) catch {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "no_token");
         return;
     };
 
-    const chat_id = runtime_resolver.parseResolvedTargetChatId(&delivery_ctx) catch {
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "skipped_no_target", reason);
+    const chat_id_text = delivery_ctx.target_id orelse {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "no_target");
         return;
     };
 
-    var chat_buf: [32]u8 = undefined;
-    const chat_id_text = std.fmt.bufPrint(&chat_buf, "{d}", .{chat_id}) catch "0";
     const dedupe_key = makeHeartbeatDedupeKey(allocator, user_id, chat_id_text, actionable_reply) catch null;
     defer if (dedupe_key) |key| allocator.free(key);
-    const decision = ops_guard.allowProactive("heartbeat", user_id, "telegram", chat_id_text, actionable_reply, dedupe_key, now_s);
-    switch (decision) {
-        .allow => {},
-        .blocked_rate => {
-            saveHeartbeatRuntimeState(allocator, user_root, now_s, "blocked_rate", reason);
-            return;
-        },
-        .blocked_dedupe => {
-            saveHeartbeatRuntimeState(allocator, user_root, now_s, "blocked_dedupe", reason);
-            return;
-        },
-    }
-
-    sendHeartbeatTelegramMessage(allocator, token, chat_id, actionable_reply) catch |err| {
-        ops_guard.recordProactiveSendError("heartbeat", user_id, "telegram", chat_id_text, @errorName(err), std.time.timestamp());
-        saveHeartbeatRuntimeState(allocator, user_root, now_s, "error_send", @errorName(err));
+    enqueueHeartbeatOutboundMessage(
+        allocator,
+        event_bus,
+        user_id,
+        delivery_ctx.account_id,
+        chat_id_text,
+        actionable_reply,
+        dedupe_key,
+    ) catch |err| {
+        saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", @errorName(err));
         return;
     };
-    ops_guard.recordProactiveSent("heartbeat", user_id, "telegram", chat_id_text, std.time.timestamp());
-    saveHeartbeatRuntimeState(allocator, user_root, now_s, "sent", reason);
+    saveHeartbeatRuntimeState(allocator, user_root, now_s, "enqueued", "delivery_enqueued");
 }
 
 fn runTenantHeartbeatSweep(
     allocator: std.mem.Allocator,
     config: *const Config,
+    event_bus: *bus_mod.Bus,
     owner_instance_id: []const u8,
     forced_user_id: ?[]const u8,
     reason: []const u8,
@@ -996,6 +1004,7 @@ fn runTenantHeartbeatSweep(
         runTenantHeartbeatForUser(
             allocator,
             config,
+            event_bus,
             entry.name,
             numeric_user_id,
             user_root,
@@ -1008,7 +1017,7 @@ fn runTenantHeartbeatSweep(
 }
 
 /// Heartbeat thread — writes state file, runs periodic heartbeat checks, and handles wake-now requests.
-fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState) void {
+fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const state_path = stateFilePath(allocator, config) catch return;
     defer allocator.free(state_path);
 
@@ -1055,8 +1064,7 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
             }
             if (!config.tenant.enabled) continue;
             const owner_id = owner_instance_id orelse continue;
-            const forced = !std.mem.startsWith(u8, req.reason, CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX);
-            runTenantHeartbeatSweep(allocator, config, owner_id, req.user_id, req.reason, forced, pg_mgr);
+            runTenantHeartbeatSweep(allocator, config, event_bus, owner_id, req.user_id, req.reason, true, pg_mgr);
         }
         const wake_pending = heartbeat_wake.pendingCount();
         if (wake_pending > 0) {
@@ -1066,7 +1074,7 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
         if (config.tenant.enabled and owner_instance_id != null) {
             if (now_s - last_sweep_s >= HEARTBEAT_SWEEP_INTERVAL_SECS or now_s < last_sweep_s) {
                 last_sweep_s = now_s;
-                runTenantHeartbeatSweep(allocator, config, owner_instance_id.?, null, "interval", false, pg_mgr);
+                runTenantHeartbeatSweep(allocator, config, event_bus, owner_instance_id.?, null, "interval", false, pg_mgr);
             }
         }
 
@@ -2059,6 +2067,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     }
 
     state.addComponent("scheduler");
+    state.addComponent("delivery_outcome");
 
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
@@ -2078,8 +2087,26 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
         try stdout.print("Warning: could not write state file: {}\n", .{err});
     };
 
+    // Proactive guardrails are operator-configurable via tenant.* with
+    // bounded clamps enforced inside ops_guard.
+    ops_guard.configureProactivePolicy(
+        config.tenant.proactive_dedupe_window_secs,
+        config.tenant.proactive_rate_window_secs,
+        config.tenant.proactive_rate_limit_per_window,
+    );
+
     // Event bus (created before gateway+scheduler so all threads can publish)
     var event_bus = bus_mod.Bus.init();
+
+    var delivery_outcome_thread: ?std.Thread = null;
+    state.markRunning("delivery_outcome");
+    if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, deliveryOutcomeThread, .{ allocator, config, &state, &event_bus })) |thread| {
+        delivery_outcome_thread = thread;
+    } else |err| {
+        state.markError("delivery_outcome", @errorName(err));
+        event_bus.closeDeliveryOutcomes();
+        stdout.print("Warning: delivery outcome thread failed: {}\n", .{err}) catch {};
+    }
 
     // Spawn gateway thread
     state.markRunning("gateway");
@@ -2093,7 +2120,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var hb_thread: ?std.Thread = null;
     if (config.heartbeat.enabled) {
         state.markRunning("heartbeat");
-        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, heartbeatThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, heartbeatThread, .{ allocator, config, &state, &event_bus })) |thread| {
             hb_thread = thread;
         } else |err| {
             state.markError("heartbeat", @errorName(err));
@@ -2239,6 +2266,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Wait for threads
     for (inbound_threads.items) |t| t.join();
     for (outbound_threads.items) |t| t.join();
+    if (delivery_outcome_thread) |t| t.join();
     if (chan_thread) |t| t.join();
     if (sched_thread) |t| t.join();
     if (hb_thread) |t| t.join();
@@ -3314,36 +3342,108 @@ test "resolveCronTurnOrigin keeps scheduler origin for non-delivery jobs" {
     try std.testing.expectEqual(tools_mod.TurnOrigin.scheduler, resolveCronTurnOrigin(&job));
 }
 
-test "heartbeatActionableReplySlice suppresses ack-only output" {
-    try std.testing.expect(heartbeatActionableReplySlice("HEARTBEAT_OK") == null);
-    try std.testing.expect(heartbeatActionableReplySlice("<b>HEARTBEAT_OK</b> ✅") == null);
+test "parseHeartbeatReplyDirective accepts HEARTBEAT_OK variants" {
+    try std.testing.expectEqual(HeartbeatReplyDirective.ok, parseHeartbeatReplyDirective("HEARTBEAT_OK"));
+    try std.testing.expectEqual(HeartbeatReplyDirective.ok, parseHeartbeatReplyDirective("<b>HEARTBEAT_OK</b> ✅"));
 }
 
-test "heartbeatActionableReplySlice suppresses routine schedule narration" {
-    try std.testing.expect(heartbeatActionableReplySlice("It is not 08:00 CET yet, so no brief will be sent.") == null);
-    try std.testing.expect(heartbeatActionableReplySlice("The morning-brief job does not exist right now.") == null);
+test "parseHeartbeatReplyDirective accepts HEARTBEAT_SEND payload" {
+    const parsed = parseHeartbeatReplyDirective("HEARTBEAT_SEND: Morning brief delivered.");
+    switch (parsed) {
+        .send => |payload| try std.testing.expectEqualStrings("Morning brief delivered.", payload),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
-test "heartbeatActionableReplySlice keeps actionable output" {
-    const slice = heartbeatActionableReplySlice("  Morning brief delivered  ") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("Morning brief delivered", slice);
+test "parseHeartbeatReplyDirective rejects narrative output" {
+    const parsed = parseHeartbeatReplyDirective("Morning brief is pending but blocked.");
+    switch (parsed) {
+        .invalid => |reason| try std.testing.expectEqualStrings("invalid_heartbeat_reply_format", reason),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
-test "heartbeatActionableReplySlice suppresses verbose morning brief payloads" {
-    try std.testing.expect(heartbeatActionableReplySlice(
-        \\## Morning Brief - March 9, 2026
-        \\Weather: Hamburg 4C
-        \\Top Middle East news: ...
-    ) == null);
+test "parseHeartbeatReplyDirective rejects empty send payload" {
+    const parsed = parseHeartbeatReplyDirective("HEARTBEAT_SEND:   ");
+    switch (parsed) {
+        .invalid => |reason| try std.testing.expectEqualStrings("invalid_heartbeat_reply_format", reason),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
-test "heartbeatActionableReplySlice keeps concise remediation sentence" {
-    const slice = heartbeatActionableReplySlice("Created morning-brief job for 08:00 CET.") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("Created morning-brief job for 08:00 CET.", slice);
+test "parseHeartbeatReplyDirective rejects multi-line payload" {
+    const parsed = parseHeartbeatReplyDirective(
+        \\HEARTBEAT_SEND: line one
+        \\line two
+    );
+    switch (parsed) {
+        .invalid => |reason| try std.testing.expectEqualStrings("invalid_heartbeat_reply_format", reason),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
-test "heartbeatActionableReplySlice drops non-actionable punctuation" {
-    try std.testing.expect(heartbeatActionableReplySlice("  ... !!!  ") == null);
+test "mapHeartbeatOutcomeState maps terminal actions" {
+    const sent = mapHeartbeatOutcomeState("sent", "sent");
+    try std.testing.expectEqualStrings("sent", sent.status);
+
+    const blocked_rate = mapHeartbeatOutcomeState("blocked_rate", "rate_limit");
+    try std.testing.expectEqualStrings("blocked_rate", blocked_rate.status);
+
+    const blocked_dedupe = mapHeartbeatOutcomeState("blocked_dedupe", "dedupe_window");
+    try std.testing.expectEqualStrings("blocked_dedupe", blocked_dedupe.status);
+
+    const failed = mapHeartbeatOutcomeState("channel_not_found", "channel_not_found");
+    try std.testing.expectEqualStrings("send_failed", failed.status);
+}
+
+test "deliveryOutcomeThread writes heartbeat runtime terminal state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(data_root);
+    try tmp.dir.makePath("1");
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .tenant = .{
+            .enabled = true,
+            .data_root = data_root,
+        },
+    };
+    var state = DaemonState{};
+    var event_bus = bus_mod.Bus.init();
+    const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, deliveryOutcomeThread, .{
+        std.testing.allocator,
+        &cfg,
+        &state,
+        &event_bus,
+    });
+
+    const outcome = try bus_mod.makeDeliveryOutcome(
+        std.testing.allocator,
+        "heartbeat",
+        "1",
+        "telegram",
+        "1110331014",
+        "sent",
+        "sent",
+        99,
+    );
+    try event_bus.publishDeliveryOutcome(outcome);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    event_bus.close();
+    thread.join();
+
+    const runtime_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/1/heartbeat_runtime.json", .{data_root});
+    defer std.testing.allocator.free(runtime_path);
+    const runtime_file = try std.fs.openFileAbsolute(runtime_path, .{});
+    defer runtime_file.close();
+    const content = try runtime_file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"last_status\":\"sent\"") != null);
 }
 
 test "default heartbeat templates are treated as effectively empty" {

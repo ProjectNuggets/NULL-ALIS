@@ -167,6 +167,32 @@ pub fn runOutboundDispatcher(
     registry: *const ChannelRegistry,
     stats: *DispatchStats,
 ) void {
+    const DeliverySignal = struct {
+        fn publish(
+            alloc: Allocator,
+            eb: *bus.Bus,
+            msg: *const bus.OutboundMessage,
+            action: []const u8,
+            reason: []const u8,
+            ts_s: i64,
+        ) void {
+            if (msg.source == null) return;
+            const outcome = bus.makeDeliveryOutcome(
+                alloc,
+                msg.source,
+                msg.user_id,
+                msg.channel,
+                msg.chat_id,
+                action,
+                reason,
+                ts_s,
+            ) catch return;
+            eb.publishDeliveryOutcome(outcome) catch {
+                outcome.deinit(alloc);
+            };
+        }
+    };
+
     while (event_bus.consumeOutbound()) |msg| {
         defer msg.deinit(allocator);
 
@@ -184,7 +210,14 @@ pub fn runOutboundDispatcher(
             );
             switch (decision) {
                 .allow => {},
-                .blocked_rate, .blocked_dedupe => continue,
+                .blocked_rate => {
+                    DeliverySignal.publish(allocator, event_bus, &msg, "blocked_rate", "rate_limit", std.time.timestamp());
+                    continue;
+                },
+                .blocked_dedupe => {
+                    DeliverySignal.publish(allocator, event_bus, &msg, "blocked_dedupe", "dedupe_window", std.time.timestamp());
+                    continue;
+                },
             }
         }
 
@@ -196,17 +229,20 @@ pub fn runOutboundDispatcher(
         if (channel_opt) |channel| {
             channel.send(msg.chat_id, msg.content, msg.media) catch {
                 _ = stats.errors.fetchAdd(1, .monotonic);
+                DeliverySignal.publish(allocator, event_bus, &msg, "send_error", "channel_send_failed", std.time.timestamp());
                 if (proactive) {
                     ops_guard.recordProactiveSendError(source, msg.user_id, msg.channel, msg.chat_id, "channel_send_failed", std.time.timestamp());
                 }
                 continue;
             };
             _ = stats.dispatched.fetchAdd(1, .monotonic);
+            DeliverySignal.publish(allocator, event_bus, &msg, "sent", "sent", std.time.timestamp());
             if (proactive) {
                 ops_guard.recordProactiveSent(source, msg.user_id, msg.channel, msg.chat_id, std.time.timestamp());
             }
         } else {
             _ = stats.channel_not_found.fetchAdd(1, .monotonic);
+            DeliverySignal.publish(allocator, event_bus, &msg, "channel_not_found", "channel_not_found", std.time.timestamp());
             if (proactive) {
                 ops_guard.recordProactiveSendError(source, msg.user_id, msg.channel, msg.chat_id, "channel_not_found", std.time.timestamp());
             }
@@ -410,6 +446,16 @@ const MockChannel = struct {
     }
 };
 
+fn waitUntil(comptime predicate: fn () bool, max_wait_ms: u64) bool {
+    const sleep_step_ms: u64 = 2;
+    var elapsed_ms: u64 = 0;
+    while (elapsed_ms < max_wait_ms) : (elapsed_ms += sleep_step_ms) {
+        if (predicate()) return true;
+        std.Thread.sleep(sleep_step_ms * std.time.ns_per_ms);
+    }
+    return predicate();
+}
+
 test "DispatchStats init all zero" {
     const stats = DispatchStats{};
     try std.testing.expectEqual(@as(u64, 0), stats.getDispatched());
@@ -590,6 +636,164 @@ test "dispatcher mixed: found, not_found, error" {
     try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
     try std.testing.expectEqual(@as(u64, 1), stats.getErrors());
     try std.testing.expectEqual(@as(u64, 1), stats.getChannelNotFound());
+}
+
+test "dispatcher publishes proactive sent outcome" {
+    const allocator = std.testing.allocator;
+
+    var mock_tg = MockChannel{ .name_str = "telegram" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_tg.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+    const thread = try std.Thread.spawn(.{ .stack_size = TEST_THREAD_STACK_SIZE }, runOutboundDispatcher, .{
+        allocator, &event_bus, &reg, &stats,
+    });
+
+    const msg = try bus.makeOutboundAnnotated(
+        allocator,
+        "telegram",
+        "dispatch-outcome-chat-sent",
+        "hello",
+        "heartbeat",
+        "dispatch-outcome-user-sent",
+        "dispatch-outcome-key-sent",
+    );
+    try event_bus.publishOutbound(msg);
+    const sent_ready = struct {
+        var bus_ptr: *bus.Bus = undefined;
+        fn check() bool {
+            return bus_ptr.deliveryOutcomeLen() >= 1;
+        }
+    };
+    sent_ready.bus_ptr = &event_bus;
+    _ = waitUntil(sent_ready.check, 200);
+
+    var outcome = event_bus.consumeDeliveryOutcome() orelse return error.TestUnexpectedResult;
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqualStrings("sent", outcome.action);
+    try std.testing.expectEqualStrings("sent", outcome.reason);
+    try std.testing.expectEqualStrings("heartbeat", outcome.source.?);
+
+    event_bus.close();
+    thread.join();
+}
+
+test "dispatcher publishes proactive blocked_dedupe outcome" {
+    const allocator = std.testing.allocator;
+
+    var mock_tg = MockChannel{ .name_str = "telegram" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_tg.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+    const thread = try std.Thread.spawn(.{ .stack_size = TEST_THREAD_STACK_SIZE }, runOutboundDispatcher, .{
+        allocator, &event_bus, &reg, &stats,
+    });
+
+    const first = try bus.makeOutboundAnnotated(
+        allocator,
+        "telegram",
+        "dispatch-outcome-chat-dedupe",
+        "duplicate payload",
+        "heartbeat",
+        "dispatch-outcome-user-dedupe",
+        "dispatch-outcome-key-dedupe",
+    );
+    try event_bus.publishOutbound(first);
+
+    const second = try bus.makeOutboundAnnotated(
+        allocator,
+        "telegram",
+        "dispatch-outcome-chat-dedupe",
+        "duplicate payload",
+        "heartbeat",
+        "dispatch-outcome-user-dedupe",
+        "dispatch-outcome-key-dedupe",
+    );
+    try event_bus.publishOutbound(second);
+    const dedupe_ready = struct {
+        var bus_ptr: *bus.Bus = undefined;
+        fn check() bool {
+            return bus_ptr.deliveryOutcomeLen() >= 2;
+        }
+    };
+    dedupe_ready.bus_ptr = &event_bus;
+    _ = waitUntil(dedupe_ready.check, 200);
+
+    var found_blocked_dedupe = false;
+    while (event_bus.deliveryOutcomeLen() > 0) {
+        var outcome = event_bus.consumeDeliveryOutcome() orelse break;
+        defer outcome.deinit(allocator);
+        if (std.mem.eql(u8, outcome.action, "blocked_dedupe")) found_blocked_dedupe = true;
+    }
+    try std.testing.expect(found_blocked_dedupe);
+
+    event_bus.close();
+    thread.join();
+}
+
+test "dispatcher publishes proactive send_error and channel_not_found outcomes" {
+    const allocator = std.testing.allocator;
+
+    var mock_fail = MockChannel{ .name_str = "failing", .should_fail = true };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_fail.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+    const thread = try std.Thread.spawn(.{ .stack_size = TEST_THREAD_STACK_SIZE }, runOutboundDispatcher, .{
+        allocator, &event_bus, &reg, &stats,
+    });
+
+    const failing = try bus.makeOutboundAnnotated(
+        allocator,
+        "failing",
+        "dispatch-outcome-chat-error",
+        "boom",
+        "heartbeat",
+        "dispatch-outcome-user-error",
+        "dispatch-outcome-key-error",
+    );
+    try event_bus.publishOutbound(failing);
+
+    const not_found = try bus.makeOutboundAnnotated(
+        allocator,
+        "missing-channel",
+        "dispatch-outcome-chat-missing",
+        "hi",
+        "heartbeat",
+        "dispatch-outcome-user-missing",
+        "dispatch-outcome-key-missing",
+    );
+    try event_bus.publishOutbound(not_found);
+    const terminal_ready = struct {
+        var bus_ptr: *bus.Bus = undefined;
+        fn check() bool {
+            return bus_ptr.deliveryOutcomeLen() >= 2;
+        }
+    };
+    terminal_ready.bus_ptr = &event_bus;
+    _ = waitUntil(terminal_ready.check, 200);
+
+    var found_send_error = false;
+    var found_channel_not_found = false;
+    while (event_bus.deliveryOutcomeLen() > 0) {
+        var outcome = event_bus.consumeDeliveryOutcome() orelse break;
+        defer outcome.deinit(allocator);
+        if (std.mem.eql(u8, outcome.action, "send_error")) found_send_error = true;
+        if (std.mem.eql(u8, outcome.action, "channel_not_found")) found_channel_not_found = true;
+    }
+    try std.testing.expect(found_send_error);
+    try std.testing.expect(found_channel_not_found);
+
+    event_bus.close();
+    thread.join();
 }
 
 test "dispatcher empty bus returns immediately" {

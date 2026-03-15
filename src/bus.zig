@@ -57,6 +57,25 @@ pub const OutboundMessage = struct {
     }
 };
 
+pub const DeliveryOutcome = struct {
+    source: ?[]const u8 = null,
+    user_id: ?[]const u8 = null,
+    channel: []const u8,
+    chat_id: []const u8,
+    action: []const u8,
+    reason: []const u8,
+    ts_s: i64,
+
+    pub fn deinit(self: *const DeliveryOutcome, allocator: Allocator) void {
+        if (self.source) |source| allocator.free(source);
+        if (self.user_id) |user_id| allocator.free(user_id);
+        allocator.free(self.channel);
+        allocator.free(self.chat_id);
+        allocator.free(self.action);
+        allocator.free(self.reason);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Helpers — duplicate all strings so producer can free its originals
 // ---------------------------------------------------------------------------
@@ -216,6 +235,39 @@ pub fn makeOutboundWithAccountAnnotated(
     return msg;
 }
 
+pub fn makeDeliveryOutcome(
+    allocator: Allocator,
+    source: ?[]const u8,
+    user_id: ?[]const u8,
+    channel: []const u8,
+    chat_id: []const u8,
+    action: []const u8,
+    reason: []const u8,
+    ts_s: i64,
+) Allocator.Error!DeliveryOutcome {
+    const source_copy = if (source) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (source_copy) |value| allocator.free(value);
+    const user_copy = if (user_id) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (user_copy) |value| allocator.free(value);
+    const channel_copy = try allocator.dupe(u8, channel);
+    errdefer allocator.free(channel_copy);
+    const chat_copy = try allocator.dupe(u8, chat_id);
+    errdefer allocator.free(chat_copy);
+    const action_copy = try allocator.dupe(u8, action);
+    errdefer allocator.free(action_copy);
+    const reason_copy = try allocator.dupe(u8, reason);
+
+    return .{
+        .source = source_copy,
+        .user_id = user_copy,
+        .channel = channel_copy,
+        .chat_id = chat_copy,
+        .action = action_copy,
+        .reason = reason_copy,
+        .ts_s = ts_s,
+    };
+}
+
 /// Create an OutboundMessage with media attachments.
 fn makeOutboundWithMedia(
     allocator: Allocator,
@@ -334,6 +386,7 @@ pub const QUEUE_CAPACITY: usize = 1024;
 pub const Bus = struct {
     inbound: BoundedQueue(InboundMessage, QUEUE_CAPACITY) = .{},
     outbound: BoundedQueue(OutboundMessage, QUEUE_CAPACITY) = .{},
+    delivery_outcomes: BoundedQueue(DeliveryOutcome, QUEUE_CAPACITY) = .{},
 
     pub fn init() Bus {
         return .{};
@@ -359,11 +412,24 @@ pub const Bus = struct {
         return self.outbound.consume();
     }
 
+    pub fn publishDeliveryOutcome(self: *Bus, outcome: DeliveryOutcome) error{Closed}!void {
+        return self.delivery_outcomes.publish(outcome);
+    }
+
+    pub fn consumeDeliveryOutcome(self: *Bus) ?DeliveryOutcome {
+        return self.delivery_outcomes.consume();
+    }
+
     // -- Lifecycle --
 
     pub fn close(self: *Bus) void {
         self.inbound.close();
         self.outbound.close();
+        self.delivery_outcomes.close();
+    }
+
+    pub fn closeDeliveryOutcomes(self: *Bus) void {
+        self.delivery_outcomes.close();
     }
 
     // -- Metrics --
@@ -382,6 +448,10 @@ pub const Bus = struct {
 
     pub fn outboundLen(self: *Bus) usize {
         return self.outbound.depth();
+    }
+
+    pub fn deliveryOutcomeLen(self: *Bus) usize {
+        return self.delivery_outcomes.depth();
     }
 
     pub fn queueCapacity(_: *const Bus) usize {
@@ -538,6 +608,14 @@ test "bus len accessors mirror depth" {
     out_popped.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), bus.outboundLen());
     try testing.expectEqual(@as(usize, 0), bus.outboundDepth());
+
+    const outcome = try makeDeliveryOutcome(alloc, "heartbeat", "1", "telegram", "chat", "sent", "sent", 123);
+    try bus.publishDeliveryOutcome(outcome);
+    try testing.expectEqual(@as(usize, 1), bus.deliveryOutcomeLen());
+
+    var outcome_popped = bus.consumeDeliveryOutcome().?;
+    outcome_popped.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), bus.deliveryOutcomeLen());
 }
 
 test "bus queueCapacity reports compile-time capacity" {
@@ -578,6 +656,35 @@ test "bus roundtrip outbound" {
     try testing.expectEqualStrings("pong", got.content);
 }
 
+test "bus roundtrip delivery outcome" {
+    const alloc = testing.allocator;
+    var bus = Bus.init();
+    defer bus.close();
+
+    const outcome = try makeDeliveryOutcome(
+        alloc,
+        "heartbeat",
+        "7",
+        "telegram",
+        "1110331014",
+        "blocked_rate",
+        "rate_limit",
+        42,
+    );
+    try bus.publishDeliveryOutcome(outcome);
+    try testing.expectEqual(@as(usize, 1), bus.deliveryOutcomeLen());
+
+    var got = bus.consumeDeliveryOutcome().?;
+    defer got.deinit(alloc);
+    try testing.expectEqualStrings("heartbeat", got.source.?);
+    try testing.expectEqualStrings("7", got.user_id.?);
+    try testing.expectEqualStrings("telegram", got.channel);
+    try testing.expectEqualStrings("1110331014", got.chat_id);
+    try testing.expectEqualStrings("blocked_rate", got.action);
+    try testing.expectEqualStrings("rate_limit", got.reason);
+    try testing.expectEqual(@as(i64, 42), got.ts_s);
+}
+
 test "bus close stops both queues" {
     var bus = Bus.init();
     bus.close();
@@ -590,6 +697,10 @@ test "bus close stops both queues" {
     const out_msg = try makeOutbound(alloc, "x", "x", "x");
     try testing.expectError(error.Closed, bus.publishOutbound(out_msg));
     out_msg.deinit(alloc);
+
+    const outcome = try makeDeliveryOutcome(alloc, "heartbeat", "1", "x", "x", "sent", "sent", 1);
+    try testing.expectError(error.Closed, bus.publishDeliveryOutcome(outcome));
+    outcome.deinit(alloc);
 }
 
 test "bus close is idempotent" {
