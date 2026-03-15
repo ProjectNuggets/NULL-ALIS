@@ -251,6 +251,14 @@ pub const ComposioTool = struct {
         if (normalized) |payload| {
             allocator.free(raw.output);
             raw.output = payload;
+        } else if (connectResponseLooksLinkWithoutRedirect(allocator, raw.output)) {
+            allocator.free(raw.output);
+            raw.output = "";
+            raw.success = false;
+            raw.error_msg = try allocator.dupe(
+                u8,
+                "Composio connect response missing redirect_url. Generate a fresh link and open it immediately; do not reuse older links.",
+            );
         }
         return raw;
     }
@@ -282,10 +290,13 @@ pub const ComposioTool = struct {
             defer if (lookup.error_msg) |e| allocator.free(e);
             defer if (lookup.output.len > 0) allocator.free(lookup.output);
             if (!lookup.success) continue;
-
-            if (parseFirstAuthConfigId(allocator, lookup.output)) |auth_id| {
-                return auth_id;
-            } else |_| {}
+            const auth_id = parseBestAuthConfigId(allocator, lookup.output, candidates[i]) catch |err| switch (err) {
+                error.AuthConfigNotFound => continue,
+                error.InvalidResponse => continue,
+                error.AuthConfigAmbiguous => return err,
+                else => return error.AuthConfigLookupFailed,
+            };
+            return auth_id;
         }
 
         return error.AuthConfigNotFound;
@@ -296,6 +307,11 @@ pub const ComposioTool = struct {
         const auth_config_id_in = root.getString(args, "auth_config_id");
         if (app == null and auth_config_id_in == null) {
             return ToolResult.fail("Missing 'app' or 'auth_config_id' for connect");
+        }
+        if (root.getString(args, "callback_url")) |callback_url| {
+            validateConnectCallbackUrl(callback_url) catch {
+                return ToolResult.fail("Invalid 'callback_url'. Use https://... (or http://localhost/127.0.0.1 for local dev).");
+            };
         }
 
         const entity_resolution = self.resolveExecutionEntityId(args);
@@ -311,6 +327,11 @@ pub const ComposioTool = struct {
                     error.AuthConfigNotFound => blk_err: {
                         const msg = allocator.dupe(u8, "No v3 auth_config found for app. Pass auth_config_id explicitly.") catch
                             break :blk_err ToolResult.fail("No v3 auth_config found for app. Pass auth_config_id explicitly.");
+                        break :blk_err ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    },
+                    error.AuthConfigAmbiguous => blk_err: {
+                        const msg = allocator.dupe(u8, "Multiple equally-ranked auth configs found for app. Pass auth_config_id explicitly.") catch
+                            break :blk_err ToolResult.fail("Multiple equally-ranked auth configs found for app. Pass auth_config_id explicitly.");
                         break :blk_err ToolResult{ .success = false, .output = "", .error_msg = msg };
                     },
                     else => blk_err: {
@@ -465,6 +486,34 @@ fn buildConnectBodyV3(allocator: std.mem.Allocator, entity: []const u8, auth_con
     return body_buf.toOwnedSlice(allocator);
 }
 
+fn isLocalDevCallbackAuthority(rest: []const u8) bool {
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    if (end == 0) return false;
+    const authority = rest[0..end];
+    if (std.mem.eql(u8, authority, "localhost")) return true;
+    if (std.mem.startsWith(u8, authority, "localhost:")) return true;
+    if (std.mem.eql(u8, authority, "127.0.0.1")) return true;
+    if (std.mem.startsWith(u8, authority, "127.0.0.1:")) return true;
+    if (std.mem.eql(u8, authority, "[::1]")) return true;
+    if (std.mem.startsWith(u8, authority, "[::1]:")) return true;
+    return false;
+}
+
+fn validateConnectCallbackUrl(callback_url: []const u8) !void {
+    const trimmed = std.mem.trim(u8, callback_url, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidCallbackUrl;
+    if (std.mem.startsWith(u8, trimmed, "https://")) {
+        if (trimmed.len <= "https://".len) return error.InvalidCallbackUrl;
+        return;
+    }
+    if (std.mem.startsWith(u8, trimmed, "http://")) {
+        const rest = trimmed["http://".len..];
+        if (!isLocalDevCallbackAuthority(rest)) return error.InvalidCallbackUrl;
+        return;
+    }
+    return error.InvalidCallbackUrl;
+}
+
 fn firstObjectString(obj: std.json.ObjectMap, comptime fields: []const []const u8) ?[]const u8 {
     inline for (fields) |field| {
         if (obj.get(field)) |v| {
@@ -474,6 +523,33 @@ fn firstObjectString(obj: std.json.ObjectMap, comptime fields: []const []const u
     return null;
 }
 
+fn selectConnectPayloadObject(root_obj: std.json.ObjectMap) std.json.ObjectMap {
+    const redirect_fields = &.{ "redirect_url", "redirectUrl", "url", "link" };
+    const token_fields = &.{ "link_token", "linkToken" };
+    if (firstObjectString(root_obj, redirect_fields) != null or firstObjectString(root_obj, token_fields) != null) {
+        return root_obj;
+    }
+    if (root_obj.get("data")) |data_val| {
+        if (data_val == .object) {
+            const nested = data_val.object;
+            if (firstObjectString(nested, redirect_fields) != null or firstObjectString(nested, token_fields) != null) {
+                return nested;
+            }
+        }
+    }
+    return root_obj;
+}
+
+fn connectResponseLooksLinkWithoutRedirect(allocator: std.mem.Allocator, raw_body: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const obj = selectConnectPayloadObject(parsed.value.object);
+    const has_redirect = firstObjectString(obj, &.{ "redirect_url", "redirectUrl", "url", "link" }) != null;
+    const has_token = firstObjectString(obj, &.{ "link_token", "linkToken" }) != null;
+    return has_token and !has_redirect;
+}
+
 /// Normalize Composio connect response into a stable payload that always includes
 /// one canonical URL field (`redirect_url`).
 fn normalizeConnectLinkResponse(allocator: std.mem.Allocator, raw_body: []const u8) !?[]u8 {
@@ -481,26 +557,17 @@ fn normalizeConnectLinkResponse(allocator: std.mem.Allocator, raw_body: []const 
     defer parsed.deinit();
     if (parsed.value != .object) return null;
 
-    const obj = parsed.value.object;
+    const obj = selectConnectPayloadObject(parsed.value.object);
     const redirect_in = firstObjectString(obj, &.{ "redirect_url", "redirectUrl", "url", "link" });
     const link_token = firstObjectString(obj, &.{ "link_token", "linkToken" });
     const expires_at = firstObjectString(obj, &.{ "expires_at", "expiresAt" });
     const connected_account_id = firstObjectString(obj, &.{ "connected_account_id", "connectedAccountId" });
-
-    const redirect_url: ?[]const u8 = if (redirect_in) |url|
-        url
-    else if (link_token) |token|
-        std.fmt.allocPrint(allocator, "https://connect.composio.dev/link/{s}", .{token}) catch null
-    else
-        null;
-    defer if (redirect_in == null and redirect_url != null) allocator.free(redirect_url.?);
-
-    if (redirect_url == null) return null;
+    if (redirect_in == null) return null;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"status\":\"connect_link_created\",\"redirect_url\":\"");
-    try appendJsonEscaped(&out, allocator, redirect_url.?);
+    try appendJsonEscaped(&out, allocator, redirect_in.?);
     try out.appendSlice(allocator, "\"");
 
     if (expires_at) |value| {
@@ -519,7 +586,17 @@ fn normalizeConnectLinkResponse(allocator: std.mem.Allocator, raw_body: []const 
         try out.appendSlice(allocator, ",\"connected_account_id\":null");
     }
 
-    try out.appendSlice(allocator, ",\"note\":\"Open redirect_url exactly as returned; avoid rebuilding from link_token.\"}");
+    if (link_token) |value| {
+        try out.appendSlice(allocator, ",\"link_token\":\"");
+        try appendJsonEscaped(&out, allocator, value);
+        try out.appendSlice(allocator, "\"");
+    } else {
+        try out.appendSlice(allocator, ",\"link_token\":null");
+    }
+
+    try out.appendSlice(allocator, ",\"generated_at_s\":");
+    try std.fmt.format(out.writer(allocator), "{d}", .{std.time.timestamp()});
+    try out.appendSlice(allocator, ",\"note\":\"Open redirect_url exactly as returned. Link is short-lived and may be single-use; if invalid, generate a fresh connect link.\"}");
     const owned = try out.toOwnedSlice(allocator);
     return owned;
 }
@@ -534,14 +611,107 @@ fn lowerNoSeparators(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn parseFirstAuthConfigId(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+const AuthConfigSelection = struct {
+    id: []u8,
+    score: u8,
+    updated_at: []const u8,
+};
+
+fn authConfigCanonicalToolkitSlug(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !?[]u8 {
+    if (obj.get("toolkit")) |toolkit_val| {
+        if (toolkit_val == .object) {
+            if (toolkit_val.object.get("slug")) |slug_val| {
+                if (slug_val == .string and slug_val.string.len > 0) {
+                    return try lowerNoSeparators(allocator, slug_val.string);
+                }
+            }
+        }
+    }
+
+    const direct = firstObjectString(obj, &.{ "toolkit_slug", "toolkitSlug", "app" }) orelse return null;
+    return try lowerNoSeparators(allocator, direct);
+}
+
+fn authConfigSelectionScore(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    expected_toolkit_canonical: []const u8,
+) !?u8 {
+    if (obj.get("status")) |status_val| {
+        if (status_val == .string and std.ascii.eqlIgnoreCase(status_val.string, "DISABLED")) {
+            return null;
+        }
+    }
+    if (try authConfigCanonicalToolkitSlug(allocator, obj)) |observed| {
+        defer allocator.free(observed);
+        if (std.mem.eql(u8, observed, expected_toolkit_canonical)) return 2;
+    }
+    return 1;
+}
+
+fn selectionUpdatedAt(obj: std.json.ObjectMap) []const u8 {
+    return firstObjectString(obj, &.{ "last_updated_at", "lastUpdatedAt", "updated_at", "updatedAt" }) orelse "";
+}
+
+fn considerAuthConfigSelection(
+    allocator: std.mem.Allocator,
+    maybe_best: *?AuthConfigSelection,
+    ambiguous: *bool,
+    obj: std.json.ObjectMap,
+    expected_toolkit_canonical: []const u8,
+) !void {
+    const score = (try authConfigSelectionScore(allocator, obj, expected_toolkit_canonical)) orelse return;
+    const id = firstObjectString(obj, &.{ "id", "auth_config_id", "authConfigId", "nanoid" }) orelse return;
+    const updated_at = selectionUpdatedAt(obj);
+
+    if (maybe_best.* == null) {
+        maybe_best.* = .{
+            .id = try allocator.dupe(u8, id),
+            .score = score,
+            .updated_at = updated_at,
+        };
+        ambiguous.* = false;
+        return;
+    }
+
+    const best = &maybe_best.*.?;
+    var replace = false;
+    if (score > best.score) {
+        replace = true;
+    } else if (score == best.score) {
+        const order = std.mem.order(u8, updated_at, best.updated_at);
+        if (order == .gt) {
+            replace = true;
+        } else if (order == .eq and !std.mem.eql(u8, id, best.id)) {
+            ambiguous.* = true;
+        }
+    }
+
+    if (replace) {
+        allocator.free(best.id);
+        best.* = .{
+            .id = try allocator.dupe(u8, id),
+            .score = score,
+            .updated_at = updated_at,
+        };
+        ambiguous.* = false;
+    }
+}
+
+fn parseBestAuthConfigId(allocator: std.mem.Allocator, body: []const u8, expected_toolkit_slug: []const u8) ![]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidResponse;
     const obj = parsed.value.object;
+    const expected_toolkit_canonical = try lowerNoSeparators(allocator, expected_toolkit_slug);
+    defer allocator.free(expected_toolkit_canonical);
 
-    if (extractAuthConfigIdFromObject(allocator, obj)) |id| return id else |_| {}
+    var best: ?AuthConfigSelection = null;
+    defer if (best) |selection| allocator.free(selection.id);
+    var ambiguous = false;
+
+    try considerAuthConfigSelection(allocator, &best, &ambiguous, obj, expected_toolkit_canonical);
 
     const list_fields = [_][]const u8{ "items", "data", "results", "auth_configs" };
     for (list_fields) |field| {
@@ -549,25 +719,13 @@ fn parseFirstAuthConfigId(allocator: std.mem.Allocator, body: []const u8) ![]u8 
         if (list_val != .array) continue;
         for (list_val.array.items) |item| {
             if (item != .object) continue;
-            if (extractAuthConfigIdFromObject(allocator, item.object)) |id| return id else |_| {}
+            try considerAuthConfigSelection(allocator, &best, &ambiguous, item.object, expected_toolkit_canonical);
         }
     }
 
-    return error.AuthConfigNotFound;
-}
-
-fn extractAuthConfigIdFromObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8 {
-    if (obj.get("status")) |status_val| {
-        if (status_val == .string and std.ascii.eqlIgnoreCase(status_val.string, "DISABLED")) {
-            return error.AuthConfigDisabled;
-        }
-    }
-    const id_fields = [_][]const u8{ "id", "auth_config_id", "authConfigId", "nanoid" };
-    for (id_fields) |field| {
-        const id_val = obj.get(field) orelse continue;
-        if (id_val == .string and id_val.string.len > 0) {
-            return allocator.dupe(u8, id_val.string);
-        }
+    if (best) |selection| {
+        if (ambiguous) return error.AuthConfigAmbiguous;
+        return allocator.dupe(u8, selection.id);
     }
     return error.AuthConfigNotFound;
 }
@@ -834,6 +992,25 @@ test "composio buildConnectBodyV3 includes callback_url and connection_data when
     try std.testing.expect(std.mem.indexOf(u8, body, "\"connection_data\":{\"tenant\":\"acme\"}") != null);
 }
 
+test "composio validateConnectCallbackUrl accepts https" {
+    try validateConnectCallbackUrl("https://example.com/cb");
+}
+
+test "composio validateConnectCallbackUrl accepts local http" {
+    try validateConnectCallbackUrl("http://localhost:3000/cb");
+    try validateConnectCallbackUrl("http://127.0.0.1:8080/cb");
+    try validateConnectCallbackUrl("http://[::1]:8787/cb");
+}
+
+test "composio validateConnectCallbackUrl rejects non-local http" {
+    try std.testing.expectError(error.InvalidCallbackUrl, validateConnectCallbackUrl("http://example.com/cb"));
+}
+
+test "composio validateConnectCallbackUrl rejects malformed values" {
+    try std.testing.expectError(error.InvalidCallbackUrl, validateConnectCallbackUrl(""));
+    try std.testing.expectError(error.InvalidCallbackUrl, validateConnectCallbackUrl("ftp://example.com/cb"));
+}
+
 test "composio normalizeConnectLinkResponse prefers redirect_url" {
     const alloc = std.testing.allocator;
     const raw =
@@ -844,15 +1021,33 @@ test "composio normalizeConnectLinkResponse prefers redirect_url" {
     try std.testing.expect(normalized != null);
     try std.testing.expect(std.mem.indexOf(u8, normalized.?, "\"redirect_url\":\"https://connect.composio.dev/link/lk_abc?sid=1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, normalized.?, "\"connected_account_id\":\"ca_123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.?, "\"generated_at_s\":") != null);
 }
 
-test "composio normalizeConnectLinkResponse builds redirect_url from link_token" {
+test "composio normalizeConnectLinkResponse requires redirect_url" {
     const alloc = std.testing.allocator;
     const raw = "{\"link_token\":\"lk_xyz\"}";
     const normalized = try normalizeConnectLinkResponse(alloc, raw);
+    try std.testing.expect(normalized == null);
+}
+
+test "composio normalizeConnectLinkResponse supports nested data payload" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"status":"ok","data":{"link_token":"lk_nested","redirect_url":"https://connect.composio.dev/link/lk_nested","expires_at":"2026-03-10T00:00:00Z","connected_account_id":"ca_nested"}}
+    ;
+    const normalized = try normalizeConnectLinkResponse(alloc, raw);
     defer if (normalized) |v| alloc.free(v);
     try std.testing.expect(normalized != null);
-    try std.testing.expect(std.mem.indexOf(u8, normalized.?, "\"redirect_url\":\"https://connect.composio.dev/link/lk_xyz\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.?, "\"redirect_url\":\"https://connect.composio.dev/link/lk_nested\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.?, "\"connected_account_id\":\"ca_nested\"") != null);
+}
+
+test "composio connectResponseLooksLinkWithoutRedirect flags unusable payload" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(connectResponseLooksLinkWithoutRedirect(alloc, "{\"link_token\":\"lk_xyz\"}"));
+    try std.testing.expect(connectResponseLooksLinkWithoutRedirect(alloc, "{\"data\":{\"link_token\":\"lk_xyz\"}}"));
+    try std.testing.expect(!connectResponseLooksLinkWithoutRedirect(alloc, "{\"redirect_url\":\"https://connect.composio.dev/link/lk_ok\"}"));
 }
 
 test "composio normalizeConnectLinkResponse returns null for non-object payload" {
@@ -868,11 +1063,55 @@ test "composio lowerNoSeparators normalizes toolkit slug variants" {
     try std.testing.expectEqualStrings("googledrive", normalized);
 }
 
-test "composio parseFirstAuthConfigId reads id from items payload" {
+test "composio parseBestAuthConfigId reads id from items payload" {
     const alloc = std.testing.allocator;
-    const id = try parseFirstAuthConfigId(alloc,
+    const id = try parseBestAuthConfigId(alloc,
         \\{"items":[{"id":"ac_abc123","status":"ENABLED"}]}
-    );
+    , "github");
+    defer alloc.free(id);
+    try std.testing.expectEqualStrings("ac_abc123", id);
+}
+
+test "composio parseBestAuthConfigId prefers exact toolkit match over newer non-match" {
+    const alloc = std.testing.allocator;
+    const id = try parseBestAuthConfigId(alloc,
+        \\{"items":[{"id":"ac_new","status":"ENABLED","toolkit":{"slug":"gmail"},"last_updated_at":"2026-03-15T12:00:00Z"},{"id":"ac_exact","status":"ENABLED","toolkit":{"slug":"github"},"last_updated_at":"2026-03-14T12:00:00Z"}]}
+    , "github");
+    defer alloc.free(id);
+    try std.testing.expectEqualStrings("ac_exact", id);
+}
+
+test "composio parseBestAuthConfigId ignores disabled entries" {
+    const alloc = std.testing.allocator;
+    const id = try parseBestAuthConfigId(alloc,
+        \\{"items":[{"id":"ac_disabled","status":"DISABLED","toolkit":{"slug":"github"}},{"id":"ac_enabled","status":"ENABLED","toolkit":{"slug":"github"}}]}
+    , "github");
+    defer alloc.free(id);
+    try std.testing.expectEqualStrings("ac_enabled", id);
+}
+
+test "composio parseBestAuthConfigId uses latest updated timestamp for ties" {
+    const alloc = std.testing.allocator;
+    const id = try parseBestAuthConfigId(alloc,
+        \\{"items":[{"id":"ac_old","status":"ENABLED","toolkit":{"slug":"github"},"last_updated_at":"2026-03-14T12:00:00Z"},{"id":"ac_new","status":"ENABLED","toolkit":{"slug":"github"},"last_updated_at":"2026-03-15T12:00:00Z"}]}
+    , "github");
+    defer alloc.free(id);
+    try std.testing.expectEqualStrings("ac_new", id);
+}
+
+test "composio parseBestAuthConfigId returns ambiguous when tie remains" {
+    const alloc = std.testing.allocator;
+    const result = parseBestAuthConfigId(alloc,
+        \\{"items":[{"id":"ac_a","status":"ENABLED","toolkit":{"slug":"github"},"last_updated_at":"2026-03-15T12:00:00Z"},{"id":"ac_b","status":"ENABLED","toolkit":{"slug":"github"},"last_updated_at":"2026-03-15T12:00:00Z"}]}
+    , "github");
+    try std.testing.expectError(error.AuthConfigAmbiguous, result);
+}
+
+test "composio parseBestAuthConfigId supports direct toolkit_slug field" {
+    const alloc = std.testing.allocator;
+    const id = try parseBestAuthConfigId(alloc,
+        \\{"items":[{"id":"ac_abc123","status":"ENABLED","toolkit_slug":"github"}]}
+    , "github");
     defer alloc.free(id);
     try std.testing.expectEqualStrings("ac_abc123", id);
 }

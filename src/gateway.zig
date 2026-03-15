@@ -3126,10 +3126,31 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
         return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
     };
     defer allocator.free(resp);
-    if (!(jsonBoolField(resp, "ok") orelse false)) {
-        log.warn("telegram sendMessage api returned non-ok; retrying via curl fallback", .{});
-        return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
+    try ensureTelegramSendMessageAccepted(allocator, resp);
+}
+
+fn ensureTelegramSendMessageAccepted(allocator: std.mem.Allocator, response_body: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch {
+        const preview_len: usize = @min(response_body.len, 220);
+        log.warn("telegram sendMessage rejected: non-json body_preview={s}", .{response_body[0..preview_len]});
+        return error.TelegramApiRejected;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TelegramApiRejected;
+
+    const ok_val = parsed.value.object.get("ok") orelse return error.TelegramApiRejected;
+    if (ok_val == .bool and ok_val.bool) return;
+
+    if (parsed.value.object.get("description")) |desc_val| {
+        if (desc_val == .string and desc_val.string.len > 0) {
+            log.warn("telegram sendMessage rejected: {s}", .{desc_val.string});
+            return error.TelegramApiRejected;
+        }
     }
+
+    const preview_len: usize = @min(response_body.len, 220);
+    log.warn("telegram sendMessage rejected: body_preview={s}", .{response_body[0..preview_len]});
+    return error.TelegramApiRejected;
 }
 
 fn telegramReplyContainsMediaMarkers(text: []const u8) bool {
@@ -8748,6 +8769,23 @@ test "jsonStringField handles nested JSON" {
     const val = jsonStringField(json, "text");
     try std.testing.expect(val != null);
     try std.testing.expectEqualStrings("hi", val.?);
+}
+
+test "ensureTelegramSendMessageAccepted accepts ok=true payload" {
+    try ensureTelegramSendMessageAccepted(std.testing.allocator, "{\"ok\":true,\"result\":{}}");
+}
+
+test "ensureTelegramSendMessageAccepted rejects ok=false payload" {
+    const result = ensureTelegramSendMessageAccepted(
+        std.testing.allocator,
+        "{\"ok\":false,\"description\":\"Bad Request: chat not found\"}",
+    );
+    try std.testing.expectError(error.TelegramApiRejected, result);
+}
+
+test "ensureTelegramSendMessageAccepted rejects non-json payload" {
+    const result = ensureTelegramSendMessageAccepted(std.testing.allocator, "<html>error</html>");
+    try std.testing.expectError(error.TelegramApiRejected, result);
 }
 
 test "jsonIntField extracts positive integer" {
