@@ -3126,19 +3126,27 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
         return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
     };
     defer allocator.free(resp);
-    try ensureTelegramSendMessageAccepted(allocator, resp);
+    ensureTelegramSendMessageAccepted(allocator, resp) catch |err| {
+        switch (err) {
+            error.TelegramApiUnexpectedResponse => {
+                log.warn("telegram sendMessage unexpected response; retrying via curl fallback", .{});
+                return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
+            },
+            else => return err,
+        }
+    };
 }
 
 fn ensureTelegramSendMessageAccepted(allocator: std.mem.Allocator, response_body: []const u8) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch {
         const preview_len: usize = @min(response_body.len, 220);
         log.warn("telegram sendMessage rejected: non-json body_preview={s}", .{response_body[0..preview_len]});
-        return error.TelegramApiRejected;
+        return error.TelegramApiUnexpectedResponse;
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return error.TelegramApiRejected;
+    if (parsed.value != .object) return error.TelegramApiUnexpectedResponse;
 
-    const ok_val = parsed.value.object.get("ok") orelse return error.TelegramApiRejected;
+    const ok_val = parsed.value.object.get("ok") orelse return error.TelegramApiUnexpectedResponse;
     if (ok_val == .bool and ok_val.bool) return;
 
     if (parsed.value.object.get("description")) |desc_val| {
@@ -3149,8 +3157,8 @@ fn ensureTelegramSendMessageAccepted(allocator: std.mem.Allocator, response_body
     }
 
     const preview_len: usize = @min(response_body.len, 220);
-    log.warn("telegram sendMessage rejected: body_preview={s}", .{response_body[0..preview_len]});
-    return error.TelegramApiRejected;
+    log.warn("telegram sendMessage unexpected payload: body_preview={s}", .{response_body[0..preview_len]});
+    return error.TelegramApiUnexpectedResponse;
 }
 
 fn telegramReplyContainsMediaMarkers(text: []const u8) bool {
@@ -3225,6 +3233,12 @@ fn sendTelegramReplyViaCurlFallback(allocator: std.mem.Allocator, bot_token: []c
         },
         else => return error.CurlFailed,
     }
+
+    if (stdout_bytes.len == 0) return;
+    ensureTelegramSendMessageAccepted(allocator, stdout_bytes) catch |err| switch (err) {
+        error.TelegramApiUnexpectedResponse => return error.TelegramApiRejected,
+        else => return err,
+    };
 }
 
 fn userFacingAgentError(err: anyerror) []const u8 {
@@ -8785,7 +8799,12 @@ test "ensureTelegramSendMessageAccepted rejects ok=false payload" {
 
 test "ensureTelegramSendMessageAccepted rejects non-json payload" {
     const result = ensureTelegramSendMessageAccepted(std.testing.allocator, "<html>error</html>");
-    try std.testing.expectError(error.TelegramApiRejected, result);
+    try std.testing.expectError(error.TelegramApiUnexpectedResponse, result);
+}
+
+test "ensureTelegramSendMessageAccepted rejects payload without ok field" {
+    const result = ensureTelegramSendMessageAccepted(std.testing.allocator, "{\"result\":{}}");
+    try std.testing.expectError(error.TelegramApiUnexpectedResponse, result);
 }
 
 test "jsonIntField extracts positive integer" {
