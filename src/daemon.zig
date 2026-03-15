@@ -796,6 +796,7 @@ fn runHeartbeatAgentTurn(
     user_id: []const u8,
     user_root: []const u8,
     workspace_path: []const u8,
+    event_bus: *bus_mod.Bus,
     prompt: []const u8,
     turn_origin: tools_mod.TurnOrigin,
 ) ![]const u8 {
@@ -809,7 +810,14 @@ fn runHeartbeatAgentTurn(
         .command = if (turn_origin == .wake) HEARTBEAT_WAKE_COMMAND else "heartbeat",
         .session_target = .isolated,
     };
-    return runCronAgentTurn(@ptrCast(@constCast(config)), allocator, &scheduler, &heartbeat_job, prompt);
+    return runCronAgentTurnWithBus(
+        @ptrCast(@constCast(config)),
+        allocator,
+        &scheduler,
+        &heartbeat_job,
+        prompt,
+        event_bus,
+    );
 }
 
 fn runTenantHeartbeatForUser(
@@ -871,7 +879,7 @@ fn runTenantHeartbeatForUser(
     else
         .heartbeat;
 
-    const reply = runHeartbeatAgentTurn(allocator, config, user_id, user_root, workspace_path, hb_cfg.prompt, turn_origin) catch |err| {
+    const reply = runHeartbeatAgentTurn(allocator, config, user_id, user_root, workspace_path, event_bus, hb_cfg.prompt, turn_origin) catch |err| {
         log.warn("heartbeat agent turn failed for user={s}: {}", .{ user_id, err });
         saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "turn_error");
         return;
@@ -1119,12 +1127,13 @@ fn schedulerJobChanged(job: *const cron.CronJob, snapshot: SchedulerJobSnapshot)
     return false;
 }
 
-fn runCronAgentTurn(
+fn runCronAgentTurnWithBus(
     ctx: ?*anyopaque,
     allocator: std.mem.Allocator,
     scheduler: *const CronScheduler,
     job: *const cron.CronJob,
     prompt: []const u8,
+    out_bus: ?*bus_mod.Bus,
 ) ![]const u8 {
     const cfg_ptr = ctx orelse return error.InvalidArgument;
     const cfg: *const Config = @ptrCast(@alignCast(cfg_ptr));
@@ -1153,7 +1162,7 @@ fn runCronAgentTurn(
         onboard.projectContextForConfig(&runtime_cfg);
     onboard.scaffoldWorkspace(allocator, runtime_cfg.workspace_dir, &project_ctx) catch {};
 
-    var runtime = try channel_loop.ChannelRuntime.init(allocator, &runtime_cfg, null);
+    var runtime = try channel_loop.ChannelRuntime.init(allocator, &runtime_cfg, out_bus);
     defer runtime.deinit();
 
     var session_buf: [256]u8 = undefined;
@@ -1193,6 +1202,23 @@ fn runCronAgentTurn(
     return runtime.session_mgr.processMessageWithContext(session_key, prompt, null, .{
         .turn_origin = turn_origin,
     });
+}
+
+fn runCronAgentTurn(
+    ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    scheduler: *const CronScheduler,
+    job: *const cron.CronJob,
+    prompt: []const u8,
+) ![]const u8 {
+    return runCronAgentTurnWithBus(
+        ctx,
+        allocator,
+        scheduler,
+        job,
+        prompt,
+        scheduler.tick_out_bus,
+    );
 }
 
 fn resolveCronTurnOrigin(job: *const cron.CronJob) tools_mod.TurnOrigin {

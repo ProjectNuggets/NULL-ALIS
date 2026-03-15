@@ -134,6 +134,11 @@ pub const MessageTool = struct {
         if (is_telegram_channel and can_direct_telegram and !is_background_origin) {
             return send_telegram_direct(allocator, content, account_id, chat_id_opt);
         }
+        // Background turns should primarily use bus dispatch, but allow a direct
+        // fallback when bus wiring is unavailable for this runtime lane.
+        if (is_telegram_channel and can_direct_telegram and is_background_origin and self.event_bus == null) {
+            return send_telegram_direct(allocator, content, account_id, chat_id_opt);
+        }
         if (self.event_bus == null and is_telegram_channel) {
             if (is_background_origin) {
                 return ToolResult.fail("Background Telegram send requires event bus dispatch");
@@ -180,6 +185,9 @@ pub const MessageTool = struct {
 
         event_bus.publishOutbound(msg) catch {
             msg.deinit(outbound_allocator);
+            if (is_telegram_channel and can_direct_telegram and is_background_origin) {
+                return send_telegram_direct(allocator, content, account_id, chat_id_opt);
+            }
             return ToolResult.fail("Bus is closed, cannot send message");
         };
 

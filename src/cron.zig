@@ -446,6 +446,7 @@ pub const CronScheduler = struct {
     context_numeric_user_id: ?i64 = null,
     context_state_mgr: ?*zaki_state.Manager = null,
     context_expect_postgres_state: bool = false,
+    tick_out_bus: ?*bus.Bus = null,
     agent_runner: ?AgentRunnerFn = null,
     agent_runner_ctx: ?*anyopaque = null,
 
@@ -768,6 +769,9 @@ pub const CronScheduler = struct {
     /// Execute one tick of the scheduler: run all due jobs, deliver results, handle one-shots.
     /// Separated from `run` for testability.
     pub fn tick(self: *CronScheduler, now: i64, out_bus: ?*bus.Bus) bool {
+        self.tick_out_bus = out_bus;
+        defer self.tick_out_bus = null;
+
         var changed = false;
 
         // Collect indices of one-shot jobs to remove after iteration
