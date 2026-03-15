@@ -129,7 +129,7 @@ fn normalizeMorningBriefJob(
     job_id: []const u8,
 ) !void {
     const job = scheduler.getMutableJob(job_id) orelse return error.JobNotFound;
-    job.session_target = .main;
+    job.session_target = .isolated;
     job.wake_mode = .now;
     job.job_type = .agent;
 
@@ -216,7 +216,7 @@ fn applyTenantDefaults(
     const tenant = root.getTenantContext();
     if (tenant.numeric_user_id == null) return;
     const job = scheduler.getMutableJob(job_id) orelse return;
-    job.session_target = .main;
+    job.session_target = .isolated;
 
     const turn = message_tool.MessageTool.getTurnContext();
     const reminder_text = parseMessageCommand(command) orelse parseEchoCommand(command) orelse return;
@@ -1011,7 +1011,7 @@ test "schedule tenant defaults convert echo without live target into agent remin
     try applyTenantDefaults(&scheduler, std.testing.allocator, job.id, job.command);
     const updated = scheduler.getJob(job.id).?;
     try std.testing.expectEqual(cron.JobType.agent, updated.job_type);
-    try std.testing.expectEqual(cron.SessionTarget.main, updated.session_target);
+    try std.testing.expectEqual(cron.SessionTarget.isolated, updated.session_target);
     try std.testing.expectEqual(cron.DeliveryMode.none, updated.delivery.mode);
     try std.testing.expectEqualStrings("Meeting starts now", updated.command);
     try std.testing.expect(updated.prompt != null);
@@ -1039,7 +1039,7 @@ test "schedule tenant defaults keep normal shell commands intact" {
     try applyTenantDefaults(&scheduler, std.testing.allocator, job.id, job.command);
     const updated = scheduler.getJob(job.id).?;
     try std.testing.expectEqual(cron.JobType.shell, updated.job_type);
-    try std.testing.expectEqual(cron.SessionTarget.main, updated.session_target);
+    try std.testing.expectEqual(cron.SessionTarget.isolated, updated.session_target);
     try std.testing.expectEqual(cron.DeliveryMode.none, updated.delivery.mode);
     try std.testing.expectEqualStrings("echo-shell-output >/tmp/task.log", updated.command);
     try std.testing.expect(updated.prompt == null);

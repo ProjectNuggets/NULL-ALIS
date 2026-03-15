@@ -1278,6 +1278,11 @@ pub const Agent = struct {
                     self.stream_callback.?,
                     self.stream_ctx.?,
                 ) catch |err| {
+                    log.warn("llm.call failed provider={s} model={s} error={s}", .{
+                        self.provider.getName(),
+                        self.model_name,
+                        @errorName(err),
+                    });
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
@@ -1310,6 +1315,11 @@ pub const Agent = struct {
                     self.model_name,
                     self.temperature,
                 ) catch |err| retry_blk: {
+                    log.warn("llm.call failed provider={s} model={s} error={s}", .{
+                        self.provider.getName(),
+                        self.model_name,
+                        @errorName(err),
+                    });
                     // Record the failed attempt
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{

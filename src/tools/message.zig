@@ -13,7 +13,6 @@ const bus = @import("../bus.zig");
 const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
 const runtime_resolver = @import("../delivery/runtime_resolver.zig");
-const ops_guard = @import("../ops_guard.zig");
 const log = std.log.scoped(.message_tool);
 
 /// Message tool — sends a message to a specific channel/chat via the bus.
@@ -132,11 +131,14 @@ pub const MessageTool = struct {
         // Prefer direct Telegram delivery when tenant state is available.
         // This provides immediate success/failure instead of "queued" semantics,
         // and avoids account mismatch drops in the async dispatcher path.
-        if (is_telegram_channel and can_direct_telegram) {
-            return send_telegram_direct(allocator, content, account_id, chat_id_opt, is_background_origin);
+        if (is_telegram_channel and can_direct_telegram and !is_background_origin) {
+            return send_telegram_direct(allocator, content, account_id, chat_id_opt);
         }
         if (self.event_bus == null and is_telegram_channel) {
-            return send_telegram_direct(allocator, content, account_id, chat_id_opt, is_background_origin);
+            if (is_background_origin) {
+                return ToolResult.fail("Background Telegram send requires event bus dispatch");
+            }
+            return send_telegram_direct(allocator, content, account_id, chat_id_opt);
         }
 
         const chat_id = chat_id_opt orelse
@@ -151,6 +153,7 @@ pub const MessageTool = struct {
             std.fmt.bufPrint(&user_id_buf, "{d}", .{user_id}) catch null
         else
             null;
+        const source_tag: ?[]const u8 = if (is_background_origin) "tool" else null;
 
         const msg = (if (account_id) |aid|
             bus.makeOutboundWithAccountAnnotated(
@@ -159,7 +162,7 @@ pub const MessageTool = struct {
                 aid,
                 chat_id,
                 content,
-                "tool",
+                source_tag,
                 user_id_opt,
                 null,
             )
@@ -169,7 +172,7 @@ pub const MessageTool = struct {
                 channel,
                 chat_id,
                 content,
-                "tool",
+                source_tag,
                 user_id_opt,
                 null,
             )) catch
@@ -205,7 +208,6 @@ pub const MessageTool = struct {
         content: []const u8,
         requested_account_id: ?[]const u8,
         requested_chat_id: ?[]const u8,
-        is_background_origin: bool,
     ) ToolResult {
         const tenant_ctx = root.getTenantContext();
         const state_mgr = tenant_ctx.state_mgr orelse
@@ -232,14 +234,6 @@ pub const MessageTool = struct {
         const resolved_chat_id = resolved.target_id orelse
             return ToolResult.fail("Telegram chat is not connected");
 
-        var user_id_buf: [32]u8 = undefined;
-        const proactive_user_id = resolveProactiveUserId(tenant_ctx, &user_id_buf);
-        if (is_background_origin) {
-            if (backgroundTelegramBlockReason(proactive_user_id, resolved_chat_id, content, std.time.timestamp())) |reason| {
-                return ToolResult.fail(reason);
-            }
-        }
-
         const url = std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{token}) catch
             return ToolResult.fail("Failed to build Telegram API URL");
         defer allocator.free(url);
@@ -262,28 +256,16 @@ pub const MessageTool = struct {
             .body = body.items,
             .timeout_ms = 30_000,
             .max_response_bytes = 256 * 1024,
-        }) catch |err| {
-            if (is_background_origin) {
-                ops_guard.recordProactiveSendError("tool", proactive_user_id, "telegram", resolved_chat_id, @errorName(err), std.time.timestamp());
-            }
+        }) catch {
             return ToolResult.fail("Telegram send failed");
         };
         defer allocator.free(response.body);
 
         if (response.status_code < 200 or response.status_code >= 300) {
-            if (is_background_origin) {
-                ops_guard.recordProactiveSendError("tool", proactive_user_id, "telegram", resolved_chat_id, "http_status", std.time.timestamp());
-            }
             return ToolResult.fail("Telegram send failed");
         }
         if (!telegramApiResponseOk(allocator, response.body)) {
-            if (is_background_origin) {
-                ops_guard.recordProactiveSendError("tool", proactive_user_id, "telegram", resolved_chat_id, "api_rejected", std.time.timestamp());
-            }
             return ToolResult.fail("Telegram API rejected message");
-        }
-        if (is_background_origin) {
-            ops_guard.recordProactiveSent("tool", proactive_user_id, "telegram", resolved_chat_id, std.time.timestamp());
         }
 
         if (std.fmt.allocPrint(
@@ -298,26 +280,6 @@ pub const MessageTool = struct {
         } else |_| {
             return ToolResult.ok("Message delivered to telegram");
         }
-    }
-
-    fn resolveProactiveUserId(tenant_ctx: root.ToolTenantContext, user_id_buf: *[32]u8) ?[]const u8 {
-        if (tenant_ctx.numeric_user_id) |numeric_user_id| {
-            return std.fmt.bufPrint(user_id_buf, "{d}", .{numeric_user_id}) catch tenant_ctx.user_id;
-        }
-        return tenant_ctx.user_id;
-    }
-
-    fn backgroundTelegramBlockReason(
-        user_id_opt: ?[]const u8,
-        chat_id: []const u8,
-        content: []const u8,
-        now_s: i64,
-    ) ?[]const u8 {
-        return switch (ops_guard.allowProactive("tool", user_id_opt, "telegram", chat_id, content, null, now_s)) {
-            .allow => null,
-            .blocked_rate => "Telegram send blocked by background rate guard",
-            .blocked_dedupe => "Telegram send blocked by background dedupe guard",
-        };
     }
 
     fn telegramApiResponseOk(allocator: std.mem.Allocator, body: []const u8) bool {
@@ -587,13 +549,23 @@ test "MessageTool background telegram without connected target fails explicitly"
     try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Telegram chat is not connected") != null);
 }
 
-test "MessageTool background proactive guard blocks duplicate direct sends" {
-    const now_s = std.time.timestamp();
-    const block_first = MessageTool.backgroundTelegramBlockReason("msg-tool-guard-user", "msg-tool-guard-chat", "hello guard", now_s);
-    try testing.expect(block_first == null);
+test "MessageTool background telegram requires bus when direct path is unavailable" {
+    resetTestTurnContext();
+    defer resetTestTurnContext();
+    root.setTurnContext(.{ .origin = .heartbeat });
+    defer root.clearTurnContext();
 
-    const block_second = MessageTool.backgroundTelegramBlockReason("msg-tool-guard-user", "msg-tool-guard-chat", "hello guard", now_s + 1) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("Telegram send blocked by background dedupe guard", block_second);
+    var mt = MessageTool{};
+    MessageTool.setTurnContext(.{
+        .channel = "telegram",
+        .chat_id = "123",
+    });
+    const parsed = try root.parseTestArgs("{\"content\":\"hello\"}");
+    defer parsed.deinit();
+
+    const result = try mt.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Background Telegram send requires event bus dispatch", result.error_msg.?);
 }
 
 test "MessageTool background telegram rejects invalid explicit chat_id" {

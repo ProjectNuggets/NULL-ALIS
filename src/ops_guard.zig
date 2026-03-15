@@ -4,9 +4,15 @@ const json_util = @import("json_util.zig");
 const MAX_TRACKED_KEYS: usize = 4096;
 const MAX_EVENTS: usize = 64;
 const EVENT_FIELD_CAP: usize = 72;
-const DEDUPE_WINDOW_SECS: i64 = 120;
-const RATE_WINDOW_SECS: i64 = 300;
-const PROACTIVE_RATE_LIMIT_PER_WINDOW: u32 = 12;
+const DEFAULT_DEDUPE_WINDOW_SECS: i64 = 120;
+const DEFAULT_RATE_WINDOW_SECS: i64 = 300;
+const DEFAULT_PROACTIVE_RATE_LIMIT_PER_WINDOW: u32 = 12;
+const MIN_DEDUPE_WINDOW_SECS: i64 = 5;
+const MAX_DEDUPE_WINDOW_SECS: i64 = 600;
+const MIN_RATE_WINDOW_SECS: i64 = 30;
+const MAX_RATE_WINDOW_SECS: i64 = 3600;
+const MIN_RATE_LIMIT_PER_WINDOW: u32 = 1;
+const MAX_RATE_LIMIT_PER_WINDOW: u32 = 1000;
 
 const EventAction = enum {
     sent,
@@ -54,6 +60,34 @@ const GuardState = struct {
 };
 
 var g_state = GuardState{};
+const GuardPolicy = struct {
+    dedupe_window_secs: i64 = DEFAULT_DEDUPE_WINDOW_SECS,
+    rate_window_secs: i64 = DEFAULT_RATE_WINDOW_SECS,
+    proactive_rate_limit_per_window: u32 = DEFAULT_PROACTIVE_RATE_LIMIT_PER_WINDOW,
+};
+var g_policy = GuardPolicy{};
+
+fn clampI64(value: i64, min: i64, max: i64) i64 {
+    return std.math.clamp(value, min, max);
+}
+
+fn clampU32(value: u32, min: u32, max: u32) u32 {
+    return std.math.clamp(value, min, max);
+}
+
+pub fn configureProactivePolicy(
+    dedupe_window_secs: u32,
+    rate_window_secs: u32,
+    rate_limit_per_window: u32,
+) void {
+    g_state.mutex.lock();
+    defer g_state.mutex.unlock();
+    g_policy = .{
+        .dedupe_window_secs = clampI64(@intCast(dedupe_window_secs), MIN_DEDUPE_WINDOW_SECS, MAX_DEDUPE_WINDOW_SECS),
+        .rate_window_secs = clampI64(@intCast(rate_window_secs), MIN_RATE_WINDOW_SECS, MAX_RATE_WINDOW_SECS),
+        .proactive_rate_limit_per_window = clampU32(rate_limit_per_window, MIN_RATE_LIMIT_PER_WINDOW, MAX_RATE_LIMIT_PER_WINDOW),
+    };
+}
 
 fn copyField(dest: []u8, src: []const u8) u8 {
     const n: usize = @min(dest.len, src.len);
@@ -156,7 +190,7 @@ pub fn allowProactive(
     defer g_state.mutex.unlock();
 
     if (g_state.dedupe.get(dedupe_key)) |last_s| {
-        if (now_s - last_s <= DEDUPE_WINDOW_SECS and now_s >= last_s) {
+        if (now_s - last_s <= g_policy.dedupe_window_secs and now_s >= last_s) {
             g_state.proactive_blocked_dedupe_total += 1;
             addEventLocked(now_s, source, user_key, channel, chat_id, .blocked_dedupe, "dedupe_window");
             return .blocked_dedupe;
@@ -167,11 +201,11 @@ pub fn allowProactive(
         .window_start_s = now_s,
         .count = 0,
     };
-    if (now_s - bucket.window_start_s >= RATE_WINDOW_SECS or now_s < bucket.window_start_s) {
+    if (now_s - bucket.window_start_s >= g_policy.rate_window_secs or now_s < bucket.window_start_s) {
         bucket.window_start_s = now_s;
         bucket.count = 0;
     }
-    if (bucket.count >= PROACTIVE_RATE_LIMIT_PER_WINDOW) {
+    if (bucket.count >= g_policy.proactive_rate_limit_per_window) {
         g_state.proactive_blocked_rate_total += 1;
         addEventLocked(now_s, source, user_key, channel, chat_id, .blocked_rate, "rate_limit");
         return .blocked_rate;
@@ -245,6 +279,15 @@ pub fn diagnosticsJson(allocator: std.mem.Allocator) ![]u8 {
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "scheduler_blocked_cooldown_total", @intCast(g_state.scheduler_blocked_cooldown_total));
     try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "proactive_policy");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "dedupe_window_secs", g_policy.dedupe_window_secs);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "rate_window_secs", g_policy.rate_window_secs);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "rate_limit_per_window", g_policy.proactive_rate_limit_per_window);
+    try buf.appendSlice(allocator, "}");
+    try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(&buf, allocator, "last_event");
     if (g_state.event_len == 0) {
         try buf.appendSlice(allocator, "null");
@@ -306,12 +349,33 @@ test "ops guard blocks duplicate proactive message in dedupe window" {
 test "ops guard blocks proactive message on rate limit" {
     const base = std.time.timestamp();
     var i: u32 = 0;
-    while (i < PROACTIVE_RATE_LIMIT_PER_WINDOW) : (i += 1) {
+    while (i < g_policy.proactive_rate_limit_per_window) : (i += 1) {
         var key_buf: [32]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "msg-{d}", .{i}) catch "msg";
         try std.testing.expectEqual(ProactiveDecision.allow, allowProactive("cron", "2", "telegram", "200", key, key, base));
     }
     try std.testing.expectEqual(ProactiveDecision.blocked_rate, allowProactive("cron", "2", "telegram", "200", "overflow", "overflow", base));
+}
+
+test "ops guard configureProactivePolicy clamps values" {
+    configureProactivePolicy(1, 9_999, 0);
+
+    const payload = try diagnosticsJson(std.testing.allocator);
+    defer std.testing.allocator.free(payload);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    const policy = parsed.value.object.get("proactive_policy") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(policy == .object);
+    try std.testing.expectEqual(@as(i64, MIN_DEDUPE_WINDOW_SECS), policy.object.get("dedupe_window_secs").?.integer);
+    try std.testing.expectEqual(@as(i64, MAX_RATE_WINDOW_SECS), policy.object.get("rate_window_secs").?.integer);
+    try std.testing.expectEqual(@as(i64, MIN_RATE_LIMIT_PER_WINDOW), policy.object.get("rate_limit_per_window").?.integer);
+
+    configureProactivePolicy(
+        @intCast(DEFAULT_DEDUPE_WINDOW_SECS),
+        @intCast(DEFAULT_RATE_WINDOW_SECS),
+        DEFAULT_PROACTIVE_RATE_LIMIT_PER_WINDOW,
+    );
 }
 
 test "diagnosticsJson includes last_event summary" {

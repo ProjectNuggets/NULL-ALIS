@@ -157,6 +157,7 @@ pub const OpenAiCompatibleProvider = struct {
     pub fn extractResponsesText(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
+        if (parsed.value != .object) return error.NoResponseContent;
         const root_obj = parsed.value.object;
 
         // Check top-level output_text first
@@ -171,9 +172,13 @@ pub const OpenAiCompatibleProvider = struct {
 
         // Walk output[*].content[*] looking for type "output_text"
         if (root_obj.get("output")) |output_arr| {
+            if (output_arr != .array) return error.NoResponseContent;
             for (output_arr.array.items) |item| {
+                if (item != .object) continue;
                 if (item.object.get("content")) |content_arr| {
+                    if (content_arr != .array) continue;
                     for (content_arr.array.items) |content| {
+                        if (content != .object) continue;
                         const cobj = content.object;
                         if (cobj.get("type")) |t| {
                             if (t == .string and std.mem.eql(u8, t.string, "output_text")) {
@@ -194,9 +199,13 @@ pub const OpenAiCompatibleProvider = struct {
 
         // Fallback: any text in output[*].content[*]
         if (root_obj.get("output")) |output_arr| {
+            if (output_arr != .array) return error.NoResponseContent;
             for (output_arr.array.items) |item| {
+                if (item != .object) continue;
                 if (item.object.get("content")) |content_arr| {
+                    if (content_arr != .array) continue;
                     for (content_arr.array.items) |content| {
+                        if (content != .object) continue;
                         if (content.object.get("text")) |text| {
                             if (text == .string) {
                                 const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
@@ -238,7 +247,7 @@ pub const OpenAiCompatibleProvider = struct {
             break :blk root.request_with_mode(allocator, .{}, .{
                 .method = "POST",
                 .url = url,
-                .headers = &.{auth_hdr},
+                .headers = &.{ auth_hdr, "Content-Type: application/json" },
                 .body = body,
                 .timeout_ms = 30_000,
                 .subsystem = .providers,
@@ -246,6 +255,7 @@ pub const OpenAiCompatibleProvider = struct {
         } else root.request_with_mode(allocator, .{}, .{
             .method = "POST",
             .url = url,
+            .headers = &.{"Content-Type: application/json"},
             .body = body,
             .timeout_ms = 30_000,
             .subsystem = .providers,
@@ -321,6 +331,7 @@ pub const OpenAiCompatibleProvider = struct {
     pub fn parseTextResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
+        if (parsed.value != .object) return error.NoResponseContent;
         const root_obj = parsed.value.object;
 
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
@@ -328,8 +339,10 @@ pub const OpenAiCompatibleProvider = struct {
         }
 
         if (root_obj.get("choices")) |choices| {
-            if (choices.array.items.len > 0) {
+            if (choices != .array) return error.NoResponseContent;
+            if (choices.array.items.len > 0 and choices.array.items[0] == .object) {
                 if (choices.array.items[0].object.get("message")) |msg| {
+                    if (msg != .object) return error.NoResponseContent;
                     if (msg.object.get("content")) |content| {
                         if (content == .string) {
                             return try allocator.dupe(u8, content.string);
@@ -346,6 +359,7 @@ pub const OpenAiCompatibleProvider = struct {
     pub fn parseNativeResponse(allocator: std.mem.Allocator, body: []const u8) !ChatResponse {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
+        if (parsed.value != .object) return error.NoResponseContent;
         const root_obj = parsed.value.object;
 
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
@@ -353,8 +367,10 @@ pub const OpenAiCompatibleProvider = struct {
         }
 
         if (root_obj.get("choices")) |choices| {
-            if (choices.array.items.len > 0) {
+            if (choices != .array) return error.NoResponseContent;
+            if (choices.array.items.len > 0 and choices.array.items[0] == .object) {
                 const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
+                if (msg != .object) return error.NoResponseContent;
                 const msg_obj = msg.object;
 
                 var content: ?[]const u8 = null;
@@ -367,11 +383,15 @@ pub const OpenAiCompatibleProvider = struct {
                 var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
 
                 if (msg_obj.get("tool_calls")) |tc_arr| {
-                    for (tc_arr.array.items) |tc| {
+                    if (tc_arr != .array) {
+                        // Ignore malformed tool_calls and continue with text content.
+                    } else for (tc_arr.array.items) |tc| {
+                        if (tc != .object) continue;
                         const tc_obj = tc.object;
                         const id = if (tc_obj.get("id")) |i| (if (i == .string) try allocator.dupe(u8, i.string) else try allocator.dupe(u8, "unknown")) else try allocator.dupe(u8, "unknown");
 
                         if (tc_obj.get("function")) |func| {
+                            if (func != .object) continue;
                             const func_obj = func.object;
                             const name = if (func_obj.get("name")) |n| (if (n == .string) try allocator.dupe(u8, n.string) else try allocator.dupe(u8, "")) else try allocator.dupe(u8, "");
                             const arguments = if (func_obj.get("arguments")) |a| (if (a == .string) try allocator.dupe(u8, a.string) else try allocator.dupe(u8, "{}")) else try allocator.dupe(u8, "{}");
@@ -462,7 +482,7 @@ pub const OpenAiCompatibleProvider = struct {
         else
             null;
 
-        return sse.curlStream(allocator, url, body, auth_hdr, &.{}, request.timeout_secs, callback, callback_ctx);
+        return sse.curlStream(allocator, url, body, auth_hdr, &.{"Content-Type: application/json"}, request.timeout_secs, callback, callback_ctx);
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
@@ -509,7 +529,7 @@ pub const OpenAiCompatibleProvider = struct {
             break :blk root.request_with_mode(allocator, .{}, .{
                 .method = "POST",
                 .url = url,
-                .headers = &.{auth_hdr},
+                .headers = &.{ auth_hdr, "Content-Type: application/json" },
                 .body = body,
                 .timeout_ms = 30_000,
                 .subsystem = .providers,
@@ -517,6 +537,7 @@ pub const OpenAiCompatibleProvider = struct {
         } else root.request_with_mode(allocator, .{}, .{
             .method = "POST",
             .url = url,
+            .headers = &.{"Content-Type: application/json"},
             .body = body,
             .timeout_ms = 30_000,
             .subsystem = .providers,
@@ -562,7 +583,7 @@ pub const OpenAiCompatibleProvider = struct {
             break :blk root.request_with_mode(allocator, .{}, .{
                 .method = "POST",
                 .url = url,
-                .headers = &.{auth_hdr},
+                .headers = &.{ auth_hdr, "Content-Type: application/json" },
                 .body = body,
                 .timeout_ms = timeout_ms,
                 .subsystem = .providers,
@@ -570,6 +591,7 @@ pub const OpenAiCompatibleProvider = struct {
         } else root.request_with_mode(allocator, .{}, .{
             .method = "POST",
             .url = url,
+            .headers = &.{"Content-Type: application/json"},
             .body = body,
             .timeout_ms = timeout_ms,
             .subsystem = .providers,
@@ -801,6 +823,20 @@ test "parseTextResponse empty choices" {
     try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
 }
 
+test "parseTextResponse rejects non-object top-level payload" {
+    const body =
+        \\[]
+    ;
+    try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseTextResponse rejects malformed choices shape" {
+    const body =
+        \\{"choices":{"message":{"content":"bad"}}}
+    ;
+    try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+}
+
 test "parseTextResponse classifies rate-limit errors" {
     const body =
         \\{"error":{"message":"Too many requests","type":"rate_limit_error","status":429}}
@@ -880,6 +916,21 @@ test "parseTextResponse with null content fails" {
         \\{"choices":[{"message":{"content":null}}]}
     ;
     try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseNativeResponse ignores malformed tool_calls shape" {
+    const body =
+        \\{"choices":[{"message":{"content":"ok","tool_calls":{"bad":true}}}],"model":"m"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| std.testing.allocator.free(c);
+        std.testing.allocator.free(result.tool_calls);
+        std.testing.allocator.free(result.model);
+    }
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("ok", result.content.?);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
 }
 
 test "AuthStyle headerName" {

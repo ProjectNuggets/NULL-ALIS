@@ -140,6 +140,7 @@ pub fn buildSystemPrompt(
     try w.writeAll("- Prefer `trash` over `rm`.\n");
     try w.writeAll("- When in doubt, ask before acting externally.\n\n");
     try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
+    try w.writeAll("- Do not invent timing, scheduler, or delivery status claims. If unsure, say unknown or verify with tools first.\n\n");
 
     // Skills section
     try appendSkillsSection(allocator, w, ctx.workspace_dir);
@@ -395,6 +396,7 @@ test "buildSystemPrompt includes core sections" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "test-model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent timing, scheduler, or delivery status claims") != null);
 }
 
 test "buildSystemPrompt includes workspace dir" {

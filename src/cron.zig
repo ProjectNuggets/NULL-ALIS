@@ -1770,27 +1770,14 @@ fn deliverResultForContext(
     success: bool,
     out_bus: *bus.Bus,
 ) !bool {
-    if (context_user_root) |user_root| {
-        if (delivery.channel) |channel| {
-            if (std.ascii.eqlIgnoreCase(channel, "telegram")) {
-                return deliverTenantTelegram(
-                    allocator,
-                    user_root,
-                    context_user_id,
-                    context_numeric_user_id,
-                    context_state_mgr,
-                    context_expect_postgres_state,
-                    job_id,
-                    delivery,
-                    output,
-                    success,
-                ) catch |err| blk: {
-                    if (!delivery.best_effort) return err;
-                    break :blk false;
-                };
-            }
-        }
-    }
+    _ = context_user_root;
+    _ = context_numeric_user_id;
+    _ = context_state_mgr;
+    _ = context_expect_postgres_state;
+
+    // Single delivery truth path: proactive channel delivery is always routed
+    // through outbound bus + dispatcher. Direct telegram sends are retained
+    // for legacy/manual helpers but not used here.
     return deliverResult(allocator, delivery, output, success, out_bus, "cron", context_user_id, job_id);
 }
 

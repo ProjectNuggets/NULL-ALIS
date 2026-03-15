@@ -1433,6 +1433,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ten.object.get("runtime_idle_ttl_secs")) |v| {
                 if (v == .integer) self.tenant.runtime_idle_ttl_secs = @intCast(v.integer);
             }
+            if (ten.object.get("proactive_dedupe_window_secs")) |v| {
+                if (v == .integer) self.tenant.proactive_dedupe_window_secs = @intCast(v.integer);
+            }
+            if (ten.object.get("proactive_rate_window_secs")) |v| {
+                if (v == .integer) self.tenant.proactive_rate_window_secs = @intCast(v.integer);
+            }
+            if (ten.object.get("proactive_rate_limit_per_window")) |v| {
+                if (v == .integer) self.tenant.proactive_rate_limit_per_window = @intCast(v.integer);
+            }
             if (ten.object.get("ownership_lock_lease_secs")) |v| {
                 if (v == .integer) self.tenant.ownership_lock_lease_secs = @intCast(v.integer);
             }

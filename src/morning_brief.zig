@@ -5,7 +5,7 @@ pub const MORNING_BRIEF_AGENT_COMMAND = "daily_morning_brief";
 pub const MORNING_BRIEF_AGENT_PROMPT =
     "Prepare the daily morning brief now. Read HEARTBEAT.md in workspace for exact format and requirements. " ++
     "Use runtime_info and schedule first for runtime truth. Then gather data using read-only integrations/tools as needed (calendar/email/news/weather). " ++
-    "Deliver one concise Telegram-ready brief suitable for scheduler delivery. Message sending is allowed when explicitly needed. Do not create/update scheduler jobs in this turn.";
+    "Deliver one concise Telegram-ready brief suitable for scheduler delivery. Do not call the message tool in this turn; scheduler delivery sends the final output. Do not create/update scheduler jobs in this turn.";
 
 pub fn isMorningBriefId(id: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, id, " \t\r\n"), MORNING_BRIEF_JOB_ID);
