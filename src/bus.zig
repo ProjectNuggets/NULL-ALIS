@@ -35,7 +35,7 @@ pub const InboundMessage = struct {
 };
 
 pub const OutboundMessage = struct {
-    channel: []const u8, // target channel
+    channel: []const u8, // target channel (owned)
     account_id: ?[]const u8 = null, // target account (multi-account channels)
     chat_id: []const u8, // target chat
     content: []const u8, // response text
@@ -47,7 +47,7 @@ pub const OutboundMessage = struct {
     pub fn deinit(self: *const OutboundMessage, allocator: Allocator) void {
         for (self.media) |m| allocator.free(m);
         if (self.media.len > 0) allocator.free(self.media);
-        // channel is a string literal or long-lived config pointer — not owned, don't free
+        allocator.free(self.channel);
         if (self.account_id) |aid| allocator.free(aid);
         if (self.source) |source| allocator.free(source);
         if (self.user_id) |user_id| allocator.free(user_id);
@@ -167,13 +167,15 @@ pub fn makeOutbound(
     chat_id: []const u8,
     content: []const u8,
 ) Allocator.Error!OutboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const channel_copy = try allocator.dupe(u8, channel);
+    errdefer allocator.free(channel_copy);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
+    errdefer allocator.free(ct);
 
     return .{
-        .channel = channel,
+        .channel = channel_copy,
         .chat_id = cid,
         .content = ct,
     };
@@ -203,14 +205,17 @@ pub fn makeOutboundWithAccount(
     chat_id: []const u8,
     content: []const u8,
 ) Allocator.Error!OutboundMessage {
+    const channel_copy = try allocator.dupe(u8, channel);
+    errdefer allocator.free(channel_copy);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
     errdefer allocator.free(ct);
     const aid = try allocator.dupe(u8, account_id);
+    errdefer allocator.free(aid);
 
     return .{
-        .channel = channel,
+        .channel = channel_copy,
         .account_id = aid,
         .chat_id = cid,
         .content = ct,
@@ -276,7 +281,8 @@ fn makeOutboundWithMedia(
     content: []const u8,
     media_src: []const []const u8,
 ) Allocator.Error!OutboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const channel_copy = try allocator.dupe(u8, channel);
+    errdefer allocator.free(channel_copy);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -296,7 +302,7 @@ fn makeOutboundWithMedia(
     } else &[_][]const u8{};
 
     return .{
-        .channel = channel,
+        .channel = channel_copy,
         .chat_id = cid,
         .content = ct,
         .media = media,
@@ -495,13 +501,17 @@ test "makeInbound produces owned copies of non-channel fields" {
 
 test "makeOutbound produces owned copies" {
     const alloc = testing.allocator;
+    var src_channel = try alloc.dupe(u8, "telegram");
+    defer alloc.free(src_channel);
     var src_content = try alloc.dupe(u8, "reply");
     defer alloc.free(src_content);
 
-    const msg = try makeOutbound(alloc, "telegram", "c1", src_content);
+    const msg = try makeOutbound(alloc, src_channel, "c1", src_content);
     defer msg.deinit(alloc);
 
+    src_channel[0] = 'X';
     src_content[0] = 'Z';
+    try testing.expectEqualStrings("telegram", msg.channel);
     try testing.expectEqualStrings("reply", msg.content);
 }
 
