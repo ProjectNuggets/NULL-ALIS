@@ -1,4 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const c_time = @cImport({
+    @cInclude("time.h");
+});
 const platform = @import("../platform.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
@@ -149,11 +153,11 @@ pub fn buildSystemPrompt(
     try std.fmt.format(w, "## Workspace\n\nWorking directory: `{s}`\n\n", .{ctx.workspace_dir});
 
     // DateTime section
-    try appendDateTimeSection(w);
+    try appendDateTimeSection(allocator, w, ctx.workspace_dir);
 
     // Runtime section
     try std.fmt.format(w, "## Runtime\n\nOS: {s} | Model: {s}\n\n", .{
-        @tagName(comptime std.Target.Os.Tag.macos),
+        @tagName(builtin.os.tag),
         ctx.model_name,
     });
 
@@ -293,8 +297,12 @@ fn appendSkillsSection(
     }
 }
 
-/// Append a human-readable UTC date/time section derived from the system clock.
-fn appendDateTimeSection(w: anytype) !void {
+/// Append a human-readable date/time section derived from the system clock.
+fn appendDateTimeSection(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    workspace_dir: []const u8,
+) !void {
     const timestamp = std.time.timestamp();
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
     const epoch_day = epoch_seconds.getEpochDay();
@@ -308,9 +316,86 @@ fn appendDateTimeSection(w: anytype) !void {
     const hour = day_seconds.getHoursIntoDay();
     const minute = day_seconds.getMinutesIntoHour();
 
-    try std.fmt.format(w, "## Current Date & Time\n\n{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC\n\n", .{
+    try std.fmt.format(w, "## Current Date & Time\n\n{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC\n", .{
         year, month, day, hour, minute,
     });
+
+    var wrote_local = false;
+    switch (builtin.os.tag) {
+        .wasi => {},
+        else => {
+            var local_tm: c_time.struct_tm = undefined;
+            var t: c_time.time_t = @intCast(timestamp);
+            if (c_time.localtime_r(&t, &local_tm) != null) {
+                const local_year = local_tm.tm_year + 1900;
+                const local_month = local_tm.tm_mon + 1;
+                const local_day = local_tm.tm_mday;
+                const local_hour = local_tm.tm_hour;
+                const local_minute = local_tm.tm_min;
+
+                const tz_label: []const u8 = blk: {
+                    const tz = std.posix.getenv("TZ");
+                    if (tz) |value| {
+                        const slice = std.mem.sliceTo(value, 0);
+                        if (slice.len > 0) break :blk slice;
+                    }
+                    break :blk "system_local";
+                };
+
+                try std.fmt.format(w, "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} Local ({s})\n", .{
+                    local_year, local_month, local_day, local_hour, local_minute, tz_label,
+                });
+                wrote_local = true;
+            }
+        },
+    }
+
+    if (!wrote_local) {
+        try w.writeAll("Local time unavailable in this runtime\n");
+    }
+
+    const configured_tz_opt = try readConfiguredTimezoneHint(allocator, workspace_dir);
+    if (configured_tz_opt) |hint| {
+        defer allocator.free(hint);
+        try std.fmt.format(w, "Configured timezone hint: {s}\n", .{hint});
+    }
+
+    try w.writeAll("\n");
+}
+
+fn readConfiguredTimezoneHint(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+) !?[]u8 {
+    const path = try std.fs.path.join(allocator, &.{ workspace_dir, "USER.md" });
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+
+    const raw = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(raw);
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        const colon_idx = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        var key = std.mem.trim(u8, line[0..colon_idx], " \t*-");
+        const value = std.mem.trim(u8, line[colon_idx + 1 ..], " \t");
+        if (value.len == 0) continue;
+        if (key.len >= 2 and (key[0] == '*' or key[0] == '_') and key[key.len - 1] == key[0]) {
+            key = std.mem.trim(u8, key[1 .. key.len - 1], " \t");
+        }
+        if (std.ascii.eqlIgnoreCase(key, "timezone") or std.ascii.eqlIgnoreCase(key, "time zone")) {
+            const dup = try allocator.dupe(u8, value);
+            return dup;
+        }
+    }
+    return null;
 }
 
 /// Read a workspace file and append it to the prompt, truncating if too large.
@@ -539,11 +624,12 @@ test "appendDateTimeSection outputs UTC timestamp" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     const w = buf.writer(std.testing.allocator);
-    try appendDateTimeSection(w);
+    try appendDateTimeSection(std.testing.allocator, w, "/tmp/nonexistent");
 
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "UTC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Local") != null);
     // Verify the year is plausible (2025+)
     try std.testing.expect(std.mem.indexOf(u8, output, "202") != null);
 }
