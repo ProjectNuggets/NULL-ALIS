@@ -2234,6 +2234,11 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     }
 
     var dispatch_stats = dispatch.DispatchStats{};
+    var tenant_dispatch_ctx = dispatch.TenantDispatchContext{
+        .enabled = config.tenant.enabled,
+        .data_root = config.tenant.data_root,
+        .allow_telegram_fallback = config.tenant.enabled,
+    };
 
     state.addComponent("outbound_dispatcher");
 
@@ -2250,8 +2255,8 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     }
     var outbound_idx: u32 = 0;
     while (outbound_idx < bounded_outbound_workers) : (outbound_idx += 1) {
-        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, dispatch.runOutboundDispatcher, .{
-            allocator, &event_bus, &channel_registry, &dispatch_stats,
+        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, dispatch.runOutboundDispatcherWithTenantContext, .{
+            allocator, &event_bus, &channel_registry, &dispatch_stats, &tenant_dispatch_ctx,
         })) |thread| {
             outbound_threads.append(allocator, thread) catch {
                 thread.join();

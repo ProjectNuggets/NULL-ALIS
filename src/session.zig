@@ -203,6 +203,8 @@ pub const SessionManager = struct {
         var replacement_agent = try self.buildSessionAgent(session.session_key);
         errdefer replacement_agent.deinit();
 
+        session.agent.persistSessionCheckpoint("ttl_recycle");
+
         var previous_agent = session.agent;
         session.agent = replacement_agent;
         previous_agent.deinit();
@@ -539,6 +541,11 @@ pub const SessionManager = struct {
             defer session.mutex.unlock();
             const idle_secs: u64 = @intCast(@max(0, now - session.last_active));
             if (idle_secs > max_idle_secs or sessionIsTtlExpired(session, now)) {
+                if (sessionIsTtlExpired(session, now)) {
+                    session.agent.persistSessionCheckpoint("ttl_evict");
+                } else {
+                    session.agent.persistSessionCheckpoint("idle_evict");
+                }
                 to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
@@ -1139,6 +1146,47 @@ test "evictIdle removes old sessions" {
     try testing.expectEqual(@as(usize, 0), sm.sessionCount());
 }
 
+test "evictIdle persists checkpoint before removing idle session" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const first_reply = try sm.processMessage("evict:checkpoint", "hello", null);
+    defer testing.allocator.free(first_reply);
+    try testing.expectEqualStrings("ok", first_reply);
+
+    const session = try sm.getOrCreate("evict:checkpoint");
+    session.last_active = std.time.timestamp() - 1000;
+
+    const evicted = sm.evictIdle(120);
+    try testing.expectEqual(@as(usize, 1), evicted);
+    try testing.expectEqual(@as(usize, 0), sm.sessionCount());
+
+    const daily_entries = try mem.list(testing.allocator, .daily, null);
+    defer memory_mod.freeEntries(testing.allocator, daily_entries);
+
+    var found_checkpoint = false;
+    for (daily_entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "session_checkpoint_")) continue;
+        if (std.mem.indexOf(u8, entry.content, "reason=idle_evict") == null) continue;
+        if (std.mem.indexOf(u8, entry.content, "session=evict:checkpoint") == null) continue;
+        found_checkpoint = true;
+        break;
+    }
+    try testing.expect(found_checkpoint);
+
+    const anchor = (try mem.get(testing.allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=idle_evict") != null);
+}
+
 test "evictIdle preserves recent sessions" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
@@ -1440,6 +1488,47 @@ test "ttl_expired_session_recycles_in_place_under_lock" {
     try testing.expect(first == second);
     try testing.expectEqual(@as(u64, 1), second.turn_count);
     try testing.expect(second.agent.historyLen() <= 3);
+}
+
+test "ttl recycle persists session checkpoint before replacement" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const warmup = try sm.processMessage("ttl:checkpoint", "before", null);
+    defer testing.allocator.free(warmup);
+
+    const first = try sm.getOrCreate("ttl:checkpoint");
+    first.agent.session_ttl_secs = 1;
+    first.last_active = std.time.timestamp() - 60;
+
+    const reply = try sm.processMessage("ttl:checkpoint", "after", null);
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("ok", reply);
+
+    const daily_entries = try mem.list(testing.allocator, .daily, null);
+    defer memory_mod.freeEntries(testing.allocator, daily_entries);
+
+    var found_checkpoint = false;
+    for (daily_entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "session_checkpoint_")) continue;
+        if (std.mem.indexOf(u8, entry.content, "reason=ttl_recycle") == null) continue;
+        if (std.mem.indexOf(u8, entry.content, "session=ttl:checkpoint") == null) continue;
+        found_checkpoint = true;
+        break;
+    }
+    try testing.expect(found_checkpoint);
+
+    const anchor = (try mem.get(testing.allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=ttl_recycle") != null);
 }
 
 test "activation_mode mention blocks unmentioned group turn" {

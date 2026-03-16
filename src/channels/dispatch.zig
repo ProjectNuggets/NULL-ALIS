@@ -3,6 +3,8 @@ const Allocator = std.mem.Allocator;
 const root = @import("root.zig");
 const bus = @import("../bus.zig");
 const ops_guard = @import("../ops_guard.zig");
+const runtime_resolver = @import("../delivery/runtime_resolver.zig");
+const telegram = @import("telegram.zig");
 const TEST_THREAD_STACK_SIZE: usize = 256 * 1024;
 
 /// Message dispatch — routes incoming ChannelMessages to the agent,
@@ -153,6 +155,67 @@ pub const DispatchStats = struct {
     }
 };
 
+pub const TenantDispatchContext = struct {
+    enabled: bool = false,
+    data_root: []const u8 = "",
+    allow_telegram_fallback: bool = true,
+};
+
+fn normalizeTenantUserId(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "u:")) {
+        return std.mem.trim(u8, trimmed[2..], " \t\r\n");
+    }
+    return trimmed;
+}
+
+fn isValidTenantUserId(user_id: []const u8) bool {
+    if (user_id.len == 0 or user_id.len > 32) return false;
+    for (user_id) |ch| {
+        if (!std.ascii.isDigit(ch)) return false;
+    }
+    return true;
+}
+
+fn tryTenantTelegramFallbackSend(
+    allocator: Allocator,
+    tenant_ctx: *const TenantDispatchContext,
+    msg: *const bus.OutboundMessage,
+) bool {
+    if (!tenant_ctx.enabled or !tenant_ctx.allow_telegram_fallback) return false;
+    if (!std.mem.eql(u8, msg.channel, "telegram")) return false;
+    if (msg.content.len == 0) return false;
+    const raw_user_id = msg.user_id orelse return false;
+    const user_id = normalizeTenantUserId(raw_user_id);
+    if (!isValidTenantUserId(user_id)) return false;
+    if (user_id.len == 0 or tenant_ctx.data_root.len == 0) return false;
+
+    const user_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tenant_ctx.data_root, user_id }) catch return false;
+    defer allocator.free(user_root);
+
+    const user_dir = std.fs.openDirAbsolute(user_root, .{}) catch return false;
+    @constCast(&user_dir).close();
+
+    var resolved = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
+        .channel = "telegram",
+        .tenant_ctx = .{},
+        .user_root = user_root,
+        .account_id_hint = msg.account_id,
+        .target_hint = msg.chat_id,
+    }) catch return false;
+    defer resolved.deinit(allocator);
+
+    runtime_resolver.requireConnectedTarget(&resolved) catch return false;
+    const bot_token = runtime_resolver.requireCredential(&resolved) catch return false;
+    const chat_id = runtime_resolver.parseResolvedTargetChatId(&resolved) catch return false;
+
+    var chat_buf: [32]u8 = undefined;
+    const chat_text = std.fmt.bufPrint(&chat_buf, "{d}", .{chat_id}) catch return false;
+    var tg_channel = telegram.TelegramChannel.init(allocator, bot_token, &.{"*"}, &.{}, "open");
+    tg_channel.sendMessage(chat_text, msg.content) catch return false;
+    return true;
+}
+
 /// Run the outbound dispatch loop. Blocks until the bus is closed.
 /// Consumes messages from `bus.consumeOutbound()` and routes them to the
 /// appropriate channel via `registry.findByName(msg.channel)`.
@@ -166,6 +229,16 @@ pub fn runOutboundDispatcher(
     event_bus: *bus.Bus,
     registry: *const ChannelRegistry,
     stats: *DispatchStats,
+) void {
+    runOutboundDispatcherWithTenantContext(allocator, event_bus, registry, stats, null);
+}
+
+pub fn runOutboundDispatcherWithTenantContext(
+    allocator: Allocator,
+    event_bus: *bus.Bus,
+    registry: *const ChannelRegistry,
+    stats: *DispatchStats,
+    tenant_ctx: ?*const TenantDispatchContext,
 ) void {
     const DeliverySignal = struct {
         fn publish(
@@ -241,6 +314,16 @@ pub fn runOutboundDispatcher(
                 ops_guard.recordProactiveSent(source, msg.user_id, msg.channel, msg.chat_id, std.time.timestamp());
             }
         } else {
+            if (tenant_ctx) |ctx| {
+                if (tryTenantTelegramFallbackSend(allocator, ctx, &msg)) {
+                    _ = stats.dispatched.fetchAdd(1, .monotonic);
+                    DeliverySignal.publish(allocator, event_bus, &msg, "sent", "tenant_fallback", std.time.timestamp());
+                    if (proactive) {
+                        ops_guard.recordProactiveSent(source, msg.user_id, msg.channel, msg.chat_id, std.time.timestamp());
+                    }
+                    continue;
+                }
+            }
             _ = stats.channel_not_found.fetchAdd(1, .monotonic);
             DeliverySignal.publish(allocator, event_bus, &msg, "channel_not_found", "channel_not_found", std.time.timestamp());
             if (proactive) {
@@ -461,6 +544,22 @@ test "DispatchStats init all zero" {
     try std.testing.expectEqual(@as(u64, 0), stats.getDispatched());
     try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
     try std.testing.expectEqual(@as(u64, 0), stats.getChannelNotFound());
+}
+
+test "normalizeTenantUserId trims optional prefix and whitespace" {
+    try std.testing.expectEqualStrings("7", normalizeTenantUserId("u:7"));
+    try std.testing.expectEqualStrings("42", normalizeTenantUserId("  u:42  "));
+    try std.testing.expectEqualStrings("9", normalizeTenantUserId(" 9 "));
+}
+
+test "isValidTenantUserId accepts digits only" {
+    try std.testing.expect(isValidTenantUserId("1"));
+    try std.testing.expect(isValidTenantUserId("1234567890"));
+    try std.testing.expect(!isValidTenantUserId(""));
+    try std.testing.expect(!isValidTenantUserId("u:1"));
+    try std.testing.expect(!isValidTenantUserId("../1"));
+    try std.testing.expect(!isValidTenantUserId("1/2"));
+    try std.testing.expect(!isValidTenantUserId("abc"));
 }
 
 test "dispatcher routes message to correct channel" {

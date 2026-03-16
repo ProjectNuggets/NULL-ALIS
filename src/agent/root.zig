@@ -316,6 +316,9 @@ pub const Agent = struct {
     system_prompt_conversation_context_fingerprint: u64 = 0,
     /// Fingerprint of workspace prompt files for the currently injected system prompt.
     workspace_prompt_fingerprint: ?u64 = null,
+    /// UTC minute bucket for the currently injected system prompt timestamp.
+    /// Used to refresh the prompt clock without rebuilding every turn.
+    system_prompt_time_bucket_min: i64 = -1,
 
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
@@ -1063,8 +1066,12 @@ pub const Agent = struct {
         }
 
         // Inject system prompt on first turn (or when tracked workspace files changed).
+        const current_time_bucket_min = @divFloor(std.time.timestamp(), 60);
         const workspace_fp = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
+            self.has_system_prompt = false;
+        }
+        if (self.has_system_prompt and self.system_prompt_time_bucket_min != current_time_bucket_min) {
             self.has_system_prompt = false;
         }
 
@@ -1125,6 +1132,7 @@ pub const Agent = struct {
             self.system_prompt_has_conversation_context = turn_has_conversation_context;
             self.system_prompt_conversation_context_fingerprint = conversation_context_fingerprint;
             self.workspace_prompt_fingerprint = workspace_fp;
+            self.system_prompt_time_bucket_min = current_time_bucket_min;
         }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
@@ -2061,6 +2069,13 @@ pub const Agent = struct {
         self.system_prompt_has_conversation_context = false;
         self.system_prompt_conversation_context_fingerprint = 0;
         self.workspace_prompt_fingerprint = null;
+        self.system_prompt_time_bucket_min = -1;
+    }
+
+    /// Persist a compact session checkpoint and refresh context anchor.
+    /// Used by slash resets and session lifecycle hooks (TTL/eviction).
+    pub fn persistSessionCheckpoint(self: *Agent, reason: []const u8) void {
+        commands.persistSessionCheckpoint(self, reason);
     }
 
     fn conversationContextFingerprint(ctx: ?prompt.ConversationContext) u64 {
@@ -3045,6 +3060,84 @@ test "slash /new clears history" {
     try std.testing.expectEqualStrings("Session cleared.", response);
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     try std.testing.expect(!agent.has_system_prompt);
+}
+
+test "slash /new writes session checkpoint and context anchor" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:main";
+    agent.auto_save = true;
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "[Memory context]\n- pref: concise\n\nactual user request"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "Working on it."),
+    });
+
+    const response = (try agent.handleSlashCommand("/new")).?;
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("Session cleared.", response);
+
+    const daily_entries = try mem.list(allocator, .daily, null);
+    defer memory_mod.freeEntries(allocator, daily_entries);
+
+    var checkpoint_found = false;
+    for (daily_entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "session_checkpoint_")) continue;
+        checkpoint_found = true;
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "reason=new") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "actual user request") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "[Memory context]") == null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "Working on it.") != null);
+        break;
+    }
+    try std.testing.expect(checkpoint_found);
+
+    const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_session=agent:zaki-bot:user:1:main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=new") != null);
+}
+
+test "slash /new with empty session does not write checkpoint" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:main";
+
+    const response = (try agent.handleSlashCommand("/new")).?;
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("Session cleared.", response);
+
+    const daily_entries = try mem.list(allocator, .daily, null);
+    defer memory_mod.freeEntries(allocator, daily_entries);
+    try std.testing.expectEqual(@as(usize, 0), daily_entries.len);
+
+    const anchor = try mem.get(allocator, "context_anchor_current");
+    if (anchor) |entry| {
+        defer entry.deinit(allocator);
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "slash /reset clears history and switches model" {

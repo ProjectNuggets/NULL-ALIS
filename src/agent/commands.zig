@@ -14,6 +14,7 @@ const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
+const util = @import("../util.zig");
 
 const SlashCommand = struct {
     name: []const u8,
@@ -167,6 +168,9 @@ fn invalidateSystemPromptCache(self: anytype) void {
     }
     if (@hasField(@TypeOf(self.*), "system_prompt_has_conversation_context")) {
         self.system_prompt_has_conversation_context = false;
+    }
+    if (@hasField(@TypeOf(self.*), "system_prompt_time_bucket_min")) {
+        self.system_prompt_time_bucket_min = -1;
     }
 }
 
@@ -486,7 +490,140 @@ fn findToolByName(self: anytype, name: []const u8) ?Tool {
     return null;
 }
 
-fn clearSessionState(self: anytype) void {
+fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
+    if (s.len <= max_len) return s;
+    var end: usize = max_len;
+    while (end > 0 and s[end] & 0xC0 == 0x80) end -= 1;
+    return s[0..end];
+}
+
+fn stripMemoryContextPrefix(text: []const u8) []const u8 {
+    const prefix = "[Memory context]\n";
+    if (!std.mem.startsWith(u8, text, prefix)) return text;
+    if (std.mem.indexOf(u8, text, "\n\n")) |sep_idx| {
+        return std.mem.trim(u8, text[sep_idx + 2 ..], " \t\r\n");
+    }
+    return text;
+}
+
+fn appendSanitizedSnippet(w: anytype, raw: []const u8, max_chars: usize) !void {
+    const stripped = stripMemoryContextPrefix(raw);
+    const clipped = truncateUtf8(stripped, max_chars);
+    const trimmed = std.mem.trim(u8, clipped, " \t\r\n");
+    if (trimmed.len == 0) {
+        try w.writeAll("(empty)");
+        return;
+    }
+
+    var wrote_any = false;
+    var previous_space = false;
+    for (trimmed) |ch| {
+        const is_space = ch == ' ' or ch == '\n' or ch == '\r' or ch == '\t';
+        if (is_space) {
+            if (wrote_any and !previous_space) {
+                try w.writeByte(' ');
+                previous_space = true;
+            }
+            continue;
+        }
+        try w.writeByte(ch);
+        wrote_any = true;
+        previous_space = false;
+    }
+
+    if (!wrote_any) {
+        try w.writeAll("(empty)");
+    }
+}
+
+fn appendRecentRoleSnippets(
+    w: anytype,
+    history_items: anytype,
+    role: providers.Role,
+    max_items: usize,
+    max_chars: usize,
+) !void {
+    var selected: [8]usize = undefined;
+    const target = @min(max_items, selected.len);
+
+    var count: usize = 0;
+    var idx = history_items.len;
+    while (idx > 0 and count < target) {
+        idx -= 1;
+        if (history_items[idx].role != role) continue;
+        selected[count] = idx;
+        count += 1;
+    }
+
+    if (count == 0) {
+        try w.writeAll("- none\n");
+        return;
+    }
+
+    var rev = count;
+    while (rev > 0) {
+        rev -= 1;
+        const item = history_items[selected[rev]];
+        try w.writeAll("- ");
+        try appendSanitizedSnippet(w, item.content, max_chars);
+        try w.writeByte('\n');
+    }
+}
+
+pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
+    const mem = self.mem orelse return;
+    const session_id = self.memory_session_id orelse return;
+    if (session_id.len == 0) return;
+
+    var user_count: usize = 0;
+    var assistant_count: usize = 0;
+    for (self.history.items) |item| {
+        if (item.role == .user) user_count += 1;
+        if (item.role == .assistant) assistant_count += 1;
+    }
+    if (user_count == 0 and assistant_count == 0) return;
+
+    const now_s = std.time.timestamp();
+    var ts_buf: [32]u8 = undefined;
+    const now_iso = util.timestamp(&ts_buf);
+
+    var key_buf: [96]u8 = undefined;
+    const checkpoint_key = std.fmt.bufPrint(&key_buf, "session_checkpoint_{d}", .{now_s}) catch return;
+
+    var content: std.ArrayListUnmanaged(u8) = .empty;
+    defer content.deinit(self.allocator);
+    const w = content.writer(self.allocator);
+    w.print(
+        "type=session_checkpoint\nreason={s}\nsession={s}\nmodel={s}\nat={s}\ncounts.user={d}\ncounts.assistant={d}\n\n",
+        .{ reason, session_id, self.model_name, now_iso, user_count, assistant_count },
+    ) catch return;
+    w.writeAll("recent_user:\n") catch return;
+    appendRecentRoleSnippets(w, self.history.items, .user, 3, 220) catch return;
+    w.writeAll("\nrecent_assistant:\n") catch return;
+    appendRecentRoleSnippets(w, self.history.items, .assistant, 3, 220) catch return;
+
+    const checkpoint_content = content.toOwnedSlice(self.allocator) catch return;
+    defer self.allocator.free(checkpoint_content);
+
+    mem.store(checkpoint_key, checkpoint_content, .daily, null) catch return;
+    if (self.mem_rt) |rt| {
+        rt.syncVectorAfterStore(self.allocator, checkpoint_key, checkpoint_content);
+    }
+
+    const anchor_content = std.fmt.allocPrint(
+        self.allocator,
+        "type=context_anchor\nlast_session={s}\nlast_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\nlast_at={s}",
+        .{ session_id, reason, self.model_name, checkpoint_key, now_iso },
+    ) catch return;
+    defer self.allocator.free(anchor_content);
+    mem.store("context_anchor_current", anchor_content, .core, null) catch return;
+    if (self.mem_rt) |rt| {
+        rt.syncVectorAfterStore(self.allocator, "context_anchor_current", anchor_content);
+    }
+}
+
+fn clearSessionState(self: anytype, reason: []const u8) void {
+    persistSessionCheckpoint(self, reason);
     self.clearHistory();
     clearPendingExecCommand(self);
 
@@ -2387,7 +2524,8 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
 
     if (isSlashName(cmd, "new") or isSlashName(cmd, "reset")) {
-        clearSessionState(self);
+        const checkpoint_reason: []const u8 = if (isSlashName(cmd, "reset")) "reset" else "new";
+        clearSessionState(self, checkpoint_reason);
         if (cmd.arg.len > 0) {
             try setModelName(self, cmd.arg);
             return try std.fmt.allocPrint(self.allocator, "Session cleared. Switched to model: {s}", .{cmd.arg});
@@ -2396,7 +2534,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     }
 
     if (isSlashName(cmd, "restart")) {
-        clearSessionState(self);
+        clearSessionState(self, "restart");
         resetRuntimeCommandState(self);
         if (cmd.arg.len > 0) {
             try setModelName(self, cmd.arg);
