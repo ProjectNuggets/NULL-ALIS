@@ -31,6 +31,7 @@ const runtime_resolver = @import("delivery/runtime_resolver.zig");
 const morning_brief = @import("morning_brief.zig");
 const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
 const channel_identity_key = @import("channel_identity_key.zig");
+const lane_metrics = @import("lane_metrics.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 
 const log = std.log.scoped(.daemon);
@@ -1165,15 +1166,18 @@ fn runCronAgentTurnWithBus(
     var runtime = try channel_loop.ChannelRuntime.init(allocator, &runtime_cfg, out_bus);
     defer runtime.deinit();
 
+    const turn_origin: tools_mod.TurnOrigin = resolveCronTurnOrigin(job);
+    const lane_resolution = resolveCronSessionLaneWithMetrics(job, turn_origin);
+
     var session_buf: [256]u8 = undefined;
     const session_key = blk: {
         if (scheduler.context_user_id) |user_id| {
-            if (job.session_target == .main) {
+            if (lane_resolution.effective_target == .main) {
                 break :blk zaki_session.userMainSessionKey(&session_buf, user_id);
             }
             break :blk zaki_session.userCronSessionKey(&session_buf, user_id, job.id);
         }
-        if (job.session_target == .main) break :blk zaki_session.fallbackMainSessionKey();
+        if (lane_resolution.effective_target == .main) break :blk zaki_session.fallbackMainSessionKey();
         break :blk zaki_session.fallbackCronSessionKey();
     };
 
@@ -1198,7 +1202,6 @@ fn runCronAgentTurnWithBus(
     });
     defer tools_mod.clearTenantContext();
 
-    const turn_origin: tools_mod.TurnOrigin = resolveCronTurnOrigin(job);
     return runtime.session_mgr.processMessageWithContext(session_key, prompt, null, .{
         .turn_origin = turn_origin,
     });
@@ -1228,6 +1231,43 @@ fn resolveCronTurnOrigin(job: *const cron.CronJob) tools_mod.TurnOrigin {
         .none => .scheduler,
         else => .proactive,
     };
+}
+
+const CronSessionLaneResolution = struct {
+    effective_target: cron.SessionTarget,
+    rerouted_from_main: bool = false,
+};
+
+fn resolveCronSessionTarget(
+    job: *const cron.CronJob,
+    turn_origin: tools_mod.TurnOrigin,
+) CronSessionLaneResolution {
+    if (job.session_target == .main and turn_origin != .user) {
+        return .{
+            .effective_target = .isolated,
+            .rerouted_from_main = true,
+        };
+    }
+    return .{
+        .effective_target = job.session_target,
+        .rerouted_from_main = false,
+    };
+}
+
+fn resolveCronSessionLaneWithMetrics(
+    job: *const cron.CronJob,
+    turn_origin: tools_mod.TurnOrigin,
+) CronSessionLaneResolution {
+    const resolution = resolveCronSessionTarget(job, turn_origin);
+    if (resolution.rerouted_from_main) {
+        lane_metrics.recordBackgroundMainReroute(job.id);
+        log.info("cron.main_reroute job_id={s} origin={s} effective_target={s}", .{
+            job.id,
+            turn_origin.toSlice(),
+            resolution.effective_target.asStr(),
+        });
+    }
+    return resolution;
 }
 
 fn clearSchedulerSnapshot(
@@ -3371,6 +3411,58 @@ test "resolveCronTurnOrigin keeps scheduler origin for non-delivery jobs" {
         .delivery = .{ .mode = .none },
     };
     try std.testing.expectEqual(tools_mod.TurnOrigin.scheduler, resolveCronTurnOrigin(&job));
+}
+
+test "resolveCronSessionTarget reroutes non-user main target to isolated" {
+    const job = cron.CronJob{
+        .id = "daily-brief",
+        .expression = "0 8 * * *",
+        .command = "daily_morning_brief",
+        .session_target = .main,
+        .delivery = .{
+            .mode = .always,
+            .channel = "telegram",
+            .to = "chat-1",
+        },
+    };
+    const resolution = resolveCronSessionTarget(&job, .proactive);
+    try std.testing.expectEqual(cron.SessionTarget.isolated, resolution.effective_target);
+    try std.testing.expect(resolution.rerouted_from_main);
+}
+
+test "resolveCronSessionTarget keeps user main target" {
+    const job = cron.CronJob{
+        .id = "interactive",
+        .expression = "* * * * *",
+        .command = "noop",
+        .session_target = .main,
+    };
+    const resolution = resolveCronSessionTarget(&job, .user);
+    try std.testing.expectEqual(cron.SessionTarget.main, resolution.effective_target);
+    try std.testing.expect(!resolution.rerouted_from_main);
+}
+
+test "resolveCronSessionLaneWithMetrics records reroute counter" {
+    lane_metrics.resetForTest();
+    const job = cron.CronJob{
+        .id = "metric-probe",
+        .expression = "* * * * *",
+        .command = "noop",
+        .session_target = .main,
+        .delivery = .{
+            .mode = .always,
+            .channel = "telegram",
+            .to = "chat-1",
+        },
+    };
+    const resolution = resolveCronSessionLaneWithMetrics(&job, .proactive);
+    try std.testing.expectEqual(cron.SessionTarget.isolated, resolution.effective_target);
+
+    var snap = try lane_metrics.snapshotBackgroundMainReroutes(std.testing.allocator);
+    defer snap.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1), snap.total);
+    try std.testing.expect(snap.last_job_id != null);
+    try std.testing.expectEqualStrings("metric-probe", snap.last_job_id.?);
 }
 
 test "parseHeartbeatReplyDirective accepts HEARTBEAT_OK variants" {

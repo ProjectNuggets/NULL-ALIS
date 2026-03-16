@@ -47,6 +47,7 @@ const voice = @import("voice.zig");
 const telegram_token = @import("telegram_token.zig");
 const user_settings = @import("user_settings.zig");
 const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
+const lane_metrics = @import("lane_metrics.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -1353,6 +1354,10 @@ fn ensureUserProvisioned(state: *GatewayState, ctx: *const UserContext) !void {
         ensureFileWithDefault(ctx.heartbeat_path, "{}\n") catch {};
         ensureFileWithDefault(ctx.channel_state_path, "{}\n") catch {};
     }
+}
+
+fn isIdentityUserNotFound(err: anyerror) bool {
+    return std.mem.eql(u8, @errorName(err), "IdentityUserNotFound");
 }
 
 fn scaffoldUserWorkspace(allocator: std.mem.Allocator, ctx: *const UserContext) void {
@@ -4041,6 +4046,8 @@ fn internalDiagnosticsPayload(
     const tenant_lock_conflict_retries_total = state.tenant_lock_conflict_retries_total.load(.monotonic);
     const tenant_runtime_policy_attached = state.tenant_runtime_policy_attached.load(.monotonic);
     const sandbox_diag = tool_sandbox_v1.diagnosticsSnapshot();
+    var lane_snapshot = try lane_metrics.snapshotBackgroundMainReroutes(allocator);
+    defer lane_snapshot.deinit(allocator);
 
     var lease_probe_snapshot: ?zaki_state_mod.UserOwnershipLeaseSnapshot = null;
     defer if (lease_probe_snapshot) |*value| value.deinit(allocator);
@@ -4118,6 +4125,15 @@ fn internalDiagnosticsPayload(
     try json_util.appendJsonInt(&buf, allocator, "sandbox_fallback_none_total", @intCast(sandbox_diag.workspace_fallback_none_total));
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(&buf, allocator, "sandbox_workspace_validation_last_reason", sandbox_diag.workspace_validation_last_reason);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "background_main_reroutes_total", @intCast(lane_snapshot.total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "background_main_reroutes_last_job_id");
+    if (lane_snapshot.last_job_id) |job_id| {
+        try json_util.appendJsonString(&buf, allocator, job_id);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
     try buf.appendSlice(allocator, ",");
 
     try json_util.appendJsonKey(&buf, allocator, "tenant_lock_conflicts_by_route");
@@ -4887,6 +4903,17 @@ fn handleApiChatStreamSseConnection(
         return true;
     };
 
+    ensureUserProvisioned(state, &user_ctx) catch |err| {
+        if (isIdentityUserNotFound(err)) {
+            sendSseErrorResponse(stream, req_allocator, "404 Not Found", "unknown_user_id", "unknown user id");
+            return true;
+        }
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
+        return true;
+    };
+    scaffoldUserWorkspace(req_allocator, &user_ctx);
+    prep_guard.release();
+
     var ownership_lock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch {
         sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "tenant_lock_failed", "tenant ownership lock failed");
         return true;
@@ -4901,13 +4928,6 @@ fn handleApiChatStreamSseConnection(
             return true;
         },
     }
-
-    ensureUserProvisioned(state, &user_ctx) catch {
-        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
-        return true;
-    };
-    scaffoldUserWorkspace(req_allocator, &user_ctx);
-    prep_guard.release();
 
     const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse {
         sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_message", "missing message");
@@ -5173,6 +5193,14 @@ fn handleApiRoute(
         ensureUserDirectories(&user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user provisioning failed\"}" };
         };
+        ensureUserProvisioned(state, &user_ctx) catch |err| {
+            if (isIdentityUserNotFound(err)) {
+                return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_user_id\"}" };
+            }
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user provisioning failed\"}" };
+        };
+        scaffoldUserWorkspace(req_allocator, &user_ctx);
+        prep_guard.release();
         var ownership_lock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch {
             return .{
                 .status = "500 Internal Server Error",
@@ -5188,11 +5216,6 @@ fn handleApiRoute(
                 return ownershipLockConflictSseRouteResponse(req_allocator, conflict);
             },
         }
-        ensureUserProvisioned(state, &user_ctx) catch {
-            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"user provisioning failed\"}" };
-        };
-        scaffoldUserWorkspace(req_allocator, &user_ctx);
-        prep_guard.release();
 
         const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing message\"}" };
@@ -5328,19 +5351,10 @@ fn handleApiRoute(
         ensureUserDirectories(&user_ctx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
         };
-        var provision_lock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch {
-            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"tenant ownership lock failed\"}" };
-        };
-        defer provision_lock.deinit();
-        switch (provision_lock) {
-            .disabled => {},
-            .acquired => {},
-            .conflict => |*conflict| {
-                recordTenantLockConflict(state, .api);
-                return ownershipLockConflictJsonRouteResponse(req_allocator, conflict);
-            },
-        }
-        ensureUserProvisioned(state, &user_ctx) catch {
+        ensureUserProvisioned(state, &user_ctx) catch |err| {
+            if (isIdentityUserNotFound(err)) {
+                return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_user_id\"}" };
+            }
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
         };
         scaffoldUserWorkspace(req_allocator, &user_ctx);
@@ -5362,6 +5376,14 @@ fn handleApiRoute(
     ensureUserDirectories(&user_ctx) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
     };
+    ensureUserProvisioned(state, &user_ctx) catch |err| {
+        if (isIdentityUserNotFound(err)) {
+            return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_user_id\"}" };
+        }
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
+    };
+    scaffoldUserWorkspace(req_allocator, &user_ctx);
+    prep_guard.release();
     const needs_write_lock = !std.mem.eql(u8, method, "GET");
     var user_write_lock: ?OwnershipLockAcquireResult = null;
     if (needs_write_lock) {
@@ -5380,11 +5402,6 @@ fn handleApiRoute(
         user_write_lock = acquired;
     }
     defer if (user_write_lock) |*lock| lock.deinit();
-    ensureUserProvisioned(state, &user_ctx) catch {
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
-    };
-    scaffoldUserWorkspace(req_allocator, &user_ctx);
-    prep_guard.release();
 
     if (std.mem.eql(u8, parsed.subpath, "onboarding")) {
         if (std.mem.eql(u8, method, "GET")) {
@@ -9056,6 +9073,53 @@ test "ownership_lock_wait_succeeds_within_budget_when_lease_released" {
     try std.testing.expect(state.tenant_lock_conflict_retries_total.load(.monotonic) > 0);
 }
 
+test "users provision route succeeds even when ownership lock is held in file mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const user_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_root);
+    try std.fs.makeDirAbsolute(user_root);
+
+    var held_lock = try tenant_lock.acquireUserOwnershipLock(std.testing.allocator, user_root, "owner-b", 300);
+    defer held_lock.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.ownership_lock_enabled = true;
+    state.owner_instance_id = "owner-a";
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"user_id\":\"1\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/users/provision HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "POST",
+        "/api/v1/users/provision",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    try std.testing.expectEqualStrings("{\"status\":\"provisioned\"}", response.body);
+}
+
 test "tenant_lock_config_clamps_invalid_values" {
     const cfg = config_types.TenantConfig{
         .ownership_lock_lease_secs = 5,
@@ -10787,6 +10851,8 @@ test "UserPreparationGate serializes same-user work on one node" {
 
 test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     const allocator = std.testing.allocator;
+    lane_metrics.resetForTest();
+    lane_metrics.recordBackgroundMainReroute("diag-job");
     var gs = GatewayState.init(allocator);
     defer gs.deinit();
     var eb = bus_mod.Bus.init();
@@ -10814,6 +10880,8 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_conflicts_by_route\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"chat_stream_sse\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"webhook\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"background_main_reroutes_total\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"background_main_reroutes_last_job_id\":\"diag-job\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lease_probe\":null") != null);
 }
 

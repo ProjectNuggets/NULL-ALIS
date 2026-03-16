@@ -8,6 +8,7 @@ const ops_guard = @import("../ops_guard.zig");
 const tool_dispatcher = @import("../tool_dispatcher.zig");
 const process_util = @import("process_util.zig");
 const voice = @import("../voice.zig");
+const lane_metrics = @import("../lane_metrics.zig");
 const root = @import("root.zig");
 
 const Tool = root.Tool;
@@ -101,6 +102,8 @@ pub const RuntimeInfoTool = struct {
         defer telegram_state.deinit(allocator);
         var ownership_lease = try readOwnershipLeaseState(allocator, tenant_ctx, user_id_override);
         defer ownership_lease.deinit(allocator);
+        var lane_snapshot = try lane_metrics.snapshotBackgroundMainReroutes(allocator);
+        defer lane_snapshot.deinit(allocator);
 
         var configured_channels: std.ArrayListUnmanaged([]const u8) = .empty;
         defer configured_channels.deinit(allocator);
@@ -177,6 +180,15 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, if (self.config.heartbeat.enabled) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonInt(&buf, allocator, "heartbeat_interval_minutes", self.config.heartbeat.interval_minutes);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "background_main_reroutes_total", @intCast(lane_snapshot.total));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "background_main_reroutes_last_job_id");
+        if (lane_snapshot.last_job_id) |job_id| {
+            try json_util.appendJsonString(&buf, allocator, job_id);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "tenant_enabled");
         try buf.appendSlice(allocator, if (self.config.tenant.enabled) "true" else "false");
@@ -367,6 +379,8 @@ pub const RuntimeInfoTool = struct {
         const tenant_ctx = root.getTenantContext();
         const effective_backend = root.effectiveStateBackend(self.config, tenant_ctx);
         const scheduler_backend = root.schedulerBackend(self.config, tenant_ctx);
+        var lane_snapshot = try lane_metrics.snapshotBackgroundMainReroutes(allocator);
+        defer lane_snapshot.deinit(allocator);
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(allocator);
@@ -379,6 +393,15 @@ pub const RuntimeInfoTool = struct {
         try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_effective", effective_backend);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonInt(&buf, allocator, "max_tasks", self.config.scheduler.max_tasks);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonInt(&buf, allocator, "background_main_reroutes_total", @intCast(lane_snapshot.total));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "background_main_reroutes_last_job_id");
+        if (lane_snapshot.last_job_id) |job_id| {
+            try json_util.appendJsonString(&buf, allocator, job_id);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
         try buf.appendSlice(allocator, "}");
         return try buf.toOwnedSlice(allocator);
     }

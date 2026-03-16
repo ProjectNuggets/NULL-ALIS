@@ -66,6 +66,9 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn provisionUser(_: *@This(), _: i64, _: []const u8) !void {
         return error.PostgresNotEnabled;
     }
+    pub fn hasExternalIdentity(_: *@This(), _: i64) !?bool {
+        return null;
+    }
     pub fn getConfigJson(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]u8 {
         return allocator.dupe(u8, "{}");
     }
@@ -765,6 +768,9 @@ const ManagerImpl = struct {
     }
 
     pub fn provisionUser(self: *Self, user_id: i64, workspace_path: []const u8) !void {
+        if (try self.hasExternalIdentity(user_id)) |exists| {
+            if (!exists) return error.IdentityUserNotFound;
+        }
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
         const workspace_z = try self.allocator.dupeZ(u8, workspace_path);
@@ -804,6 +810,23 @@ const ManagerImpl = struct {
             &.{ session_key_z, user_s.ptr },
             &.{ @as(c_int, @intCast(session_key.len)), @as(c_int, @intCast(user_s.len)) },
         );
+    }
+
+    pub fn hasExternalIdentity(self: *Self, user_id: i64) !?bool {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const query =
+            "SELECT 1 FROM public.zaki_users WHERE id = $1 LIMIT 1";
+
+        const result = self.execParams(query, &.{user_s.ptr}, &.{@as(c_int, @intCast(user_s.len))}) catch |err| switch (err) {
+            // Compatibility mode: keep provisioning behavior when the identity
+            // table is inaccessible in this runtime.
+            error.ExecFailed, error.ConnectionFailed => return null,
+            else => return err,
+        };
+        defer c.PQclear(result);
+
+        return c.PQntuples(result) > 0;
     }
 
     pub fn getConfigJson(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]u8 {
