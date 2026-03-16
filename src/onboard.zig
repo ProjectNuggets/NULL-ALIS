@@ -51,6 +51,7 @@ const WorkspaceOnboardingState = struct {
 };
 
 const WORKSPACE_AGENTS_TEMPLATE = @embedFile("workspace_templates/AGENTS.md");
+const WORKSPACE_AGENTS_ZAKI_TEMPLATE = @embedFile("workspace_templates/AGENTS_ZAKI.md");
 const WORKSPACE_SOUL_TEMPLATE = @embedFile("workspace_templates/SOUL.md");
 const WORKSPACE_TOOLS_TEMPLATE = @embedFile("workspace_templates/TOOLS.md");
 const WORKSPACE_IDENTITY_TEMPLATE = @embedFile("workspace_templates/IDENTITY.md");
@@ -1574,7 +1575,7 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
     try writeIfMissing(allocator, workspace_dir, "SOUL.md", soul_tmpl);
 
     // AGENTS.md (operational guidelines — loaded by prompt.zig)
-    try writeIfMissing(allocator, workspace_dir, "AGENTS.md", agentsTemplate());
+    try writeIfMissing(allocator, workspace_dir, "AGENTS.md", agentsTemplate(ctx));
 
     // TOOLS.md (tool usage guide — loaded by prompt.zig)
     try writeIfMissing(allocator, workspace_dir, "TOOLS.md", toolsTemplate());
@@ -1918,8 +1919,11 @@ fn soulTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]con
     }
 }
 
-fn agentsTemplate() []const u8 {
-    return WORKSPACE_AGENTS_TEMPLATE;
+fn agentsTemplate(ctx: *const ProjectContext) []const u8 {
+    return switch (ctx.workspace_profile) {
+        .standard => WORKSPACE_AGENTS_TEMPLATE,
+        .zaki_bot => WORKSPACE_AGENTS_ZAKI_TEMPLATE,
+    };
 }
 
 fn toolsTemplate() []const u8 {
@@ -1934,6 +1938,7 @@ fn identityTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![
                 \\# IDENTITY.md - ZAKI BOT Identity
                 \\
                 \\This agent lives in the dedicated ZAKI BOT space.
+                \\Built by NovaNuggets.
                 \\
                 \\- **Name:** {s}
                 \\- **Role:** personal AI operator inside ZAKI
@@ -1946,6 +1951,7 @@ fn identityTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![
                 \\- During onboarding, ask the user if they want to rename you.
                 \\- Keep this file aligned with how the user experiences you.
                 \\- If Telegram or other channels are connected, the identity should stay consistent across all of them.
+                \\- If a request is pure normal LLM chat with no execution/tooling need, suggest using a normal Space and offer a ready prompt.
                 \\
             , .{ctx.agent_name});
         },
@@ -2624,9 +2630,17 @@ test "soulTemplate contains personality" {
 }
 
 test "agentsTemplate contains guidelines" {
-    const tmpl = agentsTemplate();
+    const ctx = ProjectContext{};
+    const tmpl = agentsTemplate(&ctx);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "AGENTS.md - Your Workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "Every Session") != null);
+}
+
+test "agentsTemplate uses zaki guidance for zaki profile" {
+    const ctx = zakiBotProjectContext();
+    const tmpl = agentsTemplate(&ctx);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "NovaNuggets") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Mode Boundary (BOT vs Spaces)") != null);
 }
 
 test "toolsTemplate contains tool docs" {
@@ -2673,6 +2687,8 @@ test "zaki templates contain onboarding and proactive guidance" {
     const identity = try identityTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(identity);
     try std.testing.expect(std.mem.indexOf(u8, identity, "personal AI operator inside ZAKI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "NovaNuggets") != null);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "normal Space") != null);
 
     const heartbeat = try heartbeatTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(heartbeat);
@@ -2701,6 +2717,26 @@ test "scaffoldWorkspace uses zaki bootstrap for zaki profile" {
     defer std.testing.allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "ZAKI BOT space") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "Telegram") != null);
+}
+
+test "scaffoldWorkspace uses zaki agents template for zaki profile" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const ctx = zakiBotProjectContext();
+    try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+
+    const agents = try tmp.dir.openFile("AGENTS.md", .{});
+    defer agents.close();
+    const content = try agents.readToEndAlloc(std.testing.allocator, 16 * 1024);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "ZAKI BOT Workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "NovaNuggets") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Mode Boundary (BOT vs Spaces)") != null);
 }
 
 test "scaffoldWorkspace creates all prompt.zig files" {
