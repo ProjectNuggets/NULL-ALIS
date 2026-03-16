@@ -158,6 +158,10 @@ Expected:
 
 Checks:
 - `startup.self_check` has `state_effective=postgres`, `scheduler_backend=postgres`, `degraded=false`
+- `startup.self_check` has strict internal auth posture:
+  - `internal_auth_required=true`
+  - `internal_token_configured=true`
+  - `internal_token_policy_ok=true`
 - Composio toolkit availability for `gmail`, `googledrive`, `googlecalendar`
 - per-entity connected-account readiness probe for Gmail/Drive/Calendar
 

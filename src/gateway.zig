@@ -83,6 +83,14 @@ const TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN_DEFAULT: u32 = 20;
 const TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX_DEFAULT: u32 = 80;
 const TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN: u32 = 5;
 const TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX: u32 = 250;
+const INTERNAL_TOKEN_MIN_LEN: usize = 16;
+const INTERNAL_TOKEN_DENYLIST = [_][]const u8{
+    "test-internal-token",
+    "dev-internal-token",
+    "changeme",
+    "change-me",
+    "default",
+};
 
 const TELEGRAM_REQUIRED_INPUTS = [_][]const u8{
     "bot_token",
@@ -439,6 +447,10 @@ pub const GatewayState = struct {
     lark_account_id: []const u8 = "default",
     lark_allow_from: []const []const u8 = &.{},
     internal_service_tokens: []const []const u8 = &.{},
+    internal_auth_required: bool = false,
+    internal_token_configured: bool = false,
+    internal_token_policy_ok: bool = true,
+    internal_token_policy_reason: []const u8 = "",
     tenant_enabled: bool = false,
     tenant_data_root: []const u8 = DEFAULT_TENANT_DATA_ROOT,
     tenant_runtime_cache_max_users: u32 = 2048,
@@ -1264,13 +1276,101 @@ fn extractInternalServiceToken(raw: []const u8) ?[]const u8 {
     return null;
 }
 
-fn validateInternalServiceToken(raw: []const u8, internal_service_tokens: []const []const u8) bool {
-    if (internal_service_tokens.len == 0) return true;
-    const provided = extractInternalServiceToken(raw) orelse return false;
-    for (internal_service_tokens) |tok| {
-        if (std.mem.eql(u8, tok, provided)) return true;
+const InternalTokenValidationResult = struct {
+    ok: bool,
+    configured: bool,
+    reason: ?[]const u8 = null,
+};
+
+fn isLoopbackHost(host_raw: []const u8) bool {
+    const host = std.mem.trim(u8, host_raw, " \t\r\n");
+    if (host.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+    if (std.mem.eql(u8, host, "127.0.0.1")) return true;
+    if (std.mem.eql(u8, host, "::1")) return true;
+    if (std.mem.eql(u8, host, "[::1]")) return true;
+    return false;
+}
+
+fn isProductionLikeGateway(cfg: *const Config, effective_host: []const u8) bool {
+    if (cfg.tenant.enabled) return true;
+    if (cfg.gateway.allow_public_bind) return true;
+    return !isLoopbackHost(effective_host);
+}
+
+fn isInternalTokenDenylisted(token: []const u8) bool {
+    for (INTERNAL_TOKEN_DENYLIST) |blocked| {
+        if (std.ascii.eqlIgnoreCase(token, blocked)) return true;
     }
     return false;
+}
+
+fn validateInternalTokensForMode(
+    internal_service_tokens: []const []const u8,
+    production_like: bool,
+) InternalTokenValidationResult {
+    var has_non_empty = false;
+    for (internal_service_tokens) |token_raw| {
+        const token = std.mem.trim(u8, token_raw, " \t\r\n");
+        if (token.len == 0) continue;
+        has_non_empty = true;
+        if (!production_like) continue;
+        if (token.len < INTERNAL_TOKEN_MIN_LEN) {
+            return .{
+                .ok = false,
+                .configured = true,
+                .reason = "invalid_internal_service_token_too_short",
+            };
+        }
+        if (isInternalTokenDenylisted(token)) {
+            return .{
+                .ok = false,
+                .configured = true,
+                .reason = "invalid_internal_service_token_denylisted",
+            };
+        }
+    }
+
+    if (production_like and !has_non_empty) {
+        const reason: []const u8 = if (internal_service_tokens.len == 0)
+            "missing_internal_service_tokens"
+        else
+            "invalid_internal_service_token_empty";
+        return .{
+            .ok = false,
+            .configured = false,
+            .reason = reason,
+        };
+    }
+
+    return .{
+        .ok = true,
+        .configured = has_non_empty,
+        .reason = null,
+    };
+}
+
+fn validateInternalServiceTokenWithPolicy(
+    raw: []const u8,
+    internal_service_tokens: []const []const u8,
+    auth_required: bool,
+) bool {
+    if (internal_service_tokens.len == 0) return !auth_required;
+    const provided = extractInternalServiceToken(raw) orelse return false;
+    for (internal_service_tokens) |tok| {
+        const expected = std.mem.trim(u8, tok, " \t\r\n");
+        if (expected.len == 0) continue;
+        if (std.mem.eql(u8, expected, provided)) return true;
+    }
+    return false;
+}
+
+fn validateInternalServiceToken(raw: []const u8, state: *const GatewayState) bool {
+    return validateInternalServiceTokenWithPolicy(
+        raw,
+        state.internal_service_tokens,
+        state.internal_auth_required,
+    );
 }
 
 fn extractZakiUserId(raw: []const u8) ?[]const u8 {
@@ -2328,7 +2428,7 @@ fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init
 
 fn logStartupSelfCheck(state: *const GatewayState) void {
     log.info(
-        "startup.self_check config_path={s} tenant_enabled={s} heartbeat_enabled={s} heartbeat_interval_minutes={d} state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} webhook_mode={s} chat_provider={s} chat_fallbacks={s} embedding_provider={s}",
+        "startup.self_check config_path={s} tenant_enabled={s} heartbeat_enabled={s} heartbeat_interval_minutes={d} state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} webhook_mode={s} chat_provider={s} chat_fallbacks={s} embedding_provider={s} internal_auth_required={s} internal_token_configured={s} internal_token_policy_ok={s} internal_token_policy_reason={s}",
         .{
             state.configPath(),
             if (state.tenant_enabled_configured) "true" else "false",
@@ -2345,6 +2445,10 @@ fn logStartupSelfCheck(state: *const GatewayState) void {
             state.chat_provider_effective,
             state.chatFallbackChain(),
             state.embedding_provider_effective,
+            if (state.internal_auth_required) "true" else "false",
+            if (state.internal_token_configured) "true" else "false",
+            if (state.internal_token_policy_ok) "true" else "false",
+            if (state.internal_token_policy_reason.len > 0) state.internal_token_policy_reason else "null",
         },
     );
     if (state.state_degraded) {
@@ -4091,6 +4195,22 @@ fn internalDiagnosticsPayload(
 
     try json_util.appendJsonKeyValue(&buf, allocator, "runtime_mode", "threaded");
     try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "internal_auth_required");
+    try buf.appendSlice(allocator, if (state.internal_auth_required) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "internal_token_configured");
+    try buf.appendSlice(allocator, if (state.internal_token_configured) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "internal_token_policy_ok");
+    try buf.appendSlice(allocator, if (state.internal_token_policy_ok) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "internal_token_policy_reason");
+    if (state.internal_token_policy_reason.len > 0) {
+        try json_util.appendJsonString(&buf, allocator, state.internal_token_policy_reason);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
 
     try json_util.appendJsonKey(&buf, allocator, "instance_id");
     if (state.owner_instance_id.len > 0) {
@@ -4859,7 +4979,7 @@ fn handleApiChatStreamSseConnection(
     if (!std.mem.eql(u8, base_path, "/api/v1/chat/stream")) return false;
 
     const request_start_ms = std.time.milliTimestamp();
-    if (!validateInternalServiceToken(raw_request, state.internal_service_tokens)) {
+    if (!validateInternalServiceToken(raw_request, state)) {
         sendSseErrorResponse(stream, req_allocator, "401 Unauthorized", "unauthorized", "unauthorized");
         return true;
     }
@@ -5159,7 +5279,7 @@ fn handleApiRoute(
     config_opt: ?*const Config,
     session_mgr_opt: ?*session_mod.SessionManager,
 ) RouteResponse {
-    if (!validateInternalServiceToken(raw_request, state.internal_service_tokens)) {
+    if (!validateInternalServiceToken(raw_request, state)) {
         return .{ .status = "401 Unauthorized", .body = "{\"error\":\"unauthorized\"}" };
     }
 
@@ -7677,7 +7797,7 @@ fn handleAcceptedConnection(
             if (!std.mem.eql(u8, method_str, "GET")) {
                 response_status = "405 Method Not Allowed";
                 response_body = "{\"error\":\"method not allowed\"}";
-            } else if (!validateInternalServiceToken(raw, state.internal_service_tokens)) {
+            } else if (!validateInternalServiceToken(raw, state)) {
                 response_status = "401 Unauthorized";
                 response_body = "{\"error\":\"unauthorized\"}";
             } else {
@@ -7689,7 +7809,7 @@ fn handleAcceptedConnection(
             if (!std.mem.eql(u8, method_str, "POST")) {
                 response_status = "405 Method Not Allowed";
                 response_body = "{\"error\":\"method not allowed\"}";
-            } else if (!validateInternalServiceToken(raw, state.internal_service_tokens)) {
+            } else if (!validateInternalServiceToken(raw, state)) {
                 response_status = "401 Unauthorized";
                 response_body = "{\"error\":\"unauthorized\"}";
             } else {
@@ -7726,7 +7846,7 @@ fn handleAcceptedConnection(
             if (!std.mem.eql(u8, method_str, "POST")) {
                 response_status = "405 Method Not Allowed";
                 response_body = "{\"error\":\"method not allowed\"}";
-            } else if (!validateInternalServiceToken(raw, state.internal_service_tokens)) {
+            } else if (!validateInternalServiceToken(raw, state)) {
                 response_status = "401 Unauthorized";
                 response_body = "{\"error\":\"unauthorized\"}";
             } else {
@@ -7738,7 +7858,7 @@ fn handleAcceptedConnection(
             if (!std.mem.eql(u8, method_str, "POST")) {
                 response_status = "405 Method Not Allowed";
                 response_body = "{\"error\":\"method not allowed\"}";
-            } else if (!validateInternalServiceToken(raw, state.internal_service_tokens)) {
+            } else if (!validateInternalServiceToken(raw, state)) {
                 response_status = "401 Unauthorized";
                 response_body = "{\"error\":\"unauthorized\"}";
             } else {
@@ -7751,7 +7871,7 @@ fn handleAcceptedConnection(
             if (!std.mem.eql(u8, method_str, "POST")) {
                 response_status = "405 Method Not Allowed";
                 response_body = "{\"error\":\"method not allowed\"}";
-            } else if (!validateInternalServiceToken(raw, state.internal_service_tokens)) {
+            } else if (!validateInternalServiceToken(raw, state)) {
                 response_status = "401 Unauthorized";
                 response_body = "{\"error\":\"unauthorized\"}";
             } else {
@@ -7917,6 +8037,27 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.lark_app_secret = lark_cfg.app_secret;
             state.lark_allow_from = lark_cfg.allow_from;
             state.lark_account_id = lark_cfg.account_id;
+        }
+        const production_like_gateway = isProductionLikeGateway(cfg, host);
+        const token_validation = validateInternalTokensForMode(
+            cfg.gateway.internal_service_tokens,
+            production_like_gateway,
+        );
+        state.internal_auth_required = production_like_gateway;
+        state.internal_token_policy_ok = token_validation.ok;
+        state.internal_token_configured = token_validation.configured;
+        state.internal_token_policy_reason = token_validation.reason orelse "";
+        if (production_like_gateway and !token_validation.ok) {
+            log.err(
+                "security_config_invalid reason={s} host={s} tenant_enabled={s} allow_public_bind={s}",
+                .{
+                    token_validation.reason orelse "unknown",
+                    host,
+                    if (cfg.tenant.enabled) "true" else "false",
+                    if (cfg.gateway.allow_public_bind) "true" else "false",
+                },
+            );
+            return error.SecurityConfigInvalid;
         }
         state.internal_service_tokens = cfg.gateway.internal_service_tokens;
         state.tenant_enabled = cfg.tenant.enabled;
@@ -9214,6 +9355,71 @@ test "validateBearerToken exact match required" {
     try std.testing.expect(validateBearerToken("abc123", tokens));
     try std.testing.expect(!validateBearerToken("abc1234", tokens));
     try std.testing.expect(!validateBearerToken("abc12", tokens));
+}
+
+test "validateInternalTokensForMode allows empty tokens in localhost mode" {
+    const result = validateInternalTokensForMode(&.{}, false);
+    try std.testing.expect(result.ok);
+    try std.testing.expect(!result.configured);
+    try std.testing.expect(result.reason == null);
+}
+
+test "validateInternalTokensForMode rejects empty tokens in production-like mode" {
+    const missing = validateInternalTokensForMode(&.{}, true);
+    try std.testing.expect(!missing.ok);
+    try std.testing.expect(!missing.configured);
+    try std.testing.expectEqualStrings("missing_internal_service_tokens", missing.reason.?);
+
+    const empty_only = validateInternalTokensForMode(&[_][]const u8{"   "}, true);
+    try std.testing.expect(!empty_only.ok);
+    try std.testing.expect(!empty_only.configured);
+    try std.testing.expectEqualStrings("invalid_internal_service_token_empty", empty_only.reason.?);
+}
+
+test "validateInternalTokensForMode rejects weak and denylisted tokens in production-like mode" {
+    const too_short = validateInternalTokensForMode(&[_][]const u8{"short-token"}, true);
+    try std.testing.expect(!too_short.ok);
+    try std.testing.expect(too_short.configured);
+    try std.testing.expectEqualStrings("invalid_internal_service_token_too_short", too_short.reason.?);
+
+    const denylisted = validateInternalTokensForMode(&[_][]const u8{"DEV-INTERNAL-TOKEN"}, true);
+    try std.testing.expect(!denylisted.ok);
+    try std.testing.expect(denylisted.configured);
+    try std.testing.expectEqualStrings("invalid_internal_service_token_denylisted", denylisted.reason.?);
+
+    const strong = validateInternalTokensForMode(&[_][]const u8{"svc-prod-token-1234"}, true);
+    try std.testing.expect(strong.ok);
+    try std.testing.expect(strong.configured);
+    try std.testing.expect(strong.reason == null);
+}
+
+test "validateInternalServiceTokenWithPolicy enforces strict mode when token set is empty" {
+    const no_auth_raw = "GET /internal/diagnostics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try std.testing.expect(validateInternalServiceTokenWithPolicy(no_auth_raw, &.{}, false));
+    try std.testing.expect(!validateInternalServiceTokenWithPolicy(no_auth_raw, &.{}, true));
+
+    const with_auth_raw = "GET /internal/diagnostics HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: svc-prod-token-1234\r\n\r\n";
+    const tokens = &[_][]const u8{"svc-prod-token-1234"};
+    try std.testing.expect(validateInternalServiceTokenWithPolicy(with_auth_raw, tokens, true));
+}
+
+test "isProductionLikeGateway treats non-loopback host as production-like" {
+    var cfg = Config{
+        .workspace_dir = ".",
+        .config_path = "config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(!isProductionLikeGateway(&cfg, "127.0.0.1"));
+    try std.testing.expect(!isProductionLikeGateway(&cfg, "localhost"));
+    try std.testing.expect(isProductionLikeGateway(&cfg, "0.0.0.0"));
+
+    cfg.tenant.enabled = true;
+    try std.testing.expect(isProductionLikeGateway(&cfg, "127.0.0.1"));
+
+    cfg.tenant.enabled = false;
+    cfg.gateway.allow_public_bind = true;
+    try std.testing.expect(isProductionLikeGateway(&cfg, "127.0.0.1"));
 }
 
 test "isWebhookAuthorized fails closed when pairing guard missing" {
@@ -10861,6 +11067,10 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     gs.tenant_enabled = true;
     gs.ownership_lock_enabled = true;
     gs.ownership_lock_lease_secs = 300;
+    gs.internal_auth_required = true;
+    gs.internal_token_configured = true;
+    gs.internal_token_policy_ok = true;
+    gs.internal_token_policy_reason = "";
     gs.owner_instance_id = "diag-owner";
     recordTenantLockConflict(&gs, .chat_stream_sse);
     recordTenantLockConflict(&gs, .webhook);
@@ -10869,6 +11079,10 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"runtime_mode\":\"threaded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"internal_auth_required\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"internal_token_configured\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"internal_token_policy_ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"internal_token_policy_reason\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"instance_id\":\"diag-owner\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"owned_users_count\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_backend\":\"file_lock\"") != null);

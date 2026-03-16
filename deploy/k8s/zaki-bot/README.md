@@ -111,6 +111,28 @@ Update these fields before apply:
 - `LITESTREAM_S3_BUCKET`, `LITESTREAM_S3_PREFIX`
 - `AWS_REGION` (if required by your S3 endpoint)
 
+## Security preflight (required)
+Before deploy, verify `INTERNAL_SERVICE_TOKEN` is production-safe:
+1. not empty
+2. length >= 16
+3. not denylisted (`test-internal-token`, `dev-internal-token`, `changeme`, `change-me`, `default`)
+
+Example:
+```bash
+tok="${INTERNAL_SERVICE_TOKEN:-}"
+if [ -z "$tok" ]; then
+  echo "FAIL: INTERNAL_SERVICE_TOKEN is empty"; exit 1
+fi
+if [ "${#tok}" -lt 16 ]; then
+  echo "FAIL: INTERNAL_SERVICE_TOKEN must be at least 16 chars"; exit 1
+fi
+case "$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')" in
+  test-internal-token|dev-internal-token|changeme|change-me|default)
+    echo "FAIL: INTERNAL_SERVICE_TOKEN uses denylisted value"; exit 1 ;;
+esac
+echo "PASS: INTERNAL_SERVICE_TOKEN preflight"
+```
+
 Composio scoping model:
 - `COMPOSIO_API_KEY` is global app/platform auth.
 - In tenant mode, runtime binds Composio `entity_id` to the current tenant user id for per-user OAuth/account scope.
@@ -134,6 +156,10 @@ kubectl -n zaki-bot-staging port-forward svc/nullclaw 3000:80
 curl -s http://127.0.0.1:3000/metrics | head -n 40
 curl -s http://127.0.0.1:3000/internal/diagnostics -H "X-Internal-Token: ${INTERNAL_TOKEN}" | jq '.startup_self_check'
 ```
+Expected auth posture in diagnostics:
+1. `internal_auth_required=true`
+2. `internal_token_configured=true`
+3. `internal_token_policy_ok=true`
 If PgBouncer is enabled, verify state path points to the pooler:
 ```bash
 kubectl -n zaki-bot-staging get pods -l app.kubernetes.io/name=nullclaw-pgbouncer
