@@ -101,6 +101,7 @@ pub const ShellTool = struct {
                 .enabled = self.sandbox_enabled,
                 .backend = self.sandbox_backend,
                 .workspace_dir = self.workspace_dir,
+                .allowed_roots = self.allowed_paths,
             },
             &.{ platform.getShell(), platform.getShellFlag(), command },
             .{

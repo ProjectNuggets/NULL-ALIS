@@ -12,7 +12,7 @@ pub const MemoryListTool = struct {
     pub const tool_name = "memory_list";
     pub const tool_description = "List memory entries in recency order. Use for requests like 'show first N memory records' without shell/sqlite access.";
     pub const tool_params =
-        \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"scope":{"type":"string","enum":["session","global"],"description":"List scope (default: global)"},"session_id":{"type":"string","description":"Optional explicit session filter override"},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys (default: false)"}}}
+        \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"scope":{"type":"string","enum":["session","global"],"description":"List scope (default: session)"},"session_id":{"type":"string","description":"Optional explicit session filter override"},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys (default: false)"}}}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -94,7 +94,7 @@ pub const MemoryListTool = struct {
             return sid;
         }
 
-        const scope_raw = root.getString(args, "scope") orelse "global";
+        const scope_raw = root.getString(args, "scope") orelse "session";
         const scope = std.mem.trim(u8, scope_raw, " \t\r\n");
         if (scope.len == 0) return error.InvalidScope;
         if (std.ascii.eqlIgnoreCase(scope, "global")) return null;
@@ -143,7 +143,7 @@ test "memory_list filters internal keys by default" {
 
     var mt = MemoryListTool{ .memory = mem };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"limit\":10}");
+    const parsed = try root.parseTestArgs("{\"limit\":10,\"scope\":\"global\"}");
     defer parsed.deinit();
     const result = try t.execute(allocator, parsed.value.object);
     defer if (result.output.len > 0) allocator.free(result.output);
@@ -164,7 +164,7 @@ test "memory_list include_internal true includes autosave entries" {
 
     var mt = MemoryListTool{ .memory = mem };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"include_internal\":true}");
+    const parsed = try root.parseTestArgs("{\"include_internal\":true,\"scope\":\"global\"}");
     defer parsed.deinit();
     const result = try t.execute(allocator, parsed.value.object);
     defer if (result.output.len > 0) allocator.free(result.output);
@@ -184,7 +184,7 @@ test "memory_list filters markdown-encoded internal keys in content" {
 
     var mt = MemoryListTool{ .memory = mem };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"limit\":10}");
+    const parsed = try root.parseTestArgs("{\"limit\":10,\"scope\":\"global\"}");
     defer parsed.deinit();
     const result = try t.execute(allocator, parsed.value.object);
     defer if (result.output.len > 0) allocator.free(result.output);
@@ -205,7 +205,7 @@ test "memory_list filters bootstrap internal keys by default" {
 
     var mt = MemoryListTool{ .memory = mem };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"limit\":10}");
+    const parsed = try root.parseTestArgs("{\"limit\":10,\"scope\":\"global\"}");
     defer parsed.deinit();
     const result = try t.execute(allocator, parsed.value.object);
     defer if (result.output.len > 0) allocator.free(result.output);
@@ -216,7 +216,7 @@ test "memory_list filters bootstrap internal keys by default" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-agents") == null);
 }
 
-test "memory_list defaults to global scope" {
+test "memory_list defaults to session scope" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
     defer sqlite_mem.deinit();
@@ -237,7 +237,7 @@ test "memory_list defaults to global scope" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "session_only") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_only") == null);
 }
 
 test "memory_list supports explicit global scope" {

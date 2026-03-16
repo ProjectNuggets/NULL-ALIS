@@ -2,14 +2,89 @@ const std = @import("std");
 const config_types = @import("../config_types.zig");
 const security = @import("../security/root.zig");
 const process_util = @import("process_util.zig");
+const log = std.log.scoped(.tool_sandbox_v1);
 
 pub const SandboxExecConfig = struct {
     enabled: bool = false,
     backend: config_types.SandboxBackend = .auto,
     workspace_dir: []const u8 = ".",
+    allowed_roots: []const []const u8 = &.{},
 };
 
 pub const MAX_WRAPPED_ARGV: usize = 160;
+
+const WorkspaceValidationReason = enum(u8) {
+    none = 0,
+    empty,
+    not_absolute,
+    is_root,
+    traversal,
+    dangerous_mount,
+    null_bytes,
+    path_too_long,
+    not_in_allowed_roots,
+
+    fn fromValidationResult(result: security.ValidationResult) WorkspaceValidationReason {
+        return switch (result) {
+            .valid => .none,
+            .empty => .empty,
+            .not_absolute => .not_absolute,
+            .is_root => .is_root,
+            .traversal => .traversal,
+            .dangerous_mount => .dangerous_mount,
+            .null_bytes => .null_bytes,
+            .path_too_long => .path_too_long,
+            .not_in_allowed_roots => .not_in_allowed_roots,
+        };
+    }
+
+    fn toString(self: WorkspaceValidationReason) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .empty => "empty",
+            .not_absolute => "not_absolute",
+            .is_root => "is_root",
+            .traversal => "traversal",
+            .dangerous_mount => "dangerous_mount",
+            .null_bytes => "null_bytes",
+            .path_too_long => "path_too_long",
+            .not_in_allowed_roots => "not_in_allowed_roots",
+        };
+    }
+};
+
+pub const SandboxDiagnosticsSnapshot = struct {
+    workspace_validation_failed_total: u64,
+    workspace_fallback_none_total: u64,
+    workspace_validation_last_reason: []const u8,
+};
+
+var workspace_validation_failed_total = std.atomic.Value(u64).init(0);
+var workspace_fallback_none_total = std.atomic.Value(u64).init(0);
+var workspace_validation_last_reason = std.atomic.Value(u8).init(@intFromEnum(WorkspaceValidationReason.none));
+
+pub fn diagnosticsSnapshot() SandboxDiagnosticsSnapshot {
+    const reason_code = workspace_validation_last_reason.load(.monotonic);
+    const reason: WorkspaceValidationReason = @enumFromInt(reason_code);
+    return .{
+        .workspace_validation_failed_total = workspace_validation_failed_total.load(.monotonic),
+        .workspace_fallback_none_total = workspace_fallback_none_total.load(.monotonic),
+        .workspace_validation_last_reason = reason.toString(),
+    };
+}
+
+fn recordWorkspaceValidationFailure(reason: WorkspaceValidationReason) void {
+    _ = workspace_validation_failed_total.fetchAdd(1, .monotonic);
+    _ = workspace_fallback_none_total.fetchAdd(1, .monotonic);
+    workspace_validation_last_reason.store(@intFromEnum(reason), .monotonic);
+}
+
+fn shouldValidateDockerWorkspacePath(backend: config_types.SandboxBackend) bool {
+    return switch (backend) {
+        .auto, .docker => true,
+        else => false,
+    };
+}
 
 pub fn resolve_sandboxed_argv(
     allocator: std.mem.Allocator,
@@ -18,6 +93,20 @@ pub fn resolve_sandboxed_argv(
     wrapped_buf: *[MAX_WRAPPED_ARGV][]const u8,
 ) ![]const []const u8 {
     if (!exec_cfg.enabled) return argv;
+
+    if (shouldValidateDockerWorkspacePath(exec_cfg.backend)) {
+        const allowed_roots_opt: ?[]const []const u8 = if (exec_cfg.allowed_roots.len > 0) exec_cfg.allowed_roots else null;
+        const validation = security.validateWorkspaceMount(exec_cfg.workspace_dir, allowed_roots_opt);
+        if (!validation.isValid()) {
+            const reason = WorkspaceValidationReason.fromValidationResult(validation);
+            recordWorkspaceValidationFailure(reason);
+            log.warn("sandbox workspace validation failed backend={s} reason={s}; falling back to none", .{
+                @tagName(exec_cfg.backend),
+                reason.toString(),
+            });
+            return argv;
+        }
+    }
 
     var sandbox_storage: security.SandboxStorage = .{};
     const sandbox = security.createSandbox(
@@ -84,6 +173,28 @@ test "resolve_sandboxed_argv enabled none backend fails closed" {
         &buf,
     );
     try std.testing.expectError(error.SandboxUnavailable, result);
+}
+
+test "resolve_sandboxed_argv invalid docker workspace falls back to passthrough and records diagnostics" {
+    var buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
+    const argv = &[_][]const u8{ "echo", "hello" };
+    const before = diagnosticsSnapshot();
+    const resolved = try resolve_sandboxed_argv(
+        std.testing.allocator,
+        .{
+            .enabled = true,
+            .backend = .docker,
+            .workspace_dir = "/etc",
+        },
+        argv,
+        &buf,
+    );
+    const after = diagnosticsSnapshot();
+    try std.testing.expectEqual(@as(usize, argv.len), resolved.len);
+    try std.testing.expectEqualStrings("echo", resolved[0]);
+    try std.testing.expect(after.workspace_validation_failed_total >= before.workspace_validation_failed_total + 1);
+    try std.testing.expect(after.workspace_fallback_none_total >= before.workspace_fallback_none_total + 1);
+    try std.testing.expectEqualStrings("dangerous_mount", after.workspace_validation_last_reason);
 }
 
 test "resolve_sandboxed_argv docker wrapper composition" {

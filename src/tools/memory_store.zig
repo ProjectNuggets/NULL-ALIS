@@ -16,7 +16,7 @@ pub const MemoryStoreTool = struct {
     pub const tool_name = "memory_store";
     pub const tool_description = "Store durable user facts, preferences, and decisions in long-term memory. Use category 'core' for stable facts, 'daily' for session notes, 'conversation' for important context only. Do not store routine greetings or every chat message.";
     pub const tool_params =
-        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"},"scope":{"type":"string","enum":["session","global"],"description":"Memory scope (default: global)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["key","content"]}
+        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"},"scope":{"type":"string","enum":["session","global"],"description":"Memory scope (default: session)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["key","content"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -70,7 +70,7 @@ pub const MemoryStoreTool = struct {
             return sid;
         }
 
-        const scope_raw = root.getString(args, "scope") orelse "global";
+        const scope_raw = root.getString(args, "scope") orelse "session";
         const scope = std.mem.trim(u8, scope_raw, " \t\r\n");
         if (scope.len == 0) return error.InvalidScope;
         if (std.ascii.eqlIgnoreCase(scope, "global")) return null;
@@ -102,7 +102,7 @@ test "memory_store schema has key and content" {
 test "memory_store executes without backend" {
     var mt = MemoryStoreTool{};
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"key\": \"lang\", \"content\": \"Prefers Zig\"}");
+    const parsed = try root.parseTestArgs("{\"key\": \"lang\", \"content\": \"Prefers Zig\", \"scope\": \"global\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -136,7 +136,7 @@ test "memory_store with real backend" {
 
     var mt = MemoryStoreTool{ .memory = backend.memory() };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"key\": \"lang\", \"content\": \"Prefers Zig\", \"category\": \"core\"}");
+    const parsed = try root.parseTestArgs("{\"key\": \"lang\", \"content\": \"Prefers Zig\", \"category\": \"core\", \"scope\": \"global\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -152,7 +152,7 @@ test "memory_store default category is core" {
 
     var mt = MemoryStoreTool{ .memory = backend.memory() };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"key\": \"test\", \"content\": \"value\"}");
+    const parsed = try root.parseTestArgs("{\"key\": \"test\", \"content\": \"value\", \"scope\": \"global\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -167,7 +167,7 @@ test "memory_store with daily category" {
 
     var mt = MemoryStoreTool{ .memory = backend.memory() };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"key\": \"note\", \"content\": \"today's note\", \"category\": \"daily\"}");
+    const parsed = try root.parseTestArgs("{\"key\": \"note\", \"content\": \"today's note\", \"category\": \"daily\", \"scope\": \"global\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -175,7 +175,7 @@ test "memory_store with daily category" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "daily") != null);
 }
 
-test "memory_store defaults to global scope" {
+test "memory_store defaults to session scope" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
     defer sqlite_mem.deinit();
@@ -194,7 +194,8 @@ test "memory_store defaults to global scope" {
 
     const entry = (try mem.get(allocator, "lane_pref")) orelse return error.TestUnexpectedResult;
     defer entry.deinit(allocator);
-    try std.testing.expect(entry.session_id == null);
+    try std.testing.expect(entry.session_id != null);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:main", entry.session_id.?);
 }
 
 test "memory_store supports explicit global scope" {

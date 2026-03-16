@@ -123,6 +123,8 @@ pub const ValidationResult = enum {
     dangerous_mount,
     /// Path contains null bytes
     null_bytes,
+    /// Path exceeds Docker mount path safety limit
+    path_too_long,
     /// Path is not under any of the allowed workspace roots
     not_in_allowed_roots,
 
@@ -139,6 +141,7 @@ pub const ValidationResult = enum {
             .traversal => "path contains '..' traversal",
             .dangerous_mount => "path targets a dangerous system directory",
             .null_bytes => "path contains null bytes",
+            .path_too_long => "path exceeds maximum supported length",
             .not_in_allowed_roots => "path is not under any allowed workspace root",
         };
     }
@@ -181,23 +184,26 @@ pub fn validateWorkspaceMount(path: []const u8, allowed_roots: ?[]const []const 
     // 2. Null byte check
     if (std.mem.indexOfScalar(u8, path, 0) != null) return .null_bytes;
 
-    // 3. Absolute path check
+    // 3. Length check (prevents silent truncation in docker mount arg composition)
+    if (path.len > MAX_WORKSPACE_LEN) return .path_too_long;
+
+    // 4. Absolute path check
     if (path[0] != '/') return .not_absolute;
 
-    // 4. Root check — normalize trailing slashes: treat "///" the same as "/"
+    // 5. Root check — normalize trailing slashes: treat "///" the same as "/"
     const trimmed = std.mem.trimRight(u8, path, "/");
     if (trimmed.len == 0) return .is_root;
 
-    // 5. Traversal check — look for ".." as a path component
+    // 6. Traversal check — look for ".." as a path component
     if (containsTraversal(path)) return .traversal;
 
-    // 6. Dangerous mount check
+    // 7. Dangerous mount check
     if (isDangerousMount(trimmed)) return .dangerous_mount;
 
-    // 7. Bare /home check — "/home" alone is dangerous, but "/home/user" is fine
+    // 8. Bare /home check — "/home" alone is dangerous, but "/home/user" is fine
     if (std.mem.eql(u8, trimmed, "/home")) return .dangerous_mount;
 
-    // 8. Allowed roots check (optional)
+    // 9. Allowed roots check (optional)
     if (allowed_roots) |roots| {
         if (roots.len > 0) {
             for (roots) |root| {
@@ -413,6 +419,14 @@ test "mount validation: path with null bytes rejected" {
     try std.testing.expectEqual(ValidationResult.null_bytes, result);
 }
 
+test "mount validation: overlong path rejected" {
+    var path_buf: [MAX_WORKSPACE_LEN + 32]u8 = undefined;
+    path_buf[0] = '/';
+    for (path_buf[1..]) |*b| b.* = 'a';
+    const result = validateWorkspaceMount(path_buf[0..], null);
+    try std.testing.expectEqual(ValidationResult.path_too_long, result);
+}
+
 test "mount validation: allowed roots enforcement" {
     const roots = [_][]const u8{ "/opt/workspaces", "/srv/projects" };
     // Path under allowed root passes
@@ -446,5 +460,6 @@ test "mount validation: ValidationResult.toString returns descriptive strings" {
     try std.testing.expectEqualStrings("path contains '..' traversal", ValidationResult.traversal.toString());
     try std.testing.expectEqualStrings("path targets a dangerous system directory", ValidationResult.dangerous_mount.toString());
     try std.testing.expectEqualStrings("path contains null bytes", ValidationResult.null_bytes.toString());
+    try std.testing.expectEqualStrings("path exceeds maximum supported length", ValidationResult.path_too_long.toString());
     try std.testing.expectEqualStrings("path is not under any allowed workspace root", ValidationResult.not_in_allowed_roots.toString());
 }

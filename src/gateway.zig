@@ -46,6 +46,7 @@ const multimodal = @import("multimodal.zig");
 const voice = @import("voice.zig");
 const telegram_token = @import("telegram_token.zig");
 const user_settings = @import("user_settings.zig");
+const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
@@ -467,6 +468,7 @@ pub const GatewayState = struct {
     tenant_lock_conflicts_daemon_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     tenant_lock_conflicts_api_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     tenant_lock_conflict_retries_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    tenant_runtime_policy_attached: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     in_flight_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     drain_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     overload_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -600,6 +602,8 @@ const TenantRuntime = struct {
     pg_session_store: ?*zaki_state_mod.Manager.UserSessionStore,
     state_mgr: ?*zaki_state_mod.Manager,
     subagent_manager: ?*subagent_mod.SubagentManager,
+    sec_tracker: ?security.RateTracker,
+    sec_policy: ?security.SecurityPolicy,
     log_obs: *observability.LogObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: std.atomic.Value(i64),
@@ -681,6 +685,8 @@ const TenantRuntime = struct {
             .pg_session_store = null,
             .state_mgr = state_mgr,
             .subagent_manager = null,
+            .sec_tracker = null,
+            .sec_policy = null,
             .log_obs = undefined,
             .session_mgr = undefined,
             .last_used_s = std.atomic.Value(i64).init(std.time.timestamp()),
@@ -718,6 +724,18 @@ const TenantRuntime = struct {
         errdefer runtime.provider_bundle.deinit();
         const provider_i: providers.Provider = runtime.provider_bundle.provider();
         const resolved_api_key = runtime.provider_bundle.primaryApiKey();
+
+        runtime.sec_tracker = security.RateTracker.init(allocator, runtime.config.autonomy.max_actions_per_hour);
+        runtime.sec_policy = .{
+            .autonomy = runtime.config.autonomy.level,
+            .workspace_dir = runtime.config.workspace_dir,
+            .workspace_only = runtime.config.autonomy.workspace_only,
+            .allowed_commands = if (runtime.config.autonomy.allowed_commands.len > 0) runtime.config.autonomy.allowed_commands else &security.default_allowed_commands,
+            .max_actions_per_hour = runtime.config.autonomy.max_actions_per_hour,
+            .require_approval_for_medium_risk = runtime.config.autonomy.require_approval_for_medium_risk,
+            .block_high_risk_commands = runtime.config.autonomy.block_high_risk_commands,
+            .tracker = if (runtime.sec_tracker) |*tracker| tracker else null,
+        };
 
         applyTenantSemanticMemoryDefaults(&runtime.config);
         runtime.mem_rt = memory_mod.initRuntimeWithOptions(allocator, &runtime.config.memory, runtime.config.workspace_dir, .{
@@ -776,6 +794,8 @@ const TenantRuntime = struct {
             .fallback_api_key = resolved_api_key,
             .event_bus = event_bus,
             .tools_config = runtime.config.tools,
+            .allowed_paths = runtime.config.autonomy.allowed_paths,
+            .policy = if (runtime.sec_policy) |*policy| policy else null,
             .subagent_manager = runtime.subagent_manager,
         }) catch &.{};
         errdefer if (runtime.tools.len > 0) tools_mod.deinitTools(allocator, runtime.tools);
@@ -797,6 +817,10 @@ const TenantRuntime = struct {
             if (runtime.mem_rt) |*rt| rt.response_cache else null,
         );
         errdefer runtime.session_mgr.deinit();
+
+        if (runtime.sec_policy) |*policy| {
+            runtime.session_mgr.policy = policy;
+        }
 
         if (runtime.mem_rt) |*rt| {
             runtime.session_mgr.mem_rt = rt;
@@ -867,6 +891,7 @@ const TenantRuntime = struct {
             self.allocator.destroy(store);
         }
         if (self.mem_rt) |*rt| rt.deinit();
+        if (self.sec_tracker) |*tracker| tracker.deinit();
         self.provider_bundle.deinit();
         self.allocator.destroy(self.log_obs);
         self.allocator.free(self.workspace_path);
@@ -971,6 +996,9 @@ fn getTenantRuntime(
     }
 
     const runtime = try TenantRuntime.init(state.allocator, config, user_ctx, state.event_bus, state.zaki_state);
+    if (runtime.session_mgr.policy != null) {
+        state.tenant_runtime_policy_attached.store(true, .monotonic);
+    }
     try state.tenant_runtimes.put(state.allocator, runtime.user_id, runtime);
     return runtime;
 }
@@ -1498,6 +1526,15 @@ const OnboardingStateSummary = struct {
     completed_at_s: ?i64 = null,
 };
 
+const OnboardingReadiness = struct {
+    can_start_chat_now: bool,
+    minimum_required: []const []const u8,
+
+    fn deinit(self: *OnboardingReadiness, allocator: std.mem.Allocator) void {
+        allocator.free(self.minimum_required);
+    }
+};
+
 fn parseOnboardingStateSummary(content: []const u8) OnboardingStateSummary {
     return .{
         .completed = jsonBoolField(content, "completed") orelse false,
@@ -1509,6 +1546,32 @@ fn manualConnectStatus(available: bool, configured_by_operator: bool) []const u8
     if (!available) return "disabled_in_build";
     if (!configured_by_operator) return "not_configured_by_operator";
     return "ready_for_user_binding";
+}
+
+fn computeOnboardingReadiness(
+    allocator: std.mem.Allocator,
+    config_opt: ?*const Config,
+    summary: OnboardingStateSummary,
+    telegram_state: TelegramUserState,
+) !OnboardingReadiness {
+    _ = summary;
+    _ = telegram_state;
+
+    var minimum_required: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer minimum_required.deinit(allocator);
+
+    if (config_opt) |cfg| {
+        const default_model = cfg.default_model orelse "";
+        if (cfg.default_provider.len == 0 or default_model.len == 0) {
+            try minimum_required.append(allocator, "operator_configure_model_provider");
+        }
+    }
+
+    const required_slice = try minimum_required.toOwnedSlice(allocator);
+    return .{
+        .can_start_chat_now = required_slice.len == 0,
+        .minimum_required = required_slice,
+    };
 }
 
 fn buildUserRoutePath(
@@ -1575,6 +1638,9 @@ fn buildOnboardingSetupResponse(
     telegram_state: TelegramUserState,
     config_opt: ?*const Config,
 ) ![]u8 {
+    var readiness = try computeOnboardingReadiness(allocator, config_opt, summary, telegram_state);
+    defer readiness.deinit(allocator);
+
     const settings_defaults = user_settings.defaults();
     const settings_defaults_json = try user_settings.renderSettingsJson(allocator, settings_defaults);
     defer allocator.free(settings_defaults_json);
@@ -1611,8 +1677,10 @@ fn buildOnboardingSetupResponse(
         try w.writeAll("null");
     }
     try w.writeAll(",\"setup\":{");
-    try w.writeAll("\"can_start_chat_now\":true");
-    try w.writeAll(",\"minimum_required\":[]");
+    try w.writeAll("\"can_start_chat_now\":");
+    try w.writeAll(if (readiness.can_start_chat_now) "true" else "false");
+    try w.writeAll(",\"minimum_required\":");
+    try jsonWriteStringArray(w, readiness.minimum_required);
     try w.writeAll(",\"settings\":{");
     try w.writeAll("\"endpoint\":\"");
     try jsonEscapeInto(w, settings_endpoint);
@@ -3335,10 +3403,7 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
     defer allocator.free(resp);
     ensureTelegramSendMessageAccepted(allocator, resp) catch |err| {
         switch (err) {
-            error.TelegramApiUnexpectedResponse => {
-                log.warn("telegram sendMessage unexpected response; retrying via curl fallback", .{});
-                return sendTelegramReplyViaCurlFallback(allocator, normalized_bot_token, body_buf.items);
-            },
+            error.TelegramApiUnexpectedResponse => return error.TelegramApiRejected,
             else => return err,
         }
     };
@@ -3433,9 +3498,7 @@ fn sendTelegramReplyViaCurlFallback(allocator: std.mem.Allocator, bot_token: []c
     const term = try child.wait();
     switch (term) {
         .Exited => |code| if (code != 0) {
-            if (stderr_bytes.len > 0) {
-                log.warn("telegram curl fallback failed code={d} stderr={s}", .{ code, stderr_bytes });
-            }
+            log.warn("telegram curl fallback failed code={d} stderr_len={d}", .{ code, stderr_bytes.len });
             return error.CurlFailed;
         },
         else => return error.CurlFailed,
@@ -3976,6 +4039,8 @@ fn internalDiagnosticsPayload(
     const tenant_lock_conflicts_daemon_total = state.tenant_lock_conflicts_daemon_total.load(.monotonic);
     const tenant_lock_conflicts_api_total = state.tenant_lock_conflicts_api_total.load(.monotonic);
     const tenant_lock_conflict_retries_total = state.tenant_lock_conflict_retries_total.load(.monotonic);
+    const tenant_runtime_policy_attached = state.tenant_runtime_policy_attached.load(.monotonic);
+    const sandbox_diag = tool_sandbox_v1.diagnosticsSnapshot();
 
     var lease_probe_snapshot: ?zaki_state_mod.UserOwnershipLeaseSnapshot = null;
     defer if (lease_probe_snapshot) |*value| value.deinit(allocator);
@@ -4044,6 +4109,15 @@ fn internalDiagnosticsPayload(
     try json_util.appendJsonInt(&buf, allocator, "tenant_lock_retry_max_ms", state.ownership_lock_retry_max_ms);
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "tenant_lock_conflict_retries_total", @intCast(tenant_lock_conflict_retries_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "tenant_runtime_policy_attached");
+    try buf.appendSlice(allocator, if (tenant_runtime_policy_attached) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "sandbox_workspace_validation_failed_total", @intCast(sandbox_diag.workspace_validation_failed_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "sandbox_fallback_none_total", @intCast(sandbox_diag.workspace_fallback_none_total));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "sandbox_workspace_validation_last_reason", sandbox_diag.workspace_validation_last_reason);
     try buf.appendSlice(allocator, ",");
 
     try json_util.appendJsonKey(&buf, allocator, "tenant_lock_conflicts_by_route");
@@ -8507,6 +8581,57 @@ test "handleApiRoute GET onboarding returns setup contract for settings panel" {
     const discord = guides.get("discord").?.object;
     try std.testing.expectEqual(build_options.enable_channel_discord, discord.get("available").?.bool);
     try std.testing.expectEqual(false, discord.get("connect_supported").?.bool);
+}
+
+test "handleApiRoute GET onboarding reports minimum_required when model/provider missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.default_provider = "";
+    cfg.default_model = "";
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/onboarding HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "GET",
+        "/api/v1/users/1/onboarding",
+        &state,
+        &cfg,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", response.status);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    const setup = parsed.value.object.get("setup").?.object;
+    try std.testing.expectEqual(false, setup.get("can_start_chat_now").?.bool);
+    const minimum_required = setup.get("minimum_required").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), minimum_required.len);
+    try std.testing.expectEqualStrings("operator_configure_model_provider", minimum_required[0].string);
 }
 
 test "handleApiRoute GET onboarding reflects connected telegram status" {

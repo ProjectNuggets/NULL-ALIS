@@ -213,6 +213,7 @@ pub const GitTool = struct {
                 .enabled = self.sandbox_enabled,
                 .backend = self.sandbox_backend,
                 .workspace_dir = self.workspace_dir,
+                .allowed_roots = self.allowed_paths,
             },
             argv_buf[0 .. arg_count + 1],
             .{ .cwd = git_cwd },

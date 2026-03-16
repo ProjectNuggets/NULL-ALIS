@@ -4090,6 +4090,9 @@ test "bindMemoryTools wires memory tools to sqlite backend" {
     );
     defer agent.deinit();
 
+    tools_mod.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:main" });
+    defer tools_mod.clearTurnContext();
+
     const store_tool = find_tool_by_name(tools, "memory_store").?;
     const store_args = try tools_mod.parseTestArgs("{\"key\":\"preference.test\",\"content\":\"123\"}");
     defer store_args.deinit();

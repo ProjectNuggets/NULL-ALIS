@@ -18,7 +18,7 @@ pub const MemoryRecallTool = struct {
     pub const tool_name = "memory_recall";
     pub const tool_description = "Search long-term memory for relevant facts, preferences, or context.";
     pub const tool_params =
-        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: global)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}
+        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: session)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -135,7 +135,7 @@ pub const MemoryRecallTool = struct {
             return sid;
         }
 
-        const scope_raw = root.getString(args, "scope") orelse "global";
+        const scope_raw = root.getString(args, "scope") orelse "session";
         const scope = std.mem.trim(u8, scope_raw, " \t\r\n");
         if (scope.len == 0) return error.InvalidScope;
         if (std.ascii.eqlIgnoreCase(scope, "global")) return null;
@@ -203,7 +203,7 @@ test "memory_recall schema has query" {
 test "memory_recall executes without backend" {
     var mt = MemoryRecallTool{};
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"query\": \"Zig\"}");
+    const parsed = try root.parseTestArgs("{\"query\": \"Zig\", \"scope\": \"global\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -227,7 +227,7 @@ test "memory_recall with real backend empty result" {
 
     var mt = MemoryRecallTool{ .memory = backend.memory() };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"query\": \"Zig\"}");
+    const parsed = try root.parseTestArgs("{\"query\": \"Zig\", \"scope\": \"global\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -242,7 +242,7 @@ test "memory_recall with custom limit" {
 
     var mt = MemoryRecallTool{ .memory = backend.memory() };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"query\": \"test\", \"limit\": 10}");
+    const parsed = try root.parseTestArgs("{\"query\": \"test\", \"limit\": 10, \"scope\": \"global\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -260,7 +260,7 @@ test "memory_recall filters internal bootstrap keys" {
 
     var mt = MemoryRecallTool{ .memory = mem };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"query\": \"zig\"}");
+    const parsed = try root.parseTestArgs("{\"query\": \"zig\", \"scope\": \"global\"}");
     defer parsed.deinit();
     const result = try t.execute(allocator, parsed.value.object);
     defer if (result.output.len > 0) allocator.free(result.output);
@@ -282,7 +282,7 @@ test "memory_recall filters markdown encoded internal keys" {
 
     var mt = MemoryRecallTool{ .memory = mem };
     const t = mt.tool();
-    const parsed = try root.parseTestArgs("{\"query\": \"User\"}");
+    const parsed = try root.parseTestArgs("{\"query\": \"User\", \"scope\": \"global\"}");
     defer parsed.deinit();
     const result = try t.execute(allocator, parsed.value.object);
     defer if (result.output.len > 0) allocator.free(result.output);
@@ -292,7 +292,7 @@ test "memory_recall filters markdown encoded internal keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "**Name**: User") != null);
 }
 
-test "memory_recall defaults to global scope" {
+test "memory_recall defaults to session scope" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
     defer sqlite_mem.deinit();
@@ -313,7 +313,7 @@ test "memory_recall defaults to global scope" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "session_fact") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_fact") == null);
 }
 
 test "memory_recall supports explicit global scope" {
