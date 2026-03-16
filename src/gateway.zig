@@ -1293,7 +1293,7 @@ fn isLoopbackHost(host_raw: []const u8) bool {
 }
 
 fn isProductionLikeGateway(cfg: *const Config, effective_host: []const u8) bool {
-    if (cfg.tenant.enabled) return true;
+    _ = cfg.tenant.enabled;
     if (cfg.gateway.allow_public_bind) return true;
     return !isLoopbackHost(effective_host);
 }
@@ -9415,7 +9415,8 @@ test "isProductionLikeGateway treats non-loopback host as production-like" {
     try std.testing.expect(isProductionLikeGateway(&cfg, "0.0.0.0"));
 
     cfg.tenant.enabled = true;
-    try std.testing.expect(isProductionLikeGateway(&cfg, "127.0.0.1"));
+    try std.testing.expect(!isProductionLikeGateway(&cfg, "127.0.0.1"));
+    try std.testing.expect(isProductionLikeGateway(&cfg, "8.8.8.8"));
 
     cfg.tenant.enabled = false;
     cfg.gateway.allow_public_bind = true;
