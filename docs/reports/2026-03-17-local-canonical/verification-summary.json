@@ -1,0 +1,14 @@
+{
+  "health_status": "ok",
+  "ready_status": "ready",
+  "effective_config_source": "postgres_seeded_from_file",
+  "effective_config_hash": "59750d4df997b660",
+  "tenant_lock_backend": "postgres_lease",
+  "tenant_runtime_policy_attached": true,
+  "state_backend_effective": "postgres",
+  "postgres_port": 6432,
+  "postgres_schema": "nullalis_local_canonical",
+  "degraded": false,
+  "chat_provider_effective": "openrouter",
+  "provider_data_source": "config"
+}
