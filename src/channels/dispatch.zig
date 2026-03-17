@@ -241,13 +241,6 @@ pub fn runOutboundDispatcherWithTenantContext(
     tenant_ctx: ?*const TenantDispatchContext,
 ) void {
     const DeliverySignal = struct {
-        fn shouldPublish(msg: *const bus.OutboundMessage) bool {
-            const source = msg.source orelse return false;
-            // Beta containment: only heartbeat outcomes drive runtime state today.
-            // Suppress other sourced outcomes until the delivery path is stable again.
-            return std.mem.eql(u8, source, "heartbeat");
-        }
-
         fn publish(
             alloc: Allocator,
             eb: *bus.Bus,
@@ -256,7 +249,7 @@ pub fn runOutboundDispatcherWithTenantContext(
             reason: []const u8,
             ts_s: i64,
         ) void {
-            if (!shouldPublish(msg)) return;
+            if (msg.source == null) return;
             const outcome = bus.makeDeliveryOutcome(
                 alloc,
                 msg.source,
@@ -897,46 +890,6 @@ test "dispatcher publishes proactive send_error and channel_not_found outcomes" 
     }
     try std.testing.expect(found_send_error);
     try std.testing.expect(found_channel_not_found);
-
-    event_bus.close();
-    thread.join();
-}
-
-test "dispatcher suppresses non-heartbeat delivery outcomes during beta containment" {
-    const allocator = std.testing.allocator;
-
-    var mock_tg = MockChannel{ .name_str = "telegram" };
-    var reg = ChannelRegistry.init(allocator);
-    defer reg.deinit();
-    try reg.register(mock_tg.channel());
-
-    var event_bus = bus.Bus.init();
-    var stats = DispatchStats{};
-    const thread = try std.Thread.spawn(.{ .stack_size = TEST_THREAD_STACK_SIZE }, runOutboundDispatcher, .{
-        allocator, &event_bus, &reg, &stats,
-    });
-
-    const msg = try bus.makeOutboundAnnotated(
-        allocator,
-        "telegram",
-        "dispatch-outcome-chat-cron",
-        "hello from cron",
-        "cron",
-        "dispatch-outcome-user-cron",
-        "dispatch-outcome-key-cron",
-    );
-    try event_bus.publishOutbound(msg);
-
-    const sent_ready = struct {
-        var stats_ptr: *DispatchStats = undefined;
-        fn check() bool {
-            return stats_ptr.getDispatched() >= 1;
-        }
-    };
-    sent_ready.stats_ptr = &stats;
-    _ = waitUntil(sent_ready.check, 200);
-
-    try std.testing.expectEqual(@as(usize, 0), event_bus.deliveryOutcomeLen());
 
     event_bus.close();
     thread.join();

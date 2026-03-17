@@ -12,7 +12,6 @@ zig-cache/
 *.bak
 *.a
 reference/
-_artifacts/
 
 result
 .direnv/

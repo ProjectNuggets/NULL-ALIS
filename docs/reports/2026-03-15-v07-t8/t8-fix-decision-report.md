@@ -1,9 +1,5 @@
 # T8 Fix Decision Report (Core Proactivity Stabilization)
 
-Status: historical snapshot, not current canonical stability truth
-
-This report remains accurate about what changed on `2026-03-15`, but later crash evidence means its local `GO` conclusion must not be used as the current production stability decision.
-
 Date: 2026-03-15  
 Branch: `v0.7-t8-proactive-single-truth`
 
