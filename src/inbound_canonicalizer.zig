@@ -1,5 +1,7 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const Config = @import("config.zig").Config;
+const config_types = @import("config_types.zig");
 const zaki_session = @import("zaki_session.zig");
 const zaki_state = @import("zaki_state.zig");
 
@@ -461,6 +463,23 @@ fn buildCanonicalSessionKey(
     };
 }
 
+fn initStateManagerForTest() !zaki_state.Manager {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const test_url = std.process.getEnvVarOwned(std.testing.allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer std.testing.allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "canon_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+    return try zaki_state.Manager.init(std.testing.allocator, cfg);
+}
+
 test "canonicalizer degrades when tenant mapping not required" {
     var cfg = Config{
         .workspace_dir = "/tmp",
@@ -513,10 +532,7 @@ test "canonicalizer rejects strict channel when identity keys missing" {
     cfg.state.backend = "postgres";
     cfg.tenant.identity_mapping_enforcement = "staged_strict";
     cfg.tenant.identity_mapping_strict_channels = &[_][]const u8{"telegram"};
-    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.PostgresNotEnabled => return error.SkipZigTest,
-        else => return err,
-    };
+    var mgr = try initStateManagerForTest();
     defer mgr.deinit();
 
     var decision = try canonicalizeInboundTurn(std.testing.allocator, &mgr, &cfg, .{
@@ -541,10 +557,7 @@ test "canonicalizer rejects strict channel when identity keys are whitespace onl
     cfg.state.backend = "postgres";
     cfg.tenant.identity_mapping_enforcement = "staged_strict";
     cfg.tenant.identity_mapping_strict_channels = &[_][]const u8{"telegram"};
-    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.PostgresNotEnabled => return error.SkipZigTest,
-        else => return err,
-    };
+    var mgr = try initStateManagerForTest();
     defer mgr.deinit();
 
     var decision = try canonicalizeInboundTurn(std.testing.allocator, &mgr, &cfg, .{
@@ -569,10 +582,7 @@ test "canonicalizer cache key avoids delimiter-style collisions" {
     cfg.tenant.enabled = true;
     cfg.state.backend = "postgres";
     cfg.tenant.identity_mapping_enforcement = "compat";
-    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.PostgresNotEnabled => return error.SkipZigTest,
-        else => return err,
-    };
+    var mgr = try initStateManagerForTest();
     defer mgr.deinit();
 
     const before = metricsSnapshot();
@@ -612,10 +622,7 @@ test "canonicalizer caches negative lookup and reuses it" {
     cfg.tenant.enabled = true;
     cfg.state.backend = "postgres";
     cfg.tenant.identity_mapping_enforcement = "compat";
-    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.PostgresNotEnabled => return error.SkipZigTest,
-        else => return err,
-    };
+    var mgr = try initStateManagerForTest();
     defer mgr.deinit();
 
     const before = metricsSnapshot();
@@ -654,10 +661,7 @@ test "canonicalizer caches positive lookup and reuses it" {
     cfg.tenant.enabled = true;
     cfg.state.backend = "postgres";
     cfg.tenant.identity_mapping_enforcement = "compat";
-    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.PostgresNotEnabled => return error.SkipZigTest,
-        else => return err,
-    };
+    var mgr = try initStateManagerForTest();
     defer mgr.deinit();
 
     const user_id: i64 = 990101;
@@ -723,10 +727,7 @@ test "canonicalizer invalidation reflects upserted binding after negative cache"
     cfg.tenant.enabled = true;
     cfg.state.backend = "postgres";
     cfg.tenant.identity_mapping_enforcement = "compat";
-    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.PostgresNotEnabled => return error.SkipZigTest,
-        else => return err,
-    };
+    var mgr = try initStateManagerForTest();
     defer mgr.deinit();
 
     var before_upsert = try canonicalizeInboundTurn(std.testing.allocator, &mgr, &cfg, .{
@@ -786,10 +787,7 @@ test "canonicalizer invalidation reflects deleted binding after positive cache" 
     cfg.tenant.enabled = true;
     cfg.state.backend = "postgres";
     cfg.tenant.identity_mapping_enforcement = "compat";
-    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.PostgresNotEnabled => return error.SkipZigTest,
-        else => return err,
-    };
+    var mgr = try initStateManagerForTest();
     defer mgr.deinit();
 
     const user_id: i64 = 990103;
