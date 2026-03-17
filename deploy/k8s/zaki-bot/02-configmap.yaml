@@ -36,8 +36,8 @@ data:
   # or implement per-user mapping enforcement in Nullclaw before tightening.
   TELEGRAM_ALLOW_FROM: "*"
 
-  # Session unification for app + telegram.
-  SESSION_CROSS_CHANNEL_SHARED_MAIN: "true"
+  # Canonical tenant lane policy: app main lane only, channels use thread lanes.
+  SESSION_CROSS_CHANNEL_SHARED_MAIN: "false"
 
   # Litestream backup target settings.
   LITESTREAM_S3_BUCKET: "REPLACE_WITH_S3_BUCKET"

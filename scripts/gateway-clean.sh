@@ -74,7 +74,7 @@ fi
 exec ./zig-out/bin/nullalis gateway --host "$HOST" --port "$PORT" 2>&1 \
   | awk '
       BEGIN {
-        keep = "nullalis gateway runtime started|Gateway listening|Gateway pairing code|startup\\.self_check|gateway running in degraded state|^warning\\(|^error\\(|info\\(gateway\\): chat\\.stream\\.complete|info\\(session\\): message\\.process|info\\(agent\\): turn\\.stage stage=(memory_enrich|compact_pre_provider|build_provider_messages|parse_provider_response|tool_reflection|finalize_no_tools)|^info: llm\\.(request|response)|^info: tool\\.(start|call)|info\\(memory\\): memory plan resolved";
+        keep = "nullalis gateway runtime started|Gateway listening|Gateway pairing code|startup\\.self_check|gateway running in degraded state|^warning\\(|^error\\(|info\\(gateway\\): chat\\.stream\\.complete|info\\(session\\): message\\.process|info\\(agent\\): turn\\.stage stage=(memory_enrich|turn_compaction|build_provider_messages|parse_provider_response|tool_reflection|finalize_no_tools|memory_lifecycle_summarizer)|^info: llm\\.(request|response)|^info: tool\\.(start|call)|info\\(memory\\): memory plan resolved|info\\(agent\\): memory\\.lifecycle_summarizer";
       }
       !/^NOTICE:[[:space:]]/ && $0 ~ keep {
         print;

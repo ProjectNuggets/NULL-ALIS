@@ -48,9 +48,10 @@ curl -fsS -X POST "${BASE_URL}/api/v1/users/${USER_ID}/channels/telegram/connect
   -d "{\"bot_token\":\"${TELEGRAM_BOT_TOKEN}\",\"webhook_base_url\":\"${WEBHOOK_BASE_URL}\",\"webhook_secret_token\":\"${TELEGRAM_WEBHOOK_SECRET}\",\"drop_pending_updates\":false}" >/dev/null
 
 echo "[6/9] chat stream"
+session_key="agent:zaki-bot:user:${USER_ID}:main"
 curl -fsS -N -X POST "${BASE_URL}/api/v1/chat/stream" "${auth[@]}" "${json[@]}" \
   -H "X-Zaki-User-Id: ${USER_ID}" \
-  -d '{"message":"Say hello from smoke test"}' | head -n 20
+  -d "{\"message\":\"Say hello from smoke test\",\"session_key\":\"${session_key}\"}" | head -n 20
 
 echo "[7/9] telegram webhook + duplicate idempotency"
 update='{"update_id":999001,"message":{"chat":{"id":123456789},"from":{"id":123456789},"text":"hello-from-telegram"}}'

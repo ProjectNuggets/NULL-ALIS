@@ -8,6 +8,7 @@ const spawn_tool_mod = @import("../tools/spawn.zig");
 const message_tool = @import("../tools/message.zig");
 const subagent_mod = @import("../subagent.zig");
 const memory_mod = @import("../memory/root.zig");
+const observability = @import("../observability.zig");
 const config_types = @import("../config_types.zig");
 const config_module = @import("../config.zig");
 const capabilities_mod = @import("../capabilities.zig");
@@ -15,6 +16,7 @@ const config_mutator = @import("../config_mutator.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const util = @import("../util.zig");
+const log = std.log.scoped(.agent);
 
 const SlashCommand = struct {
     name: []const u8,
@@ -570,6 +572,175 @@ fn appendRecentRoleSnippets(
     }
 }
 
+fn roleLabel(role: providers.Role) []const u8 {
+    return switch (role) {
+        .system => "system",
+        .user => "user",
+        .assistant => "assistant",
+        .tool => "tool",
+    };
+}
+
+fn lifecycleSummaryTimeoutSecs(self: anytype) u64 {
+    const hard_cap = if (self.lifecycle_summarizer_timeout_secs > 0) self.lifecycle_summarizer_timeout_secs else @as(u64, 8);
+    const configured = if (self.message_timeout_secs > 0) self.message_timeout_secs else hard_cap;
+    return @max(@as(u64, 1), @min(configured, hard_cap));
+}
+
+fn lifecycleSummaryFallback(self: anytype, checkpoint_content: []const u8) ?[]u8 {
+    const max_len: usize = @min(checkpoint_content.len, 1200);
+    return self.allocator.dupe(u8, checkpoint_content[0..max_len]) catch null;
+}
+
+fn emitLifecycleSummarizerStage(self: anytype, duration_ms: u64, summarized_count: usize) void {
+    const event = observability.ObserverEvent{ .turn_stage = .{
+        .stage = "memory_lifecycle_summarizer",
+        .duration_ms = duration_ms,
+        .count = @intCast(@min(summarized_count, @as(usize, std.math.maxInt(u32)))),
+    } };
+    self.observer.recordEvent(&event);
+}
+
+fn maybePersistLifecycleSummary(self: anytype, checkpoint_content: []const u8, session_id: []const u8, reason: []const u8, now_s: i64) void {
+    const mem = self.mem orelse return;
+    const rt = self.mem_rt orelse return;
+    const summarizer_cfg = rt.summarizerConfig();
+    if (!summarizer_cfg.enabled) return;
+    if (self.history.items.len <= 2) return;
+
+    if (self.lifecycle_summarizer_last_attempt_s != 0 and self.lifecycle_summarizer_cooldown_secs > 0) {
+        const elapsed: u64 = @intCast(@max(@as(i64, 0), now_s - self.lifecycle_summarizer_last_attempt_s));
+        if (elapsed < self.lifecycle_summarizer_cooldown_secs) {
+            return;
+        }
+    }
+
+    const entries = self.allocator.alloc(memory_mod.MessageEntry, self.history.items.len) catch return;
+    defer self.allocator.free(entries);
+    for (self.history.items, 0..) |item, idx| {
+        entries[idx] = .{
+            .role = roleLabel(item.role),
+            .content = item.content,
+        };
+    }
+
+    if (!memory_mod.shouldSummarize(entries, summarizer_cfg)) return;
+    const partition = memory_mod.summarizer.partitionMessages(entries, summarizer_cfg);
+    if (partition.to_summarize == 0) return;
+
+    self.lifecycle_summarizer_last_attempt_s = now_s;
+    const summarize_start_ms = std.time.milliTimestamp();
+    defer {
+        const duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - summarize_start_ms));
+        emitLifecycleSummarizerStage(self, duration_ms, partition.to_summarize);
+    }
+
+    const prompt = memory_mod.buildSummarizationPrompt(self.allocator, entries, partition.to_summarize) catch return;
+    defer self.allocator.free(prompt);
+
+    const summary_system = "Summarize the session checkpoint. Preserve durable facts, decisions, commitments, and open loops. Keep it concise.";
+    var summary_messages: [2]providers.ChatMessage = .{
+        .{ .role = .system, .content = summary_system },
+        .{ .role = .user, .content = prompt },
+    };
+    const timeout_secs = lifecycleSummaryTimeoutSecs(self);
+
+    var summary_text_owned: ?[]u8 = null;
+    defer if (summary_text_owned) |owned| self.allocator.free(owned);
+
+    var parsed_summary: ?memory_mod.SummaryResult = null;
+    defer if (parsed_summary) |*result| result.deinit(self.allocator);
+    const content = blk: {
+        var response = self.provider.chat(
+            self.allocator,
+            .{
+                .messages = summary_messages[0..],
+                .model = self.model_name,
+                .temperature = 0.2,
+                .tools = null,
+                .timeout_secs = timeout_secs,
+            },
+            self.model_name,
+            0.2,
+        ) catch {
+            summary_text_owned = lifecycleSummaryFallback(self, checkpoint_content);
+            if (summary_text_owned) |owned| {
+                log.warn("memory.lifecycle_summarizer fallback=session_checkpoint reason=provider_error session={s} reason_tag={s}", .{
+                    session_id,
+                    reason,
+                });
+                break :blk owned;
+            }
+            return;
+        };
+        defer {
+            if (response.content) |content_part| {
+                if (content_part.len > 0) self.allocator.free(content_part);
+            }
+            for (response.tool_calls) |tc| {
+                self.allocator.free(tc.id);
+                self.allocator.free(tc.name);
+                self.allocator.free(tc.arguments);
+            }
+            if (response.tool_calls.len > 0) self.allocator.free(response.tool_calls);
+            if (response.model.len > 0) self.allocator.free(response.model);
+            if (response.reasoning_content) |rc| {
+                if (rc.len > 0) self.allocator.free(rc);
+            }
+        }
+
+        parsed_summary = memory_mod.parseSummaryResponse(self.allocator, response.contentOrEmpty(), summarizer_cfg) catch {
+            summary_text_owned = lifecycleSummaryFallback(self, checkpoint_content);
+            if (summary_text_owned) |owned| {
+                log.warn("memory.lifecycle_summarizer fallback=session_checkpoint reason=parse_error session={s} reason_tag={s}", .{
+                    session_id,
+                    reason,
+                });
+                break :blk owned;
+            }
+            return;
+        };
+        break :blk parsed_summary.?.summary;
+    };
+
+    const summary_key = std.fmt.allocPrint(
+        self.allocator,
+        "session_summary/{s}/{d}",
+        .{ session_id, now_s },
+    ) catch return;
+    defer self.allocator.free(summary_key);
+
+    if (mem.store(summary_key, content, .conversation, session_id)) |_| {
+        rt.syncVectorAfterStore(self.allocator, summary_key, content);
+    } else |_| {}
+
+    if (parsed_summary) |parsed| {
+        for (parsed.extracted_facts, 0..) |fact, idx| {
+            const fact_key = std.fmt.allocPrint(
+                self.allocator,
+                "durable_fact/{d}/{d}",
+                .{ now_s, idx },
+            ) catch continue;
+            defer self.allocator.free(fact_key);
+            if (mem.store(fact_key, fact.content, .core, null)) |_| {
+                rt.syncVectorAfterStore(self.allocator, fact_key, fact.content);
+            } else |_| {}
+        }
+        log.info("memory.lifecycle_summarizer status=ok session={s} reason={s} summarized={d} facts={d}", .{
+            session_id,
+            reason,
+            partition.to_summarize,
+            parsed.extracted_facts.len,
+        });
+    } else {
+        log.info("memory.lifecycle_summarizer status=fallback session={s} reason={s} summarized={d}", .{
+            session_id,
+            reason,
+            partition.to_summarize,
+        });
+    }
+}
+
 pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
     const mem = self.mem orelse return;
     const session_id = self.memory_session_id orelse return;
@@ -620,6 +791,8 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
     if (self.mem_rt) |rt| {
         rt.syncVectorAfterStore(self.allocator, "context_anchor_current", anchor_content);
     }
+
+    maybePersistLifecycleSummary(self, checkpoint_content, session_id, reason, now_s);
 }
 
 fn clearSessionState(self: anytype, reason: []const u8) void {

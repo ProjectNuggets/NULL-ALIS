@@ -291,6 +291,9 @@ pub const Agent = struct {
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
+    lifecycle_summarizer_last_attempt_s: i64 = 0,
+    lifecycle_summarizer_cooldown_secs: u64 = 900,
+    lifecycle_summarizer_timeout_secs: u64 = 8,
 
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
@@ -1176,19 +1179,13 @@ pub const Agent = struct {
 
         if (self.compact_context_enabled) {
             const compact_start_ms = std.time.milliTimestamp();
-            const turn_ctx = tools_mod.getTurnContext();
-            if (tools_mod.isBackgroundTurnOrigin(turn_ctx.origin)) {
-                // Background lanes should not block user-facing turns on provider-backed
-                // compaction. Keep them bounded with local trim only.
-                self.last_turn_compacted = false;
-                self.trimHistory();
-            } else {
-                _ = self.autoCompactHistory() catch false;
-            }
+            // Keep interactive turns deterministic: pre-provider compaction is trim-only.
+            self.last_turn_compacted = false;
+            self.trimHistory();
             const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
-            log.info("turn.stage stage=compact_pre_provider duration_ms={d}", .{compact_duration_ms});
+            log.info("turn.stage stage=turn_compaction duration_ms={d} mode=trim", .{compact_duration_ms});
             const compact_stage_event = ObserverEvent{ .turn_stage = .{
-                .stage = "compact_pre_provider",
+                .stage = "turn_compaction",
                 .duration_ms = compact_duration_ms,
             } };
             self.observer.recordEvent(&compact_stage_event);

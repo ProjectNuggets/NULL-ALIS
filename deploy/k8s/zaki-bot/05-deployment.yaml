@@ -58,6 +58,10 @@ spec:
               if [ "${POSTGRES_USE_PGBOUNCER:-false}" = "true" ] && [ -n "${PGBOUNCER_CONNECTION_STRING:-}" ]; then
                 POSTGRES_RUNTIME_CONNECTION_STRING="${PGBOUNCER_CONNECTION_STRING}"
               fi
+              SESSION_SHARED_MAIN_BOOL=false
+              if [ "${SESSION_CROSS_CHANNEL_SHARED_MAIN:-false}" = "true" ]; then
+                SESSION_SHARED_MAIN_BOOL=true
+              fi
 
               cat > /nullclaw-data/.nullalis/config.json <<JSON
               {
@@ -107,7 +111,7 @@ spec:
                   "entity_id": "${COMPOSIO_ENTITY_ID}"
                 },
                 "session": {
-                  "cross_channel_shared_main": true
+                  "cross_channel_shared_main": ${SESSION_SHARED_MAIN_BOOL}
                 },
                 "channels": {
                   "telegram": {

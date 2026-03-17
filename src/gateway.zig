@@ -790,6 +790,8 @@ const TenantRuntime = struct {
         }
         // User config JSON must never override the per-tenant workspace root.
         runtime.config.workspace_dir = runtime.workspace_path;
+        // Canonical tenant lane policy: app continuity stays on main, channels use thread/task/cron lanes.
+        runtime.config.session.cross_channel_shared_main = false;
 
         runtime.provider_bundle = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &runtime.config);
         errdefer runtime.provider_bundle.deinit();
@@ -2220,7 +2222,21 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
     };
 
     var session_key_buf: [256]u8 = undefined;
-    const session_key = zaki_session.userMainSessionKey(&session_key_buf, job.user_id);
+    var topic_buf: [32]u8 = undefined;
+    var lane_buf: [64]u8 = undefined;
+    const lane_resolution = resolveTenantTelegramLane(
+        job.allocator,
+        job.config,
+        tenantTelegramUsesSharedMain(job.config),
+        job.user_id,
+        job.account_id,
+        job.chat_id,
+        null,
+        &session_key_buf,
+        &topic_buf,
+        &lane_buf,
+    );
+    const session_key = lane_resolution.fallback_session_key;
 
     var chat_id_buf: [32]u8 = undefined;
     const chat_id_str = std.fmt.bufPrint(&chat_id_buf, "{d}", .{job.chat_id}) catch "0";
@@ -3245,6 +3261,62 @@ fn telegramThreadKey(allocator: std.mem.Allocator, body: []const u8, buf: []u8) 
     return std.fmt.bufPrint(buf, "{d}", .{thread_val.integer}) catch null;
 }
 
+const TenantTelegramLaneResolution = struct {
+    fallback_session_key: []const u8,
+    lane: inbound_canonicalizer.CanonicalSessionLane,
+    canonical_thread_key: ?[]const u8 = null,
+};
+
+fn buildTelegramCanonicalThreadKey(
+    chat_id: i64,
+    topic_key_opt: ?[]const u8,
+    buf: []u8,
+) ?[]const u8 {
+    if (topic_key_opt) |topic_key| {
+        return std.fmt.bufPrint(buf, "{d}:{s}", .{ chat_id, topic_key }) catch
+            std.fmt.bufPrint(buf, "{d}", .{chat_id}) catch null;
+    }
+    return std.fmt.bufPrint(buf, "{d}", .{chat_id}) catch null;
+}
+
+fn resolveTenantTelegramLane(
+    allocator: std.mem.Allocator,
+    cfg_opt: ?*const Config,
+    use_shared_main: bool,
+    user_id: []const u8,
+    account_id: []const u8,
+    chat_id: i64,
+    body_opt: ?[]const u8,
+    fallback_buf: []u8,
+    topic_buf: []u8,
+    lane_buf: []u8,
+) TenantTelegramLaneResolution {
+    if (use_shared_main) {
+        return .{
+            .fallback_session_key = zaki_session.userMainSessionKey(fallback_buf, user_id),
+            .lane = .main,
+            .canonical_thread_key = null,
+        };
+    }
+
+    const topic_key = if (body_opt) |body|
+        telegramThreadKey(allocator, body, topic_buf)
+    else
+        null;
+    const canonical_thread_key = buildTelegramCanonicalThreadKey(chat_id, topic_key, lane_buf);
+    const fallback_session_key = if (canonical_thread_key) |thread_key|
+        zaki_session.userThreadSessionKey(fallback_buf, user_id, thread_key)
+    else if (body_opt) |body|
+        telegramSessionKeyRouted(allocator, fallback_buf, chat_id, body, cfg_opt, account_id)
+    else
+        std.fmt.bufPrint(fallback_buf, "telegram:{d}", .{chat_id}) catch "telegram:0";
+    return .{
+        .fallback_session_key = fallback_session_key,
+        .lane = .thread,
+        .canonical_thread_key = canonical_thread_key,
+    };
+}
+
 fn telegramSenderIdentity(
     allocator: std.mem.Allocator,
     body: []const u8,
@@ -3412,8 +3484,8 @@ fn telegramWebhookExtractInboundText(
 }
 
 fn tenantTelegramUsesSharedMain(cfg_opt: ?*const Config) bool {
-    if (cfg_opt) |cfg| return cfg.session.cross_channel_shared_main;
-    return true;
+    _ = cfg_opt;
+    return false;
 }
 
 fn lineSessionKey(buf: []u8, evt: channels.line.LineEvent) []const u8 {
@@ -5861,6 +5933,9 @@ fn handleApiRoute(
                 mgr.putConfigJson(user_id, body) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
+                writeFile(user_ctx.config_path, body) catch |err| {
+                    log.warn("tenant config mirror write failed path={s}: {}", .{ user_ctx.config_path, err });
+                };
             } else {
                 writeFile(user_ctx.config_path, body) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
@@ -5914,6 +5989,9 @@ fn handleApiRoute(
                 const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 mgr.putConfigJson(user_id, merged) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+                };
+                writeFile(user_ctx.config_path, merged) catch |err| {
+                    log.warn("tenant settings mirror write failed path={s}: {}", .{ user_ctx.config_path, err });
                 };
             } else {
                 writeFile(user_ctx.config_path, merged) catch {
@@ -6542,6 +6620,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
             };
             const user_ctx = &tenant_user_ctx.?;
             tenant_channel_state_path = ctx.req_allocator.dupe(u8, user_ctx.channel_state_path) catch null;
+            const lock_wait_start_ms = std.time.milliTimestamp();
             var user_lock = maybeAcquireTenantOwnershipLock(ctx.req_allocator, ctx.state, user_ctx.user_id, user_ctx.user_root) catch |err| switch (err) {
                 error.FileNotFound => {
                     _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
@@ -6556,6 +6635,11 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     return;
                 },
             };
+            const lock_wait_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - lock_wait_start_ms));
+            log.info("telegram.webhook.stage stage=ownership_lock_wait user={s} duration_ms={d}", .{
+                user_ctx.user_id,
+                lock_wait_duration_ms,
+            });
             defer user_lock.deinit();
             switch (user_lock) {
                 .disabled => {},
@@ -6741,19 +6825,28 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 // failures silently drop replies.
 
                 var kb: [256]u8 = undefined;
-                const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg_opt| cfg_opt else null;
-                const fallback_session_key = if (use_shared_main)
-                    zaki_session.userMainSessionKey(&kb, scoped_user_id.?)
-                else
-                    telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
                 var thread_buf: [32]u8 = undefined;
-                const thread_raw = telegramThreadKey(ctx.req_allocator, b, &thread_buf);
+                var lane_buf: [64]u8 = undefined;
+                const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg_opt| cfg_opt else null;
+                const lane_resolution = resolveTenantTelegramLane(
+                    ctx.req_allocator,
+                    tg_cfg_opt,
+                    use_shared_main,
+                    scoped_user_id.?,
+                    tg_account_id,
+                    chat_id.?,
+                    b,
+                    &kb,
+                    &thread_buf,
+                    &lane_buf,
+                );
+                const fallback_session_key = lane_resolution.fallback_session_key;
                 var identity_keys = channel_identity_key.build(
                     ctx.req_allocator,
                     "telegram",
                     sender,
                     cid_str,
-                    thread_raw,
+                    lane_resolution.canonical_thread_key,
                 ) catch {
                     ctx.response_status = "400 Bad Request";
                     ctx.response_body = "{\"error\":\"invalid telegram identity\"}";
@@ -6794,6 +6887,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     });
                 }
 
+                const canonicalize_start_ms = std.time.milliTimestamp();
                 var canonical_decision = inbound_canonicalizer.canonicalizeInboundTurn(
                     ctx.req_allocator,
                     ctx.state.zaki_state,
@@ -6805,7 +6899,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         .scope_key = identity_keys.scope_key,
                         .thread_key = identity_keys.thread_key,
                         .fallback_session_key = fallback_session_key,
-                        .lane = if (use_shared_main) .main else if (identity_keys.thread_key != null) .thread else .main,
+                        .lane = lane_resolution.lane,
                     },
                 ) catch |err| {
                     log.warn("telegram canonicalization failed: {}", .{err});
@@ -6813,11 +6907,28 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     ctx.response_body = "{\"error\":\"canonicalization_failed\"}";
                     return;
                 };
+                const canonicalize_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - canonicalize_start_ms));
+                log.info("telegram.webhook.stage stage=canonicalization user={s} duration_ms={d} lane={s} decision={s}", .{
+                    scoped_user_id.?,
+                    canonicalize_duration_ms,
+                    switch (lane_resolution.lane) {
+                        .main => "main",
+                        .thread => "thread",
+                        .task => "task",
+                        .cron => "cron",
+                    },
+                    switch (canonical_decision.kind) {
+                        .canonical => "canonical",
+                        .degraded_compat => "degraded_compat",
+                        .strict_reject => "strict_reject",
+                    },
+                });
                 defer canonical_decision.deinit(ctx.req_allocator);
 
                 const sk = blk: {
                     switch (canonical_decision.kind) {
                         .strict_reject => {
+                            const send_start_ms = std.time.milliTimestamp();
                             sendTelegramReply(
                                 ctx.req_allocator,
                                 tg_bot_token,
@@ -6826,6 +6937,11 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                             ) catch |err| {
                                 log.warn("telegram strict reject reply send failed: {}", .{err});
                             };
+                            const send_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - send_start_ms));
+                            log.info("telegram.webhook.stage stage=telegram_send user={s} duration_ms={d} path=strict_reject", .{
+                                scoped_user_id.?,
+                                send_duration_ms,
+                            });
                             const reject_body = std.fmt.allocPrint(
                                 ctx.req_allocator,
                                 "{{\"error\":\"strict_identity_reject\",\"code\":\"{s}\"}}",
@@ -6852,6 +6968,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 );
                 typing_channel.startTyping(cid_str) catch {};
                 defer typing_channel.stopTyping(cid_str) catch {};
+                const agent_turn_start_ms = std.time.milliTimestamp();
                 const reply: ?[]const u8 = tenant_runtime.processMessage(
                     sk,
                     msg_text.?,
@@ -6868,6 +6985,11 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     },
                     null,
                 ) catch |err| blk: {
+                    const agent_turn_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - agent_turn_start_ms));
+                    log.info("telegram.webhook.stage stage=agent_turn user={s} duration_ms={d} ok=false", .{
+                        scoped_user_id.?,
+                        agent_turn_duration_ms,
+                    });
                     if (tenant_user_ctx) |*send_user_ctx| {
                         const send_token = resolveTenantTelegramBotTokenForSend(
                             ctx.req_allocator,
@@ -6879,12 +7001,25 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                             break :blk null;
                         };
                         defer if (send_token.len > 0) ctx.req_allocator.free(send_token);
+                        const send_start_ms = std.time.milliTimestamp();
                         sendTelegramReply(ctx.req_allocator, send_token, chat_id.?, userFacingAgentError(err)) catch |send_err| {
                             log.warn("telegram webhook error-reply send failed: {}", .{send_err});
                         };
+                        const send_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - send_start_ms));
+                        log.info("telegram.webhook.stage stage=telegram_send user={s} duration_ms={d} path=error_reply", .{
+                            scoped_user_id.?,
+                            send_duration_ms,
+                        });
                     }
                     break :blk null;
                 };
+                if (reply != null) {
+                    const agent_turn_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - agent_turn_start_ms));
+                    log.info("telegram.webhook.stage stage=agent_turn user={s} duration_ms={d} ok=true", .{
+                        scoped_user_id.?,
+                        agent_turn_duration_ms,
+                    });
+                }
                 if (reply) |r| {
                     defer ctx.root_allocator.free(r);
                     if (tenant_user_ctx) |*send_user_ctx| {
@@ -6902,9 +7037,15 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         };
                         if (send_token_opt) |send_token| {
                             defer if (send_token.len > 0) ctx.req_allocator.free(send_token);
+                            const send_start_ms = std.time.milliTimestamp();
                             sendTelegramReply(ctx.req_allocator, send_token, chat_id.?, r) catch |send_err| {
                                 log.warn("telegram webhook reply send failed: {}", .{send_err});
                             };
+                            const send_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - send_start_ms));
+                            log.info("telegram.webhook.stage stage=telegram_send user={s} duration_ms={d} path=success", .{
+                                scoped_user_id.?,
+                                send_duration_ms,
+                            });
                         } else {
                             ctx.response_body = "{\"status\":\"received\"}";
                         }
@@ -10303,11 +10444,11 @@ test "telegramSessionKeyRouted applies session dm_scope for direct chats" {
     try std.testing.expectEqualStrings("agent:tg-dm-agent:direct:4242", key);
 }
 
-test "tenantTelegramUsesSharedMain defaults true without config" {
-    try std.testing.expect(tenantTelegramUsesSharedMain(null));
+test "tenantTelegramUsesSharedMain defaults false without config" {
+    try std.testing.expect(!tenantTelegramUsesSharedMain(null));
 }
 
-test "tenantTelegramUsesSharedMain follows session cross_channel_shared_main" {
+test "tenantTelegramUsesSharedMain is locked off for tenant lane determinism" {
     var cfg = Config{
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",
@@ -10318,7 +10459,51 @@ test "tenantTelegramUsesSharedMain follows session cross_channel_shared_main" {
     try std.testing.expect(!tenantTelegramUsesSharedMain(&cfg));
 
     cfg.session.cross_channel_shared_main = true;
-    try std.testing.expect(tenantTelegramUsesSharedMain(&cfg));
+    try std.testing.expect(!tenantTelegramUsesSharedMain(&cfg));
+}
+
+test "resolveTenantTelegramLane routes direct chats to thread lane by chat id" {
+    var fallback_buf: [128]u8 = undefined;
+    var topic_buf: [32]u8 = undefined;
+    var lane_buf: [64]u8 = undefined;
+
+    const lane = resolveTenantTelegramLane(
+        std.testing.allocator,
+        null,
+        false,
+        "1",
+        "default",
+        123456789,
+        "{\"message\":{\"chat\":{\"id\":123456789,\"type\":\"private\"}}}",
+        &fallback_buf,
+        &topic_buf,
+        &lane_buf,
+    );
+
+    try std.testing.expectEqual(inbound_canonicalizer.CanonicalSessionLane.thread, lane.lane);
+    try std.testing.expectEqualStrings("123456789", lane.canonical_thread_key.?);
+}
+
+test "resolveTenantTelegramLane appends topic id for forum messages" {
+    var fallback_buf: [128]u8 = undefined;
+    var topic_buf: [32]u8 = undefined;
+    var lane_buf: [64]u8 = undefined;
+
+    const lane = resolveTenantTelegramLane(
+        std.testing.allocator,
+        null,
+        false,
+        "1",
+        "default",
+        -10012345,
+        "{\"message\":{\"chat\":{\"id\":-10012345,\"type\":\"supergroup\"},\"message_thread_id\":77}}",
+        &fallback_buf,
+        &topic_buf,
+        &lane_buf,
+    );
+
+    try std.testing.expectEqual(inbound_canonicalizer.CanonicalSessionLane.thread, lane.lane);
+    try std.testing.expectEqualStrings("-10012345:77", lane.canonical_thread_key.?);
 }
 
 test "lineSessionKeyRouted uses group id for group events" {

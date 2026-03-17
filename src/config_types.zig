@@ -1025,5 +1025,5 @@ pub const SessionConfig = struct {
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
     typing_interval_secs: u32 = 5,
-    cross_channel_shared_main: bool = true,
+    cross_channel_shared_main: bool = false,
 };

@@ -62,6 +62,9 @@ const ModeMapping = struct {
     queue_cap: u32,
     queue_drop: []const u8,
     max_history_messages: u32,
+    summarizer_enabled: bool,
+    summarizer_window_size_tokens: u32,
+    summarizer_summary_max_tokens: u32,
 };
 
 const mode_mappings = [_]ModeMapping{
@@ -71,6 +74,9 @@ const mode_mappings = [_]ModeMapping{
         .queue_cap = 8,
         .queue_drop = "newest",
         .max_history_messages = 40,
+        .summarizer_enabled = false,
+        .summarizer_window_size_tokens = 3000,
+        .summarizer_summary_max_tokens = 300,
     },
     .{
         .mode = .balanced,
@@ -78,6 +84,9 @@ const mode_mappings = [_]ModeMapping{
         .queue_cap = 12,
         .queue_drop = "summarize",
         .max_history_messages = 50,
+        .summarizer_enabled = true,
+        .summarizer_window_size_tokens = 4000,
+        .summarizer_summary_max_tokens = 500,
     },
     .{
         .mode = .deep,
@@ -85,6 +94,9 @@ const mode_mappings = [_]ModeMapping{
         .queue_cap = 20,
         .queue_drop = "summarize",
         .max_history_messages = 80,
+        .summarizer_enabled = true,
+        .summarizer_window_size_tokens = 6000,
+        .summarizer_summary_max_tokens = 700,
     },
 };
 
@@ -210,6 +222,16 @@ pub fn mergeSettingsIntoConfigJson(
     putString(agent_obj, a, "tts_mode", if (settings.voice_replies) "inbound" else "off") catch {};
     putBool(agent_obj, a, "tts_audio", settings.voice_replies) catch {};
     putInt(agent_obj, a, "session_ttl_secs", settings.session_timeout_minutes * 60) catch {};
+
+    const session_obj = ensureObjectKey(root_obj, a, "session");
+    putBool(session_obj, a, "cross_channel_shared_main", false) catch {};
+
+    const memory_obj = ensureObjectKey(root_obj, a, "memory");
+    const summarizer_obj = ensureObjectKey(memory_obj, a, "summarizer");
+    putBool(summarizer_obj, a, "enabled", mapping.summarizer_enabled) catch {};
+    putInt(summarizer_obj, a, "window_size_tokens", mapping.summarizer_window_size_tokens) catch {};
+    putInt(summarizer_obj, a, "summary_max_tokens", mapping.summarizer_summary_max_tokens) catch {};
+    putBool(summarizer_obj, a, "auto_extract_semantic", true) catch {};
 
     var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
@@ -503,4 +525,12 @@ test "mergeSettingsIntoConfigJson preserves unknown keys and writes mapped agent
     try std.testing.expectEqual(true, agent.get("tts_audio").?.bool);
     try std.testing.expectEqual(@as(i64, 2700), agent.get("session_ttl_secs").?.integer);
     try std.testing.expectEqual(@as(i64, 9), agent.get("max_tool_iterations").?.integer);
+    const session = parsed.value.object.get("session").?.object;
+    try std.testing.expectEqual(false, session.get("cross_channel_shared_main").?.bool);
+    const memory = parsed.value.object.get("memory").?.object;
+    const summarizer = memory.get("summarizer").?.object;
+    try std.testing.expectEqual(true, summarizer.get("enabled").?.bool);
+    try std.testing.expectEqual(@as(i64, 6000), summarizer.get("window_size_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 700), summarizer.get("summary_max_tokens").?.integer);
+    try std.testing.expectEqual(true, summarizer.get("auto_extract_semantic").?.bool);
 }
