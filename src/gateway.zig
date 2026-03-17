@@ -620,6 +620,8 @@ const TenantRuntime = struct {
     log_obs: *observability.LogObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: std.atomic.Value(i64),
+    effective_config_source: []const u8,
+    effective_config_hash: u64,
 
     fn semanticEmbeddingProviderForPrimary(primary_provider: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, primary_provider, "openrouter")) return "together";
@@ -672,6 +674,27 @@ const TenantRuntime = struct {
         }
     }
 
+    fn configHash(payload: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, payload);
+    }
+
+    fn hashConfigFileBestEffort(allocator: std.mem.Allocator, path: []const u8) u64 {
+        const file = std.fs.openFileAbsolute(path, .{}) catch return 0;
+        defer file.close();
+        const raw = file.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return 0;
+        defer allocator.free(raw);
+        return configHash(raw);
+    }
+
+    fn buildSeedConfigJsonFromFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        const file = try std.fs.openFileAbsolute(path, .{});
+        defer file.close();
+        const raw = try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+        defer allocator.free(raw);
+        const settings = user_settings.resolveSettingsFromConfigJson(allocator, raw) catch user_settings.defaults();
+        return user_settings.mergeSettingsIntoConfigJson(allocator, "{}", settings);
+    }
+
     fn init(
         allocator: std.mem.Allocator,
         base_config: *const Config,
@@ -703,6 +726,8 @@ const TenantRuntime = struct {
             .log_obs = undefined,
             .session_mgr = undefined,
             .last_used_s = std.atomic.Value(i64).init(std.time.timestamp()),
+            .effective_config_source = "file_config",
+            .effective_config_hash = hashConfigFileBestEffort(allocator, base_config.config_path),
         };
         runtime.config.workspace_dir = runtime.workspace_path;
         if (state_mgr != null) {
@@ -712,13 +737,37 @@ const TenantRuntime = struct {
                 defer allocator.free(json);
                 const trimmed = std.mem.trim(u8, json, " \t\r\n");
                 if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "{}")) {
+                    runtime.effective_config_source = "postgres_user_config";
+                    runtime.effective_config_hash = configHash(trimmed);
                     runtime.config.parseJson(trimmed) catch |err| {
                         log.warn("tenant config parse failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
                     };
                     runtime.config.applyProfileDefaults() catch {};
                     runtime.config.memory.applyProfileDefaults();
                     runtime.config.syncFlatFields();
+                } else {
+                    const seed_json = buildSeedConfigJsonFromFile(allocator, base_config.config_path) catch null;
+                    if (seed_json) |seed| {
+                        defer allocator.free(seed);
+                        if (state_mgr.?.putConfigJson(numeric_user_id, seed)) |_| {
+                            runtime.effective_config_source = "postgres_seeded_from_file";
+                            runtime.effective_config_hash = configHash(seed);
+                            runtime.config.parseJson(seed) catch |err| {
+                                log.warn("tenant seeded config parse failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
+                            };
+                            runtime.config.applyProfileDefaults() catch {};
+                            runtime.config.memory.applyProfileDefaults();
+                            runtime.config.syncFlatFields();
+                        } else |err| {
+                            runtime.effective_config_source = "file_config_fallback";
+                            log.warn("tenant config seed failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
+                        }
+                    } else {
+                        runtime.effective_config_source = "file_config_fallback";
+                    }
                 }
+            } else {
+                runtime.effective_config_source = "file_config_fallback";
             }
             if (std.mem.eql(u8, runtime.config.state.backend, "postgres")) {
                 // Use a ZAKI BOT-specific canonical memory backend instead of the generic
@@ -839,6 +888,12 @@ const TenantRuntime = struct {
             runtime.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(runtime.tools, rt);
         }
+
+        log.info("tenant.runtime.config user={s} source={s} hash={x}", .{
+            runtime.user_id,
+            runtime.effective_config_source,
+            runtime.effective_config_hash,
+        });
 
         return runtime;
     }
@@ -4156,7 +4211,19 @@ fn internalDiagnosticsPayload(
     var lease_probe_snapshot: ?zaki_state_mod.UserOwnershipLeaseSnapshot = null;
     defer if (lease_probe_snapshot) |*value| value.deinit(allocator);
     var lease_probe_data_source: ?[]const u8 = null;
+    var effective_config_source: []const u8 = if (user_id_opt == null) "no_user_context" else "runtime_not_loaded";
+    var effective_config_hash: ?u64 = null;
     if (user_id_opt) |user_id_raw| {
+        {
+            const mutable_state: *GatewayState = @constCast(state);
+            mutable_state.tenant_runtime_mutex.lock();
+            defer mutable_state.tenant_runtime_mutex.unlock();
+            if (mutable_state.tenant_runtimes.get(user_id_raw)) |tenant_runtime| {
+                effective_config_source = tenant_runtime.effective_config_source;
+                effective_config_hash = tenant_runtime.effective_config_hash;
+            }
+        }
+
         if (!tenantOwnershipUsesPostgresLease(state) or state.zaki_state == null) {
             lease_probe_data_source = "unavailable";
         } else {
@@ -4239,6 +4306,17 @@ fn internalDiagnosticsPayload(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(&buf, allocator, "tenant_runtime_policy_attached");
     try buf.appendSlice(allocator, if (tenant_runtime_policy_attached) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "effective_config_source", effective_config_source);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "effective_config_hash");
+    if (effective_config_hash) |hash| {
+        var hash_buf: [24]u8 = undefined;
+        const hash_text = std.fmt.bufPrint(&hash_buf, "{x:0>16}", .{hash}) catch "0000000000000000";
+        try json_util.appendJsonString(&buf, allocator, hash_text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "sandbox_workspace_validation_failed_total", @intCast(sandbox_diag.workspace_validation_failed_total));
     try buf.appendSlice(allocator, ",");
