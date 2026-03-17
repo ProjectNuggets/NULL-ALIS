@@ -49,6 +49,7 @@ pub const CompactionConfig = struct {
     max_summary_chars: u32 = DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     max_source_chars: u32 = DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
     token_limit: u64 = DEFAULT_TOKEN_LIMIT,
+    message_timeout_secs: u64 = 0,
     max_history_messages: u32 = 50,
     workspace_dir: ?[]const u8 = null,
 };
@@ -295,6 +296,7 @@ fn summarizeSlice(
             .model = model_name,
             .temperature = 0.2,
             .tools = null,
+            .timeout_secs = config.message_timeout_secs,
         },
         model_name,
         0.2,

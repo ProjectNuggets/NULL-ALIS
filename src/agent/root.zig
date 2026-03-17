@@ -476,6 +476,7 @@ pub const Agent = struct {
             .max_summary_chars = self.compaction_max_summary_chars,
             .max_source_chars = self.compaction_max_source_chars,
             .token_limit = self.token_limit,
+            .message_timeout_secs = self.message_timeout_secs,
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
         });
