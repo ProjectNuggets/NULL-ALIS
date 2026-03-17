@@ -730,6 +730,8 @@ pub const MemoryPostgresConfig = struct {
     schema: []const u8 = "public",
     table: []const u8 = "memories",
     connect_timeout_secs: u32 = 30,
+    pool_max: u32 = 4,
+    acquire_timeout_ms: u32 = 1_500,
 };
 
 pub const MemoryRedisConfig = struct {
