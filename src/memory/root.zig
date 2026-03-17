@@ -997,8 +997,6 @@ pub fn initRuntimeWithOptions(
                     .connection_url = pg_url,
                     .table_name = config.search.store.pgvector_table,
                     .dimensions = config.search.dimensions,
-                    .pool_max = config.postgres.pool_max,
-                    .acquire_timeout_ms = config.postgres.acquire_timeout_ms,
                 }) catch |err| {
                     log.warn("pgvector vector store init failed: {}", .{err});
                     break :vec_plane;

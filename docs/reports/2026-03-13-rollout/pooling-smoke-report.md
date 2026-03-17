@@ -1,72 +1,72 @@
-# P-DB1 / P-PGV1 Pooling Smoke Report
+# P-DB1 Pooling Smoke Report (2026-03-13)
 
-Date: 2026-03-13  
-Branch: `v0.2-scale-exec-swisswatch`  
-Scope: pgvector connection pooling uniformity patch (internal behavior only)
+## Scope
+- Patch: bounded `zaki_state` Postgres connection pool (`state.postgres.pool_max` enforced).
+- Validation mode: smoke-only (no 100-burst rerun).
 
-## Baseline (Pre-change)
+## Phase 0 Baseline Evidence
+- Branch/SHA at start: `v0.2-scale-exec-swisswatch` / `747cd7f`.
+- Pre-change Postgres sockets held by `nullalis`:
+  - `lsof -nP -iTCP:5432 | awk 'NR>1 && $1=="nullalis"{c++} END{print c+0}'`
+  - Result: `34`
+- Baseline Postgres log evidence (historical):
+  - `tail -n 50 /opt/homebrew/var/log/postgresql@17.log`
+  - Contains repeated `remaining connection slots are reserved for roles with the SUPERUSER attribute`.
 
-1. Baseline SHA: `67b136a`
-2. `nullalis` DB socket count before edits:
-   - `lsof -nP -iTCP:5432 | awk 'NR>1 && $1=="nullalis"{c++} END{print c+0}'`
-   - result: `3`
-3. Postgres log tail (50 lines) captured before edits.
-4. Pre-change gates:
-   - `zig build test --summary all` ✅
-   - `zig build -Dengines=base,sqlite,postgres` ✅
+## Gate Results (Pre-change)
+- `zig build test --summary all` ✅
+- `zig build -Dengines=base,sqlite,postgres` ✅
 
-## Patch Summary
+## Implementation Summary
+- Removed thread-local libpq ownership from `src/zaki_state.zig`.
+- Added manager-owned bounded pool with:
+  - hard cap (`pool_max`, clamped 1..256)
+  - acquire/release + timed wait path
+  - pooled connection reuse
+  - unhealthy-connection retirement on release
+- Rewired `exec`, `execMigrateStatement`, `execParams` to pool leases.
+- Added regression tests:
+  - `postgres_pool_enforces_cap_under_concurrency`
+  - `postgres_pool_reuses_connections`
+  - `postgres_pool_timeout_when_exhausted`
+  - `postgres_pool_releases_on_exec_error`
 
-Files changed:
-1. `src/memory/vector/store_pgvector.zig`
-2. `src/memory/root.zig`
-3. `src/config_types.zig`
-4. `src/config_parse.zig`
+## Gate Results (Post-change)
+- `zig build test --summary all` ✅
+- `zig build -Dengines=base,sqlite,postgres` ✅
 
-Behavioral changes:
-1. Replaced single shared pgvector `PGconn` with bounded reusable pool.
-2. Enforced pool cap for pgvector via `memory.postgres.pool_max` (default `4`).
-3. Added bounded pool acquire timeout via `memory.postgres.acquire_timeout_ms` (default `1500`).
-4. All pgvector operations now use acquire/release lease semantics.
-5. Added pgvector pool regression tests (cap, reuse, timeout, release-on-error).
+## Smoke Validation
 
-## Post-change Gates
+### Notes
+- Initial smoke attempt with host-only URL returned 404 (`/api/v1/chat/stream` path missing) and was discarded.
+- A high-contention same-lane run (`30 req / 20 workers`) showed request timeouts as expected from session-lane serialization, but no DB slot exhaustion.
 
-1. `zig build test --summary all` ✅
-   - `4550/4575` passed, `25` skipped, `0` failed.
-2. `zig build -Dengines=base,sqlite,postgres` ✅
+### Recorded smoke runs
+1. `p-db1-pool-smoke-v2` (`10 req / 4 workers / single user / main lane`)
+   - Output: `/tmp/p-db1-pool-smoke-v2.json`
+   - Result: `success=9`, `errors=1` (single timeout), `wall_ms=142844`
+2. `p-db1-pool-smoke-v3` (`6 req / 2 workers / single user / main lane`)
+   - Output: `/tmp/p-db1-pool-smoke-v3.json`
+   - Result: `success=6`, `errors=0`, `wall_ms=157630`
 
-## Smoke Validation (No 100-burst)
+### DB socket boundedness
+- Pre-smoke (`v2`): `3`
+- Post-smoke (`v2`): `5`
+- Post-smoke (`v3`): `5`
+- Observation: connection count remained bounded and far below prior saturation levels.
 
-Primary smoke run (concurrency-focused):
-1. Command:
-   - `python3 scripts/load-burst.py --url http://127.0.0.1:3000/api/v1/chat/stream --token dev-internal-token --mode single-user --users 1 --requests 20 --workers 20 --timeout-secs 90 --lane-strategy task_per_request --run-label p-db1-pgvector-pool-smoke-task --json`
-2. Artifact:
-   - `/tmp/p-db1-pgvector-pool-smoke-task.json`
-3. Result:
-   - success: `20`
-   - errors: `0`
-   - wall: `47792ms`
-   - p50/p95/p99: `28641 / 47713 / 47789 ms`
+### Postgres log check
+- Log baseline line index captured before smoke: `7294`
+- New lines scanned after smoke:
+  - `sed -n "$((START+1)),999999p" /opt/homebrew/var/log/postgresql@17.log`
+- `remaining connection slots...` occurrences in new lines: `0`
+- Remaining observed noise: known migration warning `permission denied for table zaki_users`.
 
-Connection/log checks after run:
-1. `nullalis` DB sockets after run:
-   - result: `25`
-2. Postgres tail check for slot exhaustion:
-   - grep patterns: `remaining connection slots|too many clients|FATAL`
-   - result: **no matches**
-
-Note:
-1. A separate `main_only` contention sample showed expected session-lane timeout behavior (single-lane serialization), but did not show DB slot exhaustion.
-
-## Decision
-
-Status: **PASS (smoke-level)** for pgvector pooling patch.
-
-What this confirms:
-1. pgvector no longer relies on a single shared connection path.
-2. Connections are bounded/reused under concurrent task-lane load.
-3. No Postgres slot-exhaustion signal observed in this smoke window.
-
-Remaining risk:
-1. Per-process DB socket count still includes other Postgres consumers (`zaki_state`, state/session paths), so full DB capacity planning remains a separate ops task.
+## Conclusion
+- P-DB1 objective met for smoke scope:
+  - no unbounded `zaki_state` connection growth observed,
+  - no new Postgres slot-exhaustion events during smoke window,
+  - build/test gates remained green.
+- Deferred by design:
+  - `pgvector` pooling changes,
+  - 100-burst validation rerun.

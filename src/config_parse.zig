@@ -1268,12 +1268,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (pg.get("connect_timeout_secs")) |v| if (v == .integer) {
                         self.memory.postgres.connect_timeout_secs = @intCast(v.integer);
                     };
-                    if (pg.get("pool_max")) |v| if (v == .integer) {
-                        self.memory.postgres.pool_max = @intCast(v.integer);
-                    };
-                    if (pg.get("acquire_timeout_ms")) |v| if (v == .integer) {
-                        self.memory.postgres.acquire_timeout_ms = @intCast(v.integer);
-                    };
                 }
             }
             // redis
