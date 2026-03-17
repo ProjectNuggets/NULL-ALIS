@@ -504,3 +504,23 @@ test "mergeSettingsIntoConfigJson preserves unknown keys and writes mapped agent
     try std.testing.expectEqual(@as(i64, 2700), agent.get("session_ttl_secs").?.integer);
     try std.testing.expectEqual(@as(i64, 9), agent.get("max_tool_iterations").?.integer);
 }
+
+test "mergeSettingsIntoConfigJson maps balanced to serial queue defaults" {
+    const merged = try mergeSettingsIntoConfigJson(std.testing.allocator, "{}", .{
+        .assistant_mode = .balanced,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 30,
+    });
+    defer std.testing.allocator.free(merged);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, merged, .{});
+    defer parsed.deinit();
+
+    const agent = parsed.value.object.get("agent").?.object;
+    try std.testing.expectEqualStrings("serial", agent.get("queue_mode").?.string);
+    try std.testing.expectEqual(@as(i64, 12), agent.get("queue_cap").?.integer);
+    try std.testing.expectEqualStrings("summarize", agent.get("queue_drop").?.string);
+    try std.testing.expectEqual(@as(i64, 50), agent.get("max_history_messages").?.integer);
+}
