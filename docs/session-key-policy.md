@@ -22,9 +22,9 @@ If independent requests are routed to different valid session keys, they can run
 ## Gateway enforcement
 1. Ownership is validated server-side (`session_key` must belong to authenticated user).
 2. Lane class is validated server-side in tenant mode.
-3. Optional strict mode can require explicit `session_key`:
+3. Strict mode requires explicit `session_key` on chat stream:
 - config key: `gateway.require_explicit_chat_stream_session_key`
-- default: `false` (fallback to canonical `:main`)
+- default: `true`
 
 ## Key formats
 Use only these key classes:
@@ -63,7 +63,7 @@ Use only these key classes:
 2. Resolve active UI context:
 - active chat thread => `thread:<conversation_id>`
 - explicit independent action => `task:<task_id>`
-- otherwise fallback => `main`
+- otherwise explicit legacy continuity mode => `main`
 3. Build final key:
 - `agent:zaki-bot:user:${user_id}:${lane}`
 4. Send to `POST /api/v1/chat/stream` with:
@@ -96,8 +96,9 @@ Use only these key classes:
 1. Start with:
 - chat => `thread:<conversation_id>`
 - explicit independent actions => `task:<task_id>`
-2. Keep `main` only for legacy fallback.
+2. Keep `main` only for explicit legacy continuity fallback.
 3. Monitor:
 - per-lane in-flight count
 - lock-wait stage frequency
 - p95/p99 by lane type
+- `chat_stream_session_key_rejections`

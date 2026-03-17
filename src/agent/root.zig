@@ -1176,7 +1176,15 @@ pub const Agent = struct {
 
         if (self.compact_context_enabled) {
             const compact_start_ms = std.time.milliTimestamp();
-            _ = self.autoCompactHistory() catch false;
+            const turn_ctx = tools_mod.getTurnContext();
+            if (tools_mod.isBackgroundTurnOrigin(turn_ctx.origin)) {
+                // Background lanes should not block user-facing turns on provider-backed
+                // compaction. Keep them bounded with local trim only.
+                self.last_turn_compacted = false;
+                self.trimHistory();
+            } else {
+                _ = self.autoCompactHistory() catch false;
+            }
             const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
             log.info("turn.stage stage=compact_pre_provider duration_ms={d}", .{compact_duration_ms});
             const compact_stage_event = ObserverEvent{ .turn_stage = .{
@@ -3712,6 +3720,93 @@ test "turn includes reasoning and usage footer when enabled" {
     try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\nthinking trace") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "[usage] total_tokens=10") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "final answer") != null);
+}
+
+test "turn uses trim-only pre-provider compaction for background origins" {
+    const ProviderState = struct {
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const state: *@This() = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "trim-only-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = ProviderState{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ProviderState.chatWithSystem,
+        .chat = ProviderState.chat,
+        .supportsNativeTools = ProviderState.supportsNativeTools,
+        .getName = ProviderState.getName,
+        .deinit = ProviderState.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 2,
+        .compaction_keep_recent = 1,
+        .compact_context_enabled = true,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "u1"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "a1"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "u2"),
+    });
+
+    tools_mod.setTurnContext(.{ .origin = .heartbeat });
+    defer tools_mod.clearTurnContext();
+
+    const response = try agent.turn("next");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
 }
 
 test "turn refreshes system prompt after workspace markdown change" {

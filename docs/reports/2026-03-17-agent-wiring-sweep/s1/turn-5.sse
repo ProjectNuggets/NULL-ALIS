@@ -1,0 +1,33 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Retrieving memory","duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Preparing model request","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":2294}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Processing model response","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Composing final response","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"update","label":"Finalizing response","iteration":0,"duration_ms":11}
+
+event: token
+data: {"delta":"ok","content":"ok","seq":0}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:1:main","message_id":"1773751841784"}
+

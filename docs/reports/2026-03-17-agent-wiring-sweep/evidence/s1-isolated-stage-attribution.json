@@ -1,0 +1,110 @@
+{
+  "window": {
+    "start": "2026-03-17T13:18:23.928862Z",
+    "end": "2026-03-17T13:19:12.413248Z"
+  },
+  "message_process": {
+    "n": 10,
+    "p50_ms": 3334,
+    "p95_ms": 11071,
+    "max_ms": 15387
+  },
+  "agent_ms": {
+    "n": 10,
+    "p50_ms": 3332,
+    "p95_ms": 11067,
+    "max_ms": 15383
+  },
+  "lock_wait": {
+    "n": 0,
+    "p50_ms": null,
+    "p95_ms": null,
+    "max_ms": null
+  },
+  "llm_response": {
+    "n": 11,
+    "p50_ms": 3398,
+    "p95_ms": 7683,
+    "max_ms": 8965
+  },
+  "stages": {
+    "memory_enrich": {
+      "n": 10,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    "compact_pre_provider": {
+      "n": 10,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    "build_provider_messages": {
+      "n": 11,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    "parse_provider_response": {
+      "n": 11,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    "dispatch_tools": {
+      "n": 1,
+      "p50_ms": 9,
+      "p95_ms": 9,
+      "max_ms": 9
+    },
+    "tool_reflection": {
+      "n": 1,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    "trim_history_after_tools": {
+      "n": 1,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    "compose_final_reply": {
+      "n": 10,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    "tts_prepare": {
+      "n": 10,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    "compact_trim": {
+      "n": 10,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    "autosave_assistant": {
+      "n": 10,
+      "p50_ms": 6,
+      "p95_ms": 8,
+      "max_ms": 8
+    },
+    "drain_outbox": {
+      "n": 10,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    "finalize_no_tools": {
+      "n": 10,
+      "p50_ms": 6,
+      "p95_ms": 8,
+      "max_ms": 8
+    }
+  }
+}

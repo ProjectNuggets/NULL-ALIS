@@ -33,16 +33,22 @@ Implement a shared product-facing BFF API layer (`/v1/me/bot/*`) that is fronten
 4. Enforce auth-binding and identity isolation:
    - derive internal user id from auth principal
    - never trust client-supplied internal user id
-5. Implement lock conflict retry policy:
+   - validate `session_key` belongs to the authenticated user
+   - reject missing or invalid lane keys before proxying
+5. Add chat session lane contract on `POST /v1/me/bot/chat/stream`:
+   - require raw `session_key`
+   - allow only `main`, `thread:<id>`, `task:<id>`, `cron:<id>`
+   - forward the validated `session_key` unchanged to nullalis
+6. Implement lock conflict retry policy:
    - retry only `409 + ownership_lock_conflict`
    - max attempts: `3`
    - max wall-time: `1500ms`
    - backoff from `retry_after_ms`; fallback `100/250/500ms` with jitter ±20%
-6. SSE behavior:
+7. SSE behavior:
    - retries only before stream establishment
    - no retry after first SSE byte forwarded
    - mid-stream errors emitted as normalized SSE error event
-7. Publish BFF contract examples and snapshots.
+8. Publish BFF contract examples and snapshots.
 
 ## Validation Checklist
 1. Auth isolation:
@@ -53,11 +59,15 @@ Implement a shared product-facing BFF API layer (`/v1/me/bot/*`) that is fronten
    - returns `503 temporary_contention`.
 4. SSE guard:
    - pre-stream retry allowed, mid-stream replay forbidden.
-5. Settings:
+5. Chat session contract:
+   - missing `session_key` rejected
+   - wrong-user `session_key` rejected
+   - valid `thread`/`task` keys proxy cleanly
+6. Settings:
    - 5-field profile roundtrip, no UI fields.
-6. Telegram:
+7. Telegram:
    - invalid token mapped to `invalid_telegram_token`.
-7. Usage:
+8. Usage:
    - unavailable state mapped to `usage_unavailable`.
 
 ## Required T6 Staging E2E

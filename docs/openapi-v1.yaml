@@ -8,6 +8,7 @@ info:
     Notes:
     - `/api/v1/*` and `/internal/*` endpoints require `X-Internal-Token`.
     - `X-Zaki-User-Id` is required for `/api/v1/chat/stream` when tenant mode is enabled.
+    - `/api/v1/chat/stream` requires an explicit `session_key` by default.
     - `/webhook` auth is pairing-token based (Bearer), depending on pairing guard state.
     - `/webhook/telegram` auth is Telegram secret-token based.
 servers:
@@ -291,7 +292,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [message]
+              required: [message, session_key]
               properties:
                 message:
                   type: string
@@ -301,7 +302,7 @@ paths:
                   type: string
                 session_key:
                   type: string
-                  description: Optional session key override. In tenant mode it must belong to the authenticated user (`agent:zaki-bot:user:{user_id}:...`).
+                  description: Required explicit lane key. In tenant mode it must belong to the authenticated user and use one of `main`, `thread:<id>`, `task:<id>`, or `cron:<id>`.
       responses:
         "200":
           description: SSE stream (`status`, optional `progress`, `token`, `done`)
@@ -310,7 +311,7 @@ paths:
               schema:
                 type: string
         "400":
-          description: Invalid payload or missing user header in tenant mode
+          description: Invalid payload, missing `session_key`, invalid lane, wrong-user lane, or missing user header in tenant mode
           content:
             text/event-stream:
               schema:

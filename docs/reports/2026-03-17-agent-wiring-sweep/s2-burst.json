@@ -1,0 +1,315 @@
+{
+  "diagnostics": {
+    "after": {
+      "background_main_reroutes_last_job_id": null,
+      "background_main_reroutes_total": 0,
+      "bus": {
+        "capacity": 1024,
+        "inbound_len": 0,
+        "outbound_len": 0
+      },
+      "effective_config_hash": null,
+      "effective_config_source": "no_user_context",
+      "gateway": {
+        "drain_rejected_total": 0,
+        "draining": false,
+        "in_flight_requests": 2,
+        "overload_rejected_total": 0,
+        "requests_total": 756
+      },
+      "heartbeat_runtime": {
+        "available": false,
+        "last_reason": null,
+        "last_run_s": null,
+        "last_status": null,
+        "user_id": null
+      },
+      "heartbeat_wake": {
+        "coalesced_total": 0,
+        "dropped_total": 0,
+        "pending": 0
+      },
+      "identity_mapping": {
+        "cache_hit": 0,
+        "cache_miss": 0,
+        "cache_stale": 0,
+        "db_lookup_count": 0,
+        "db_lookup_ms_total": 0,
+        "degraded_compat": 0,
+        "mapped": 0,
+        "strict_rejected": 0,
+        "unmapped": 0
+      },
+      "instance_id": "nullclaw-6dc897558c-8f4fw",
+      "integrations": {
+        "telegram": {
+          "account_id": null,
+          "chat_id": null,
+          "configured": true,
+          "connected": null,
+          "data_source": "global"
+        }
+      },
+      "internal_auth_required": true,
+      "internal_token_configured": true,
+      "internal_token_policy_ok": true,
+      "internal_token_policy_reason": null,
+      "last_trigger": null,
+      "multimodal": {
+        "image_markers_detected": 0,
+        "image_markers_ignored": 0,
+        "image_parts_failed": 0,
+        "image_parts_prepared": 0,
+        "messages_with_image_markers": 0
+      },
+      "ops": {
+        "last_event": null,
+        "proactive_blocked_dedupe_total": 0,
+        "proactive_blocked_rate_total": 0,
+        "proactive_policy": {
+          "dedupe_window_secs": 120,
+          "rate_limit_per_window": 12,
+          "rate_window_secs": 300
+        },
+        "proactive_send_errors_total": 0,
+        "proactive_sent_total": 0,
+        "recent_events": [],
+        "scheduler_blocked_burst_total": 0,
+        "scheduler_blocked_cooldown_total": 0,
+        "scheduler_executed_total": 0
+      },
+      "owned_users_count": 1,
+      "pool": {
+        "hits": 0,
+        "idle": 0,
+        "misses": 0
+      },
+      "runtime_mode": "threaded",
+      "sandbox_fallback_none_total": 0,
+      "sandbox_workspace_validation_failed_total": 0,
+      "sandbox_workspace_validation_last_reason": "none",
+      "startup_self_check": {
+        "chat_fallback_chain": "none",
+        "chat_provider_effective": "openrouter",
+        "config_path": "/nullclaw-data/.nullalis/config.json",
+        "degraded": false,
+        "degraded_reason": "",
+        "embedding_provider_effective": "openai",
+        "heartbeat_enabled": false,
+        "heartbeat_interval_minutes": 30,
+        "postgres_host": "nullclaw-pgbouncer.zaki-bot-staging.svc.cluster.local",
+        "postgres_port": 6432,
+        "postgres_schema": "nullalis_local_canonical",
+        "provider_data_source": "config",
+        "scheduler_backend": "postgres",
+        "state_backend_configured": "postgres",
+        "state_backend_effective": "postgres",
+        "tenant_enabled": true,
+        "webhook_mode": "telegram"
+      },
+      "stt": {
+        "failure_download": 0,
+        "failure_empty_transcript": 0,
+        "failure_get_file": 0,
+        "failure_transcriber": 0,
+        "transcriber_configured": 0,
+        "transcription_attempted": 0,
+        "transcription_failed": 0,
+        "transcription_skipped_no_transcriber": 0,
+        "transcription_succeeded": 0
+      },
+      "tenant_lease_probe": null,
+      "tenant_lock_backend": "postgres_lease",
+      "tenant_lock_conflict_retries_total": 0,
+      "tenant_lock_conflicts_by_route": {
+        "api": 0,
+        "chat_stream_http": 0,
+        "chat_stream_sse": 0,
+        "daemon": 0,
+        "webhook": 0
+      },
+      "tenant_lock_lease_secs": 300,
+      "tenant_lock_retry_max_ms": 80,
+      "tenant_lock_retry_min_ms": 20,
+      "tenant_lock_wait_ms": 750,
+      "tenant_runtime_policy_attached": true
+    },
+    "after_error": null,
+    "before": {
+      "background_main_reroutes_last_job_id": null,
+      "background_main_reroutes_total": 0,
+      "bus": {
+        "capacity": 1024,
+        "inbound_len": 0,
+        "outbound_len": 0
+      },
+      "effective_config_hash": null,
+      "effective_config_source": "no_user_context",
+      "gateway": {
+        "drain_rejected_total": 0,
+        "draining": false,
+        "in_flight_requests": 2,
+        "overload_rejected_total": 0,
+        "requests_total": 730
+      },
+      "heartbeat_runtime": {
+        "available": false,
+        "last_reason": null,
+        "last_run_s": null,
+        "last_status": null,
+        "user_id": null
+      },
+      "heartbeat_wake": {
+        "coalesced_total": 0,
+        "dropped_total": 0,
+        "pending": 0
+      },
+      "identity_mapping": {
+        "cache_hit": 0,
+        "cache_miss": 0,
+        "cache_stale": 0,
+        "db_lookup_count": 0,
+        "db_lookup_ms_total": 0,
+        "degraded_compat": 0,
+        "mapped": 0,
+        "strict_rejected": 0,
+        "unmapped": 0
+      },
+      "instance_id": "nullclaw-6dc897558c-8f4fw",
+      "integrations": {
+        "telegram": {
+          "account_id": null,
+          "chat_id": null,
+          "configured": true,
+          "connected": null,
+          "data_source": "global"
+        }
+      },
+      "internal_auth_required": true,
+      "internal_token_configured": true,
+      "internal_token_policy_ok": true,
+      "internal_token_policy_reason": null,
+      "last_trigger": null,
+      "multimodal": {
+        "image_markers_detected": 0,
+        "image_markers_ignored": 0,
+        "image_parts_failed": 0,
+        "image_parts_prepared": 0,
+        "messages_with_image_markers": 0
+      },
+      "ops": {
+        "last_event": null,
+        "proactive_blocked_dedupe_total": 0,
+        "proactive_blocked_rate_total": 0,
+        "proactive_policy": {
+          "dedupe_window_secs": 120,
+          "rate_limit_per_window": 12,
+          "rate_window_secs": 300
+        },
+        "proactive_send_errors_total": 0,
+        "proactive_sent_total": 0,
+        "recent_events": [],
+        "scheduler_blocked_burst_total": 0,
+        "scheduler_blocked_cooldown_total": 0,
+        "scheduler_executed_total": 0
+      },
+      "owned_users_count": 1,
+      "pool": {
+        "hits": 0,
+        "idle": 0,
+        "misses": 0
+      },
+      "runtime_mode": "threaded",
+      "sandbox_fallback_none_total": 0,
+      "sandbox_workspace_validation_failed_total": 0,
+      "sandbox_workspace_validation_last_reason": "none",
+      "startup_self_check": {
+        "chat_fallback_chain": "none",
+        "chat_provider_effective": "openrouter",
+        "config_path": "/nullclaw-data/.nullalis/config.json",
+        "degraded": false,
+        "degraded_reason": "",
+        "embedding_provider_effective": "openai",
+        "heartbeat_enabled": false,
+        "heartbeat_interval_minutes": 30,
+        "postgres_host": "nullclaw-pgbouncer.zaki-bot-staging.svc.cluster.local",
+        "postgres_port": 6432,
+        "postgres_schema": "nullalis_local_canonical",
+        "provider_data_source": "config",
+        "scheduler_backend": "postgres",
+        "state_backend_configured": "postgres",
+        "state_backend_effective": "postgres",
+        "tenant_enabled": true,
+        "webhook_mode": "telegram"
+      },
+      "stt": {
+        "failure_download": 0,
+        "failure_empty_transcript": 0,
+        "failure_get_file": 0,
+        "failure_transcriber": 0,
+        "transcriber_configured": 0,
+        "transcription_attempted": 0,
+        "transcription_failed": 0,
+        "transcription_skipped_no_transcriber": 0,
+        "transcription_succeeded": 0
+      },
+      "tenant_lease_probe": null,
+      "tenant_lock_backend": "postgres_lease",
+      "tenant_lock_conflict_retries_total": 0,
+      "tenant_lock_conflicts_by_route": {
+        "api": 0,
+        "chat_stream_http": 0,
+        "chat_stream_sse": 0,
+        "daemon": 0,
+        "webhook": 0
+      },
+      "tenant_lock_lease_secs": 300,
+      "tenant_lock_retry_max_ms": 80,
+      "tenant_lock_retry_min_ms": 20,
+      "tenant_lock_wait_ms": 750,
+      "tenant_runtime_policy_attached": true
+    },
+    "before_error": null,
+    "url": "http://127.0.0.1:3004/internal/diagnostics"
+  },
+  "distinct_session_keys": 10,
+  "distinct_users": 10,
+  "error_details": {
+    "detail_counts": {},
+    "exception_classes": {},
+    "status_codes": {}
+  },
+  "error_reasons": {},
+  "errors": 0,
+  "failure_samples": [],
+  "isolation_probe": {
+    "enabled": false
+  },
+  "lane_counts": {
+    "main": 10
+  },
+  "lane_strategy": "main_only",
+  "latency_ms": {
+    "max": 46855,
+    "mean": 11164,
+    "min": 2182,
+    "p50": 3000,
+    "p95": 46855,
+    "p99": 46855
+  },
+  "mode": "multi-user",
+  "requested_users": 10,
+  "requests": 10,
+  "run_finished_utc": "2026-03-17T12:53:42.688595+00:00",
+  "run_label": "2026-03-17-s2-multi10-rerun",
+  "run_started_utc": "2026-03-17T12:52:55.801298+00:00",
+  "same_user_contention_profile": {
+    "max_requests_on_single_user_session": 1,
+    "mean_requests_per_user_session": 1,
+    "mean_sessions_per_user": 1,
+    "users_with_multi_sessions": 0
+  },
+  "success": 10,
+  "wall_ms": 46887,
+  "workers": 10
+}

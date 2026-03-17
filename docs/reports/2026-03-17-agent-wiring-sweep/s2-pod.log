@@ -1,0 +1,248 @@
+2026-03-17T12:52:55.890320969Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.890337427Z info: turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.890357427Z info(agent): turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.890362261Z info: turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.890459136Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=6
+2026-03-17T12:52:55.890471094Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=0 history_messages=6
+2026-03-17T12:52:55.890472511Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=0 count=6
+2026-03-17T12:52:55.891192677Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.891200761Z info: turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.891201761Z info(agent): turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.891202511Z info: turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.891203302Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.891203969Z info: turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.891204636Z info(agent): turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.891205302Z info: turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.891391094Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=16
+2026-03-17T12:52:55.891824802Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.891832344Z info: turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.891833094Z info(agent): turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.891833761Z info: turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.891957636Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=10
+2026-03-17T12:52:55.892145969Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.892151719Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=0 history_messages=10
+2026-03-17T12:52:55.892154136Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=0 count=10
+2026-03-17T12:52:55.892368927Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=0 history_messages=16
+2026-03-17T12:52:55.892391844Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=0 count=16
+2026-03-17T12:52:55.892393761Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.892394469Z info: turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.892395177Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.892478677Z info: turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.892488302Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=6
+2026-03-17T12:52:55.892491136Z info(agent): turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.892491886Z info: turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.893169094Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=6
+2026-03-17T12:52:55.893180427Z info: turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.893277011Z info(agent): turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.893281511Z info: turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.893422594Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=6
+2026-03-17T12:52:55.893762844Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=1 history_messages=6
+2026-03-17T12:52:55.893767511Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=1 count=6
+2026-03-17T12:52:55.893768344Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=0 history_messages=6
+2026-03-17T12:52:55.893770261Z info(agent): turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.893770927Z info: turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.893771636Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=0 count=6
+2026-03-17T12:52:55.893954761Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.893958552Z info: turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.893960302Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=6
+2026-03-17T12:52:55.893965302Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=0 history_messages=6
+2026-03-17T12:52:55.893966761Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=0 count=6
+2026-03-17T12:52:55.893967469Z info(agent): turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.893968177Z info: turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.893968761Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.893969886Z info: turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:52:55.894339136Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=0 history_messages=6
+2026-03-17T12:52:55.894345761Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=0 count=6
+2026-03-17T12:52:55.894346886Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=6
+2026-03-17T12:52:55.895070511Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=0 history_messages=6
+2026-03-17T12:52:55.895078886Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=0 count=6
+2026-03-17T12:52:55.895080552Z info(agent): turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.895081636Z info: turn.stage stage=compact_pre_provider duration_ms=0
+2026-03-17T12:52:55.895872844Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=8
+2026-03-17T12:52:55.895969844Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=0 history_messages=8
+2026-03-17T12:52:55.895987511Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=0 count=8
+2026-03-17T12:52:58.008830512Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=2115 success=true
+2026-03-17T12:52:58.008861095Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=0
+2026-03-17T12:52:58.008864137Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=0
+2026-03-17T12:52:58.008865178Z info(agent): turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:58.008866137Z info: turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:58.008868053Z info(agent): turn.stage stage=tts_prepare iteration=0 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:52:58.008869178Z info(agent): turn.stage stage=compact_trim iteration=0 duration_ms=0 compacted=false
+2026-03-17T12:52:58.011800428Z info(agent): turn.stage stage=autosave_assistant iteration=0 duration_ms=3
+2026-03-17T12:52:58.011816803Z info(agent): turn.stage stage=drain_outbox iteration=0 duration_ms=0
+2026-03-17T12:52:58.011818720Z info: turn.complete
+2026-03-17T12:52:58.011891053Z info(agent): turn.stage stage=finalize_no_tools iteration=0 duration_ms=3 total_turn_ms=2124
+2026-03-17T12:52:58.011895012Z info: turn.stage stage=finalize_no_tools iteration=0 duration_ms=3
+2026-03-17T12:52:58.013949262Z info(session): message.process session=agent:zaki-bot:user:5:main agent_ms=2124 persist_ms=2 total_ms=2126
+2026-03-17T12:52:58.013964678Z info(gateway): chat.stream.complete user=5 session=agent:zaki-bot:user:5:main chat_ms=2126 sse_ms=0 total_ms=2134
+2026-03-17T12:52:58.388134137Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=2492 success=true
+2026-03-17T12:52:58.388182720Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=0
+2026-03-17T12:52:58.388186262Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=0
+2026-03-17T12:52:58.388208012Z info(agent): turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:58.388213345Z info: turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:58.388502762Z info(agent): turn.stage stage=tts_prepare iteration=0 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:52:58.388512720Z info(agent): turn.stage stage=compact_trim iteration=0 duration_ms=0 compacted=false
+2026-03-17T12:52:58.394495470Z info(agent): turn.stage stage=autosave_assistant iteration=0 duration_ms=6
+2026-03-17T12:52:58.394508262Z info(agent): turn.stage stage=drain_outbox iteration=0 duration_ms=0
+2026-03-17T12:52:58.394510554Z info: turn.complete
+2026-03-17T12:52:58.394524637Z info(agent): turn.stage stage=finalize_no_tools iteration=0 duration_ms=6 total_turn_ms=2506
+2026-03-17T12:52:58.394526179Z info: turn.stage stage=finalize_no_tools iteration=0 duration_ms=6
+2026-03-17T12:52:58.396934345Z info(session): message.process session=agent:zaki-bot:user:9:main agent_ms=2506 persist_ms=2 total_ms=2508
+2026-03-17T12:52:58.396943262Z info(gateway): chat.stream.complete user=9 session=agent:zaki-bot:user:9:main chat_ms=2508 sse_ms=0 total_ms=2517
+2026-03-17T12:52:58.807229554Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=2913 success=true
+2026-03-17T12:52:58.807323220Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=0
+2026-03-17T12:52:58.807342554Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=0
+2026-03-17T12:52:58.807344720Z info(agent): turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:58.807366762Z info: turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:58.807369595Z info(agent): turn.stage stage=tts_prepare iteration=0 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:52:58.807371220Z info(agent): turn.stage stage=compact_trim iteration=0 duration_ms=0 compacted=false
+2026-03-17T12:52:58.811221137Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=2917 success=true
+2026-03-17T12:52:58.811268970Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=0
+2026-03-17T12:52:58.811271512Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=0
+2026-03-17T12:52:58.811272845Z info(agent): turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:58.811273887Z info: turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:58.811276345Z info(agent): turn.stage stage=tts_prepare iteration=0 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:52:58.811277720Z info(agent): turn.stage stage=compact_trim iteration=0 duration_ms=0 compacted=false
+2026-03-17T12:52:58.814651887Z info(agent): turn.stage stage=autosave_assistant iteration=0 duration_ms=7
+2026-03-17T12:52:58.814668929Z info(agent): turn.stage stage=drain_outbox iteration=0 duration_ms=0
+2026-03-17T12:52:58.814677262Z info: turn.complete
+2026-03-17T12:52:58.814772554Z info(agent): turn.stage stage=finalize_no_tools iteration=0 duration_ms=7 total_turn_ms=2928
+2026-03-17T12:52:58.814781845Z info: turn.stage stage=finalize_no_tools iteration=0 duration_ms=7
+2026-03-17T12:52:58.816067762Z info(agent): turn.stage stage=autosave_assistant iteration=0 duration_ms=4
+2026-03-17T12:52:58.816082845Z info(agent): turn.stage stage=drain_outbox iteration=0 duration_ms=0
+2026-03-17T12:52:58.816086387Z info: turn.complete
+2026-03-17T12:52:58.816246929Z info(agent): turn.stage stage=finalize_no_tools iteration=0 duration_ms=5 total_turn_ms=2930
+2026-03-17T12:52:58.816253804Z info: turn.stage stage=finalize_no_tools iteration=0 duration_ms=5
+2026-03-17T12:52:58.817665137Z info(session): message.process session=agent:zaki-bot:user:6:main agent_ms=2928 persist_ms=3 total_ms=2931
+2026-03-17T12:52:58.817674637Z info(gateway): chat.stream.complete user=6 session=agent:zaki-bot:user:6:main chat_ms=2931 sse_ms=0 total_ms=2938
+2026-03-17T12:52:58.818862262Z info(session): message.process session=agent:zaki-bot:user:7:main agent_ms=2930 persist_ms=2 total_ms=2932
+2026-03-17T12:52:58.818869220Z info(gateway): chat.stream.complete user=7 session=agent:zaki-bot:user:7:main chat_ms=2932 sse_ms=0 total_ms=2939
+2026-03-17T12:52:58.828823720Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=2934 success=true
+2026-03-17T12:52:58.828836845Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=0
+2026-03-17T12:52:58.828839262Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=0
+2026-03-17T12:52:58.828859304Z info(agent): turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:58.828865387Z info: turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:58.828867220Z info(agent): turn.stage stage=tts_prepare iteration=0 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:52:58.828868929Z info(agent): turn.stage stage=compact_trim iteration=0 duration_ms=0 compacted=false
+2026-03-17T12:52:58.830855345Z info(agent): turn.stage stage=autosave_assistant iteration=0 duration_ms=2
+2026-03-17T12:52:58.830860137Z info(agent): turn.stage stage=drain_outbox iteration=0 duration_ms=0
+2026-03-17T12:52:58.830861804Z info: turn.complete
+2026-03-17T12:52:58.830979470Z info(agent): turn.stage stage=finalize_no_tools iteration=0 duration_ms=2 total_turn_ms=2944
+2026-03-17T12:52:58.830983762Z info: turn.stage stage=finalize_no_tools iteration=0 duration_ms=2
+2026-03-17T12:52:58.832985470Z info(session): message.process session=agent:zaki-bot:user:8:main agent_ms=2944 persist_ms=2 total_ms=2946
+2026-03-17T12:52:58.832995512Z info(gateway): chat.stream.complete user=8 session=agent:zaki-bot:user:8:main chat_ms=2946 sse_ms=0 total_ms=2953
+2026-03-17T12:52:59.030030679Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=3139 success=true
+2026-03-17T12:52:59.030061095Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=0
+2026-03-17T12:52:59.030062845Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=0
+2026-03-17T12:52:59.030063637Z info(agent): turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:59.030064262Z info: turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:59.030065512Z info(agent): turn.stage stage=tts_prepare iteration=0 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:52:59.030066304Z info(agent): turn.stage stage=compact_trim iteration=0 duration_ms=0 compacted=false
+2026-03-17T12:52:59.033342720Z info(agent): turn.stage stage=autosave_assistant iteration=0 duration_ms=4
+2026-03-17T12:52:59.033352679Z info(agent): turn.stage stage=drain_outbox iteration=0 duration_ms=0
+2026-03-17T12:52:59.033354262Z info: turn.complete
+2026-03-17T12:52:59.033357345Z info(agent): turn.stage stage=finalize_no_tools iteration=0 duration_ms=4 total_turn_ms=3147
+2026-03-17T12:52:59.033358095Z info: turn.stage stage=finalize_no_tools iteration=0 duration_ms=4
+2026-03-17T12:52:59.034771054Z info(session): message.process session=agent:zaki-bot:user:10:main agent_ms=3147 persist_ms=1 total_ms=3148
+2026-03-17T12:52:59.034775970Z info(gateway): chat.stream.complete user=10 session=agent:zaki-bot:user:10:main chat_ms=3148 sse_ms=0 total_ms=3155
+2026-03-17T12:52:59.185543721Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=3294 success=true
+2026-03-17T12:52:59.185640762Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=0
+2026-03-17T12:52:59.185645846Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=0
+2026-03-17T12:52:59.185702762Z info(agent): turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:59.185734137Z info: turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:59.185927512Z info(agent): turn.stage stage=tts_prepare iteration=0 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:52:59.185936596Z info(agent): turn.stage stage=compact_trim iteration=0 duration_ms=0 compacted=false
+2026-03-17T12:52:59.192526137Z info(agent): turn.stage stage=autosave_assistant iteration=0 duration_ms=7
+2026-03-17T12:52:59.192560971Z info(agent): turn.stage stage=drain_outbox iteration=0 duration_ms=0
+2026-03-17T12:52:59.192564137Z info: turn.complete
+2026-03-17T12:52:59.192608012Z info(agent): turn.stage stage=finalize_no_tools iteration=0 duration_ms=7 total_turn_ms=3306
+2026-03-17T12:52:59.192621262Z info: turn.stage stage=finalize_no_tools iteration=0 duration_ms=7
+2026-03-17T12:52:59.195626346Z info(session): message.process session=agent:zaki-bot:user:3:main agent_ms=3306 persist_ms=3 total_ms=3309
+2026-03-17T12:52:59.195652346Z info(gateway): chat.stream.complete user=3 session=agent:zaki-bot:user:3:main chat_ms=3309 sse_ms=0 total_ms=3316
+2026-03-17T12:52:59.451738596Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=3559 success=true
+2026-03-17T12:52:59.451797971Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=0
+2026-03-17T12:52:59.451800512Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=0
+2026-03-17T12:52:59.451802096Z info(agent): turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:59.451803054Z info: turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:52:59.451805346Z info(agent): turn.stage stage=tts_prepare iteration=0 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:52:59.451806471Z info(agent): turn.stage stage=compact_trim iteration=0 duration_ms=0 compacted=false
+2026-03-17T12:52:59.457159262Z info(agent): turn.stage stage=autosave_assistant iteration=0 duration_ms=6
+2026-03-17T12:52:59.457177846Z info(agent): turn.stage stage=drain_outbox iteration=0 duration_ms=0
+2026-03-17T12:52:59.457180304Z info: turn.complete
+2026-03-17T12:52:59.457269929Z info(agent): turn.stage stage=finalize_no_tools iteration=0 duration_ms=6 total_turn_ms=3571
+2026-03-17T12:52:59.457275304Z info: turn.stage stage=finalize_no_tools iteration=0 duration_ms=6
+2026-03-17T12:52:59.459767387Z info(session): message.process session=agent:zaki-bot:user:2:main agent_ms=3571 persist_ms=2 total_ms=3573
+2026-03-17T12:52:59.459774304Z info(gateway): chat.stream.complete user=2 session=agent:zaki-bot:user:2:main chat_ms=3573 sse_ms=0 total_ms=3580
+2026-03-17T12:53:06.038146335Z info(agent): turn.stage stage=compact_pre_provider duration_ms=18383
+2026-03-17T12:53:06.038172585Z info: turn.stage stage=compact_pre_provider duration_ms=18383
+2026-03-17T12:53:06.038178001Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=22
+2026-03-17T12:53:06.038216335Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=0 history_messages=22
+2026-03-17T12:53:06.038219543Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=0 count=22
+2026-03-17T12:53:09.396531878Z </tool_call><tool_call>
+2026-03-17T12:53:09.396580419Z {"name": "runtime_info", "arguments": {"section": "summary"}}
+2026-03-17T12:53:09.396553461Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=3358 success=true
+2026-03-17T12:53:09.396595711Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=1
+2026-03-17T12:53:09.396599044Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=1
+2026-03-17T12:53:09.396601919Z info: tool.start tool=runtime_info
+2026-03-17T12:53:09.398612419Z info: tool.call tool=runtime_info duration_ms=2 success=true
+2026-03-17T12:53:09.398631378Z info(agent): turn.stage stage=dispatch_tools iteration=0 duration_ms=2 mode=serial calls=1
+2026-03-17T12:53:09.399073919Z info(agent): turn.stage stage=tool_reflection iteration=0 duration_ms=0 results=1
+2026-03-17T12:53:09.399092794Z info: turn.stage stage=tool_reflection iteration=0 duration_ms=0 count=1
+2026-03-17T12:53:09.399095128Z info(agent): turn.stage stage=trim_history_after_tools iteration=0 duration_ms=0
+2026-03-17T12:53:09.399101503Z info(agent): turn.stage stage=build_provider_messages iteration=1 duration_ms=0 history_messages=24
+2026-03-17T12:53:09.399103628Z info: turn.stage stage=build_provider_messages iteration=1 duration_ms=0 count=24
+2026-03-17T12:53:13.260813713Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=3861 success=true
+2026-03-17T12:53:13.260821755Z info(agent): turn.stage stage=parse_provider_response iteration=1 duration_ms=0 tool_calls=0
+2026-03-17T12:53:13.260823630Z info: turn.stage stage=parse_provider_response iteration=1 duration_ms=0 count=0
+2026-03-17T12:53:13.260824380Z info(agent): turn.stage stage=compose_final_reply iteration=1 duration_ms=0
+2026-03-17T12:53:13.260834130Z info: turn.stage stage=compose_final_reply iteration=1 duration_ms=0
+2026-03-17T12:53:13.260835380Z info(agent): turn.stage stage=tts_prepare iteration=1 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:53:13.260835880Z info(agent): turn.stage stage=compact_trim iteration=1 duration_ms=0 compacted=false
+2026-03-17T12:53:13.262665005Z info(agent): turn.stage stage=autosave_assistant iteration=1 duration_ms=2
+2026-03-17T12:53:13.262672296Z info(agent): turn.stage stage=drain_outbox iteration=1 duration_ms=0
+2026-03-17T12:53:13.262673921Z info: turn.complete
+2026-03-17T12:53:13.262765421Z info(agent): turn.stage stage=finalize_no_tools iteration=1 duration_ms=2 total_turn_ms=25610
+2026-03-17T12:53:13.262770588Z info: turn.stage stage=finalize_no_tools iteration=1 duration_ms=2
+2026-03-17T12:53:13.264178046Z info(session): message.process session=agent:zaki-bot:user:1:main agent_ms=25610 persist_ms=2 total_ms=25612
+2026-03-17T12:53:13.264185088Z info: turn.stage stage=session_lock_wait duration_ms=17377
+2026-03-17T12:53:13.264186421Z warning(session): session.lock_wait session=agent:zaki-bot:user:1:main wait_ms=17377
+2026-03-17T12:53:13.264189921Z info(gateway): chat.stream.complete user=1 session=agent:zaki-bot:user:1:main chat_ms=25612 sse_ms=0 total_ms=25615
+2026-03-17T12:53:13.266548755Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:53:13.266555171Z info: turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:53:36.698555835Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=40804 success=true
+2026-03-17T12:53:36.698595126Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=0
+2026-03-17T12:53:36.698597960Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=0
+2026-03-17T12:53:36.698604126Z info(agent): turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:53:36.698605251Z info: turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:53:36.698607460Z info(agent): turn.stage stage=tts_prepare iteration=0 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:53:36.698608460Z info(agent): turn.stage stage=compact_trim iteration=0 duration_ms=0 compacted=false
+2026-03-17T12:53:36.701529710Z info(agent): turn.stage stage=autosave_assistant iteration=0 duration_ms=3
+2026-03-17T12:53:36.701540876Z info(agent): turn.stage stage=drain_outbox iteration=0 duration_ms=0
+2026-03-17T12:53:36.701543293Z info: turn.complete
+2026-03-17T12:53:36.701651960Z info(agent): turn.stage stage=finalize_no_tools iteration=0 duration_ms=3 total_turn_ms=40813
+2026-03-17T12:53:36.701658376Z info: turn.stage stage=finalize_no_tools iteration=0 duration_ms=3
+2026-03-17T12:53:36.703794418Z info(session): message.process session=agent:zaki-bot:user:4:main agent_ms=40813 persist_ms=2 total_ms=40815
+2026-03-17T12:53:36.703804710Z info(gateway): chat.stream.complete user=4 session=agent:zaki-bot:user:4:main chat_ms=40815 sse_ms=0 total_ms=40824
+2026-03-17T12:53:39.891203295Z info(agent): turn.stage stage=compact_pre_provider duration_ms=26625
+2026-03-17T12:53:39.891235045Z info: turn.stage stage=compact_pre_provider duration_ms=26625
+2026-03-17T12:53:39.891280920Z info: llm.request provider=OpenRouter model=moonshotai/kimi-k2.5 messages=22
+2026-03-17T12:53:39.891365086Z info(agent): turn.stage stage=build_provider_messages iteration=0 duration_ms=0 history_messages=22
+2026-03-17T12:53:39.891391461Z info: turn.stage stage=build_provider_messages iteration=0 duration_ms=0 count=22
+2026-03-17T12:53:42.674097463Z info: llm.response provider=OpenRouter model=moonshotai/kimi-k2.5 duration_ms=2782 success=true
+2026-03-17T12:53:42.674196254Z info(agent): turn.stage stage=parse_provider_response iteration=0 duration_ms=0 tool_calls=0
+2026-03-17T12:53:42.674200296Z info: turn.stage stage=parse_provider_response iteration=0 duration_ms=0 count=0
+2026-03-17T12:53:42.674201838Z info(agent): turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:53:42.674203504Z info: turn.stage stage=compose_final_reply iteration=0 duration_ms=0
+2026-03-17T12:53:42.674223046Z info(agent): turn.stage stage=tts_prepare iteration=0 duration_ms=0 chars=0 provider=openrouter audio=off
+2026-03-17T12:53:42.674224588Z info(agent): turn.stage stage=compact_trim iteration=0 duration_ms=0 compacted=false
+2026-03-17T12:53:42.681678504Z info(agent): turn.stage stage=autosave_assistant iteration=0 duration_ms=7
+2026-03-17T12:53:42.681694588Z info(agent): turn.stage stage=drain_outbox iteration=0 duration_ms=0
+2026-03-17T12:53:42.681697129Z info: turn.complete
+2026-03-17T12:53:42.681891629Z info(agent): turn.stage stage=finalize_no_tools iteration=0 duration_ms=8 total_turn_ms=29417
+2026-03-17T12:53:42.681912963Z info: turn.stage stage=finalize_no_tools iteration=0 duration_ms=8
+2026-03-17T12:53:42.684606088Z info(session): message.process session=agent:zaki-bot:user:1:main agent_ms=29417 persist_ms=3 total_ms=46797
+2026-03-17T12:53:42.684618713Z info(gateway): chat.stream.complete user=1 session=agent:zaki-bot:user:1:main chat_ms=46797 sse_ms=0 total_ms=46805
+2026-03-17T12:53:42.684625213Z info: turn.stage stage=session_lock_wait duration_ms=29389
+2026-03-17T12:53:42.684627546Z warning(session): session.lock_wait session=agent:zaki-bot:user:1:main wait_ms=29389
+2026-03-17T12:53:42.686845046Z info(agent): turn.stage stage=memory_enrich duration_ms=0
+2026-03-17T12:53:42.686855004Z info: turn.stage stage=memory_enrich duration_ms=0

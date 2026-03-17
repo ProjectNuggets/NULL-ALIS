@@ -1,0 +1,78 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Retrieving memory","duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Preparing model request","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":4019}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Processing model response","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"tool","state":"start","label":"Using runtime_info","tool":"runtime_info"}
+
+event: progress
+data: {"type":"progress","phase":"tool","state":"done","label":"runtime_info completed","tool":"runtime_info","duration_ms":2}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Reflecting on tool results","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Preparing model request","iteration":1,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":13259}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Processing model response","iteration":1,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Composing final response","iteration":1,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"update","label":"Finalizing response","iteration":1,"duration_ms":7}
+
+event: token
+data: {"delta":"**Runtime Configuration:**\n\n| Aspect | Setting |\n|--------|---------|\n| **Model** | moonshotai/k","content":"**Runtime Configuration:**\n\n| Aspect | Setting |\n|--------|---------|\n| **Model** | moonshotai/k","seq":0}
+
+event: token
+data: {"delta":"imi-k2.5 via OpenRouter |\n| **Memory/State** | PostgreSQL backend |\n| **Scheduler** | PostgreSQL","content":"imi-k2.5 via OpenRouter |\n| **Memory/State** | PostgreSQL backend |\n| **Scheduler** | PostgreSQL","seq":1}
+
+event: token
+data: {"delta":"-backed |\n| **Tool Execution** | Serial (parallel disabled) |\n| **Channels** | CLI, Telegram |\n|","content":"-backed |\n| **Tool Execution** | Serial (parallel disabled) |\n| **Channels** | CLI, Telegram |\n|","seq":2}
+
+event: token
+data: {"delta":" **Workspace** | `/data/users/2/workspace` |\n| **Heartbeat** | Disabled |\n\n**Current Session:**\n","content":" **Workspace** | `/data/users/2/workspace` |\n| **Heartbeat** | Disabled |\n\n**Current Session:**\n","seq":3}
+
+event: token
+data: {"delta":"\n- **Session Key**: `agent:zaki-bot:user:2:main` — this is your dedicated main session lane fo","content":"\n- **Session Key**: `agent:zaki-bot:user:2:main` — this is your dedicated main session lane fo","seq":4}
+
+event: token
+data: {"delta":"r ZAKI BOT\n- **User ID**: 2\n- **Lease**: Active on pod `nullclaw-6dc897558c-8f4fw`\n\n**Capabiliti","content":"r ZAKI BOT\n- **User ID**: 2\n- **Lease**: Active on pod `nullclaw-6dc897558c-8f4fw`\n\n**Capabiliti","seq":5}
+
+event: token
+data: {"delta":"es Available:**\n\nAll core operator tools are enabled: shell commands, file I/O, git operations, ","content":"es Available:**\n\nAll core operator tools are enabled: shell commands, file I/O, git operations, ","seq":6}
+
+event: token
+data: {"delta":"memory (postgres-backed), scheduling, messaging (Telegram/CLI), screenshots, skill registry, and","content":"memory (postgres-backed), scheduling, messaging (Telegram/CLI), screenshots, skill registry, and","seq":7}
+
+event: token
+data: {"delta":" background spawning.\n\nThe runtime is healthy (not degraded), tenant-enabled, and ready for proa","content":" background spawning.\n\nThe runtime is healthy (not degraded), tenant-enabled, and ready for proa","seq":8}
+
+event: token
+data: {"delta":"ctive work.","content":"ctive work.","seq":9}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:2:main","message_id":"1773751859142"}
+

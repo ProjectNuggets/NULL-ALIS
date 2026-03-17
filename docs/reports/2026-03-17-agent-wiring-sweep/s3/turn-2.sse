@@ -1,0 +1,78 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Retrieving memory","duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Preparing model request","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":3226}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Processing model response","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"tool","state":"start","label":"Using runtime_info","tool":"runtime_info"}
+
+event: progress
+data: {"type":"progress","phase":"tool","state":"done","label":"runtime_info completed","tool":"runtime_info","duration_ms":3}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Reflecting on tool results","iteration":0,"duration_ms":1}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Preparing model request","iteration":1,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":8076}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Processing model response","iteration":1,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Composing final response","iteration":1,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"update","label":"Finalizing response","iteration":1,"duration_ms":7}
+
+event: token
+data: {"delta":"**Runtime Configuration**\n\n| Layer | Details |\n|-------|---------|\n| **AI Model** | moonshotai/k","content":"**Runtime Configuration**\n\n| Layer | Details |\n|-------|---------|\n| **AI Model** | moonshotai/k","seq":0}
+
+event: token
+data: {"delta":"imi-k2.5 via OpenRouter |\n| **State & Memory** | PostgreSQL (configured + active) |\n| **Schedule","content":"imi-k2.5 via OpenRouter |\n| **State & Memory** | PostgreSQL (configured + active) |\n| **Schedule","seq":1}
+
+event: token
+data: {"delta":"r** | PostgreSQL-backed |\n| **Tool Dispatch** | Serial execution (parallel tools disabled) |\n| *","content":"r** | PostgreSQL-backed |\n| **Tool Dispatch** | Serial execution (parallel tools disabled) |\n| *","seq":2}
+
+event: token
+data: {"delta":"*Channels** | CLI, Telegram |\n| **Tools Enabled** | 16 tools including shell, file I/O, git, mem","content":"*Channels** | CLI, Telegram |\n| **Tools Enabled** | 16 tools including shell, file I/O, git, mem","seq":3}
+
+event: token
+data: {"delta":"ory ops, schedule, spawn, messaging, screenshots |\n| **Heartbeat** | Disabled |\n| **Workspace** ","content":"ory ops, schedule, spawn, messaging, screenshots |\n| **Heartbeat** | Disabled |\n| **Workspace** ","seq":4}
+
+event: token
+data: {"delta":"| `/data/users/2/workspace` |\n| **Health** | Healthy (not degraded) |\n\n**Current Session**\n\n- **","content":"| `/data/users/2/workspace` |\n| **Health** | Healthy (not degraded) |\n\n**Current Session**\n\n- **","seq":5}
+
+event: token
+data: {"delta":"Session Key**: `agent:zaki-bot:user:2:main` — this is your dedicated ZAKI BOT main lane\n- **Us","content":"Session Key**: `agent:zaki-bot:user:2:main` — this is your dedicated ZAKI BOT main lane\n- **Us","seq":6}
+
+event: token
+data: {"delta":"er ID**: 2 (tenant-enabled)\n- **Active Lease**: Pod `nullclaw-6dc897558c-8f4fw` with lock until ","content":"er ID**: 2 (tenant-enabled)\n- **Active Lease**: Pod `nullclaw-6dc897558c-8f4fw` with lock until ","seq":7}
+
+event: token
+data: {"delta":"~12:55 UTC\n\n**Bottom Line**: You have a fully-enabled personal operator runtime with persistent ","content":"~12:55 UTC\n\n**Bottom Line**: You have a fully-enabled personal operator runtime with persistent ","seq":8}
+
+event: token
+data: {"delta":"PostgreSQL memory, Telegram connectivity, and all execution tools ready.","content":"PostgreSQL memory, Telegram connectivity, and all execution tools ready.","seq":9}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:2:main","message_id":"1773751870541"}
+

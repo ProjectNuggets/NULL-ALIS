@@ -58,7 +58,7 @@ curl -N -i -sS \
   -H "Authorization: Bearer $BFF_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   -X POST "$BFF_BASE_URL/v1/me/bot/chat/stream" \
-  -d '{"message":"t6 staging validation ping"}' \
+  -d '{"message":"t6 staging validation ping","session_key":"agent:zaki-bot:user:<AUTH_USER_ID>:thread:t6-staging-chat"}' \
   | tee /tmp/t6-staging-evidence/04-chat-stream-success.sse
 ```
 
@@ -89,6 +89,14 @@ curl -i -sS \
   -H "X-Internal-Token: $NULLALIS_INTERNAL_TOKEN" \
   "$NULLALIS_BASE_URL/internal/diagnostics" \
   | tee /tmp/t6-staging-evidence/06d-nullalis-diagnostics.json
+```
+
+Check lane metrics after the run:
+```bash
+curl -sS \
+  -H "X-Internal-Token: $NULLALIS_INTERNAL_TOKEN" \
+  "$NULLALIS_BASE_URL/metrics" \
+  | rg 'nullalis_gateway_chat_stream_(lanes|session_key_rejections)_total'
 ```
 
 ## 7) Telegram Disconnect/Reconnect

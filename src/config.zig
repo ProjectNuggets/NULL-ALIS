@@ -894,6 +894,15 @@ test "json parse roundtrip" {
     allocator.free(cfg.runtime.kind);
 }
 
+test "gateway config defaults require explicit chat stream session key" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expect(cfg.gateway.require_explicit_chat_stream_session_key);
+}
+
 test "validation rejects bad temperature" {
     const cfg = Config{
         .workspace_dir = "/tmp/yc",

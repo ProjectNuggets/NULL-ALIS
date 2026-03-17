@@ -1,0 +1,63 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Retrieving memory","duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Preparing model request","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":7467}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Processing model response","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Composing final response","iteration":0,"duration_ms":0}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"update","label":"Finalizing response","iteration":0,"duration_ms":5}
+
+event: token
+data: {"delta":"- **Limit blast radius** – Issues affect only a small subset of users, not your entire base.\n-","content":"- **Limit blast radius** – Issues affect only a small subset of users, not your entire base.\n-","seq":0}
+
+event: token
+data: {"delta":" **Early detection** – Problems surface in production before full deployment.\n- **Automatic ro","content":" **Early detection** – Problems surface in production before full deployment.\n- **Automatic ro","seq":1}
+
+event: token
+data: {"delta":"llback** – Failing health checks trigger instant reversion without human delay.\n- **Confidence","content":"llback** – Failing health checks trigger instant reversion without human delay.\n- **Confidence","seq":2}
+
+event: token
+data: {"delta":" to ship** – Teams release more frequently knowing safety nets exist.\n- **Real-world validatio","content":" to ship** – Teams release more frequently knowing safety nets exist.\n- **Real-world validatio","seq":3}
+
+event: token
+data: {"delta":"n** – Staging can't replicate production load, data, or edge cases.\n- **Reduced downtime** –","content":"n** – Staging can't replicate production load, data, or edge cases.\n- **Reduced downtime** –","seq":4}
+
+event: token
+data: {"delta":" Catching failures early prevents prolonged outages.\n- **Safer experimentation** – Test featur","content":" Catching failures early prevents prolonged outages.\n- **Safer experimentation** – Test featur","seq":5}
+
+event: token
+data: {"delta":"es with real users before global launch.\n- **Faster incident response** – Isolated issues are ","content":"es with real users before global launch.\n- **Faster incident response** – Isolated issues are ","seq":6}
+
+event: token
+data: {"delta":"easier to diagnose and fix.\n- **Protect revenue** – Critical paths stay healthy for the majori","content":"easier to diagnose and fix.\n- **Protect revenue** – Critical paths stay healthy for the majori","seq":7}
+
+event: token
+data: {"delta":"ty of users.\n- **Lower stress** – Engineers sleep better knowing deployments are guarded.\n- **","content":"ty of users.\n- **Lower stress** – Engineers sleep better knowing deployments are guarded.\n- **","seq":8}
+
+event: token
+data: {"delta":"Gradual load testing** – Ramp up traffic to validate performance under scale.\n- ** Regulatory ","content":"Gradual load testing** – Ramp up traffic to validate performance under scale.\n- ** Regulatory ","seq":9}
+
+event: token
+data: {"delta":"compliance** – Demonstrate controlled release practices for audits.","content":"compliance** – Demonstrate controlled release practices for audits.","seq":10}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:3:main","message_id":"1773751887718"}
+

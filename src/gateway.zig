@@ -474,6 +474,7 @@ pub const GatewayState = struct {
     chat_stream_errors_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     telegram_webhook_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     telegram_webhook_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    require_explicit_chat_stream_session_key: bool = true,
     tenant_lock_conflicts_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     tenant_lock_conflicts_chat_stream_sse_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     tenant_lock_conflicts_chat_stream_http_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -482,6 +483,14 @@ pub const GatewayState = struct {
     tenant_lock_conflicts_api_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     tenant_lock_conflict_retries_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     tenant_runtime_policy_attached: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    chat_stream_lane_main_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    chat_stream_lane_thread_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    chat_stream_lane_task_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    chat_stream_lane_cron_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    chat_stream_session_key_missing_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    chat_stream_session_key_invalid_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    chat_stream_session_key_wrong_user_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    chat_stream_session_key_invalid_lane_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     in_flight_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     drain_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     overload_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -3777,13 +3786,29 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
     const tenant_lock_conflicts_daemon_total = state.tenant_lock_conflicts_daemon_total.load(.monotonic);
     const tenant_lock_conflicts_api_total = state.tenant_lock_conflicts_api_total.load(.monotonic);
     const tenant_lock_conflict_retries_total = state.tenant_lock_conflict_retries_total.load(.monotonic);
+    const chat_stream_lane_main_total = state.chat_stream_lane_main_total.load(.monotonic);
+    const chat_stream_lane_thread_total = state.chat_stream_lane_thread_total.load(.monotonic);
+    const chat_stream_lane_task_total = state.chat_stream_lane_task_total.load(.monotonic);
+    const chat_stream_lane_cron_total = state.chat_stream_lane_cron_total.load(.monotonic);
+    const chat_stream_session_key_missing_total = state.chat_stream_session_key_missing_total.load(.monotonic);
+    const chat_stream_session_key_invalid_total = state.chat_stream_session_key_invalid_total.load(.monotonic);
+    const chat_stream_session_key_wrong_user_total = state.chat_stream_session_key_wrong_user_total.load(.monotonic);
+    const chat_stream_session_key_invalid_lane_total = state.chat_stream_session_key_invalid_lane_total.load(.monotonic);
     const in_flight_requests = state.in_flight_requests.load(.monotonic);
     const drain_rejected_total = state.drain_rejected_total.load(.monotonic);
     const overload_rejected_total = state.overload_rejected_total.load(.monotonic);
     const draining = state.draining.load(.acquire);
     const shutdown_requested = state.shutdown_requested.load(.acquire);
-    return std.fmt.allocPrint(
-        allocator,
+    const pool = http_native.pool_mod.globalPool(.{}, http_native.closePooledConnForGateway);
+    const pool_hits = pool.hits.load(.monotonic);
+    const pool_misses = pool.misses.load(.monotonic);
+    const pool_idle = pool.idleCount();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.print(
         \\# HELP nullalis_gateway_requests_total Total HTTP requests handled.
         \\# TYPE nullalis_gateway_requests_total counter
         \\nullalis_gateway_requests_total {d}
@@ -3793,12 +3818,43 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\# HELP nullalis_gateway_chat_stream_errors_total Total chat stream errors.
         \\# TYPE nullalis_gateway_chat_stream_errors_total counter
         \\nullalis_gateway_chat_stream_errors_total {d}
+        \\# HELP nullalis_gateway_chat_stream_lanes_total Accepted chat stream requests by lane.
+        \\# TYPE nullalis_gateway_chat_stream_lanes_total counter
+        \\nullalis_gateway_chat_stream_lanes_total{{lane="main"}} {d}
+        \\nullalis_gateway_chat_stream_lanes_total{{lane="thread"}} {d}
+        \\nullalis_gateway_chat_stream_lanes_total{{lane="task"}} {d}
+        \\nullalis_gateway_chat_stream_lanes_total{{lane="cron"}} {d}
+        \\# HELP nullalis_gateway_chat_stream_session_key_rejections_total Rejected chat stream requests by session_key validation reason.
+        \\# TYPE nullalis_gateway_chat_stream_session_key_rejections_total counter
+        \\nullalis_gateway_chat_stream_session_key_rejections_total{{reason="missing"}} {d}
+        \\nullalis_gateway_chat_stream_session_key_rejections_total{{reason="invalid"}} {d}
+        \\nullalis_gateway_chat_stream_session_key_rejections_total{{reason="wrong_user"}} {d}
+        \\nullalis_gateway_chat_stream_session_key_rejections_total{{reason="invalid_lane"}} {d}
         \\# HELP nullalis_gateway_telegram_webhook_total Total telegram webhook requests.
         \\# TYPE nullalis_gateway_telegram_webhook_total counter
         \\nullalis_gateway_telegram_webhook_total {d}
         \\# HELP nullalis_gateway_telegram_webhook_rejected_total Total rejected telegram webhooks.
         \\# TYPE nullalis_gateway_telegram_webhook_rejected_total counter
         \\nullalis_gateway_telegram_webhook_rejected_total {d}
+        \\
+    ,
+        .{
+            requests_total,
+            chat_stream_total,
+            chat_stream_errors_total,
+            chat_stream_lane_main_total,
+            chat_stream_lane_thread_total,
+            chat_stream_lane_task_total,
+            chat_stream_lane_cron_total,
+            chat_stream_session_key_missing_total,
+            chat_stream_session_key_invalid_total,
+            chat_stream_session_key_wrong_user_total,
+            chat_stream_session_key_invalid_lane_total,
+            telegram_webhook_total,
+            telegram_webhook_rejected_total,
+        },
+    );
+    try w.print(
         \\# HELP nullalis_gateway_tenant_lock_conflicts_total Total tenant ownership-lock conflicts.
         \\# TYPE nullalis_gateway_tenant_lock_conflicts_total counter
         \\nullalis_gateway_tenant_lock_conflicts_total {d}
@@ -3827,6 +3883,24 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\# HELP nullalis_gateway_shutdown_requested Whether shutdown has been requested.
         \\# TYPE nullalis_gateway_shutdown_requested gauge
         \\nullalis_gateway_shutdown_requested {d}
+        \\
+    ,
+        .{
+            tenant_lock_conflicts_total,
+            tenant_lock_conflicts_chat_stream_sse_total,
+            tenant_lock_conflicts_chat_stream_http_total,
+            tenant_lock_conflicts_webhook_total,
+            tenant_lock_conflicts_daemon_total,
+            tenant_lock_conflicts_api_total,
+            tenant_lock_conflict_retries_total,
+            in_flight_requests,
+            drain_rejected_total,
+            overload_rejected_total,
+            if (draining) @as(u8, 1) else @as(u8, 0),
+            if (shutdown_requested) @as(u8, 1) else @as(u8, 0),
+        },
+    );
+    try w.print(
         \\# HELP nullalis_http_transport_native_total Native transport successes by subsystem.
         \\# TYPE nullalis_http_transport_native_total counter
         \\nullalis_http_transport_native_total{{subsystem="tools"}} {d}
@@ -3857,23 +3931,6 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\
     ,
         .{
-            requests_total,
-            chat_stream_total,
-            chat_stream_errors_total,
-            telegram_webhook_total,
-            telegram_webhook_rejected_total,
-            tenant_lock_conflicts_total,
-            tenant_lock_conflicts_chat_stream_sse_total,
-            tenant_lock_conflicts_chat_stream_http_total,
-            tenant_lock_conflicts_webhook_total,
-            tenant_lock_conflicts_daemon_total,
-            tenant_lock_conflicts_api_total,
-            tenant_lock_conflict_retries_total,
-            in_flight_requests,
-            drain_rejected_total,
-            overload_rejected_total,
-            if (draining) @as(u8, 1) else @as(u8, 0),
-            if (shutdown_requested) @as(u8, 1) else @as(u8, 0),
             transport_stats.tools_native_total,
             transport_stats.providers_native_total,
             transport_stats.channels_native_total,
@@ -3886,29 +3943,12 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             transport_stats.providers_fallback_total,
             transport_stats.channels_fallback_total,
             transport_stats.system_fallback_total,
-            blk: {
-                const p = http_native.pool_mod.globalPool(
-                    .{},
-                    http_native.closePooledConnForGateway,
-                );
-                break :blk p.hits.load(.monotonic);
-            },
-            blk: {
-                const p = http_native.pool_mod.globalPool(
-                    .{},
-                    http_native.closePooledConnForGateway,
-                );
-                break :blk p.misses.load(.monotonic);
-            },
-            blk: {
-                const p = http_native.pool_mod.globalPool(
-                    .{},
-                    http_native.closePooledConnForGateway,
-                );
-                break :blk p.idleCount();
-            },
+            pool_hits,
+            pool_misses,
+            pool_idle,
         },
     );
+    return buf.toOwnedSlice(allocator);
 }
 
 fn appendHeartbeatRuntimeSummaryJson(
@@ -4324,6 +4364,29 @@ fn internalDiagnosticsPayload(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(&buf, allocator, "sandbox_workspace_validation_last_reason", sandbox_diag.workspace_validation_last_reason);
     try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "chat_stream_require_explicit_session_key");
+    try buf.appendSlice(allocator, if (state.require_explicit_chat_stream_session_key) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "chat_stream_lane_counts");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "main", @intCast(state.chat_stream_lane_main_total.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "thread", @intCast(state.chat_stream_lane_thread_total.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "task", @intCast(state.chat_stream_lane_task_total.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "cron", @intCast(state.chat_stream_lane_cron_total.load(.monotonic)));
+    try buf.appendSlice(allocator, "},");
+    try json_util.appendJsonKey(&buf, allocator, "chat_stream_session_key_rejections");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(&buf, allocator, "missing", @intCast(state.chat_stream_session_key_missing_total.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "invalid", @intCast(state.chat_stream_session_key_invalid_total.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "wrong_user", @intCast(state.chat_stream_session_key_wrong_user_total.load(.monotonic)));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "invalid_lane", @intCast(state.chat_stream_session_key_invalid_lane_total.load(.monotonic)));
+    try buf.appendSlice(allocator, "},");
     try json_util.appendJsonInt(&buf, allocator, "background_main_reroutes_total", @intCast(lane_snapshot.total));
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(&buf, allocator, "background_main_reroutes_last_job_id");
@@ -5003,6 +5066,20 @@ const ChatStreamSessionKeyError = error{
     MissingSessionKey,
 };
 
+const ChatStreamTenantLane = enum {
+    main,
+    thread,
+    task,
+    cron,
+};
+
+const ChatStreamSessionKeyRejection = enum {
+    missing,
+    invalid,
+    wrong_user,
+    invalid_lane,
+};
+
 fn sessionKeyOwnedByUser(session_key: []const u8, user_id: []const u8) bool {
     var prefix_buf: [128]u8 = undefined;
     const prefix = std.fmt.bufPrint(&prefix_buf, "agent:zaki-bot:user:{s}:", .{user_id}) catch return false;
@@ -5010,15 +5087,45 @@ fn sessionKeyOwnedByUser(session_key: []const u8, user_id: []const u8) bool {
 }
 
 fn sessionKeyHasAllowedTenantLane(session_key: []const u8, user_id: []const u8) bool {
+    return tenantLaneFromSessionKey(session_key, user_id) != null;
+}
+
+fn tenantLaneFromSessionKey(session_key: []const u8, user_id: []const u8) ?ChatStreamTenantLane {
     var prefix_buf: [128]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&prefix_buf, "agent:zaki-bot:user:{s}:", .{user_id}) catch return false;
-    if (!std.mem.startsWith(u8, session_key, prefix)) return false;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "agent:zaki-bot:user:{s}:", .{user_id}) catch return null;
+    if (!std.mem.startsWith(u8, session_key, prefix)) return null;
     const lane = session_key[prefix.len..];
-    if (std.mem.eql(u8, lane, "main")) return true;
-    if (std.mem.startsWith(u8, lane, "thread:")) return lane.len > "thread:".len;
-    if (std.mem.startsWith(u8, lane, "task:")) return lane.len > "task:".len;
-    if (std.mem.startsWith(u8, lane, "cron:")) return lane.len > "cron:".len;
-    return false;
+    if (std.mem.eql(u8, lane, "main")) return .main;
+    if (std.mem.startsWith(u8, lane, "thread:") and lane.len > "thread:".len) return .thread;
+    if (std.mem.startsWith(u8, lane, "task:") and lane.len > "task:".len) return .task;
+    if (std.mem.startsWith(u8, lane, "cron:") and lane.len > "cron:".len) return .cron;
+    return null;
+}
+
+fn recordChatStreamLane(state: *GatewayState, session_key: []const u8, user_id: []const u8, tenant_enabled: bool) void {
+    const lane_opt = if (tenant_enabled) tenantLaneFromSessionKey(session_key, user_id) else blk: {
+        if (std.mem.eql(u8, session_key, "main")) break :blk ChatStreamTenantLane.main;
+        if (std.mem.startsWith(u8, session_key, "thread:")) break :blk ChatStreamTenantLane.thread;
+        if (std.mem.startsWith(u8, session_key, "task:")) break :blk ChatStreamTenantLane.task;
+        if (std.mem.startsWith(u8, session_key, "cron:")) break :blk ChatStreamTenantLane.cron;
+        break :blk null;
+    };
+    const lane = lane_opt orelse return;
+    switch (lane) {
+        .main => _ = state.chat_stream_lane_main_total.fetchAdd(1, .monotonic),
+        .thread => _ = state.chat_stream_lane_thread_total.fetchAdd(1, .monotonic),
+        .task => _ = state.chat_stream_lane_task_total.fetchAdd(1, .monotonic),
+        .cron => _ = state.chat_stream_lane_cron_total.fetchAdd(1, .monotonic),
+    }
+}
+
+fn recordChatStreamSessionKeyRejection(state: *GatewayState, reason: ChatStreamSessionKeyRejection) void {
+    switch (reason) {
+        .missing => _ = state.chat_stream_session_key_missing_total.fetchAdd(1, .monotonic),
+        .invalid => _ = state.chat_stream_session_key_invalid_total.fetchAdd(1, .monotonic),
+        .wrong_user => _ = state.chat_stream_session_key_wrong_user_total.fetchAdd(1, .monotonic),
+        .invalid_lane => _ = state.chat_stream_session_key_invalid_lane_total.fetchAdd(1, .monotonic),
+    }
 }
 
 fn resolveChatStreamSessionKey(
@@ -5133,8 +5240,15 @@ fn handleApiChatStreamSseConnection(
     };
 
     var session_buf: [256]u8 = undefined;
-    const require_explicit_session_key = if (config_opt) |cfg| cfg.gateway.require_explicit_chat_stream_session_key else false;
+    const require_explicit_session_key = if (config_opt) |cfg| cfg.gateway.require_explicit_chat_stream_session_key else true;
     const session_key = resolveChatStreamSessionKey(body, user_id, state.tenant_enabled, require_explicit_session_key, &session_buf) catch |err| {
+        const rejection: ChatStreamSessionKeyRejection = switch (err) {
+            error.InvalidSessionKey => .invalid,
+            error.SessionKeyUserMismatch => .wrong_user,
+            error.InvalidSessionLane => .invalid_lane,
+            error.MissingSessionKey => .missing,
+        };
+        recordChatStreamSessionKeyRejection(state, rejection);
         const code: []const u8 = switch (err) {
             error.InvalidSessionKey => "invalid_session_key",
             error.SessionKeyUserMismatch => "session_key_user_mismatch",
@@ -5151,6 +5265,7 @@ fn handleApiChatStreamSseConnection(
         return true;
     };
     _ = state.chat_stream_total.fetchAdd(1, .monotonic);
+    recordChatStreamLane(state, session_key, user_id, state.tenant_enabled);
     sendChunkedSseHeader(stream, "200 OK") catch return true;
 
     const status_fallback = "event: status\ndata: {\"type\":\"statusResponse\",\"content\":\"Processing request\"}\n\n";
@@ -5418,8 +5533,15 @@ fn handleApiRoute(
         const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing message\"}" };
         var session_buf: [256]u8 = undefined;
-        const require_explicit_session_key = if (config_opt) |cfg| cfg.gateway.require_explicit_chat_stream_session_key else false;
+        const require_explicit_session_key = if (config_opt) |cfg| cfg.gateway.require_explicit_chat_stream_session_key else true;
         const session_key = resolveChatStreamSessionKey(body, user_id, state.tenant_enabled, require_explicit_session_key, &session_buf) catch |err| {
+            const rejection: ChatStreamSessionKeyRejection = switch (err) {
+                error.InvalidSessionKey => .invalid,
+                error.SessionKeyUserMismatch => .wrong_user,
+                error.InvalidSessionLane => .invalid_lane,
+                error.MissingSessionKey => .missing,
+            };
+            recordChatStreamSessionKeyRejection(state, rejection);
             const code: []const u8 = switch (err) {
                 error.InvalidSessionKey => "invalid_session_key",
                 error.SessionKeyUserMismatch => "session_key_user_mismatch",
@@ -5440,6 +5562,7 @@ fn handleApiRoute(
             };
         };
         _ = state.chat_stream_total.fetchAdd(1, .monotonic);
+        recordChatStreamLane(state, session_key, user_id, state.tenant_enabled);
 
         const chat_start_ms = std.time.milliTimestamp();
         const reply = blk: {
@@ -8138,6 +8261,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             return error.SecurityConfigInvalid;
         }
         state.internal_service_tokens = cfg.gateway.internal_service_tokens;
+        state.require_explicit_chat_stream_session_key = cfg.gateway.require_explicit_chat_stream_session_key;
         state.tenant_enabled = cfg.tenant.enabled;
         state.tenant_data_root = cfg.tenant.data_root;
         state.tenant_runtime_cache_max_users = cfg.tenant.runtime_cache_max_users;
@@ -11150,9 +11274,12 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     gs.internal_token_configured = true;
     gs.internal_token_policy_ok = true;
     gs.internal_token_policy_reason = "";
+    gs.require_explicit_chat_stream_session_key = true;
     gs.owner_instance_id = "diag-owner";
     recordTenantLockConflict(&gs, .chat_stream_sse);
     recordTenantLockConflict(&gs, .webhook);
+    recordChatStreamLane(&gs, "agent:zaki-bot:user:1:thread:diag", "1", true);
+    recordChatStreamSessionKeyRejection(&gs, .missing);
 
     const payload = try internalDiagnosticsPayload(allocator, &gs, null);
     defer allocator.free(payload);
@@ -11164,8 +11291,13 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"internal_token_policy_reason\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"instance_id\":\"diag-owner\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"owned_users_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"chat_stream_require_explicit_session_key\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_backend\":\"file_lock\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_lease_secs\":300") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"chat_stream_lane_counts\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"thread\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"chat_stream_session_key_rejections\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"missing\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"bus\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"inbound_len\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"outbound_len\":0") != null);
@@ -11195,6 +11327,53 @@ test "recordTenantLockConflict increments route counters and total" {
     try std.testing.expectEqual(@as(u64, 1), gs.tenant_lock_conflicts_webhook_total.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), gs.tenant_lock_conflicts_daemon_total.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), gs.tenant_lock_conflicts_api_total.load(.monotonic));
+}
+
+test "recordChatStreamLane increments per-lane counters" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    recordChatStreamLane(&gs, "agent:zaki-bot:user:5:main", "5", true);
+    recordChatStreamLane(&gs, "agent:zaki-bot:user:5:thread:abc", "5", true);
+    recordChatStreamLane(&gs, "agent:zaki-bot:user:5:task:abc", "5", true);
+    recordChatStreamLane(&gs, "agent:zaki-bot:user:5:cron:abc", "5", true);
+
+    try std.testing.expectEqual(@as(u64, 1), gs.chat_stream_lane_main_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.chat_stream_lane_thread_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.chat_stream_lane_task_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.chat_stream_lane_cron_total.load(.monotonic));
+}
+
+test "recordChatStreamSessionKeyRejection increments reason counters" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    recordChatStreamSessionKeyRejection(&gs, .missing);
+    recordChatStreamSessionKeyRejection(&gs, .invalid);
+    recordChatStreamSessionKeyRejection(&gs, .wrong_user);
+    recordChatStreamSessionKeyRejection(&gs, .invalid_lane);
+
+    try std.testing.expectEqual(@as(u64, 1), gs.chat_stream_session_key_missing_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.chat_stream_session_key_invalid_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.chat_stream_session_key_wrong_user_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), gs.chat_stream_session_key_invalid_lane_total.load(.monotonic));
+}
+
+test "metricsPayload includes chat stream lane and session key counters" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    recordChatStreamLane(&gs, "agent:zaki-bot:user:7:task:bench", "7", true);
+    recordChatStreamSessionKeyRejection(&gs, .wrong_user);
+
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_chat_stream_lanes_total{lane=\"task\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_chat_stream_session_key_rejections_total{reason=\"wrong_user\"} 1") != null);
 }
 
 // ── jsonEscapeInto tests ────────────────────────────────────────

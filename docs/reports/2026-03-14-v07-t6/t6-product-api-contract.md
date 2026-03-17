@@ -209,6 +209,24 @@ Reusable by second frontend unchanged: `yes`
 ### 6) `POST /v1/me/bot/chat/stream` (SSE)
 Product capability: stream model response for authenticated user turn.
 
+Request contract:
+```json
+{
+  "message": "hello",
+  "session_key": "agent:zaki-bot:user:<authenticated_user_id>:thread:<conversation_id>"
+}
+```
+
+Required rules:
+- `session_key` is required.
+- BFF derives `<authenticated_user_id>` from auth and must never trust a client-supplied internal user id.
+- Accepted lane classes only:
+  - `main`
+  - `thread:<id>`
+  - `task:<id>`
+  - `cron:<id>`
+- Missing, malformed, wrong-user, or invalid-lane `session_key` values are validation failures.
+
 Success example (SSE):
 ```text
 event: status
@@ -225,7 +243,7 @@ Validation error example:
 ```json
 {
   "error": "forbidden",
-  "message": "invalid chat payload",
+  "message": "invalid chat payload or session_key",
   "retryable": false,
   "request_id": "req_123"
 }

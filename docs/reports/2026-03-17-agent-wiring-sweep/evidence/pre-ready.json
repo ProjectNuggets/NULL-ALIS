@@ -1,0 +1,1 @@
+{"status":"ready","checks":[{"name":"daemon","healthy":true},{"name":"channels","healthy":true},{"name":"outbound_dispatcher","healthy":true},{"name":"gateway","healthy":true},{"name":"inbound_dispatcher","healthy":true},{"name":"scheduler","healthy":true}]}

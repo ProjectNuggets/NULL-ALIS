@@ -1,0 +1,667 @@
+{
+  "s1": {
+    "turn_count": 5,
+    "turn_total_ms": {
+      "median": 3075,
+      "p95": 8635.8,
+      "values": [
+        3075,
+        6955,
+        2125,
+        2268,
+        9056
+      ]
+    },
+    "llm_response_ms": {
+      "median": 2294,
+      "p95": 6168.799999999999,
+      "values": [
+        3064,
+        6945,
+        2111,
+        2260,
+        2294
+      ]
+    },
+    "lock_wait_ms": [
+      3137
+    ],
+    "tool_call_count": 0,
+    "tool_call_ms": [],
+    "stage_stats": {
+      "memory_enrich": {
+        "count": 12,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "compact_pre_provider": {
+        "count": 10,
+        "median": 0.0,
+        "p95": 6747.0,
+        "max": 6747,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          6747,
+          6747
+        ]
+      },
+      "build_provider_messages": {
+        "count": 10,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "parse_provider_response": {
+        "count": 10,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "compose_final_reply": {
+        "count": 10,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "tts_prepare": {
+        "count": 5,
+        "median": 0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "compact_trim": {
+        "count": 5,
+        "median": 0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "autosave_assistant": {
+        "count": 5,
+        "median": 6,
+        "p95": 10.0,
+        "max": 11,
+        "values": [
+          6,
+          6,
+          6,
+          3,
+          11
+        ]
+      },
+      "drain_outbox": {
+        "count": 5,
+        "median": 0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "finalize_no_tools": {
+        "count": 10,
+        "median": 6.0,
+        "p95": 11.0,
+        "max": 11,
+        "values": [
+          6,
+          6,
+          6,
+          6,
+          7,
+          7,
+          4,
+          4,
+          11,
+          11
+        ]
+      },
+      "session_lock_wait": {
+        "count": 1,
+        "median": 3137,
+        "p95": 3137,
+        "max": 3137,
+        "values": [
+          3137
+        ]
+      }
+    }
+  },
+  "s3": {
+    "turn_count": 3,
+    "turn_total_ms": {
+      "median": 11317,
+      "p95": 16692.7,
+      "values": [
+        17290,
+        11317,
+        9525
+      ]
+    },
+    "llm_response_ms": {
+      "median": 6528,
+      "p95": 12134.899999999998,
+      "values": [
+        2294,
+        4019,
+        13259,
+        3226,
+        8076,
+        6528,
+        9512
+      ]
+    },
+    "lock_wait_ms": [],
+    "tool_call_count": 3,
+    "tool_call_ms": [
+      2,
+      3,
+      3
+    ],
+    "stage_stats": {
+      "parse_provider_response": {
+        "count": 14,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "compose_final_reply": {
+        "count": 8,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "tts_prepare": {
+        "count": 4,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "compact_trim": {
+        "count": 4,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "autosave_assistant": {
+        "count": 4,
+        "median": 6.5,
+        "p95": 10.399999999999999,
+        "max": 11,
+        "values": [
+          11,
+          6,
+          6,
+          7
+        ]
+      },
+      "drain_outbox": {
+        "count": 4,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "finalize_no_tools": {
+        "count": 8,
+        "median": 7.0,
+        "p95": 11.0,
+        "max": 11,
+        "values": [
+          11,
+          11,
+          7,
+          7,
+          7,
+          7,
+          7,
+          7
+        ]
+      },
+      "session_lock_wait": {
+        "count": 1,
+        "median": 3137,
+        "p95": 3137,
+        "max": 3137,
+        "values": [
+          3137
+        ]
+      },
+      "memory_enrich": {
+        "count": 8,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "compact_pre_provider": {
+        "count": 8,
+        "median": 0.0,
+        "p95": 28469.0,
+        "max": 28469,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          28469,
+          28469,
+          0,
+          0
+        ]
+      },
+      "build_provider_messages": {
+        "count": 14,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "dispatch_tools": {
+        "count": 3,
+        "median": 3,
+        "p95": 3.9,
+        "max": 4,
+        "values": [
+          2,
+          3,
+          4
+        ]
+      },
+      "tool_reflection": {
+        "count": 6,
+        "median": 0.0,
+        "p95": 1.0,
+        "max": 1,
+        "values": [
+          0,
+          0,
+          1,
+          1,
+          0,
+          0
+        ]
+      },
+      "trim_history_after_tools": {
+        "count": 3,
+        "median": 0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  },
+  "s4": {
+    "turn_count": 2,
+    "turn_total_ms": {
+      "median": 8492.0,
+      "p95": 9405.5,
+      "values": [
+        7477,
+        9507
+      ]
+    },
+    "llm_response_ms": {
+      "median": 4306.5,
+      "p95": 9000.75,
+      "values": [
+        9512,
+        3764,
+        3473,
+        7467,
+        4849,
+        2336
+      ]
+    },
+    "lock_wait_ms": [
+      7160
+    ],
+    "tool_call_count": 1,
+    "tool_call_ms": [
+      4
+    ],
+    "stage_stats": {
+      "parse_provider_response": {
+        "count": 12,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "compose_final_reply": {
+        "count": 10,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "tts_prepare": {
+        "count": 5,
+        "median": 0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "compact_trim": {
+        "count": 5,
+        "median": 0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "autosave_assistant": {
+        "count": 5,
+        "median": 5,
+        "p95": 7.0,
+        "max": 7,
+        "values": [
+          7,
+          5,
+          7,
+          5,
+          5
+        ]
+      },
+      "drain_outbox": {
+        "count": 5,
+        "median": 0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "finalize_no_tools": {
+        "count": 10,
+        "median": 6.0,
+        "p95": 7.0,
+        "max": 7,
+        "values": [
+          7,
+          7,
+          5,
+          5,
+          7,
+          7,
+          5,
+          5,
+          6,
+          6
+        ]
+      },
+      "memory_enrich": {
+        "count": 8,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "compact_pre_provider": {
+        "count": 8,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "build_provider_messages": {
+        "count": 10,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "session_lock_wait": {
+        "count": 1,
+        "median": 7160,
+        "p95": 7160,
+        "max": 7160,
+        "values": [
+          7160
+        ]
+      },
+      "dispatch_tools": {
+        "count": 1,
+        "median": 4,
+        "p95": 4,
+        "max": 4,
+        "values": [
+          4
+        ]
+      },
+      "tool_reflection": {
+        "count": 2,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0,
+        "values": [
+          0,
+          0
+        ]
+      },
+      "trim_history_after_tools": {
+        "count": 1,
+        "median": 0,
+        "p95": 0,
+        "max": 0,
+        "values": [
+          0
+        ]
+      }
+    }
+  }
+}

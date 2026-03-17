@@ -1,0 +1,3328 @@
+{
+  "run_started_utc": "2026-03-17T12:58:19Z",
+  "run_finished_utc": "2026-03-17T13:10:22Z",
+  "scenario_windows": [
+    {
+      "scenario": "S1_short_single_user_consecutive",
+      "phase": "start",
+      "ts": "2026-03-17T12:58:19Z"
+    },
+    {
+      "scenario": "S1_short_single_user_consecutive",
+      "phase": "end",
+      "ts": "2026-03-17T13:06:32Z"
+    },
+    {
+      "scenario": "S2_short_multi_user_burst",
+      "phase": "start",
+      "ts": "2026-03-17T13:06:32Z"
+    },
+    {
+      "scenario": "S2_short_multi_user_burst",
+      "phase": "end",
+      "ts": "2026-03-17T13:07:47Z"
+    },
+    {
+      "scenario": "S3_deep_tool_heavy",
+      "phase": "start",
+      "ts": "2026-03-17T13:07:47Z"
+    },
+    {
+      "scenario": "S3_deep_tool_heavy",
+      "phase": "end",
+      "ts": "2026-03-17T13:08:39Z"
+    },
+    {
+      "scenario": "S4_same_session_rapid_input",
+      "phase": "start",
+      "ts": "2026-03-17T13:08:39Z"
+    },
+    {
+      "scenario": "S4_same_session_rapid_input",
+      "phase": "end",
+      "ts": "2026-03-17T13:10:22Z"
+    }
+  ],
+  "summary": {
+    "S1_short_single_user_consecutive": {
+      "count": 20,
+      "ok": 18,
+      "errors": 2,
+      "latency_ms": {
+        "min": 2915,
+        "p50": 7958,
+        "p95": 43777,
+        "p99": 60055,
+        "max": 60055,
+        "mean": 17385
+      },
+      "error_reasons": {
+        "curl_timeout": 2
+      }
+    },
+    "S2_short_multi_user_burst": {
+      "count": 20,
+      "ok": 20,
+      "errors": 0,
+      "latency_ms": {
+        "min": 8009,
+        "p50": 30756,
+        "p95": 71659,
+        "p99": 75213,
+        "max": 75213,
+        "mean": 33924
+      },
+      "error_reasons": {}
+    },
+    "S3_deep_tool_heavy": {
+      "count": 2,
+      "ok": 2,
+      "errors": 0,
+      "latency_ms": {
+        "min": 21115,
+        "p50": 21115,
+        "p95": 30818,
+        "p99": 30818,
+        "max": 30818,
+        "mean": 25966
+      },
+      "error_reasons": {}
+    },
+    "S4_same_session_rapid_input": {
+      "count": 10,
+      "ok": 10,
+      "errors": 0,
+      "latency_ms": {
+        "min": 8400,
+        "p50": 73216,
+        "p95": 103046,
+        "p99": 103046,
+        "max": 103046,
+        "mean": 67256
+      },
+      "error_reasons": {}
+    }
+  },
+  "results": [
+    {
+      "start_utc": "2026-03-17T12:58:19Z",
+      "end_utc": "2026-03-17T12:58:59Z",
+      "elapsed_ms": 40063,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":4806}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using runtime_info\",\"tool\":\"runtime_info\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"error\",\"label\":\"runtime_info failed\",\"tool\":\"runtime_info\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":4378}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using runtime_info\",\"tool\":\"runtime_info\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"error\",\"label\":\"runtime_info failed\",\"tool\":\"runtime_info\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":2,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":5083}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":2,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":2,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 1,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T12:58:59Z",
+      "end_utc": "2026-03-17T13:00:29Z",
+      "elapsed_ms": 90020,
+      "ok": false,
+      "reason": "curl_timeout",
+      "curl_code": 28,
+      "stderr": "curl: (28) Operation timed out after 90006 milliseconds with 441 bytes received",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 2,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:00:29Z",
+      "end_utc": "2026-03-17T13:01:59Z",
+      "elapsed_ms": 90026,
+      "ok": false,
+      "reason": "curl_timeout",
+      "curl_code": 28,
+      "stderr": "curl: (28) Operation timed out after 90005 milliseconds with 78 bytes received",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 3,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:01:59Z",
+      "end_utc": "2026-03-17T13:02:35Z",
+      "elapsed_ms": 36193,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":6288}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":3}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 4 acknowledged.\",\"content\":\"Ping 4 acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752555333\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 4,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:02:35Z",
+      "end_utc": "2026-03-17T13:02:56Z",
+      "elapsed_ms": 20878,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":5070}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":5}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 5 received.\",\"content\":\"Ping 5 received.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752576212\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 5,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:02:56Z",
+      "end_utc": "2026-03-17T13:03:03Z",
+      "elapsed_ms": 7591,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":3602}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":6}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 6 confirmed.\",\"content\":\"Ping 6 confirmed.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752583803\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 6,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:03:03Z",
+      "end_utc": "2026-03-17T13:03:47Z",
+      "elapsed_ms": 43777,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":4889}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 7 acknowledged.\",\"content\":\"Ping 7 acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752627582\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 7,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:03:47Z",
+      "end_utc": "2026-03-17T13:03:56Z",
+      "elapsed_ms": 8859,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":3833}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":9}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 8 received.\",\"content\":\"Ping 8 received.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752636440\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 8,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:03:56Z",
+      "end_utc": "2026-03-17T13:04:08Z",
+      "elapsed_ms": 12498,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":6186}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 9 confirmed.\",\"content\":\"Ping 9 confirmed.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752648940\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 9,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:04:08Z",
+      "end_utc": "2026-03-17T13:04:11Z",
+      "elapsed_ms": 2915,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":2871}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":7}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 10 received.\",\"content\":\"Ping 10 received.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752651854\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 10,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:04:11Z",
+      "end_utc": "2026-03-17T13:04:18Z",
+      "elapsed_ms": 6357,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":6295}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 11 acknowledged.\",\"content\":\"Ping 11 acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752658213\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 11,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:04:18Z",
+      "end_utc": "2026-03-17T13:05:18Z",
+      "elapsed_ms": 60055,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":6501}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":6}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 12 confirmed.\",\"content\":\"Ping 12 confirmed.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752718267\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 12,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:05:18Z",
+      "end_utc": "2026-03-17T13:05:24Z",
+      "elapsed_ms": 6027,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":5983}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 13 received.\",\"content\":\"Ping 13 received.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752724295\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 13,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:05:24Z",
+      "end_utc": "2026-03-17T13:05:28Z",
+      "elapsed_ms": 4553,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":4454}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":7}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 14 confirmed.\",\"content\":\"Ping 14 confirmed.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752728849\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 14,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:05:28Z",
+      "end_utc": "2026-03-17T13:05:38Z",
+      "elapsed_ms": 9405,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":9366}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 15 acknowledged.\",\"content\":\"Ping 15 acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752738254\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 15,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:05:38Z",
+      "end_utc": "2026-03-17T13:05:42Z",
+      "elapsed_ms": 3911,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":3843}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":8}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 16 received.\",\"content\":\"Ping 16 received.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752742167\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 16,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:05:42Z",
+      "end_utc": "2026-03-17T13:05:45Z",
+      "elapsed_ms": 3043,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":2978}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":5}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 17 confirmed.\",\"content\":\"Ping 17 confirmed.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752745210\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 17,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:05:45Z",
+      "end_utc": "2026-03-17T13:05:50Z",
+      "elapsed_ms": 5688,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":5655}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":3}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 18 acknowledged.\",\"content\":\"Ping 18 acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752750899\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 18,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:05:50Z",
+      "end_utc": "2026-03-17T13:05:58Z",
+      "elapsed_ms": 7958,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":7871}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":3}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 19 confirmed.\",\"content\":\"Ping 19 confirmed.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752758857\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 19,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:05:58Z",
+      "end_utc": "2026-03-17T13:06:32Z",
+      "elapsed_ms": 33160,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":33129}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 20 received.\",\"content\":\"Ping 20 received.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:1:main\",\"message_id\":\"1773752792018\"}"
+        }
+      ],
+      "scenario": "S1_short_single_user_consecutive",
+      "request_index": 20,
+      "user_id": "1"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:06:40Z",
+      "elapsed_ms": 8009,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":1}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":7949}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":5}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Ping 12 received loud and clear.\",\"content\":\"Ping 12 received loud and clear.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52012:main\",\"message_id\":\"1773752800044\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 12,
+      "user_id": "52012"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:06:40Z",
+      "elapsed_ms": 8026,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":7945}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":6}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Got it \u2014 ping received loud and clear.\",\"content\":\"Got it \u2014 ping received loud and clear.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52002:main\",\"message_id\":\"1773752800044\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 2,
+      "user_id": "52002"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:06:46Z",
+      "elapsed_ms": 14249,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":6236}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":2}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"The ping command is blocked by your environment's allowlist policy.\",\"content\":\"The ping command is blocked by your environment's allowlist policy.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52016:main\",\"message_id\":\"1773752806291\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 16,
+      "user_id": "52016"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:06:51Z",
+      "elapsed_ms": 18961,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":10943}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":7}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Pong 17 acknowledged.\",\"content\":\"Pong 17 acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52017:main\",\"message_id\":\"1773752811004\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 17,
+      "user_id": "52017"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:06:54Z",
+      "elapsed_ms": 22530,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":22451}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":6}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"I'm online and ready.\",\"content\":\"I'm online and ready.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52008:main\",\"message_id\":\"1773752814555\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 8,
+      "user_id": "52008"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:06:56Z",
+      "elapsed_ms": 24253,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":24177}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":6}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Got it, loud and clear.\",\"content\":\"Got it, loud and clear.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52007:main\",\"message_id\":\"1773752816277\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 7,
+      "user_id": "52007"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:06:56Z",
+      "elapsed_ms": 24265,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":24214}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":3}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Pong 14 acknowledged and active.\",\"content\":\"Pong 14 acknowledged and active.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52014:main\",\"message_id\":\"1773752816302\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 14,
+      "user_id": "52014"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:06:56Z",
+      "elapsed_ms": 24715,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":24637}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":5}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Pong received \u2014 I'm here and ready.\",\"content\":\"Pong received \u2014 I'm here and ready.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52006:main\",\"message_id\":\"1773752816738\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 6,
+      "user_id": "52006"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:06:58Z",
+      "elapsed_ms": 26294,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":26227}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Pong received \u2014 I'm here.\",\"content\":\"Pong received \u2014 I'm here.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52010:main\",\"message_id\":\"1773752818322\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 10,
+      "user_id": "52010"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:00Z",
+      "elapsed_ms": 28206,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":23493}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using shell\",\"tool\":\"shell\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"error\",\"label\":\"shell failed\",\"tool\":\"shell\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":4654}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":1,\"duration_ms\":3}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Shell commands (including `ping`) are blocked by the workspace allowlist policy, so I can't exec\",\"content\":\"Shell commands (including `ping`) are blocked by the workspace allowlist policy, so I can't exec\",\"seq\":0}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"ute network tests from here.\",\"content\":\"ute network tests from here.\",\"seq\":1}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52013:main\",\"message_id\":\"1773752820242\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 13,
+      "user_id": "52013"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:02Z",
+      "elapsed_ms": 30756,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":30672}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":3}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"I'm here and ready.\",\"content\":\"I'm here and ready.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52001:main\",\"message_id\":\"1773752822774\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 1,
+      "user_id": "52001"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:08Z",
+      "elapsed_ms": 36811,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":1}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":36733}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":5}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"System online and ready.\",\"content\":\"System online and ready.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52004:main\",\"message_id\":\"1773752828831\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 4,
+      "user_id": "52004"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:12Z",
+      "elapsed_ms": 40261,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":35367}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using shell\",\"tool\":\"shell\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"error\",\"label\":\"shell failed\",\"tool\":\"shell\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":4838}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":1,\"duration_ms\":6}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Shell commands are blocked by policy; I can't run ping directly.\",\"content\":\"Shell commands are blocked by policy; I can't run ping directly.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52015:main\",\"message_id\":\"1773752832301\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 15,
+      "user_id": "52015"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:13Z",
+      "elapsed_ms": 41858,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":29269}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using shell\",\"tool\":\"shell\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"error\",\"label\":\"shell failed\",\"tool\":\"shell\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":12511}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":1,\"duration_ms\":7}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"Shell exec is blocked by policy\u2014I can't run ping commands.\",\"content\":\"Shell exec is blocked by policy\u2014I can't run ping commands.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52009:main\",\"message_id\":\"1773752833885\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 9,
+      "user_id": "52009"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:14Z",
+      "elapsed_ms": 42398,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":23428}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":7}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"I don't have S2's IP or hostname in my notes\u2014can you tell me what host this refers to?\",\"content\":\"I don't have S2's IP or hostname in my notes\u2014can you tell me what host this refers to?\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52019:main\",\"message_id\":\"1773752834447\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 19,
+      "user_id": "52019"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:14Z",
+      "elapsed_ms": 42732,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":42659}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":7}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"I hear you loud and clear.\",\"content\":\"I hear you loud and clear.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52003:main\",\"message_id\":\"1773752834754\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 3,
+      "user_id": "52003"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:15Z",
+      "elapsed_ms": 43519,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":21003}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":3}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"I cannot run ping commands due to shell access restrictions.\",\"content\":\"I cannot run ping commands due to shell access restrictions.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52020:main\",\"message_id\":\"1773752835568\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 20,
+      "user_id": "52020"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:25Z",
+      "elapsed_ms": 53784,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":43900}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using shell\",\"tool\":\"shell\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"error\",\"label\":\"shell failed\",\"tool\":\"shell\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":9807}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":1,\"duration_ms\":3}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"I need to know what \\\"S2\\\" refers to in your environment \u2014 could you tell me the hostname or IP \",\"content\":\"I need to know what \\\"S2\\\" refers to in your environment \u2014 could you tell me the hostname or IP \",\"seq\":0}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"address?\",\"content\":\"address?\",\"seq\":1}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52005:main\",\"message_id\":\"1773752845806\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 5,
+      "user_id": "52005"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:43Z",
+      "elapsed_ms": 71659,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":11989}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using skill_registry\",\"tool\":\"skill_registry\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"error\",\"label\":\"skill_registry failed\",\"tool\":\"skill_registry\",\"duration_ms\":30012}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":0,\"duration_ms\":1}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":29604}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":1,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"I can't ping S2\u2014shell commands are blocked and the network diagnostic skill isn't available.\",\"content\":\"I can't ping S2\u2014shell commands are blocked and the network diagnostic skill isn't available.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:52011:main\",\"message_id\":\"1773752863693\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 11,
+      "user_id": "52011"
+    },
+    {
+      "start_utc": "2026-03-17T13:06:32Z",
+      "end_utc": "2026-03-17T13:07:47Z",
+      "elapsed_ms": 75213,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":8253}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using skill_registry\",\"tool\":\"skill_registry\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"done\",\"label\":\"skill_registry completed\",\"tool\":\"skill_registry\",\"duration_ms\":15951}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":1,\"duration_ms\":1}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":9965}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using delegate\",\"tool\":\"delegate\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"error\",\"label\":\"delegate failed\",\"tool\":\"delegate\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":2,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":26784}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":2,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":2,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        }
+      ],
+      "scenario": "S2_short_multi_user_burst",
+      "request_index": 18,
+      "user_id": "52018"
+    },
+    {
+      "start_utc": "2026-03-17T13:07:47Z",
+      "end_utc": "2026-03-17T13:08:08Z",
+      "elapsed_ms": 21115,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":8850}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using memory_list\",\"tool\":\"memory_list\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"done\",\"label\":\"memory_list completed\",\"tool\":\"memory_list\",\"duration_ms\":10}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using memory_recall\",\"tool\":\"memory_recall\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"done\",\"label\":\"memory_recall completed\",\"tool\":\"memory_recall\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using memory_recall\",\"tool\":\"memory_recall\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"done\",\"label\":\"memory_recall completed\",\"tool\":\"memory_recall\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":12169}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":1,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"**Strategic Decision:** Prioritize **full onboarding now** over incremental activation.\\n\\n| Appro\",\"content\":\"**Strategic Decision:** Prioritize **full onboarding now** over incremental activation.\\n\\n| Appro\",\"seq\":0}"
+        }
+      ],
+      "scenario": "S3_deep_tool_heavy",
+      "request_index": 1,
+      "user_id": "53001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:08Z",
+      "end_utc": "2026-03-17T13:08:39Z",
+      "elapsed_ms": 30818,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":13440}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using memory_recall\",\"tool\":\"memory_recall\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"done\",\"label\":\"memory_recall completed\",\"tool\":\"memory_recall\",\"duration_ms\":1}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using memory_recall\",\"tool\":\"memory_recall\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"done\",\"label\":\"memory_recall completed\",\"tool\":\"memory_recall\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"start\",\"label\":\"Using memory_recall\",\"tool\":\"memory_recall\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"tool\",\"state\":\"error\",\"label\":\"memory_recall failed\",\"tool\":\"memory_recall\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Reflecting on tool results\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":17292}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":1,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":1,\"duration_ms\":3}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"- **Fix the foundation before building**: Completing onboarding (name, timezone, Telegram link) \",\"content\":\"- **Fix the foundation before building**: Completing onboarding (name, timezone, Telegram link) \",\"seq\":0}"
+        }
+      ],
+      "scenario": "S3_deep_tool_heavy",
+      "request_index": 2,
+      "user_id": "53001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:39Z",
+      "end_utc": "2026-03-17T13:08:47Z",
+      "elapsed_ms": 8400,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":4905}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":3}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"3. Acknowledged.\",\"content\":\"3. Acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:54001:main\",\"message_id\":\"1773752927596\"}"
+        }
+      ],
+      "scenario": "S4_same_session_rapid_input",
+      "request_index": 3,
+      "user_id": "54001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:39Z",
+      "end_utc": "2026-03-17T13:09:20Z",
+      "elapsed_ms": 40972,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":32571}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":7}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"6. Acknowledged.\",\"content\":\"6. Acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:54001:main\",\"message_id\":\"1773752960179\"}"
+        }
+      ],
+      "scenario": "S4_same_session_rapid_input",
+      "request_index": 6,
+      "user_id": "54001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:39Z",
+      "end_utc": "2026-03-17T13:09:25Z",
+      "elapsed_ms": 46694,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":5720}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"8. Acknowledged.\",\"content\":\"8. Acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:54001:main\",\"message_id\":\"1773752965908\"}"
+        }
+      ],
+      "scenario": "S4_same_session_rapid_input",
+      "request_index": 8,
+      "user_id": "54001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:39Z",
+      "end_utc": "2026-03-17T13:09:33Z",
+      "elapsed_ms": 54738,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":8035}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":8}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"9. Acknowledged.\",\"content\":\"9. Acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:54001:main\",\"message_id\":\"1773752973956\"}"
+        }
+      ],
+      "scenario": "S4_same_session_rapid_input",
+      "request_index": 9,
+      "user_id": "54001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:39Z",
+      "end_utc": "2026-03-17T13:09:52Z",
+      "elapsed_ms": 73216,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":1}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":18463}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":7}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"10. Acknowledged.\",\"content\":\"10. Acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:54001:main\",\"message_id\":\"1773752992435\"}"
+        }
+      ],
+      "scenario": "S4_same_session_rapid_input",
+      "request_index": 10,
+      "user_id": "54001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:39Z",
+      "end_utc": "2026-03-17T13:09:55Z",
+      "elapsed_ms": 76241,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":2998}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"5. Acknowledged.\",\"content\":\"5. Acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:54001:main\",\"message_id\":\"1773752995443\"}"
+        }
+      ],
+      "scenario": "S4_same_session_rapid_input",
+      "request_index": 5,
+      "user_id": "54001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:39Z",
+      "end_utc": "2026-03-17T13:09:57Z",
+      "elapsed_ms": 78408,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":2159}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":4}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"4. Acknowledged.\",\"content\":\"4. Acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:54001:main\",\"message_id\":\"1773752997609\"}"
+        }
+      ],
+      "scenario": "S4_same_session_rapid_input",
+      "request_index": 4,
+      "user_id": "54001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:39Z",
+      "end_utc": "2026-03-17T13:10:10Z",
+      "elapsed_ms": 91797,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":13369}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":8}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"2. Acknowledged.\",\"content\":\"2. Acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:54001:main\",\"message_id\":\"1773753010992\"}"
+        }
+      ],
+      "scenario": "S4_same_session_rapid_input",
+      "request_index": 2,
+      "user_id": "54001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:39Z",
+      "end_utc": "2026-03-17T13:10:18Z",
+      "elapsed_ms": 99049,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":7245}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":5}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"1. Acknowledged.\",\"content\":\"1. Acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:54001:main\",\"message_id\":\"1773753018246\"}"
+        }
+      ],
+      "scenario": "S4_same_session_rapid_input",
+      "request_index": 1,
+      "user_id": "54001"
+    },
+    {
+      "start_utc": "2026-03-17T13:08:39Z",
+      "end_utc": "2026-03-17T13:10:22Z",
+      "elapsed_ms": 103046,
+      "ok": true,
+      "reason": "ok",
+      "curl_code": 0,
+      "stderr": "",
+      "events": [
+        {
+          "event": "status",
+          "data": "{\"type\":\"statusResponse\",\"content\":\"Processing request\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Retrieving memory\",\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"start\",\"label\":\"Thinking\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Preparing model request\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Model response received\",\"duration_ms\":3998}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Processing model response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"compose\",\"state\":\"update\",\"label\":\"Composing final response\",\"iteration\":0,\"duration_ms\":0}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"done\",\"label\":\"Response ready\"}"
+        },
+        {
+          "event": "progress",
+          "data": "{\"type\":\"progress\",\"phase\":\"finalize\",\"state\":\"update\",\"label\":\"Finalizing response\",\"iteration\":0,\"duration_ms\":8}"
+        },
+        {
+          "event": "token",
+          "data": "{\"delta\":\"7. Acknowledged.\",\"content\":\"7. Acknowledged.\",\"seq\":0}"
+        },
+        {
+          "event": "done",
+          "data": "{\"type\":\"done\",\"session_id\":\"agent:zaki-bot:user:54001:main\",\"message_id\":\"1773753022258\"}"
+        }
+      ],
+      "scenario": "S4_same_session_rapid_input",
+      "request_index": 7,
+      "user_id": "54001"
+    }
+  ]
+}

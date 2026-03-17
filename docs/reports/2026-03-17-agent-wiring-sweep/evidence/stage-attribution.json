@@ -1,0 +1,574 @@
+{
+  "S1_short_single_user_consecutive": {
+    "counts": {
+      "turn_stage_lines": 950,
+      "message_process": 27,
+      "chat_complete": 25,
+      "llm_response": 68
+    },
+    "stages": {
+      "autosave_assistant": {
+        "n": 48,
+        "median_ms": 5,
+        "p95_ms": 8,
+        "mean_ms": 5.0,
+        "sum_ms": 240
+      },
+      "build_provider_messages": {
+        "n": 138,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "compact_pre_provider": {
+        "n": 98,
+        "median_ms": 0,
+        "p95_ms": 37647,
+        "mean_ms": 3627.6,
+        "sum_ms": 355502
+      },
+      "compact_trim": {
+        "n": 48,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "compose_final_reply": {
+        "n": 96,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "dispatch_tools": {
+        "n": 20,
+        "median_ms": 0,
+        "p95_ms": 519,
+        "mean_ms": 513.9,
+        "sum_ms": 10278
+      },
+      "drain_outbox": {
+        "n": 48,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "finalize_no_tools": {
+        "n": 96,
+        "median_ms": 6,
+        "p95_ms": 8,
+        "mean_ms": 5.3,
+        "sum_ms": 506
+      },
+      "memory_enrich": {
+        "n": 98,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "parse_provider_response": {
+        "n": 136,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 2
+      },
+      "session_lock_wait": {
+        "n": 16,
+        "median_ms": 10996,
+        "p95_ms": 78562,
+        "mean_ms": 25577.5,
+        "sum_ms": 409240
+      },
+      "tool_reflection": {
+        "n": 40,
+        "median_ms": 0,
+        "p95_ms": 1,
+        "mean_ms": 0.1,
+        "sum_ms": 6
+      },
+      "trim_history_after_tools": {
+        "n": 20,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "tts_prepare": {
+        "n": 48,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      }
+    },
+    "llm_response": {
+      "n": 68,
+      "median_ms": 7006,
+      "p95_ms": 28450,
+      "mean_ms": 10422.3,
+      "min_ms": 2871,
+      "max_ms": 38866
+    },
+    "message_process_total": {
+      "n": 27,
+      "median_ms": 10126,
+      "p95_ms": 124353,
+      "mean_ms": 32736.2,
+      "min_ms": 2883,
+      "max_ms": 132387
+    },
+    "chat_complete_total": {
+      "n": 25,
+      "median_ms": 9905,
+      "p95_ms": 95599,
+      "mean_ms": 25513.8,
+      "min_ms": 2887,
+      "max_ms": 132389
+    },
+    "stage_share_of_agent_ms": {
+      "parse_provider_response": 0.0,
+      "dispatch_tools": 2.17,
+      "tool_reflection": 0.0,
+      "trim_history_after_tools": 0.0,
+      "build_provider_messages": 0.0,
+      "compose_final_reply": 0.0,
+      "tts_prepare": 0.0,
+      "compact_trim": 0.0,
+      "autosave_assistant": 0.05,
+      "drain_outbox": 0.0,
+      "finalize_no_tools": 0.11,
+      "session_lock_wait": 86.23,
+      "memory_enrich": 0.0,
+      "compact_pre_provider": 74.91,
+      "_agent_total_ms_sum": 474578
+    }
+  },
+  "S2_short_multi_user_burst": {
+    "counts": {
+      "turn_stage_lines": 449,
+      "message_process": 19,
+      "chat_complete": 19,
+      "llm_response": 33
+    },
+    "stages": {
+      "autosave_assistant": {
+        "n": 23,
+        "median_ms": 5,
+        "p95_ms": 8,
+        "mean_ms": 5.0,
+        "sum_ms": 115
+      },
+      "build_provider_messages": {
+        "n": 66,
+        "median_ms": 0,
+        "p95_ms": 1,
+        "mean_ms": 0.1,
+        "sum_ms": 6
+      },
+      "compact_pre_provider": {
+        "n": 46,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "compact_trim": {
+        "n": 23,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "compose_final_reply": {
+        "n": 46,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "dispatch_tools": {
+        "n": 10,
+        "median_ms": 0,
+        "p95_ms": 23685,
+        "mean_ms": 4597.3,
+        "sum_ms": 45973
+      },
+      "drain_outbox": {
+        "n": 23,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "finalize_no_tools": {
+        "n": 46,
+        "median_ms": 5,
+        "p95_ms": 8,
+        "mean_ms": 5.2,
+        "sum_ms": 238
+      },
+      "memory_enrich": {
+        "n": 46,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "parse_provider_response": {
+        "n": 66,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "session_lock_wait": {
+        "n": 1,
+        "median_ms": 9475,
+        "p95_ms": 9475,
+        "mean_ms": 9475.0,
+        "sum_ms": 9475
+      },
+      "tool_reflection": {
+        "n": 20,
+        "median_ms": 0,
+        "p95_ms": 1,
+        "mean_ms": 0.2,
+        "sum_ms": 4
+      },
+      "trim_history_after_tools": {
+        "n": 10,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "tts_prepare": {
+        "n": 23,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      }
+    },
+    "llm_response": {
+      "n": 33,
+      "median_ms": 21003,
+      "p95_ms": 43155,
+      "mean_ms": 20395.1,
+      "min_ms": 4576,
+      "max_ms": 51862
+    },
+    "message_process_total": {
+      "n": 19,
+      "median_ms": 24660,
+      "p95_ms": 55516,
+      "mean_ms": 28684.7,
+      "min_ms": 6241,
+      "max_ms": 71616
+    },
+    "chat_complete_total": {
+      "n": 19,
+      "median_ms": 24668,
+      "p95_ms": 55525,
+      "mean_ms": 28693.5,
+      "min_ms": 6246,
+      "max_ms": 71623
+    },
+    "stage_share_of_agent_ms": {
+      "parse_provider_response": 0.0,
+      "compose_final_reply": 0.0,
+      "tts_prepare": 0.0,
+      "compact_trim": 0.0,
+      "autosave_assistant": 0.02,
+      "drain_outbox": 0.0,
+      "finalize_no_tools": 0.04,
+      "memory_enrich": 0.0,
+      "compact_pre_provider": 0.0,
+      "build_provider_messages": 0.0,
+      "dispatch_tools": 8.44,
+      "tool_reflection": 0.0,
+      "trim_history_after_tools": 0.0,
+      "session_lock_wait": 1.74,
+      "_agent_total_ms_sum": 544967
+    }
+  },
+  "S3_deep_tool_heavy": {
+    "counts": {
+      "turn_stage_lines": 184,
+      "message_process": 1,
+      "chat_complete": 1,
+      "llm_response": 12
+    },
+    "stages": {
+      "autosave_assistant": {
+        "n": 10,
+        "median_ms": 5,
+        "p95_ms": 7,
+        "mean_ms": 5.1,
+        "sum_ms": 51
+      },
+      "build_provider_messages": {
+        "n": 24,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "compact_pre_provider": {
+        "n": 20,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "compact_trim": {
+        "n": 10,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "compose_final_reply": {
+        "n": 20,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "dispatch_tools": {
+        "n": 2,
+        "median_ms": 6,
+        "p95_ms": 10,
+        "mean_ms": 6.0,
+        "sum_ms": 12
+      },
+      "drain_outbox": {
+        "n": 10,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "finalize_no_tools": {
+        "n": 20,
+        "median_ms": 5,
+        "p95_ms": 8,
+        "mean_ms": 5.3,
+        "sum_ms": 106
+      },
+      "memory_enrich": {
+        "n": 20,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "parse_provider_response": {
+        "n": 24,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "session_lock_wait": {
+        "n": 8,
+        "median_ms": 52166,
+        "p95_ms": 63012,
+        "mean_ms": 50641.6,
+        "sum_ms": 405133
+      },
+      "tool_reflection": {
+        "n": 4,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "trim_history_after_tools": {
+        "n": 2,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "tts_prepare": {
+        "n": 10,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      }
+    },
+    "llm_response": {
+      "n": 12,
+      "median_ms": 5862,
+      "p95_ms": 26148,
+      "mean_ms": 9655.3,
+      "min_ms": 2922,
+      "max_ms": 26784
+    },
+    "message_process_total": {
+      "n": 1,
+      "median_ms": 21042,
+      "p95_ms": 21042,
+      "mean_ms": 21042.0,
+      "min_ms": 21042,
+      "max_ms": 21042
+    },
+    "chat_complete_total": {
+      "n": 1,
+      "median_ms": 21049,
+      "p95_ms": 21049,
+      "mean_ms": 21049.0,
+      "min_ms": 21049,
+      "max_ms": 21049
+    },
+    "stage_share_of_agent_ms": {
+      "parse_provider_response": 0.0,
+      "compose_final_reply": 0.0,
+      "tts_prepare": 0.0,
+      "compact_trim": 0.0,
+      "autosave_assistant": 0.24,
+      "drain_outbox": 0.0,
+      "finalize_no_tools": 0.5,
+      "memory_enrich": 0.0,
+      "compact_pre_provider": 0.0,
+      "build_provider_messages": 0.0,
+      "dispatch_tools": 0.06,
+      "tool_reflection": 0.0,
+      "trim_history_after_tools": 0.0,
+      "session_lock_wait": 1925.54,
+      "_agent_total_ms_sum": 21040
+    }
+  },
+  "S4_same_session_rapid_input": {
+    "counts": {
+      "turn_stage_lines": 180,
+      "message_process": 10,
+      "chat_complete": 10,
+      "llm_response": 11
+    },
+    "stages": {
+      "autosave_assistant": {
+        "n": 11,
+        "median_ms": 5,
+        "p95_ms": 8,
+        "mean_ms": 5.4,
+        "sum_ms": 59
+      },
+      "build_provider_messages": {
+        "n": 20,
+        "median_ms": 0,
+        "p95_ms": 1,
+        "mean_ms": 0.1,
+        "sum_ms": 2
+      },
+      "compact_pre_provider": {
+        "n": 20,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "compact_trim": {
+        "n": 11,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "compose_final_reply": {
+        "n": 22,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "drain_outbox": {
+        "n": 11,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "finalize_no_tools": {
+        "n": 22,
+        "median_ms": 5,
+        "p95_ms": 8,
+        "mean_ms": 5.5,
+        "sum_ms": 120
+      },
+      "memory_enrich": {
+        "n": 20,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "parse_provider_response": {
+        "n": 22,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      },
+      "session_lock_wait": {
+        "n": 10,
+        "median_ms": 63944,
+        "p95_ms": 95724,
+        "mean_ms": 57252.9,
+        "sum_ms": 572529
+      },
+      "tts_prepare": {
+        "n": 11,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "mean_ms": 0.0,
+        "sum_ms": 0
+      }
+    },
+    "llm_response": {
+      "n": 11,
+      "median_ms": 7245,
+      "p95_ms": 25517,
+      "mean_ms": 10850.2,
+      "min_ms": 2159,
+      "max_ms": 32571
+    },
+    "message_process_total": {
+      "n": 10,
+      "median_ms": 71978,
+      "p95_ms": 95726,
+      "mean_ms": 63987.4,
+      "min_ms": 8351,
+      "max_ms": 98989
+    },
+    "chat_complete_total": {
+      "n": 10,
+      "median_ms": 71992,
+      "p95_ms": 95739,
+      "mean_ms": 63997.0,
+      "min_ms": 8354,
+      "max_ms": 99004
+    },
+    "stage_share_of_agent_ms": {
+      "parse_provider_response": 0.0,
+      "compose_final_reply": 0.0,
+      "tts_prepare": 0.0,
+      "compact_trim": 0.0,
+      "autosave_assistant": 0.06,
+      "drain_outbox": 0.0,
+      "finalize_no_tools": 0.12,
+      "session_lock_wait": 560.51,
+      "memory_enrich": 0.0,
+      "compact_pre_provider": 0.0,
+      "build_provider_messages": 0.0,
+      "_agent_total_ms_sum": 102145
+    }
+  }
+}

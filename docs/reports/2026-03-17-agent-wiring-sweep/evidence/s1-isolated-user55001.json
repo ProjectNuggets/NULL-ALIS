@@ -1,0 +1,121 @@
+{
+  "run_started_utc": "2026-03-17T13:18:23.928862Z",
+  "run_finished_utc": "2026-03-17T13:19:12.413248Z",
+  "user_id": "55001",
+  "summary": {
+    "count": 10,
+    "ok": 10,
+    "errors": 0,
+    "latency_ms": {
+      "min": 2114,
+      "p50": 3391,
+      "p95": 11136,
+      "max": 15439,
+      "mean": 4642.9
+    },
+    "tool_calls_total": 1
+  },
+  "results": [
+    {
+      "idx": 1,
+      "elapsed_ms": 15439,
+      "curl_code": 0,
+      "model_durations_ms": [
+        8965,
+        6401
+      ],
+      "tool_calls": 1,
+      "ok": true
+    },
+    {
+      "idx": 2,
+      "elapsed_ms": 3463,
+      "curl_code": 0,
+      "model_durations_ms": [
+        3398
+      ],
+      "tool_calls": 0,
+      "ok": true
+    },
+    {
+      "idx": 3,
+      "elapsed_ms": 2589,
+      "curl_code": 0,
+      "model_durations_ms": [
+        2550
+      ],
+      "tool_calls": 0,
+      "ok": true
+    },
+    {
+      "idx": 4,
+      "elapsed_ms": 2614,
+      "curl_code": 0,
+      "model_durations_ms": [
+        2533
+      ],
+      "tool_calls": 0,
+      "ok": true
+    },
+    {
+      "idx": 5,
+      "elapsed_ms": 4088,
+      "curl_code": 0,
+      "model_durations_ms": [
+        3985
+      ],
+      "tool_calls": 0,
+      "ok": true
+    },
+    {
+      "idx": 6,
+      "elapsed_ms": 4086,
+      "curl_code": 0,
+      "model_durations_ms": [
+        4023
+      ],
+      "tool_calls": 0,
+      "ok": true
+    },
+    {
+      "idx": 7,
+      "elapsed_ms": 5877,
+      "curl_code": 0,
+      "model_durations_ms": [
+        5784
+      ],
+      "tool_calls": 0,
+      "ok": true
+    },
+    {
+      "idx": 8,
+      "elapsed_ms": 2840,
+      "curl_code": 0,
+      "model_durations_ms": [
+        2780
+      ],
+      "tool_calls": 0,
+      "ok": true
+    },
+    {
+      "idx": 9,
+      "elapsed_ms": 2114,
+      "curl_code": 0,
+      "model_durations_ms": [
+        2067
+      ],
+      "tool_calls": 0,
+      "ok": true
+    },
+    {
+      "idx": 10,
+      "elapsed_ms": 3319,
+      "curl_code": 0,
+      "model_durations_ms": [
+        3249
+      ],
+      "tool_calls": 0,
+      "ok": true
+    }
+  ]
+}

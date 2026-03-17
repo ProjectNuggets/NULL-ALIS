@@ -1,0 +1,30 @@
+{
+  "S1_short_single_user_consecutive": {
+    "n": 16,
+    "p50_ms": 10996,
+    "p95_ms": 78562,
+    "max_ms": 110334,
+    "mean_ms": 25577.5
+  },
+  "S2_short_multi_user_burst": {
+    "n": 0,
+    "p50_ms": null,
+    "p95_ms": null,
+    "max_ms": null,
+    "mean_ms": null
+  },
+  "S3_deep_tool_heavy": {
+    "n": 0,
+    "p50_ms": null,
+    "p95_ms": null,
+    "max_ms": null,
+    "mean_ms": null
+  },
+  "S4_same_session_rapid_input": {
+    "n": 10,
+    "p50_ms": 63944,
+    "p95_ms": 95724,
+    "max_ms": 98988,
+    "mean_ms": 57252.9
+  }
+}
