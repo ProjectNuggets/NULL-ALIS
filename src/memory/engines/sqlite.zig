@@ -602,13 +602,21 @@ pub const SqliteMemory = struct {
 
         if (fts_query.items.len == 0) return allocator.alloc(MemoryEntry, 0);
 
-        const sql =
+        const sql_unscoped =
             "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id " ++
             "FROM memories_fts f " ++
             "JOIN memories m ON m.rowid = f.rowid " ++
             "WHERE memories_fts MATCH ?1 " ++
             "ORDER BY score " ++
             "LIMIT ?2";
+        const sql_scoped =
+            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id " ++
+            "FROM memories_fts f " ++
+            "JOIN memories m ON m.rowid = f.rowid " ++
+            "WHERE memories_fts MATCH ?1 AND m.session_id = ?2 " ++
+            "ORDER BY score " ++
+            "LIMIT ?3";
+        const sql = if (session_id != null) sql_scoped else sql_unscoped;
 
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
@@ -619,7 +627,12 @@ pub const SqliteMemory = struct {
         try fts_query.append(allocator, 0);
         const fts_z = fts_query.items[0 .. fts_query.items.len - 1];
         _ = c.sqlite3_bind_text(stmt, 1, fts_z.ptr, @intCast(fts_z.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+        if (session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int64(stmt, 3, @intCast(limit));
+        } else {
+            _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+        }
 
         var entries: std.ArrayList(MemoryEntry) = .empty;
         errdefer {
@@ -633,13 +646,6 @@ pub const SqliteMemory = struct {
                 const score_raw = c.sqlite3_column_double(stmt.?, 5);
                 var entry = try readEntryFromRowWithSessionCol(stmt.?, allocator, 6);
                 entry.score = -score_raw; // BM25 returns negative (lower = better)
-                // Filter by session_id if requested
-                if (session_id) |sid| {
-                    if (entry.session_id == null or !std.mem.eql(u8, entry.session_id.?, sid)) {
-                        entry.deinit(allocator);
-                        continue;
-                    }
-                }
                 try entries.append(allocator, entry);
             } else break;
         }
@@ -672,8 +678,19 @@ pub const SqliteMemory = struct {
             try sql_buf.appendSlice(allocator, " ESCAPE '\\')");
         }
 
+        const session_param_index: ?usize = if (session_id != null) keywords.items.len * 2 + 1 else null;
+        const limit_param_index: usize = if (session_param_index != null)
+            keywords.items.len * 2 + 2
+        else
+            keywords.items.len * 2 + 1;
+
+        if (session_param_index) |param_idx| {
+            try sql_buf.appendSlice(allocator, " AND session_id = ?");
+            try appendInt(&sql_buf, allocator, param_idx);
+        }
+
         try sql_buf.appendSlice(allocator, " ORDER BY updated_at DESC LIMIT ?");
-        try appendInt(&sql_buf, allocator, keywords.items.len * 2 + 1);
+        try appendInt(&sql_buf, allocator, limit_param_index);
         try sql_buf.append(allocator, 0);
 
         var stmt: ?*c.sqlite3_stmt = null;
@@ -693,7 +710,11 @@ pub const SqliteMemory = struct {
             _ = c.sqlite3_bind_text(stmt, @intCast(i * 2 + 1), like.ptr, @intCast(like.len), SQLITE_STATIC);
             _ = c.sqlite3_bind_text(stmt, @intCast(i * 2 + 2), like.ptr, @intCast(like.len), SQLITE_STATIC);
         }
-        _ = c.sqlite3_bind_int64(stmt, @intCast(keywords.items.len * 2 + 1), @intCast(limit));
+        if (session_param_index) |param_idx| {
+            const sid = session_id.?;
+            _ = c.sqlite3_bind_text(stmt, @intCast(param_idx), sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        }
+        _ = c.sqlite3_bind_int64(stmt, @intCast(limit_param_index), @intCast(limit));
 
         var entries: std.ArrayList(MemoryEntry) = .empty;
         errdefer {
@@ -706,13 +727,6 @@ pub const SqliteMemory = struct {
             if (rc == c.SQLITE_ROW) {
                 var entry = try readEntryFromRow(stmt.?, allocator);
                 entry.score = 1.0;
-                // Filter by session_id if requested
-                if (session_id) |sid| {
-                    if (entry.session_id == null or !std.mem.eql(u8, entry.session_id.?, sid)) {
-                        entry.deinit(allocator);
-                        continue;
-                    }
-                }
                 try entries.append(allocator, entry);
             } else break;
         }
@@ -1536,6 +1550,52 @@ test "sqlite recall with session_id filters correctly" {
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("k1", results[0].key);
+    try std.testing.expect(results[0].session_id != null);
+    try std.testing.expectEqualStrings("sess-a", results[0].session_id.?);
+}
+
+test "sqlite likeSearch applies session filter before limit" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("sess_target", "needle", .core, "sess-a");
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const key = try std.fmt.allocPrint(std.testing.allocator, "global_{d}", .{i});
+        defer std.testing.allocator.free(key);
+        try m.store(key, "needle", .core, null);
+    }
+
+    const results = try mem.likeSearch(std.testing.allocator, "needle", 3, "sess-a");
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("sess_target", results[0].key);
+    try std.testing.expect(results[0].session_id != null);
+    try std.testing.expectEqualStrings("sess-a", results[0].session_id.?);
+}
+
+test "sqlite fts5Search applies session filter before limit" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("sess_target", "needle", .core, "sess-a");
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const key = try std.fmt.allocPrint(std.testing.allocator, "global_fts_{d}", .{i});
+        defer std.testing.allocator.free(key);
+        try m.store(key, "needle needle needle needle", .core, null);
+    }
+
+    const results = try mem.fts5Search(std.testing.allocator, "needle", 3, "sess-a");
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("sess_target", results[0].key);
     try std.testing.expect(results[0].session_id != null);
     try std.testing.expectEqualStrings("sess-a", results[0].session_id.?);
 }

@@ -174,7 +174,7 @@ fn purgeOldArchives(allocator: std.mem.Allocator, config: HygieneConfig) !u64 {
 }
 
 /// Prune conversation rows older than retention_days via the Memory interface.
-/// Searches for conversation-tagged entries and deletes those whose timestamp is old.
+/// Lists conversation-category entries and deletes those whose parsed timestamp is old.
 pub fn pruneConversationRows(allocator: std.mem.Allocator, mem: Memory, retention_days: u32) !u64 {
     // Markdown backend has append-only files and forget() is a no-op,
     // so conversation pruning via search/forget is not applicable.
@@ -182,17 +182,13 @@ pub fn pruneConversationRows(allocator: std.mem.Allocator, mem: Memory, retentio
 
     const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(retention_days)) * 24 * 60 * 60;
 
-    // Search for conversation-tagged entries
-    const results = mem.search(allocator, "conversation", 1000) catch return 0;
-    defer {
-        for (results) |r| r.deinit(allocator);
-        allocator.free(results);
-    }
-    if (results.len == 0) return 0;
+    // Pull by category, not keyword. Keyword search misses many autosave entries.
+    const entries = mem.list(allocator, .conversation, null) catch return 0;
+    defer root.freeEntries(allocator, entries);
+    if (entries.len == 0) return 0;
 
     var pruned: u64 = 0;
-    for (results) |entry| {
-        // Parse timestamp from entry key (format: "conv_<timestamp>_<id>")
+    for (entries) |entry| {
         const ts = parseConversationTimestamp(entry.key) orelse continue;
         if (ts < cutoff_secs) {
             _ = mem.forget(entry.key) catch continue;
@@ -203,12 +199,39 @@ pub fn pruneConversationRows(allocator: std.mem.Allocator, mem: Memory, retentio
     return pruned;
 }
 
-/// Parse a unix timestamp from a conversation key like "conv_1234567890_abc".
+/// Parse a unix timestamp from known conversation key formats:
+/// - conv_<seconds>[_...]
+/// - autosave_user_<nanoseconds>
+/// - autosave_assistant_<nanoseconds>
 fn parseConversationTimestamp(key: []const u8) ?i64 {
-    if (!std.mem.startsWith(u8, key, "conv_")) return null;
-    const after_prefix = key[5..];
-    const underscore_pos = std.mem.indexOfScalar(u8, after_prefix, '_') orelse after_prefix.len;
-    return std.fmt.parseInt(i64, after_prefix[0..underscore_pos], 10) catch null;
+    if (std.mem.startsWith(u8, key, "conv_")) {
+        const after_prefix = key[5..];
+        const underscore_pos = std.mem.indexOfScalar(u8, after_prefix, '_') orelse after_prefix.len;
+        return std.fmt.parseInt(i64, after_prefix[0..underscore_pos], 10) catch null;
+    }
+
+    if (std.mem.startsWith(u8, key, "autosave_user_")) {
+        return parseAutosaveTimestamp(key["autosave_user_".len..]);
+    }
+
+    if (std.mem.startsWith(u8, key, "autosave_assistant_")) {
+        return parseAutosaveTimestamp(key["autosave_assistant_".len..]);
+    }
+
+    return null;
+}
+
+fn parseAutosaveTimestamp(raw_suffix: []const u8) ?i64 {
+    // autosave keys use nanoTimestamp in modern paths; older tests/data may use
+    // plain second-like values. Accept both.
+    const raw = std.fmt.parseInt(u128, raw_suffix, 10) catch return null;
+    if (raw > 10_000_000_000_000) {
+        const secs_u128 = raw / std.time.ns_per_s;
+        if (secs_u128 > std.math.maxInt(i64)) return null;
+        return @intCast(secs_u128);
+    }
+    if (raw > std.math.maxInt(i64)) return null;
+    return @intCast(raw);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -359,4 +382,39 @@ test "R3: parseConversationTimestamp key with only prefix" {
 test "R3: parseConversationTimestamp key without trailing id" {
     const ts = parseConversationTimestamp("conv_1700000000");
     try std.testing.expectEqual(@as(i64, 1700000000), ts.?);
+}
+
+test "parseConversationTimestamp parses autosave nanoseconds" {
+    const ts = parseConversationTimestamp("autosave_user_1700000000000000000");
+    try std.testing.expectEqual(@as(i64, 1700000000), ts.?);
+}
+
+test "parseConversationTimestamp parses autosave low value as seconds" {
+    const ts = parseConversationTimestamp("autosave_assistant_1000");
+    try std.testing.expectEqual(@as(i64, 1000), ts.?);
+}
+
+test "R3: pruneConversationRows removes old autosave conversation entries in sqlite" {
+    if (!build_options.enable_sqlite) return;
+
+    var mem_impl = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    try mem.store("autosave_user_1000", "old turn", .conversation, null);
+    try mem.store("autosave_user_9999999999999999999", "new turn", .conversation, null);
+    try mem.store("core_keep", "stable fact", .core, null);
+
+    const pruned = try pruneConversationRows(std.testing.allocator, mem, 30);
+    try std.testing.expectEqual(@as(u64, 1), pruned);
+
+    try std.testing.expect((try mem.get(std.testing.allocator, "autosave_user_1000")) == null);
+
+    const new_turn_entry = try mem.get(std.testing.allocator, "autosave_user_9999999999999999999");
+    defer if (new_turn_entry) |entry| entry.deinit(std.testing.allocator);
+    try std.testing.expect(new_turn_entry != null);
+
+    const core_keep_entry = try mem.get(std.testing.allocator, "core_keep");
+    defer if (core_keep_entry) |entry| entry.deinit(std.testing.allocator);
+    try std.testing.expect(core_keep_entry != null);
 }
