@@ -76,6 +76,12 @@ spec:
                     }
                   }
                 },
+                "agent": {
+                  "queue_mode": "serial",
+                  "queue_cap": 12,
+                  "queue_drop": "summarize",
+                  "max_history_messages": 50
+                },
                 "gateway": {
                   "port": ${GATEWAY_PORT},
                   "host": "${GATEWAY_HOST}",

@@ -38,6 +38,7 @@ It includes:
 - `15-pgbouncer-pdb.yaml`
 - `kustomization.yaml`
 - `smoke.sh`
+- `collect-runtime-evidence.sh`
 - `stickiness-probe.sh`
 - `restore-drill.sh`
 - `ZAKI_BACKEND_HANDOFF.md`
@@ -50,6 +51,7 @@ It includes:
 - State backend: `postgres` (via runtime env wiring)
 - Postgres connection routing: PgBouncer-enabled by default (`POSTGRES_USE_PGBOUNCER=true`)
 - Composio: configurable via env (`COMPOSIO_ENABLED` + `COMPOSIO_API_KEY`)
+- Beta queue default: `queue_mode=serial`, `queue_cap=12`, `queue_drop=summarize`
 
 ## Production profile (moderate workload)
 Recommended baseline for production:
@@ -188,7 +190,15 @@ SAMPLES=30 \
 Expected result:
 1. `PASS` with one observed `instance_id`.
 
-5. Run restore drill for sampled users.
+5. Collect runtime evidence after a restart or interrupted stream.
+```bash
+NAMESPACE=zaki-bot-staging \
+./deploy/k8s/zaki-bot/collect-runtime-evidence.sh
+```
+Expected result:
+1. per-pod restart counts, last termination state, describe output, and filtered logs under `_artifacts/runtime-evidence/`
+
+6. Run restore drill for sampled users.
 ```bash
 NAMESPACE=zaki-bot-staging \
 LITESTREAM_S3_BUCKET=... \
@@ -202,6 +212,7 @@ USER_IDS=test-user-1,test-user-2 \
 - `preStop` calls `/internal/drain` then `/internal/shutdown`.
 - Readiness returns `503` while draining.
 - Gateway exits after in-flight requests finish.
+- `collect-runtime-evidence.sh` captures pod restart count, last termination state, and filtered gateway logs for crash-vs-restart triage.
 
 2. Consistent user routing is enabled at ingress.
 - Hash key: `X-Zaki-User-Id` for app traffic.

@@ -65,6 +65,11 @@ pub const Session = struct {
     }
 };
 
+const QueueSnapshot = struct {
+    waiting: u32,
+    summarize_pending_count: u32,
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SessionManager
 // ═══════════════════════════════════════════════════════════════════════════
@@ -305,6 +310,15 @@ pub const SessionManager = struct {
         std.Thread.sleep(ns);
     }
 
+    fn queueSnapshot(session: *Session) QueueSnapshot {
+        session.queue_mutex.lock();
+        defer session.queue_mutex.unlock();
+        return .{
+            .waiting = session.queue_waiting,
+            .summarize_pending_count = session.queue_summarize_pending_count,
+        };
+    }
+
     fn takeQueueSummaryPrefix(self: *SessionManager, session: *Session) !?[]u8 {
         session.queue_mutex.lock();
         const pending = session.queue_summarize_pending_count;
@@ -473,7 +487,17 @@ pub const SessionManager = struct {
             } };
             session.agent.observer.recordEvent(&lock_wait_event);
             if (lock_wait_ms >= SESSION_LOCK_WAIT_WARN_MS) {
-                log.warn("session.lock_wait session={s} wait_ms={d}", .{ session_key, lock_wait_ms });
+                const queue_snapshot = queueSnapshot(session);
+                const queue_waiters = if (waiter_registered and queue_snapshot.waiting > 0)
+                    queue_snapshot.waiting - 1
+                else
+                    queue_snapshot.waiting;
+                log.warn("session.lock_wait session={s} wait_ms={d} queue_mode={s} queue_waiters={d}", .{
+                    session_key,
+                    lock_wait_ms,
+                    session.agent.queue_mode.toSlice(),
+                    queue_waiters,
+                });
             }
         }
 
@@ -505,8 +529,17 @@ pub const SessionManager = struct {
         }
         const persist_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - persist_start_ms));
         const total_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - total_start_ms));
-        log.info("message.process session={s} agent_ms={d} persist_ms={d} total_ms={d}", .{
+        const queue_snapshot = queueSnapshot(session);
+        const queue_waiters = if (waiter_registered and queue_snapshot.waiting > 0)
+            queue_snapshot.waiting - 1
+        else
+            queue_snapshot.waiting;
+        log.info("message.process session={s} queue_mode={s} queue_wait_ms={d} queue_waiters={d} queue_summarize_pending={d} agent_ms={d} persist_ms={d} total_ms={d}", .{
             session_key,
+            session.agent.queue_mode.toSlice(),
+            lock_wait_ms,
+            queue_waiters,
+            queue_snapshot.summarize_pending_count,
             agent_duration_ms,
             persist_duration_ms,
             total_duration_ms,

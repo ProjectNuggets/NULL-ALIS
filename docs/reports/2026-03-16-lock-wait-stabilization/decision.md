@@ -1,5 +1,9 @@
 # Lock-Wait Stabilization Decision
 
+Status: historical snapshot, not the full current runtime decision
+
+This document remains useful for lock-wait tuning evidence, but it does not cover the newer runtime crash signatures and should not be treated as the canonical current stability decision.
+
 Date: 2026-03-16  
 Branch: `v0.7-open-beta-hardening`
 
