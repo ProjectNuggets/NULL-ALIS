@@ -12,7 +12,7 @@ on:
       namespace:
         description: "Target Kubernetes namespace"
         required: false
-        default: "zaki"
+        default: "zaki-bot-staging"
       deployment:
         description: "Target Nullalis deployment name"
         required: false
@@ -80,7 +80,7 @@ jobs:
         env:
           DISPATCH_TOKEN: ${{ secrets.ZAKI_PROD_REPO_DISPATCH_TOKEN }}
           CLUSTER: ${{ github.event.inputs.cluster || 'zaki-prod' }}
-          NAMESPACE: ${{ github.event.inputs.namespace || 'zaki' }}
+          NAMESPACE: ${{ github.event.inputs.namespace || 'zaki-bot-staging' }}
           DEPLOYMENT: ${{ github.event.inputs.deployment || 'nullclaw' }}
           CONTAINER: ${{ github.event.inputs.container || 'nullclaw' }}
           IMAGE_REF: ${{ steps.image.outputs.sha_tag }}
