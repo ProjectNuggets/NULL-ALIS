@@ -263,7 +263,7 @@ Current status: **ready for staging integration and production rollout after env
 ## ARM Linux image build
 Validated binary cross-build command:
 ```bash
-zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall
+zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres
 ```
 
 Build/push ARM64 runtime image:

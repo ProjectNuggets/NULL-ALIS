@@ -208,11 +208,20 @@ fn countBindingsForAccount(
     return count;
 }
 
-test "runTelegramBackfill flags conflicting candidate users as ambiguous" {
-    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.PostgresNotEnabled => return error.SkipZigTest,
-        else => return err,
+fn initTestStateManager() !zaki_state.Manager {
+    return zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| {
+        const err_name = @errorName(err);
+        if (std.mem.eql(u8, err_name, "PostgresNotEnabled") or
+            std.mem.eql(u8, err_name, "MissingConnectionString"))
+        {
+            return error.SkipZigTest;
+        }
+        return err;
     };
+}
+
+test "runTelegramBackfill flags conflicting candidate users as ambiguous" {
+    var mgr = try initTestStateManager();
     defer mgr.deinit();
 
     const account_id = "bf-ambiguous-conflict";
@@ -227,10 +236,7 @@ test "runTelegramBackfill flags conflicting candidate users as ambiguous" {
 }
 
 test "runTelegramBackfill flags existing binding conflict as ambiguous" {
-    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.PostgresNotEnabled => return error.SkipZigTest,
-        else => return err,
-    };
+    var mgr = try initTestStateManager();
     defer mgr.deinit();
 
     const account_id = "bf-existing-binding-conflict";
@@ -271,10 +277,7 @@ test "runTelegramBackfill flags existing binding conflict as ambiguous" {
 }
 
 test "runTelegramBackfill remains idempotent for migrated bindings" {
-    var mgr = zaki_state.Manager.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.PostgresNotEnabled => return error.SkipZigTest,
-        else => return err,
-    };
+    var mgr = try initTestStateManager();
     defer mgr.deinit();
 
     const account_id = "bf-idempotent";

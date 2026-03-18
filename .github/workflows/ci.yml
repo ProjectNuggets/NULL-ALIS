@@ -78,3 +78,26 @@ jobs:
         with:
           name: nullalis-${{ matrix.target }}
           path: zig-out/bin/nullalis${{ runner.os == 'Windows' && '.exe' || '' }}
+
+  canonical-production-profile:
+    name: Canonical Profile (linux-x86_64, postgres)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install Postgres headers/libs
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Run tests (canonical production engines)
+        run: zig build test --summary all -Dengines=base,sqlite,postgres
+
+      - name: Build ReleaseSmall (canonical production engines)
+        run: zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres

@@ -8,10 +8,11 @@ HOST="127.0.0.1"
 PORT="3000"
 PROFILE="ops"
 RAW=0
+REPLACE=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/gateway-clean.sh [--host HOST] [--port PORT] [--profile ops|debug] [--raw]
+Usage: scripts/gateway-clean.sh [--host HOST] [--port PORT] [--profile ops|debug] [--raw] [--replace]
 
 Profiles:
   ops    High-signal runtime lines only (default)
@@ -38,6 +39,10 @@ while [[ $# -gt 0 ]]; do
       RAW=1
       shift
       ;;
+    --replace)
+      REPLACE=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -49,6 +54,26 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$REPLACE" -eq 1 ]]; then
+  if command -v lsof >/dev/null 2>&1; then
+    found=0
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+      if [[ "$cmd" == *"nullalis gateway"* ]]; then
+        found=1
+        echo "gateway-clean: stopping existing gateway pid=$pid on :$PORT" >&2
+        kill "$pid" 2>/dev/null || true
+      fi
+    done < <(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+    if [[ "$found" -eq 1 ]]; then
+      sleep 0.5
+    fi
+  else
+    echo "gateway-clean: --replace requested but lsof not found; skipping pre-stop" >&2
+  fi
+fi
 
 if [[ "$RAW" -eq 1 ]]; then
   exec ./zig-out/bin/nullalis gateway --host "$HOST" --port "$PORT"

@@ -80,6 +80,11 @@ pub const SessionConfig = config_types.SessionConfig;
 // ── Top-level Config ────────────────────────────────────────────
 
 pub const Config = struct {
+    const ResolvedConfigPaths = struct {
+        config_path: []const u8,
+        config_dir: []const u8,
+        workspace_dir: []const u8,
+    };
     // Computed paths (not serialized)
     workspace_dir: []const u8,
     config_path: []const u8,
@@ -215,20 +220,18 @@ pub const Config = struct {
         const allocator = arena_ptr.allocator();
 
         const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
-
-        const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullalis" });
-        const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
-        const workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+        const config_path_override = std.process.getEnvVarOwned(allocator, "NULLALIS_CONFIG_PATH") catch null;
+        const resolved_paths = try resolveConfigPaths(allocator, home, config_path_override);
 
         var cfg = Config{
-            .workspace_dir = workspace_dir,
-            .config_path = config_path,
+            .workspace_dir = resolved_paths.workspace_dir,
+            .config_path = resolved_paths.config_path,
             .allocator = allocator,
             .arena = arena_ptr,
         };
 
         // Try to read existing config file
-        if (std.fs.openFileAbsolute(config_path, .{})) |file| {
+        if (std.fs.openFileAbsolute(resolved_paths.config_path, .{})) |file| {
             defer file.close();
             const content = try file.readToEndAlloc(allocator, 1024 * 64);
             cfg.parseJson(content) catch |err| switch (err) {
@@ -246,6 +249,58 @@ pub const Config = struct {
         cfg.syncFlatFields();
 
         return cfg;
+    }
+
+    fn resolveConfigPaths(
+        allocator: std.mem.Allocator,
+        home: []const u8,
+        config_path_override: ?[]const u8,
+    ) !ResolvedConfigPaths {
+        const default_config_dir = try std.fs.path.join(allocator, &.{ home, ".nullalis" });
+        const default_config_path = try std.fs.path.join(allocator, &.{ default_config_dir, "config.json" });
+        const default_workspace_dir = try std.fs.path.join(allocator, &.{ default_config_dir, "workspace" });
+
+        const override_raw = config_path_override orelse {
+            return .{
+                .config_path = default_config_path,
+                .config_dir = default_config_dir,
+                .workspace_dir = default_workspace_dir,
+            };
+        };
+
+        const override_trimmed = std.mem.trim(u8, override_raw, " \t\r\n");
+        if (override_trimmed.len == 0) {
+            return .{
+                .config_path = default_config_path,
+                .config_dir = default_config_dir,
+                .workspace_dir = default_workspace_dir,
+            };
+        }
+        if (!std.fs.path.isAbsolute(override_trimmed)) {
+            std.log.warn("NULLALIS_CONFIG_PATH ignored: expected absolute path, got '{s}'", .{override_trimmed});
+            return .{
+                .config_path = default_config_path,
+                .config_dir = default_config_dir,
+                .workspace_dir = default_workspace_dir,
+            };
+        }
+
+        const override_path = try allocator.dupe(u8, override_trimmed);
+        const override_dir = std.fs.path.dirname(override_path) orelse {
+            std.log.warn("NULLALIS_CONFIG_PATH ignored: missing parent directory '{s}'", .{override_trimmed});
+            return .{
+                .config_path = default_config_path,
+                .config_dir = default_config_dir,
+                .workspace_dir = default_workspace_dir,
+            };
+        };
+        const override_dir_owned = try allocator.dupe(u8, override_dir);
+        const override_workspace = try std.fs.path.join(allocator, &.{ override_dir_owned, "workspace" });
+        return .{
+            .config_path = override_path,
+            .config_dir = override_dir_owned,
+            .workspace_dir = override_workspace,
+        };
     }
 
     /// Free all memory owned by this config (arena + heap pointer).
@@ -2102,6 +2157,36 @@ test "applyEnvOverrides does not crash on default config" {
     try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
     try std.testing.expect(cfg.default_model == null);
     try std.testing.expectEqual(@as(usize, 0), cfg.providers.len);
+}
+
+test "resolveConfigPaths uses default HOME path when override missing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const resolved = try Config.resolveConfigPaths(allocator, "/home/tester", null);
+    try std.testing.expectEqualStrings("/home/tester/.nullalis/config.json", resolved.config_path);
+    try std.testing.expectEqualStrings("/home/tester/.nullalis", resolved.config_dir);
+    try std.testing.expectEqualStrings("/home/tester/.nullalis/workspace", resolved.workspace_dir);
+}
+
+test "resolveConfigPaths accepts absolute NULLALIS_CONFIG_PATH override" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const resolved = try Config.resolveConfigPaths(allocator, "/home/tester", "/tmp/nullalis-custom/config.json");
+    try std.testing.expectEqualStrings("/tmp/nullalis-custom/config.json", resolved.config_path);
+    try std.testing.expectEqualStrings("/tmp/nullalis-custom", resolved.config_dir);
+    try std.testing.expectEqualStrings("/tmp/nullalis-custom/workspace", resolved.workspace_dir);
+}
+
+test "resolveConfigPaths ignores relative override and falls back to HOME default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const resolved = try Config.resolveConfigPaths(allocator, "/home/tester", "config.json");
+    try std.testing.expectEqualStrings("/home/tester/.nullalis/config.json", resolved.config_path);
+    try std.testing.expectEqualStrings("/home/tester/.nullalis", resolved.config_dir);
+    try std.testing.expectEqualStrings("/home/tester/.nullalis/workspace", resolved.workspace_dir);
 }
 
 test "json parse mcp_servers" {

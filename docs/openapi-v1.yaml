@@ -6,11 +6,11 @@ info:
     Runtime HTTP API for nullalis v0.1.
 
     Notes:
-    - `/api/v1/*` and `/internal/*` endpoints require `X-Internal-Token`.
+    - `/api/v1/*` and `/internal/*` endpoints use `X-Internal-Token` auth. In production-like mode this is always required; in local/non-production mode with no configured internal tokens, auth may be bypassed.
     - `X-Zaki-User-Id` is required for `/api/v1/chat/stream` when tenant mode is enabled.
     - `/api/v1/chat/stream` requires an explicit `session_key` by default.
     - `/webhook` auth is pairing-token based (Bearer), depending on pairing guard state.
-    - `/webhook/telegram` auth is Telegram secret-token based.
+    - Channel webhooks are unauthenticated at the internal-token layer; each route enforces its channel-specific verification/signature rules when configured.
 servers:
   - url: http://127.0.0.1:3000
     description: Local gateway
@@ -141,6 +141,7 @@ paths:
     post:
       tags: [webhook]
       summary: Telegram webhook ingress
+      description: Canonical Telegram webhook route. `/telegram` is an alias with the same behavior.
       parameters:
         - in: query
           name: user_id
@@ -175,6 +176,199 @@ paths:
           description: Unauthorized Telegram config/token
         "409":
           description: Tenant ownership lock conflict
+        "429":
+          description: Rate limited
+
+  /telegram:
+    post:
+      tags: [webhook]
+      summary: Telegram webhook ingress (alias)
+      description: Alias route for `/webhook/telegram`.
+      parameters:
+        - in: query
+          name: user_id
+          required: false
+          schema:
+            type: string
+          description: Required when tenant mode is enabled.
+        - in: header
+          name: X-Telegram-Bot-Api-Secret-Token
+          required: false
+          schema:
+            type: string
+          description: Required when secret token is configured.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Processed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Invalid request
+        "403":
+          description: Unauthorized Telegram config/token
+        "409":
+          description: Tenant ownership lock conflict
+        "429":
+          description: Rate limited
+
+  /whatsapp:
+    get:
+      tags: [webhook]
+      summary: WhatsApp webhook verification challenge
+      parameters:
+        - in: query
+          name: hub.mode
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: hub.verify_token
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: hub.challenge
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Verification challenge echo
+          content:
+            text/plain:
+              schema:
+                type: string
+        "403":
+          description: Verification failed
+    post:
+      tags: [webhook]
+      summary: WhatsApp webhook ingress
+      parameters:
+        - in: header
+          name: X-Hub-Signature-256
+          required: false
+          schema:
+            type: string
+          description: Required when a WhatsApp app secret is configured.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Processed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "403":
+          description: Missing or invalid signature (when signature enforcement is active)
+        "429":
+          description: Rate limited
+
+  /slack/events:
+    post:
+      tags: [webhook]
+      summary: Slack Events API webhook ingress
+      parameters:
+        - in: header
+          name: X-Slack-Request-Timestamp
+          required: false
+          schema:
+            type: string
+        - in: header
+          name: X-Slack-Signature
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Processed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "403":
+          description: Invalid signature for a configured Slack endpoint
+        "404":
+          description: Slack account or endpoint not configured
+        "429":
+          description: Rate limited
+
+  /line:
+    post:
+      tags: [webhook]
+      summary: LINE webhook ingress
+      parameters:
+        - in: header
+          name: X-Line-Signature
+          required: false
+          schema:
+            type: string
+          description: Required when LINE channel secret verification is enabled.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Processed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "403":
+          description: Missing or invalid signature
+        "429":
+          description: Rate limited
+
+  /lark:
+    post:
+      tags: [webhook]
+      summary: Lark webhook ingress
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Processed (or challenge response)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "403":
+          description: Invalid verification token
         "429":
           description: Rate limited
 
@@ -1086,6 +1280,7 @@ components:
       type: apiKey
       in: header
       name: X-Internal-Token
+      description: In production-like mode this token is required for internal and `/api/v1/*` routes. In local/non-production mode with no configured token set, auth may be bypassed.
     BearerAuth:
       type: http
       scheme: bearer

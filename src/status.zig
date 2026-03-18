@@ -49,7 +49,8 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
     try w.print("Diagnostics:   {s}\n", .{cfg.diagnostics.backend});
 
     // Runtime
-    try w.print("Runtime:     {s}\n", .{cfg.runtime.kind});
+    try w.print("Runtime:     {s} (deferred config; runtime selection not yet wired)\n", .{cfg.runtime.kind});
+    try w.print("Tunnel:      {s} (deferred config; tunnel manager not yet wired)\n", .{cfg.tunnel.provider});
 
     // Gateway
     try w.print("Gateway:     {s}:{d}\n", .{ cfg.gateway_host, cfg.gateway_port });

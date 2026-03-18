@@ -83,6 +83,8 @@ pub const DockerRuntimeConfig = struct {
 };
 
 pub const RuntimeConfig = struct {
+    /// Deferred control surface (beta): currently parsed and reported,
+    /// but not used to switch gateway/daemon execution path yet.
     kind: []const u8 = "native",
     docker: DockerRuntimeConfig = .{},
 };
@@ -770,6 +772,8 @@ pub const MemorySummarizerConfig = struct {
 // ── Tunnel config ───────────────────────────────────────────────
 
 pub const TunnelConfig = struct {
+    /// Deferred control surface (beta): currently parsed and reported,
+    /// but tunnel providers are not started/managed by gateway/daemon runtime yet.
     provider: []const u8 = "none",
 };
 

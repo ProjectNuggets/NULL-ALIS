@@ -11405,7 +11405,9 @@ test "resolveUserContext rejects non-numeric user ids when postgres tenant state
     var gs = GatewayState.init(allocator);
     defer gs.deinit();
     gs.tenant_enabled = true;
-    gs.zaki_state = @ptrFromInt(1);
+    var fake_mgr: zaki_state_mod.Manager = undefined;
+    gs.zaki_state = &fake_mgr;
+    defer gs.zaki_state = null;
 
     try std.testing.expectError(error.InvalidUserId, resolveUserContext(allocator, &gs, "stable-user"));
 }
