@@ -2276,7 +2276,8 @@ fn canIgnoreMigrateError(template: []const u8, raw_err: [*c]const u8) bool {
         return std.mem.indexOf(u8, err_text, "already exists") != null or
             std.mem.indexOf(u8, err_text, "duplicate_object") != null or
             std.mem.indexOf(u8, err_text, "permission denied for table zaki_users") != null or
-            std.mem.indexOf(u8, err_text, "relation \"zaki_users\" does not exist") != null;
+            std.mem.indexOf(u8, err_text, "relation \"zaki_users\" does not exist") != null or
+            std.mem.indexOf(u8, err_text, "relation \"public.zaki_users\" does not exist") != null;
     }
     if (std.mem.startsWith(u8, template, "ALTER TABLE") and std.mem.indexOf(u8, template, "DROP CONSTRAINT IF EXISTS") != null) {
         return std.mem.indexOf(u8, err_text, "does not exist") != null;
@@ -2304,6 +2305,12 @@ test "canIgnoreMigrateError tolerates extension duplicate key race" {
 test "canIgnoreMigrateError tolerates users fk permission denial" {
     const tpl = "ALTER TABLE {schema}.users ADD CONSTRAINT users_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.zaki_users(id) ON DELETE CASCADE";
     const err_text: [:0]const u8 = "ERROR:  permission denied for table zaki_users";
+    try std.testing.expect(canIgnoreMigrateError(tpl, err_text.ptr));
+}
+
+test "canIgnoreMigrateError tolerates missing public zaki_users relation" {
+    const tpl = "ALTER TABLE {schema}.users ADD CONSTRAINT users_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.zaki_users(id) ON DELETE CASCADE";
+    const err_text: [:0]const u8 = "ERROR:  relation \"public.zaki_users\" does not exist";
     try std.testing.expect(canIgnoreMigrateError(tpl, err_text.ptr));
 }
 
