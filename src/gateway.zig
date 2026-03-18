@@ -4258,6 +4258,78 @@ fn appendIntegrationsSummaryJson(
     try buf.appendSlice(allocator, "}");
 }
 
+const DiagnosticsConfigSnapshot = struct {
+    source: []const u8,
+    memory_search_enabled: bool,
+    memory_summarizer_enabled: bool,
+    provider_retries: u32,
+    fallback_provider_count: usize,
+    memory_vector_sync_mode_requested: []const u8,
+    memory_outbox_requested: bool,
+};
+
+fn loadDiagnosticsConfigSnapshot(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id_raw: []const u8,
+) ?DiagnosticsConfigSnapshot {
+    var user_ctx = resolveUserContext(allocator, state, user_id_raw) catch return null;
+    defer user_ctx.deinit(allocator);
+
+    var source: []const u8 = "user_file_config";
+    const raw_user_config = blk: {
+        if (state.zaki_state) |mgr| {
+            const numeric_user_id = parseNumericUserId(user_id_raw) catch return null;
+            if (mgr.getConfigJson(allocator, numeric_user_id)) |value| {
+                source = "postgres_user_config";
+                break :blk value;
+            } else |_| {}
+        }
+        break :blk readFileOrDefault(allocator, user_ctx.config_path, "{}\n") catch return null;
+    };
+    defer allocator.free(raw_user_config);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = user_ctx.workspace_path,
+        .config_path = state.configPath(),
+        .allocator = a,
+    };
+
+    const base_config_path = state.configPath();
+    if (base_config_path.len > 0) {
+        if (readFileOrDefault(a, base_config_path, "{}\n")) |base_json| {
+            cfg.parseJson(base_json) catch {};
+        } else |_| {}
+    }
+
+    cfg.parseJson(raw_user_config) catch {};
+    cfg.applyProfileDefaults() catch {};
+    cfg.memory.applyProfileDefaults();
+    cfg.syncFlatFields();
+    TenantRuntime.applyTenantSemanticMemoryDefaults(&cfg);
+
+    const requested_sync_mode: []const u8 = if (std.mem.eql(u8, cfg.memory.search.sync.mode, "best_effort"))
+        "best_effort"
+    else if (std.mem.eql(u8, cfg.memory.search.sync.mode, "durable_outbox"))
+        "durable_outbox"
+    else
+        "custom";
+
+    return .{
+        .source = source,
+        .memory_search_enabled = cfg.memory.search.enabled,
+        .memory_summarizer_enabled = cfg.memory.summarizer.enabled,
+        .provider_retries = cfg.reliability.provider_retries,
+        .fallback_provider_count = cfg.reliability.fallback_providers.len,
+        .memory_vector_sync_mode_requested = requested_sync_mode,
+        .memory_outbox_requested = !std.mem.eql(u8, cfg.memory.search.sync.mode, "best_effort"),
+    };
+}
+
 fn internalDiagnosticsPayload(
     allocator: std.mem.Allocator,
     state: *const GatewayState,
@@ -4334,7 +4406,27 @@ fn internalDiagnosticsPayload(
     var effective_config_hash: ?u64 = null;
     var memory_search_enabled: ?bool = null;
     var memory_summarizer_enabled: ?bool = null;
+    var provider_retries: ?u32 = null;
+    var fallback_provider_count: ?usize = null;
+    var memory_vector_sync_mode: ?[]const u8 = null;
+    var memory_outbox_enabled: ?bool = null;
+    var configured_config_source: ?[]const u8 = null;
+    var configured_memory_search_enabled: ?bool = null;
+    var configured_memory_summarizer_enabled: ?bool = null;
+    var configured_provider_retries: ?u32 = null;
+    var configured_fallback_provider_count: ?usize = null;
+    var configured_memory_vector_sync_mode_requested: ?[]const u8 = null;
+    var configured_memory_outbox_requested: ?bool = null;
     if (user_id_opt) |user_id_raw| {
+        if (loadDiagnosticsConfigSnapshot(allocator, state, user_id_raw)) |snapshot| {
+            configured_config_source = snapshot.source;
+            configured_memory_search_enabled = snapshot.memory_search_enabled;
+            configured_memory_summarizer_enabled = snapshot.memory_summarizer_enabled;
+            configured_provider_retries = snapshot.provider_retries;
+            configured_fallback_provider_count = snapshot.fallback_provider_count;
+            configured_memory_vector_sync_mode_requested = snapshot.memory_vector_sync_mode_requested;
+            configured_memory_outbox_requested = snapshot.memory_outbox_requested;
+        }
         {
             const mutable_state: *GatewayState = @constCast(state);
             mutable_state.tenant_runtime_mutex.lock();
@@ -4344,6 +4436,12 @@ fn internalDiagnosticsPayload(
                 effective_config_hash = tenant_runtime.effective_config_hash;
                 memory_search_enabled = tenant_runtime.config.memory.search.enabled;
                 memory_summarizer_enabled = tenant_runtime.config.memory.summarizer.enabled;
+                provider_retries = tenant_runtime.config.reliability.provider_retries;
+                fallback_provider_count = tenant_runtime.config.reliability.fallback_providers.len;
+                if (tenant_runtime.mem_rt) |*memory_rt| {
+                    memory_vector_sync_mode = memory_rt.resolved.vector_sync_mode;
+                    memory_outbox_enabled = memory_rt._outbox != null;
+                }
             }
         }
 
@@ -4450,6 +4548,91 @@ fn internalDiagnosticsPayload(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(&buf, allocator, "memory_summarizer_enabled");
     if (memory_summarizer_enabled) |enabled| {
+        try buf.appendSlice(allocator, if (enabled) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "provider_retries");
+    if (provider_retries) |value| {
+        var value_buf: [32]u8 = undefined;
+        const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch "0";
+        try buf.appendSlice(allocator, value_text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "fallback_provider_count");
+    if (fallback_provider_count) |value| {
+        var value_buf: [32]u8 = undefined;
+        const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch "0";
+        try buf.appendSlice(allocator, value_text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "memory_vector_sync_mode");
+    if (memory_vector_sync_mode) |mode| {
+        try json_util.appendJsonString(&buf, allocator, mode);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "memory_outbox_enabled");
+    if (memory_outbox_enabled) |enabled| {
+        try buf.appendSlice(allocator, if (enabled) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_config_source");
+    if (configured_config_source) |value| {
+        try json_util.appendJsonString(&buf, allocator, value);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_memory_search_enabled");
+    if (configured_memory_search_enabled) |enabled| {
+        try buf.appendSlice(allocator, if (enabled) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_memory_summarizer_enabled");
+    if (configured_memory_summarizer_enabled) |enabled| {
+        try buf.appendSlice(allocator, if (enabled) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_provider_retries");
+    if (configured_provider_retries) |value| {
+        var value_buf: [32]u8 = undefined;
+        const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch "0";
+        try buf.appendSlice(allocator, value_text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_fallback_provider_count");
+    if (configured_fallback_provider_count) |value| {
+        var value_buf: [32]u8 = undefined;
+        const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch "0";
+        try buf.appendSlice(allocator, value_text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_memory_vector_sync_mode_requested");
+    if (configured_memory_vector_sync_mode_requested) |mode| {
+        try json_util.appendJsonString(&buf, allocator, mode);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_memory_outbox_requested");
+    if (configured_memory_outbox_requested) |enabled| {
         try buf.appendSlice(allocator, if (enabled) "true" else "false");
     } else {
         try buf.appendSlice(allocator, "null");
@@ -11519,6 +11702,10 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"webhook\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"background_main_reroutes_total\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"background_main_reroutes_last_job_id\":\"diag-job\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"provider_retries\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"fallback_provider_count\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"memory_vector_sync_mode\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"memory_outbox_enabled\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lease_probe\":null") != null);
 }
 

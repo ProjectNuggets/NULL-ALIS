@@ -54,6 +54,36 @@ const DEFAULT_MAX_HISTORY: u32 = 50;
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Agent = struct {
+    const StreamTimingContext = struct {
+        agent: *Agent,
+        callback: providers.StreamCallback,
+        callback_ctx: *anyopaque,
+        iteration: u32,
+        provider_start_ms: i64,
+        first_token_recorded: bool = false,
+        first_token_ms: ?u64 = null,
+    };
+
+    fn streamCallbackWithTiming(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
+        const ctx: *StreamTimingContext = @ptrCast(@alignCast(ctx_ptr));
+        if (!ctx.first_token_recorded and chunk.delta.len > 0) {
+            ctx.first_token_recorded = true;
+            const first_token_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - ctx.provider_start_ms));
+            ctx.first_token_ms = first_token_ms;
+            log.info("turn.stage stage=llm_first_token iteration={d} duration_ms={d}", .{
+                ctx.iteration,
+                first_token_ms,
+            });
+            const first_token_event = ObserverEvent{ .turn_stage = .{
+                .stage = "llm_first_token",
+                .iteration = ctx.iteration,
+                .duration_ms = first_token_ms,
+            } };
+            ctx.agent.observer.recordEvent(&first_token_event);
+        }
+        ctx.callback(ctx.callback_ctx, chunk);
+    }
+
     const TtsSynthesizeFn = *const fn (
         allocator: std.mem.Allocator,
         provider: []const u8,
@@ -1063,6 +1093,14 @@ pub const Agent = struct {
         const turn_start_ms = std.time.milliTimestamp();
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
+        var turn_llm_calls: u32 = 0;
+        var turn_retry_attempts: u32 = 0;
+        var turn_tool_calls_total: u32 = 0;
+        var turn_tool_iterations: u32 = 0;
+        var turn_memory_enrich_ms: u64 = 0;
+        var turn_compaction_ms: u64 = 0;
+        var turn_first_token_ms: ?u64 = null;
+        var turn_first_token_upper_bound_ms: ?u64 = null;
 
         // Handle slash commands before sending to LLM (saves tokens)
         if (try self.handleSlashCommand(user_message)) |response| {
@@ -1164,6 +1202,7 @@ pub const Agent = struct {
         else
             try self.allocator.dupe(u8, user_message);
         const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
+        turn_memory_enrich_ms = enrich_duration_ms;
         log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
         const memory_stage_event = ObserverEvent{ .turn_stage = .{
             .stage = "memory_enrich",
@@ -1183,6 +1222,7 @@ pub const Agent = struct {
             self.last_turn_compacted = false;
             self.trimHistory();
             const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
+            turn_compaction_ms = compact_duration_ms;
             log.info("turn.stage stage=turn_compaction duration_ms={d} mode=trim", .{compact_duration_ms});
             const compact_stage_event = ObserverEvent{ .turn_stage = .{
                 .stage = "turn_compaction",
@@ -1272,10 +1312,19 @@ pub const Agent = struct {
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
+            var saw_stream_first_token = false;
+            turn_llm_calls += 1;
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;
             if (is_streaming) {
+                var stream_timing_ctx = StreamTimingContext{
+                    .agent = self,
+                    .callback = self.stream_callback.?,
+                    .callback_ctx = self.stream_ctx.?,
+                    .iteration = iteration,
+                    .provider_start_ms = timer_start,
+                };
                 const stream_result = self.provider.streamChat(
                     self.allocator,
                     .{
@@ -1289,8 +1338,8 @@ pub const Agent = struct {
                     },
                     self.model_name,
                     self.temperature,
-                    self.stream_callback.?,
-                    self.stream_ctx.?,
+                    streamCallbackWithTiming,
+                    @ptrCast(&stream_timing_ctx),
                 ) catch |err| {
                     log.warn("llm.call failed provider={s} model={s} error={s}", .{
                         self.provider.getName(),
@@ -1308,6 +1357,10 @@ pub const Agent = struct {
                     self.observer.recordEvent(&fail_event);
                     return err;
                 };
+                saw_stream_first_token = stream_timing_ctx.first_token_recorded;
+                if (stream_timing_ctx.first_token_ms) |value| {
+                    turn_first_token_ms = value;
+                }
                 response = ChatResponse{
                     .content = stream_result.content,
                     .tool_calls = &.{},
@@ -1352,6 +1405,8 @@ pub const Agent = struct {
                         self.forceCompressHistory())
                     {
                         self.context_was_compacted = true;
+                        turn_retry_attempts += 1;
+                        turn_llm_calls += 1;
                         const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
                         break :retry_blk self.provider.chat(
                             self.allocator,
@@ -1371,6 +1426,8 @@ pub const Agent = struct {
 
                     // Retry once
                     std.Thread.sleep(500 * std.time.ns_per_ms);
+                    turn_retry_attempts += 1;
+                    turn_llm_calls += 1;
                     break :retry_blk self.provider.chat(
                         self.allocator,
                         .{
@@ -1389,6 +1446,8 @@ pub const Agent = struct {
                         // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
+                            turn_retry_attempts += 1;
+                            turn_llm_calls += 1;
                             const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
                             break :retry_blk self.provider.chat(
                                 self.allocator,
@@ -1419,6 +1478,19 @@ pub const Agent = struct {
                 .error_message = null,
             } };
             self.observer.recordEvent(&resp_event);
+            if (!is_streaming or !saw_stream_first_token) {
+                log.info("turn.stage stage=llm_first_token_upper_bound iteration={d} duration_ms={d}", .{
+                    iteration,
+                    duration_ms,
+                });
+                turn_first_token_upper_bound_ms = duration_ms;
+                const first_token_bound_event = ObserverEvent{ .turn_stage = .{
+                    .stage = "llm_first_token_upper_bound",
+                    .iteration = iteration,
+                    .duration_ms = duration_ms,
+                } };
+                self.observer.recordEvent(&first_token_bound_event);
+            }
 
             // Track tokens
             self.total_tokens += response.usage.total_tokens;
@@ -1516,6 +1588,10 @@ pub const Agent = struct {
 
             // Determine display text
             const display_text = if (parsed_text.len > 0) parsed_text else response_text;
+            if (parsed_calls.len > 0) {
+                turn_tool_iterations += 1;
+                turn_tool_calls_total += @intCast(@min(parsed_calls.len, std.math.maxInt(u32)));
+            }
 
             if (parsed_calls.len == 0) {
                 const malformed_tool_markup = startsWithToolCallMarkup(display_text);
@@ -1670,6 +1746,7 @@ pub const Agent = struct {
                 // ── Cache store (only for direct responses, no tool calls) ──
                 const cache_start_ms = std.time.milliTimestamp();
                 var cached = false;
+                var cache_duration_ms: u64 = 0;
                 var store_key_buf: [16]u8 = undefined;
                 const sys_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
                     self.history.items[0].content
@@ -1698,12 +1775,31 @@ pub const Agent = struct {
                 }
 
                 if (cached) {
-                    const cache_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - cache_start_ms));
+                    cache_duration_ms = @intCast(@max(0, std.time.milliTimestamp() - cache_start_ms));
                     log.info("turn.stage stage=response_cache_put iteration={d} duration_ms={d}", .{ iteration, cache_duration_ms });
                 }
 
                 const finalize_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - finalize_start_ms));
                 const total_turn_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - turn_start_ms));
+                const first_token_ms_i64: i64 = if (turn_first_token_ms) |value| @intCast(value) else -1;
+                const first_token_upper_bound_ms_i64: i64 = if (turn_first_token_upper_bound_ms) |value| @intCast(value) else -1;
+                const post_reply_maintenance_ms: u64 = autosave_duration_ms + outbox_duration_ms + cache_duration_ms;
+                log.info("turn.profile kind={s} llm_calls={d} retries={d} tool_iterations={d} tool_calls={d} first_token_ms={d} first_token_upper_bound_ms={d} memory_enrich_ms={d} pre_compaction_ms={d} autosave_ms={d} outbox_ms={d} cache_put_ms={d} post_reply_maintenance_ms={d} total_turn_ms={d}", .{
+                    if (turn_tool_calls_total > 0) "tool" else "direct",
+                    turn_llm_calls,
+                    turn_retry_attempts,
+                    turn_tool_iterations,
+                    turn_tool_calls_total,
+                    first_token_ms_i64,
+                    first_token_upper_bound_ms_i64,
+                    turn_memory_enrich_ms,
+                    turn_compaction_ms,
+                    autosave_duration_ms,
+                    outbox_duration_ms,
+                    cache_duration_ms,
+                    post_reply_maintenance_ms,
+                    total_turn_ms,
+                });
                 log.info("turn.stage stage=finalize_no_tools iteration={d} duration_ms={d} total_turn_ms={d}", .{
                     iteration,
                     finalize_duration_ms,
@@ -1868,6 +1964,20 @@ pub const Agent = struct {
 
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
+        const total_turn_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - turn_start_ms));
+        const first_token_ms_i64: i64 = if (turn_first_token_ms) |value| @intCast(value) else -1;
+        const first_token_upper_bound_ms_i64: i64 = if (turn_first_token_upper_bound_ms) |value| @intCast(value) else -1;
+        log.info("turn.profile kind=tool_exhausted llm_calls={d} retries={d} tool_iterations={d} tool_calls={d} first_token_ms={d} first_token_upper_bound_ms={d} memory_enrich_ms={d} pre_compaction_ms={d} autosave_ms=0 outbox_ms=0 cache_put_ms=0 post_reply_maintenance_ms=0 total_turn_ms={d}", .{
+            turn_llm_calls + 1, // include final summary call
+            turn_retry_attempts,
+            turn_tool_iterations,
+            turn_tool_calls_total,
+            first_token_ms_i64,
+            first_token_upper_bound_ms_i64,
+            turn_memory_enrich_ms,
+            turn_compaction_ms,
+            total_turn_ms,
+        });
 
         return prefixed;
     }

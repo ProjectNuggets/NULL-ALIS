@@ -8,17 +8,23 @@
   Zig-first autonomous agent runtime for persistent digital twins and multitenant products.
 </p>
 
-## Current Status (March 9, 2026)
+## Current Status (March 18, 2026)
 
-`nullALIS v0.1` is release-ready, with hardening focused on reliability, runtime correctness, and operator-grade behavior.
+`nullALIS v0.1` is the declared baseline for public beta stabilization.
+
+Scope of this declaration:
+- Freeze current runtime/API behavior as the canonical baseline.
+- Defer larger upstream ports to controlled cherry-pick/upsert tracks.
+- Prioritize clean reproducibility over new feature intake.
 
 Current verified baseline on active branch work:
-- Full tests pass: `zig build test --summary all` (`4444` passed, `4` skipped).
+- Full tests pass: `zig build test --summary all` (`4692` passed, `25` skipped).
 - Build passes with production engines: `zig build -Dengines=base,sqlite,postgres`.
 - Postgres-backed tenant runtime is the authoritative state path when configured.
 - Chat SSE contract is stable, with additive `progress` events for live UX (`status/progress/token/done`).
 
 References:
+- [v0.1 declaration (2026-03-18)](docs/releases/v0.1-declaration-2026-03-18.md)
 - [v0.1 final sweep](docs/final-sweep-2026-03-09.md)
 - [ops runbook](docs/reliability-ops-runbook.md)
 - [runtime status notes](docs/status-2026-03-06.md)

@@ -4,6 +4,7 @@ info:
   version: "0.1"
   description: |
     Runtime HTTP API for nullalis v0.1.
+    Contract baseline declaration date: 2026-03-18.
 
     Notes:
     - `/api/v1/*` and `/internal/*` endpoints use `X-Internal-Token` auth. In production-like mode this is always required; in local/non-production mode with no configured internal tokens, auth may be bypassed.
@@ -390,8 +391,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: "#/components/schemas/InternalDiagnosticsResponse"
         "401":
           description: Unauthorized
 
@@ -1292,6 +1292,67 @@ components:
       properties:
         status:
           type: string
+      additionalProperties: true
+    InternalDiagnosticsResponse:
+      type: object
+      description: |
+        Runtime snapshot for operators. Shape is additive and may include more fields.
+      properties:
+        runtime_mode:
+          type: string
+        startup_self_check:
+          type: string
+        effective_config_source:
+          type: string
+          nullable: true
+        effective_config_hash:
+          type: string
+          nullable: true
+        memory_search_enabled:
+          type: boolean
+          nullable: true
+        memory_summarizer_enabled:
+          type: boolean
+          nullable: true
+        provider_retries:
+          type: integer
+          nullable: true
+        fallback_provider_count:
+          type: integer
+          nullable: true
+        memory_vector_sync_mode:
+          type: string
+          nullable: true
+        memory_outbox_enabled:
+          type: boolean
+          nullable: true
+        configured_config_source:
+          type: string
+          nullable: true
+        configured_memory_search_enabled:
+          type: boolean
+          nullable: true
+        configured_memory_summarizer_enabled:
+          type: boolean
+          nullable: true
+        configured_provider_retries:
+          type: integer
+          nullable: true
+        configured_fallback_provider_count:
+          type: integer
+          nullable: true
+        configured_memory_vector_sync_mode_requested:
+          type: string
+          nullable: true
+        configured_memory_outbox_requested:
+          type: boolean
+          nullable: true
+        chat_stream_require_explicit_session_key:
+          type: boolean
+        chat_stream_lane_counts:
+          type: object
+          additionalProperties:
+            type: integer
       additionalProperties: true
     ProductSettings:
       type: object

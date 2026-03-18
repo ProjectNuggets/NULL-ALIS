@@ -5,12 +5,13 @@ Scope: source audit plus existing staging evidence already checked into this rep
 
 ## Executive Summary
 
-1. The dominant confirmed cost between "agent prompted" and "agent replied" is provider round-trip time, with same-session lock wait as the biggest internal latency amplifier.
+1. The dominant confirmed cost between "agent prompted" and "agent replied" is provider round-trip time.
 2. Current context loading is cheaper than expected partly because it is often effectively off: when a `MemoryRuntime` exists but `search.enabled=false`, `memory_enrich` returns no candidates instead of falling back to raw recall.
 3. Prompt construction is heavier than the timing reports make visible: the agent can rebuild a very large system prompt by re-reading workspace files and reloading config from disk, but that work is not separately instrumented.
 4. The terminal is likely telling the truth with `summarizer=false`. That value is read directly from `MemoryRuntime._summarizer_cfg.enabled`, which is copied from `config.memory.summarizer.enabled`. It is not a UI-only flag.
-5. There is a meaningful distinction between queue "summarize" and memory "summarizer". Queue summarize is overflow coalescing in `SessionManager`; memory summarizer is the lifecycle checkpoint summarizer. They are different subsystems.
-6. The repo has the bones of a strong agent runtime, but it is not SOTA yet because it lacks first-token observability, lane-aware concurrency by default, budgeted context packing, and robust memory recall behavior when semantic retrieval is disabled.
+5. The current repo's deployment manifest and current seed code do not line up with the observed seeded runtime state. Under today's checked-in code, a freshly seeded tenant should not land on `search.enabled=false` and `summarizer=false` at the same time.
+6. There is a meaningful distinction between queue "summarize" and memory "summarizer". Queue summarize is overflow coalescing in `SessionManager`; memory summarizer is the lifecycle checkpoint summarizer. They are different subsystems.
+7. The repo has the bones of a strong agent runtime, but it is not SOTA yet because it lacks first-token observability, budgeted context packing, and robust memory recall behavior when semantic retrieval is disabled.
 
 ## 1. Verified Turn Path
 
@@ -152,6 +153,64 @@ High-confidence inference:
 - the mismatch is between expected seed behavior and the actual effective config derived from the base file
 - that needs a focused config-truth investigation; it does not look like a display bug
 
+### What the current deployment manifest would actually seed
+
+The checked-in Kubernetes deployment does not write any explicit memory or product-settings block into the runtime `config.json`:
+
+- it writes `agents.defaults.model`, `models.providers`, `gateway`, `tenant`, `state`, `composio`, `session`, and `channels`
+- it does not write `memory`
+- it does not write `product_settings`
+- it does not write `agent`
+- source: `deploy/k8s/zaki-bot/05-deployment.yaml:66-130`
+
+Given that file, current source says:
+
+- top-level memory defaults start as `profile="markdown_only"` and `backend="markdown"`. `src/config_types.zig:529-546`
+- default memory search is `enabled=true`. `src/config_types.zig:587-598`
+- tenant seed generation reads the base config file, resolves settings from `product_settings` or `agent`, and if neither exists falls back to `user_settings.defaults()`. `src/gateway.zig:698-705`, `src/user_settings.zig:103-105`, `src/user_settings.zig:141-143`
+- `user_settings.defaults()` is `assistant_mode=balanced`. `src/user_settings.zig:42-48`, `src/user_settings.zig:103-105`
+- balanced-mode seed output writes `memory.summarizer.enabled=true`. `src/user_settings.zig:81-89`, `src/user_settings.zig:229-234`, `src/user_settings.zig:498-535`
+
+Under current checked-in code, a freshly seeded tenant from the checked-in deployment manifest should therefore look roughly like:
+
+- `search.enabled=true` inherited from `Config.memory.search`
+- `summarizer.enabled=true` written by balanced-mode seed JSON
+- semantic tenant defaults applied afterward (`profile=postgres_hybrid`, hybrid query enabled, pgvector store, rollout `on`) without forcing either flag back off. `src/gateway.zig:645-684`, `src/config_types.zig:550-575`
+
+### Why `search.enabled=false` is especially suspicious
+
+Current code does not implicitly disable search in the tenant semantic path:
+
+- `applyTenantSemanticMemoryDefaults(...)` sets profile/provider/fallback/store/rollout but never writes `search.enabled=false`. `src/gateway.zig:645-684`
+- `MemoryConfig.applyProfileDefaults()` also never disables search. `src/config_types.zig:550-575`
+- `search.enabled` only changes when parsed explicitly from JSON. `src/config_parse.zig:896-905`
+
+So for a runtime that reports both:
+
+- `effective_config_source=postgres_seeded_from_file`
+- `retrieval=disabled`
+
+the most likely explanations are not "terminal bug" or "profile side effect". They are:
+
+1. The seed row in Postgres was created by an older image or older seed logic than the one currently checked in.
+2. The live base config file used at seed time differed from the checked-in deployment manifest and explicitly disabled memory search.
+3. The `postgres_seeded_from_file` source label is truthful only in a narrow sense, while the actual seed payload came from a partial or repaired config path that hid important fields.
+
+### Strongest config-truth conclusion
+
+The current repo now contains enough evidence to say something stronger than the earlier audit:
+
+- the terminal readout is almost certainly truthful
+- the observed `search=false` plus `summarizer=false` combination is real runtime state
+- that combination does not match what the current deployment manifest plus current seeding code should produce for a brand-new seeded tenant
+
+So the config-truth mismatch is not just "docs vs code". It is:
+
+- checked-in deploy template and checked-in seed logic imply one runtime state
+- checked-in staging diagnostics and logs show a different seeded runtime state
+
+That means the repo's documented source of truth for tenant memory defaults is incomplete.
+
 ## 6. Important Wrinkles And Gaps
 
 ### A. Observability is missing the metrics you actually want for agent UX
@@ -188,13 +247,7 @@ Good for determinism, but not SOTA memory retention.
 
 On context exhaustion the agent can `forceCompressHistory()` and keep only the system prompt plus the last few messages, dropping the middle without semantic preservation. `src/agent/root.zig:1348-1408`, `src/agent/compaction.zig:156-177`
 
-### E. Default lane behavior still invites serialized waits
-
-When the caller omits `session_key`, chat stream falls back to `user:<id>:main`. `src/gateway.zig:5203-5222`, `src/zaki_session.zig:3-4`
-
-That makes same-user rapid inputs contend on one mutex-backed lane. `src/session.zig:389-405`
-
-### F. Current source and older timing artifacts have naming drift
+### E. Current source and older timing artifacts have naming drift
 
 Checked-in staging logs use `compact_pre_provider`; current source emits `turn_compaction` for the trim-before-provider stage. `docs/reports/2026-03-17-agent-wiring-sweep/sweep-report.md:39-47`, `src/agent/root.zig:1185-1191`
 
@@ -217,6 +270,7 @@ That is survivable, but it is a warning that some latency parsers and some menta
    - `agent.queue_mode`
    - `agent.queue_drop`
 3. Resolve the seed/config contradiction behind hash `59750d4df997b660`.
+4. Log whether a tenant config row was seeded by current code, migrated from older rows, or repaired from fallback paths.
 
 ### P1: Improve context quality without making latency worse
 
@@ -235,19 +289,19 @@ That is survivable, but it is a warning that some latency parsers and some menta
 ### P2: Make memory actually agent-grade
 
 1. Turn lifecycle summarization into a real tiered memory pipeline rather than checkpoint-only behavior.
-2. Add budget-aware context packing:
+2. Make the deployment template explicit about memory defaults instead of relying on struct defaults plus seed-time inference.
+3. Add budget-aware context packing:
    - system prompt budget
    - working memory budget
    - recent-history budget
    - tool-reflection budget
-3. Add durable semantic summaries that survive context exhaustion instead of relying on trim/drop recovery.
+4. Add durable semantic summaries that survive context exhaustion instead of relying on trim/drop recovery.
 
 ## 8. Bottom Line
 
-This agent is not slow because Zig is slow or because the code is bloated. It is slow for three concrete reasons:
+This agent is not slow because Zig is slow or because the code is bloated. It is slow for two concrete reasons:
 
 1. provider RTT is the main clean-turn cost
-2. same-session serialization makes overlap painful
-3. context and tool behavior are not yet budgeted and instrumented at SOTA granularity
+2. context and tool behavior are not yet budgeted and instrumented at SOTA granularity
 
-And the `summarizer=false` readout is probably not lying. It is reporting the actual runtime memory summarizer flag, which currently appears to be off in the seeded tenant runtimes captured in this repo's own evidence.
+And the `summarizer=false` readout is probably not lying. It is reporting the actual runtime memory summarizer flag, which currently appears to be off in the seeded tenant runtimes captured in this repo's own evidence. The bigger problem is that the current checked-in deploy template and the current checked-in seed path should not be producing that state for fresh tenants, so the real gap is configuration truth and rollout provenance.
