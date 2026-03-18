@@ -28,7 +28,7 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: nullclaw
-      terminationGracePeriodSeconds: 90
+      terminationGracePeriodSeconds: 180
       containers:
         - name: nullclaw
           # Replace with your registry/tag.

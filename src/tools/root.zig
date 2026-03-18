@@ -377,6 +377,38 @@ pub fn allTools(
     scht.* = .{ .config = opts.config };
     try list.append(allocator, scht.tool());
 
+    // Cron tools + push notifications
+    const cat = try allocator.create(cron_add.CronAddTool);
+    cat.* = .{};
+    try list.append(allocator, cat.tool());
+
+    const clt = try allocator.create(cron_list.CronListTool);
+    clt.* = .{};
+    try list.append(allocator, clt.tool());
+
+    const crt = try allocator.create(cron_remove.CronRemoveTool);
+    crt.* = .{};
+    try list.append(allocator, crt.tool());
+
+    const crst = try allocator.create(cron_runs.CronRunsTool);
+    crst.* = .{};
+    try list.append(allocator, crst.tool());
+
+    const crut = try allocator.create(cron_run.CronRunTool);
+    crut.* = .{};
+    try list.append(allocator, crut.tool());
+
+    const cupt = try allocator.create(cron_update.CronUpdateTool);
+    cupt.* = .{};
+    try list.append(allocator, cupt.tool());
+
+    const pt = try allocator.create(pushover.PushoverTool);
+    pt.* = .{
+        .workspace_dir = workspace_dir,
+        .allocator = allocator,
+    };
+    try list.append(allocator, pt.tool());
+
     const rit = try allocator.create(runtime_info.RuntimeInfoTool);
     rit.* = .{
         .config = opts.config orelse return error.InvalidArgument,
@@ -634,7 +666,7 @@ fn backgroundPolicyForOrigin(origin: TurnOrigin) BackgroundOriginPolicy {
         // Internal scheduler maintenance lane; keep conservative to avoid self-loop mutation.
         .scheduler => .{
             .allow_schedule_write = false,
-            .allow_composio_read_execute = false,
+            .allow_composio_read_execute = true,
         },
         .user => .{
             .allow_schedule_write = true,
@@ -924,14 +956,13 @@ test "proactive origin allows schedule writes" {
     try std.testing.expect(toolBlockedForCurrentTurn("schedule", parsed.value.object) == null);
 }
 
-test "scheduler-origin maintenance blocks composio execute" {
+test "scheduler-origin maintenance allows composio read-only execute" {
     setTurnContext(.{ .origin = .scheduler });
     defer clearTurnContext();
 
     const parsed = try parseTestArgs("{\"action\":\"execute\",\"tool_slug\":\"gmail-list-messages\"}");
     defer parsed.deinit();
-    const blocked = toolBlockedForCurrentTurn("composio", parsed.value.object) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, blocked, "Composio execute is disabled") != null);
+    try std.testing.expect(toolBlockedForCurrentTurn("composio", parsed.value.object) == null);
 }
 
 test "background turns block composio connect" {
@@ -1059,8 +1090,8 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 16 + http_request + web_fetch + web_search + browser = 20
-    try std.testing.expectEqual(@as(usize, 20), tools.len);
+    // base 23 + http_request + web_fetch + web_search + browser = 27
+    try std.testing.expectEqual(@as(usize, 27), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -1073,8 +1104,47 @@ test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
     defer deinitTools(std.testing.allocator, tools);
     // shell + file_read + file_write + file_edit + file_append + git + image_info
-    // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule + runtime_info + skill_registry + spawn = 16
-    try std.testing.expectEqual(@as(usize, 16), tools.len);
+    // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule
+    // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
+    // + runtime_info + skill_registry + spawn = 23
+    try std.testing.expectEqual(@as(usize, 23), tools.len);
+}
+
+test "all tools includes cron and pushover tools" {
+    const Config = @import("../config.zig").Config;
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_cron_add = false;
+    var saw_cron_list = false;
+    var saw_cron_remove = false;
+    var saw_cron_runs = false;
+    var saw_cron_run = false;
+    var saw_cron_update = false;
+    var saw_pushover = false;
+
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "cron_add")) saw_cron_add = true;
+        if (std.mem.eql(u8, t.name(), "cron_list")) saw_cron_list = true;
+        if (std.mem.eql(u8, t.name(), "cron_remove")) saw_cron_remove = true;
+        if (std.mem.eql(u8, t.name(), "cron_runs")) saw_cron_runs = true;
+        if (std.mem.eql(u8, t.name(), "cron_run")) saw_cron_run = true;
+        if (std.mem.eql(u8, t.name(), "cron_update")) saw_cron_update = true;
+        if (std.mem.eql(u8, t.name(), "pushover")) saw_pushover = true;
+    }
+
+    try std.testing.expect(saw_cron_add);
+    try std.testing.expect(saw_cron_list);
+    try std.testing.expect(saw_cron_remove);
+    try std.testing.expect(saw_cron_runs);
+    try std.testing.expect(saw_cron_run);
+    try std.testing.expect(saw_cron_update);
+    try std.testing.expect(saw_pushover);
 }
 
 test "all tools propagates sandbox config to shell and git" {
@@ -1163,7 +1233,7 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    try std.testing.expectEqual(@as(usize, 17), tools.len);
+    try std.testing.expectEqual(@as(usize, 24), tools.len);
 
     var found_message = false;
     for (tools) |t| {

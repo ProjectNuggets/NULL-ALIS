@@ -9,9 +9,9 @@ metadata:
   annotations:
     kubernetes.io/ingress.class: nginx
 
-    # Keep long-running SSE streams stable.
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Keep SSE budget aligned with pod drain/termination budget.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
 
     # Route same user to same pod for SQLite single-writer safety.

@@ -202,6 +202,8 @@ USER_IDS=test-user-1,test-user-2 \
 - `preStop` calls `/internal/drain` then `/internal/shutdown`.
 - Readiness returns `503` while draining.
 - Gateway exits after in-flight requests finish.
+- SSE stream budget is aligned to `180s` at ingress (`proxy-read-timeout` / `proxy-send-timeout`) and pod termination grace (`terminationGracePeriodSeconds`).
+- Turns that exceed `180s` can be interrupted during rollout; clients should reconnect and retry.
 
 2. Consistent user routing is enabled at ingress.
 - Hash key: `X-Zaki-User-Id` for app traffic.

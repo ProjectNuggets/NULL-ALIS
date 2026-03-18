@@ -13,7 +13,8 @@ const core_tool_names = [_][]const u8{
     "file_read",
     "file_write",
     "file_edit",
-    "git",
+    "file_append",
+    "git_operations",
     "image_info",
     "memory_store",
     "memory_recall",
@@ -21,18 +22,31 @@ const core_tool_names = [_][]const u8{
     "memory_forget",
     "delegate",
     "schedule",
+    "cron_add",
+    "cron_list",
+    "cron_remove",
+    "cron_runs",
+    "cron_run",
+    "cron_update",
+    "pushover",
+    "runtime_info",
+    "skill_registry",
     "spawn",
+    "screenshot",
 };
 
 const optional_tool_names = [_][]const u8{
     "http_request",
+    "web_fetch",
+    "web_search",
     "browser",
-    "screenshot",
     "composio",
     "browser_open",
+    "message",
     "hardware_board_info",
     "hardware_memory",
     "i2c",
+    "spi",
 };
 
 const ChannelMode = enum {
@@ -61,14 +75,44 @@ fn runtimeHasTool(runtime_tools: ?[]const Tool, name: []const u8) bool {
 
 fn optionalToolEnabledByConfig(cfg: *const Config, name: []const u8) bool {
     if (std.mem.eql(u8, name, "http_request")) return cfg.http_request.enabled;
+    if (std.mem.eql(u8, name, "web_fetch")) return cfg.http_request.enabled;
+    if (std.mem.eql(u8, name, "web_search")) return cfg.http_request.enabled;
     if (std.mem.eql(u8, name, "browser")) return cfg.browser.enabled;
-    if (std.mem.eql(u8, name, "screenshot")) return cfg.browser.enabled;
     if (std.mem.eql(u8, name, "composio")) return cfg.composio.enabled and cfg.composio.api_key != null;
     if (std.mem.eql(u8, name, "browser_open")) return cfg.browser.allowed_domains.len > 0;
-    if (std.mem.eql(u8, name, "hardware_board_info")) return cfg.hardware.enabled;
-    if (std.mem.eql(u8, name, "hardware_memory")) return cfg.hardware.enabled;
-    if (std.mem.eql(u8, name, "i2c")) return cfg.hardware.enabled;
+    // message depends on event_bus wiring at runtime, not config alone.
+    if (std.mem.eql(u8, name, "message")) return false;
+    // Hardware tools depend on runtime board discovery/wiring, not config flag alone.
+    if (std.mem.eql(u8, name, "hardware_board_info")) return false;
+    if (std.mem.eql(u8, name, "hardware_memory")) return false;
+    if (std.mem.eql(u8, name, "i2c")) return false;
+    if (std.mem.eql(u8, name, "spi")) return false;
     return false;
+}
+
+fn collectEstimatedToolNamesFromConfig(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+) ![]const []const u8 {
+    const estimated_tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
+        .config = cfg,
+        .http_enabled = cfg.http_request.enabled,
+        .browser_enabled = cfg.browser.enabled,
+        .screenshot_enabled = true,
+        .composio_api_key = if (cfg.composio.enabled) cfg.composio.api_key else null,
+        .browser_open_domains = if (cfg.browser.allowed_domains.len > 0) cfg.browser.allowed_domains else null,
+        .agents = cfg.agents,
+        .tools_config = cfg.tools,
+        .allowed_paths = cfg.autonomy.allowed_paths,
+    });
+    defer tools_mod.deinitTools(allocator, estimated_tools);
+
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (estimated_tools) |tool| {
+        try out.append(allocator, tool.name());
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 fn collectChannelNames(
@@ -153,6 +197,10 @@ fn collectRuntimeToolNames(
             try out.append(allocator, t.name());
         }
         return try out.toOwnedSlice(allocator);
+    }
+
+    if (cfg_opt) |cfg| {
+        return collectEstimatedToolNamesFromConfig(allocator, cfg);
     }
 
     var estimated: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -430,4 +478,49 @@ test "buildSummaryText includes availability sections" {
 
     try std.testing.expect(std.mem.indexOf(u8, summary, "Available in this runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "Not available in this runtime") != null);
+}
+
+test "buildManifestJson estimated tools align with runtime naming" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const manifest = try buildManifestJson(std.testing.allocator, &cfg, null);
+    defer std.testing.allocator.free(manifest);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"git_operations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_append\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"cron_add\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"cron_update\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"pushover\"") != null);
+}
+
+test "optional tools reflect http toggle for web tools" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.enabled = false;
+    const optional_enabled_off = try collectOptionalTools(std.testing.allocator, &cfg, .enabled);
+    defer std.testing.allocator.free(optional_enabled_off);
+    try std.testing.expect(optional_enabled_off.len == 0);
+
+    cfg.http_request.enabled = true;
+    const optional_enabled_on = try collectOptionalTools(std.testing.allocator, &cfg, .enabled);
+    defer std.testing.allocator.free(optional_enabled_on);
+
+    var saw_http_request = false;
+    var saw_web_fetch = false;
+    var saw_web_search = false;
+    for (optional_enabled_on) |name| {
+        if (std.mem.eql(u8, name, "http_request")) saw_http_request = true;
+        if (std.mem.eql(u8, name, "web_fetch")) saw_web_fetch = true;
+        if (std.mem.eql(u8, name, "web_search")) saw_web_search = true;
+    }
+
+    try std.testing.expect(saw_http_request);
+    try std.testing.expect(saw_web_fetch);
+    try std.testing.expect(saw_web_search);
 }

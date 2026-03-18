@@ -803,8 +803,8 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\  list                          List configured channels
             \\  start [channel]               Start a channel (default: first available)
             \\  status                        Show channel health/status
-            \\  add <type> <config_json>      Add a channel
-            \\  remove <name>                 Remove a channel
+            \\  add <type>                    Manual config-only (not implemented in CLI)
+            \\  remove <name>                 Manual config-only (not implemented in CLI)
             \\
         , .{});
         std.process.exit(1);
@@ -846,15 +846,19 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             std.debug.print("\n", .{});
             std.process.exit(1);
         }
+        std.debug.print("Not implemented: nullalis channel add\n", .{});
         std.debug.print("To add a '{s}' channel, edit your config file:\n  {s}\n", .{ sub_args[1], cfg.config_path });
         std.debug.print("Add a \"{s}\" object under \"channels\" with the required fields.\n", .{sub_args[1]});
+        std.process.exit(2);
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullalis channel remove <name>\n", .{});
             std.process.exit(1);
         }
+        std.debug.print("Not implemented: nullalis channel remove\n", .{});
         std.debug.print("To remove the '{s}' channel, edit your config file:\n  {s}\n", .{ sub_args[1], cfg.config_path });
         std.debug.print("Remove or set the \"{s}\" object to null under \"channels\".\n", .{sub_args[1]});
+        std.process.exit(2);
     } else {
         std.debug.print("Unknown channel command: {s}\n", .{subcmd});
         std.process.exit(1);
@@ -1012,8 +1016,8 @@ fn runHardware(allocator: std.mem.Allocator, sub_args: []const []const u8) !void
             \\
             \\Commands:
             \\  scan                          Scan for connected hardware
-            \\  flash                         Flash firmware to a device
-            \\  monitor                       Monitor connected devices
+            \\  flash                         Not implemented
+            \\  monitor                       Not implemented
             \\
         , .{});
         std.process.exit(1);
@@ -1051,9 +1055,13 @@ fn runHardware(allocator: std.mem.Allocator, sub_args: []const []const u8) !void
             std.debug.print("Usage: nullalis hardware flash <firmware_file> [--target <board>]\n", .{});
             std.process.exit(1);
         }
-        std.debug.print("Flash not yet implemented. Firmware file: {s}\n", .{sub_args[1]});
+        std.debug.print("Not implemented: nullalis hardware flash\n", .{});
+        std.debug.print("Firmware file provided: {s}\n", .{sub_args[1]});
+        std.process.exit(2);
     } else if (std.mem.eql(u8, subcmd, "monitor")) {
-        std.debug.print("Monitor not yet implemented. Use `nullalis hardware scan` to discover devices first.\n", .{});
+        std.debug.print("Not implemented: nullalis hardware monitor\n", .{});
+        std.debug.print("Use `nullalis hardware scan` to discover devices first.\n", .{});
+        std.process.exit(2);
     } else {
         std.debug.print("Unknown hardware command: {s}\n", .{subcmd});
         std.process.exit(1);
@@ -1674,7 +1682,7 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Commands:
             \\  list                          List available models
             \\  info <model>                  Show model details
-            \\  benchmark                     Run model latency benchmark
+            \\  benchmark                     Not implemented
             \\  refresh                       Refresh model catalog
             \\
         , .{});
@@ -1711,8 +1719,9 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         std.debug.print("  Context: varies by provider\n", .{});
         std.debug.print("  Pricing: see provider dashboard\n", .{});
     } else if (std.mem.eql(u8, subcmd, "benchmark")) {
-        std.debug.print("Running model latency benchmark...\n", .{});
-        std.debug.print("Configure a provider first (nullalis onboard).\n", .{});
+        std.debug.print("Not implemented: nullalis models benchmark\n", .{});
+        std.debug.print("Use `nullalis models list` and provider dashboards for latency verification.\n", .{});
+        std.process.exit(2);
     } else if (std.mem.eql(u8, subcmd, "refresh")) {
         try yc.onboard.runModelsRefresh(allocator);
     } else {
