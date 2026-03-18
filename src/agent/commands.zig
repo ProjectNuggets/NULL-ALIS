@@ -2516,6 +2516,21 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
         );
     }
 
+    if (std.ascii.eqlIgnoreCase(action_or_name, "remove") or std.ascii.eqlIgnoreCase(action_or_name, "uninstall")) {
+        const target = std.mem.trim(u8, parsed.tail, " \t");
+        if (target.len == 0) {
+            return try self.allocator.dupe(u8, "Usage: /skill remove <local-skill-name>");
+        }
+        skills_mod.removeSkill(self.allocator, target, self.workspace_dir) catch |err| {
+            return switch (err) {
+                error.SkillNotFound => try std.fmt.allocPrint(self.allocator, "Skill not found: {s}", .{target}),
+                error.UnsafeName => try self.allocator.dupe(u8, "Invalid skill name."),
+                else => try std.fmt.allocPrint(self.allocator, "Skill remove failed: {s}", .{@errorName(err)}),
+            };
+        };
+        return try std.fmt.allocPrint(self.allocator, "Removed local skill `{s}`.", .{target});
+    }
+
     const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
     };

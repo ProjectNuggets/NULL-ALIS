@@ -12,9 +12,9 @@ pub const SkillRegistryTool = struct {
     workspace_dir: []const u8,
 
     pub const tool_name = "skill_registry";
-    pub const tool_description = "Manage skills. Actions: list installed skills, search Decision Hub skills, and install a skill from Decision Hub by org/skill reference or natural-language query.";
+    pub const tool_description = "Manage skills. Actions: list installed skills, search Decision Hub skills, install a skill from Decision Hub, and remove locally installed skills.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["list","search","install"],"default":"list"},"query":{"type":"string","description":"Natural-language search query or install target query"},"skill_ref":{"type":"string","description":"Decision Hub reference org/skill for install"},"count":{"type":"integer","minimum":1,"maximum":20,"default":5},"spec":{"type":"string","description":"Version spec for install (default latest)"},"allow_risky":{"type":"boolean","default":false,"description":"Allow C-grade risky skills on install"}}}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["list","search","install","remove","uninstall"],"default":"list"},"query":{"type":"string","description":"Natural-language search query or install target query"},"skill_ref":{"type":"string","description":"Decision Hub reference org/skill for install"},"name":{"type":"string","description":"Local installed skill name for remove/uninstall"},"count":{"type":"integer","minimum":1,"maximum":20,"default":5},"spec":{"type":"string","description":"Version spec for install (default latest)"},"allow_risky":{"type":"boolean","default":false,"description":"Allow C-grade risky skills on install"}}}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -31,7 +31,8 @@ pub const SkillRegistryTool = struct {
         if (std.ascii.eqlIgnoreCase(action, "list")) return try listInstalled(self, allocator);
         if (std.ascii.eqlIgnoreCase(action, "search")) return try searchRegistry(allocator, args);
         if (std.ascii.eqlIgnoreCase(action, "install")) return try installSkill(self, allocator, args);
-        const msg = try std.fmt.allocPrint(allocator, "Unknown action '{s}'. Use list|search|install.", .{action});
+        if (std.ascii.eqlIgnoreCase(action, "remove") or std.ascii.eqlIgnoreCase(action, "uninstall")) return try removeSkill(self, allocator, args);
+        const msg = try std.fmt.allocPrint(allocator, "Unknown action '{s}'. Use list|search|install|remove.", .{action});
         return .{ .success = false, .output = "", .error_msg = msg };
     }
 };
@@ -125,6 +126,24 @@ fn installSkill(self: *SkillRegistryTool, allocator: std.mem.Allocator, args: Js
     return .{ .success = true, .output = msg };
 }
 
+fn removeSkill(self: *SkillRegistryTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    const raw_name = root.getString(args, "name") orelse {
+        return ToolResult.fail("Missing 'name'. Use action=remove with local skill name.");
+    };
+    const name = std.mem.trim(u8, raw_name, " \t\r\n");
+    if (name.len == 0) return ToolResult.fail("'name' must not be empty.");
+
+    skills_mod.removeSkill(allocator, name, self.workspace_dir) catch |err| {
+        return switch (err) {
+            error.SkillNotFound => ToolResult.fail("Skill not found."),
+            error.UnsafeName => ToolResult.fail("Invalid skill name."),
+            else => ToolResult.fail("Skill remove failed."),
+        };
+    };
+
+    return ToolResult.ok("Removed local skill.");
+}
+
 test "skill_registry list action handles empty workspace" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -156,4 +175,68 @@ test "skill_registry search action requires query" {
     try std.testing.expect(!result.success);
     try std.testing.expect(result.error_msg != null);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Missing 'query'") != null);
+}
+
+test "skill_registry remove action requires name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var tool = SkillRegistryTool{ .workspace_dir = workspace };
+    var parsed = try root.parseTestArgs("{\"action\":\"remove\"}");
+    defer parsed.deinit();
+    const result = try tool.execute(allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Missing 'name'") != null);
+}
+
+test "skill_registry remove action returns not found" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var tool = SkillRegistryTool{ .workspace_dir = workspace };
+    var parsed = try root.parseTestArgs("{\"action\":\"remove\",\"name\":\"ghost\"}");
+    defer parsed.deinit();
+    const result = try tool.execute(allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Skill not found.") != null);
+}
+
+test "skill_registry remove action deletes installed skill" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const skills_root = try std.fs.path.join(allocator, &.{ workspace, "skills" });
+    defer allocator.free(skills_root);
+    try std.fs.makeDirAbsolute(skills_root);
+
+    const skills_dir = try std.fs.path.join(allocator, &.{ workspace, "skills", "temp-skill" });
+    defer allocator.free(skills_dir);
+    try std.fs.makeDirAbsolute(skills_dir);
+
+    const marker_path = try std.fs.path.join(allocator, &.{ skills_dir, "skill.json" });
+    defer allocator.free(marker_path);
+    const marker_file = try std.fs.createFileAbsolute(marker_path, .{});
+    marker_file.close();
+
+    var tool = SkillRegistryTool{ .workspace_dir = workspace };
+    var parsed = try root.parseTestArgs("{\"action\":\"remove\",\"name\":\"temp-skill\"}");
+    defer parsed.deinit();
+    const result = try tool.execute(allocator, parsed.value.object);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Removed local skill.") != null);
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(skills_dir, .{}));
 }
