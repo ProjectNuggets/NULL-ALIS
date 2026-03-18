@@ -136,7 +136,7 @@ pub const Config = struct {
     memory_backend: []const u8 = config_types.MemoryConfig.DEFAULT_MEMORY_BACKEND,
     memory_auto_save: bool = true,
     heartbeat_enabled: bool = false,
-    heartbeat_interval_minutes: u32 = 30,
+    heartbeat_interval_minutes: u32 = 60,
     gateway_host: []const u8 = "127.0.0.1",
     gateway_port: u16 = 3000,
     workspace_only: bool = true,
@@ -533,7 +533,7 @@ pub const Config = struct {
         // agents.defaults (model + heartbeat) + agents.list
         {
             const has_model = self.default_model != null;
-            const has_heartbeat = self.heartbeat.enabled or self.heartbeat.interval_minutes != 30;
+            const has_heartbeat = self.heartbeat.enabled or self.heartbeat.interval_minutes != 60;
             const has_agents = self.agents.len > 0;
             if (has_model or has_heartbeat or has_agents) {
                 try w.print("  \"agents\": {{\n", .{});

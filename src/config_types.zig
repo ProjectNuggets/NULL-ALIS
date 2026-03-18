@@ -193,7 +193,7 @@ pub const ModelRouteConfig = struct {
 
 pub const HeartbeatConfig = struct {
     enabled: bool = false,
-    interval_minutes: u32 = 30,
+    interval_minutes: u32 = 60,
 };
 
 pub const CronConfig = struct {
