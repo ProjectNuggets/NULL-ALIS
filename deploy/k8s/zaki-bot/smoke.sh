@@ -39,8 +39,8 @@ host_resolves() {
     dig +short "${host}" | grep -q '.'
     return $?
   fi
-  echo "warning: no DNS resolver tools (getent/nslookup/dig) found; skipping DNS check for ${host}" >&2
-  return 0
+  echo "error: strict DNS check requested but no resolver tools available (need getent or nslookup or dig) for ${host}" >&2
+  return 1
 }
 
 if [[ "${EXPECT_BASE_URL_DNS}" == "true" ]]; then

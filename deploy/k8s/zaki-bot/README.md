@@ -195,6 +195,10 @@ EXPECT_NOT_DEGRADED=true \
 PGBOUNCER_EXPECTED=true \
 ./deploy/k8s/zaki-bot/smoke.sh
 ```
+Notes for strict mode:
+1. DNS resolver tooling must be present on the operator host (`getent`, `nslookup`, or `dig`).
+2. If no resolver tool is installed, strict mode fails closed by design.
+
 4. Run stickiness probe.
 ```bash
 BASE_URL=https://agent-staging.zaki.com \
