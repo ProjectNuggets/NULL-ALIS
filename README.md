@@ -25,6 +25,7 @@ Current verified baseline on active branch work:
 
 References:
 - [v0.1 declaration (2026-03-18)](docs/releases/v0.1-declaration-2026-03-18.md)
+- [v1.1 next steps](docs/releases/v1.1-next-steps.md)
 - [v0.1 final sweep](docs/final-sweep-2026-03-09.md)
 - [ops runbook](docs/reliability-ops-runbook.md)
 - [runtime status notes](docs/status-2026-03-06.md)
