@@ -180,6 +180,21 @@ TELEGRAM_WEBHOOK_SECRET=... \
 PGBOUNCER_EXPECTED=true \
 ./deploy/k8s/zaki-bot/smoke.sh
 ```
+For strict staging readiness (Phase 2 gates), require DNS + non-degraded Postgres runtime:
+```bash
+BASE_URL=https://agent-staging.zaki.com \
+INTERNAL_TOKEN=... \
+USER_ID=test-user-1 \
+TELEGRAM_BOT_TOKEN=... \
+WEBHOOK_BASE_URL=https://agent-staging.zaki.com \
+TELEGRAM_WEBHOOK_SECRET=... \
+EXPECT_BASE_URL_DNS=true \
+EXPECT_WEBHOOK_BASE_URL_DNS=true \
+EXPECT_STATE_EFFECTIVE=postgres \
+EXPECT_NOT_DEGRADED=true \
+PGBOUNCER_EXPECTED=true \
+./deploy/k8s/zaki-bot/smoke.sh
+```
 4. Run stickiness probe.
 ```bash
 BASE_URL=https://agent-staging.zaki.com \

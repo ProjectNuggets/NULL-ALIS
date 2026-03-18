@@ -8,19 +8,89 @@ set -euo pipefail
 : "${WEBHOOK_BASE_URL:?Set WEBHOOK_BASE_URL, e.g. https://agent-staging.zaki.com}"
 : "${TELEGRAM_WEBHOOK_SECRET:?Set TELEGRAM_WEBHOOK_SECRET}"
 : "${PGBOUNCER_EXPECTED:=false}"
+: "${EXPECT_NOT_DEGRADED:=false}"
+: "${EXPECT_STATE_EFFECTIVE:=}"
+: "${EXPECT_BASE_URL_DNS:=false}"
+: "${EXPECT_WEBHOOK_BASE_URL_DNS:=false}"
 
 auth=(-H "X-Internal-Token: ${INTERNAL_TOKEN}")
 json=(-H "Content-Type: application/json")
+
+extract_host() {
+  # Accepts URL-like values (https://host:port/path) and returns host only.
+  # If input already looks like a bare host, returns it unchanged.
+  local raw="$1"
+  local host
+  host="$(printf '%s' "${raw}" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*$##; s#:[0-9]+$##')"
+  printf '%s' "${host}"
+}
+
+host_resolves() {
+  local host="$1"
+  if command -v getent >/dev/null 2>&1; then
+    getent ahosts "${host}" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v nslookup >/dev/null 2>&1; then
+    nslookup "${host}" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v dig >/dev/null 2>&1; then
+    dig +short "${host}" | grep -q '.'
+    return $?
+  fi
+  echo "warning: no DNS resolver tools (getent/nslookup/dig) found; skipping DNS check for ${host}" >&2
+  return 0
+}
+
+if [[ "${EXPECT_BASE_URL_DNS}" == "true" ]]; then
+  base_host="$(extract_host "${BASE_URL}")"
+  echo "[0a/9] verify BASE_URL DNS resolves (${base_host})"
+  if ! host_resolves "${base_host}"; then
+    echo "BASE_URL host does not resolve: ${base_host}" >&2
+    exit 1
+  fi
+fi
+
+if [[ "${EXPECT_WEBHOOK_BASE_URL_DNS}" == "true" ]]; then
+  webhook_host="$(extract_host "${WEBHOOK_BASE_URL}")"
+  echo "[0b/9] verify WEBHOOK_BASE_URL DNS resolves (${webhook_host})"
+  if ! host_resolves "${webhook_host}"; then
+    echo "WEBHOOK_BASE_URL host does not resolve: ${webhook_host}" >&2
+    exit 1
+  fi
+fi
 
 echo "[1/9] health and ready"
 curl -fsS "${BASE_URL}/health" >/dev/null
 curl -fsS "${BASE_URL}/ready" >/dev/null
 
+diagnostics_json="$(curl -fsS "${BASE_URL}/internal/diagnostics" "${auth[@]}")"
+state_effective="$(jq -r '.startup_self_check.state_effective // ""' <<<"${diagnostics_json}")"
+degraded_flag="$(jq -r '.startup_self_check.degraded // ""' <<<"${diagnostics_json}")"
+
 if [[ "${PGBOUNCER_EXPECTED}" == "true" ]]; then
   echo "[1b/9] verify runtime is routed via PgBouncer"
-  pg_port="$(curl -fsS "${BASE_URL}/internal/diagnostics" "${auth[@]}" | jq -r '.startup_self_check.pg_port // ""')"
+  pg_port="$(jq -r '.startup_self_check.pg_port // ""' <<<"${diagnostics_json}")"
   if [[ "${pg_port}" != "6432" ]]; then
     echo "expected pg_port=6432 (PgBouncer), got: ${pg_port}" >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "${EXPECT_STATE_EFFECTIVE}" ]]; then
+  echo "[1c/9] verify effective state backend (${EXPECT_STATE_EFFECTIVE})"
+  if [[ "${state_effective}" != "${EXPECT_STATE_EFFECTIVE}" ]]; then
+    echo "expected startup_self_check.state_effective=${EXPECT_STATE_EFFECTIVE}, got: ${state_effective}" >&2
+    exit 1
+  fi
+fi
+
+if [[ "${EXPECT_NOT_DEGRADED}" == "true" ]]; then
+  echo "[1d/9] verify runtime is not degraded"
+  if [[ "${degraded_flag}" != "false" ]]; then
+    degraded_reason="$(jq -r '.startup_self_check.degraded_reason // ""' <<<"${diagnostics_json}")"
+    echo "expected startup_self_check.degraded=false, got: ${degraded_flag} (${degraded_reason})" >&2
     exit 1
   fi
 fi
