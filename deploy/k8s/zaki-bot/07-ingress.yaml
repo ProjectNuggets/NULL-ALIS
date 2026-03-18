@@ -13,6 +13,8 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # Internal-only exposure: allow private-network source ranges only.
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 
     # Route same user to same pod for SQLite single-writer safety.
     # App requests use X-Zaki-User-Id, Telegram uses user_id query arg.

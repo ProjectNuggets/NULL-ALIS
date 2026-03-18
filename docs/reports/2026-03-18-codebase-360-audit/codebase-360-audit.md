@@ -119,3 +119,40 @@ Legend:
 - Confirmed fact: the codebase is not sloppy, but it is not yet “swiss watch exact.”
 - Confirmed fact: the sharpest current wrinkles are profile-specific correctness gaps and decorative config/features: Postgres-enabled tests fail, some config knobs do not drive runtime behavior, and some docs promise a cleaner contract than the gateway actually enforces. (`src/channel_identity_backfill.zig:211-277`, `src/inbound_canonicalizer.zig:516-790`, `src/gateway.zig:11403-11410`, `src/config_parse.zig:599-610`, `src/config_parse.zig:1623-1665`, `src/config_parse.zig:1740-1745`, `docs/openapi-v1.yaml:8-13`, `src/gateway.zig:1361-1439`)
 - High-confidence inference: the next step is not broad refactoring; it is tightening the decorative surfaces until config, docs, tests, and the deployment profile all describe the same machine.
+
+## Next Steps: Memory and Caching Roadmap
+
+### Objective
+
+- Keep current snappy behavior while improving continuity and correctness using explicit short-term, mid-term, and long-term memory layers plus disciplined caching.
+
+### Phase 1 (Short-Term Memory, Hot Path)
+
+- Keep interactive turn compaction trim-only (`turn_compaction mode=trim`) and avoid provider-backed summarization in the turn hot path.
+- Maintain a strict working set per lane/session: recent turns + active task context only.
+- Add per-turn retrieval dedupe (L1 cache) to avoid repeated identical memory lookups within a single turn.
+
+### Phase 2 (Mid-Term Memory, Boundary Path)
+
+- Keep lifecycle summarizer at boundaries only (`/new`, TTL recycle/evict, idle evict, shutdown/drain checkpoint).
+- Enforce bounded summarizer budget (cooldown + timeout + fallback) so failure never blocks user-turn completion.
+- Store session episodes as `session_summary/*` and keep them retrievable ahead of noisy transcript/autosave entries.
+
+### Phase 3 (Long-Term Durable Memory)
+
+- Promote only durable facts by policy: preferences, decisions, commitments, project state, relationship facts, shared vocabulary.
+- Do not auto-promote filler/tool noise/transient guesses.
+- Keep canonical durable state in backend; workspace files remain projection/inspection surfaces.
+
+### Caching Layers
+
+- L1: in-turn dedupe cache for repeated retrieval calls in the same turn.
+- L2: semantic/response cache with TTL + similarity/confidence threshold.
+- L3: short-lived retrieval-result cache keyed by `(user_id, session_lane, query_hash)` to cut repetitive enrich latency across nearby turns.
+
+### Validation Gates
+
+- Stage attribution must show no provider-backed compaction in interactive hot path.
+- Boundary summarizer events (`memory_lifecycle_summarizer`) must appear on checkpoint flows, not ordinary turn flows.
+- Recall quality tests must show durable fact recall without transcript stuffing.
+- Cache hit ratio and latency deltas must improve p50/p95 without increasing wrong-context recalls.

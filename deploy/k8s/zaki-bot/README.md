@@ -6,7 +6,8 @@ This folder is the deployment handoff package for running `nullALIS` as the dedi
 This package is for the shared pool model with tenant isolation under `/data/users/{user_id}`.
 
 Compatibility note:
-- This deployment pack still uses `nullclaw` resource names, labels, lock-file names, and metric prefixes.
+- This deployment pack still uses `nullclaw` resource names, labels, and lock-file names.
+- Gateway metric prefixes are `nullalis_*`.
 - Keep those names unless you also migrate the manifest objects and dashboards together.
 
 It includes:
@@ -75,6 +76,8 @@ Planning envelope (validate with your own traffic replay):
 3. TLS secret exists for `agent-staging.zaki.com`.
 4. ZAKI backend can call nullALIS internal APIs with `X-Internal-Token`.
 5. ZAKI backend sends canonical `X-Zaki-User-Id` for app chat calls.
+6. Prometheus Operator CRDs are installed if you apply `ServiceMonitor` / `PrometheusRule` resources.
+7. Ingress controller is internal-only (DO VPC internal LB) and no public DNS route points to this ingress host.
 
 Sticky routing contract:
 1. precedence is `X-Zaki-User-Id` (app/API) then `user_id` query arg (Telegram webhook path).
@@ -104,7 +107,7 @@ Update these fields before apply:
  - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (if not using workload identity)
 4. `07-ingress.yaml`: host and TLS secret if different.
 5. `02-configmap.yaml`:
-- `PUBLIC_BASE_URL`, `TELEGRAM_ALLOW_FROM` policy
+- `TELEGRAM_ALLOW_FROM` policy
 - Postgres state tuning (`STATE_BACKEND`, `POSTGRES_SCHEMA`, `POSTGRES_POOL_MAX`, timeout values)
 - PgBouncer toggles/tuning (`POSTGRES_USE_PGBOUNCER`, `PGBOUNCER_*`)
 - Composio toggles (`COMPOSIO_ENABLED`, `COMPOSIO_ENTITY_ID`)

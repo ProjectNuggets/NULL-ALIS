@@ -62,6 +62,54 @@ spec:
               if [ "${SESSION_CROSS_CHANNEL_SHARED_MAIN:-false}" = "true" ]; then
                 SESSION_SHARED_MAIN_BOOL=true
               fi
+              json_escape() {
+                # Escape arbitrary env values so runtime config JSON remains valid.
+                printf '%s' "$1" | sed \
+                  -e 's/\\/\\\\/g' \
+                  -e 's/"/\\"/g' \
+                  -e ':a' \
+                  -e 'N' \
+                  -e '$!ba' \
+                  -e 's/\n/\\n/g' \
+                  -e 's/\r/\\r/g' \
+                  -e 's/\t/\\t/g'
+              }
+              require_bool() {
+                case "$2" in
+                  true|false) ;;
+                  *)
+                    echo "invalid boolean for $1: $2" >&2
+                    exit 1
+                    ;;
+                esac
+              }
+              require_uint() {
+                case "$2" in
+                  ''|*[!0-9]*)
+                    echo "invalid integer for $1: $2" >&2
+                    exit 1
+                    ;;
+                  *)
+                    ;;
+                esac
+              }
+              require_bool COMPOSIO_ENABLED "${COMPOSIO_ENABLED}"
+              require_uint GATEWAY_PORT "${GATEWAY_PORT}"
+              require_uint POSTGRES_POOL_MAX "${POSTGRES_POOL_MAX}"
+              require_uint POSTGRES_STATEMENT_TIMEOUT_MS "${POSTGRES_STATEMENT_TIMEOUT_MS}"
+              require_uint POSTGRES_LOCK_TIMEOUT_MS "${POSTGRES_LOCK_TIMEOUT_MS}"
+              OPENROUTER_API_KEY_ESC="$(json_escape "${OPENROUTER_API_KEY}")"
+              INTERNAL_SERVICE_TOKEN_ESC="$(json_escape "${INTERNAL_SERVICE_TOKEN}")"
+              GATEWAY_HOST_ESC="$(json_escape "${GATEWAY_HOST}")"
+              TENANT_DATA_ROOT_ESC="$(json_escape "${TENANT_DATA_ROOT}")"
+              STATE_BACKEND_ESC="$(json_escape "${STATE_BACKEND}")"
+              POSTGRES_RUNTIME_CONNECTION_STRING_ESC="$(json_escape "${POSTGRES_RUNTIME_CONNECTION_STRING}")"
+              POSTGRES_SCHEMA_ESC="$(json_escape "${POSTGRES_SCHEMA}")"
+              COMPOSIO_API_KEY_ESC="$(json_escape "${COMPOSIO_API_KEY}")"
+              COMPOSIO_ENTITY_ID_ESC="$(json_escape "${COMPOSIO_ENTITY_ID}")"
+              TELEGRAM_BOT_TOKEN_ESC="$(json_escape "${TELEGRAM_BOT_TOKEN}")"
+              TELEGRAM_WEBHOOK_SECRET_ESC="$(json_escape "${TELEGRAM_WEBHOOK_SECRET}")"
+              TELEGRAM_ALLOW_FROM_ESC="$(json_escape "${TELEGRAM_ALLOW_FROM}")"
 
               cat > /nullclaw-data/.nullalis/config.json <<JSON
               {
@@ -75,31 +123,31 @@ spec:
                 "models": {
                   "providers": {
                     "openrouter": {
-                      "api_key": "${OPENROUTER_API_KEY}",
+                      "api_key": "${OPENROUTER_API_KEY_ESC}",
                       "base_url": "https://openrouter.ai/api/v1"
                     }
                   }
                 },
                 "gateway": {
                   "port": ${GATEWAY_PORT},
-                  "host": "${GATEWAY_HOST}",
+                  "host": "${GATEWAY_HOST_ESC}",
                   "require_pairing": false,
                   "allow_public_bind": true,
                   "max_workers": 16,
                   "max_queued_requests": 2048,
-                  "internal_service_tokens": ["${INTERNAL_SERVICE_TOKEN}"]
+                  "internal_service_tokens": ["${INTERNAL_SERVICE_TOKEN_ESC}"]
                 },
                 "tenant": {
                   "enabled": true,
-                  "data_root": "${TENANT_DATA_ROOT}",
+                  "data_root": "${TENANT_DATA_ROOT_ESC}",
                   "runtime_cache_max_users": 2048,
                   "runtime_idle_ttl_secs": 1800
                 },
                 "state": {
-                  "backend": "${STATE_BACKEND}",
+                  "backend": "${STATE_BACKEND_ESC}",
                   "postgres": {
-                    "connection_string": "${POSTGRES_RUNTIME_CONNECTION_STRING}",
-                    "schema": "${POSTGRES_SCHEMA}",
+                    "connection_string": "${POSTGRES_RUNTIME_CONNECTION_STRING_ESC}",
+                    "schema": "${POSTGRES_SCHEMA_ESC}",
                     "pool_max": ${POSTGRES_POOL_MAX},
                     "statement_timeout_ms": ${POSTGRES_STATEMENT_TIMEOUT_MS},
                     "lock_timeout_ms": ${POSTGRES_LOCK_TIMEOUT_MS}
@@ -107,8 +155,8 @@ spec:
                 },
                 "composio": {
                   "enabled": ${COMPOSIO_ENABLED},
-                  "api_key": "${COMPOSIO_API_KEY}",
-                  "entity_id": "${COMPOSIO_ENTITY_ID}"
+                  "api_key": "${COMPOSIO_API_KEY_ESC}",
+                  "entity_id": "${COMPOSIO_ENTITY_ID_ESC}"
                 },
                 "session": {
                   "cross_channel_shared_main": ${SESSION_SHARED_MAIN_BOOL}
@@ -118,10 +166,10 @@ spec:
                     "accounts": {
                       "default": {
                         "account_id": "default",
-                        "bot_token": "${TELEGRAM_BOT_TOKEN}",
+                        "bot_token": "${TELEGRAM_BOT_TOKEN_ESC}",
                         "receive_mode": "webhook",
-                        "webhook_secret_token": "${TELEGRAM_WEBHOOK_SECRET}",
-                        "allow_from": ["${TELEGRAM_ALLOW_FROM}"]
+                        "webhook_secret_token": "${TELEGRAM_WEBHOOK_SECRET_ESC}",
+                        "allow_from": ["${TELEGRAM_ALLOW_FROM_ESC}"]
                       }
                     }
                   }

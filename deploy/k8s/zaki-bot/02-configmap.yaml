@@ -29,9 +29,6 @@ data:
   # Tenant user data root on mounted RWX volume.
   TENANT_DATA_ROOT: "/data/users"
 
-  # Dedicated ingress host for agent runtime.
-  PUBLIC_BASE_URL: "https://agent-staging.zaki.com"
-
   # Set to "*" for initial staging. For production, replace with explicit IDs
   # or implement per-user mapping enforcement in Nullclaw before tightening.
   TELEGRAM_ALLOW_FROM: "*"

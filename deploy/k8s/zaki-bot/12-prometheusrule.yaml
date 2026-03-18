@@ -26,6 +26,14 @@ spec:
           annotations:
             summary: "Nullclaw drain rejections are elevated"
             description: "Pods are rejecting many requests while draining. Check rollout pacing and readiness behavior."
+        - alert: NullclawOverloadRejectsHigh
+          expr: rate(nullalis_gateway_overload_rejected_total[5m]) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Nullclaw overload rejections are elevated"
+            description: "Gateway queue is saturating and rejecting requests. Check HPA headroom and upstream latency."
         - alert: NullclawTelegramWebhookRejectsHigh
           expr: rate(nullalis_gateway_telegram_webhook_rejected_total[5m]) > 1
           for: 10m
