@@ -614,6 +614,8 @@ const UserContext = struct {
 };
 
 const TenantRuntime = struct {
+    const TENANT_SEED_SCHEMA_VERSION: []const u8 = "2026-03-18-v1";
+
     allocator: std.mem.Allocator,
     user_id: []u8,
     workspace_path: []u8,
@@ -761,6 +763,11 @@ const TenantRuntime = struct {
                         if (state_mgr.?.putConfigJson(numeric_user_id, seed)) |_| {
                             runtime.effective_config_source = "postgres_seeded_from_file";
                             runtime.effective_config_hash = configHash(seed);
+                            log.info("tenant.config.seeded user={s} schema_version={s} hash={x}", .{
+                                user_ctx.user_id,
+                                TENANT_SEED_SCHEMA_VERSION,
+                                runtime.effective_config_hash,
+                            });
                             runtime.config.parseJson(seed) catch |err| {
                                 log.warn("tenant seeded config parse failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
                             };
@@ -4325,6 +4332,8 @@ fn internalDiagnosticsPayload(
     var lease_probe_data_source: ?[]const u8 = null;
     var effective_config_source: []const u8 = if (user_id_opt == null) "no_user_context" else "runtime_not_loaded";
     var effective_config_hash: ?u64 = null;
+    var memory_search_enabled: ?bool = null;
+    var memory_summarizer_enabled: ?bool = null;
     if (user_id_opt) |user_id_raw| {
         {
             const mutable_state: *GatewayState = @constCast(state);
@@ -4333,6 +4342,8 @@ fn internalDiagnosticsPayload(
             if (mutable_state.tenant_runtimes.get(user_id_raw)) |tenant_runtime| {
                 effective_config_source = tenant_runtime.effective_config_source;
                 effective_config_hash = tenant_runtime.effective_config_hash;
+                memory_search_enabled = tenant_runtime.config.memory.search.enabled;
+                memory_summarizer_enabled = tenant_runtime.config.memory.summarizer.enabled;
             }
         }
 
@@ -4426,6 +4437,20 @@ fn internalDiagnosticsPayload(
         var hash_buf: [24]u8 = undefined;
         const hash_text = std.fmt.bufPrint(&hash_buf, "{x:0>16}", .{hash}) catch "0000000000000000";
         try json_util.appendJsonString(&buf, allocator, hash_text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "memory_search_enabled");
+    if (memory_search_enabled) |enabled| {
+        try buf.appendSlice(allocator, if (enabled) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "memory_summarizer_enabled");
+    if (memory_summarizer_enabled) |enabled| {
+        try buf.appendSlice(allocator, if (enabled) "true" else "false");
     } else {
         try buf.appendSlice(allocator, "null");
     }

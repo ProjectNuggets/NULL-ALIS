@@ -227,6 +227,8 @@ pub fn mergeSettingsIntoConfigJson(
     putBool(session_obj, a, "cross_channel_shared_main", false) catch {};
 
     const memory_obj = ensureObjectKey(root_obj, a, "memory");
+    const search_obj = ensureObjectKey(memory_obj, a, "search");
+    putBool(search_obj, a, "enabled", true) catch {};
     const summarizer_obj = ensureObjectKey(memory_obj, a, "summarizer");
     putBool(summarizer_obj, a, "enabled", mapping.summarizer_enabled) catch {};
     putInt(summarizer_obj, a, "window_size_tokens", mapping.summarizer_window_size_tokens) catch {};
@@ -528,6 +530,8 @@ test "mergeSettingsIntoConfigJson preserves unknown keys and writes mapped agent
     const session = parsed.value.object.get("session").?.object;
     try std.testing.expectEqual(false, session.get("cross_channel_shared_main").?.bool);
     const memory = parsed.value.object.get("memory").?.object;
+    const search = memory.get("search").?.object;
+    try std.testing.expectEqual(true, search.get("enabled").?.bool);
     const summarizer = memory.get("summarizer").?.object;
     try std.testing.expectEqual(true, summarizer.get("enabled").?.bool);
     try std.testing.expectEqual(@as(i64, 6000), summarizer.get("window_size_tokens").?.integer);
