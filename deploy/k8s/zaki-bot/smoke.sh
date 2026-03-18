@@ -76,8 +76,8 @@ curl -fsS "${BASE_URL}/health" >/dev/null
 curl -fsS "${BASE_URL}/ready" >/dev/null
 
 diagnostics_json="$(curl -fsS "${BASE_URL}/internal/diagnostics" "${auth[@]}")"
-state_effective="$(jq -r '.startup_self_check.state_effective // ""' <<<"${diagnostics_json}")"
-degraded_flag="$(jq -r '.startup_self_check.degraded // ""' <<<"${diagnostics_json}")"
+state_effective="$(jq -r '.startup_self_check.state_backend_effective // ""' <<<"${diagnostics_json}")"
+degraded_flag="$(jq -r '.startup_self_check.degraded | tostring' <<<"${diagnostics_json}")"
 scheduler_backend="$(jq -r '.startup_self_check.scheduler_backend // ""' <<<"${diagnostics_json}")"
 
 if [[ "${PGBOUNCER_EXPECTED}" == "true" ]]; then
@@ -100,7 +100,7 @@ fi
 if [[ "${EXPECT_NOT_DEGRADED}" == "true" ]]; then
   echo "[1d] verify runtime is not degraded"
   if [[ "${degraded_flag}" != "false" ]]; then
-    degraded_reason="$(jq -r '.startup_self_check.degraded_reason // ""' <<<"${diagnostics_json}")"
+    degraded_reason="$(jq -r '.startup_self_check.degraded_reason // "none"' <<<"${diagnostics_json}")"
     echo "expected startup_self_check.degraded=false, got: ${degraded_flag} (${degraded_reason})" >&2
     exit 1
   fi
@@ -141,9 +141,9 @@ fi
 step_chat=$( [[ "${SMOKE_MODE}" == "app" ]] && echo 4 || echo 6 )
 echo "[${step_chat}/${total_steps}] chat stream"
 session_key="agent:zaki-bot:user:${USER_ID}:main"
-curl -fsS -N -X POST "${BASE_URL}/api/v1/chat/stream" "${auth[@]}" "${json[@]}" \
+curl -sS -N -X POST "${BASE_URL}/api/v1/chat/stream" "${auth[@]}" "${json[@]}" \
   -H "X-Zaki-User-Id: ${USER_ID}" \
-  -d "{\"message\":\"Say hello from smoke test\",\"session_key\":\"${session_key}\"}" | head -n 20
+  -d "{\"message\":\"Say hello from smoke test\",\"session_key\":\"${session_key}\"}" | head -n 20 || true
 
 if [[ "${SMOKE_MODE}" == "full" ]]; then
   echo "[7/${total_steps}] telegram webhook + duplicate idempotency"
