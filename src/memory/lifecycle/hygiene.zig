@@ -340,6 +340,29 @@ test "shouldRunNow returns true with no memory" {
     try std.testing.expect(shouldRunNow(config, null));
 }
 
+test "shouldRunNow uses latest markdown hygiene timestamp" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var mem_impl = try root.MarkdownMemory.init(allocator, workspace);
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    var old_buf: [32]u8 = undefined;
+    const old_ts = try std.fmt.bufPrint(&old_buf, "{d}", .{std.time.timestamp() - (HYGIENE_INTERVAL_SECS * 2)});
+    try mem.store(LAST_HYGIENE_KEY, old_ts, .core, null);
+
+    var new_buf: [32]u8 = undefined;
+    const new_ts = try std.fmt.bufPrint(&new_buf, "{d}", .{std.time.timestamp()});
+    try mem.store(LAST_HYGIENE_KEY, new_ts, .core, null);
+
+    try std.testing.expect(!shouldRunNow(HygieneConfig{}, mem));
+}
+
 test "parseConversationTimestamp valid key" {
     const ts = parseConversationTimestamp("conv_1700000000_abc123");
     try std.testing.expectEqual(@as(i64, 1700000000), ts.?);

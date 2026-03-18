@@ -11,6 +11,7 @@ const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
+const LAST_HYGIENE_KEY = "last_hygiene_at";
 
 pub const MarkdownMemory = struct {
     workspace_dir: []const u8,
@@ -93,6 +94,72 @@ pub const MarkdownMemory = struct {
         const line = try std.fmt.allocPrint(allocator, "{s}\n", .{content});
         defer allocator.free(line);
         try file.writeAll(line);
+    }
+
+    fn writeFileAtomic(path: []const u8, content: []const u8, allocator: std.mem.Allocator) !void {
+        try ensureDir(path);
+
+        const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+        defer allocator.free(tmp_path);
+
+        const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+        errdefer tmp_file.close();
+        try tmp_file.writeAll(content);
+        tmp_file.close();
+
+        std.fs.renameAbsolute(tmp_path, path) catch {
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            const file = try std.fs.createFileAbsolute(path, .{});
+            defer file.close();
+            try file.writeAll(content);
+        };
+    }
+
+    fn lineHasStructuredKey(line: []const u8, key: []const u8) bool {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) return false;
+
+        const clean = if (std.mem.startsWith(u8, trimmed, "- "))
+            trimmed[2..]
+        else
+            trimmed;
+
+        if (!std.mem.startsWith(u8, clean, "**")) return false;
+        if (std.mem.indexOf(u8, clean[2..], "**:")) |end_off| {
+            const key_slice = std.mem.trim(u8, clean[2 .. 2 + end_off], " \t");
+            return std.mem.eql(u8, key_slice, key);
+        }
+        return false;
+    }
+
+    fn replaceCoreEntryAtomic(path: []const u8, key: []const u8, content: []const u8, allocator: std.mem.Allocator) !void {
+        try ensureDir(path);
+
+        const existing = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => try allocator.dupe(u8, ""),
+            else => return err,
+        };
+        defer allocator.free(existing);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+
+        var iter = std.mem.splitScalar(u8, existing, '\n');
+        while (iter.next()) |line| {
+            if (lineHasStructuredKey(line, key)) continue;
+            try buf.appendSlice(allocator, line);
+            try buf.append(allocator, '\n');
+        }
+
+        while (buf.items.len > 0 and std.ascii.isWhitespace(buf.items[buf.items.len - 1])) {
+            _ = buf.pop();
+        }
+        if (buf.items.len > 0) {
+            try buf.append(allocator, '\n');
+        }
+        try std.fmt.format(buf.writer(allocator), "- **{s}**: {s}\n", .{ key, content });
+
+        try writeFileAtomic(path, buf.items, allocator);
     }
 
     fn dupeEntryBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
@@ -266,12 +333,16 @@ pub const MarkdownMemory = struct {
         defer scratch.deinit();
         const scratch_allocator = scratch.allocator();
 
-        const entry_text = try std.fmt.allocPrint(scratch_allocator, "- **{s}**: {s}", .{ key, content });
-
         const path = switch (category) {
             .core => try self_.corePath(scratch_allocator),
             else => try self_.dailyPath(scratch_allocator),
         };
+        if (category == .core and std.mem.eql(u8, key, LAST_HYGIENE_KEY)) {
+            try replaceCoreEntryAtomic(path, key, content, scratch_allocator);
+            return;
+        }
+
+        const entry_text = try std.fmt.allocPrint(scratch_allocator, "- **{s}**: {s}", .{ key, content });
         try appendToFile(path, entry_text, scratch_allocator);
     }
 
@@ -339,17 +410,28 @@ pub const MarkdownMemory = struct {
         const all = try self_.readAllEntries(allocator);
         defer allocator.free(all);
 
-        var found: ?MemoryEntry = null;
+        var exact: ?MemoryEntry = null;
+        var fallback: ?MemoryEntry = null;
         for (all) |*entry_ptr| {
             const entry = entry_ptr.*;
-            if (found == null and (std.mem.eql(u8, entry.key, key) or std.mem.indexOf(u8, entry.content, key) != null)) {
-                found = entry;
-            } else {
-                @constCast(entry_ptr).deinit(allocator);
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (exact) |*prev| {
+                    prev.deinit(allocator);
+                } else if (fallback) |*prev| {
+                    prev.deinit(allocator);
+                    fallback = null;
+                }
+                exact = entry;
+                continue;
             }
+            if (exact == null and fallback == null and std.mem.indexOf(u8, entry.content, key) != null) {
+                fallback = entry;
+                continue;
+            }
+            @constCast(entry_ptr).deinit(allocator);
         }
 
-        return found;
+        return exact orelse fallback;
     }
 
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
@@ -644,4 +726,51 @@ test "markdown concurrent recall list get does not panic" {
 
     for (handles) |handle| handle.join();
     try std.testing.expect(!failed.load(.acquire));
+}
+
+test "markdown replaces hygiene metadata instead of appending duplicates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+    const memory = mem.memory();
+
+    try memory.store("favorite_color", "teal", .core, null);
+    try memory.store(LAST_HYGIENE_KEY, "100", .core, null);
+    try memory.store(LAST_HYGIENE_KEY, "200", .core, null);
+
+    const memory_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/MEMORY.md", .{base});
+    defer std.testing.allocator.free(memory_path);
+    const content = try std.fs.cwd().readFileAlloc(std.testing.allocator, memory_path, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "- **favorite_color**: teal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "- **last_hygiene_at**: 100") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "- **last_hygiene_at**: 200") != null);
+}
+
+test "markdown get prefers newest exact key match" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const memory_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/MEMORY.md", .{base});
+    defer std.testing.allocator.free(memory_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = memory_path,
+        .data = "# MEMORY.md - Long-Term Memory\n\n" ++
+            "- **duplicate_key**: first\n" ++
+            "- **duplicate_key**: second\n",
+    });
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+
+    const got = (try mem.memory().get(std.testing.allocator, "duplicate_key")).?;
+    defer got.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("second", got.content);
 }

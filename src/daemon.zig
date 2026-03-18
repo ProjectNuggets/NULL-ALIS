@@ -5,6 +5,10 @@
 //!   - Exponential backoff on component failure
 //!   - Periodic state file writing (daemon_state.json)
 //!   - Ctrl+C graceful shutdown
+//!
+//! `daemon_state.json` is an operational diagnostics artifact. It is intended
+//! for health/debug visibility and should not be treated as canonical user or
+//! product state.
 
 const builtin = @import("builtin");
 const std = @import("std");

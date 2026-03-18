@@ -3,6 +3,13 @@
 //! Stores last active channel/chat so heartbeat, cron, and other
 //! components know where to route messages.
 //! Persisted to `~/.nullalis/state.json` with atomic writes (temp + rename).
+//!
+//! Current note:
+//! - This helper is file-backed runtime metadata, not a canonical source of
+//!   truth for tenant Postgres mode.
+//! - In the current tenant Postgres release path, core user/product state is
+//!   centralized in `zaki_state.zig`; this module should be treated as
+//!   legacy/general-runtime support unless explicitly wired by a caller.
 
 const std = @import("std");
 const json_util = @import("json_util.zig");

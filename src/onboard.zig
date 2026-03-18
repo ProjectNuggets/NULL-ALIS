@@ -289,6 +289,55 @@ const ollama_fallback = [_][]const u8{
 };
 
 const MAX_MODELS = 20;
+const MODELS_CACHE_FILE = "models_cache.json";
+
+const ModelsCacheStoredEntry = struct {
+    provider: []u8,
+    models: [][]u8,
+
+    fn deinit(self: *ModelsCacheStoredEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.provider);
+        for (self.models) |model| allocator.free(model);
+        allocator.free(self.models);
+        self.* = undefined;
+    }
+};
+
+fn modelsCacheDirPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ home, ".nullalis", "state" });
+}
+
+fn modelsCachePath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ home, ".nullalis", "state", MODELS_CACHE_FILE });
+}
+
+fn ensureParentDir(path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+}
+
+fn writeAbsoluteFileAtomic(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !void {
+    try ensureParentDir(path);
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    errdefer tmp_file.close();
+    try tmp_file.writeAll(content);
+    tmp_file.close();
+
+    std.fs.renameAbsolute(tmp_path, path) catch {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(content);
+    };
+}
 
 /// Return a heap-allocated copy of the static fallback list for a provider.
 /// Caller owns the returned slice and all its strings.
@@ -315,7 +364,7 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
         return dupeFallbackModels(allocator, provider);
     defer allocator.free(home);
 
-    const state_dir = try std.fs.path.join(allocator, &.{ home, ".nullalis", "state" });
+    const state_dir = try modelsCacheDirPath(allocator, home);
     defer allocator.free(state_dir);
 
     // Ensure state directory exists
@@ -494,32 +543,104 @@ fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
     return result.toOwnedSlice(allocator);
 }
 
+fn readAllCachedModels(allocator: std.mem.Allocator, cache_path: []const u8) ![]ModelsCacheStoredEntry {
+    const file = std.fs.openFileAbsolute(cache_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return allocator.alloc(ModelsCacheStoredEntry, 0),
+        else => return err,
+    };
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 256 * 1024);
+    defer allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.CacheParseError;
+
+    var entries: std.ArrayListUnmanaged(ModelsCacheStoredEntry) = .empty;
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(allocator);
+        entries.deinit(allocator);
+    }
+
+    var iter = parsed.value.object.iterator();
+    while (iter.next()) |entry| {
+        const provider_name = entry.key_ptr.*;
+        if (std.mem.eql(u8, provider_name, "fetched_at")) continue;
+        if (entry.value_ptr.* != .array) continue;
+
+        var models: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (models.items) |model| allocator.free(model);
+            models.deinit(allocator);
+        }
+
+        for (entry.value_ptr.array.items) |item| {
+            if (item != .string) continue;
+            try models.append(allocator, try allocator.dupe(u8, item.string));
+        }
+        if (models.items.len == 0) continue;
+
+        try entries.append(allocator, .{
+            .provider = try allocator.dupe(u8, provider_name),
+            .models = try models.toOwnedSlice(allocator),
+        });
+    }
+
+    return entries.toOwnedSlice(allocator);
+}
+
 fn saveCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provider: []const u8, models: []const []const u8) !void {
-    // Build simple JSON: { "fetched_at": <ts>, "<provider>": ["model1", ...] }
-    // We merge into existing cache if present
+    var entries = readAllCachedModels(allocator, cache_path) catch try allocator.alloc(ModelsCacheStoredEntry, 0);
+    defer {
+        for (entries) |*entry| entry.deinit(allocator);
+        allocator.free(entries);
+    }
+
+    var replaced = false;
+    for (entries) |*entry| {
+        if (!std.mem.eql(u8, entry.provider, provider)) continue;
+        for (entry.models) |model| allocator.free(model);
+        allocator.free(entry.models);
+
+        entry.models = try allocator.alloc([]u8, models.len);
+        for (models, 0..) |model, idx| {
+            entry.models[idx] = try allocator.dupe(u8, model);
+        }
+        replaced = true;
+        break;
+    }
+
+    if (!replaced) {
+        const updated = try allocator.realloc(entries, entries.len + 1);
+        entries = updated;
+        entries[entries.len - 1] = .{
+            .provider = try allocator.dupe(u8, provider),
+            .models = try allocator.alloc([]u8, models.len),
+        };
+        for (models, 0..) |model, idx| {
+            entries[entries.len - 1].models[idx] = try allocator.dupe(u8, model);
+        }
+    }
+
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
 
-    try buf.appendSlice(allocator, "{\n  \"fetched_at\": ");
-    var ts_buf: [24]u8 = undefined;
-    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch return;
-    try buf.appendSlice(allocator, ts_str);
-    try buf.appendSlice(allocator, ",\n  \"");
-    try buf.appendSlice(allocator, provider);
-    try buf.appendSlice(allocator, "\": [");
-
-    for (models, 0..) |m, i| {
-        if (i > 0) try buf.appendSlice(allocator, ", ");
-        try buf.append(allocator, '"');
-        try buf.appendSlice(allocator, m);
-        try buf.append(allocator, '"');
+    try buf.appendSlice(allocator, "{\n  ");
+    try json_util.appendJsonInt(&buf, allocator, "fetched_at", std.time.timestamp());
+    for (entries) |entry| {
+        try buf.appendSlice(allocator, ",\n  ");
+        try json_util.appendJsonKey(&buf, allocator, entry.provider);
+        try buf.appendSlice(allocator, "[");
+        for (entry.models, 0..) |model, idx| {
+            if (idx > 0) try buf.appendSlice(allocator, ", ");
+            try json_util.appendJsonString(&buf, allocator, model);
+        }
+        try buf.appendSlice(allocator, "]");
     }
+    try buf.appendSlice(allocator, "\n}\n");
 
-    try buf.appendSlice(allocator, "]\n}\n");
-
-    const file = std.fs.createFileAbsolute(cache_path, .{}) catch return;
-    defer file.close();
-    file.writeAll(buf.items) catch {};
+    try writeAbsoluteFileAtomic(allocator, cache_path, buf.items);
 }
 
 /// Parse a mock OpenRouter-style JSON response and extract model IDs.
@@ -1437,9 +1558,9 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
         return;
     };
     defer allocator.free(home);
-    const cache_path = try std.fs.path.join(allocator, &.{ home, ".nullalis", "models_cache.json" });
+    const cache_path = try modelsCachePath(allocator, home);
     defer allocator.free(cache_path);
-    const cache_dir = try std.fs.path.join(allocator, &.{ home, ".nullalis" });
+    const cache_dir = try modelsCacheDirPath(allocator, home);
     defer allocator.free(cache_dir);
 
     // Ensure directory exists
@@ -1454,12 +1575,8 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
 
     // Collect models from each provider using curl
     var total_models: usize = 0;
-    var results_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer results_buf.deinit(allocator);
 
-    try results_buf.appendSlice(allocator, "{\n");
-
-    for (catalog_providers, 0..) |cp, cp_idx| {
+    for (catalog_providers) |cp| {
         try out.print("  Fetching from {s}...\n", .{cp.name});
         try out.flush();
 
@@ -1508,42 +1625,35 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
         }
 
         var count: usize = 0;
-        if (cp_idx > 0) try results_buf.appendSlice(allocator, ",\n");
-        try results_buf.appendSlice(allocator, "  \"");
-        try results_buf.appendSlice(allocator, cp.name);
-        try results_buf.appendSlice(allocator, "\": [");
+        var models: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (models.items) |model| allocator.free(model);
+            models.deinit(allocator);
+        }
 
-        for (data.array.items, 0..) |item, i| {
+        for (data.array.items) |item| {
             if (item != .object) continue;
             const id_val = item.object.get(cp.id_field) orelse continue;
             if (id_val != .string) continue;
-            if (i > 0) try results_buf.appendSlice(allocator, ",");
-            try results_buf.appendSlice(allocator, "\"");
-            try results_buf.appendSlice(allocator, id_val.string);
-            try results_buf.appendSlice(allocator, "\"");
+            try models.append(allocator, try allocator.dupe(u8, id_val.string));
             count += 1;
         }
+        if (models.items.len == 0) {
+            try out.print("  [SKIP] {s}: no models extracted\n", .{cp.name});
+            try out.flush();
+            continue;
+        }
 
-        try results_buf.appendSlice(allocator, "]");
+        const models_const: []const []const u8 = models.items;
+        saveCachedModels(allocator, cache_path, cp.name, models_const) catch {
+            try out.print("  [SKIP] {s}: could not update cache\n", .{cp.name});
+            try out.flush();
+            continue;
+        };
         total_models += count;
         try out.print("  [OK] {s}: {d} models\n", .{ cp.name, count });
         try out.flush();
     }
-
-    try results_buf.appendSlice(allocator, "\n}\n");
-
-    // Write cache file
-    const file = std.fs.createFileAbsolute(cache_path, .{}) catch {
-        try out.writeAll("Could not write cache file.\n");
-        try out.flush();
-        return;
-    };
-    defer file.close();
-    file.writeAll(results_buf.items) catch {
-        try out.writeAll("Error writing cache file.\n");
-        try out.flush();
-        return;
-    };
 
     try out.print("\nFetched {d} models total. Cache saved to {s}\n", .{ total_models, cache_path });
     try out.flush();
@@ -2903,6 +3013,12 @@ test "cache round-trip: write then read fresh cache" {
     try std.testing.expectEqualStrings("model-gamma", loaded[2]);
 }
 
+test "models cache helper resolves canonical state path" {
+    const path = try modelsCachePath(std.testing.allocator, "/tmp/home");
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/tmp/home/.nullalis/state/models_cache.json", path);
+}
+
 test "cache read returns error for wrong provider" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2937,6 +3053,37 @@ test "cache read returns error for expired cache" {
 
     const result = readCachedModels(std.testing.allocator, cache_path, "myprov");
     try std.testing.expectError(error.CacheExpired, result);
+}
+
+test "saveCachedModels preserves unrelated provider entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    defer std.testing.allocator.free(cache_path);
+
+    const models_a = [_][]const u8{ "model-a1", "model-a2" };
+    const models_b = [_][]const u8{"model-b1"};
+    try saveCachedModels(std.testing.allocator, cache_path, "provA", &models_a);
+    try saveCachedModels(std.testing.allocator, cache_path, "provB", &models_b);
+
+    const loaded_a = try readCachedModels(std.testing.allocator, cache_path, "provA");
+    defer {
+        for (loaded_a) |model| std.testing.allocator.free(model);
+        std.testing.allocator.free(loaded_a);
+    }
+    const loaded_b = try readCachedModels(std.testing.allocator, cache_path, "provB");
+    defer {
+        for (loaded_b) |model| std.testing.allocator.free(model);
+        std.testing.allocator.free(loaded_b);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), loaded_a.len);
+    try std.testing.expectEqual(@as(usize, 1), loaded_b.len);
+    try std.testing.expectEqualStrings("model-a1", loaded_a[0]);
+    try std.testing.expectEqualStrings("model-b1", loaded_b[0]);
 }
 
 test "loadModelsWithCache falls back on fetch failure" {

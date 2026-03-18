@@ -1,3 +1,12 @@
+//! ZAKI tenant state manager.
+//!
+//! In tenant Postgres mode this module is the canonical persistence surface
+//! for user/product state such as config, secrets, heartbeat, onboarding,
+//! channel state, jobs, identities, leases, and canonical memory metadata.
+//! File artifacts may still exist for diagnostics, compatibility, or non-tenant
+//! modes, but they should not supersede this module when Postgres tenant state
+//! is healthy.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const config_types = @import("config_types.zig");
