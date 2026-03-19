@@ -5,11 +5,17 @@ FROM alpine:3.23 AS builder
 
 RUN apk add --no-cache zig musl-dev postgresql-dev
 
+ARG TARGETARCH
+
 WORKDIR /app
 COPY build.zig build.zig.zon ./
 COPY src/ src/
 
-RUN zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres
+RUN case "${TARGETARCH}" in \
+      amd64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dcpu=haswell ;; \
+      arm64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac
 
 # ── Stage 2: Config Prep ─────────────────────────────────────
 FROM busybox:1.37 AS config
