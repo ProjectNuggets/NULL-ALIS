@@ -4,7 +4,8 @@ This folder is the deployment handoff package for running `nullALIS` as the dedi
 
 Important ownership note:
 - This directory is a reference deployment pack, not the production source of truth.
-- Production runtime config, rollout, smoke checks, and rollback are owned by `zaki-prod`.
+- Production runtime config, rollout, service wiring, and rollback are owned by `zaki-infra`.
+- `zaki-prod` only owns the browser/backend proxy contract to Nullalis.
 - Keep this pack usable for local/dev and contract reference, but do not treat it as authoritative for live production.
 
 ## Scope
@@ -90,6 +91,11 @@ Sticky routing contract:
 3. missing canonical user identity is a routing contract violation.
 
 ## Required value replacement
+Legacy compatibility note:
+- This reference pack still shows the older secret names `INTERNAL_SERVICE_TOKEN` and `POSTGRES_CONNECTION_STRING`.
+- The authoritative `zaki-infra` chart uses `NULLCLAW_INTERNAL_SERVICE_TOKEN` and `NULLCLAW_POSTGRES_CONNECTION_STRING`.
+- Nullalis supports both during the migration window.
+
 Update these fields before apply:
 1. `03-pvc.yaml`: `storageClassName`.
 2. `05-deployment.yaml`: image tag.
@@ -147,7 +153,7 @@ Composio scoping model:
 - `COMPOSIO_ENTITY_ID` is fallback/default and is not the primary tenant scoping mechanism.
 
 ## Apply order
-For live production, apply the authoritative Nullalis deployment assets from `zaki-prod`.
+For live production, apply the authoritative Nullalis deployment assets from `zaki-infra`.
 This section remains for local/reference environments only.
 
 ```bash

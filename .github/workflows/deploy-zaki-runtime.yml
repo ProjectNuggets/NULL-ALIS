@@ -62,4 +62,4 @@ jobs:
       - name: Publish summary
         run: |
           echo "Published image: ${{ steps.image.outputs.sha_tag }}"
-          echo "Production promotion is owned by zaki-prod."
+          echo "Production promotion is owned by zaki-infra."

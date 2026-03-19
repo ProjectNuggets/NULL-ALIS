@@ -29,6 +29,7 @@ References:
 - [v0.1 final sweep](docs/final-sweep-2026-03-09.md)
 - [ops runbook](docs/reliability-ops-runbook.md)
 - [runtime status notes](docs/status-2026-03-06.md)
+- [ZAKI runtime contract](docs/zaki-runtime-contract.md)
 
 ## What nullALIS Is
 
@@ -91,7 +92,7 @@ Core stack:
 
 Ops stack:
 - Observability: structured runtime logs + metrics endpoints.
-- Deployment: Docker image publishing in this repo; production rollout is owned by `zaki-prod`.
+- Deployment: Docker image publishing in this repo; production rollout is owned by `zaki-infra`.
 - Reference manifests and handoff docs live under `deploy/k8s/zaki-bot/` for local/dev and contract reference.
 
 ## Architecture At a Glance
@@ -138,7 +139,8 @@ Integration handoff specs:
 
 Production ownership note:
 - `NULL-ALIS` owns provider integrations, app code, tests, and published images.
-- `zaki-prod` owns live Kubernetes manifests, secrets references, rollout policy, smoke checks, and rollback.
+- `zaki-infra` owns live Kubernetes manifests, secrets references, ArgoCD/Helm rollout policy, and service wiring.
+- `zaki-prod` owns frontend/backend proxy behavior and service discovery to internal apps only.
 
 ## Quick Start
 

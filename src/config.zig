@@ -193,6 +193,25 @@ pub const Config = struct {
         self.max_actions_per_hour = self.autonomy.max_actions_per_hour;
     }
 
+    fn setInternalServiceToken(self: *Config, token: []const u8) !void {
+        const tokens = try self.allocator.alloc([]const u8, 1);
+        tokens[0] = token;
+        self.gateway.internal_service_tokens = tokens;
+    }
+
+    fn applySecretRuntimeOverrides(
+        self: *Config,
+        internal_service_token: ?[]const u8,
+        postgres_connection_string: ?[]const u8,
+    ) void {
+        if (internal_service_token) |token| {
+            self.setInternalServiceToken(token) catch return;
+        }
+        if (postgres_connection_string) |connection_string| {
+            self.state.postgres.connection_string = connection_string;
+        }
+    }
+
     /// Apply top-level profile defaults after parsing explicit config values.
     /// Only set values that are still at their default, so direct config always wins.
     pub fn applyProfileDefaults(self: *Config) !void {
@@ -524,6 +543,26 @@ pub const Config = struct {
             defer self.allocator.free(val);
             self.gateway.allow_public_bind = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else |_| {}
+
+        var internal_service_token: ?[]const u8 = null;
+        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_INTERNAL_SERVICE_TOKEN")) |token| {
+            internal_service_token = token;
+        } else |_| {
+            if (std.process.getEnvVarOwned(self.allocator, "INTERNAL_SERVICE_TOKEN")) |token| {
+                internal_service_token = token;
+            } else |_| {}
+        }
+
+        var postgres_connection_string: ?[]const u8 = null;
+        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_POSTGRES_CONNECTION_STRING")) |connection_string| {
+            postgres_connection_string = connection_string;
+        } else |_| {
+            if (std.process.getEnvVarOwned(self.allocator, "POSTGRES_CONNECTION_STRING")) |connection_string| {
+                postgres_connection_string = connection_string;
+            } else |_| {}
+        }
+
+        self.applySecretRuntimeOverrides(internal_service_token, postgres_connection_string);
     }
 
     /// Save config as JSON to the config_path.
@@ -801,6 +840,10 @@ pub const Config = struct {
         InvalidPort,
         InvalidRetryCount,
         InvalidBackoffMs,
+        MissingDefaultProviderConfig,
+        MissingInternalServiceToken,
+        InvalidZakiBotStateBackend,
+        MissingPostgresConnectionString,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -828,6 +871,20 @@ pub const Config = struct {
         if (self.reliability.provider_backoff_ms > 600_000) {
             return ValidationError.InvalidBackoffMs;
         }
+        if (AppProfile.fromString(self.profile) == .zaki_bot) {
+            if (self.getProviderBaseUrl(self.default_provider) == null) {
+                return ValidationError.MissingDefaultProviderConfig;
+            }
+            if (self.gateway.internal_service_tokens.len == 0) {
+                return ValidationError.MissingInternalServiceToken;
+            }
+            if (!std.mem.eql(u8, self.state.backend, "postgres")) {
+                return ValidationError.InvalidZakiBotStateBackend;
+            }
+            if (self.state.postgres.connection_string.len == 0) {
+                return ValidationError.MissingPostgresConnectionString;
+            }
+        }
     }
 
     /// Print a human-readable validation error to stderr.
@@ -853,6 +910,22 @@ pub const Config = struct {
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
+            ValidationError.MissingDefaultProviderConfig => std.debug.print(
+                "Config error: the selected provider must exist under models.providers with a base_url in zaki_bot profile.\n",
+                .{},
+            ),
+            ValidationError.MissingInternalServiceToken => std.debug.print(
+                "Config error: zaki_bot profile requires NULLCLAW_INTERNAL_SERVICE_TOKEN (or INTERNAL_SERVICE_TOKEN).\n",
+                .{},
+            ),
+            ValidationError.InvalidZakiBotStateBackend => std.debug.print(
+                "Config error: zaki_bot profile requires state.backend=postgres.\n",
+                .{},
+            ),
+            ValidationError.MissingPostgresConnectionString => std.debug.print(
+                "Config error: zaki_bot profile requires NULLCLAW_POSTGRES_CONNECTION_STRING (or POSTGRES_CONNECTION_STRING).\n",
+                .{},
+            ),
         }
     }
 
@@ -3258,6 +3331,27 @@ test "gateway config parses internal_service_tokens" {
     allocator.free(cfg.gateway.internal_service_tokens);
 }
 
+test "secret runtime overrides set internal token and postgres connection string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+
+    const internal_token = try allocator.dupe(u8, "prod-internal-token-1234");
+    const connection_string = try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki");
+
+    cfg.applySecretRuntimeOverrides(internal_token, connection_string);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.gateway.internal_service_tokens.len);
+    try std.testing.expectEqualStrings("prod-internal-token-1234", cfg.gateway.internal_service_tokens[0]);
+    try std.testing.expectEqualStrings("postgresql://zaki:zaki@127.0.0.1:5432/zaki", cfg.state.postgres.connection_string);
+}
+
 test "tenant config parses enabled and data_root" {
     const allocator = std.testing.allocator;
     const json =
@@ -3325,6 +3419,54 @@ test "profile defaults do not override explicit model primary" {
     try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
     try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 0), cfg.reliability.fallback_providers.len);
+}
+
+test "zaki_bot validation requires provider entry token and postgres" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "together-ai",
+        .default_model = "moonshotai/kimi-k2.5",
+    };
+
+    cfg.providers = &.{
+        .{ .name = "together-ai", .base_url = "https://api.together.xyz/v1" },
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "prod-internal-token-1234"),
+        try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
+    );
+
+    try cfg.validate();
+}
+
+test "zaki_bot validation rejects missing provider config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "together-ai",
+        .default_model = "moonshotai/kimi-k2.5",
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "prod-internal-token-1234"),
+        try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
+    );
+
+    try std.testing.expectError(ValidationError.MissingDefaultProviderConfig, cfg.validate());
 }
 
 test "tools config parses web_search_provider" {
