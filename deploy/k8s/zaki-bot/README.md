@@ -7,6 +7,7 @@ Important ownership note:
 - Production runtime config, rollout, service wiring, and rollback are owned by `zaki-infra`.
 - `zaki-prod` only owns the browser/backend proxy contract to Nullalis.
 - Keep this pack usable for local/dev and contract reference, but do not treat it as authoritative for live production.
+- The final production namespace/topology target is `zaki`, with `nullclaw` served there and consumed by `zaki-api` through cluster DNS.
 
 ## Scope
 This package is for the shared pool model with tenant isolation under `/data/users/{user_id}`.
@@ -95,6 +96,7 @@ Legacy compatibility note:
 - This reference pack still shows the older secret names `INTERNAL_SERVICE_TOKEN` and `POSTGRES_CONNECTION_STRING`.
 - The authoritative `zaki-infra` chart uses `NULLCLAW_INTERNAL_SERVICE_TOKEN` and `NULLCLAW_POSTGRES_CONNECTION_STRING`.
 - Nullalis supports both during the migration window.
+- Placeholder values such as `REPLACE_WITH_*`, `changeme`, `default`, `test-internal-token`, and `dev-internal-token` are not valid production secrets and should fail startup in the `zaki_bot` profile.
 
 Update these fields before apply:
 1. `03-pvc.yaml`: `storageClassName`.

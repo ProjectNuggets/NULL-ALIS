@@ -163,6 +163,45 @@ pub const Config = struct {
         return self.getProviderKey(self.default_provider);
     }
 
+    fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(a, b);
+    }
+
+    fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (haystack.len < needle.len) return false;
+        return std.ascii.eqlIgnoreCase(haystack[0..needle.len], needle);
+    }
+
+    fn isPlaceholderSecretValue(value: []const u8) bool {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len == 0) return true;
+
+        if (startsWithIgnoreCase(trimmed, "REPLACE_WITH_")) return true;
+        if (eqlIgnoreCase(trimmed, "changeme")) return true;
+        if (eqlIgnoreCase(trimmed, "change-me")) return true;
+        if (eqlIgnoreCase(trimmed, "default")) return true;
+        if (eqlIgnoreCase(trimmed, "replace_with_strong_random_token")) return true;
+        if (eqlIgnoreCase(trimmed, "replace_with_provider_key")) return true;
+        if (eqlIgnoreCase(trimmed, "replace_with_postgres_connection_string")) return true;
+        if (eqlIgnoreCase(trimmed, "test-internal-token")) return true;
+        if (eqlIgnoreCase(trimmed, "dev-internal-token")) return true;
+        return false;
+    }
+
+    fn hasUsableTogetherApiKey(self: *const Config) bool {
+        if (self.getProviderKey("together-ai")) |key| {
+            if (!isPlaceholderSecretValue(key)) return true;
+        }
+        if (self.getProviderKey("together")) |key| {
+            if (!isPlaceholderSecretValue(key)) return true;
+        }
+        if (std.process.getEnvVarOwned(self.allocator, "TOGETHER_API_KEY")) |key| {
+            defer self.allocator.free(key);
+            return !isPlaceholderSecretValue(key);
+        } else |_| {}
+        return false;
+    }
+
     /// Look up a provider's base_url from the providers list.
     pub fn getProviderBaseUrl(self: *const Config, name: []const u8) ?[]const u8 {
         for (self.providers) |e| {
@@ -841,9 +880,12 @@ pub const Config = struct {
         InvalidRetryCount,
         InvalidBackoffMs,
         MissingDefaultProviderConfig,
+        MissingTogetherApiKey,
         MissingInternalServiceToken,
+        InvalidInternalServiceToken,
         InvalidZakiBotStateBackend,
         MissingPostgresConnectionString,
+        InvalidPostgresConnectionString,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -875,14 +917,25 @@ pub const Config = struct {
             if (self.getProviderBaseUrl(self.default_provider) == null) {
                 return ValidationError.MissingDefaultProviderConfig;
             }
+            if ((std.mem.eql(u8, self.default_provider, "together") or std.mem.eql(u8, self.default_provider, "together-ai")) and !self.hasUsableTogetherApiKey()) {
+                return ValidationError.MissingTogetherApiKey;
+            }
             if (self.gateway.internal_service_tokens.len == 0) {
                 return ValidationError.MissingInternalServiceToken;
+            }
+            for (self.gateway.internal_service_tokens) |token| {
+                if (isPlaceholderSecretValue(token)) {
+                    return ValidationError.InvalidInternalServiceToken;
+                }
             }
             if (!std.mem.eql(u8, self.state.backend, "postgres")) {
                 return ValidationError.InvalidZakiBotStateBackend;
             }
             if (self.state.postgres.connection_string.len == 0) {
                 return ValidationError.MissingPostgresConnectionString;
+            }
+            if (isPlaceholderSecretValue(self.state.postgres.connection_string)) {
+                return ValidationError.InvalidPostgresConnectionString;
             }
         }
     }
@@ -914,8 +967,16 @@ pub const Config = struct {
                 "Config error: the selected provider must exist under models.providers with a base_url in zaki_bot profile.\n",
                 .{},
             ),
+            ValidationError.MissingTogetherApiKey => std.debug.print(
+                "Config error: zaki_bot profile requires a valid TOGETHER_API_KEY for together-ai.\n",
+                .{},
+            ),
             ValidationError.MissingInternalServiceToken => std.debug.print(
                 "Config error: zaki_bot profile requires NULLCLAW_INTERNAL_SERVICE_TOKEN (or INTERNAL_SERVICE_TOKEN).\n",
+                .{},
+            ),
+            ValidationError.InvalidInternalServiceToken => std.debug.print(
+                "Config error: zaki_bot profile internal service token is empty or uses a placeholder value.\n",
                 .{},
             ),
             ValidationError.InvalidZakiBotStateBackend => std.debug.print(
@@ -924,6 +985,10 @@ pub const Config = struct {
             ),
             ValidationError.MissingPostgresConnectionString => std.debug.print(
                 "Config error: zaki_bot profile requires NULLCLAW_POSTGRES_CONNECTION_STRING (or POSTGRES_CONNECTION_STRING).\n",
+                .{},
+            ),
+            ValidationError.InvalidPostgresConnectionString => std.debug.print(
+                "Config error: zaki_bot profile Postgres connection string is empty or uses a placeholder value.\n",
                 .{},
             ),
         }
@@ -3436,7 +3501,7 @@ test "zaki_bot validation requires provider entry token and postgres" {
     };
 
     cfg.providers = &.{
-        .{ .name = "together-ai", .base_url = "https://api.together.xyz/v1" },
+        .{ .name = "together-ai", .api_key = "together-valid-key", .base_url = "https://api.together.xyz/v1" },
     };
     cfg.state.backend = "postgres";
     cfg.applySecretRuntimeOverrides(
@@ -3467,6 +3532,84 @@ test "zaki_bot validation rejects missing provider config" {
     );
 
     try std.testing.expectError(Config.ValidationError.MissingDefaultProviderConfig, cfg.validate());
+}
+
+test "zaki_bot validation rejects missing together api key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "together-ai",
+        .default_model = "moonshotai/kimi-k2.5",
+    };
+
+    cfg.providers = &.{
+        .{ .name = "together-ai", .base_url = "https://api.together.xyz/v1" },
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "prod-internal-token-1234"),
+        try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
+    );
+
+    try std.testing.expectError(Config.ValidationError.MissingTogetherApiKey, cfg.validate());
+}
+
+test "zaki_bot validation rejects placeholder internal service token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "together-ai",
+        .default_model = "moonshotai/kimi-k2.5",
+    };
+
+    cfg.providers = &.{
+        .{ .name = "together-ai", .api_key = "together-valid-key", .base_url = "https://api.together.xyz/v1" },
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "REPLACE_WITH_STRONG_RANDOM_TOKEN"),
+        try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
+    );
+
+    try std.testing.expectError(Config.ValidationError.InvalidInternalServiceToken, cfg.validate());
+}
+
+test "zaki_bot validation rejects placeholder postgres connection string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "together-ai",
+        .default_model = "moonshotai/kimi-k2.5",
+    };
+
+    cfg.providers = &.{
+        .{ .name = "together-ai", .api_key = "together-valid-key", .base_url = "https://api.together.xyz/v1" },
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "prod-internal-token-1234"),
+        try allocator.dupe(u8, "REPLACE_WITH_POSTGRES_CONNECTION_STRING"),
+    );
+
+    try std.testing.expectError(Config.ValidationError.InvalidPostgresConnectionString, cfg.validate());
 }
 
 test "tools config parses web_search_provider" {

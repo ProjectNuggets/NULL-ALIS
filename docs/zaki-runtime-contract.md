@@ -58,6 +58,16 @@ Backward-compatible fallbacks still supported during migration:
 - `INTERNAL_SERVICE_TOKEN`
 - `POSTGRES_CONNECTION_STRING`
 
+Placeholder values are not valid runtime secrets. The `zaki_bot` profile must reject:
+
+- empty values
+- `REPLACE_WITH_*`
+- `changeme`
+- `change-me`
+- `default`
+- `test-internal-token`
+- `dev-internal-token`
+
 ## Startup Validation
 
 For `profile: "zaki_bot"`, startup validation requires:

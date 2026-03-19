@@ -5950,13 +5950,13 @@ fn handleApiRoute(
         };
         defer prep_guard.deinit();
         ensureUserDirectories(&user_ctx) catch {
-            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"workspace_bootstrap_failed\"}" };
         };
         ensureUserProvisioned(state, &user_ctx) catch |err| {
             if (isIdentityUserNotFound(err)) {
                 return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_user_id\"}" };
             }
-            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"state_provisioning_failed\"}" };
         };
         scaffoldUserWorkspace(req_allocator, &user_ctx);
         prep_guard.release();
@@ -5975,13 +5975,13 @@ fn handleApiRoute(
     };
     defer prep_guard.deinit();
     ensureUserDirectories(&user_ctx) catch {
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"workspace_bootstrap_failed\"}" };
     };
     ensureUserProvisioned(state, &user_ctx) catch |err| {
         if (isIdentityUserNotFound(err)) {
             return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_user_id\"}" };
         }
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provisioning failed\"}" };
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"state_provisioning_failed\"}" };
     };
     scaffoldUserWorkspace(req_allocator, &user_ctx);
     prep_guard.release();

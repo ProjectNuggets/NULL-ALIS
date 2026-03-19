@@ -141,6 +141,7 @@ Production ownership note:
 - `NULL-ALIS` owns provider integrations, app code, tests, and published images.
 - `zaki-infra` owns live Kubernetes manifests, secrets references, ArgoCD/Helm rollout policy, and service wiring.
 - `zaki-prod` owns frontend/backend proxy behavior and service discovery to internal apps only.
+- The legacy `deploy/k8s/zaki-bot/` pack is reference-only and must not be used as the live production source of truth.
 
 ## Quick Start
 
