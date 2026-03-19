@@ -91,7 +91,8 @@ Core stack:
 
 Ops stack:
 - Observability: structured runtime logs + metrics endpoints.
-- Deployment: Docker + Kubernetes manifests under `deploy/k8s/zaki-bot/`.
+- Deployment: Docker image publishing in this repo; production rollout is owned by `zaki-prod`.
+- Reference manifests and handoff docs live under `deploy/k8s/zaki-bot/` for local/dev and contract reference.
 
 ## Architecture At a Glance
 
@@ -134,6 +135,10 @@ SSE chat stream contract:
 Integration handoff specs:
 - [ZAKI backend handoff](deploy/k8s/zaki-bot/ZAKI_BACKEND_HANDOFF.md)
 - [ZAKI frontend handoff](deploy/k8s/zaki-bot/ZAKI_FRONTEND_HANDOFF.md)
+
+Production ownership note:
+- `NULL-ALIS` owns provider integrations, app code, tests, and published images.
+- `zaki-prod` owns live Kubernetes manifests, secrets references, rollout policy, smoke checks, and rollback.
 
 ## Quick Start
 

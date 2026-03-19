@@ -1,36 +1,19 @@
-name: Build and Deploy Nullalis for ZAKI
+name: Build and Publish Nullalis Image
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      cluster:
-        description: "Target DigitalOcean Kubernetes cluster"
-        required: false
-        default: "zaki-prod"
-      namespace:
-        description: "Target Kubernetes namespace"
-        required: false
-        default: "zaki-bot-staging"
-      deployment:
-        description: "Target Nullalis deployment name"
-        required: false
-        default: "nullclaw"
-      container:
-        description: "Target container name"
-        required: false
-        default: "nullclaw"
 
 env:
   IMAGE_REPO: ghcr.io/projectnuggets/null-alis
 
 concurrency:
-  group: deploy-zaki-nullalis
+  group: publish-nullalis-image
   cancel-in-progress: false
 
 jobs:
-  build-and-dispatch:
+  build-and-publish:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -76,36 +59,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Trigger zaki-prod runtime deployment
-        env:
-          DISPATCH_TOKEN: ${{ secrets.ZAKI_PROD_REPO_DISPATCH_TOKEN }}
-          CLUSTER: ${{ github.event.inputs.cluster || 'zaki-prod' }}
-          NAMESPACE: ${{ github.event.inputs.namespace || 'zaki-bot-staging' }}
-          DEPLOYMENT: ${{ github.event.inputs.deployment || 'nullclaw' }}
-          CONTAINER: ${{ github.event.inputs.container || 'nullclaw' }}
-          IMAGE_REF: ${{ steps.image.outputs.sha_tag }}
+      - name: Publish summary
         run: |
-          if [ -z "${DISPATCH_TOKEN}" ]; then
-            echo "ZAKI_PROD_REPO_DISPATCH_TOKEN is not configured."
-            exit 1
-          fi
-
-          curl -fsSL \
-            -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
-            https://api.github.com/repos/ProjectNuggets/zaki-prod/dispatches \
-            -d @- <<EOF
-          {
-            "event_type": "nullalis_deploy",
-            "client_payload": {
-              "cluster": "${CLUSTER}",
-              "namespace": "${NAMESPACE}",
-              "deployment": "${DEPLOYMENT}",
-              "container": "${CONTAINER}",
-              "image_ref": "${IMAGE_REF}",
-              "source_repo": "${GITHUB_REPOSITORY}",
-              "source_sha": "${GITHUB_SHA}"
-            }
-          }
-          EOF
+          echo "Published image: ${{ steps.image.outputs.sha_tag }}"
+          echo "Production promotion is owned by zaki-prod."

@@ -2,6 +2,11 @@
 
 This folder is the deployment handoff package for running `nullALIS` as the dedicated `ZAKI BOT` backend in a namespace-based K8s cluster.
 
+Important ownership note:
+- This directory is a reference deployment pack, not the production source of truth.
+- Production runtime config, rollout, smoke checks, and rollback are owned by `zaki-prod`.
+- Keep this pack usable for local/dev and contract reference, but do not treat it as authoritative for live production.
+
 ## Scope
 This package is for the shared pool model with tenant isolation under `/data/users/{user_id}`.
 
@@ -90,7 +95,7 @@ Update these fields before apply:
 2. `05-deployment.yaml`: image tag.
 3. `01-secrets-template.yaml`:
 - `INTERNAL_SERVICE_TOKEN`
-- `OPENROUTER_API_KEY`
+- `TOGETHER_API_KEY`
 - `POSTGRES_CONNECTION_STRING`
 - `PGBOUNCER_CONNECTION_STRING` (recommended runtime DSN via `nullclaw-pgbouncer:6432`)
 - PgBouncer upstream and auth values:
@@ -142,6 +147,9 @@ Composio scoping model:
 - `COMPOSIO_ENTITY_ID` is fallback/default and is not the primary tenant scoping mechanism.
 
 ## Apply order
+For live production, apply the authoritative Nullalis deployment assets from `zaki-prod`.
+This section remains for local/reference environments only.
+
 ```bash
 kubectl apply -k deploy/k8s/zaki-bot
 kubectl -n zaki-bot-staging rollout status deploy/nullclaw
