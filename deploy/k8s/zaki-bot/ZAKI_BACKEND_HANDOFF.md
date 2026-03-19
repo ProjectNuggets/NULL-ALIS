@@ -19,7 +19,7 @@ Browser must never receive `X-Internal-Token`.
 Default Nullclaw profile/model for this integration:
 
 - `profile = "zaki_bot"`
-- `agents.defaults.model.primary = "openrouter/moonshotai/kimi-k2.5"`
+- `agents.defaults.model.primary = "together-ai/moonshotai/kimi-k2.5"`
 
 ## 2) Required backend endpoint
 

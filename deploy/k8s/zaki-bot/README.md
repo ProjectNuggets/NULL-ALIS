@@ -46,7 +46,7 @@ It includes:
 
 ## Runtime defaults
 - Profile: `zaki_bot`
-- Default model: `openrouter/moonshotai/kimi-k2.5`
+- Default model: `together-ai/moonshotai/kimi-k2.5`
 - Tenant mode: enabled
 - State backend: `postgres` (via runtime env wiring)
 - Postgres connection routing: PgBouncer-enabled by default (`POSTGRES_USE_PGBOUNCER=true`)

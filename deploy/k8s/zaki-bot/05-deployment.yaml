@@ -98,7 +98,7 @@ spec:
               require_uint POSTGRES_POOL_MAX "${POSTGRES_POOL_MAX}"
               require_uint POSTGRES_STATEMENT_TIMEOUT_MS "${POSTGRES_STATEMENT_TIMEOUT_MS}"
               require_uint POSTGRES_LOCK_TIMEOUT_MS "${POSTGRES_LOCK_TIMEOUT_MS}"
-              OPENROUTER_API_KEY_ESC="$(json_escape "${OPENROUTER_API_KEY}")"
+              TOGETHER_API_KEY_ESC="$(json_escape "${TOGETHER_API_KEY}")"
               INTERNAL_SERVICE_TOKEN_ESC="$(json_escape "${INTERNAL_SERVICE_TOKEN}")"
               GATEWAY_HOST_ESC="$(json_escape "${GATEWAY_HOST}")"
               TENANT_DATA_ROOT_ESC="$(json_escape "${TENANT_DATA_ROOT}")"
@@ -116,15 +116,15 @@ spec:
                 "agents": {
                   "defaults": {
                     "model": {
-                      "primary": "openrouter/moonshotai/kimi-k2.5"
+                      "primary": "together-ai/moonshotai/kimi-k2.5"
                     }
                   }
                 },
                 "models": {
                   "providers": {
-                    "openrouter": {
-                      "api_key": "${OPENROUTER_API_KEY_ESC}",
-                      "base_url": "https://openrouter.ai/api/v1"
+                    "together-ai": {
+                      "api_key": "${TOGETHER_API_KEY_ESC}",
+                      "base_url": "https://api.together.xyz/v1"
                     }
                   }
                 },

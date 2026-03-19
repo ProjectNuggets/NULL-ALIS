@@ -27,15 +27,15 @@ RUN cat > /nullclaw-data/.nullalis/config.json << 'EOF'
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openrouter/moonshotai/kimi-k2.5"
+        "primary": "together-ai/moonshotai/kimi-k2.5"
       }
     }
   },
   "models": {
     "providers": {
-      "openrouter": {
+      "together-ai": {
         "api_key": "",
-        "base_url": "https://openrouter.ai/api/v1"
+        "base_url": "https://api.together.xyz/v1"
       }
     }
   },
