@@ -3466,7 +3466,7 @@ test "zaki_bot validation rejects missing provider config" {
         try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
     );
 
-    try std.testing.expectError(ValidationError.MissingDefaultProviderConfig, cfg.validate());
+    try std.testing.expectError(Config.ValidationError.MissingDefaultProviderConfig, cfg.validate());
 }
 
 test "tools config parses web_search_provider" {
