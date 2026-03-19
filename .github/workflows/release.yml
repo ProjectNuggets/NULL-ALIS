@@ -54,14 +54,15 @@ jobs:
             target: macos-x86_64
             zig_target: x86_64-macos
             ext: ""
-          - os: windows-latest
-            target: windows-x86_64
-            zig_target: ""
-            ext: ".exe"
-          - os: windows-latest
-            target: windows-aarch64
-            zig_target: aarch64-windows
-            ext: ".exe"
+          # Windows builds disabled - not needed for production deployment
+          # - os: windows-latest
+          #   target: windows-x86_64
+          #   zig_target: ""
+          #   ext: ".exe"
+          # - os: windows-latest
+          #   target: windows-aarch64
+          #   zig_target: aarch64-windows
+          #   ext: ".exe"
 
     steps:
       - uses: actions/checkout@v4
@@ -96,8 +97,9 @@ jobs:
           mv nullalis-linux-riscv64/nullalis nullalis-linux-riscv64.bin
           mv nullalis-macos-aarch64/nullalis nullalis-macos-aarch64.bin
           mv nullalis-macos-x86_64/nullalis nullalis-macos-x86_64.bin
-          mv nullalis-windows-x86_64/nullalis.exe nullalis-windows-x86_64.exe
-          mv nullalis-windows-aarch64/nullalis.exe nullalis-windows-aarch64.exe
+          # Windows artifacts disabled
+          # mv nullalis-windows-x86_64/nullalis.exe nullalis-windows-x86_64.exe
+          # mv nullalis-windows-aarch64/nullalis.exe nullalis-windows-aarch64.exe
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -108,8 +110,8 @@ jobs:
             nullalis-linux-riscv64.bin
             nullalis-macos-aarch64.bin
             nullalis-macos-x86_64.bin
-            nullalis-windows-x86_64.exe
-            nullalis-windows-aarch64.exe
+            # nullalis-windows-x86_64.exe
+            # nullalis-windows-aarch64.exe
           generate_release_notes: true
 
   docker:
