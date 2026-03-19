@@ -12,8 +12,8 @@ COPY build.zig build.zig.zon ./
 COPY src/ src/
 
 RUN case "${TARGETARCH}" in \
-      amd64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dtarget=x86_64-linux-musl -Dcpu=haswell ;; \
-      arm64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dtarget=aarch64-linux-musl ;; \
+      amd64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dcpu=haswell ;; \
+      arm64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres ;; \
       *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac
 
