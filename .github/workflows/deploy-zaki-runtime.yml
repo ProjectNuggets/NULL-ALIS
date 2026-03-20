@@ -38,10 +38,13 @@ jobs:
         id: image
         run: |
           sha_tag="${IMAGE_REPO}:sha-${GITHUB_SHA}"
+          raw_tag="${IMAGE_REPO}:${GITHUB_SHA}"
           echo "sha_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
+          echo "raw_tag=${raw_tag}" >> "$GITHUB_OUTPUT"
           {
             echo "tags<<EOF"
             echo "${sha_tag}"
+            echo "${raw_tag}"
             if [ "${GITHUB_REF_NAME}" = "main" ]; then
               echo "${IMAGE_REPO}:latest"
             fi
@@ -62,4 +65,5 @@ jobs:
       - name: Publish summary
         run: |
           echo "Published image: ${{ steps.image.outputs.sha_tag }}"
+          echo "Immutable alias: ${{ steps.image.outputs.raw_tag }}"
           echo "Production promotion is owned by zaki-infra."

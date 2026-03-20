@@ -85,3 +85,12 @@ For the cleaned-up production layout:
 - service name: `nullclaw`
 - namespace: `zaki`
 - backend discovery URL from `zaki-prod`: `http://nullclaw:3000`
+
+## Production Promotion
+
+- `NULL-ALIS` publishes immutable image tags on `main`.
+- `zaki-infra` chooses which exact image tag is live in production.
+- Production must not depend on `latest`.
+- During the migration to fully immutable promotion, both of these image tag formats are valid:
+  - `sha-<40-char git sha>`
+  - `<40-char git sha>`
