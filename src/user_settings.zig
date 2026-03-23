@@ -1,4 +1,6 @@
 const std = @import("std");
+const config_types = @import("config_types.zig");
+const Config = @import("config.zig").Config;
 
 pub const AssistantMode = enum {
     fast,
@@ -12,7 +14,7 @@ pub const AssistantMode = enum {
         return null;
     }
 
-    fn toSlice(self: AssistantMode) []const u8 {
+    pub fn toSlice(self: AssistantMode) []const u8 {
         return switch (self) {
             .fast => "fast",
             .balanced => "balanced",
@@ -31,7 +33,7 @@ pub const GroupActivation = enum {
         return null;
     }
 
-    fn toSlice(self: GroupActivation) []const u8 {
+    pub fn toSlice(self: GroupActivation) []const u8 {
         return switch (self) {
             .mention => "mention",
             .always => "always",
@@ -54,6 +56,14 @@ pub const Error = error{
     InvalidProactiveUpdates,
     InvalidVoiceReplies,
     InvalidSessionTimeoutMinutes,
+};
+
+pub const OwnershipPlane = enum {
+    operator,
+    tenant_preference,
+    tenant_integration,
+    derived,
+    unknown,
 };
 
 const ModeMapping = struct {
@@ -100,8 +110,80 @@ const mode_mappings = [_]ModeMapping{
     },
 };
 
+const operator_owned_top_level_config_keys = [_][]const u8{
+    "profile",
+    "providers",
+    "audio_media",
+    "default_provider",
+    "default_model",
+    "default_temperature",
+    "max_tokens",
+    "reasoning_effort",
+    "model_routes",
+    "agents",
+    "bindings",
+    "mcp_servers",
+    "diagnostics",
+    "autonomy",
+    "runtime",
+    "network",
+    "reliability",
+    "scheduler",
+    "agent",
+    "heartbeat",
+    "cron",
+    "channels",
+    "memory",
+    "tunnel",
+    "gateway",
+    "tenant",
+    "state",
+    "composio",
+    "secrets",
+    "browser",
+    "http_request",
+    "identity",
+    "cost",
+    "peripherals",
+    "hardware",
+    "security",
+    "tools",
+    "session",
+    "models",
+    "product_presets",
+};
+
+const tenant_preference_product_settings_keys = [_][]const u8{
+    "assistant_mode",
+    "group_activation",
+    "proactive_updates",
+    "voice_replies",
+    "session_timeout_minutes",
+};
+
+pub const NormalizedTenantConfig = struct {
+    json: []u8,
+    ignored_override_count: usize,
+    settings: ProductSettings,
+};
+
 pub fn defaults() ProductSettings {
     return .{};
+}
+
+pub fn topLevelKeyOwnership(key: []const u8) OwnershipPlane {
+    if (std.mem.eql(u8, key, "product_settings")) return .tenant_preference;
+    inline for (operator_owned_top_level_config_keys) |owned_key| {
+        if (std.mem.eql(u8, key, owned_key)) return .operator;
+    }
+    return .unknown;
+}
+
+pub fn productSettingsFieldOwnership(key: []const u8) OwnershipPlane {
+    inline for (tenant_preference_product_settings_keys) |owned_key| {
+        if (std.mem.eql(u8, key, owned_key)) return .tenant_preference;
+    }
+    return .unknown;
 }
 
 pub fn errorCode(err: anyerror) []const u8 {
@@ -209,32 +291,6 @@ pub fn mergeSettingsIntoConfigJson(
     putBool(product_obj, a, "voice_replies", settings.voice_replies) catch {};
     putInt(product_obj, a, "session_timeout_minutes", settings.session_timeout_minutes) catch {};
 
-    const agent_obj = ensureObjectKey(root_obj, a, "agent");
-    const mapping = mappingFor(settings.assistant_mode);
-    putString(agent_obj, a, "queue_mode", mapping.queue_mode) catch {};
-    putInt(agent_obj, a, "queue_cap", mapping.queue_cap) catch {};
-    putString(agent_obj, a, "queue_drop", mapping.queue_drop) catch {};
-    putInt(agent_obj, a, "queue_debounce_ms", 0) catch {};
-    putBool(agent_obj, a, "compact_context", true) catch {};
-    putInt(agent_obj, a, "max_history_messages", mapping.max_history_messages) catch {};
-    putString(agent_obj, a, "activation_mode", settings.group_activation.toSlice()) catch {};
-    putString(agent_obj, a, "send_mode", if (settings.proactive_updates) "inherit" else "off") catch {};
-    putString(agent_obj, a, "tts_mode", if (settings.voice_replies) "inbound" else "off") catch {};
-    putBool(agent_obj, a, "tts_audio", settings.voice_replies) catch {};
-    putInt(agent_obj, a, "session_ttl_secs", settings.session_timeout_minutes * 60) catch {};
-
-    const session_obj = ensureObjectKey(root_obj, a, "session");
-    putBool(session_obj, a, "cross_channel_shared_main", false) catch {};
-
-    const memory_obj = ensureObjectKey(root_obj, a, "memory");
-    const search_obj = ensureObjectKey(memory_obj, a, "search");
-    putBool(search_obj, a, "enabled", true) catch {};
-    const summarizer_obj = ensureObjectKey(memory_obj, a, "summarizer");
-    putBool(summarizer_obj, a, "enabled", mapping.summarizer_enabled) catch {};
-    putInt(summarizer_obj, a, "window_size_tokens", mapping.summarizer_window_size_tokens) catch {};
-    putInt(summarizer_obj, a, "summary_max_tokens", mapping.summarizer_summary_max_tokens) catch {};
-    putBool(summarizer_obj, a, "auto_extract_semantic", true) catch {};
-
     var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
         const with_nl = try std.fmt.allocPrint(allocator, "{s}\n", .{rendered});
@@ -242,6 +298,69 @@ pub fn mergeSettingsIntoConfigJson(
         rendered = with_nl;
     }
     return rendered;
+}
+
+pub fn normalizeTenantConfigJson(
+    allocator: std.mem.Allocator,
+    existing_config_json: []const u8,
+) !NormalizedTenantConfig {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var root = parseRootOrEmptyObject(a, existing_config_json);
+    const root_obj = ensureObject(&root, a);
+    const settings = resolveSettingsFromConfigJson(allocator, existing_config_json) catch defaults();
+
+    var ignored_override_count: usize = 0;
+    inline for (operator_owned_top_level_config_keys) |key| {
+        if (topLevelKeyOwnership(key) == .operator) {
+            if (root_obj.swapRemove(key)) ignored_override_count += 1;
+        }
+    }
+
+    const product_obj = ensureObjectKey(root_obj, a, "product_settings");
+    putString(product_obj, a, "assistant_mode", settings.assistant_mode.toSlice()) catch {};
+    putString(product_obj, a, "group_activation", settings.group_activation.toSlice()) catch {};
+    putBool(product_obj, a, "proactive_updates", settings.proactive_updates) catch {};
+    putBool(product_obj, a, "voice_replies", settings.voice_replies) catch {};
+    putInt(product_obj, a, "session_timeout_minutes", settings.session_timeout_minutes) catch {};
+
+    var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
+    if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
+        const with_nl = try std.fmt.allocPrint(allocator, "{s}\n", .{rendered});
+        allocator.free(rendered);
+        rendered = with_nl;
+    }
+    return .{
+        .json = rendered,
+        .ignored_override_count = ignored_override_count,
+        .settings = settings,
+    };
+}
+
+pub fn applySettingsToConfig(cfg: *Config, settings: ProductSettings) void {
+    const preset = presetForMode(settings.assistant_mode, cfg.product_presets);
+
+    cfg.agent.compact_context = preset.agent.compact_context;
+    cfg.agent.max_history_messages = preset.agent.max_history_messages;
+    cfg.agent.queue_mode = preset.agent.queue_mode;
+    cfg.agent.queue_cap = preset.agent.queue_cap;
+    cfg.agent.queue_drop = preset.agent.queue_drop;
+    cfg.agent.queue_debounce_ms = preset.agent.queue_debounce_ms;
+
+    cfg.memory.summarizer.enabled = preset.summarizer.enabled;
+    cfg.memory.summarizer.window_size_tokens = preset.summarizer.window_size_tokens;
+    cfg.memory.summarizer.summary_max_tokens = preset.summarizer.summary_max_tokens;
+    cfg.memory.summarizer.auto_extract_semantic = preset.summarizer.auto_extract_semantic;
+
+    cfg.agent.activation_mode = settings.group_activation.toSlice();
+    cfg.agent.send_mode = if (settings.proactive_updates) "inherit" else "off";
+    cfg.agent.tts_mode = if (settings.voice_replies) "inbound" else "off";
+    cfg.agent.tts_audio = settings.voice_replies;
+    cfg.agent.session_ttl_secs = settings.session_timeout_minutes * 60;
+    cfg.session.cross_channel_shared_main = false;
+    cfg.syncFlatFields();
 }
 
 pub fn renderSettingsJson(allocator: std.mem.Allocator, settings: ProductSettings) ![]u8 {
@@ -351,6 +470,17 @@ fn mappingFor(mode: AssistantMode) ModeMapping {
         .fast => mode_mappings[0],
         .balanced => mode_mappings[1],
         .deep => mode_mappings[2],
+    };
+}
+
+fn presetForMode(
+    mode: AssistantMode,
+    presets: config_types.ProductPresetsConfig,
+) config_types.AssistantModePresetConfig {
+    return switch (mode) {
+        .fast => presets.fast,
+        .balanced => presets.balanced,
+        .deep => presets.deep,
     };
 }
 
@@ -497,7 +627,7 @@ test "deriveNearestFromConfigJson snaps from agent config" {
     try std.testing.expect(settings.assistant_mode == .fast);
 }
 
-test "mergeSettingsIntoConfigJson preserves unknown keys and writes mapped agent knobs" {
+test "mergeSettingsIntoConfigJson preserves unknown keys and writes canonical product settings" {
     const existing =
         \\{"foo":"bar","agent":{"max_tool_iterations":9}}
     ;
@@ -517,24 +647,40 @@ test "mergeSettingsIntoConfigJson preserves unknown keys and writes mapped agent
     const product = parsed.value.object.get("product_settings").?.object;
     try std.testing.expectEqualStrings("deep", product.get("assistant_mode").?.string);
     const agent = parsed.value.object.get("agent").?.object;
-    try std.testing.expectEqualStrings("serial", agent.get("queue_mode").?.string);
-    try std.testing.expectEqual(@as(i64, 20), agent.get("queue_cap").?.integer);
-    try std.testing.expectEqualStrings("summarize", agent.get("queue_drop").?.string);
-    try std.testing.expectEqual(@as(i64, 80), agent.get("max_history_messages").?.integer);
-    try std.testing.expectEqualStrings("always", agent.get("activation_mode").?.string);
-    try std.testing.expectEqualStrings("off", agent.get("send_mode").?.string);
-    try std.testing.expectEqualStrings("inbound", agent.get("tts_mode").?.string);
-    try std.testing.expectEqual(true, agent.get("tts_audio").?.bool);
-    try std.testing.expectEqual(@as(i64, 2700), agent.get("session_ttl_secs").?.integer);
     try std.testing.expectEqual(@as(i64, 9), agent.get("max_tool_iterations").?.integer);
-    const session = parsed.value.object.get("session").?.object;
-    try std.testing.expectEqual(false, session.get("cross_channel_shared_main").?.bool);
-    const memory = parsed.value.object.get("memory").?.object;
-    const search = memory.get("search").?.object;
-    try std.testing.expectEqual(true, search.get("enabled").?.bool);
-    const summarizer = memory.get("summarizer").?.object;
-    try std.testing.expectEqual(true, summarizer.get("enabled").?.bool);
-    try std.testing.expectEqual(@as(i64, 6000), summarizer.get("window_size_tokens").?.integer);
-    try std.testing.expectEqual(@as(i64, 700), summarizer.get("summary_max_tokens").?.integer);
-    try std.testing.expectEqual(true, summarizer.get("auto_extract_semantic").?.bool);
+    try std.testing.expect(parsed.value.object.get("session") == null);
+    try std.testing.expect(parsed.value.object.get("memory") == null);
+}
+
+test "normalizeTenantConfigJson strips operator-owned overrides and preserves tenant metadata" {
+    const existing =
+        \\{"foo":"bar","agent":{"queue_mode":"latest","queue_cap":8},"memory":{"summarizer":{"enabled":false}},"default_provider":"openai","models":{"providers":{"openai":{"api_key":"test-key"}}},"product_presets":{"fast":{"agent":{"queue_mode":"latest"}}}}
+    ;
+    const normalized = try normalizeTenantConfigJson(std.testing.allocator, existing);
+    defer std.testing.allocator.free(normalized.json);
+
+    try std.testing.expectEqual(@as(usize, 5), normalized.ignored_override_count);
+    try std.testing.expect(normalized.settings.assistant_mode == .fast);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, normalized.json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("bar", parsed.value.object.get("foo").?.string);
+    try std.testing.expect(parsed.value.object.get("agent") == null);
+    try std.testing.expect(parsed.value.object.get("memory") == null);
+    try std.testing.expect(parsed.value.object.get("default_provider") == null);
+    try std.testing.expect(parsed.value.object.get("models") == null);
+    try std.testing.expect(parsed.value.object.get("product_presets") == null);
+    const product = parsed.value.object.get("product_settings").?.object;
+    try std.testing.expectEqualStrings("fast", product.get("assistant_mode").?.string);
+}
+
+test "ownership registry classifies operator and tenant preference keys" {
+    try std.testing.expect(topLevelKeyOwnership("memory") == .operator);
+    try std.testing.expect(topLevelKeyOwnership("models") == .operator);
+    try std.testing.expect(topLevelKeyOwnership("product_presets") == .operator);
+    try std.testing.expect(topLevelKeyOwnership("product_settings") == .tenant_preference);
+    try std.testing.expect(topLevelKeyOwnership("foo") == .unknown);
+    try std.testing.expect(productSettingsFieldOwnership("assistant_mode") == .tenant_preference);
+    try std.testing.expect(productSettingsFieldOwnership("voice_replies") == .tenant_preference);
+    try std.testing.expect(productSettingsFieldOwnership("queue_mode") == .unknown);
 }

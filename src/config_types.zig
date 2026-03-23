@@ -137,6 +137,78 @@ pub const SchedulerConfig = struct {
     max_concurrent: u32 = 4,
 };
 
+pub const AssistantModePresetAgentConfig = struct {
+    compact_context: bool = true,
+    max_history_messages: u32,
+    queue_mode: []const u8,
+    queue_cap: u32,
+    queue_drop: []const u8,
+    queue_debounce_ms: u32 = 0,
+};
+
+pub const AssistantModePresetSummarizerConfig = struct {
+    enabled: bool,
+    window_size_tokens: u32,
+    summary_max_tokens: u32,
+    auto_extract_semantic: bool = true,
+};
+
+pub const AssistantModePresetConfig = struct {
+    agent: AssistantModePresetAgentConfig,
+    summarizer: AssistantModePresetSummarizerConfig,
+};
+
+pub const ProductPresetsConfig = struct {
+    fast: AssistantModePresetConfig = .{
+        .agent = .{
+            .compact_context = true,
+            .max_history_messages = 40,
+            .queue_mode = "latest",
+            .queue_cap = 8,
+            .queue_drop = "newest",
+            .queue_debounce_ms = 0,
+        },
+        .summarizer = .{
+            .enabled = false,
+            .window_size_tokens = 3000,
+            .summary_max_tokens = 300,
+            .auto_extract_semantic = true,
+        },
+    },
+    balanced: AssistantModePresetConfig = .{
+        .agent = .{
+            .compact_context = true,
+            .max_history_messages = 50,
+            .queue_mode = "serial",
+            .queue_cap = 12,
+            .queue_drop = "summarize",
+            .queue_debounce_ms = 0,
+        },
+        .summarizer = .{
+            .enabled = true,
+            .window_size_tokens = 4000,
+            .summary_max_tokens = 500,
+            .auto_extract_semantic = true,
+        },
+    },
+    deep: AssistantModePresetConfig = .{
+        .agent = .{
+            .compact_context = true,
+            .max_history_messages = 80,
+            .queue_mode = "serial",
+            .queue_cap = 20,
+            .queue_drop = "summarize",
+            .queue_debounce_ms = 0,
+        },
+        .summarizer = .{
+            .enabled = true,
+            .window_size_tokens = 6000,
+            .summary_max_tokens = 700,
+            .auto_extract_semantic = true,
+        },
+    },
+};
+
 pub const AgentConfig = struct {
     compact_context: bool = false,
     max_tool_iterations: u32 = 25,

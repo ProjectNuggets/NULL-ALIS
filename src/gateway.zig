@@ -633,57 +633,8 @@ const TenantRuntime = struct {
     last_used_s: std.atomic.Value(i64),
     effective_config_source: []const u8,
     effective_config_hash: u64,
-
-    fn semanticEmbeddingProviderForPrimary(primary_provider: []const u8) ?[]const u8 {
-        if (std.mem.eql(u8, primary_provider, "openrouter")) return "together";
-        if (std.mem.eql(u8, primary_provider, "together") or std.mem.eql(u8, primary_provider, "together-ai")) return "together";
-        if (std.mem.eql(u8, primary_provider, "openai")) return "openai";
-        if (std.mem.eql(u8, primary_provider, "gemini") or std.mem.eql(u8, primary_provider, "google") or std.mem.eql(u8, primary_provider, "google-gemini")) return "gemini";
-        if (std.mem.eql(u8, primary_provider, "voyage")) return "voyage";
-        if (std.mem.eql(u8, primary_provider, "ollama")) return "ollama";
-        return null;
-    }
-
-    fn applyTenantSemanticMemoryDefaults(cfg: *Config) void {
-        if (!std.mem.eql(u8, cfg.state.backend, "postgres")) return;
-
-        // Reuse tenant state Postgres connection for pgvector store unless explicitly overridden.
-        if (cfg.memory.postgres.url.len == 0 and cfg.state.postgres.connection_string.len > 0) {
-            cfg.memory.postgres.url = cfg.state.postgres.connection_string;
-        }
-        if (std.mem.eql(u8, cfg.memory.postgres.schema, "public") and cfg.state.postgres.schema.len > 0) {
-            cfg.memory.postgres.schema = cfg.state.postgres.schema;
-        }
-
-        const has_semantic_override =
-            !std.mem.eql(u8, cfg.memory.search.provider, "none") or
-            !std.mem.eql(u8, cfg.memory.search.fallback_provider, "none") or
-            cfg.memory.search.query.hybrid.enabled or
-            !std.mem.eql(u8, cfg.memory.search.store.kind, "auto") or
-            !std.mem.eql(u8, cfg.memory.reliability.rollout_mode, "off");
-        if (has_semantic_override) return;
-
-        // Default tenant Postgres runtimes to semantic-ready retrieval, while keeping
-        // explicit user memory config authoritative.
-        cfg.memory.profile = "postgres_hybrid";
-        cfg.memory.applyProfileDefaults();
-        // Tenant runtime uses zaki_dual (markdown workspace + canonical Postgres state).
-        // Keep the primary backend pinned to markdown and only inherit semantic/vector knobs.
-        cfg.memory.backend = "markdown";
-
-        if (semanticEmbeddingProviderForPrimary(cfg.default_provider)) |provider_name| {
-            cfg.memory.search.provider = provider_name;
-            if (std.mem.eql(u8, provider_name, "together") and std.mem.eql(u8, cfg.memory.search.model, "text-embedding-3-small")) {
-                cfg.memory.search.model = "intfloat/multilingual-e5-large-instruct";
-                cfg.memory.search.dimensions = 1024;
-            }
-            if (std.mem.eql(u8, cfg.memory.search.fallback_provider, "none") and !std.mem.eql(u8, provider_name, "local")) {
-                // Keep semantic recall available if the remote embedding provider
-                // is blocked/unavailable at runtime.
-                cfg.memory.search.fallback_provider = "local";
-            }
-        }
-    }
+    resolved_settings: user_settings.ProductSettings,
+    ignored_tenant_override_count: usize,
 
     fn configHash(payload: []const u8) u64 {
         return std.hash.Wyhash.hash(0, payload);
@@ -702,8 +653,8 @@ const TenantRuntime = struct {
         defer file.close();
         const raw = try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
         defer allocator.free(raw);
-        const settings = user_settings.resolveSettingsFromConfigJson(allocator, raw) catch user_settings.defaults();
-        return user_settings.mergeSettingsIntoConfigJson(allocator, "{}", settings);
+        const normalized = try user_settings.normalizeTenantConfigJson(allocator, raw);
+        return normalized.json;
     }
 
     fn init(
@@ -739,6 +690,8 @@ const TenantRuntime = struct {
             .last_used_s = std.atomic.Value(i64).init(std.time.timestamp()),
             .effective_config_source = "file_config",
             .effective_config_hash = hashConfigFileBestEffort(allocator, base_config.config_path),
+            .resolved_settings = user_settings.defaults(),
+            .ignored_tenant_override_count = 0,
         };
         runtime.config.workspace_dir = runtime.workspace_path;
         if (state_mgr != null) {
@@ -748,14 +701,23 @@ const TenantRuntime = struct {
                 defer allocator.free(json);
                 const trimmed = std.mem.trim(u8, json, " \t\r\n");
                 if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "{}")) {
+                    const normalized = user_settings.normalizeTenantConfigJson(allocator, trimmed) catch null;
                     runtime.effective_config_source = "postgres_user_config";
                     runtime.effective_config_hash = configHash(trimmed);
-                    runtime.config.parseJson(trimmed) catch |err| {
-                        log.warn("tenant config parse failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
-                    };
+                    if (normalized) |snapshot| {
+                        defer allocator.free(snapshot.json);
+                        runtime.effective_config_hash = configHash(snapshot.json);
+                        runtime.resolved_settings = snapshot.settings;
+                        runtime.ignored_tenant_override_count = snapshot.ignored_override_count;
+                        runtime.config.parseJson(snapshot.json) catch |err| {
+                            log.warn("tenant config parse failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
+                        };
+                    } else {
+                        log.warn("tenant config normalize failed for user {s}", .{user_ctx.user_id});
+                    }
                     runtime.config.applyProfileDefaults() catch {};
                     runtime.config.memory.applyProfileDefaults();
-                    runtime.config.syncFlatFields();
+                    user_settings.applySettingsToConfig(&runtime.config, runtime.resolved_settings);
                 } else {
                     const seed_json = buildSeedConfigJsonFromFile(allocator, base_config.config_path) catch null;
                     if (seed_json) |seed| {
@@ -763,17 +725,24 @@ const TenantRuntime = struct {
                         if (state_mgr.?.putConfigJson(numeric_user_id, seed)) |_| {
                             runtime.effective_config_source = "postgres_seeded_from_file";
                             runtime.effective_config_hash = configHash(seed);
+                            const normalized = user_settings.normalizeTenantConfigJson(allocator, seed) catch null;
                             log.info("tenant.config.seeded user={s} schema_version={s} hash={x}", .{
                                 user_ctx.user_id,
                                 TENANT_SEED_SCHEMA_VERSION,
                                 runtime.effective_config_hash,
                             });
-                            runtime.config.parseJson(seed) catch |err| {
-                                log.warn("tenant seeded config parse failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
-                            };
+                            if (normalized) |snapshot| {
+                                defer allocator.free(snapshot.json);
+                                runtime.effective_config_hash = configHash(snapshot.json);
+                                runtime.resolved_settings = snapshot.settings;
+                                runtime.ignored_tenant_override_count = snapshot.ignored_override_count;
+                                runtime.config.parseJson(snapshot.json) catch |err| {
+                                    log.warn("tenant seeded config parse failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
+                                };
+                            }
                             runtime.config.applyProfileDefaults() catch {};
                             runtime.config.memory.applyProfileDefaults();
-                            runtime.config.syncFlatFields();
+                            user_settings.applySettingsToConfig(&runtime.config, runtime.resolved_settings);
                         } else |err| {
                             runtime.effective_config_source = "file_config_fallback";
                             log.warn("tenant config seed failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
@@ -817,7 +786,6 @@ const TenantRuntime = struct {
             .tracker = if (runtime.sec_tracker) |*tracker| tracker else null,
         };
 
-        applyTenantSemanticMemoryDefaults(&runtime.config);
         runtime.mem_rt = memory_mod.initRuntimeWithOptions(allocator, &runtime.config.memory, runtime.config.workspace_dir, .{
             .providers = runtime.config.providers,
             .search_api_key_override = resolved_api_key,
@@ -1018,6 +986,89 @@ fn removeTenantRuntime(state: *GatewayState, user_id: []const u8) void {
     if (state.tenant_runtimes.fetchRemove(user_id)) |kv| {
         kv.value.deinit();
     }
+}
+
+fn clearAllTenantRuntimes(state: *GatewayState) usize {
+    var removed: usize = 0;
+    while (state.tenant_runtimes.count() > 0) {
+        var it = state.tenant_runtimes.iterator();
+        const entry = it.next() orelse break;
+        const key_copy = state.allocator.dupe(u8, entry.key_ptr.*) catch break;
+        defer state.allocator.free(key_copy);
+        removeTenantRuntime(state, key_copy);
+        removed += 1;
+    }
+    return removed;
+}
+
+const TenantRuntimeInvalidationRequest = struct {
+    all: bool = false,
+    user_ids: []const []const u8 = &.{},
+
+    fn deinit(self: TenantRuntimeInvalidationRequest, allocator: std.mem.Allocator) void {
+        for (self.user_ids) |user_id| allocator.free(user_id);
+        allocator.free(self.user_ids);
+    }
+};
+
+fn appendTenantRuntimeInvalidationUserId(
+    allocator: std.mem.Allocator,
+    user_ids: *std.ArrayListUnmanaged([]const u8),
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .string => try user_ids.append(allocator, try allocator.dupe(u8, std.mem.trim(u8, value.string, " \t\r\n"))),
+        .integer => try user_ids.append(allocator, try std.fmt.allocPrint(allocator, "{d}", .{value.integer})),
+        else => return error.InvalidPayload,
+    }
+}
+
+fn parseTenantRuntimeInvalidationRequest(
+    allocator: std.mem.Allocator,
+    header_user_id: ?[]const u8,
+    body: ?[]const u8,
+) !TenantRuntimeInvalidationRequest {
+    var user_ids: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (user_ids.items) |user_id| allocator.free(user_id);
+        user_ids.deinit(allocator);
+    }
+
+    var all = false;
+    if (body) |payload| {
+        const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+        if (trimmed.len > 0) {
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidPayload;
+            if (parsed.value.object.get("all")) |all_value| {
+                if (all_value != .bool) return error.InvalidPayload;
+                all = all_value.bool;
+            }
+            if (parsed.value.object.get("user_id")) |user_id_value| {
+                try appendTenantRuntimeInvalidationUserId(allocator, &user_ids, user_id_value);
+            }
+            if (parsed.value.object.get("user_ids")) |user_ids_value| {
+                if (user_ids_value != .array) return error.InvalidPayload;
+                for (user_ids_value.array.items) |item| {
+                    try appendTenantRuntimeInvalidationUserId(allocator, &user_ids, item);
+                }
+            }
+        }
+    }
+
+    if (!all and user_ids.items.len == 0) {
+        if (header_user_id) |value| {
+            try user_ids.append(allocator, try allocator.dupe(u8, value));
+        } else {
+            return error.InvalidPayload;
+        }
+    }
+
+    return .{
+        .all = all,
+        .user_ids = try user_ids.toOwnedSlice(allocator),
+    };
 }
 
 fn pruneTenantRuntimeCache(state: *GatewayState, now_s: i64) void {
@@ -4260,12 +4311,30 @@ fn appendIntegrationsSummaryJson(
 
 const DiagnosticsConfigSnapshot = struct {
     source: []const u8,
+    config_hash: u64,
+    assistant_mode: []const u8,
+    ignored_override_count: usize,
+    agent_parallel_tools: bool,
+    agent_parallel_tools_rollout_percent: u8,
+    agent_tool_dispatcher: []const u8,
     memory_search_enabled: bool,
+    memory_search_sync_mode_requested: []const u8,
     memory_summarizer_enabled: bool,
+    memory_summarizer_window_size_tokens: u32,
+    memory_summarizer_summary_max_tokens: u32,
+    memory_summarizer_auto_extract_semantic: bool,
+    memory_reliability_rollout_mode: []const u8,
+    memory_reliability_shadow_hybrid_percent: u32,
+    memory_reliability_canary_hybrid_percent: u32,
+    memory_reliability_fallback_policy: []const u8,
     provider_retries: u32,
     fallback_provider_count: usize,
     memory_vector_sync_mode_requested: []const u8,
     memory_outbox_requested: bool,
+    tenant_identity_mapping_enforcement: []const u8,
+    tenant_identity_mapping_strict_channels: []const []const u8,
+    gateway_require_explicit_chat_stream_session_key: bool,
+    session_cross_channel_shared_main: bool,
 };
 
 fn loadDiagnosticsConfigSnapshot(
@@ -4298,6 +4367,8 @@ fn loadDiagnosticsConfigSnapshot(
         .config_path = state.configPath(),
         .allocator = a,
     };
+    var settings = user_settings.defaults();
+    var ignored_override_count: usize = 0;
 
     const base_config_path = state.configPath();
     if (base_config_path.len > 0) {
@@ -4306,11 +4377,16 @@ fn loadDiagnosticsConfigSnapshot(
         } else |_| {}
     }
 
-    cfg.parseJson(raw_user_config) catch {};
+    const normalized = user_settings.normalizeTenantConfigJson(allocator, raw_user_config) catch null;
+    defer if (normalized) |snapshot| allocator.free(snapshot.json);
+    if (normalized) |snapshot| {
+        settings = snapshot.settings;
+        ignored_override_count = snapshot.ignored_override_count;
+        cfg.parseJson(snapshot.json) catch {};
+    }
     cfg.applyProfileDefaults() catch {};
     cfg.memory.applyProfileDefaults();
-    cfg.syncFlatFields();
-    TenantRuntime.applyTenantSemanticMemoryDefaults(&cfg);
+    user_settings.applySettingsToConfig(&cfg, settings);
 
     const requested_sync_mode: []const u8 = if (std.mem.eql(u8, cfg.memory.search.sync.mode, "best_effort"))
         "best_effort"
@@ -4321,13 +4397,257 @@ fn loadDiagnosticsConfigSnapshot(
 
     return .{
         .source = source,
+        .config_hash = if (normalized) |snapshot| TenantRuntime.configHash(snapshot.json) else TenantRuntime.configHash(raw_user_config),
+        .assistant_mode = settings.assistant_mode.toSlice(),
+        .ignored_override_count = ignored_override_count,
+        .agent_parallel_tools = cfg.agent.parallel_tools,
+        .agent_parallel_tools_rollout_percent = cfg.agent.parallel_tools_rollout_percent,
+        .agent_tool_dispatcher = cfg.agent.tool_dispatcher,
         .memory_search_enabled = cfg.memory.search.enabled,
+        .memory_search_sync_mode_requested = cfg.memory.search.sync.mode,
         .memory_summarizer_enabled = cfg.memory.summarizer.enabled,
+        .memory_summarizer_window_size_tokens = cfg.memory.summarizer.window_size_tokens,
+        .memory_summarizer_summary_max_tokens = cfg.memory.summarizer.summary_max_tokens,
+        .memory_summarizer_auto_extract_semantic = cfg.memory.summarizer.auto_extract_semantic,
+        .memory_reliability_rollout_mode = cfg.memory.reliability.rollout_mode,
+        .memory_reliability_shadow_hybrid_percent = cfg.memory.reliability.shadow_hybrid_percent,
+        .memory_reliability_canary_hybrid_percent = cfg.memory.reliability.canary_hybrid_percent,
+        .memory_reliability_fallback_policy = cfg.memory.reliability.fallback_policy,
         .provider_retries = cfg.reliability.provider_retries,
         .fallback_provider_count = cfg.reliability.fallback_providers.len,
         .memory_vector_sync_mode_requested = requested_sync_mode,
         .memory_outbox_requested = !std.mem.eql(u8, cfg.memory.search.sync.mode, "best_effort"),
+        .tenant_identity_mapping_enforcement = cfg.tenant.identity_mapping_enforcement,
+        .tenant_identity_mapping_strict_channels = cfg.tenant.identity_mapping_strict_channels,
+        .gateway_require_explicit_chat_stream_session_key = cfg.gateway.require_explicit_chat_stream_session_key,
+        .session_cross_channel_shared_main = cfg.session.cross_channel_shared_main,
     };
+}
+
+fn appendJsonBoolValue(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: ?bool,
+) !void {
+    if (value) |resolved| {
+        try buf.appendSlice(allocator, if (resolved) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendJsonU32Value(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: ?u32,
+) !void {
+    if (value) |resolved| {
+        var number_buf: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&number_buf, "{d}", .{resolved}) catch "0";
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendJsonU8Value(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: ?u8,
+) !void {
+    if (value) |resolved| {
+        var number_buf: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&number_buf, "{d}", .{resolved}) catch "0";
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendJsonUsizeValue(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: ?usize,
+) !void {
+    if (value) |resolved| {
+        var number_buf: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&number_buf, "{d}", .{resolved}) catch "0";
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendJsonStringValue(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+) !void {
+    if (value) |resolved| {
+        try json_util.appendJsonString(buf, allocator, resolved);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendJsonStringArrayValue(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    values_opt: ?[]const []const u8,
+) !void {
+    if (values_opt) |values| {
+        try buf.appendSlice(allocator, "[");
+        for (values, 0..) |value, index| {
+            if (index > 0) try buf.appendSlice(allocator, ",");
+            try json_util.appendJsonString(buf, allocator, value);
+        }
+        try buf.appendSlice(allocator, "]");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendControlPlaneStringEntry(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    configured: ?[]const u8,
+    effective: ?[]const u8,
+    source: ?[]const u8,
+) !void {
+    return appendControlPlaneStringEntryWithDrift(buf, allocator, key, configured, effective, source, null);
+}
+
+fn appendControlPlaneStringEntryWithDrift(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    configured: ?[]const u8,
+    effective: ?[]const u8,
+    source: ?[]const u8,
+    drift_override: ?bool,
+) !void {
+    try json_util.appendJsonKey(buf, allocator, key);
+    try buf.appendSlice(allocator, "{\"configured\":");
+    try appendJsonStringValue(buf, allocator, configured);
+    try buf.appendSlice(allocator, ",\"effective\":");
+    try appendJsonStringValue(buf, allocator, effective);
+    try buf.appendSlice(allocator, ",\"owner\":\"operator\",\"source\":");
+    try appendJsonStringValue(buf, allocator, source);
+    try buf.appendSlice(allocator, ",\"drift\":");
+    if (drift_override) |override| {
+        try buf.appendSlice(allocator, if (override) "true" else "false");
+    } else if (configured != null and effective != null) {
+        try buf.appendSlice(allocator, if (std.mem.eql(u8, configured.?, effective.?)) "false" else "true");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, "}");
+}
+
+fn appendControlPlaneBoolEntry(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    configured: ?bool,
+    effective: ?bool,
+    source: ?[]const u8,
+) !void {
+    try json_util.appendJsonKey(buf, allocator, key);
+    try buf.appendSlice(allocator, "{\"configured\":");
+    try appendJsonBoolValue(buf, allocator, configured);
+    try buf.appendSlice(allocator, ",\"effective\":");
+    try appendJsonBoolValue(buf, allocator, effective);
+    try buf.appendSlice(allocator, ",\"owner\":\"operator\",\"source\":");
+    try appendJsonStringValue(buf, allocator, source);
+    try buf.appendSlice(allocator, ",\"drift\":");
+    if (configured != null and effective != null) {
+        try buf.appendSlice(allocator, if (configured.? == effective.?) "false" else "true");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, "}");
+}
+
+fn appendControlPlaneU32Entry(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    configured: ?u32,
+    effective: ?u32,
+    source: ?[]const u8,
+) !void {
+    try json_util.appendJsonKey(buf, allocator, key);
+    try buf.appendSlice(allocator, "{\"configured\":");
+    try appendJsonU32Value(buf, allocator, configured);
+    try buf.appendSlice(allocator, ",\"effective\":");
+    try appendJsonU32Value(buf, allocator, effective);
+    try buf.appendSlice(allocator, ",\"owner\":\"operator\",\"source\":");
+    try appendJsonStringValue(buf, allocator, source);
+    try buf.appendSlice(allocator, ",\"drift\":");
+    if (configured != null and effective != null) {
+        try buf.appendSlice(allocator, if (configured.? == effective.?) "false" else "true");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, "}");
+}
+
+fn appendControlPlaneU8Entry(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    configured: ?u8,
+    effective: ?u8,
+    source: ?[]const u8,
+) !void {
+    try json_util.appendJsonKey(buf, allocator, key);
+    try buf.appendSlice(allocator, "{\"configured\":");
+    try appendJsonU8Value(buf, allocator, configured);
+    try buf.appendSlice(allocator, ",\"effective\":");
+    try appendJsonU8Value(buf, allocator, effective);
+    try buf.appendSlice(allocator, ",\"owner\":\"operator\",\"source\":");
+    try appendJsonStringValue(buf, allocator, source);
+    try buf.appendSlice(allocator, ",\"drift\":");
+    if (configured != null and effective != null) {
+        try buf.appendSlice(allocator, if (configured.? == effective.?) "false" else "true");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, "}");
+}
+
+fn appendControlPlaneStringArrayEntry(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    configured: ?[]const []const u8,
+    effective: ?[]const []const u8,
+    source: ?[]const u8,
+) !void {
+    try json_util.appendJsonKey(buf, allocator, key);
+    try buf.appendSlice(allocator, "{\"configured\":");
+    try appendJsonStringArrayValue(buf, allocator, configured);
+    try buf.appendSlice(allocator, ",\"effective\":");
+    try appendJsonStringArrayValue(buf, allocator, effective);
+    try buf.appendSlice(allocator, ",\"owner\":\"operator\",\"source\":");
+    try appendJsonStringValue(buf, allocator, source);
+    try buf.appendSlice(allocator, ",\"drift\":");
+    if (configured != null and effective != null) {
+        var drift = configured.?.len != effective.?.len;
+        if (!drift) {
+            for (configured.?, effective.?) |lhs, rhs| {
+                if (!std.mem.eql(u8, lhs, rhs)) {
+                    drift = true;
+                    break;
+                }
+            }
+        }
+        try buf.appendSlice(allocator, if (drift) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, "}");
 }
 
 fn internalDiagnosticsPayload(
@@ -4411,21 +4731,74 @@ fn internalDiagnosticsPayload(
     var memory_vector_sync_mode: ?[]const u8 = null;
     var memory_outbox_enabled: ?bool = null;
     var configured_config_source: ?[]const u8 = null;
+    var configured_config_hash: ?u64 = null;
+    var configured_assistant_mode: ?[]const u8 = null;
+    var configured_ignored_tenant_override_count: ?usize = null;
+    var configured_agent_parallel_tools: ?bool = null;
+    var configured_agent_parallel_tools_rollout_percent: ?u8 = null;
+    var configured_agent_tool_dispatcher: ?[]const u8 = null;
     var configured_memory_search_enabled: ?bool = null;
+    var configured_memory_search_sync_mode_requested: ?[]const u8 = null;
     var configured_memory_summarizer_enabled: ?bool = null;
+    var configured_memory_summarizer_window_size_tokens: ?u32 = null;
+    var configured_memory_summarizer_summary_max_tokens: ?u32 = null;
+    var configured_memory_summarizer_auto_extract_semantic: ?bool = null;
+    var configured_memory_reliability_rollout_mode: ?[]const u8 = null;
+    var configured_memory_reliability_shadow_hybrid_percent: ?u32 = null;
+    var configured_memory_reliability_canary_hybrid_percent: ?u32 = null;
+    var configured_memory_reliability_fallback_policy: ?[]const u8 = null;
     var configured_provider_retries: ?u32 = null;
     var configured_fallback_provider_count: ?usize = null;
     var configured_memory_vector_sync_mode_requested: ?[]const u8 = null;
     var configured_memory_outbox_requested: ?bool = null;
+    var configured_tenant_identity_mapping_enforcement: ?[]const u8 = null;
+    var configured_tenant_identity_mapping_strict_channels: ?[]const []const u8 = null;
+    var configured_gateway_require_explicit_chat_stream_session_key: ?bool = null;
+    var configured_session_cross_channel_shared_main: ?bool = null;
+    var effective_assistant_mode: ?[]const u8 = null;
+    var effective_ignored_tenant_override_count: ?usize = null;
+    var effective_agent_parallel_tools: ?bool = null;
+    var effective_agent_parallel_tools_rollout_percent: ?u8 = null;
+    var effective_agent_tool_dispatcher: ?[]const u8 = null;
+    var effective_memory_search_sync_mode: ?[]const u8 = null;
+    var effective_memory_summarizer_window_size_tokens: ?u32 = null;
+    var effective_memory_summarizer_summary_max_tokens: ?u32 = null;
+    var effective_memory_summarizer_auto_extract_semantic: ?bool = null;
+    var effective_memory_reliability_rollout_mode: ?[]const u8 = null;
+    var effective_memory_reliability_shadow_hybrid_percent: ?u32 = null;
+    var effective_memory_reliability_canary_hybrid_percent: ?u32 = null;
+    var effective_memory_reliability_fallback_policy: ?[]const u8 = null;
+    var effective_tenant_identity_mapping_enforcement: ?[]const u8 = null;
+    var effective_tenant_identity_mapping_strict_channels: ?[]const []const u8 = null;
+    var effective_gateway_require_explicit_chat_stream_session_key: ?bool = null;
+    var effective_session_cross_channel_shared_main: ?bool = null;
     if (user_id_opt) |user_id_raw| {
         if (loadDiagnosticsConfigSnapshot(allocator, state, user_id_raw)) |snapshot| {
             configured_config_source = snapshot.source;
+            configured_config_hash = snapshot.config_hash;
+            configured_assistant_mode = snapshot.assistant_mode;
+            configured_ignored_tenant_override_count = snapshot.ignored_override_count;
+            configured_agent_parallel_tools = snapshot.agent_parallel_tools;
+            configured_agent_parallel_tools_rollout_percent = snapshot.agent_parallel_tools_rollout_percent;
+            configured_agent_tool_dispatcher = snapshot.agent_tool_dispatcher;
             configured_memory_search_enabled = snapshot.memory_search_enabled;
+            configured_memory_search_sync_mode_requested = snapshot.memory_search_sync_mode_requested;
             configured_memory_summarizer_enabled = snapshot.memory_summarizer_enabled;
+            configured_memory_summarizer_window_size_tokens = snapshot.memory_summarizer_window_size_tokens;
+            configured_memory_summarizer_summary_max_tokens = snapshot.memory_summarizer_summary_max_tokens;
+            configured_memory_summarizer_auto_extract_semantic = snapshot.memory_summarizer_auto_extract_semantic;
+            configured_memory_reliability_rollout_mode = snapshot.memory_reliability_rollout_mode;
+            configured_memory_reliability_shadow_hybrid_percent = snapshot.memory_reliability_shadow_hybrid_percent;
+            configured_memory_reliability_canary_hybrid_percent = snapshot.memory_reliability_canary_hybrid_percent;
+            configured_memory_reliability_fallback_policy = snapshot.memory_reliability_fallback_policy;
             configured_provider_retries = snapshot.provider_retries;
             configured_fallback_provider_count = snapshot.fallback_provider_count;
             configured_memory_vector_sync_mode_requested = snapshot.memory_vector_sync_mode_requested;
             configured_memory_outbox_requested = snapshot.memory_outbox_requested;
+            configured_tenant_identity_mapping_enforcement = snapshot.tenant_identity_mapping_enforcement;
+            configured_tenant_identity_mapping_strict_channels = snapshot.tenant_identity_mapping_strict_channels;
+            configured_gateway_require_explicit_chat_stream_session_key = snapshot.gateway_require_explicit_chat_stream_session_key;
+            configured_session_cross_channel_shared_main = snapshot.session_cross_channel_shared_main;
         }
         {
             const mutable_state: *GatewayState = @constCast(state);
@@ -4434,10 +4807,27 @@ fn internalDiagnosticsPayload(
             if (mutable_state.tenant_runtimes.get(user_id_raw)) |tenant_runtime| {
                 effective_config_source = tenant_runtime.effective_config_source;
                 effective_config_hash = tenant_runtime.effective_config_hash;
+                effective_assistant_mode = tenant_runtime.resolved_settings.assistant_mode.toSlice();
+                effective_ignored_tenant_override_count = tenant_runtime.ignored_tenant_override_count;
+                effective_agent_parallel_tools = tenant_runtime.config.agent.parallel_tools;
+                effective_agent_parallel_tools_rollout_percent = tenant_runtime.config.agent.parallel_tools_rollout_percent;
+                effective_agent_tool_dispatcher = tenant_runtime.config.agent.tool_dispatcher;
                 memory_search_enabled = tenant_runtime.config.memory.search.enabled;
                 memory_summarizer_enabled = tenant_runtime.config.memory.summarizer.enabled;
+                effective_memory_search_sync_mode = tenant_runtime.config.memory.search.sync.mode;
+                effective_memory_summarizer_window_size_tokens = tenant_runtime.config.memory.summarizer.window_size_tokens;
+                effective_memory_summarizer_summary_max_tokens = tenant_runtime.config.memory.summarizer.summary_max_tokens;
+                effective_memory_summarizer_auto_extract_semantic = tenant_runtime.config.memory.summarizer.auto_extract_semantic;
+                effective_memory_reliability_rollout_mode = tenant_runtime.config.memory.reliability.rollout_mode;
+                effective_memory_reliability_shadow_hybrid_percent = tenant_runtime.config.memory.reliability.shadow_hybrid_percent;
+                effective_memory_reliability_canary_hybrid_percent = tenant_runtime.config.memory.reliability.canary_hybrid_percent;
+                effective_memory_reliability_fallback_policy = tenant_runtime.config.memory.reliability.fallback_policy;
                 provider_retries = tenant_runtime.config.reliability.provider_retries;
                 fallback_provider_count = tenant_runtime.config.reliability.fallback_providers.len;
+                effective_tenant_identity_mapping_enforcement = tenant_runtime.config.tenant.identity_mapping_enforcement;
+                effective_tenant_identity_mapping_strict_channels = tenant_runtime.config.tenant.identity_mapping_strict_channels;
+                effective_gateway_require_explicit_chat_stream_session_key = tenant_runtime.config.gateway.require_explicit_chat_stream_session_key;
+                effective_session_cross_channel_shared_main = tenant_runtime.config.session.cross_channel_shared_main;
                 if (tenant_runtime.mem_rt) |*memory_rt| {
                     memory_vector_sync_mode = memory_rt.resolved.vector_sync_mode;
                     memory_outbox_enabled = memory_rt._outbox != null;
@@ -4638,6 +5028,88 @@ fn internalDiagnosticsPayload(
         try buf.appendSlice(allocator, "null");
     }
     try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "control_plane");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKey(&buf, allocator, "configured_config_source");
+    try appendJsonStringValue(&buf, allocator, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "effective_config_source");
+    try json_util.appendJsonString(&buf, allocator, effective_config_source);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_config_hash");
+    if (configured_config_hash) |hash| {
+        var hash_buf: [24]u8 = undefined;
+        const hash_text = std.fmt.bufPrint(&hash_buf, "{x:0>16}", .{hash}) catch "0000000000000000";
+        try json_util.appendJsonString(&buf, allocator, hash_text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "effective_config_hash");
+    if (effective_config_hash) |hash| {
+        var hash_buf: [24]u8 = undefined;
+        const hash_text = std.fmt.bufPrint(&hash_buf, "{x:0>16}", .{hash}) catch "0000000000000000";
+        try json_util.appendJsonString(&buf, allocator, hash_text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_assistant_mode");
+    try appendJsonStringValue(&buf, allocator, configured_assistant_mode);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "effective_assistant_mode");
+    try appendJsonStringValue(&buf, allocator, effective_assistant_mode);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_ignored_tenant_override_count");
+    try appendJsonUsizeValue(&buf, allocator, configured_ignored_tenant_override_count);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "effective_ignored_tenant_override_count");
+    try appendJsonUsizeValue(&buf, allocator, effective_ignored_tenant_override_count);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "controls");
+    try buf.appendSlice(allocator, "{");
+    try appendControlPlaneBoolEntry(&buf, allocator, "agent.parallel_tools", configured_agent_parallel_tools, effective_agent_parallel_tools, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneU8Entry(&buf, allocator, "agent.parallel_tools_rollout_percent", configured_agent_parallel_tools_rollout_percent, effective_agent_parallel_tools_rollout_percent, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    const effective_dispatcher_effective = if (effective_agent_tool_dispatcher != null and effective_agent_parallel_tools != null)
+        tool_dispatcher.effectiveMode(effective_agent_parallel_tools.?, tool_dispatcher.parseMode(effective_agent_tool_dispatcher.?).mode).toSlice()
+    else
+        null;
+    const dispatcher_drift_override = if (configured_agent_tool_dispatcher) |configured_mode|
+        if (std.ascii.eqlIgnoreCase(configured_mode, "auto")) false else null
+    else
+        null;
+    try appendControlPlaneStringEntryWithDrift(&buf, allocator, "agent.tool_dispatcher", configured_agent_tool_dispatcher, effective_dispatcher_effective, configured_config_source, dispatcher_drift_override);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneStringEntry(&buf, allocator, "memory.reliability.rollout_mode", configured_memory_reliability_rollout_mode, effective_memory_reliability_rollout_mode, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneU32Entry(&buf, allocator, "memory.reliability.shadow_hybrid_percent", configured_memory_reliability_shadow_hybrid_percent, effective_memory_reliability_shadow_hybrid_percent, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneU32Entry(&buf, allocator, "memory.reliability.canary_hybrid_percent", configured_memory_reliability_canary_hybrid_percent, effective_memory_reliability_canary_hybrid_percent, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneStringEntry(&buf, allocator, "memory.reliability.fallback_policy", configured_memory_reliability_fallback_policy, effective_memory_reliability_fallback_policy, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneBoolEntry(&buf, allocator, "memory.search.enabled", configured_memory_search_enabled, memory_search_enabled, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneStringEntry(&buf, allocator, "memory.search.sync.mode", configured_memory_search_sync_mode_requested, effective_memory_search_sync_mode orelse memory_vector_sync_mode, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneBoolEntry(&buf, allocator, "memory.summarizer.enabled", configured_memory_summarizer_enabled, memory_summarizer_enabled, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneU32Entry(&buf, allocator, "memory.summarizer.window_size_tokens", configured_memory_summarizer_window_size_tokens, effective_memory_summarizer_window_size_tokens, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneU32Entry(&buf, allocator, "memory.summarizer.summary_max_tokens", configured_memory_summarizer_summary_max_tokens, effective_memory_summarizer_summary_max_tokens, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneBoolEntry(&buf, allocator, "memory.summarizer.auto_extract_semantic", configured_memory_summarizer_auto_extract_semantic, effective_memory_summarizer_auto_extract_semantic, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneStringEntry(&buf, allocator, "tenant.identity_mapping_enforcement", configured_tenant_identity_mapping_enforcement, effective_tenant_identity_mapping_enforcement, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneStringArrayEntry(&buf, allocator, "tenant.identity_mapping_strict_channels", configured_tenant_identity_mapping_strict_channels, effective_tenant_identity_mapping_strict_channels, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneBoolEntry(&buf, allocator, "gateway.require_explicit_chat_stream_session_key", configured_gateway_require_explicit_chat_stream_session_key, effective_gateway_require_explicit_chat_stream_session_key, configured_config_source);
+    try buf.appendSlice(allocator, ",");
+    try appendControlPlaneBoolEntry(&buf, allocator, "session.cross_channel_shared_main", configured_session_cross_channel_shared_main, effective_session_cross_channel_shared_main, configured_config_source);
+    try buf.appendSlice(allocator, "}},");
     try json_util.appendJsonInt(&buf, allocator, "sandbox_workspace_validation_failed_total", @intCast(sandbox_diag.workspace_validation_failed_total));
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "sandbox_fallback_none_total", @intCast(sandbox_diag.workspace_fallback_none_total));
@@ -5985,7 +6457,8 @@ fn handleApiRoute(
     };
     scaffoldUserWorkspace(req_allocator, &user_ctx);
     prep_guard.release();
-    const needs_write_lock = !std.mem.eql(u8, method, "GET");
+    const raw_config_write_attempt = std.mem.eql(u8, parsed.subpath, "config") and !std.mem.eql(u8, method, "GET");
+    const needs_write_lock = !std.mem.eql(u8, method, "GET") and !raw_config_write_attempt;
     var user_write_lock: ?OwnershipLockAcquireResult = null;
     if (needs_write_lock) {
         var acquired = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch {
@@ -6122,36 +6595,24 @@ fn handleApiRoute(
 
     if (std.mem.eql(u8, parsed.subpath, "config")) {
         if (std.mem.eql(u8, method, "GET")) {
-            if (state.zaki_state) |mgr| {
+            const raw_content = if (state.zaki_state) |mgr| blk: {
                 const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                const content = mgr.getConfigJson(req_allocator, user_id) catch {
+                break :blk mgr.getConfigJson(req_allocator, user_id) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
                 };
-                return .{ .body = content };
-            }
-            const content = readFileOrDefault(req_allocator, user_ctx.config_path, "{}\n") catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+            } else blk: {
+                break :blk readFileOrDefault(req_allocator, user_ctx.config_path, "{}\n") catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+                };
             };
-            return .{ .body = content };
+            defer req_allocator.free(raw_content);
+            const normalized = user_settings.normalizeTenantConfigJson(req_allocator, raw_content) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"normalize failed\"}" };
+            };
+            return .{ .body = normalized.json };
         }
         if (std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "PUT")) {
-            const body = extractBody(raw_request) orelse "{}\n";
-            if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                mgr.putConfigJson(user_id, body) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-                };
-                writeFile(user_ctx.config_path, body) catch |err| {
-                    log.warn("tenant config mirror write failed path={s}: {}", .{ user_ctx.config_path, err });
-                };
-            } else {
-                writeFile(user_ctx.config_path, body) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-                };
-            }
-            // Ensure next turn picks up updated tenant config/tool settings immediately.
-            removeTenantRuntime(state, parsed.user_id);
-            return .{ .body = "{\"status\":\"updated\"}" };
+            return .{ .status = "403 Forbidden", .body = "{\"error\":\"raw_config_writes_disabled\"}" };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
@@ -8110,7 +8571,7 @@ fn handleAcceptedConnection(
     defer _ = state.in_flight_requests.fetchSub(1, .acq_rel);
 
     // Simple routing — control endpoints + descriptor-driven channel webhooks + ZAKI API.
-    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, drain, undrain, shutdown };
+    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, drain, undrain, shutdown };
     const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
         .{ "/health", .health },
         .{ "/ready", .ready },
@@ -8119,6 +8580,7 @@ fn handleAcceptedConnection(
         .{ "/metrics", .metrics },
         .{ "/internal/diagnostics", .diagnostics },
         .{ "/internal/wake-heartbeat", .wake_heartbeat },
+        .{ "/internal/tenant-runtime-cache/invalidate", .invalidate_tenant_runtime_cache },
         .{ "/internal/drain", .drain },
         .{ "/internal/undrain", .undrain },
         .{ "/internal/shutdown", .shutdown },
@@ -8390,6 +8852,51 @@ fn handleAcceptedConnection(
                     std.fmt.allocPrint(req_allocator, "{{\"status\":\"queued\",\"user_id\":\"{s}\"}}", .{uid}) catch "{\"status\":\"queued\"}"
                 else
                     "{\"status\":\"queued\",\"scope\":\"all\"}";
+            }
+        },
+        .invalidate_tenant_runtime_cache => {
+            if (!std.mem.eql(u8, method_str, "POST")) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (!validateInternalServiceToken(raw, state)) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                const request = parseTenantRuntimeInvalidationRequest(
+                    req_allocator,
+                    extractHeader(raw, "X-Zaki-User-Id"),
+                    extractBody(raw),
+                ) catch {
+                    response_status = "400 Bad Request";
+                    response_body = "{\"error\":\"invalid_payload\"}";
+                    sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+                    return;
+                };
+                defer request.deinit(req_allocator);
+
+                var requested: usize = 0;
+                var removed: usize = 0;
+                var missing: usize = 0;
+                if (request.all) {
+                    requested = state.tenant_runtimes.count();
+                    removed = clearAllTenantRuntimes(state);
+                } else {
+                    requested = request.user_ids.len;
+                    for (request.user_ids) |user_id| {
+                        if (state.tenant_runtimes.get(user_id) != null) {
+                            removeTenantRuntime(state, user_id);
+                            removed += 1;
+                        } else {
+                            missing += 1;
+                        }
+                    }
+                }
+
+                response_body = std.fmt.allocPrint(
+                    req_allocator,
+                    "{{\"status\":\"ok\",\"requested\":{d},\"removed\":{d},\"missing\":{d},\"all\":{s}}}",
+                    .{ requested, removed, missing, if (request.all) "true" else "false" },
+                ) catch "{\"error\":\"response build failed\"}";
             }
         },
         .drain => {
@@ -9435,7 +9942,7 @@ test "handleApiRoute GET settings returns defaults when no profile exists" {
     try std.testing.expectEqual(@as(i64, 30), parsed.value.object.get("session_timeout_minutes").?.integer);
 }
 
-test "handleApiRoute PATCH settings writes mapped config and preserves unknown keys" {
+test "handleApiRoute PATCH settings writes canonical tenant preferences and preserves unknown keys" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -9502,16 +10009,48 @@ test "handleApiRoute PATCH settings writes mapped config and preserves unknown k
     try std.testing.expectEqualStrings("bar", parsed.value.object.get("foo").?.string);
     const product = parsed.value.object.get("product_settings").?.object;
     try std.testing.expectEqualStrings("deep", product.get("assistant_mode").?.string);
-    const agent = parsed.value.object.get("agent").?.object;
-    try std.testing.expectEqual(@as(i64, 9), agent.get("max_tool_iterations").?.integer);
-    try std.testing.expectEqualStrings("serial", agent.get("queue_mode").?.string);
-    try std.testing.expectEqual(@as(i64, 20), agent.get("queue_cap").?.integer);
-    try std.testing.expectEqualStrings("summarize", agent.get("queue_drop").?.string);
-    try std.testing.expectEqualStrings("always", agent.get("activation_mode").?.string);
-    try std.testing.expectEqualStrings("off", agent.get("send_mode").?.string);
-    try std.testing.expectEqualStrings("inbound", agent.get("tts_mode").?.string);
-    try std.testing.expectEqual(true, agent.get("tts_audio").?.bool);
-    try std.testing.expectEqual(@as(i64, 2700), agent.get("session_ttl_secs").?.integer);
+    try std.testing.expect(parsed.value.object.get("agent") == null);
+    try std.testing.expect(parsed.value.object.get("memory") == null);
+    try std.testing.expect(parsed.value.object.get("session") == null);
+}
+
+test "handleApiRoute PATCH config rejects raw config writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"agent\":{\"queue_mode\":\"latest\"}}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "PATCH /api/v1/users/1/config HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "PATCH",
+        "/api/v1/users/1/config",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("403 Forbidden", response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"raw_config_writes_disabled\"}", response.body);
 }
 
 test "handleApiRoute PATCH settings rejects invalid assistant mode" {
@@ -9621,10 +10160,10 @@ test "ownership_lock_conflict_http_returns_structured_payload_and_retry_after" {
     defer req_arena.deinit();
     const req_allocator = req_arena.allocator();
 
-    const body = "{}";
+    const body = "{\"assistant_mode\":\"deep\"}";
     const raw_request = try std.fmt.allocPrint(
         req_allocator,
-        "PATCH /api/v1/users/1/config HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        "PATCH /api/v1/users/1/settings HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
         .{ body.len, body },
     );
 
@@ -9633,7 +10172,7 @@ test "ownership_lock_conflict_http_returns_structured_payload_and_retry_after" {
         req_allocator,
         raw_request,
         "PATCH",
-        "/api/v1/users/1/config",
+        "/api/v1/users/1/settings",
         &state,
         null,
         null,
@@ -9826,7 +10365,7 @@ test "tenant_lock_config_clamps_invalid_values" {
     try std.testing.expectEqual(@as(u32, TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX), normalized.retry_max_ms);
 }
 
-test "handleApiRoute config endpoint remains backward compatible with settings endpoint" {
+test "handleApiRoute settings endpoint derives from legacy config and config GET normalizes overlay" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -9843,23 +10382,13 @@ test "handleApiRoute config endpoint remains backward compatible with settings e
     defer req_arena.deinit();
     const req_allocator = req_arena.allocator();
 
-    const raw_cfg = "{\"agent\":{\"queue_mode\":\"latest\",\"queue_cap\":8,\"queue_drop\":\"newest\",\"max_history_messages\":40}}\n";
-    const patch_config_request = try std.fmt.allocPrint(
-        req_allocator,
-        "PATCH /api/v1/users/1/config HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ raw_cfg.len, raw_cfg },
-    );
-    const config_patch_response = handleApiRoute(
-        std.testing.allocator,
-        req_allocator,
-        patch_config_request,
-        "PATCH",
-        "/api/v1/users/1/config",
-        &state,
-        null,
-        null,
-    );
-    try std.testing.expectEqualStrings("200 OK", config_patch_response.status);
+    const user_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_dir);
+    try std.fs.makeDirAbsolute(user_dir);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{user_dir});
+    defer std.testing.allocator.free(config_path);
+    const raw_cfg = "{\"agent\":{\"queue_mode\":\"latest\",\"queue_cap\":8,\"queue_drop\":\"newest\",\"max_history_messages\":40},\"models\":{\"providers\":{\"openai\":{\"api_key\":\"test-key\"}}}}\n";
+    try writeFile(config_path, raw_cfg);
 
     const settings_get_request = try std.fmt.allocPrint(
         req_allocator,
@@ -9878,6 +10407,47 @@ test "handleApiRoute config endpoint remains backward compatible with settings e
     );
     try std.testing.expectEqualStrings("200 OK", settings_get_response.status);
     try std.testing.expect(std.mem.indexOf(u8, settings_get_response.body, "\"assistant_mode\":\"fast\"") != null);
+
+    const config_get_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/config HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const config_get_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        config_get_request,
+        "GET",
+        "/api/v1/users/1/config",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", config_get_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, config_get_response.body, "\"agent\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, config_get_response.body, "\"models\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, config_get_response.body, "\"product_settings\"") != null);
+}
+
+test "parseTenantRuntimeInvalidationRequest rejects empty payload without user id" {
+    try std.testing.expectError(
+        error.InvalidPayload,
+        parseTenantRuntimeInvalidationRequest(std.testing.allocator, null, "{}"),
+    );
+}
+
+test "parseTenantRuntimeInvalidationRequest accepts mixed user id body" {
+    const request = try parseTenantRuntimeInvalidationRequest(
+        std.testing.allocator,
+        null,
+        "{\"user_ids\":[1,\"2\"]}",
+    );
+    defer request.deinit(std.testing.allocator);
+
+    try std.testing.expect(!request.all);
+    try std.testing.expectEqual(@as(usize, 2), request.user_ids.len);
+    try std.testing.expectEqualStrings("1", request.user_ids[0]);
+    try std.testing.expectEqualStrings("2", request.user_ids[1]);
 }
 
 // ── Bearer Token Validation tests ───────────────────────────────
@@ -11706,7 +12276,28 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"fallback_provider_count\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"memory_vector_sync_mode\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"memory_outbox_enabled\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"control_plane\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"agent.parallel_tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"agent.tool_dispatcher\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lease_probe\":null") != null);
+}
+
+test "appendControlPlaneStringEntryWithDrift suppresses expected derived drift" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+
+    try appendControlPlaneStringEntryWithDrift(
+        &buf,
+        std.testing.allocator,
+        "agent.tool_dispatcher",
+        "auto",
+        "serial",
+        "helm_config",
+        false,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"configured\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"effective\":\"serial\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"drift\":false") != null);
 }
 
 test "recordTenantLockConflict increments route counters and total" {
@@ -12041,57 +12632,48 @@ test "parseUserChannelBindingsSubpath parses binding item route" {
     try std.testing.expectEqualStrings("bnd_123", parsed.binding_id.?);
 }
 
-test "tenant semantic memory defaults enable postgres_hybrid safely" {
+test "tenant preference application uses operator-owned assistant mode presets" {
     var cfg = Config{
         .workspace_dir = "/tmp/nullalis",
         .config_path = "/tmp/nullalis/config.json",
         .allocator = std.testing.allocator,
     };
-    cfg.state.backend = "postgres";
-    cfg.state.postgres.connection_string = "postgresql://zaki:zaki@127.0.0.1:5432/zaki";
-    cfg.state.postgres.schema = "zaki_bot";
-    cfg.default_provider = "openrouter";
+    user_settings.applySettingsToConfig(&cfg, .{
+        .assistant_mode = .deep,
+        .group_activation = .always,
+        .proactive_updates = false,
+        .voice_replies = true,
+        .session_timeout_minutes = 45,
+    });
 
-    TenantRuntime.applyTenantSemanticMemoryDefaults(&cfg);
-
-    try std.testing.expectEqualStrings("postgres_hybrid", cfg.memory.profile);
-    try std.testing.expectEqualStrings("markdown", cfg.memory.backend);
-    try std.testing.expectEqualStrings("together", cfg.memory.search.provider);
-    try std.testing.expectEqualStrings("intfloat/multilingual-e5-large-instruct", cfg.memory.search.model);
-    try std.testing.expectEqual(@as(u32, 1024), cfg.memory.search.dimensions);
-    try std.testing.expectEqualStrings("local", cfg.memory.search.fallback_provider);
-    try std.testing.expect(cfg.memory.search.query.hybrid.enabled);
-    try std.testing.expectEqualStrings("pgvector", cfg.memory.search.store.kind);
-    try std.testing.expectEqualStrings("on", cfg.memory.reliability.rollout_mode);
-    try std.testing.expectEqualStrings("postgresql://zaki:zaki@127.0.0.1:5432/zaki", cfg.memory.postgres.url);
-    try std.testing.expectEqualStrings("zaki_bot", cfg.memory.postgres.schema);
+    try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
+    try std.testing.expectEqual(@as(u32, 20), cfg.agent.queue_cap);
+    try std.testing.expectEqualStrings("summarize", cfg.agent.queue_drop);
+    try std.testing.expectEqual(@as(u32, 80), cfg.agent.max_history_messages);
+    try std.testing.expectEqualStrings("always", cfg.agent.activation_mode);
+    try std.testing.expectEqualStrings("off", cfg.agent.send_mode);
+    try std.testing.expectEqualStrings("inbound", cfg.agent.tts_mode);
+    try std.testing.expect(cfg.agent.tts_audio);
+    try std.testing.expectEqual(@as(?u64, 2700), cfg.agent.session_ttl_secs);
+    try std.testing.expect(cfg.memory.summarizer.enabled);
+    try std.testing.expectEqual(@as(u32, 6000), cfg.memory.summarizer.window_size_tokens);
+    try std.testing.expectEqual(@as(u32, 700), cfg.memory.summarizer.summary_max_tokens);
+    try std.testing.expect(cfg.memory.summarizer.auto_extract_semantic);
+    try std.testing.expect(!cfg.session.cross_channel_shared_main);
 }
 
-test "tenant semantic memory defaults preserve explicit overrides" {
-    var cfg = Config{
-        .workspace_dir = "/tmp/nullalis",
-        .config_path = "/tmp/nullalis/config.json",
-        .allocator = std.testing.allocator,
-    };
-    cfg.state.backend = "postgres";
-    cfg.state.postgres.connection_string = "postgresql://zaki:zaki@127.0.0.1:5432/zaki";
-    cfg.state.postgres.schema = "zaki_bot";
-    cfg.memory.profile = "custom";
-    cfg.memory.search.provider = "gemini";
-    cfg.memory.search.query.hybrid.enabled = true;
-    cfg.memory.search.store.kind = "qdrant";
-    cfg.memory.reliability.rollout_mode = "canary";
+test "tenant config normalization strips operator-owned runtime keys" {
+    const normalized = try user_settings.normalizeTenantConfigJson(
+        std.testing.allocator,
+        "{\"default_provider\":\"openai\",\"agent\":{\"parallel_tools\":true},\"memory\":{\"search\":{\"enabled\":false}},\"product_settings\":{\"assistant_mode\":\"balanced\",\"group_activation\":\"mention\",\"proactive_updates\":true,\"voice_replies\":false,\"session_timeout_minutes\":30}}",
+    );
+    defer std.testing.allocator.free(normalized.json);
 
-    TenantRuntime.applyTenantSemanticMemoryDefaults(&cfg);
-
-    try std.testing.expectEqualStrings("custom", cfg.memory.profile);
-    try std.testing.expectEqualStrings("gemini", cfg.memory.search.provider);
-    try std.testing.expectEqualStrings("none", cfg.memory.search.fallback_provider);
-    try std.testing.expect(cfg.memory.search.query.hybrid.enabled);
-    try std.testing.expectEqualStrings("qdrant", cfg.memory.search.store.kind);
-    try std.testing.expectEqualStrings("canary", cfg.memory.reliability.rollout_mode);
-    try std.testing.expectEqualStrings("postgresql://zaki:zaki@127.0.0.1:5432/zaki", cfg.memory.postgres.url);
-    try std.testing.expectEqualStrings("zaki_bot", cfg.memory.postgres.schema);
+    try std.testing.expectEqual(@as(usize, 3), normalized.ignored_override_count);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"default_provider\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"agent\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"memory\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"product_settings\"") != null);
 }
 
 test "telegramReplyContainsMediaMarkers detects audio marker" {

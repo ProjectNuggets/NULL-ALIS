@@ -56,6 +56,15 @@ pub const TelegramBackfillCandidate = struct {
     }
 };
 
+pub const UserConfigRow = struct {
+    user_id: i64,
+    config_json: []u8,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.config_json);
+    }
+};
+
 pub const UserOwnershipLeaseSnapshot = struct {
     owner_id: []u8,
     lease_until_s: i64,
@@ -83,6 +92,9 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     }
     pub fn putConfigJson(_: *@This(), _: i64, _: []const u8) !void {
         return error.PostgresNotEnabled;
+    }
+    pub fn listUserConfigRows(_: *@This(), allocator: std.mem.Allocator) ![]UserConfigRow {
+        return allocator.alloc(UserConfigRow, 0);
     }
     pub fn getHeartbeatJson(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]u8 {
         return allocator.dupe(u8, "{}");
@@ -849,6 +861,33 @@ const ManagerImpl = struct {
         );
         defer self.allocator.free(q);
         try self.execJsonUpsert(q, user_id, json);
+    }
+
+    pub fn listUserConfigRows(self: *Self, allocator: std.mem.Allocator) ![]UserConfigRow {
+        const q = try self.buildQuery(
+            "SELECT user_id, config::text FROM {schema}.user_config ORDER BY user_id ASC",
+        );
+        defer self.allocator.free(q);
+        const result = try self.exec(q);
+        defer c.PQclear(result);
+        const rows: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc(UserConfigRow, rows);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*row| row.deinit(allocator);
+            allocator.free(out);
+        }
+        for (0..rows) |i| {
+            const row_idx: c_int = @intCast(i);
+            const user_text = try dupeResultValue(allocator, result, row_idx, 0);
+            defer allocator.free(user_text);
+            out[i] = .{
+                .user_id = try std.fmt.parseInt(i64, user_text, 10),
+                .config_json = try dupeResultValue(allocator, result, row_idx, 1),
+            };
+            initialized += 1;
+        }
+        return out;
     }
 
     pub fn getHeartbeatJson(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]u8 {

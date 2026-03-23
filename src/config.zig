@@ -21,6 +21,10 @@ pub const AppProfile = config_types.AppProfile;
 pub const ModelFallbackEntry = config_types.ModelFallbackEntry;
 pub const ReliabilityConfig = config_types.ReliabilityConfig;
 pub const SchedulerConfig = config_types.SchedulerConfig;
+pub const AssistantModePresetAgentConfig = config_types.AssistantModePresetAgentConfig;
+pub const AssistantModePresetSummarizerConfig = config_types.AssistantModePresetSummarizerConfig;
+pub const AssistantModePresetConfig = config_types.AssistantModePresetConfig;
+pub const ProductPresetsConfig = config_types.ProductPresetsConfig;
 pub const AgentConfig = config_types.AgentConfig;
 pub const ModelRouteConfig = config_types.ModelRouteConfig;
 pub const HeartbeatConfig = config_types.HeartbeatConfig;
@@ -113,6 +117,7 @@ pub const Config = struct {
     network: NetworkConfig = .{},
     reliability: ReliabilityConfig = .{},
     scheduler: SchedulerConfig = .{},
+    product_presets: ProductPresetsConfig = .{},
     agent: AgentConfig = .{},
     heartbeat: HeartbeatConfig = .{},
     cron: CronConfig = .{},
@@ -749,6 +754,7 @@ pub const Config = struct {
         // Reliability
         try self.writeReliabilitySection(w);
         try w.print("  \"scheduler\": {f},\n", .{std.json.fmt(self.scheduler, .{})});
+        try w.print("  \"product_presets\": {f},\n", .{std.json.fmt(self.product_presets, .{})});
         try w.print("  \"agent\": {f},\n", .{std.json.fmt(.{
             .compact_context = self.agent.compact_context,
             .max_tool_iterations = self.agent.max_tool_iterations,

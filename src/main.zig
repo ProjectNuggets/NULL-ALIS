@@ -105,6 +105,57 @@ fn printMaxTasksReached(max_tasks: usize) void {
     );
 }
 
+fn gatewayLoopbackHost(host: []const u8) []const u8 {
+    if (std.mem.eql(u8, host, "0.0.0.0")) return "127.0.0.1";
+    if (std.mem.eql(u8, host, "::")) return "127.0.0.1";
+    return host;
+}
+
+fn invalidateTenantRuntimeCaches(
+    allocator: std.mem.Allocator,
+    cfg: *const yc.config.Config,
+    user_ids: []const i64,
+) !void {
+    if (user_ids.len == 0) return;
+    if (cfg.gateway.internal_service_tokens.len == 0) return error.MissingGatewayInternalToken;
+
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://{s}:{d}/internal/tenant-runtime-cache/invalidate",
+        .{ gatewayLoopbackHost(cfg.gateway.host), cfg.gateway.port },
+    );
+    defer allocator.free(url);
+
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload.deinit(allocator);
+    const w = payload.writer(allocator);
+    try w.writeAll("{\"user_ids\":[");
+    for (user_ids, 0..) |user_id, index| {
+        if (index > 0) try w.writeAll(",");
+        try w.print("{d}", .{user_id});
+    }
+    try w.writeAll("]}");
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+    var response_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer response_writer.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = payload.items,
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "User-Agent", .value = "nullalis/1.0" },
+            .{ .name = "X-Internal-Token", .value = cfg.gateway.internal_service_tokens[0] },
+        },
+        .response_writer = &response_writer.writer,
+    }) catch return error.CacheInvalidationRequestFailed;
+
+    if (result.status != .ok) return error.CacheInvalidationRejected;
+}
+
 pub fn main() !void {
     // Enable UTF-8 output on Windows console (fixes Cyrillic/Unicode garbling)
     if (comptime builtin.os.tag == .windows) {
@@ -1077,10 +1128,12 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\
             \\Sources:
             \\  openclaw                      Import from OpenClaw workspace (+ config migration)
+            \\  tenant-config                 Normalize tenant config blobs to preference-only overlays
             \\
             \\Options:
             \\  --dry-run                     Preview without writing
             \\  --source <path>               Source workspace path
+            \\  --user-id <id>                Restrict tenant-config migration to one user
             \\
         , .{});
         std.process.exit(1);
@@ -1121,6 +1174,122 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             } else {
                 std.debug.print("Config migrated: ~/.openclaw/config.json -> {s}\n", .{cfg.config_path});
             }
+        }
+    } else if (std.mem.eql(u8, sub_args[0], "tenant-config")) {
+        var dry_run = false;
+        var target_user_id: ?i64 = null;
+
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--dry-run")) {
+                dry_run = true;
+            } else if (std.mem.eql(u8, sub_args[i], "--user-id") and i + 1 < sub_args.len) {
+                i += 1;
+                target_user_id = std.fmt.parseInt(i64, sub_args[i], 10) catch {
+                    std.debug.print("Invalid --user-id value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            }
+        }
+
+        var cfg = yc.config.Config.load(allocator) catch {
+            std.debug.print("No config found -- run `nullalis onboard` first\n", .{});
+            std.process.exit(1);
+        };
+        defer cfg.deinit();
+
+        if (!std.mem.eql(u8, cfg.state.backend, "postgres")) {
+            std.debug.print("tenant-config migration requires state.backend=postgres\n", .{});
+            std.process.exit(1);
+        }
+
+        var mgr = yc.zaki_state.Manager.init(allocator, cfg.state) catch |err| {
+            std.debug.print("Failed to initialize tenant state manager: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer mgr.deinit();
+
+        const rows = mgr.listUserConfigRows(allocator) catch |err| {
+            std.debug.print("Failed to list tenant configs: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer {
+            for (rows) |*row| row.deinit(allocator);
+            allocator.free(rows);
+        }
+
+        var scanned: usize = 0;
+        var changed: usize = 0;
+        var unchanged: usize = 0;
+        var ignored_override_total: usize = 0;
+        var write_failures: usize = 0;
+        var changed_user_ids: std.ArrayListUnmanaged(i64) = .empty;
+        defer changed_user_ids.deinit(allocator);
+
+        for (rows) |row| {
+            if (target_user_id != null and row.user_id != target_user_id.?) continue;
+            scanned += 1;
+
+            const normalized = yc.user_settings.normalizeTenantConfigJson(allocator, row.config_json) catch |err| {
+                std.debug.print("user {d}: normalize failed: {s}\n", .{ row.user_id, @errorName(err) });
+                continue;
+            };
+            defer allocator.free(normalized.json);
+
+            const old_trimmed = std.mem.trim(u8, row.config_json, " \t\r\n");
+            const new_trimmed = std.mem.trim(u8, normalized.json, " \t\r\n");
+            const is_changed = !std.mem.eql(u8, old_trimmed, new_trimmed);
+            if (!is_changed) {
+                unchanged += 1;
+                continue;
+            }
+
+            changed += 1;
+            ignored_override_total += normalized.ignored_override_count;
+            if (dry_run) {
+                std.debug.print(
+                    "[DRY RUN] user {d}: assistant_mode={s} removed_sections={d}\n",
+                    .{ row.user_id, normalized.settings.assistant_mode.toSlice(), normalized.ignored_override_count },
+                );
+                continue;
+            }
+
+            mgr.putConfigJson(row.user_id, normalized.json) catch |err| {
+                std.debug.print("user {d}: write failed: {s}\n", .{ row.user_id, @errorName(err) });
+                write_failures += 1;
+                continue;
+            };
+            changed_user_ids.append(allocator, row.user_id) catch {
+                std.debug.print("user {d}: cache invalidation queue append failed\n", .{row.user_id});
+                write_failures += 1;
+                continue;
+            };
+            std.debug.print(
+                "user {d}: normalized assistant_mode={s} removed_sections={d}\n",
+                .{ row.user_id, normalized.settings.assistant_mode.toSlice(), normalized.ignored_override_count },
+            );
+        }
+
+        if (dry_run) {
+            std.debug.print("[DRY RUN] ", .{});
+        }
+        std.debug.print(
+            "Tenant config migration complete: scanned={d} changed={d} unchanged={d} removed_sections_total={d} write_failures={d}\n",
+            .{ scanned, changed, unchanged, ignored_override_total, write_failures },
+        );
+        if (!dry_run and changed > 0) {
+            invalidateTenantRuntimeCaches(allocator, &cfg, changed_user_ids.items) catch |err| {
+                std.debug.print(
+                    "Tenant configs updated, but runtime cache invalidation failed: {s}\n",
+                    .{@errorName(err)},
+                );
+                std.process.exit(1);
+            };
+            std.debug.print("Tenant runtime cache invalidation complete: refreshed={d}\n", .{changed_user_ids.items.len});
+        }
+        if (!dry_run and write_failures > 0) {
+            std.debug.print("Tenant config migration completed with write failures; inspect logs before rollout.\n", .{});
+            std.process.exit(1);
         }
     } else {
         std.debug.print("Unknown migration source: {s}\n", .{sub_args[0]});
@@ -3128,6 +3297,7 @@ fn printUsage() void {
         \\  skills <list|search|install|remove> [ARGS]
         \\  hardware <discover|introspect|info> [ARGS]
         \\  migrate openclaw [--dry-run] [--source PATH]
+        \\  migrate tenant-config [--dry-run] [--user-id ID]
         \\  memory <stats|count|reindex|search|get|list|drain-outbox|forget> [ARGS]
         \\  capabilities [--json]
         \\  models refresh
