@@ -49,6 +49,7 @@ pub const Session = struct {
     last_consolidated: u64 = 0,
     session_key: []const u8, // owned copy
     turn_count: u64,
+    active_refs: usize = 0,
     turn_observers: [2]Observer,
     turn_observer_multi: MultiObserver,
     mutex: std.Thread.Mutex,
@@ -125,12 +126,12 @@ pub const SessionManager = struct {
         self.sessions.deinit(self.allocator);
     }
 
-    /// Find or create a session for the given key. Thread-safe.
-    pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
+    fn getOrCreateInternal(self: *SessionManager, session_key: []const u8, retain_ref: bool) !*Session {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.sessions.get(session_key)) |session| {
+            if (retain_ref) session.active_refs += 1;
             return session;
         }
 
@@ -150,6 +151,7 @@ pub const SessionManager = struct {
             .last_consolidated = 0,
             .session_key = owned_key,
             .turn_count = 0,
+            .active_refs = if (retain_ref) 1 else 0,
             .turn_observers = .{ self.observer, self.observer },
             .turn_observer_multi = .{ .observers = &.{} },
             .mutex = .{},
@@ -173,6 +175,21 @@ pub const SessionManager = struct {
 
         try self.sessions.put(self.allocator, owned_key, session);
         return session;
+    }
+
+    /// Find or create a session for the given key. Thread-safe.
+    pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
+        return self.getOrCreateInternal(session_key, false);
+    }
+
+    fn acquireSessionForTurn(self: *SessionManager, session_key: []const u8) !*Session {
+        return self.getOrCreateInternal(session_key, true);
+    }
+
+    fn releaseSessionRef(self: *SessionManager, session: *Session) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (session.active_refs > 0) session.active_refs -= 1;
     }
 
     fn buildSessionAgent(self: *SessionManager, memory_session_id: []const u8) !Agent {
@@ -380,7 +397,8 @@ pub const SessionManager = struct {
         options: ProcessMessageOptions,
     ) ![]const u8 {
         const total_start_ms = std.time.milliTimestamp();
-        const session = try self.getOrCreate(session_key);
+        const session = try self.acquireSessionForTurn(session_key);
+        defer self.releaseSessionRef(session);
 
         var lock_wait_ms: u64 = 0;
         var waiter_registered = false;
@@ -537,6 +555,7 @@ pub const SessionManager = struct {
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
+            if (session.active_refs != 0) continue;
             if (!session.mutex.tryLock()) continue;
             defer session.mutex.unlock();
             const idle_secs: u64 = @intCast(@max(0, now - session.last_active));
@@ -900,6 +919,35 @@ test "processMessageWithContext forwards progress observer and restores base obs
 
     const session = try sm.getOrCreate("progress:1");
     try testing.expectEqualStrings("noop", session.agent.observer.getName());
+}
+
+test "evictIdle skips session with active ref before turn lock" {
+    const allocator = std.testing.allocator;
+    var provider = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = SessionManager.init(
+        allocator,
+        &cfg,
+        provider.provider(),
+        &.{},
+        null,
+        test_noop_observer_impl.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session = try sm.acquireSessionForTurn("race:1");
+    try std.testing.expectEqual(@as(usize, 1), sm.sessionCount());
+    try std.testing.expectEqual(@as(usize, 1), session.active_refs);
+
+    const evicted = sm.evictIdle(0);
+    try std.testing.expectEqual(@as(usize, 0), evicted);
+    try std.testing.expectEqual(@as(usize, 1), sm.sessionCount());
+    try std.testing.expectEqual(@as(usize, 1), session.active_refs);
+
+    sm.releaseSessionRef(session);
+    try std.testing.expectEqual(@as(usize, 0), session.active_refs);
 }
 
 test "agent turn emits observer events with counting observer" {
