@@ -3,6 +3,15 @@
 This document defines the production runtime contract for running Nullalis as the
 internal agent service behind `zaki-prod`.
 
+Current validated baseline:
+- `profile = "zaki_bot"`
+- primary chat model = `together-ai/moonshotai/kimi-k2.5`
+- chat fallback chain = `openrouter`
+- embedding provider = `together-ai`
+- `state.backend = "postgres"`
+- `scheduler_backend = "postgres"`
+- `degraded = false`
+
 ## Ownership
 
 - `NULL-ALIS` owns:
@@ -36,7 +45,9 @@ The deployed config file should contain non-secret settings only:
 
 - `profile: "zaki_bot"`
 - `agents.defaults.model.primary: "together-ai/moonshotai/kimi-k2.5"`
+- `agents.defaults.model.fallbacks[0]: "openrouter/<validated-fallback-model>"`
 - `models.providers["together-ai"].base_url: "https://api.together.xyz/v1"`
+- `models.providers["openrouter"].base_url: "https://openrouter.ai/api/v1"` when fallback is enabled
 - `gateway.host`
 - `gateway.port`
 - `tenant.enabled`
@@ -74,9 +85,14 @@ For `profile: "zaki_bot"`, startup validation requires:
 
 - a valid `agents.defaults.model.primary`
 - a matching provider entry under `models.providers` with `base_url`
+- any configured fallback model must also resolve to a provider entry with `base_url`
 - at least one internal service token
 - `state.backend = "postgres"`
 - a Postgres connection string
+
+Local/dev note:
+- restoring an older config backup without `models.providers[*].base_url` is no longer valid for `zaki_bot`
+- placeholder internal tokens must fail startup, not degrade silently
 
 ## Kubernetes Service Contract
 
@@ -85,6 +101,10 @@ For the cleaned-up production layout:
 - service name: `nullclaw`
 - namespace: `zaki`
 - backend discovery URL from `zaki-prod`: `http://nullclaw:3000`
+
+Posture note:
+- current product posture is internal-service first
+- direct public Telegram webhook delivery to Nullalis is not the canonical deployment baseline in this document
 
 ## Production Promotion
 

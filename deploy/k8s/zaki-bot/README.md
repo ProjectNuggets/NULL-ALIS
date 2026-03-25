@@ -1,5 +1,11 @@
 # nullALIS ZAKI BOT Kubernetes Deployment Pack
 
+Legacy/reference warning:
+- This directory is not the live production source of truth.
+- Use `zaki-infra` for live Helm/Argo deployment decisions.
+- Read `docs/releases/v0.1-public-posture-2026-03-25.md` and `docs/zaki-runtime-contract.md` first.
+- Public host / direct Telegram webhook examples in this pack are historical reference material unless your current rollout explicitly opts into them.
+
 This folder is the deployment handoff package for running `nullALIS` as the dedicated `ZAKI BOT` backend in a namespace-based K8s cluster.
 
 Important ownership note:
@@ -80,11 +86,11 @@ Planning envelope (validate with your own traffic replay):
 ## Prerequisites
 1. RWX storage class exists.
 2. Ingress controller supports `nginx.ingress.kubernetes.io/upstream-hash-by`.
-3. TLS secret exists for `agent-staging.zaki.com`.
+3. TLS secret exists for the chosen ingress host if you are using the legacy direct-ingress path.
 4. ZAKI backend can call nullALIS internal APIs with `X-Internal-Token`.
 5. ZAKI backend sends canonical `X-Zaki-User-Id` for app chat calls.
 6. Prometheus Operator CRDs are installed if you apply `ServiceMonitor` / `PrometheusRule` resources.
-7. Ingress controller is internal-only (DO VPC internal LB) and no public DNS route points to this ingress host.
+7. Ingress controller is internal-only (DO VPC internal LB) and no public DNS route points to this ingress host unless your rollout intentionally uses the legacy direct webhook model.
 
 Sticky routing contract:
 1. precedence is `X-Zaki-User-Id` (app/API) then `user_id` query arg (Telegram webhook path).
@@ -118,7 +124,7 @@ Update these fields before apply:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
  - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (if not using workload identity)
-4. `07-ingress.yaml`: host and TLS secret if different.
+4. `07-ingress.yaml`: host and TLS secret if different, if you are intentionally using the legacy direct-ingress path.
 5. `02-configmap.yaml`:
 - `TELEGRAM_ALLOW_FROM` policy
 - Postgres state tuning (`STATE_BACKEND`, `POSTGRES_SCHEMA`, `POSTGRES_POOL_MAX`, timeout values)
@@ -196,6 +202,10 @@ TELEGRAM_WEBHOOK_SECRET=... \
 PGBOUNCER_EXPECTED=true \
 ./deploy/k8s/zaki-bot/smoke.sh
 ```
+Legacy note:
+- the host/DNS examples above are for the older direct-ingress path
+- current internal-service-first posture should use app-only or internal verification paths instead of treating `agent-staging.zaki.com` as canonical
+
 For strict staging readiness (Phase 2 gates), require DNS + non-degraded Postgres runtime:
 ```bash
 BASE_URL=https://agent-staging.zaki.com \
@@ -214,6 +224,7 @@ PGBOUNCER_EXPECTED=true \
 Notes for strict mode:
 1. DNS resolver tooling must be present on the operator host (`getent`, `nslookup`, or `dig`).
 2. If no resolver tool is installed, strict mode fails closed by design.
+3. These DNS gates apply only to the direct-ingress posture, not the internal-service-first baseline.
 
 4. Run stickiness probe.
 ```bash
@@ -257,6 +268,10 @@ USER_IDS=test-user-1,test-user-2 \
 - Webhook secret-token validation is enforced per user.
 - Gateway updates per-user `channel_state.json` with latest Telegram chat id.
 - Tenant cron deliveries can use this state for proactive Telegram sends.
+
+Current posture note:
+- this direct Telegram webhook path is preserved here as reference
+- the validated public posture freeze does not treat it as the canonical default rollout path
 
 5. Tenant ownership lock is enabled for write paths.
 - tenant+postgres mode uses Postgres leases (`tenant_user_leases`).

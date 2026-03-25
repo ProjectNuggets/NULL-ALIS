@@ -8,7 +8,7 @@
   Zig-first autonomous agent runtime for persistent digital twins and multitenant products.
 </p>
 
-## Current Status (March 18, 2026)
+## Current Status (March 25, 2026)
 
 `nullALIS v0.1` is the declared baseline for public beta stabilization.
 
@@ -17,19 +17,22 @@ Scope of this declaration:
 - Defer larger upstream ports to controlled cherry-pick/upsert tracks.
 - Prioritize clean reproducibility over new feature intake.
 
-Current verified baseline on active branch work:
-- Full tests pass: `zig build test --summary all` (`4692` passed, `25` skipped).
+Current verified baseline:
+- Full tests pass: `zig build test --summary all` (`4709` passed, `25` skipped).
 - Build passes with production engines: `zig build -Dengines=base,sqlite,postgres`.
 - Postgres-backed tenant runtime is the authoritative state path when configured.
+- Current validated `zaki_bot` runtime posture is Together-first:
+  `together-ai/moonshotai/kimi-k2.5` primary, `openrouter` fallback,
+  `together-ai` embeddings.
 - Chat SSE contract is stable, with additive `progress` events for live UX (`status/progress/token/done`).
 
 References:
+- [v0.1 public posture (2026-03-25)](docs/releases/v0.1-public-posture-2026-03-25.md)
+- [ZAKI runtime contract](docs/zaki-runtime-contract.md)
+- [ops runbook](docs/reliability-ops-runbook.md)
 - [v0.1 declaration (2026-03-18)](docs/releases/v0.1-declaration-2026-03-18.md)
 - [v1.1 next steps](docs/releases/v1.1-next-steps.md)
-- [v0.1 final sweep](docs/final-sweep-2026-03-09.md)
-- [ops runbook](docs/reliability-ops-runbook.md)
-- [runtime status notes](docs/status-2026-03-06.md)
-- [ZAKI runtime contract](docs/zaki-runtime-contract.md)
+- [historical archive note](docs/historical-archive.md)
 
 ## What nullALIS Is
 
@@ -94,6 +97,11 @@ Ops stack:
 - Observability: structured runtime logs + metrics endpoints.
 - Deployment: Docker image publishing in this repo; production rollout is owned by `zaki-infra`.
 - Reference manifests and handoff docs live under `deploy/k8s/zaki-bot/` for local/dev and contract reference.
+
+Current-truth rule:
+1. Read [v0.1 public posture](docs/releases/v0.1-public-posture-2026-03-25.md) first.
+2. Use [ZAKI runtime contract](docs/zaki-runtime-contract.md) as the deployment/runtime contract.
+3. Treat `docs/reports/*` and `deploy/k8s/zaki-bot/*` as archive/reference unless a current document says otherwise.
 
 ## Architecture At a Glance
 

@@ -1,5 +1,10 @@
 # ZAKI Backend Handoff Spec (Nullclaw Integration)
 
+Reference warning:
+- This handoff doc is preserved for backend contract reference.
+- It is not the production source of truth for live deployment topology.
+- Direct Telegram-to-Nullclaw webhook details below should be treated as legacy/reference unless the current rollout explicitly enables them.
+
 This document is the implementation contract for ZAKI backend to integrate with Nullclaw for the dedicated `ZAKI BOT` space.
 
 ## 1) Base setup
@@ -103,6 +108,10 @@ Important:
 
 ## 6) Telegram connect/disconnect contract
 
+Legacy topology note:
+- this section reflects the direct Nullclaw webhook model
+- current internal-service-first posture may instead terminate public webhook traffic at the app/backend edge and relay internally
+
 ### Connect
 
 Request:
@@ -156,6 +165,10 @@ Nullclaw behavior:
 - Writes latest chat mapping to tenant `channel_state.json`.
 - Routes inbound Telegram message into same main session key as app:
   - `agent:zaki-bot:user:{id}:main`
+
+Current posture note:
+- preserve this as the reference contract for direct webhook mode
+- do not assume this is the active default deployment posture without matching `zaki-infra` rollout config
 
 ## 8) Local integration checklist
 
