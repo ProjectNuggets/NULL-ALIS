@@ -1,9 +1,15 @@
 # CORRECTION PLAN — nullalis-prod
 
+Historical/reference note:
+This document captures an earlier upstream-porting workflow. It is preserved as
+engineering reference, not as the current project identity or current release
+plan.
+
 ## Context
 
 You are working on `nullalis-prod`, a Zig 0.15.2 AI agent runtime (Digital Twin as a Service).
-This is a fork of `nullclaw` with ZAKI BOT multi-tenant additions.
+This is an earlier fork/porting plan from upstream `nullclaw` into `nullalis`
+with ZAKI BOT multi-tenant additions.
 
 **Branch**: `correction`
 **Goal**: Port upstream improvements commit-by-commit, verify each step.

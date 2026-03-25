@@ -1,11 +1,11 @@
-# AGENTS.md — nullclaw Agent Engineering Protocol
+# AGENTS.md — nullALIS Agent Engineering Protocol
 
 This file defines the default working protocol for coding agents in this repository.
 Scope: entire repository.
 
 ## 1) Project Snapshot (Read First)
 
-nullclaw is a Zig-first autonomous AI assistant runtime optimized for:
+nullALIS is a Zig-first autonomous AI assistant runtime optimized for:
 
 - minimal binary size (target: < 1 MB ReleaseSmall)
 - minimal memory footprint (target: < 5 MB peak RSS)

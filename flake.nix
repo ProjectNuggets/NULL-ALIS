@@ -1,5 +1,5 @@
 {
-  description = "nullclaw";
+  description = "nullALIS";
   inputs = {
     zig2nix.url = "github:Cloudef/zig2nix";
     treefmt-nix.url = "github:numtide/treefmt-nix";
@@ -17,7 +17,7 @@
           zig = zig2nix.outputs.packages.${system}.zig-latest;
         };
         pkgs = env.pkgs;
-        project = "nullclaw";
+        project = "nullalis";
         mkPackage =
           {
             optimize ? "ReleaseSmall",
@@ -35,7 +35,7 @@
             meta = with pkgs.lib; {
               mainProgram = project;
               description = "Fastest, smallest, and fully autonomous AI assistant infrastructure written in Zig ";
-              homepage = "https://github.com/nullclaw/nullclaw";
+              homepage = "https://github.com/ProjectNuggets/NULL-ALIS";
               license = licenses.mit;
               maintainers = [
                 {
