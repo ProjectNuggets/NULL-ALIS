@@ -909,10 +909,14 @@ const ManagerImpl = struct {
 
     pub fn putOnboardingJson(self: *Self, user_id: i64, json: []const u8) !void {
         const q = try self.buildQuery(
-            "INSERT INTO {schema}.onboarding (user_id, state, updated_at) VALUES ($1, $2::jsonb, NOW()) " ++
-                "ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW();" ++
+            "WITH onboarding_upsert AS (" ++
+                "INSERT INTO {schema}.onboarding (user_id, state, updated_at) VALUES ($1, $2::jsonb, NOW()) " ++
+                "ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW() " ++
+                "RETURNING user_id" ++
+                ") " ++
                 "UPDATE {schema}.users SET onboarding_completed = COALESCE(($2::jsonb->>'completed')::boolean, false), " ++
-                "onboarding_completed_at = CASE WHEN COALESCE(($2::jsonb->>'completed')::boolean, false) THEN NOW() ELSE NULL END, updated_at = NOW() WHERE user_id = $1",
+                "onboarding_completed_at = CASE WHEN COALESCE(($2::jsonb->>'completed')::boolean, false) THEN NOW() ELSE NULL END, updated_at = NOW() " ++
+                "WHERE user_id IN (SELECT user_id FROM onboarding_upsert)",
         );
         defer self.allocator.free(q);
         try self.execJsonUpsert(q, user_id, json);
@@ -2833,6 +2837,42 @@ test "postgres_pool_reuses_connections" {
     try std.testing.expect(final_snapshot.open_conns >= 1);
     try std.testing.expect(final_snapshot.open_conns <= 2);
     try std.testing.expect(final_snapshot.open_conns <= first_snapshot.open_conns + 1);
+}
+
+test "putOnboardingJson updates onboarding row and mirrored user flags" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try initPostgresTestManagerWithPool(allocator, 2, 500);
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    try mgr.putOnboardingJson(2, "{\"completed\":true,\"completed_at_s\":123}");
+
+    const onboarding = try mgr.getOnboardingJson(allocator, 2);
+    defer allocator.free(onboarding);
+    try std.testing.expect(std.mem.indexOf(u8, onboarding, "\"completed\": true") != null);
+
+    const q = try mgr.buildQuery(
+        "SELECT onboarding_completed::text, (onboarding_completed_at IS NOT NULL)::text FROM {schema}.users WHERE user_id = $1",
+    );
+    defer allocator.free(q);
+
+    var user_buf: [32]u8 = undefined;
+    const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{@as(i64, 2)});
+    const params = [_]?[*:0]const u8{user_s.ptr};
+    const lengths = [_]c_int{@intCast(user_s.len)};
+    const result = try mgr.execParams(q, &params, &lengths);
+    defer c.PQclear(result);
+
+    try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+    const onboarding_completed = try dupeResultValue(allocator, result, 0, 0);
+    defer allocator.free(onboarding_completed);
+    const onboarding_completed_at_present = try dupeResultValue(allocator, result, 0, 1);
+    defer allocator.free(onboarding_completed_at_present);
+
+    try std.testing.expectEqualStrings("true", onboarding_completed);
+    try std.testing.expectEqualStrings("true", onboarding_completed_at_present);
 }
 
 test "postgres_pool_timeout_when_exhausted" {

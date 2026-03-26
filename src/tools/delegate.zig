@@ -3,8 +3,9 @@ const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
-const NamedAgentConfig = @import("../config.zig").NamedAgentConfig;
-const providers = @import("../providers/root.zig");
+const config_mod = @import("../config.zig");
+const NamedAgentConfig = config_mod.NamedAgentConfig;
+const runtime_bundle = @import("../providers/runtime_bundle.zig");
 
 /// Delegate tool — delegates a subtask to a named sub-agent with a different
 /// provider/model configuration. Supports depth enforcement to prevent
@@ -12,6 +13,8 @@ const providers = @import("../providers/root.zig");
 pub const DelegateTool = struct {
     /// Named agent configs from the global config (lookup by name).
     agents: []const NamedAgentConfig = &.{},
+    /// Global config reference for reliability/fallback-aware provider construction.
+    config_ref: ?*const config_mod.Config = null,
     /// Fallback API key if agent-specific key is not set.
     fallback_api_key: ?[]const u8 = null,
     /// Current delegation depth. Incremented for sub-delegates.
@@ -81,19 +84,44 @@ pub const DelegateTool = struct {
 
         // Determine system prompt, API key, provider, model from agent config or defaults
         if (agent_cfg) |ac| {
-            // Use agent-specific config via completeWithSystem
-            const api_key = ac.api_key orelse self.fallback_api_key;
             const sys_prompt = ac.system_prompt orelse "You are a helpful assistant. Respond concisely.";
-
-            const cfg = .{
-                .api_key = api_key,
-                .default_provider = ac.provider,
-                .default_model = @as(?[]const u8, ac.model),
-                .temperature = ac.temperature orelse @as(f64, 0.7),
-                .max_tokens = @as(?u64, null),
+            const base_cfg = self.config_ref orelse {
+                const msg = std.fmt.allocPrint(
+                    allocator,
+                    "Delegation to agent '{s}' failed: missing runtime config",
+                    .{trimmed_agent},
+                ) catch return ToolResult.fail("Delegation failed");
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
-            const response = providers.completeWithSystem(allocator, &cfg, sys_prompt, full_prompt) catch |err| {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const derived_cfg = self.buildDerivedConfig(arena.allocator(), base_cfg, ac) catch |err| {
+                const msg = std.fmt.allocPrint(
+                    allocator,
+                    "Delegation to agent '{s}' failed: {s}",
+                    .{ trimmed_agent, @errorName(err) },
+                ) catch return ToolResult.fail("Delegation failed");
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+
+            var bundle = runtime_bundle.RuntimeProviderBundle.init(arena.allocator(), &derived_cfg) catch |err| {
+                const msg = std.fmt.allocPrint(
+                    allocator,
+                    "Delegation to agent '{s}' failed: {s}",
+                    .{ trimmed_agent, @errorName(err) },
+                ) catch return ToolResult.fail("Delegation failed");
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+            defer bundle.deinit();
+
+            const response = bundle.provider().chatWithSystem(
+                allocator,
+                sys_prompt,
+                full_prompt,
+                derived_cfg.default_model orelse ac.model,
+                derived_cfg.default_temperature,
+            ) catch |err| {
                 const msg = std.fmt.allocPrint(
                     allocator,
                     "Delegation to agent '{s}' failed: {s}",
@@ -118,6 +146,54 @@ pub const DelegateTool = struct {
             if (std.mem.eql(u8, ac.name, name)) return ac;
         }
         return null;
+    }
+
+    fn buildDerivedConfig(
+        self: *const DelegateTool,
+        allocator: std.mem.Allocator,
+        base_cfg: *const config_mod.Config,
+        agent_cfg: NamedAgentConfig,
+    ) !config_mod.Config {
+        var derived = base_cfg.*;
+        derived.allocator = allocator;
+        derived.arena = null;
+        derived.default_provider = agent_cfg.provider;
+        derived.default_model = agent_cfg.model;
+        derived.default_temperature = agent_cfg.temperature orelse base_cfg.default_temperature;
+        derived.temperature = derived.default_temperature;
+
+        if (agent_cfg.api_key != null or self.fallback_api_key != null) {
+            const resolved_api_key = agent_cfg.api_key orelse self.fallback_api_key.?;
+            var replaced = false;
+            const entries = try allocator.alloc(config_mod.ProviderEntry, base_cfg.providers.len + 1);
+            var idx: usize = 0;
+            for (base_cfg.providers) |entry| {
+                if (std.mem.eql(u8, entry.name, agent_cfg.provider)) {
+                    entries[idx] = .{
+                        .name = entry.name,
+                        .api_key = resolved_api_key,
+                        .base_url = entry.base_url,
+                        .native_tools = entry.native_tools,
+                    };
+                    replaced = true;
+                } else {
+                    entries[idx] = entry;
+                }
+                idx += 1;
+            }
+            if (!replaced) {
+                entries[idx] = .{
+                    .name = agent_cfg.provider,
+                    .api_key = resolved_api_key,
+                    .base_url = base_cfg.getProviderBaseUrl(agent_cfg.provider),
+                    .native_tools = base_cfg.getProviderNativeTools(agent_cfg.provider),
+                };
+                idx += 1;
+            }
+            derived.providers = entries[0..idx];
+        }
+
+        return derived;
     }
 };
 
@@ -153,6 +229,40 @@ test "delegate executes gracefully without config" {
     if (!result.success) {
         try std.testing.expect(result.error_msg != null);
     }
+}
+
+test "delegate derived config preserves fallback providers and overrides agent provider" {
+    const fallback_providers = [_][]const u8{"openrouter"};
+    const providers = [_]config_mod.ProviderEntry{
+        .{ .name = "together", .api_key = "primary-key", .base_url = "https://api.together.xyz/v1" },
+        .{ .name = "openrouter", .api_key = "fallback-key", .base_url = "https://openrouter.ai/api/v1" },
+    };
+    const agents = [_]NamedAgentConfig{.{
+        .name = "researcher",
+        .provider = "together",
+        .model = "moonshotai/Kimi-K2.5",
+        .api_key = "agent-key",
+        .temperature = 0.3,
+    }};
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+        .providers = &providers,
+    };
+    cfg.reliability.fallback_providers = &fallback_providers;
+
+    var dt = DelegateTool{ .agents = &agents, .config_ref = &cfg };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const derived = try dt.buildDerivedConfig(arena.allocator(), &cfg, agents[0]);
+
+    try std.testing.expectEqualStrings("together", derived.default_provider);
+    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.5", derived.default_model.?);
+    try std.testing.expectEqual(@as(f64, 0.3), derived.default_temperature);
+    try std.testing.expectEqual(@as(usize, 1), derived.reliability.fallback_providers.len);
+    try std.testing.expectEqualStrings("openrouter", derived.reliability.fallback_providers[0]);
+    try std.testing.expectEqualStrings("agent-key", derived.getProviderKey("together").?);
 }
 
 test "delegate missing agent" {

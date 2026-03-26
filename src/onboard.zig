@@ -1086,10 +1086,6 @@ fn parseTelegramAllowFrom(allocator: std.mem.Allocator, raw: []const u8) ![]cons
         try allow.append(allocator, try allocator.dupe(u8, normalized));
     }
 
-    if (allow.items.len == 0) {
-        try allow.append(allocator, try allocator.dupe(u8, "*"));
-    }
-
     return allow.toOwnedSlice(allocator);
 }
 
@@ -1102,7 +1098,7 @@ fn configureTelegramChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, 
         return false;
     }
 
-    try out.print("{s}  Telegram allow_from (username/user_id, comma-separated) [*]: ", .{prefix});
+    try out.print("{s}  Telegram allow_from (optional usernames/user_ids, comma-separated, blank = no sender allowlist): ", .{prefix});
     const allow_input = prompt(out, input_buf, "", "") orelse return false;
     const allow_from = try parseTelegramAllowFrom(cfg.allocator, allow_input);
 
@@ -1113,8 +1109,8 @@ fn configureTelegramChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, 
         .allow_from = allow_from,
     };
     cfg.channels.telegram = accounts;
-    if (allow_from.len == 1 and std.mem.eql(u8, allow_from[0], "*")) {
-        try out.print("{s}  -> Telegram configured (allow_from=*)\n", .{prefix});
+    if (allow_from.len == 0) {
+        try out.print("{s}  -> Telegram configured (no sender allowlist)\n", .{prefix});
     } else {
         try out.print("{s}  -> Telegram configured ({d} allow_from entries)\n", .{ prefix, allow_from.len });
     }
@@ -2297,14 +2293,13 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
 }
 
-test "parseTelegramAllowFrom defaults to wildcard" {
+test "parseTelegramAllowFrom defaults to empty allowlist" {
     const allow = try parseTelegramAllowFrom(std.testing.allocator, "");
     defer {
         for (allow) |entry| std.testing.allocator.free(entry);
         std.testing.allocator.free(allow);
     }
-    try std.testing.expectEqual(@as(usize, 1), allow.len);
-    try std.testing.expectEqualStrings("*", allow[0]);
+    try std.testing.expectEqual(@as(usize, 0), allow.len);
 }
 
 test "parseTelegramAllowFrom normalizes, deduplicates and strips @" {

@@ -21,6 +21,12 @@ All backend-to-Nullclaw requests must include:
 
 Browser must never receive `X-Internal-Token`.
 
+Deployment contract:
+
+- `NULLCLAW_BASE_URL` must remain the internal backend -> nullALIS service URL, for example `http://nullclaw:3000`
+- `ZAKI_AGENT_WEBHOOK_BASE_URL` must be the public HTTPS ingress used by Telegram, for example `https://agent.zaki.com`
+- In deployed environments `ZAKI_AGENT_WEBHOOK_BASE_URL` should be treated as required operator/deployment config for smooth Telegram connect
+
 Default Nullclaw profile/model for this integration:
 
 - `profile = "zaki_bot"`
@@ -130,6 +136,9 @@ Content-Type: application/json
 
 Notes:
 
+- Product contract: end users should only need to provide `bot_token`
+- `account_id` and `allow_from` are optional advanced fields
+- Backend should inject the webhook base automatically from `ZAKI_AGENT_WEBHOOK_BASE_URL`
 - If `webhook_secret_token` missing, Nullclaw generates one.
 - `webhook_base_url` must be `https://`.
 - Resulting webhook URL is `{base}/webhook/telegram?user_id={id}`.

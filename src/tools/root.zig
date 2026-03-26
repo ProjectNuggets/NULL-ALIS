@@ -368,6 +368,7 @@ pub fn allTools(
     const dlt = try allocator.create(delegate.DelegateTool);
     dlt.* = .{
         .agents = opts.agents orelse &.{},
+        .config_ref = opts.config,
         .fallback_api_key = opts.fallback_api_key,
         .depth = opts.delegate_depth,
     };

@@ -8,7 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
-const providers = @import("providers/root.zig");
+const runtime_bundle = @import("providers/runtime_bundle.zig");
 
 const log = std.log.scoped(.subagent);
 
@@ -65,6 +65,7 @@ pub const SubagentManager = struct {
     mutex: std.Thread.Mutex,
     config: SubagentConfig,
     bus: ?*bus_mod.Bus,
+    config_ref: *const config_mod.Config,
 
     // Context needed for creating providers in subagent threads
     api_key: ?[]const u8,
@@ -89,6 +90,7 @@ pub const SubagentManager = struct {
             .mutex = .{},
             .config = subagent_config,
             .bus = bus,
+            .config_ref = cfg,
             .api_key = cfg.defaultProviderKey(),
             .default_provider = cfg.default_provider,
             .default_model = cfg.default_model,
@@ -279,44 +281,46 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         ctx.manager.allocator.destroy(ctx);
     }
 
-    // Use the legacy complete path — simple, works with any provider,
-    // no need to replicate the full ProviderHolder pattern.
-    // Build a config-like struct for providers.completeWithSystem().
     const system_prompt = "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
 
     var cfg_arena = std.heap.ArenaAllocator.init(ctx.manager.allocator);
     defer cfg_arena.deinit();
 
-    // Build a config-like struct that providers.completeWithSystem() accepts
-    const cfg = .{
-        .api_key = ctx.manager.api_key,
-        .default_provider = ctx.manager.default_provider,
-        .default_model = ctx.manager.default_model,
-        .temperature = @as(f64, 0.7),
-        .max_tokens = @as(?u64, null),
-    };
-
-    const result = blk: {
-        if (ctx.manager.completion_runner) |runner| {
-            break :blk runner(
-                ctx.manager.completion_runner_ctx,
-                cfg_arena.allocator(),
-                system_prompt,
-                ctx.task,
-            ) catch |err| {
-                ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
-                return;
-            };
-        }
-        break :blk providers.completeWithSystem(
+    if (ctx.manager.completion_runner) |runner| {
+        const result = runner(
+            ctx.manager.completion_runner_ctx,
             cfg_arena.allocator(),
-            &cfg,
             system_prompt,
             ctx.task,
         ) catch |err| {
             ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
             return;
         };
+
+        ctx.manager.completeTask(ctx.task_id, result, null);
+        return;
+    }
+
+    var provider_bundle = runtime_bundle.RuntimeProviderBundle.init(cfg_arena.allocator(), ctx.manager.config_ref) catch |err| {
+        ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
+        return;
+    };
+    defer provider_bundle.deinit();
+
+    const model = ctx.manager.config_ref.default_model orelse {
+        ctx.manager.completeTask(ctx.task_id, null, @errorName(error.NoDefaultModel));
+        return;
+    };
+
+    const result = provider_bundle.provider().chatWithSystem(
+        cfg_arena.allocator(),
+        system_prompt,
+        ctx.task,
+        model,
+        ctx.manager.config_ref.default_temperature,
+    ) catch |err| {
+        ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
+        return;
     };
 
     ctx.manager.completeTask(ctx.task_id, result, null);

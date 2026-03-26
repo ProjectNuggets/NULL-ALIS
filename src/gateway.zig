@@ -3236,7 +3236,8 @@ fn telegramChatIsGroup(allocator: std.mem.Allocator, body: []const u8) bool {
 }
 
 fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []const u8, body: []const u8) bool {
-    if (allow_from.len == 0) return false;
+    // Empty allowlist means sender filtering is disabled for this connected user.
+    if (allow_from.len == 0) return true;
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
     defer parsed.deinit();
@@ -6691,17 +6692,24 @@ fn handleApiRoute(
         }
         if (std.mem.eql(u8, method, "PUT")) {
             const body = extractBody(raw_request) orelse "{}\n";
+            const enabled = jsonBoolField(body, "enabled") orelse return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"missing enabled\"}",
+            };
+            const canonical_body = std.fmt.allocPrint(req_allocator, "{{\"enabled\":{s}}}", .{
+                if (enabled) "true" else "false",
+            }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
             if (state.zaki_state) |mgr| {
                 const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                mgr.putHeartbeatJson(user_id, body) catch {
+                mgr.putHeartbeatJson(user_id, canonical_body) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
             } else {
-                writeFile(user_ctx.heartbeat_path, body) catch {
+                writeFile(user_ctx.heartbeat_path, canonical_body) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
             }
-            return .{ .body = "{\"status\":\"updated\"}" };
+            return .{ .body = canonical_body };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
@@ -7014,7 +7022,7 @@ fn handleApiRoute(
         else if (state.telegram_allow_from.len > 0)
             state.telegram_allow_from
         else
-            &.{"*"};
+            &.{};
 
         const webhook_url = blk: {
             if (jsonStringField(body, "webhook_url")) |url| break :blk req_allocator.dupe(u8, url) catch {
@@ -10131,6 +10139,100 @@ test "handleApiRoute PATCH settings clamps huge timeout without crashing" {
     try std.testing.expect(std.mem.indexOf(u8, response.body, "\"session_timeout_minutes\":180") != null);
 }
 
+test "handleApiRoute PUT heartbeat stores canonical enabled-only payload" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"enabled\":true,\"intervalSec\":900,\"every\":\"15m\"}";
+    const put_request = try std.fmt.allocPrint(
+        req_allocator,
+        "PUT /api/v1/users/1/heartbeat HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const put_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        put_request,
+        "PUT",
+        "/api/v1/users/1/heartbeat",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", put_response.status);
+    try std.testing.expectEqualStrings("{\"enabled\":true}", put_response.body);
+
+    const get_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/heartbeat HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const get_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        get_request,
+        "GET",
+        "/api/v1/users/1/heartbeat",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", get_response.status);
+    try std.testing.expectEqualStrings("{\"enabled\":true}", get_response.body);
+}
+
+test "handleApiRoute PUT heartbeat rejects payload without enabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"intervalSec\":900}";
+    const put_request = try std.fmt.allocPrint(
+        req_allocator,
+        "PUT /api/v1/users/1/heartbeat HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const put_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        put_request,
+        "PUT",
+        "/api/v1/users/1/heartbeat",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", put_response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"missing enabled\"}", put_response.body);
+}
+
 test "ownership_lock_conflict_http_returns_structured_payload_and_retry_after" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10903,12 +11005,12 @@ test "whatsappSessionKey builds group key when group id exists" {
     try std.testing.expectEqualStrings("whatsapp:group:1203630@g.us:15550001111", key);
 }
 
-test "telegramSenderAllowed denies when allow_from is empty" {
+test "telegramSenderAllowed allows all when allow_from is empty" {
     const allocator = std.testing.allocator;
     const body =
         \\{"message":{"from":{"id":12345,"username":"alice"}}}
     ;
-    try std.testing.expect(!telegramSenderAllowed(allocator, &.{}, body));
+    try std.testing.expect(telegramSenderAllowed(allocator, &.{}, body));
 }
 
 test "telegramChatId extracts nested message.chat.id" {
@@ -11010,6 +11112,21 @@ test "telegramSenderAllowed rejects sender outside allowlist" {
         \\{"message":{"from":{"id":12345}}}
     ;
     try std.testing.expect(!telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "parseTelegramUserState accepts connected telegram state without allowlist" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"connected":true,"account_id":"default","webhook_secret_token":"sec-12345","connected_at":1234567890}
+    ;
+
+    var state = try parseTelegramUserState(allocator, body);
+    defer state.deinit(allocator);
+
+    try std.testing.expect(state.connected);
+    try std.testing.expectEqualStrings("default", state.account_id.?);
+    try std.testing.expectEqualStrings("sec-12345", state.webhook_secret_token.?);
+    try std.testing.expectEqual(@as(usize, 0), state.allow_from.len);
 }
 
 test "telegramSenderIdentity falls back to numeric id when username is missing" {
