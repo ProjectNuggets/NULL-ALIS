@@ -150,9 +150,11 @@ pub const QdrantVectorStore = struct {
 
     /// Derive a deterministic UUID (v5-style) from a key string.
     /// Qdrant point IDs must be valid UUIDs or integers — arbitrary strings are rejected.
-    fn keyToUuid(key: []const u8) [36]u8 {
+    fn keyToUuid(scope_user_id: ?i64, key: []const u8) [36]u8 {
+        var scope_buf: [64]u8 = undefined;
+        const scoped_key = std.fmt.bufPrint(&scope_buf, "{d}:{s}", .{ scope_user_id orelse 0, key }) catch unreachable;
         var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+        std.crypto.hash.sha2.Sha256.hash(scoped_key, &digest, .{});
         // Format as UUID: xxxxxxxx-xxxx-5xxx-yxxx-xxxxxxxxxxxx
         // Set version nibble to 5 and variant bits to 10xx
         digest[6] = (digest[6] & 0x0f) | 0x50; // version 5
@@ -175,11 +177,11 @@ pub const QdrantVectorStore = struct {
 
     // ── JSON builders ─────────────────────────────────────────────
 
-    fn buildUpsertPayload(alloc: Allocator, key: []const u8, embedding: []const f32) ![]u8 {
+    fn buildUpsertPayload(alloc: Allocator, scope_user_id: ?i64, key: []const u8, embedding: []const f32) ![]u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(alloc);
 
-        const uuid = keyToUuid(key);
+        const uuid = keyToUuid(scope_user_id, key);
         try buf.appendSlice(alloc, "{\"points\":[{\"id\":\"");
         try buf.appendSlice(alloc, &uuid);
         try buf.appendSlice(alloc, "\",\"vector\":[");
@@ -193,12 +195,16 @@ pub const QdrantVectorStore = struct {
         }
         try buf.appendSlice(alloc, "],\"payload\":{\"key\":\"");
         try appendJsonEscaped(&buf, alloc, key);
-        try buf.appendSlice(alloc, "\"}}]}");
+        try buf.appendSlice(alloc, "\",\"user_id\":");
+        var user_buf: [32]u8 = undefined;
+        const user_str = std.fmt.bufPrint(&user_buf, "{d}", .{scope_user_id orelse 0}) catch return error.FormatError;
+        try buf.appendSlice(alloc, user_str);
+        try buf.appendSlice(alloc, "}}]}");
 
         return alloc.dupe(u8, buf.items);
     }
 
-    fn buildSearchPayload(alloc: Allocator, query_embedding: []const f32, limit: u32) ![]u8 {
+    fn buildSearchPayload(alloc: Allocator, scope_user_id: ?i64, query_embedding: []const f32, limit: u32) ![]u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(alloc);
 
@@ -215,18 +221,26 @@ pub const QdrantVectorStore = struct {
         var lim_buf: [16]u8 = undefined;
         const lim_str = std.fmt.bufPrint(&lim_buf, "{d}", .{limit}) catch return error.FormatError;
         try buf.appendSlice(alloc, lim_str);
-        try buf.appendSlice(alloc, ",\"with_payload\":true}");
+        try buf.appendSlice(alloc, ",\"with_payload\":true,\"filter\":{\"must\":[{\"key\":\"user_id\",\"match\":{\"value\":");
+        var user_buf: [32]u8 = undefined;
+        const user_str = std.fmt.bufPrint(&user_buf, "{d}", .{scope_user_id orelse 0}) catch return error.FormatError;
+        try buf.appendSlice(alloc, user_str);
+        try buf.appendSlice(alloc, "}}]}}");
 
         return alloc.dupe(u8, buf.items);
     }
 
-    fn buildDeletePayload(alloc: Allocator, key: []const u8) ![]u8 {
+    fn buildDeletePayload(alloc: Allocator, scope_user_id: ?i64, key: []const u8) ![]u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(alloc);
 
         try buf.appendSlice(alloc, "{\"filter\":{\"must\":[{\"key\":\"key\",\"match\":{\"value\":\"");
         try appendJsonEscaped(&buf, alloc, key);
-        try buf.appendSlice(alloc, "\"}}]}}");
+        try buf.appendSlice(alloc, "\"}},{\"key\":\"user_id\",\"match\":{\"value\":");
+        var user_buf: [32]u8 = undefined;
+        const user_str = std.fmt.bufPrint(&user_buf, "{d}", .{scope_user_id orelse 0}) catch return error.FormatError;
+        try buf.appendSlice(alloc, user_str);
+        try buf.appendSlice(alloc, "}}]}}");
 
         return alloc.dupe(u8, buf.items);
     }
@@ -319,14 +333,14 @@ pub const QdrantVectorStore = struct {
 
     // ── VTable implementations ────────────────────────────────────
 
-    fn implUpsert(ptr: *anyopaque, key: []const u8, embedding: []const f32) anyerror!void {
+    fn implUpsert(ptr: *anyopaque, scope_user_id: ?i64, key: []const u8, embedding: []const f32) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const alloc = self.allocator;
 
         const url = try self.buildUrl(alloc, "/points?wait=true");
         defer alloc.free(url);
 
-        const payload = try buildUpsertPayload(alloc, key, embedding);
+        const payload = try buildUpsertPayload(alloc, scope_user_id, key, embedding);
         defer alloc.free(payload);
 
         const resp = try self.doRequest(alloc, url, .PUT, payload);
@@ -335,13 +349,13 @@ pub const QdrantVectorStore = struct {
         if (resp.status != .ok) return error.QdrantApiError;
     }
 
-    fn implSearch(ptr: *anyopaque, alloc: Allocator, query_embedding: []const f32, limit: u32) anyerror![]VectorResult {
+    fn implSearch(ptr: *anyopaque, alloc: Allocator, scope_user_id: ?i64, query_embedding: []const f32, limit: u32) anyerror![]VectorResult {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         const url = try self.buildUrl(alloc, "/points/search");
         defer alloc.free(url);
 
-        const payload = try buildSearchPayload(alloc, query_embedding, limit);
+        const payload = try buildSearchPayload(alloc, scope_user_id, query_embedding, limit);
         defer alloc.free(payload);
 
         const resp = try self.doRequest(alloc, url, .POST, payload);
@@ -352,14 +366,14 @@ pub const QdrantVectorStore = struct {
         return parseSearchResults(alloc, resp.body);
     }
 
-    fn implDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+    fn implDelete(ptr: *anyopaque, scope_user_id: ?i64, key: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const alloc = self.allocator;
 
         const url = try self.buildUrl(alloc, "/points/delete?wait=true");
         defer alloc.free(url);
 
-        const payload = try buildDeletePayload(alloc, key);
+        const payload = try buildDeletePayload(alloc, scope_user_id, key);
         defer alloc.free(payload);
 
         const resp = try self.doRequest(alloc, url, .POST, payload);
@@ -532,7 +546,7 @@ test "QdrantVectorStore produces valid VectorStore vtable" {
 test "buildUpsertPayload generates valid JSON" {
     const alloc = std.testing.allocator;
     const embedding = [_]f32{ 0.1, 0.2, 0.3 };
-    const payload = try QdrantVectorStore.buildUpsertPayload(alloc, "test_key", &embedding);
+    const payload = try QdrantVectorStore.buildUpsertPayload(alloc, 7, "test_key", &embedding);
     defer alloc.free(payload);
 
     // Parse the JSON to verify it's valid
@@ -557,12 +571,13 @@ test "buildUpsertPayload generates valid JSON" {
 
     const pl = point.get("payload").?.object;
     try std.testing.expectEqualStrings("test_key", pl.get("key").?.string);
+    try std.testing.expectEqual(@as(i64, 7), pl.get("user_id").?.integer);
 }
 
 test "buildUpsertPayload escapes special characters" {
     const alloc = std.testing.allocator;
     const embedding = [_]f32{1.0};
-    const payload = try QdrantVectorStore.buildUpsertPayload(alloc, "key\"with\\quotes", &embedding);
+    const payload = try QdrantVectorStore.buildUpsertPayload(alloc, 3, "key\"with\\quotes", &embedding);
     defer alloc.free(payload);
 
     // Should be valid JSON despite special chars in key
@@ -581,7 +596,7 @@ test "buildUpsertPayload escapes special characters" {
 test "buildSearchPayload generates valid JSON" {
     const alloc = std.testing.allocator;
     const query = [_]f32{ 1.0, 2.0 };
-    const payload = try QdrantVectorStore.buildSearchPayload(alloc, &query, 5);
+    const payload = try QdrantVectorStore.buildSearchPayload(alloc, 11, &query, 5);
     defer alloc.free(payload);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
@@ -595,11 +610,14 @@ test "buildSearchPayload generates valid JSON" {
     try std.testing.expectEqual(@as(i64, 5), limit);
 
     try std.testing.expect(root.get("with_payload").?.bool);
+    const must = root.get("filter").?.object.get("must").?.array;
+    try std.testing.expectEqual(@as(usize, 1), must.items.len);
+    try std.testing.expectEqual(@as(i64, 11), must.items[0].object.get("match").?.object.get("value").?.integer);
 }
 
 test "buildDeletePayload generates valid JSON" {
     const alloc = std.testing.allocator;
-    const payload = try QdrantVectorStore.buildDeletePayload(alloc, "my_key");
+    const payload = try QdrantVectorStore.buildDeletePayload(alloc, 9, "my_key");
     defer alloc.free(payload);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
@@ -608,12 +626,15 @@ test "buildDeletePayload generates valid JSON" {
     // {"filter":{"must":[{"key":"key","match":{"value":"my_key"}}]}}
     const filter = parsed.value.object.get("filter").?.object;
     const must = filter.get("must").?.array;
-    try std.testing.expectEqual(@as(usize, 1), must.items.len);
+    try std.testing.expectEqual(@as(usize, 2), must.items.len);
 
     const cond = must.items[0].object;
     try std.testing.expectEqualStrings("key", cond.get("key").?.string);
     const match = cond.get("match").?.object;
     try std.testing.expectEqualStrings("my_key", match.get("value").?.string);
+    const user_cond = must.items[1].object;
+    try std.testing.expectEqualStrings("user_id", user_cond.get("key").?.string);
+    try std.testing.expectEqual(@as(i64, 9), user_cond.get("match").?.object.get("value").?.integer);
 }
 
 test "parseSearchResults valid response" {
@@ -748,7 +769,7 @@ test "buildUrl with empty path" {
 }
 
 test "keyToUuid produces valid UUID format" {
-    const uuid = QdrantVectorStore.keyToUuid("test_key");
+    const uuid = QdrantVectorStore.keyToUuid(5, "test_key");
     try std.testing.expectEqual(@as(usize, 36), uuid.len);
     // Check dash positions
     try std.testing.expect(uuid[8] == '-');
@@ -762,14 +783,20 @@ test "keyToUuid produces valid UUID format" {
 }
 
 test "keyToUuid is deterministic" {
-    const uuid_a = QdrantVectorStore.keyToUuid("hello");
-    const uuid_b = QdrantVectorStore.keyToUuid("hello");
+    const uuid_a = QdrantVectorStore.keyToUuid(2, "hello");
+    const uuid_b = QdrantVectorStore.keyToUuid(2, "hello");
     try std.testing.expectEqualSlices(u8, &uuid_a, &uuid_b);
 }
 
 test "keyToUuid differs for different keys" {
-    const uuid_a = QdrantVectorStore.keyToUuid("alpha");
-    const uuid_b = QdrantVectorStore.keyToUuid("beta");
+    const uuid_a = QdrantVectorStore.keyToUuid(2, "alpha");
+    const uuid_b = QdrantVectorStore.keyToUuid(2, "beta");
+    try std.testing.expect(!std.mem.eql(u8, &uuid_a, &uuid_b));
+}
+
+test "keyToUuid differs for different users sharing a key" {
+    const uuid_a = QdrantVectorStore.keyToUuid(1, "shared");
+    const uuid_b = QdrantVectorStore.keyToUuid(2, "shared");
     try std.testing.expect(!std.mem.eql(u8, &uuid_a, &uuid_b));
 }
 
@@ -778,21 +805,21 @@ test "keyToUuid differs for different keys" {
 test "buildUpsertPayload rejects NaN embedding" {
     const alloc = std.testing.allocator;
     const embedding = [_]f32{ 0.1, std.math.nan(f32), 0.3 };
-    const result = QdrantVectorStore.buildUpsertPayload(alloc, "key", &embedding);
+    const result = QdrantVectorStore.buildUpsertPayload(alloc, null, "key", &embedding);
     try std.testing.expectError(error.InvalidEmbeddingValue, result);
 }
 
 test "buildUpsertPayload rejects Inf embedding" {
     const alloc = std.testing.allocator;
     const embedding = [_]f32{std.math.inf(f32)};
-    const result = QdrantVectorStore.buildUpsertPayload(alloc, "key", &embedding);
+    const result = QdrantVectorStore.buildUpsertPayload(alloc, null, "key", &embedding);
     try std.testing.expectError(error.InvalidEmbeddingValue, result);
 }
 
 test "buildSearchPayload rejects NaN query" {
     const alloc = std.testing.allocator;
     const query = [_]f32{ 0.1, std.math.nan(f32) };
-    const result = QdrantVectorStore.buildSearchPayload(alloc, &query, 5);
+    const result = QdrantVectorStore.buildSearchPayload(alloc, null, &query, 5);
     try std.testing.expectError(error.InvalidEmbeddingValue, result);
 }
 

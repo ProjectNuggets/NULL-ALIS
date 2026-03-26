@@ -809,6 +809,7 @@ const TenantRuntime = struct {
                 try dual.syncFromMarkdown(allocator);
                 old_memory.deinit();
                 rt.memory = dual.memory();
+                rt.setVectorUserScope(numeric_user_id);
                 rt.capabilities = .{
                     .supports_keyword_rank = true,
                     .supports_session_store = false,

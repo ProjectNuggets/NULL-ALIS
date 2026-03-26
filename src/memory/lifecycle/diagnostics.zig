@@ -359,7 +359,7 @@ test "diagnose with vector store" {
 
     // Upsert a vector
     const vs_iface = vs.store();
-    try vs_iface.upsert("vec1", &[_]f32{ 1.0, 2.0, 3.0 });
+    try vs_iface.upsertScoped(0, "vec1", &[_]f32{ 1.0, 2.0, 3.0 });
 
     var rt = root.MemoryRuntime{
         .memory = sqlite_impl.memory(),
@@ -402,7 +402,7 @@ test "diagnose with outbox" {
     try ob.migrate();
 
     // Enqueue an item
-    try ob.enqueue("key1", "upsert");
+    try ob.enqueue(null, "key1", "upsert");
 
     var rt = root.MemoryRuntime{
         .memory = sqlite_impl.memory(),

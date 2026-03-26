@@ -7,10 +7,13 @@
 //! SQL schema:
 //!   CREATE EXTENSION IF NOT EXISTS vector;
 //!   CREATE TABLE IF NOT EXISTS memory_vectors (
-//!     key       TEXT PRIMARY KEY,
+//!     user_id   BIGINT NOT NULL,
+//!     key       TEXT NOT NULL,
 //!     embedding vector(N),
-//!     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+//!     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+//!     PRIMARY KEY (user_id, key)
 //!   );
+//!   CREATE INDEX ON memory_vectors (user_id);
 //!   CREATE INDEX ON memory_vectors USING ivfflat (embedding vector_cosine_ops);
 
 const std = @import("std");
@@ -334,6 +337,10 @@ pub const PgvectorVectorStore = struct {
             }
         }
 
+        if (try self.hasLegacySchema(conn)) {
+            try self.resetLegacyTable(conn);
+        }
+
         try self.createTable(conn);
 
         if (try self.readEmbeddingDimensions(conn)) |existing_dims| {
@@ -364,9 +371,11 @@ pub const PgvectorVectorStore = struct {
     fn createTable(self: *Self, conn: *c.PGconn) !void {
         const create_sql_plain = try std.fmt.allocPrint(self.allocator,
             \\CREATE TABLE IF NOT EXISTS {s} (
-            \\  key TEXT PRIMARY KEY,
+            \\  user_id BIGINT NOT NULL,
+            \\  key TEXT NOT NULL,
             \\  embedding vector({d}),
-            \\  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            \\  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            \\  PRIMARY KEY (user_id, key)
             \\)
         , .{ self.table_name, self.dimensions });
         defer self.allocator.free(create_sql_plain);
@@ -378,6 +387,56 @@ pub const PgvectorVectorStore = struct {
         const status = c.PQresultStatus(result);
         if (status != c.PGRES_COMMAND_OK) {
             log.warn("pgvector table ensure failed: {s}", .{pqErrorMessage(conn, result)});
+            return error.PgSchemaFailed;
+        }
+
+        const user_idx_plain = try std.fmt.allocPrint(self.allocator, "CREATE INDEX IF NOT EXISTS {s}_user_id_idx ON {s}(user_id)", .{ self.table_name, self.table_name });
+        defer self.allocator.free(user_idx_plain);
+        const user_idx = try self.allocator.dupeZ(u8, user_idx_plain);
+        defer self.allocator.free(user_idx);
+        const idx_result = c.PQexec(conn, user_idx.ptr) orelse return error.PgSchemaFailed;
+        defer c.PQclear(idx_result);
+        if (c.PQresultStatus(idx_result) != c.PGRES_COMMAND_OK) {
+            log.warn("pgvector user index ensure failed: {s}", .{pqErrorMessage(conn, idx_result)});
+            return error.PgSchemaFailed;
+        }
+    }
+
+    fn hasLegacySchema(self: *Self, conn: *c.PGconn) !bool {
+        const table_z = try self.allocator.dupeZ(u8, self.table_name);
+        defer self.allocator.free(table_z);
+        const sql =
+            "SELECT 1 FROM information_schema.columns " ++
+            "WHERE table_schema = current_schema() AND table_name = $1 AND column_name = 'user_id' LIMIT 1";
+        const params = [_][*c]const u8{table_z.ptr};
+        const result = c.PQexecParams(conn, sql, 1, null, &params, null, null, 0) orelse return error.PgQueryFailed;
+        defer c.PQclear(result);
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) return error.PgQueryFailed;
+        return c.PQntuples(result) == 0 and try self.tableExists(conn);
+    }
+
+    fn tableExists(self: *Self, conn: *c.PGconn) !bool {
+        const table_z = try self.allocator.dupeZ(u8, self.table_name);
+        defer self.allocator.free(table_z);
+        const sql =
+            "SELECT 1 FROM information_schema.tables " ++
+            "WHERE table_schema = current_schema() AND table_name = $1 LIMIT 1";
+        const params = [_][*c]const u8{table_z.ptr};
+        const result = c.PQexecParams(conn, sql, 1, null, &params, null, null, 0) orelse return error.PgQueryFailed;
+        defer c.PQclear(result);
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) return error.PgQueryFailed;
+        return c.PQntuples(result) > 0;
+    }
+
+    fn resetLegacyTable(self: *Self, conn: *c.PGconn) !void {
+        const drop_sql_plain = try std.fmt.allocPrint(self.allocator, "DROP TABLE IF EXISTS {s}", .{self.table_name});
+        defer self.allocator.free(drop_sql_plain);
+        const drop_sql = try self.allocator.dupeZ(u8, drop_sql_plain);
+        defer self.allocator.free(drop_sql);
+        const drop_result = c.PQexec(conn, drop_sql.ptr) orelse return error.PgSchemaFailed;
+        defer c.PQclear(drop_result);
+        if (c.PQresultStatus(drop_result) != c.PGRES_COMMAND_OK) {
+            log.warn("pgvector legacy table reset failed: {s}", .{pqErrorMessage(conn, drop_result)});
             return error.PgSchemaFailed;
         }
     }
@@ -445,10 +504,11 @@ pub const PgvectorVectorStore = struct {
 
     // ── VTable implementations ────────────────────────────────────
 
-    fn implUpsert(ptr: *anyopaque, key: []const u8, embedding: []const f32) anyerror!void {
+    fn implUpsert(ptr: *anyopaque, scope_user_id: ?i64, key: []const u8, embedding: []const f32) anyerror!void {
         if (!build_options.enable_postgres) return error.PgNotEnabled;
         const self: *Self = @ptrCast(@alignCast(ptr));
         const alloc = self.allocator;
+        const user_id = scope_user_id orelse 0;
 
         var lease = try self.acquireQueryLease();
         var conn_healthy = true;
@@ -461,19 +521,21 @@ pub const PgvectorVectorStore = struct {
         defer alloc.free(vec_z);
         const key_z = try alloc.dupeZ(u8, key);
         defer alloc.free(key_z);
+        var user_buf: [32]u8 = undefined;
+        const user_str = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
 
         const sql_plain = try std.fmt.allocPrint(
             alloc,
-            "INSERT INTO {s} (key, embedding, updated_at) VALUES ($1, $2::vector, now()) " ++
-                "ON CONFLICT (key) DO UPDATE SET embedding = $2::vector, updated_at = now()",
+            "INSERT INTO {s} (user_id, key, embedding, updated_at) VALUES ($1::bigint, $2, $3::vector, now()) " ++
+                "ON CONFLICT (user_id, key) DO UPDATE SET embedding = $3::vector, updated_at = now()",
             .{self.table_name},
         );
         defer alloc.free(sql_plain);
         const sql = try alloc.dupeZ(u8, sql_plain);
         defer alloc.free(sql);
 
-        const params = [_][*c]const u8{ key_z.ptr, vec_z.ptr };
-        const result = c.PQexecParams(conn, sql.ptr, 2, null, &params, null, null, 0) orelse {
+        const params = [_][*c]const u8{ user_str.ptr, key_z.ptr, vec_z.ptr };
+        const result = c.PQexecParams(conn, sql.ptr, 3, null, &params, null, null, 0) orelse {
             conn_healthy = false;
             return error.PgQueryFailed;
         };
@@ -487,9 +549,10 @@ pub const PgvectorVectorStore = struct {
         }
     }
 
-    fn implSearch(ptr: *anyopaque, alloc: Allocator, query_embedding: []const f32, limit: u32) anyerror![]VectorResult {
+    fn implSearch(ptr: *anyopaque, alloc: Allocator, scope_user_id: ?i64, query_embedding: []const f32, limit: u32) anyerror![]VectorResult {
         if (!build_options.enable_postgres) return error.PgNotEnabled;
         const self: *Self = @ptrCast(@alignCast(ptr));
+        const user_id = scope_user_id orelse 0;
 
         var lease = try self.acquireQueryLease();
         var conn_healthy = true;
@@ -503,19 +566,21 @@ pub const PgvectorVectorStore = struct {
 
         var limit_buf: [16]u8 = undefined;
         const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+        var user_buf: [32]u8 = undefined;
+        const user_str = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
 
         const sql_plain = try std.fmt.allocPrint(
             alloc,
             "SELECT key, 1 - (embedding <=> $1::vector) AS similarity " ++
-                "FROM {s} ORDER BY embedding <=> $1::vector LIMIT $2::int",
+                "FROM {s} WHERE user_id = $2::bigint ORDER BY embedding <=> $1::vector LIMIT $3::int",
             .{self.table_name},
         );
         defer alloc.free(sql_plain);
         const sql = try alloc.dupeZ(u8, sql_plain);
         defer alloc.free(sql);
 
-        const params = [_][*c]const u8{ vec_z.ptr, limit_str.ptr };
-        const result = c.PQexecParams(conn, sql.ptr, 2, null, &params, null, null, 0) orelse {
+        const params = [_][*c]const u8{ vec_z.ptr, user_str.ptr, limit_str.ptr };
+        const result = c.PQexecParams(conn, sql.ptr, 3, null, &params, null, null, 0) orelse {
             conn_healthy = false;
             return error.PgQueryFailed;
         };
@@ -557,10 +622,11 @@ pub const PgvectorVectorStore = struct {
         return out;
     }
 
-    fn implDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+    fn implDelete(ptr: *anyopaque, scope_user_id: ?i64, key: []const u8) anyerror!void {
         if (!build_options.enable_postgres) return error.PgNotEnabled;
         const self: *Self = @ptrCast(@alignCast(ptr));
         const alloc = self.allocator;
+        const user_id = scope_user_id orelse 0;
 
         var lease = try self.acquireQueryLease();
         var conn_healthy = true;
@@ -569,14 +635,16 @@ pub const PgvectorVectorStore = struct {
 
         const key_z = try alloc.dupeZ(u8, key);
         defer alloc.free(key_z);
+        var user_buf: [32]u8 = undefined;
+        const user_str = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
 
-        const sql_plain = try std.fmt.allocPrint(alloc, "DELETE FROM {s} WHERE key = $1", .{self.table_name});
+        const sql_plain = try std.fmt.allocPrint(alloc, "DELETE FROM {s} WHERE user_id = $1::bigint AND key = $2", .{self.table_name});
         defer alloc.free(sql_plain);
         const sql = try alloc.dupeZ(u8, sql_plain);
         defer alloc.free(sql);
 
-        const params = [_][*c]const u8{key_z.ptr};
-        const result = c.PQexecParams(conn, sql.ptr, 1, null, &params, null, null, 0) orelse {
+        const params = [_][*c]const u8{ user_str.ptr, key_z.ptr };
+        const result = c.PQexecParams(conn, sql.ptr, 2, null, &params, null, null, 0) orelse {
             conn_healthy = false;
             return error.PgQueryFailed;
         };
@@ -894,9 +962,9 @@ test "pgvector_pool_enforces_cap_under_concurrency" {
                 var key_buf: [96]u8 = undefined;
                 const key = std.fmt.bufPrint(&key_buf, "pool-key-{d}-{d}", .{ ctx.worker_id, i }) catch continue;
                 const embedding = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, @as(f32, @floatFromInt(ctx.worker_id)), @as(f32, @floatFromInt(i)) };
-                iface.upsert(key, &embedding) catch continue;
+                iface.upsertScoped(@intCast(ctx.worker_id), key, &embedding) catch continue;
                 if (i % 5 == 0) {
-                    const results = iface.search(std.heap.page_allocator, &embedding, 3) catch continue;
+                    const results = iface.searchScoped(std.heap.page_allocator, @intCast(ctx.worker_id), &embedding, 3) catch continue;
                     store_mod.freeVectorResults(std.heap.page_allocator, results);
                 }
             }
@@ -928,14 +996,14 @@ test "pgvector_pool_reuses_connections" {
     const iface = self.store();
     const embedding = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
 
-    try iface.upsert("reuse-key-0", &embedding);
+    try iface.upsertScoped(0, "reuse-key-0", &embedding);
     const first_snapshot = self.debugPoolSnapshot();
 
     for (0..25) |i| {
         var key_buf: [64]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "reuse-key-{d}", .{i});
-        try iface.upsert(key, &embedding);
-        const results = try iface.search(allocator, &embedding, 5);
+        try iface.upsertScoped(0, key, &embedding);
+        const results = try iface.searchScoped(allocator, 0, &embedding, 5);
         store_mod.freeVectorResults(allocator, results);
     }
 
@@ -965,6 +1033,31 @@ test "pgvector_pool_timeout_when_exhausted" {
     const snapshot = self.debugPoolSnapshot();
     try std.testing.expectEqual(@as(u32, 2), snapshot.in_use);
     try std.testing.expect(snapshot.open_conns <= snapshot.pool_max);
+}
+
+test "pgvector scoped keys can coexist across users" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var self = try initPostgresTestStoreWithPool(allocator, 2, 500);
+    defer {
+        dropPostgresTestTable(self);
+        self.deinit();
+    }
+
+    const iface = self.store();
+    try iface.upsertScoped(1, "shared-key", &[_]f32{ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 });
+    try iface.upsertScoped(2, "shared-key", &[_]f32{ 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 });
+
+    const user_one_results = try iface.searchScoped(allocator, 1, &[_]f32{ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }, 5);
+    defer store_mod.freeVectorResults(allocator, user_one_results);
+    try std.testing.expectEqual(@as(usize, 1), user_one_results.len);
+    try std.testing.expectEqualStrings("shared-key", user_one_results[0].key);
+
+    const user_two_results = try iface.searchScoped(allocator, 2, &[_]f32{ 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }, 5);
+    defer store_mod.freeVectorResults(allocator, user_two_results);
+    try std.testing.expectEqual(@as(usize, 1), user_two_results.len);
+    try std.testing.expectEqualStrings("shared-key", user_two_results[0].key);
 }
 
 test "pgvector_pool_releases_on_query_error" {

@@ -46,6 +46,7 @@ pub const VectorOutbox = struct {
         const ddl =
             \\CREATE TABLE IF NOT EXISTS vector_outbox (
             \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    user_id INTEGER NOT NULL DEFAULT 0,
             \\    memory_key TEXT NOT NULL,
             \\    operation TEXT NOT NULL,
             \\    created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -62,15 +63,16 @@ pub const VectorOutbox = struct {
     }
 
     /// Enqueue an operation (upsert or delete).
-    pub fn enqueue(self: *VectorOutbox, memory_key: []const u8, operation: []const u8) !void {
-        const sql = "INSERT INTO vector_outbox (memory_key, operation) VALUES (?1, ?2)";
+    pub fn enqueue(self: *VectorOutbox, scope_user_id: ?i64, memory_key: []const u8, operation: []const u8) !void {
+        const sql = "INSERT INTO vector_outbox (user_id, memory_key, operation) VALUES (?1, ?2, ?3)";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, memory_key.ptr, @intCast(memory_key.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_text(stmt, 2, operation.ptr, @intCast(operation.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 1, scope_user_id orelse 0);
+        _ = c.sqlite3_bind_text(stmt, 2, memory_key.ptr, @intCast(memory_key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 3, operation.ptr, @intCast(operation.len), SQLITE_STATIC);
 
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -79,6 +81,7 @@ pub const VectorOutbox = struct {
     /// Internal item representation collected from the SELECT.
     const OutboxItem = struct {
         id: i64,
+        user_id: i64,
         key: []u8, // owned (duped)
         op: []u8, // owned (duped)
     };
@@ -103,7 +106,7 @@ pub const VectorOutbox = struct {
         }
 
         {
-            const select_sql = "SELECT id, memory_key, operation FROM vector_outbox WHERE attempts < ?1 ORDER BY id LIMIT 50";
+            const select_sql = "SELECT id, user_id, memory_key, operation FROM vector_outbox WHERE attempts < ?1 ORDER BY id LIMIT 50";
             var sel_stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self.db, select_sql, -1, &sel_stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -116,12 +119,13 @@ pub const VectorOutbox = struct {
                 if (rc == c.SQLITE_ROW) {
                     const id = c.sqlite3_column_int64(sel_stmt, 0);
 
-                    const key_ptr = c.sqlite3_column_text(sel_stmt, 1);
-                    const key_len: usize = @intCast(c.sqlite3_column_bytes(sel_stmt, 1));
+                    const user_id = c.sqlite3_column_int64(sel_stmt, 1);
+                    const key_ptr = c.sqlite3_column_text(sel_stmt, 2);
+                    const key_len: usize = @intCast(c.sqlite3_column_bytes(sel_stmt, 2));
                     if (key_ptr == null) continue;
 
-                    const op_ptr = c.sqlite3_column_text(sel_stmt, 2);
-                    const op_len: usize = @intCast(c.sqlite3_column_bytes(sel_stmt, 2));
+                    const op_ptr = c.sqlite3_column_text(sel_stmt, 3);
+                    const op_len: usize = @intCast(c.sqlite3_column_bytes(sel_stmt, 3));
                     if (op_ptr == null) continue;
 
                     const key_slice: []const u8 = @as([*]const u8, @ptrCast(key_ptr))[0..key_len];
@@ -133,6 +137,7 @@ pub const VectorOutbox = struct {
                     errdefer allocator.free(owned_op);
                     try items.append(allocator, .{
                         .id = id,
+                        .user_id = user_id,
                         .key = owned_key,
                         .op = owned_op,
                     });
@@ -146,7 +151,7 @@ pub const VectorOutbox = struct {
         for (items.items) |item| {
             if (std.mem.eql(u8, item.op, "delete")) {
                 // Delete from vector store
-                vs.delete(item.key) catch |err| {
+                vs.deleteScoped(item.user_id, item.key) catch |err| {
                     self.recordItemFailure(item.id, @errorName(err)) catch {};
                     if (breaker) |b| b.recordFailure();
                     continue;
@@ -156,7 +161,7 @@ pub const VectorOutbox = struct {
                 success_count += 1;
             } else if (std.mem.eql(u8, item.op, "upsert")) {
                 // Fetch content from the memories table
-                const content = self.fetchMemoryContent(allocator, item.key) catch {
+                const content = self.fetchMemoryContent(allocator, item.user_id, item.key) catch {
                     // Could not look up content — record failure
                     self.recordItemFailure(item.id, "content_lookup_failed") catch {};
                     if (breaker) |b| b.recordFailure();
@@ -175,7 +180,7 @@ pub const VectorOutbox = struct {
                     defer allocator.free(embedding);
 
                     // Upsert to vector store
-                    vs.upsert(item.key, embedding) catch |err| {
+                    vs.upsertScoped(item.user_id, item.key, embedding) catch |err| {
                         self.recordItemFailure(item.id, @errorName(err)) catch {};
                         if (breaker) |b| b.recordFailure();
                         continue;
@@ -266,7 +271,8 @@ pub const VectorOutbox = struct {
 
     /// Fetch content from the memories table by key. Returns null if not found.
     /// Caller owns the returned slice.
-    fn fetchMemoryContent(self: *VectorOutbox, allocator: Allocator, key: []const u8) !?[]u8 {
+    fn fetchMemoryContent(self: *VectorOutbox, allocator: Allocator, user_id: i64, key: []const u8) !?[]u8 {
+        _ = user_id;
         const sql = "SELECT content FROM memories WHERE key = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
@@ -330,15 +336,16 @@ fn insertMemory(db: ?*c.sqlite3, key: []const u8, content: []const u8) !void {
 }
 
 /// Helper: manually set attempts on an outbox row.
-fn setAttempts(db: ?*c.sqlite3, memory_key: []const u8, attempts: i32) !void {
-    const sql = "UPDATE vector_outbox SET attempts = ?2 WHERE memory_key = ?1";
+fn setAttempts(db: ?*c.sqlite3, user_id: i64, memory_key: []const u8, attempts: i32) !void {
+    const sql = "UPDATE vector_outbox SET attempts = ?3 WHERE user_id = ?1 AND memory_key = ?2";
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
     if (rc != c.SQLITE_OK) return error.PrepareFailed;
     defer _ = c.sqlite3_finalize(stmt);
 
-    _ = c.sqlite3_bind_text(stmt, 1, memory_key.ptr, @intCast(memory_key.len), SQLITE_STATIC);
-    _ = c.sqlite3_bind_int(stmt, 2, attempts);
+    _ = c.sqlite3_bind_int64(stmt, 1, user_id);
+    _ = c.sqlite3_bind_text(stmt, 2, memory_key.ptr, @intCast(memory_key.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_int(stmt, 3, attempts);
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -366,7 +373,7 @@ test "migrate creates vector_outbox table" {
     defer setup.deinit();
     // If we get here, migrate succeeded — table exists.
     // Verify by inserting directly.
-    try setup.ob.enqueue("test_key", "upsert");
+    try setup.ob.enqueue(null, "test_key", "upsert");
     const cnt = try setup.ob.pendingCount();
     try testing.expectEqual(@as(usize, 1), cnt);
 }
@@ -377,7 +384,7 @@ test "enqueue inserts row" {
     var setup = try testSetup(allocator);
     defer setup.deinit();
 
-    try setup.ob.enqueue("key1", "upsert");
+    try setup.ob.enqueue(null, "key1", "upsert");
     const cnt = try setup.ob.pendingCount();
     try testing.expectEqual(@as(usize, 1), cnt);
 }
@@ -388,8 +395,8 @@ test "enqueue upsert and delete" {
     var setup = try testSetup(allocator);
     defer setup.deinit();
 
-    try setup.ob.enqueue("key1", "upsert");
-    try setup.ob.enqueue("key2", "delete");
+    try setup.ob.enqueue(null, "key1", "upsert");
+    try setup.ob.enqueue(null, "key2", "delete");
     const cnt = try setup.ob.pendingCount();
     try testing.expectEqual(@as(usize, 2), cnt);
 }
@@ -401,11 +408,11 @@ test "pendingCount returns correct count" {
     defer setup.deinit();
 
     try testing.expectEqual(@as(usize, 0), try setup.ob.pendingCount());
-    try setup.ob.enqueue("a", "upsert");
+    try setup.ob.enqueue(null, "a", "upsert");
     try testing.expectEqual(@as(usize, 1), try setup.ob.pendingCount());
-    try setup.ob.enqueue("b", "upsert");
+    try setup.ob.enqueue(null, "b", "upsert");
     try testing.expectEqual(@as(usize, 2), try setup.ob.pendingCount());
-    try setup.ob.enqueue("c", "delete");
+    try setup.ob.enqueue(null, "c", "delete");
     try testing.expectEqual(@as(usize, 3), try setup.ob.pendingCount());
 }
 
@@ -419,7 +426,7 @@ test "drain upsert succeeds when content exists in memories" {
     try insertMemory(setup.mem.db, "key1", "hello world");
 
     // Enqueue an upsert
-    try setup.ob.enqueue("key1", "upsert");
+    try setup.ob.enqueue(null, "key1", "upsert");
     try testing.expectEqual(@as(usize, 1), try setup.ob.pendingCount());
 
     // Drain with noop embedding provider
@@ -442,7 +449,7 @@ test "drain removes upsert when content not found" {
     defer setup.deinit();
 
     // Enqueue upsert but do NOT store content in memories
-    try setup.ob.enqueue("missing_key", "upsert");
+    try setup.ob.enqueue(null, "missing_key", "upsert");
     try testing.expectEqual(@as(usize, 1), try setup.ob.pendingCount());
 
     var noop = embeddings.NoopEmbedding{};
@@ -462,7 +469,7 @@ test "drain deletes item from outbox on success" {
     defer setup.deinit();
 
     try insertMemory(setup.mem.db, "k", "content");
-    try setup.ob.enqueue("k", "upsert");
+    try setup.ob.enqueue(null, "k", "upsert");
 
     var noop = embeddings.NoopEmbedding{};
     const ep = noop.provider();
@@ -479,13 +486,13 @@ test "purgeDeadLetters removes over-limit items" {
     defer setup.deinit();
 
     // max_retries = 2
-    try setup.ob.enqueue("dead1", "upsert");
-    try setup.ob.enqueue("dead2", "upsert");
-    try setup.ob.enqueue("alive", "upsert");
+    try setup.ob.enqueue(null, "dead1", "upsert");
+    try setup.ob.enqueue(null, "dead2", "upsert");
+    try setup.ob.enqueue(null, "alive", "upsert");
 
     // Set attempts >= max_retries for the dead ones
-    try setAttempts(setup.mem.db, "dead1", 2);
-    try setAttempts(setup.mem.db, "dead2", 3);
+    try setAttempts(setup.mem.db, 0, "dead1", 2);
+    try setAttempts(setup.mem.db, 0, "dead2", 3);
 
     const purged = try setup.ob.purgeDeadLetters();
     try testing.expectEqual(@as(u32, 2), purged);
@@ -502,8 +509,8 @@ test "drain respects max_retries" {
     defer setup.deinit();
 
     // max_retries = 2 → items with attempts >= 2 should NOT be processed
-    try setup.ob.enqueue("exhausted", "upsert");
-    try setAttempts(setup.mem.db, "exhausted", 2);
+    try setup.ob.enqueue(null, "exhausted", "upsert");
+    try setAttempts(setup.mem.db, 0, "exhausted", 2);
 
     try insertMemory(setup.mem.db, "exhausted", "some content");
 
@@ -525,7 +532,7 @@ test "drain with circuit breaker records success" {
     defer setup.deinit();
 
     try insertMemory(setup.mem.db, "cb_key", "breaker content");
-    try setup.ob.enqueue("cb_key", "upsert");
+    try setup.ob.enqueue(null, "cb_key", "upsert");
 
     var noop = embeddings.NoopEmbedding{};
     const ep = noop.provider();
@@ -561,8 +568,8 @@ test "multiple enqueue and drain cycle" {
     // First cycle
     try insertMemory(setup.mem.db, "m1", "content one");
     try insertMemory(setup.mem.db, "m2", "content two");
-    try setup.ob.enqueue("m1", "upsert");
-    try setup.ob.enqueue("m2", "upsert");
+    try setup.ob.enqueue(null, "m1", "upsert");
+    try setup.ob.enqueue(null, "m2", "upsert");
 
     var noop = embeddings.NoopEmbedding{};
     const ep = noop.provider();
@@ -574,8 +581,8 @@ test "multiple enqueue and drain cycle" {
 
     // Second cycle
     try insertMemory(setup.mem.db, "m3", "content three");
-    try setup.ob.enqueue("m3", "upsert");
-    try setup.ob.enqueue("m1", "delete");
+    try setup.ob.enqueue(null, "m3", "upsert");
+    try setup.ob.enqueue(null, "m1", "delete");
 
     processed = try setup.ob.drain(allocator, ep, vs, null);
     try testing.expectEqual(@as(u32, 2), processed);
@@ -589,7 +596,7 @@ test "drain upsert stores embedding in vector store" {
     defer setup.deinit();
 
     try insertMemory(setup.mem.db, "vec_key", "vector content");
-    try setup.ob.enqueue("vec_key", "upsert");
+    try setup.ob.enqueue(null, "vec_key", "upsert");
 
     var noop = embeddings.NoopEmbedding{};
     const ep = noop.provider();
@@ -612,11 +619,11 @@ test "drain delete removes from vector store" {
     const vs = setup.vs_impl.store();
 
     // Pre-populate vector store with a key
-    try vs.upsert("del_key", &[_]f32{ 1.0, 2.0 });
+    try vs.upsertScoped(0, "del_key", &[_]f32{ 1.0, 2.0 });
     try testing.expectEqual(@as(usize, 1), try vs.count());
 
     // Enqueue a delete
-    try setup.ob.enqueue("del_key", "delete");
+    try setup.ob.enqueue(null, "del_key", "delete");
 
     var noop = embeddings.NoopEmbedding{};
     const ep = noop.provider();
@@ -639,9 +646,9 @@ test "pendingCount after drain is reduced" {
     try insertMemory(setup.mem.db, "p2", "data");
     try insertMemory(setup.mem.db, "p3", "data");
 
-    try setup.ob.enqueue("p1", "upsert");
-    try setup.ob.enqueue("p2", "upsert");
-    try setup.ob.enqueue("p3", "upsert");
+    try setup.ob.enqueue(null, "p1", "upsert");
+    try setup.ob.enqueue(null, "p2", "upsert");
+    try setup.ob.enqueue(null, "p3", "upsert");
     try testing.expectEqual(@as(usize, 3), try setup.ob.pendingCount());
 
     var noop = embeddings.NoopEmbedding{};
@@ -656,14 +663,15 @@ test "pendingCount after drain is reduced" {
 // ── R3 tests ──────────────────────────────────────────────────────
 
 /// Helper: read the attempts count for a given memory_key from vector_outbox.
-fn getAttempts(db: ?*c.sqlite3, memory_key: []const u8) !?i32 {
-    const sql = "SELECT attempts FROM vector_outbox WHERE memory_key = ?1";
+fn getAttempts(db: ?*c.sqlite3, user_id: i64, memory_key: []const u8) !?i32 {
+    const sql = "SELECT attempts FROM vector_outbox WHERE user_id = ?1 AND memory_key = ?2";
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
     if (rc != c.SQLITE_OK) return error.PrepareFailed;
     defer _ = c.sqlite3_finalize(stmt);
 
-    _ = c.sqlite3_bind_text(stmt, 1, memory_key.ptr, @intCast(memory_key.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_int64(stmt, 1, user_id);
+    _ = c.sqlite3_bind_text(stmt, 2, memory_key.ptr, @intCast(memory_key.len), SQLITE_STATIC);
 
     rc = c.sqlite3_step(stmt);
     if (rc == c.SQLITE_ROW) {
@@ -716,9 +724,9 @@ test "enqueue drain verify items processed" {
     try insertMemory(setup.mem.db, "r3_b", "content b");
     try insertMemory(setup.mem.db, "r3_c", "content c");
 
-    try setup.ob.enqueue("r3_a", "upsert");
-    try setup.ob.enqueue("r3_b", "upsert");
-    try setup.ob.enqueue("r3_c", "upsert");
+    try setup.ob.enqueue(null, "r3_a", "upsert");
+    try setup.ob.enqueue(null, "r3_b", "upsert");
+    try setup.ob.enqueue(null, "r3_c", "upsert");
     try testing.expectEqual(@as(usize, 3), try setup.ob.pendingCount());
 
     var noop = embeddings.NoopEmbedding{};
@@ -742,7 +750,7 @@ test "drain failure increments retry count" {
 
     // Insert content so drain attempts embedding (which will fail)
     try insertMemory(setup.mem.db, "fail_key", "some content");
-    try setup.ob.enqueue("fail_key", "upsert");
+    try setup.ob.enqueue(null, "fail_key", "upsert");
 
     // Use FailingEmbedding that always returns error
     var failing = FailingEmbedding{};
@@ -754,14 +762,14 @@ test "drain failure increments retry count" {
 
     // Item should still be in outbox with attempts incremented
     try testing.expectEqual(@as(usize, 1), try totalOutboxCount(setup.mem.db));
-    const attempts = try getAttempts(setup.mem.db, "fail_key");
+    const attempts = try getAttempts(setup.mem.db, 0, "fail_key");
     try testing.expect(attempts != null);
     try testing.expectEqual(@as(i32, 1), attempts.?);
 
     // Drain again — attempts should increment again
     const processed2 = try setup.ob.drain(allocator, ep, vs, null);
     try testing.expectEqual(@as(u32, 0), processed2);
-    const attempts2 = try getAttempts(setup.mem.db, "fail_key");
+    const attempts2 = try getAttempts(setup.mem.db, 0, "fail_key");
     try testing.expectEqual(@as(i32, 2), attempts2.?);
 
     // Now it has reached max_retries (2) — drain should skip it
@@ -779,13 +787,13 @@ test "dead letter purge removes exhausted items" {
     defer setup.deinit();
 
     // Enqueue items and manually exhaust retries
-    try setup.ob.enqueue("dead_a", "upsert");
-    try setup.ob.enqueue("dead_b", "upsert");
-    try setup.ob.enqueue("alive_c", "upsert");
+    try setup.ob.enqueue(null, "dead_a", "upsert");
+    try setup.ob.enqueue(null, "dead_b", "upsert");
+    try setup.ob.enqueue(null, "alive_c", "upsert");
 
     // Set dead_a and dead_b past max_retries (max_retries=2)
-    try setAttempts(setup.mem.db, "dead_a", 5); // well past limit
-    try setAttempts(setup.mem.db, "dead_b", 2); // exactly at limit
+    try setAttempts(setup.mem.db, 0, "dead_a", 5); // well past limit
+    try setAttempts(setup.mem.db, 0, "dead_b", 2); // exactly at limit
 
     // alive_c is still at attempts=0 — should survive purge
     try testing.expectEqual(@as(usize, 3), try totalOutboxCount(setup.mem.db));

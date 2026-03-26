@@ -275,6 +275,7 @@ pub const RetrievalEngine = struct {
     embedding_provider: ?embeddings_mod.EmbeddingProvider = null,
     vector_store: ?vector_store_mod.VectorStore = null,
     circuit_breaker: ?*circuit_breaker_mod.CircuitBreaker = null,
+    vector_user_id: ?i64 = null,
     hybrid_cfg: config_types.MemoryHybridConfig = .{},
 
     // Post-processing stage configs
@@ -446,7 +447,7 @@ pub const RetrievalEngine = struct {
 
             // Search vector store
             const vec_limit = self.top_k * self.hybrid_cfg.candidate_multiplier;
-            const vec_results = vs.search(allocator, query_embedding, vec_limit) catch |err| {
+            const vec_results = vs.searchScoped(allocator, self.vector_user_id, query_embedding, vec_limit) catch |err| {
                 log.warn("vector store search failed: {}", .{err});
                 break :hybrid_blk;
             };

@@ -1539,7 +1539,7 @@ fn cleanupTestMemoryKeys(allocator: std.mem.Allocator, cfg: *yc.config.Config) !
             const key = kv.key_ptr.*;
             if (mgr.forgetMemory(user_id, key) catch false) canonical_deleted += 1;
             if (vector_store) |vs| {
-                vs.store().delete(key) catch {};
+                vs.store().deleteScoped(user_id, key) catch {};
                 vector_delete_attempts += 1;
             }
         }

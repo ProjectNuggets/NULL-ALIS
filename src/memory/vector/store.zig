@@ -48,24 +48,36 @@ pub const VectorStore = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        upsert: *const fn (ptr: *anyopaque, key: []const u8, embedding: []const f32) anyerror!void,
-        search: *const fn (ptr: *anyopaque, alloc: Allocator, query_embedding: []const f32, limit: u32) anyerror![]VectorResult,
-        delete: *const fn (ptr: *anyopaque, key: []const u8) anyerror!void,
+        upsert: *const fn (ptr: *anyopaque, scope_user_id: ?i64, key: []const u8, embedding: []const f32) anyerror!void,
+        search: *const fn (ptr: *anyopaque, alloc: Allocator, scope_user_id: ?i64, query_embedding: []const f32, limit: u32) anyerror![]VectorResult,
+        delete: *const fn (ptr: *anyopaque, scope_user_id: ?i64, key: []const u8) anyerror!void,
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         health_check: *const fn (ptr: *anyopaque, alloc: Allocator) anyerror!HealthStatus,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
     pub fn upsert(self: VectorStore, key: []const u8, embedding: []const f32) !void {
-        return self.vtable.upsert(self.ptr, key, embedding);
+        return self.upsertScoped(null, key, embedding);
+    }
+
+    pub fn upsertScoped(self: VectorStore, scope_user_id: ?i64, key: []const u8, embedding: []const f32) !void {
+        return self.vtable.upsert(self.ptr, scope_user_id, key, embedding);
     }
 
     pub fn search(self: VectorStore, alloc: Allocator, query_embedding: []const f32, limit: u32) ![]VectorResult {
-        return self.vtable.search(self.ptr, alloc, query_embedding, limit);
+        return self.searchScoped(alloc, null, query_embedding, limit);
+    }
+
+    pub fn searchScoped(self: VectorStore, alloc: Allocator, scope_user_id: ?i64, query_embedding: []const f32, limit: u32) ![]VectorResult {
+        return self.vtable.search(self.ptr, alloc, scope_user_id, query_embedding, limit);
     }
 
     pub fn delete(self: VectorStore, key: []const u8) !void {
-        return self.vtable.delete(self.ptr, key);
+        return self.deleteScoped(null, key);
+    }
+
+    pub fn deleteScoped(self: VectorStore, scope_user_id: ?i64, key: []const u8) !void {
+        return self.vtable.delete(self.ptr, scope_user_id, key);
     }
 
     pub fn count(self: VectorStore) !usize {
@@ -91,10 +103,12 @@ pub const SqliteSharedVectorStore = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator, db: ?*c.sqlite3) SqliteSharedVectorStore {
-        return .{
+        var self = SqliteSharedVectorStore{
             .db = db,
             .allocator = allocator,
         };
+        self.ensureSchema() catch {};
+        return self;
     }
 
     pub fn store(self: *SqliteSharedVectorStore) VectorStore {
@@ -111,35 +125,83 @@ pub const SqliteSharedVectorStore = struct {
         }
     }
 
-    // ── vtable implementations ────────────────────────────────────
+    fn ensureSchema(self: *const Self) !void {
+        if (self.db == null) return error.PrepareFailed;
 
-    fn implUpsert(ptr: *anyopaque, key: []const u8, embedding: []const f32) anyerror!void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (try self.hasLegacySchema()) {
+            const drop_sql = "DROP TABLE IF EXISTS memory_embeddings";
+            if (c.sqlite3_exec(self.db, drop_sql, null, null, null) != c.SQLITE_OK) {
+                return error.MigrationFailed;
+            }
+        }
 
-        const blob = try vector.vecToBytes(self.allocator, embedding);
-        defer self.allocator.free(blob);
+        const create_sql =
+            "CREATE TABLE IF NOT EXISTS memory_embeddings (" ++
+            "user_id INTEGER NOT NULL DEFAULT 0, " ++
+            "memory_key TEXT NOT NULL, " ++
+            "embedding BLOB NOT NULL, " ++
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now')), " ++
+            "PRIMARY KEY (user_id, memory_key))";
+        if (c.sqlite3_exec(self.db, create_sql, null, null, null) != c.SQLITE_OK) {
+            return error.MigrationFailed;
+        }
+    }
 
-        const sql = "INSERT OR REPLACE INTO memory_embeddings (memory_key, embedding, updated_at) VALUES (?1, ?2, datetime('now'))";
+    fn hasLegacySchema(self: *const Self) !bool {
+        const sql = "PRAGMA table_info(memory_embeddings)";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_blob(stmt, 2, blob.ptr, @intCast(blob.len), SQLITE_STATIC);
+        var saw_rows = false;
+        while (true) {
+            rc = c.sqlite3_step(stmt);
+            if (rc != c.SQLITE_ROW) break;
+            saw_rows = true;
+            const name_ptr = c.sqlite3_column_text(stmt, 1);
+            const name_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            if (name_ptr == null or name_len == 0) continue;
+            const name = @as([*]const u8, @ptrCast(name_ptr))[0..name_len];
+            if (std.mem.eql(u8, name, "user_id")) return false;
+        }
+        return saw_rows;
+    }
+
+    // ── vtable implementations ────────────────────────────────────
+
+    fn implUpsert(ptr: *anyopaque, scope_user_id: ?i64, key: []const u8, embedding: []const f32) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.ensureSchema();
+        const user_id = scope_user_id orelse 0;
+
+        const blob = try vector.vecToBytes(self.allocator, embedding);
+        defer self.allocator.free(blob);
+
+        const sql = "INSERT OR REPLACE INTO memory_embeddings (user_id, memory_key, embedding, updated_at) VALUES (?1, ?2, ?3, datetime('now'))";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_int64(stmt, 1, user_id);
+        _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_blob(stmt, 3, blob.ptr, @intCast(blob.len), SQLITE_STATIC);
 
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
     }
 
-    fn implSearch(ptr: *anyopaque, alloc: Allocator, query_embedding: []const f32, limit: u32) anyerror![]VectorResult {
+    fn implSearch(ptr: *anyopaque, alloc: Allocator, scope_user_id: ?i64, query_embedding: []const f32, limit: u32) anyerror![]VectorResult {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.ensureSchema();
 
-        const sql = "SELECT memory_key, embedding FROM memory_embeddings";
+        const sql = "SELECT memory_key, embedding FROM memory_embeddings WHERE user_id = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, scope_user_id orelse 0);
 
         var candidates: std.ArrayList(VectorResult) = .empty;
         errdefer {
@@ -194,16 +256,18 @@ pub const SqliteSharedVectorStore = struct {
         return result;
     }
 
-    fn implDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+    fn implDelete(ptr: *anyopaque, scope_user_id: ?i64, key: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.ensureSchema();
 
-        const sql = "DELETE FROM memory_embeddings WHERE memory_key = ?1";
+        const sql = "DELETE FROM memory_embeddings WHERE user_id = ?1 AND memory_key = ?2";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 1, scope_user_id orelse 0);
+        _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_STATIC);
 
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -211,6 +275,7 @@ pub const SqliteSharedVectorStore = struct {
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.ensureSchema();
 
         const sql = "SELECT COUNT(*) FROM memory_embeddings";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -228,6 +293,14 @@ pub const SqliteSharedVectorStore = struct {
 
     fn implHealthCheck(ptr: *anyopaque, alloc: Allocator) anyerror!HealthStatus {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        self.ensureSchema() catch |err| {
+            return HealthStatus{
+                .ok = false,
+                .latency_ns = 0,
+                .entry_count = null,
+                .error_msg = try alloc.dupe(u8, @errorName(err)),
+            };
+        };
         const start = std.time.nanoTimestamp();
 
         const sql = "SELECT COUNT(*) FROM memory_embeddings";
@@ -295,18 +368,20 @@ pub const SqliteSidecarVectorStore = struct {
 
     pub fn init(allocator: Allocator, db_path: [*:0]const u8) !SqliteSidecarVectorStore {
         var db: ?*c.sqlite3 = null;
-        var rc = c.sqlite3_open(db_path, &db);
+        const rc = c.sqlite3_open(db_path, &db);
         if (rc != c.SQLITE_OK) {
             if (db) |d| _ = c.sqlite3_close(d);
             return error.SqliteOpenFailed;
         }
-        // Create table (same schema as shared)
-        const create_sql = "CREATE TABLE IF NOT EXISTS memory_embeddings (memory_key TEXT PRIMARY KEY, embedding BLOB NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')))";
-        rc = c.sqlite3_exec(db, create_sql, null, null, null);
-        if (rc != c.SQLITE_OK) {
+
+        const shared = SqliteSharedVectorStore{
+            .db = db,
+            .allocator = allocator,
+        };
+        shared.ensureSchema() catch {
             _ = c.sqlite3_close(db);
             return error.MigrationFailed;
-        }
+        };
         return .{
             .db = db,
             .allocator = allocator,
@@ -398,6 +473,65 @@ test "upsert overwrites existing key" {
 
     const cnt = try s.count();
     try std.testing.expectEqual(@as(usize, 1), cnt);
+}
+
+test "scoped upsert allows same key for different users" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var vs = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer vs.deinit();
+
+    const s = vs.store();
+    try s.upsertScoped(1, "shared_key", &[_]f32{ 1.0, 0.0 });
+    try s.upsertScoped(2, "shared_key", &[_]f32{ 0.0, 1.0 });
+
+    try std.testing.expectEqual(@as(usize, 2), try s.count());
+}
+
+test "scoped search isolates user results" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var vs = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer vs.deinit();
+
+    const s = vs.store();
+    try s.upsertScoped(1, "shared_key", &[_]f32{ 1.0, 0.0 });
+    try s.upsertScoped(2, "shared_key", &[_]f32{ 0.0, 1.0 });
+
+    const user_one_results = try s.searchScoped(std.testing.allocator, 1, &[_]f32{ 1.0, 0.0 }, 5);
+    defer freeVectorResults(std.testing.allocator, user_one_results);
+    try std.testing.expectEqual(@as(usize, 1), user_one_results.len);
+    try std.testing.expectEqualStrings("shared_key", user_one_results[0].key);
+
+    const user_two_results = try s.searchScoped(std.testing.allocator, 2, &[_]f32{ 0.0, 1.0 }, 5);
+    defer freeVectorResults(std.testing.allocator, user_two_results);
+    try std.testing.expectEqual(@as(usize, 1), user_two_results.len);
+    try std.testing.expectEqualStrings("shared_key", user_two_results[0].key);
+}
+
+test "scoped delete only removes matching user key" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var vs = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer vs.deinit();
+
+    const s = vs.store();
+    try s.upsertScoped(1, "shared_key", &[_]f32{ 1.0, 0.0 });
+    try s.upsertScoped(2, "shared_key", &[_]f32{ 0.0, 1.0 });
+
+    try s.deleteScoped(1, "shared_key");
+
+    const user_one_results = try s.searchScoped(std.testing.allocator, 1, &[_]f32{ 1.0, 0.0 }, 5);
+    defer freeVectorResults(std.testing.allocator, user_one_results);
+    try std.testing.expectEqual(@as(usize, 0), user_one_results.len);
+
+    const user_two_results = try s.searchScoped(std.testing.allocator, 2, &[_]f32{ 0.0, 1.0 }, 5);
+    defer freeVectorResults(std.testing.allocator, user_two_results);
+    try std.testing.expectEqual(@as(usize, 1), user_two_results.len);
+    try std.testing.expectEqualStrings("shared_key", user_two_results[0].key);
 }
 
 test "search returns sorted results" {

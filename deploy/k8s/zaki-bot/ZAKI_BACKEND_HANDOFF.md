@@ -26,6 +26,9 @@ Deployment contract:
 - `NULLCLAW_BASE_URL` must remain the internal backend -> nullALIS service URL, for example `http://nullclaw:3000`
 - `ZAKI_AGENT_WEBHOOK_BASE_URL` must be the public HTTPS ingress used by Telegram, for example `https://agent.zaki.com`
 - In deployed environments `ZAKI_AGENT_WEBHOOK_BASE_URL` should be treated as required operator/deployment config for smooth Telegram connect
+- After rolling out the user-scoped vector retrieval change, run a tenant-scoped memory reindex before treating semantic recall as fully warm again.
+- The vector table is now keyed by `(user_id, key)`, so resetting the legacy table is safe, but old vectors are intentionally discarded cache data until each tenant repopulates them.
+- Operationally, use `/memory reindex` from the tenant runtime (or an equivalent tenant-aware reindex pass) instead of the global CLI markdown reindex when repopulating ZAKI user memories.
 
 Default Nullclaw profile/model for this integration:
 

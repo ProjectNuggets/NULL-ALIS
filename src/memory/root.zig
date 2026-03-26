@@ -450,6 +450,7 @@ pub const MemoryRuntime = struct {
     // Lifecycle: semantic cache (optional, extends response cache with cosine similarity)
     _semantic_cache: ?*semantic_cache.SemanticCache = null,
     _semantic_cache_db_path: ?[*:0]const u8 = null,
+    _vector_user_id: ?i64 = null,
 
     // P3: vector plane components (all optional)
     _embedding_provider: ?embeddings.EmbeddingProvider = null,
@@ -476,6 +477,7 @@ pub const MemoryRuntime = struct {
             .hybrid => {
                 // Use engine if available, else fall back
                 if (self._engine) |engine| {
+                    engine.vector_user_id = self._vector_user_id;
                     const candidates = try engine.search(allocator, query, session_id);
                     const trimmed = try trimCandidatesToLimit(allocator, candidates, limit);
                     self.hydrateThinCandidatesFromPrimary(allocator, trimmed);
@@ -494,6 +496,7 @@ pub const MemoryRuntime = struct {
                 const keyword_results = try retrieval.entriesToCandidates(allocator, keyword_entries);
 
                 if (self._engine) |engine| {
+                    engine.vector_user_id = self._vector_user_id;
                     const hybrid_results = engine.search(allocator, query, session_id) catch |err| {
                         log.warn("shadow hybrid search failed: {}", .{err});
                         return keyword_results;
@@ -548,13 +551,20 @@ pub const MemoryRuntime = struct {
         return self._rollout_policy.mode;
     }
 
+    pub fn setVectorUserScope(self: *MemoryRuntime, user_id: ?i64) void {
+        self._vector_user_id = user_id;
+        if (self._engine) |engine| {
+            engine.vector_user_id = user_id;
+        }
+    }
+
     /// Best-effort vector sync after a store() call.
     /// Embeds the content and upserts into the vector store.
     /// Errors are caught and logged, never propagated.
     pub fn syncVectorAfterStore(self: *MemoryRuntime, allocator: std.mem.Allocator, key: []const u8, content: []const u8) void {
         // Durable mode: enqueue and return (drain happens at turn boundaries / shutdown).
         if (self._outbox) |ob| {
-            ob.enqueue(key, "upsert") catch |err| {
+            ob.enqueue(self._vector_user_id, key, "upsert") catch |err| {
                 log.warn("outbox enqueue failed for key '{s}': {}", .{ key, err });
             };
             return;
@@ -578,7 +588,7 @@ pub const MemoryRuntime = struct {
         if (self._circuit_breaker) |cb| cb.recordSuccess();
         if (emb.len == 0) return;
 
-        vs.upsert(key, emb) catch |err| {
+        vs.upsertScoped(self._vector_user_id, key, emb) catch |err| {
             log.warn("vector sync upsert failed for key '{s}': {}", .{ key, err });
         };
     }
@@ -596,14 +606,14 @@ pub const MemoryRuntime = struct {
     /// Errors are caught and logged, never propagated.
     pub fn deleteFromVectorStore(self: *MemoryRuntime, key: []const u8) void {
         if (self._outbox) |ob| {
-            ob.enqueue(key, "delete") catch |err| {
+            ob.enqueue(self._vector_user_id, key, "delete") catch |err| {
                 log.warn("outbox enqueue failed for key '{s}': {}", .{ key, err });
             };
             return;
         }
 
         const vs = self._vector_store orelse return;
-        vs.delete(key) catch |err| {
+        vs.deleteScoped(self._vector_user_id, key) catch |err| {
             log.warn("vector store delete failed for key '{s}': {}", .{ key, err });
         };
     }
@@ -632,7 +642,7 @@ pub const MemoryRuntime = struct {
             defer allocator.free(emb);
             if (emb.len == 0) continue;
 
-            vs.upsert(entry.key, emb) catch |err| {
+            vs.upsertScoped(self._vector_user_id, entry.key, emb) catch |err| {
                 log.warn("reindex: upsert failed for key '{s}': {}", .{ entry.key, err });
                 continue;
             };
@@ -646,7 +656,7 @@ pub const MemoryRuntime = struct {
     /// Enqueue a key for vector sync via the outbox (if configured).
     pub fn enqueueVectorSync(self: *MemoryRuntime, key: []const u8, operation: []const u8) void {
         const ob = self._outbox orelse return;
-        ob.enqueue(key, operation) catch |err| {
+        ob.enqueue(self._vector_user_id, key, operation) catch |err| {
             log.warn("outbox enqueue failed for key '{s}': {}", .{ key, err });
         };
     }
