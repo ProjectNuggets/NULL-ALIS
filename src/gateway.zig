@@ -38,7 +38,6 @@ const zaki_state_mod = @import("zaki_state.zig");
 const zaki_session = @import("zaki_session.zig");
 const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
-const runtime_resolver = @import("delivery/runtime_resolver.zig");
 const tool_dispatcher = @import("tool_dispatcher.zig");
 const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
 const channel_identity_key = @import("channel_identity_key.zig");
@@ -94,12 +93,11 @@ const INTERNAL_TOKEN_DENYLIST = [_][]const u8{
 
 const TELEGRAM_REQUIRED_INPUTS = [_][]const u8{
     "bot_token",
-    "webhook_base_url",
 };
 const TELEGRAM_CONNECT_INSTRUCTIONS = [_][]const u8{
     "Create a bot with @BotFather and copy the bot token.",
     "Paste the bot token in Connect Telegram in the app.",
-    "Use your app HTTPS host as webhook_base_url.",
+    "ZAKI configures the Telegram webhook automatically for you.",
     "Send /start to the bot once to bind and verify delivery.",
 };
 const SLACK_REQUIRED_INPUTS = [_][]const u8{
@@ -1700,11 +1698,51 @@ const TelegramUserState = struct {
     account_id: ?[]const u8 = null,
     webhook_secret_token: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
+    webhook_url: ?[]const u8 = null,
+    chat_id: ?i64 = null,
 
     fn deinit(self: *TelegramUserState, allocator: std.mem.Allocator) void {
         if (self.account_id) |v| allocator.free(v);
         if (self.webhook_secret_token) |v| allocator.free(v);
+        if (self.webhook_url) |v| allocator.free(v);
         if (self.allow_from.len > 0) freeOwnedStringArray(allocator, self.allow_from);
+    }
+};
+
+const HeartbeatStateSummary = struct {
+    enabled: bool = false,
+};
+
+const HeartbeatRuntimeSummary = struct {
+    available: bool = false,
+    last_run_s: ?i64 = null,
+    last_status: ?[]const u8 = null,
+    last_reason: ?[]const u8 = null,
+};
+
+const NormalizedTelegramReadiness = struct {
+    configured: bool = false,
+    connected_stored: bool = false,
+    connected_normalized: bool = false,
+    state_valid: bool = true,
+    bot_token_present: bool = false,
+    account_id: ?[]const u8 = null,
+    chat_id: ?i64 = null,
+    allow_from_count: usize = 0,
+    data_source: []const u8 = "context_missing",
+
+    fn deinit(self: *NormalizedTelegramReadiness, allocator: std.mem.Allocator) void {
+        if (self.account_id) |value| allocator.free(value);
+    }
+
+    fn requiresReconnect(self: *const NormalizedTelegramReadiness) bool {
+        return self.connected_stored and !self.state_valid;
+    }
+
+    fn statusLabel(self: *const NormalizedTelegramReadiness) []const u8 {
+        if (self.requiresReconnect()) return "needs_reconnect";
+        if (self.connected_normalized) return "connected";
+        return "not_connected";
     }
 };
 
@@ -1734,9 +1772,192 @@ fn parseTelegramUserState(allocator: std.mem.Allocator, body: []const u8) !Teleg
     }
     if (parsed.value.object.get("allow_from")) |allow_from| {
         state.allow_from = try cloneJsonStringArrayValue(allocator, allow_from);
+        if (telegramAllowlistIsLegacyWildcard(state.allow_from)) {
+            freeOwnedStringArray(allocator, state.allow_from);
+            state.allow_from = &.{};
+        }
+    }
+    if (parsed.value.object.get("webhook_url")) |webhook_url| {
+        if (webhook_url != .string) return error.InvalidTelegramState;
+        if (webhook_url.string.len > 0) {
+            state.webhook_url = try allocator.dupe(u8, std.mem.trim(u8, webhook_url.string, " \t\r\n"));
+        }
+    }
+    if (parsed.value.object.get("chat_id")) |chat_value| {
+        state.chat_id = switch (chat_value) {
+            .integer => chat_value.integer,
+            .string => std.fmt.parseInt(i64, std.mem.trim(u8, chat_value.string, " \t\r\n"), 10) catch return error.InvalidTelegramState,
+            else => return error.InvalidTelegramState,
+        };
     }
 
     return state;
+}
+
+fn telegramAllowlistIsLegacyWildcard(values: []const []const u8) bool {
+    if (values.len != 1) return false;
+    return std.mem.eql(u8, std.mem.trim(u8, values[0], " \t\r\n"), "*");
+}
+
+fn parseHeartbeatStateSummary(content: []const u8) HeartbeatStateSummary {
+    return .{
+        .enabled = jsonBoolField(content, "enabled") orelse false,
+    };
+}
+
+fn telegramWebhookMatchesUser(webhook_url: []const u8, user_id: []const u8) bool {
+    if (std.mem.indexOf(u8, webhook_url, "/webhook/telegram") == null) return false;
+    const parsed_user_id = parseQueryParam(webhook_url, "user_id") orelse return false;
+    return std.mem.eql(u8, parsed_user_id, user_id);
+}
+
+fn readTelegramBotTokenPresence(
+    allocator: std.mem.Allocator,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
+    numeric_user_id_opt: ?i64,
+    secrets_dir_opt: ?[]const u8,
+) bool {
+    if (state_mgr_opt) |mgr| {
+        if (numeric_user_id_opt) |numeric_user_id| {
+            const secret_opt = mgr.getSecret(allocator, numeric_user_id, "telegram_bot_token") catch null;
+            if (secret_opt) |secret_value| {
+                defer allocator.free(secret_value);
+                return normalizeTelegramBotToken(secret_value).len > 0;
+            }
+        }
+    }
+    if (secrets_dir_opt) |secrets_dir| {
+        const secret_path = resolveSecretPath(allocator, secrets_dir, "telegram_bot_token") catch return false;
+        defer allocator.free(secret_path);
+        const secret_value = readTrimmedSecretFile(allocator, secret_path) catch return false;
+        defer if (secret_value.len > 0) allocator.free(secret_value);
+        return normalizeTelegramBotToken(secret_value).len > 0;
+    }
+    return false;
+}
+
+fn loadNormalizedTelegramReadiness(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id_raw: []const u8,
+    user_ctx: *const UserContext,
+) !NormalizedTelegramReadiness {
+    const numeric_user_id = parseNumericUserId(user_id_raw) catch null;
+    var telegram_state = TelegramUserState{};
+    errdefer telegram_state.deinit(allocator);
+    var data_source: []const u8 = "file_fallback";
+
+    if (state.zaki_state) |mgr| {
+        if (numeric_user_id) |user_id| {
+            const raw_state = mgr.getTelegramStateJson(allocator, user_id) catch null;
+            if (raw_state) |content| {
+                defer allocator.free(content);
+                telegram_state = parseTelegramUserState(allocator, content) catch .{};
+            }
+            data_source = "postgres";
+        }
+    } else {
+        telegram_state = loadTelegramUserState(allocator, user_ctx.telegram_path) catch .{};
+    }
+
+    const bot_token_present = readTelegramBotTokenPresence(
+        allocator,
+        state.zaki_state,
+        numeric_user_id,
+        user_ctx.secrets_dir,
+    );
+
+    var normalized = NormalizedTelegramReadiness{
+        .configured = bot_token_present or telegram_state.connected or telegram_state.account_id != null or telegram_state.webhook_url != null or telegram_state.chat_id != null,
+        .connected_stored = telegram_state.connected,
+        .connected_normalized = false,
+        .state_valid = true,
+        .bot_token_present = bot_token_present,
+        .account_id = if (telegram_state.account_id) |value| try allocator.dupe(u8, value) else null,
+        .chat_id = telegram_state.chat_id,
+        .allow_from_count = telegram_state.allow_from.len,
+        .data_source = data_source,
+    };
+    errdefer normalized.deinit(allocator);
+
+    if (telegram_state.connected) {
+        if (!bot_token_present) normalized.state_valid = false;
+        if (telegram_state.webhook_url) |webhook_url| {
+            if (!telegramWebhookMatchesUser(webhook_url, user_id_raw)) normalized.state_valid = false;
+        } else {
+            normalized.state_valid = false;
+        }
+    }
+    normalized.connected_normalized = telegram_state.connected and normalized.state_valid;
+
+    telegram_state.deinit(allocator);
+    return normalized;
+}
+
+fn loadNormalizedHeartbeatEnabled(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id_raw: []const u8,
+    heartbeat_path: []const u8,
+) bool {
+    if (state.zaki_state) |mgr| {
+        const user_id = parseNumericUserId(user_id_raw) catch return false;
+        const content = mgr.getHeartbeatJson(allocator, user_id) catch return false;
+        defer allocator.free(content);
+        return parseHeartbeatStateSummary(content).enabled;
+    }
+    const content = readFileOrDefault(allocator, heartbeat_path, "{}\n") catch return false;
+    defer allocator.free(content);
+    return parseHeartbeatStateSummary(content).enabled;
+}
+
+fn loadHeartbeatRuntimeSummary(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id_opt: ?[]const u8,
+) HeartbeatRuntimeSummary {
+    if (user_id_opt == null) return .{};
+
+    const user_id = user_id_opt.?;
+    const path = std.fmt.allocPrint(allocator, "{s}/{s}/heartbeat_runtime.json", .{ state.tenant_data_root, user_id }) catch return .{};
+    defer allocator.free(path);
+
+    const raw = readFileOrDefault(allocator, path, "") catch return .{};
+    defer allocator.free(raw);
+    if (raw.len == 0) return .{};
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+
+    const obj = parsed.value.object;
+    return .{
+        .available = true,
+        .last_run_s = if (obj.get("last_run_s")) |v| if (v == .integer) @as(?i64, v.integer) else null else null,
+        .last_status = if (obj.get("last_status")) |v| if (v == .string) v.string else null else null,
+        .last_reason = if (obj.get("last_reason")) |v| if (v == .string) v.string else null else null,
+    };
+}
+
+fn proactiveStatusLabel(heartbeat_enabled: bool, runtime_summary: HeartbeatRuntimeSummary) []const u8 {
+    if (!heartbeat_enabled) return "disabled_cleanly";
+    if (runtime_summary.last_status) |status| {
+        if (std.mem.eql(u8, status, "sent")) return "enabled_and_successfully_sent_recently";
+        if (std.mem.eql(u8, status, "idle")) return "enabled_and_idle";
+        if (std.mem.eql(u8, status, "send_failed")) {
+            if (runtime_summary.last_reason) |reason| {
+                if (std.mem.eql(u8, reason, "no_target")) return "enabled_but_no_target";
+            }
+        }
+    }
+    return "enabled_unproven";
+}
+
+fn clientReadyStatus(operator_chat_ready: bool, telegram_readiness: NormalizedTelegramReadiness) []const u8 {
+    if (telegram_readiness.requiresReconnect()) return "needs_reconnect";
+    if (!operator_chat_ready) return "operator_action_required";
+    if (telegram_readiness.connected_normalized) return "ready";
+    return "ready_in_app";
 }
 
 fn loadTelegramUserState(allocator: std.mem.Allocator, path: []const u8) !TelegramUserState {
@@ -1759,6 +1980,11 @@ const OnboardingStateSummary = struct {
 const OnboardingReadiness = struct {
     can_start_chat_now: bool,
     minimum_required: []const []const u8,
+    onboarding_ready_normalized: bool,
+    client_ready_status: []const u8,
+    telegram_connected_normalized: bool,
+    telegram_state_valid: bool,
+    heartbeat_enabled_normalized: bool,
 
     fn deinit(self: *OnboardingReadiness, allocator: std.mem.Allocator) void {
         allocator.free(self.minimum_required);
@@ -1782,17 +2008,17 @@ fn computeOnboardingReadiness(
     allocator: std.mem.Allocator,
     config_opt: ?*const Config,
     summary: OnboardingStateSummary,
-    telegram_state: TelegramUserState,
+    telegram_readiness: NormalizedTelegramReadiness,
+    heartbeat_enabled_normalized: bool,
 ) !OnboardingReadiness {
-    _ = summary;
-    _ = telegram_state;
-
     var minimum_required: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer minimum_required.deinit(allocator);
 
+    var operator_chat_ready = true;
     if (config_opt) |cfg| {
         const default_model = cfg.default_model orelse "";
         if (cfg.default_provider.len == 0 or default_model.len == 0) {
+            operator_chat_ready = false;
             try minimum_required.append(allocator, "operator_configure_model_provider");
         }
     }
@@ -1801,6 +2027,11 @@ fn computeOnboardingReadiness(
     return .{
         .can_start_chat_now = required_slice.len == 0,
         .minimum_required = required_slice,
+        .onboarding_ready_normalized = summary.completed or operator_chat_ready or telegram_readiness.connected_normalized,
+        .client_ready_status = clientReadyStatus(operator_chat_ready, telegram_readiness),
+        .telegram_connected_normalized = telegram_readiness.connected_normalized,
+        .telegram_state_valid = telegram_readiness.state_valid,
+        .heartbeat_enabled_normalized = heartbeat_enabled_normalized,
     };
 }
 
@@ -1865,10 +2096,11 @@ fn buildOnboardingSetupResponse(
     allocator: std.mem.Allocator,
     user_id: []const u8,
     summary: OnboardingStateSummary,
-    telegram_state: TelegramUserState,
+    telegram_readiness: NormalizedTelegramReadiness,
+    heartbeat_enabled_normalized: bool,
     config_opt: ?*const Config,
 ) ![]u8 {
-    var readiness = try computeOnboardingReadiness(allocator, config_opt, summary, telegram_state);
+    var readiness = try computeOnboardingReadiness(allocator, config_opt, summary, telegram_readiness, heartbeat_enabled_normalized);
     defer readiness.deinit(allocator);
 
     const settings_defaults = user_settings.defaults();
@@ -1890,10 +2122,8 @@ fn buildOnboardingSetupResponse(
     const discord_configured_by_operator = if (config_opt) |cfg| cfg.channels.discord.len > 0 else false;
     const telegram_status: []const u8 = if (!build_options.enable_channel_telegram)
         "disabled_in_build"
-    else if (telegram_state.connected)
-        "connected"
     else
-        "not_connected";
+        telegram_readiness.statusLabel();
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -1911,6 +2141,16 @@ fn buildOnboardingSetupResponse(
     try w.writeAll(if (readiness.can_start_chat_now) "true" else "false");
     try w.writeAll(",\"minimum_required\":");
     try jsonWriteStringArray(w, readiness.minimum_required);
+    try w.writeAll(",\"onboarding_ready_normalized\":");
+    try w.writeAll(if (readiness.onboarding_ready_normalized) "true" else "false");
+    try w.writeAll(",\"client_ready_status\":\"");
+    try jsonEscapeInto(w, readiness.client_ready_status);
+    try w.writeAll("\",\"telegram_connected_normalized\":");
+    try w.writeAll(if (readiness.telegram_connected_normalized) "true" else "false");
+    try w.writeAll(",\"telegram_state_valid\":");
+    try w.writeAll(if (readiness.telegram_state_valid) "true" else "false");
+    try w.writeAll(",\"heartbeat_enabled_normalized\":");
+    try w.writeAll(if (readiness.heartbeat_enabled_normalized) "true" else "false");
     try w.writeAll(",\"settings\":{");
     try w.writeAll("\"endpoint\":\"");
     try jsonEscapeInto(w, settings_endpoint);
@@ -1931,7 +2171,7 @@ fn buildOnboardingSetupResponse(
         build_options.enable_channel_telegram,
         true,
         telegram_status,
-        telegram_state.connected,
+        telegram_readiness.connected_normalized,
         &TELEGRAM_REQUIRED_INPUTS,
         &TELEGRAM_CONNECT_INSTRUCTIONS,
         telegram_connect_endpoint,
@@ -4088,7 +4328,18 @@ fn appendHeartbeatRuntimeSummaryJson(
     allocator: std.mem.Allocator,
     state: *const GatewayState,
     user_id_opt: ?[]const u8,
+    heartbeat_enabled_opt: ?bool,
 ) !void {
+    const summary = loadHeartbeatRuntimeSummary(allocator, state, user_id_opt);
+    const last_status: ?[]const u8 = if (heartbeat_enabled_opt != null and !heartbeat_enabled_opt.?)
+        "disabled"
+    else
+        summary.last_status;
+    const last_reason: ?[]const u8 = if (heartbeat_enabled_opt != null and !heartbeat_enabled_opt.?)
+        "user_disabled"
+    else
+        summary.last_reason;
+
     try json_util.appendJsonKey(buf, allocator, "heartbeat_runtime");
     try buf.appendSlice(allocator, "{");
     try json_util.appendJsonKey(buf, allocator, "user_id");
@@ -4111,83 +4362,9 @@ fn appendHeartbeatRuntimeSummaryJson(
         return;
     }
 
-    const user_id = user_id_opt.?;
-    const path = std.fmt.allocPrint(allocator, "{s}/{s}/heartbeat_runtime.json", .{ state.tenant_data_root, user_id }) catch {
-        try buf.appendSlice(allocator, "false,");
-        try json_util.appendJsonKey(buf, allocator, "last_run_s");
-        try buf.appendSlice(allocator, "null,");
-        try json_util.appendJsonKey(buf, allocator, "last_status");
-        try buf.appendSlice(allocator, "null,");
-        try json_util.appendJsonKey(buf, allocator, "last_reason");
-        try buf.appendSlice(allocator, "null}");
-        return;
-    };
-    defer allocator.free(path);
-
-    const file = std.fs.openFileAbsolute(path, .{}) catch {
-        try buf.appendSlice(allocator, "false,");
-        try json_util.appendJsonKey(buf, allocator, "last_run_s");
-        try buf.appendSlice(allocator, "null,");
-        try json_util.appendJsonKey(buf, allocator, "last_status");
-        try buf.appendSlice(allocator, "null,");
-        try json_util.appendJsonKey(buf, allocator, "last_reason");
-        try buf.appendSlice(allocator, "null}");
-        return;
-    };
-    defer file.close();
-
-    const raw = file.readToEndAlloc(allocator, 64 * 1024) catch {
-        try buf.appendSlice(allocator, "false,");
-        try json_util.appendJsonKey(buf, allocator, "last_run_s");
-        try buf.appendSlice(allocator, "null,");
-        try json_util.appendJsonKey(buf, allocator, "last_status");
-        try buf.appendSlice(allocator, "null,");
-        try json_util.appendJsonKey(buf, allocator, "last_reason");
-        try buf.appendSlice(allocator, "null}");
-        return;
-    };
-    defer allocator.free(raw);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
-        try buf.appendSlice(allocator, "false,");
-        try json_util.appendJsonKey(buf, allocator, "last_run_s");
-        try buf.appendSlice(allocator, "null,");
-        try json_util.appendJsonKey(buf, allocator, "last_status");
-        try buf.appendSlice(allocator, "null,");
-        try json_util.appendJsonKey(buf, allocator, "last_reason");
-        try buf.appendSlice(allocator, "null}");
-        return;
-    };
-    defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        try buf.appendSlice(allocator, "false,");
-        try json_util.appendJsonKey(buf, allocator, "last_run_s");
-        try buf.appendSlice(allocator, "null,");
-        try json_util.appendJsonKey(buf, allocator, "last_status");
-        try buf.appendSlice(allocator, "null,");
-        try json_util.appendJsonKey(buf, allocator, "last_reason");
-        try buf.appendSlice(allocator, "null}");
-        return;
-    }
-
-    const obj = parsed.value.object;
-    const last_run_s = if (obj.get("last_run_s")) |v|
-        if (v == .integer) @as(?i64, v.integer) else null
-    else
-        null;
-    const last_status = if (obj.get("last_status")) |v|
-        if (v == .string) @as(?[]const u8, v.string) else null
-    else
-        null;
-    const last_reason = if (obj.get("last_reason")) |v|
-        if (v == .string) @as(?[]const u8, v.string) else null
-    else
-        null;
-
-    try buf.appendSlice(allocator, "true,");
+    try buf.appendSlice(allocator, if (summary.available or heartbeat_enabled_opt != null) "true," else "false,");
     try json_util.appendJsonKey(buf, allocator, "last_run_s");
-    if (last_run_s) |value| {
+    if (summary.last_run_s) |value| {
         var int_buf: [24]u8 = undefined;
         const text = std.fmt.bufPrint(&int_buf, "{d}", .{value}) catch "0";
         try buf.appendSlice(allocator, text);
@@ -4222,21 +4399,6 @@ fn appendIntegrationsSummaryJson(
     try json_util.appendJsonKey(buf, allocator, "telegram");
     try buf.appendSlice(allocator, "{");
 
-    const expect_postgres_state = state.tenant_enabled and std.mem.eql(u8, state.state_backend_effective, "postgres");
-    const numeric_user_id = blk: {
-        if (user_id_opt) |user_id| {
-            break :blk std.fmt.parseInt(i64, user_id, 10) catch null;
-        }
-        break :blk null;
-    };
-    const user_root = blk: {
-        if (user_id_opt) |user_id| {
-            break :blk std.fmt.allocPrint(allocator, "{s}/{s}", .{ state.tenant_data_root, user_id }) catch null;
-        }
-        break :blk null;
-    };
-    defer if (user_root) |path| allocator.free(path);
-
     const configured_from_runtime = state.telegram_bot_token.len > 0;
     var configured = configured_from_runtime;
     var connected: ?bool = null;
@@ -4244,40 +4406,27 @@ fn appendIntegrationsSummaryJson(
     defer if (account_id) |value| allocator.free(value);
     var chat_id: ?i64 = null;
     var data_source: []const u8 = if (user_id_opt != null) "context_missing" else "global";
+    var connected_normalized: ?bool = null;
+    var state_valid: ?bool = null;
+    var allow_from_count: ?usize = null;
+    var status_label: ?[]const u8 = null;
 
     if (user_id_opt != null) {
-        var resolved = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
-            .channel = "telegram",
-            .tenant_ctx = .{
-                .state_mgr = state.zaki_state,
-                .numeric_user_id = numeric_user_id,
-                .expect_postgres_state = expect_postgres_state,
-            },
-            .user_root = user_root,
-        }) catch |err| switch (err) {
-            error.MissingTenantContext => null,
-            error.NotConnected => null,
-            error.MissingCredential => null,
-            error.InvalidTarget => null,
-            error.UnsupportedChannel => null,
-            else => null,
-        };
-        if (resolved) |*ctx| {
-            defer ctx.deinit(allocator);
-            data_source = ctx.data_source;
-            connected = ctx.connected;
-            if (ctx.account_id) |value| {
-                account_id = try allocator.dupe(u8, value);
-            }
-            if (runtime_resolver.parseResolvedTargetChatId(ctx)) |parsed_chat_id| {
-                chat_id = parsed_chat_id;
-            } else |_| {}
-            if (ctx.credential_token != null) configured = true;
-            if (ctx.connected) configured = true;
-            if (ctx.target_id != null) configured = true;
-        } else {
-            if (expect_postgres_state) data_source = "context_missing";
+        var user_ctx = resolveUserContext(allocator, state, user_id_opt.?) catch return error.OutOfMemory;
+        defer user_ctx.deinit(allocator);
+        var readiness = try loadNormalizedTelegramReadiness(allocator, state, user_id_opt.?, &user_ctx);
+        defer readiness.deinit(allocator);
+        configured = readiness.configured;
+        connected = readiness.connected_stored;
+        connected_normalized = readiness.connected_normalized;
+        state_valid = readiness.state_valid;
+        status_label = readiness.statusLabel();
+        allow_from_count = readiness.allow_from_count;
+        data_source = readiness.data_source;
+        if (readiness.account_id) |value| {
+            account_id = try allocator.dupe(u8, value);
         }
+        chat_id = readiness.chat_id;
     }
 
     try json_util.appendJsonKey(buf, allocator, "configured");
@@ -4289,6 +4438,12 @@ fn appendIntegrationsSummaryJson(
     } else {
         try buf.appendSlice(allocator, "null");
     }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "connected_normalized");
+    try appendJsonBoolValue(buf, allocator, connected_normalized);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "state_valid");
+    try appendJsonBoolValue(buf, allocator, state_valid);
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(buf, allocator, "account_id");
     if (account_id) |value| {
@@ -4306,6 +4461,12 @@ fn appendIntegrationsSummaryJson(
         try buf.appendSlice(allocator, "null");
     }
     try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "allow_from_count");
+    try appendJsonUsizeValue(buf, allocator, allow_from_count);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "status");
+    try appendJsonStringValue(buf, allocator, status_label);
+    try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(buf, allocator, "data_source", data_source);
     try buf.appendSlice(allocator, "}");
     try buf.appendSlice(allocator, "}");
@@ -4315,6 +4476,11 @@ const DiagnosticsConfigSnapshot = struct {
     source: []const u8,
     config_hash: u64,
     assistant_mode: []const u8,
+    group_activation: []const u8,
+    proactive_updates: bool,
+    voice_replies: bool,
+    session_timeout_minutes: u32,
+    operator_chat_ready: bool,
     ignored_override_count: usize,
     agent_parallel_tools: bool,
     agent_parallel_tools_rollout_percent: u8,
@@ -4401,6 +4567,11 @@ fn loadDiagnosticsConfigSnapshot(
         .source = source,
         .config_hash = if (normalized) |snapshot| TenantRuntime.configHash(snapshot.json) else TenantRuntime.configHash(raw_user_config),
         .assistant_mode = settings.assistant_mode.toSlice(),
+        .group_activation = settings.group_activation.toSlice(),
+        .proactive_updates = settings.proactive_updates,
+        .voice_replies = settings.voice_replies,
+        .session_timeout_minutes = settings.session_timeout_minutes,
+        .operator_chat_ready = !(cfg.default_provider.len == 0 or (cfg.default_model orelse "").len == 0),
         .ignored_override_count = ignored_override_count,
         .agent_parallel_tools = cfg.agent.parallel_tools,
         .agent_parallel_tools_rollout_percent = cfg.agent.parallel_tools_rollout_percent,
@@ -4735,6 +4906,11 @@ fn internalDiagnosticsPayload(
     var configured_config_source: ?[]const u8 = null;
     var configured_config_hash: ?u64 = null;
     var configured_assistant_mode: ?[]const u8 = null;
+    var configured_group_activation: ?[]const u8 = null;
+    var configured_proactive_updates: ?bool = null;
+    var configured_voice_replies: ?bool = null;
+    var configured_session_timeout_minutes: ?u32 = null;
+    var operator_chat_ready: ?bool = null;
     var configured_ignored_tenant_override_count: ?usize = null;
     var configured_agent_parallel_tools: ?bool = null;
     var configured_agent_parallel_tools_rollout_percent: ?u8 = null;
@@ -4758,6 +4934,10 @@ fn internalDiagnosticsPayload(
     var configured_gateway_require_explicit_chat_stream_session_key: ?bool = null;
     var configured_session_cross_channel_shared_main: ?bool = null;
     var effective_assistant_mode: ?[]const u8 = null;
+    var effective_group_activation: ?[]const u8 = null;
+    var effective_proactive_updates: ?bool = null;
+    var effective_voice_replies: ?bool = null;
+    var effective_session_timeout_minutes: ?u32 = null;
     var effective_ignored_tenant_override_count: ?usize = null;
     var effective_agent_parallel_tools: ?bool = null;
     var effective_agent_parallel_tools_rollout_percent: ?u8 = null;
@@ -4779,6 +4959,11 @@ fn internalDiagnosticsPayload(
             configured_config_source = snapshot.source;
             configured_config_hash = snapshot.config_hash;
             configured_assistant_mode = snapshot.assistant_mode;
+            configured_group_activation = snapshot.group_activation;
+            configured_proactive_updates = snapshot.proactive_updates;
+            configured_voice_replies = snapshot.voice_replies;
+            configured_session_timeout_minutes = snapshot.session_timeout_minutes;
+            operator_chat_ready = snapshot.operator_chat_ready;
             configured_ignored_tenant_override_count = snapshot.ignored_override_count;
             configured_agent_parallel_tools = snapshot.agent_parallel_tools;
             configured_agent_parallel_tools_rollout_percent = snapshot.agent_parallel_tools_rollout_percent;
@@ -4810,6 +4995,10 @@ fn internalDiagnosticsPayload(
                 effective_config_source = tenant_runtime.effective_config_source;
                 effective_config_hash = tenant_runtime.effective_config_hash;
                 effective_assistant_mode = tenant_runtime.resolved_settings.assistant_mode.toSlice();
+                effective_group_activation = tenant_runtime.resolved_settings.group_activation.toSlice();
+                effective_proactive_updates = tenant_runtime.resolved_settings.proactive_updates;
+                effective_voice_replies = tenant_runtime.resolved_settings.voice_replies;
+                effective_session_timeout_minutes = tenant_runtime.resolved_settings.session_timeout_minutes;
                 effective_ignored_tenant_override_count = tenant_runtime.ignored_tenant_override_count;
                 effective_agent_parallel_tools = tenant_runtime.config.agent.parallel_tools;
                 effective_agent_parallel_tools_rollout_percent = tenant_runtime.config.agent.parallel_tools_rollout_percent;
@@ -4854,6 +5043,37 @@ fn internalDiagnosticsPayload(
                 lease_probe_data_source = "invalid_user_id";
             }
         }
+    }
+
+    var normalized_telegram: ?NormalizedTelegramReadiness = null;
+    defer if (normalized_telegram) |*value| value.deinit(allocator);
+    var heartbeat_enabled_normalized: ?bool = null;
+    var onboarding_summary: ?OnboardingStateSummary = null;
+    var proactive_status: ?[]const u8 = null;
+    var onboarding_ready_normalized: ?bool = null;
+    var client_ready_status_value: ?[]const u8 = null;
+    if (user_id_opt) |user_id_raw| {
+        var user_ctx = resolveUserContext(allocator, state, user_id_raw) catch return error.OutOfMemory;
+        defer user_ctx.deinit(allocator);
+        normalized_telegram = try loadNormalizedTelegramReadiness(allocator, state, user_id_raw, &user_ctx);
+        heartbeat_enabled_normalized = loadNormalizedHeartbeatEnabled(allocator, state, user_id_raw, user_ctx.heartbeat_path);
+        const onboarding_content = if (state.zaki_state) |mgr| blk: {
+            const user_id = parseNumericUserId(user_id_raw) catch break :blk try allocator.dupe(u8, "{\"completed\":false,\"completed_at_s\":null}");
+            break :blk mgr.getOnboardingJson(allocator, user_id) catch try allocator.dupe(u8, "{\"completed\":false,\"completed_at_s\":null}");
+        } else blk: {
+            const onboarding_path = onboardingStatePath(allocator, user_ctx.user_root) catch break :blk try allocator.dupe(u8, "{\"completed\":false,\"completed_at_s\":null}");
+            defer allocator.free(onboarding_path);
+            break :blk readFileOrDefault(allocator, onboarding_path, "{\"completed\":false,\"completed_at_s\":null}\n") catch try allocator.dupe(u8, "{\"completed\":false,\"completed_at_s\":null}");
+        };
+        defer allocator.free(onboarding_content);
+        onboarding_summary = parseOnboardingStateSummary(onboarding_content);
+        const heartbeat_runtime_summary = loadHeartbeatRuntimeSummary(allocator, state, user_id_opt);
+        if (heartbeat_enabled_normalized) |enabled| {
+            proactive_status = proactiveStatusLabel(enabled, heartbeat_runtime_summary);
+        }
+        const operator_ready = operator_chat_ready orelse true;
+        onboarding_ready_normalized = (onboarding_summary.?.completed or operator_ready or normalized_telegram.?.connected_normalized);
+        client_ready_status_value = clientReadyStatus(operator_ready, normalized_telegram.?);
     }
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -5029,6 +5249,39 @@ fn internalDiagnosticsPayload(
     } else {
         try buf.appendSlice(allocator, "null");
     }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "assistant_mode");
+    try appendJsonStringValue(&buf, allocator, if (effective_assistant_mode != null) effective_assistant_mode else configured_assistant_mode);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "group_activation");
+    try appendJsonStringValue(&buf, allocator, if (effective_group_activation != null) effective_group_activation else configured_group_activation);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "proactive_updates");
+    try appendJsonBoolValue(&buf, allocator, if (effective_proactive_updates != null) effective_proactive_updates else configured_proactive_updates);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "voice_replies");
+    try appendJsonBoolValue(&buf, allocator, if (effective_voice_replies != null) effective_voice_replies else configured_voice_replies);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "session_timeout_minutes");
+    try appendJsonU32Value(&buf, allocator, if (effective_session_timeout_minutes != null) effective_session_timeout_minutes else configured_session_timeout_minutes);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "telegram_connected_normalized");
+    try appendJsonBoolValue(&buf, allocator, if (normalized_telegram) |value| value.connected_normalized else null);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "telegram_state_valid");
+    try appendJsonBoolValue(&buf, allocator, if (normalized_telegram) |value| value.state_valid else null);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "heartbeat_enabled_normalized");
+    try appendJsonBoolValue(&buf, allocator, heartbeat_enabled_normalized);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "onboarding_ready_normalized");
+    try appendJsonBoolValue(&buf, allocator, onboarding_ready_normalized);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "client_ready_status");
+    try appendJsonStringValue(&buf, allocator, client_ready_status_value);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "proactive_status");
+    try appendJsonStringValue(&buf, allocator, proactive_status);
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(&buf, allocator, "control_plane");
     try buf.appendSlice(allocator, "{");
@@ -5308,7 +5561,7 @@ fn internalDiagnosticsPayload(
         try buf.appendSlice(allocator, "},");
     }
 
-    try appendHeartbeatRuntimeSummaryJson(&buf, allocator, state, user_id_opt);
+    try appendHeartbeatRuntimeSummaryJson(&buf, allocator, state, user_id_opt, heartbeat_enabled_normalized);
     try buf.appendSlice(allocator, ",");
     try appendIntegrationsSummaryJson(&buf, allocator, state, user_id_opt);
     try buf.appendSlice(allocator, ",");
@@ -6498,25 +6751,18 @@ fn handleApiRoute(
             }
             defer req_allocator.free(onboarding_content);
             const summary = parseOnboardingStateSummary(onboarding_content);
-            var telegram_state = TelegramUserState{};
-            defer telegram_state.deinit(req_allocator);
+            var telegram_readiness = NormalizedTelegramReadiness{};
+            defer telegram_readiness.deinit(req_allocator);
             if (build_options.enable_channel_telegram) {
-                if (state.zaki_state) |mgr| {
-                    const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                    const raw_telegram_state = mgr.getTelegramStateJson(req_allocator, user_id) catch {
-                        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
-                    };
-                    defer req_allocator.free(raw_telegram_state);
-                    telegram_state = parseTelegramUserState(req_allocator, raw_telegram_state) catch .{};
-                } else {
-                    telegram_state = loadTelegramUserState(req_allocator, user_ctx.telegram_path) catch .{};
-                }
+                telegram_readiness = loadNormalizedTelegramReadiness(req_allocator, state, parsed.user_id, &user_ctx) catch .{};
             }
+            const heartbeat_enabled_normalized = loadNormalizedHeartbeatEnabled(req_allocator, state, parsed.user_id, user_ctx.heartbeat_path);
             const setup = buildOnboardingSetupResponse(
                 req_allocator,
                 parsed.user_id,
                 summary,
-                telegram_state,
+                telegram_readiness,
+                heartbeat_enabled_normalized,
                 config_opt,
             ) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
@@ -6684,12 +6930,20 @@ fn handleApiRoute(
                 const content = mgr.getHeartbeatJson(req_allocator, user_id) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
                 };
-                return .{ .body = content };
+                defer req_allocator.free(content);
+                const canonical_body = std.fmt.allocPrint(req_allocator, "{{\"enabled\":{s}}}", .{
+                    if (parseHeartbeatStateSummary(content).enabled) "true" else "false",
+                }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                return .{ .body = canonical_body };
             }
             const content = readFileOrDefault(req_allocator, user_ctx.heartbeat_path, "{}\n") catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
             };
-            return .{ .body = content };
+            defer req_allocator.free(content);
+            const canonical_body = std.fmt.allocPrint(req_allocator, "{{\"enabled\":{s}}}", .{
+                if (parseHeartbeatStateSummary(content).enabled) "true" else "false",
+            }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            return .{ .body = canonical_body };
         }
         if (std.mem.eql(u8, method, "PUT")) {
             const body = extractBody(raw_request) orelse "{}\n";
@@ -9597,7 +9851,7 @@ test "parseTelegramUserState parses user-scoped telegram settings" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const body =
-        \\{"connected":true,"account_id":"work","webhook_secret_token":"sec-12345","allow_from":["user1","user2"]}
+        \\{"connected":true,"account_id":"work","webhook_secret_token":"sec-12345","allow_from":["user1","user2"],"webhook_url":"https://example.com/webhook/telegram?user_id=1","chat_id":1110331014}
     ;
     var state = try parseTelegramUserState(allocator, body);
     defer state.deinit(allocator);
@@ -9608,6 +9862,8 @@ test "parseTelegramUserState parses user-scoped telegram settings" {
     try std.testing.expectEqual(@as(usize, 2), state.allow_from.len);
     try std.testing.expectEqualStrings("user1", state.allow_from[0]);
     try std.testing.expectEqualStrings("user2", state.allow_from[1]);
+    try std.testing.expectEqualStrings("https://example.com/webhook/telegram?user_id=1", state.webhook_url.?);
+    try std.testing.expectEqual(@as(i64, 1110331014), state.chat_id.?);
 }
 
 test "parseTelegramUserState normalizes webhook secret token" {
@@ -9622,6 +9878,19 @@ test "parseTelegramUserState normalizes webhook secret token" {
 
     try std.testing.expect(state.webhook_secret_token != null);
     try std.testing.expectEqualStrings("sec-12345", state.webhook_secret_token.?);
+}
+
+test "parseTelegramUserState normalizes legacy wildcard allowlist to empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const body =
+        \\{"connected":true,"allow_from":["*"]}
+    ;
+    var state = try parseTelegramUserState(allocator, body);
+    defer state.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), state.allow_from.len);
 }
 
 test "parseTelegramUserState rejects invalid account_id" {
@@ -9788,6 +10057,11 @@ test "handleApiRoute GET onboarding returns setup contract for settings panel" {
 
     const setup = parsed.value.object.get("setup").?.object;
     try std.testing.expectEqual(true, setup.get("can_start_chat_now").?.bool);
+    try std.testing.expectEqual(true, setup.get("onboarding_ready_normalized").?.bool);
+    try std.testing.expectEqualStrings("ready_in_app", setup.get("client_ready_status").?.string);
+    try std.testing.expectEqual(false, setup.get("telegram_connected_normalized").?.bool);
+    try std.testing.expectEqual(true, setup.get("telegram_state_valid").?.bool);
+    try std.testing.expectEqual(false, setup.get("heartbeat_enabled_normalized").?.bool);
     const settings = setup.get("settings").?.object;
     try std.testing.expectEqualStrings("/api/v1/users/1/settings", settings.get("endpoint").?.string);
     const defaults = settings.get("defaults").?.object;
@@ -9854,6 +10128,8 @@ test "handleApiRoute GET onboarding reports minimum_required when model/provider
     defer parsed.deinit();
     const setup = parsed.value.object.get("setup").?.object;
     try std.testing.expectEqual(false, setup.get("can_start_chat_now").?.bool);
+    try std.testing.expectEqual(false, setup.get("onboarding_ready_normalized").?.bool);
+    try std.testing.expectEqualStrings("operator_action_required", setup.get("client_ready_status").?.string);
     const minimum_required = setup.get("minimum_required").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), minimum_required.len);
     try std.testing.expectEqualStrings("operator_configure_model_provider", minimum_required[0].string);
@@ -9871,7 +10147,16 @@ test "handleApiRoute GET onboarding reflects connected telegram status" {
     try std.fs.makeDirAbsolute(user_dir);
     const telegram_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram.json", .{user_dir});
     defer std.testing.allocator.free(telegram_path);
-    try writeFile(telegram_path, "{\"connected\":true,\"account_id\":\"main\"}\n");
+    try writeFile(telegram_path, "{\"connected\":true,\"account_id\":\"main\",\"webhook_url\":\"https://example.com/webhook/telegram?user_id=1\"}\n");
+    const secrets_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/secrets", .{user_dir});
+    defer std.testing.allocator.free(secrets_dir);
+    try std.fs.makeDirAbsolute(secrets_dir);
+    const token_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram_bot_token", .{secrets_dir});
+    defer std.testing.allocator.free(token_path);
+    try writeFile(token_path, "123456:ABCDEF\n");
+    const heartbeat_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{user_dir});
+    defer std.testing.allocator.free(heartbeat_path);
+    try writeFile(heartbeat_path, "{\"enabled\":true}\n");
 
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
@@ -9901,10 +10186,74 @@ test "handleApiRoute GET onboarding reflects connected telegram status" {
     try std.testing.expectEqualStrings("200 OK", response.status);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
     defer parsed.deinit();
-    const guides = parsed.value.object.get("setup").?.object.get("channel_guides").?.object;
+    const setup = parsed.value.object.get("setup").?.object;
+    try std.testing.expectEqual(true, setup.get("onboarding_ready_normalized").?.bool);
+    try std.testing.expectEqualStrings("ready", setup.get("client_ready_status").?.string);
+    try std.testing.expectEqual(true, setup.get("telegram_connected_normalized").?.bool);
+    try std.testing.expectEqual(true, setup.get("telegram_state_valid").?.bool);
+    try std.testing.expectEqual(true, setup.get("heartbeat_enabled_normalized").?.bool);
+    const guides = setup.get("channel_guides").?.object;
     const telegram = guides.get("telegram").?.object;
     try std.testing.expectEqual(true, telegram.get("connected").?.bool);
     try std.testing.expectEqualStrings("connected", telegram.get("status").?.string);
+}
+
+test "handleApiRoute GET onboarding flags stale telegram webhook state as needs_reconnect" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const user_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/42", .{tenant_root});
+    defer std.testing.allocator.free(user_dir);
+    try std.fs.makeDirAbsolute(user_dir);
+    const telegram_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram.json", .{user_dir});
+    defer std.testing.allocator.free(telegram_path);
+    try writeFile(telegram_path, "{\"connected\":true,\"account_id\":\"main\",\"webhook_url\":\"https://example.com/webhook/telegram?user_id=1\",\"allow_from\":[\"*\"]}\n");
+    const secrets_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/secrets", .{user_dir});
+    defer std.testing.allocator.free(secrets_dir);
+    try std.fs.makeDirAbsolute(secrets_dir);
+    const token_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram_bot_token", .{secrets_dir});
+    defer std.testing.allocator.free(token_path);
+    try writeFile(token_path, "123456:ABCDEF\n");
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/42/onboarding HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "GET",
+        "/api/v1/users/42/onboarding",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    const setup = parsed.value.object.get("setup").?.object;
+    try std.testing.expectEqual(false, setup.get("telegram_connected_normalized").?.bool);
+    try std.testing.expectEqual(false, setup.get("telegram_state_valid").?.bool);
+    try std.testing.expectEqualStrings("needs_reconnect", setup.get("client_ready_status").?.string);
+    const guides = setup.get("channel_guides").?.object;
+    const telegram = guides.get("telegram").?.object;
+    try std.testing.expectEqual(false, telegram.get("connected").?.bool);
+    try std.testing.expectEqualStrings("needs_reconnect", telegram.get("status").?.string);
 }
 
 test "handleApiRoute GET settings returns defaults when no profile exists" {
@@ -10176,6 +10525,49 @@ test "handleApiRoute PUT heartbeat stores canonical enabled-only payload" {
     );
     try std.testing.expectEqualStrings("200 OK", put_response.status);
     try std.testing.expectEqualStrings("{\"enabled\":true}", put_response.body);
+
+    const get_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/heartbeat HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const get_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        get_request,
+        "GET",
+        "/api/v1/users/1/heartbeat",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", get_response.status);
+    try std.testing.expectEqualStrings("{\"enabled\":true}", get_response.body);
+}
+
+test "handleApiRoute GET heartbeat normalizes legacy stored payload" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const user_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_dir);
+    try std.fs.makeDirAbsolute(user_dir);
+    const heartbeat_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{user_dir});
+    defer std.testing.allocator.free(heartbeat_path);
+    try writeFile(heartbeat_path, "{\"enabled\":true,\"intervalSec\":3600}\n");
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
 
     const get_request = try std.fmt.allocPrint(
         req_allocator,
@@ -12398,6 +12790,73 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"agent.parallel_tools\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"agent.tool_dispatcher\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lease_probe\":null") != null);
+}
+
+test "internalDiagnosticsPayload normalizes user readiness surfaces without loaded runtime" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const base_config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/base-config.json", .{tenant_root});
+    defer std.testing.allocator.free(base_config_path);
+    try writeFile(base_config_path, "{\"default_provider\":\"together\",\"default_model\":\"moonshotai/Kimi-K2.5\"}\n");
+
+    const user_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/42", .{tenant_root});
+    defer std.testing.allocator.free(user_dir);
+    try std.fs.makeDirAbsolute(user_dir);
+    const user_config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{user_dir});
+    defer std.testing.allocator.free(user_config_path);
+    try writeFile(user_config_path, "{\"product_settings\":{\"assistant_mode\":\"deep\",\"group_activation\":\"always\",\"proactive_updates\":false,\"voice_replies\":true,\"session_timeout_minutes\":45}}\n");
+    const heartbeat_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{user_dir});
+    defer std.testing.allocator.free(heartbeat_path);
+    try writeFile(heartbeat_path, "{\"enabled\":false,\"intervalSec\":3600}\n");
+    const runtime_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat_runtime.json", .{user_dir});
+    defer std.testing.allocator.free(runtime_path);
+    try writeFile(runtime_path, "{\"last_run_s\":123,\"last_status\":\"send_failed\",\"last_reason\":\"no_target\"}\n");
+    const telegram_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram.json", .{user_dir});
+    defer std.testing.allocator.free(telegram_path);
+    try writeFile(telegram_path, "{\"connected\":true,\"account_id\":\"default\",\"webhook_url\":\"https://example.com/webhook/telegram?user_id=1\",\"allow_from\":[\"*\"]}\n");
+    const onboarding_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/onboarding.json", .{user_dir});
+    defer std.testing.allocator.free(onboarding_path);
+    try writeFile(onboarding_path, "{\"completed\":false,\"completed_at_s\":null}\n");
+    const secrets_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/secrets", .{user_dir});
+    defer std.testing.allocator.free(secrets_dir);
+    try std.fs.makeDirAbsolute(secrets_dir);
+    const token_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram_bot_token", .{secrets_dir});
+    defer std.testing.allocator.free(token_path);
+    try writeFile(token_path, "123456:ABCDEF\n");
+
+    var gs = GatewayState.init(std.testing.allocator);
+    defer gs.deinit();
+    gs.tenant_enabled = true;
+    gs.tenant_enabled_configured = true;
+    gs.tenant_data_root = tenant_root;
+    gs.heartbeat_enabled = true;
+    gs.heartbeat_interval_minutes = 60;
+    gs.state_backend_effective = "file";
+    gs.state_backend_configured = "file";
+    gs.chat_provider_effective = "together";
+    gs.embedding_provider_effective = "together";
+    gs.config_path_len = copyIntoBuf(&gs.config_path_buf, base_config_path);
+
+    const payload = try internalDiagnosticsPayload(std.testing.allocator, &gs, "42");
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"assistant_mode\":\"deep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"group_activation\":\"always\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"proactive_updates\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"voice_replies\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"session_timeout_minutes\":45") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"telegram_connected_normalized\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"telegram_state_valid\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"heartbeat_enabled_normalized\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"client_ready_status\":\"needs_reconnect\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"proactive_status\":\"disabled_cleanly\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"last_status\":\"disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"last_reason\":\"user_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"status\":\"needs_reconnect\"") != null);
 }
 
 test "appendControlPlaneStringEntryWithDrift suppresses expected derived drift" {
