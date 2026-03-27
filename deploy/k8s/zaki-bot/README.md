@@ -218,6 +218,34 @@ EXPECT_BASE_URL_DNS=true \
 EXPECT_WEBHOOK_BASE_URL_DNS=true \
 EXPECT_STATE_EFFECTIVE=postgres \
 EXPECT_NOT_DEGRADED=true \
+
+## Pilot rollout notes
+
+For the current pilot rollout, the most important operational checks are:
+
+1. Build/runtime path
+- build with Postgres enabled:
+  - `zig build -Dengines=base,sqlite,postgres`
+- verify diagnostics show:
+  - `state_effective = "postgres"`
+  - `degraded = false`
+
+2. Telegram
+- productized token-first Telegram connect should work without requiring end users to enter webhook infrastructure
+- backend/deployment must provide:
+  - internal `NULLCLAW_BASE_URL`
+  - matching `NULLCLAW_INTERNAL_TOKEN`
+  - public `ZAKI_AGENT_WEBHOOK_BASE_URL`
+
+3. Tool calling stability
+- if provider burst throttling is observed under heavy tool use, prefer the conservative pilot posture:
+  - `agent.parallel_tools = false`
+  - `agent.tool_dispatcher = "serial"`
+  - `agent.parallel_tools_rollout_percent = 0`
+
+4. Proactive
+- heartbeat/proactive wiring can be verified locally
+- successful proactive delivery still needs a real deployed-environment smoke before calling it proven
 PGBOUNCER_EXPECTED=true \
 ./deploy/k8s/zaki-bot/smoke.sh
 ```

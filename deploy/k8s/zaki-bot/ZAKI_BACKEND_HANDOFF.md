@@ -26,6 +26,10 @@ Deployment contract:
 - `NULLCLAW_BASE_URL` must remain the internal backend -> nullALIS service URL, for example `http://nullclaw:3000`
 - `ZAKI_AGENT_WEBHOOK_BASE_URL` must be the public HTTPS ingress used by Telegram, for example `https://agent.zaki.com`
 - In deployed environments `ZAKI_AGENT_WEBHOOK_BASE_URL` should be treated as required operator/deployment config for smooth Telegram connect
+- For the current pilot rollout, prefer serial tool dispatch unless provider burst behavior is already validated:
+  - `agent.parallel_tools = false`
+  - `agent.tool_dispatcher = "serial"`
+  - `agent.parallel_tools_rollout_percent = 0`
 - After rolling out the user-scoped vector retrieval change, run a tenant-scoped memory reindex before treating semantic recall as fully warm again.
 - The vector table is now keyed by `(user_id, key)`, so resetting the legacy table is safe, but old vectors are intentionally discarded cache data until each tenant repopulates them.
 - Operationally, use `/memory reindex` from the tenant runtime (or an equivalent tenant-aware reindex pass) instead of the global CLI markdown reindex when repopulating ZAKI user memories.
@@ -209,3 +213,39 @@ curl -N -sS -X POST "$BASE/api/v1/chat/stream" \
   -H "Content-Type: application/json" \
   -d '{"message":"say hello in one sentence"}'
 ```
+
+## 10) Pilot deployment signoff
+
+Before calling the active stack pilot-ready, verify all of these:
+
+1. Runtime health:
+- `/health` returns `{"status":"ok"}`
+- `/internal/diagnostics` reports:
+  - `startup_self_check.state_effective = "postgres"`
+  - `startup_self_check.degraded = false`
+
+2. ZAKI settings plane:
+- `GET/PATCH/GET` for `/api/v1/users/{id}/settings` round-trips correctly
+- `GET /api/v1/users/{id}/heartbeat` returns canonical enabled-only JSON
+
+3. Telegram:
+- manual connect/send/reply path works with token-first setup
+- user-scoped diagnostics show:
+  - `telegram_connected_normalized = true`
+  - `telegram_state_valid = true`
+- stale Telegram rows must surface as `client_ready_status = "needs_reconnect"`, not healthy
+
+4. Memory:
+- build must include Postgres support:
+  - `zig build -Dengines=base,sqlite,postgres`
+- tenant vector table is keyed by `(user_id, key)`
+- active tenants have been reindexed after deploy
+
+5. Proactive:
+- heartbeat wiring is expected to be present
+- final proactive delivery proof must be done in the deployed environment, not assumed from local gateway-only smoke runs
+
+6. ZAKI backend:
+- `NULLCLAW_BASE_URL` remains internal-only
+- `NULLCLAW_INTERNAL_TOKEN` matches the deployed nullALIS internal token
+- `ZAKI_AGENT_WEBHOOK_BASE_URL` is set to the public HTTPS Telegram ingress
