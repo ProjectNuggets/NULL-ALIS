@@ -1593,6 +1593,34 @@ fn printRetrievalScoreLine(c: yc.memory.RetrievalCandidate) void {
     }
 }
 
+const MemoryForgetAction = enum {
+    missing,
+    protected,
+    deleted,
+    not_deleted,
+};
+
+fn forgetMemoryWithValidation(
+    allocator: std.mem.Allocator,
+    mem: yc.memory.Memory,
+    mem_rt: ?*yc.memory.MemoryRuntime,
+    key: []const u8,
+) !MemoryForgetAction {
+    var lookup = try yc.memory.lookupMemoryLifecycleEntry(allocator, mem, key);
+    defer lookup.deinit(allocator);
+
+    switch (lookup.status) {
+        .missing => return .missing,
+        .protected => return .protected,
+        .editable => {},
+    }
+
+    const deleted = try mem.forget(key);
+    if (!deleted) return .not_deleted;
+    if (mem_rt) |rt| rt.deleteFromVectorStore(key);
+    return .deleted;
+}
+
 fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
         printMemoryUsage();
@@ -1680,15 +1708,14 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.process.exit(1);
         }
         const key = sub_args[1];
-        const deleted = mem_rt.memory.forget(key) catch |err| {
+        const outcome = forgetMemoryWithValidation(allocator, mem_rt.memory, &mem_rt, key) catch |err| {
             std.debug.print("memory forget failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
-        if (deleted) {
-            mem_rt.deleteFromVectorStore(key);
-            std.debug.print("Deleted memory entry: {s}\n", .{key});
-        } else {
-            std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key});
+        switch (outcome) {
+            .deleted => std.debug.print("Deleted memory entry: {s}\n", .{key}),
+            .missing, .not_deleted => std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key}),
+            .protected => std.debug.print("Memory key is not deletable: {s}\n", .{key}),
         }
         return;
     }
@@ -3393,6 +3420,41 @@ test "parsePositiveUsize accepts only positive integers" {
     try std.testing.expect(parsePositiveUsize("0") == null);
     try std.testing.expect(parsePositiveUsize("-1") == null);
     try std.testing.expect(parsePositiveUsize("bad") == null);
+}
+
+test "forgetMemoryWithValidation returns missing for absent key" {
+    var mem_impl = yc.memory.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer mem_impl.deinit();
+
+    try std.testing.expectEqual(
+        MemoryForgetAction.missing,
+        try forgetMemoryWithValidation(std.testing.allocator, mem_impl.memory(), null, "missing"),
+    );
+}
+
+test "forgetMemoryWithValidation rejects protected key" {
+    var mem_impl = yc.memory.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+    try mem.store("summary_latest/agent:zaki-bot:user:1:main", "focus: shipping", .core, null);
+
+    try std.testing.expectEqual(
+        MemoryForgetAction.protected,
+        try forgetMemoryWithValidation(std.testing.allocator, mem, null, "summary_latest/agent:zaki-bot:user:1:main"),
+    );
+}
+
+test "forgetMemoryWithValidation deletes editable key" {
+    var mem_impl = yc.memory.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+    try mem.store("user_name", "Nova", .core, null);
+
+    try std.testing.expectEqual(
+        MemoryForgetAction.deleted,
+        try forgetMemoryWithValidation(std.testing.allocator, mem, null, "user_name"),
+    );
+    try std.testing.expect((try mem.get(std.testing.allocator, "user_name")) == null);
 }
 
 test "parseOnboardArgs parses quick setup flags" {

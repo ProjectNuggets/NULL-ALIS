@@ -37,6 +37,20 @@ pub const MemoryForgetTool = struct {
             return ToolResult{ .success = false, .output = msg };
         };
 
+        var lookup = try mem_root.lookupMemoryLifecycleEntry(allocator, m, key);
+        defer lookup.deinit(allocator);
+        switch (lookup.status) {
+            .missing => {
+                const msg = try std.fmt.allocPrint(allocator, "No memory found with key: {s}", .{key});
+                return ToolResult{ .success = true, .output = msg };
+            },
+            .protected => {
+                const msg = try std.fmt.allocPrint(allocator, "Memory key is not deletable: {s}", .{key});
+                return ToolResult{ .success = false, .output = msg };
+            },
+            .editable => {},
+        }
+
         const forgotten = m.forget(key) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to forget memory '{s}': {s}", .{ key, @errorName(err) });
             return ToolResult{ .success = false, .output = msg };
@@ -120,4 +134,40 @@ test "memory_forget with real backend returns appropriate message" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "No memory found with key: test_key") != null);
+}
+
+test "memory_forget rejects system-managed key" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("summary_latest/agent:zaki-bot:user:1:main", "focus: shipping", .core, null);
+
+    var mt = MemoryForgetTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\": \"summary_latest/agent:zaki-bot:user:1:main\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "memory_forget deletes editable key" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("user_name", "Nova", .core, null);
+
+    var mt = MemoryForgetTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\": \"user_name\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect((try mem.get(allocator, "user_name")) == null);
 }

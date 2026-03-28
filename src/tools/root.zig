@@ -60,6 +60,7 @@ pub const file_edit = @import("file_edit.zig");
 pub const http_request = @import("http_request.zig");
 pub const git = @import("git.zig");
 pub const memory_store = @import("memory_store.zig");
+pub const memory_edit = @import("memory_edit.zig");
 pub const memory_recall = @import("memory_recall.zig");
 pub const memory_list = @import("memory_list.zig");
 pub const memory_forget = @import("memory_forget.zig");
@@ -351,6 +352,10 @@ pub fn allTools(
     const mst = try allocator.create(memory_store.MemoryStoreTool);
     mst.* = .{};
     try list.append(allocator, mst.tool());
+
+    const met = try allocator.create(memory_edit.MemoryEditTool);
+    met.* = .{};
+    try list.append(allocator, met.tool());
 
     const mrt = try allocator.create(memory_recall.MemoryRecallTool);
     mrt.* = .{};
@@ -743,6 +748,9 @@ pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
         if (t.vtable == &memory_store.MemoryStoreTool.vtable) {
             const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
+        } else if (t.vtable == &memory_edit.MemoryEditTool.vtable) {
+            const mt: *memory_edit.MemoryEditTool = @ptrCast(@alignCast(t.ptr));
+            mt.memory = memory;
         } else if (t.vtable == &memory_recall.MemoryRecallTool.vtable) {
             const mt: *memory_recall.MemoryRecallTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
@@ -762,6 +770,9 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
     for (tools) |t| {
         if (t.vtable == &memory_store.MemoryStoreTool.vtable) {
             const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
+            mt.mem_rt = mem_rt;
+        } else if (t.vtable == &memory_edit.MemoryEditTool.vtable) {
+            const mt: *memory_edit.MemoryEditTool = @ptrCast(@alignCast(t.ptr));
             mt.mem_rt = mem_rt;
         } else if (t.vtable == &memory_recall.MemoryRecallTool.vtable) {
             const mt: *memory_recall.MemoryRecallTool = @ptrCast(@alignCast(t.ptr));
@@ -1091,8 +1102,8 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 23 + http_request + web_fetch + web_search + browser = 27
-    try std.testing.expectEqual(@as(usize, 27), tools.len);
+    // base 24 + http_request + web_fetch + web_search + browser = 28
+    try std.testing.expectEqual(@as(usize, 28), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -1105,10 +1116,10 @@ test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
     defer deinitTools(std.testing.allocator, tools);
     // shell + file_read + file_write + file_edit + file_append + git + image_info
-    // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule
+    // + memory_store + memory_edit + memory_recall + memory_list + memory_forget + delegate + schedule
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + spawn = 23
-    try std.testing.expectEqual(@as(usize, 23), tools.len);
+    // + runtime_info + skill_registry + spawn = 24
+    try std.testing.expectEqual(@as(usize, 24), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -1234,7 +1245,7 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    try std.testing.expectEqual(@as(usize, 24), tools.len);
+    try std.testing.expectEqual(@as(usize, 25), tools.len);
 
     var found_message = false;
     for (tools) |t| {

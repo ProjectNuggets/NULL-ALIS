@@ -262,6 +262,7 @@ pub fn freeEntries(allocator: std.mem.Allocator, entries: []MemoryEntry) void {
 }
 
 pub const PromptBootstrapKeyPrefix = "__bootstrap.prompt.";
+pub const TombstoneKeyPrefix = "__tombstone__/";
 
 pub const PromptBootstrapDoc = struct {
     filename: []const u8,
@@ -297,7 +298,75 @@ pub fn isInternalMemoryKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "autosave_user_") or
         std.mem.startsWith(u8, key, "autosave_assistant_") or
         std.mem.eql(u8, key, "last_hygiene_at") or
+        std.mem.startsWith(u8, key, TombstoneKeyPrefix) or
         std.mem.startsWith(u8, key, PromptBootstrapKeyPrefix);
+}
+
+pub fn isTombstoneKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, TombstoneKeyPrefix);
+}
+
+pub fn tombstoneTargetKey(key: []const u8) ?[]const u8 {
+    if (!isTombstoneKey(key)) return null;
+    const target = key[TombstoneKeyPrefix.len..];
+    return if (target.len > 0) target else null;
+}
+
+pub fn isAppendOnlyMemoryKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "session_summary/") or
+        std.mem.startsWith(u8, key, "timeline_summary/") or
+        std.mem.startsWith(u8, key, "session_checkpoint_") or
+        std.mem.eql(u8, key, "timeline_index/current") or
+        std.mem.startsWith(u8, key, "autosave_user_") or
+        std.mem.startsWith(u8, key, "autosave_assistant_");
+}
+
+pub fn isSystemManagedMemoryKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "context_anchor_current") or
+        std.mem.startsWith(u8, key, "summary_latest/") or
+        std.mem.startsWith(u8, key, "durable_fact/") or
+        isAppendOnlyMemoryKey(key);
+}
+
+pub fn isMutableMemoryEntry(key: []const u8, category: MemoryCategory) bool {
+    if (isTombstoneKey(key) or isMarkdownLineKey(key) or isAppendOnlyMemoryKey(key)) return false;
+    return switch (category) {
+        .core => true,
+        else => false,
+    };
+}
+
+pub fn isEditableMemoryEntry(key: []const u8, category: MemoryCategory) bool {
+    if (!isMutableMemoryEntry(key, category)) return false;
+    if (isInternalMemoryKey(key) or isSystemManagedMemoryKey(key)) return false;
+    return true;
+}
+
+pub const MemoryLifecycleStatus = enum {
+    missing,
+    editable,
+    protected,
+};
+
+pub const MemoryLifecycleLookup = struct {
+    status: MemoryLifecycleStatus,
+    entry: ?MemoryEntry = null,
+
+    pub fn deinit(self: *MemoryLifecycleLookup, allocator: std.mem.Allocator) void {
+        if (self.entry) |*entry| entry.deinit(allocator);
+    }
+};
+
+pub fn lookupMemoryLifecycleEntry(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    key: []const u8,
+) !MemoryLifecycleLookup {
+    const existing = (try mem.get(allocator, key)) orelse return .{ .status = .missing };
+    return .{
+        .status = if (isEditableMemoryEntry(existing.key, existing.category)) .editable else .protected,
+        .entry = existing,
+    };
 }
 
 /// Returns true for markdown fallback line keys like "MEMORY:8".
@@ -2162,6 +2231,67 @@ test "deriveMemoryProvenance derives connector lane" {
     const provenance = deriveMemoryProvenance("slack:sl-main:channel:C12345", "ignored");
     try std.testing.expectEqualStrings("slack", provenance.channel);
     try std.testing.expectEqualStrings("channel", provenance.lane);
+}
+
+test "editable memory classification keeps user state editable" {
+    try std.testing.expect(isEditableMemoryEntry("user_name", .core));
+    try std.testing.expect(!isEditableMemoryEntry("summary_latest/agent:zaki-bot:user:1:main", .core));
+    try std.testing.expect(!isEditableMemoryEntry("timeline_summary/agent:zaki-bot:user:1:main/1", .daily));
+    try std.testing.expect(!isEditableMemoryEntry("durable_fact/1/0", .core));
+}
+
+test "tombstone target key extracts target" {
+    try std.testing.expectEqualStrings("user_name", tombstoneTargetKey("__tombstone__/user_name").?);
+}
+
+test "lookupMemoryLifecycleEntry reports missing key" {
+    var mem_impl = InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer mem_impl.deinit();
+
+    var lookup = try lookupMemoryLifecycleEntry(std.testing.allocator, mem_impl.memory(), "missing");
+    defer lookup.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(MemoryLifecycleStatus.missing, lookup.status);
+    try std.testing.expect(lookup.entry == null);
+}
+
+test "lookupMemoryLifecycleEntry reports editable key" {
+    var mem_impl = InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+    try mem.store("user_name", "Nova", .core, null);
+
+    var lookup = try lookupMemoryLifecycleEntry(std.testing.allocator, mem, "user_name");
+    defer lookup.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(MemoryLifecycleStatus.editable, lookup.status);
+    try std.testing.expect(lookup.entry != null);
+}
+
+test "lookupMemoryLifecycleEntry reports protected system-managed key" {
+    var mem_impl = InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+    try mem.store("summary_latest/agent:zaki-bot:user:1:main", "focus: ship", .core, null);
+
+    var lookup = try lookupMemoryLifecycleEntry(std.testing.allocator, mem, "summary_latest/agent:zaki-bot:user:1:main");
+    defer lookup.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(MemoryLifecycleStatus.protected, lookup.status);
+    try std.testing.expect(lookup.entry != null);
+}
+
+test "lookupMemoryLifecycleEntry reports protected append-only key" {
+    var mem_impl = InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+    try mem.store("timeline_summary/agent:zaki-bot:user:1:main/1", "focus: ship", .daily, null);
+
+    var lookup = try lookupMemoryLifecycleEntry(std.testing.allocator, mem, "timeline_summary/agent:zaki-bot:user:1:main/1");
+    defer lookup.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(MemoryLifecycleStatus.protected, lookup.status);
+    try std.testing.expect(lookup.entry != null);
 }
 
 test {

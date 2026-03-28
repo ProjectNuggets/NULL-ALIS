@@ -33,6 +33,15 @@ pub const ZakiDualMemory = struct {
     }
 
     pub fn syncFromMarkdown(self: *Self, allocator: std.mem.Allocator) !void {
+        const tombstoned_keys = try self.markdown_impl.readTombstonedKeys(allocator);
+        defer {
+            for (tombstoned_keys) |key| allocator.free(key);
+            allocator.free(tombstoned_keys);
+        }
+        for (tombstoned_keys) |target_key| {
+            _ = self.primary.forget(target_key) catch {};
+        }
+
         const entries = try self.markdown_impl.memory().list(allocator, null, null);
         defer root.freeEntries(allocator, entries);
 
@@ -80,7 +89,19 @@ pub const ZakiDualMemory = struct {
 
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.primary.forget(key);
+        const forgotten_primary = self.primary.forget(key) catch false;
+        if (root.isInternalMemoryKey(key) or root.isMarkdownLineKey(key) or root.isSystemManagedMemoryKey(key)) {
+            return forgotten_primary;
+        }
+
+        const markdown_entry = self.markdown_impl.memory().get(self.allocator, key) catch null;
+        defer if (markdown_entry) |*entry| entry.deinit(self.allocator);
+
+        if (forgotten_primary or markdown_entry != null) {
+            try self.markdown_impl.appendTombstone(key, self.allocator);
+            return true;
+        }
+        return false;
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -223,6 +244,58 @@ test "zaki dual memory ignores internal markdown entries during sync" {
     try std.testing.expect((try mem.get(allocator, "autosave_user_123")) == null);
     try std.testing.expect((try mem.get(allocator, "__bootstrap.prompt.SOUL.md")) == null);
     try std.testing.expect((try mem.get(allocator, "last_hygiene_at")) == null);
+
+    mem.deinit();
+}
+
+test "zaki dual memory forget writes tombstone and prevents resurrection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    var mem = dual.memory();
+
+    try mem.store("user_name", "Nova", .core, null);
+    try std.testing.expect(try mem.forget("user_name"));
+    try std.testing.expect((try mem.get(allocator, "user_name")) == null);
+
+    try dual.syncFromMarkdown(allocator);
+    try std.testing.expect((try mem.get(allocator, "user_name")) == null);
+
+    mem.deinit();
+}
+
+test "zaki dual memory store clears tombstone for restored mutable key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    var mem = dual.memory();
+
+    try mem.store("user_name", "Nova", .core, null);
+    try std.testing.expect(try mem.forget("user_name"));
+    try mem.store("user_name", "Nova Restored", .core, null);
+
+    const entry = (try mem.get(allocator, "user_name")) orelse return error.TestUnexpectedResult;
+    defer entry.deinit(allocator);
+    try std.testing.expectEqualStrings("Nova Restored", entry.content);
+
+    const tombstoned = try dual.markdown_impl.readTombstonedKeys(allocator);
+    defer {
+        for (tombstoned) |key| allocator.free(key);
+        allocator.free(tombstoned);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tombstoned.len);
 
     mem.deinit();
 }

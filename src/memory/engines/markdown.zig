@@ -12,6 +12,7 @@ const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
 const LAST_HYGIENE_KEY = "last_hygiene_at";
+const TOMBSTONES_FILENAME = "TOMBSTONES.md";
 
 pub const MarkdownMemory = struct {
     workspace_dir: []const u8,
@@ -52,6 +53,10 @@ pub const MarkdownMemory = struct {
             @intFromEnum(md.month),
             md.day_index + 1,
         });
+    }
+
+    fn tombstonePath(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}/memory/{s}", .{ self.workspace_dir, TOMBSTONES_FILENAME });
     }
 
     fn ensureDir(path: []const u8) !void {
@@ -160,6 +165,92 @@ pub const MarkdownMemory = struct {
         try std.fmt.format(buf.writer(allocator), "- **{s}**: {s}\n", .{ key, content });
 
         try writeFileAtomic(path, buf.items, allocator);
+    }
+
+    fn removeStructuredEntryAtomic(path: []const u8, key: []const u8, allocator: std.mem.Allocator) !void {
+        try ensureDir(path);
+
+        const existing = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => try allocator.dupe(u8, ""),
+            else => return err,
+        };
+        defer allocator.free(existing);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+
+        var iter = std.mem.splitScalar(u8, existing, '\n');
+        while (iter.next()) |line| {
+            if (lineHasStructuredKey(line, key)) continue;
+            try buf.appendSlice(allocator, line);
+            try buf.append(allocator, '\n');
+        }
+
+        while (buf.items.len > 0 and std.ascii.isWhitespace(buf.items[buf.items.len - 1])) {
+            _ = buf.pop();
+        }
+        if (buf.items.len == 0) {
+            std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            return;
+        }
+
+        try writeFileAtomic(path, buf.items, allocator);
+    }
+
+    fn removeTombstoneAtomic(self: *const Self, key: []const u8, allocator: std.mem.Allocator) !void {
+        const path = try self.tombstonePath(allocator);
+        defer allocator.free(path);
+        const tombstone_key = try std.fmt.allocPrint(allocator, "{s}{s}", .{ root.TombstoneKeyPrefix, key });
+        defer allocator.free(tombstone_key);
+        try removeStructuredEntryAtomic(path, tombstone_key, allocator);
+    }
+
+    pub fn appendTombstone(self: *const Self, key: []const u8, allocator: std.mem.Allocator) !void {
+        const path = try self.tombstonePath(allocator);
+        defer allocator.free(path);
+        const now = try std.fmt.allocPrint(allocator, "{d}", .{std.time.timestamp()});
+        defer allocator.free(now);
+        const tombstone_key = try std.fmt.allocPrint(allocator, "{s}{s}", .{ root.TombstoneKeyPrefix, key });
+        defer allocator.free(tombstone_key);
+        const entry_text = try std.fmt.allocPrint(allocator, "- **{s}**: {s}", .{ tombstone_key, now });
+        defer allocator.free(entry_text);
+        try appendToFile(path, entry_text, allocator);
+    }
+
+    pub fn readTombstonedKeys(self: *const Self, allocator: std.mem.Allocator) ![][]u8 {
+        var result: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (result.items) |key| allocator.free(key);
+            result.deinit(allocator);
+        }
+
+        const path = try self.tombstonePath(allocator);
+        defer allocator.free(path);
+
+        const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return result.toOwnedSlice(allocator),
+            else => return err,
+        };
+        defer allocator.free(content);
+
+        var iter = std.mem.splitScalar(u8, content, '\n');
+        while (iter.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0 or trimmed[0] == '#') continue;
+            const clean = if (std.mem.startsWith(u8, trimmed, "- ")) trimmed[2..] else trimmed;
+            if (!std.mem.startsWith(u8, clean, "**")) continue;
+            if (std.mem.indexOf(u8, clean[2..], "**:")) |end_off| {
+                const key_slice = std.mem.trim(u8, clean[2 .. 2 + end_off], " \t");
+                if (root.tombstoneTargetKey(key_slice)) |target_key| {
+                    try result.append(allocator, try allocator.dupe(u8, target_key));
+                }
+            }
+        }
+
+        return result.toOwnedSlice(allocator);
     }
 
     fn dupeEntryBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
@@ -302,13 +393,29 @@ pub const MarkdownMemory = struct {
         if (std.fs.cwd().openDir(md, .{ .iterate = true })) |*dir_handle| {
             var dir = dir_handle.*;
             defer dir.close();
+            var filenames: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (filenames.items) |name| allocator.free(name);
+                filenames.deinit(allocator);
+            }
             var it = dir.iterate();
             while (try it.next()) |entry| {
                 if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
-                const fpath = try std.fmt.allocPrint(parse_allocator, "{s}/{s}", .{ md, entry.name });
+                if (std.mem.eql(u8, entry.name, TOMBSTONES_FILENAME)) continue;
+                try filenames.append(allocator, try allocator.dupe(u8, entry.name));
+            }
+
+            std.mem.sort([]u8, filenames.items, {}, struct {
+                fn lessThan(_: void, a: []u8, b: []u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lessThan);
+
+            for (filenames.items) |entry_name| {
+                const fpath = try std.fmt.allocPrint(parse_allocator, "{s}/{s}", .{ md, entry_name });
                 defer parse_allocator.free(fpath);
                 if (std.fs.cwd().readFileAlloc(parse_allocator, fpath, 1024 * 1024)) |content| {
-                    const fname = entry.name[0 .. entry.name.len - 3];
+                    const fname = entry_name[0 .. entry_name.len - 3];
                     const entries = try parseEntries(content, fname, .daily, parse_allocator);
                     for (entries) |parsed| {
                         const cloned = try cloneEntry(allocator, parsed);
@@ -316,9 +423,72 @@ pub const MarkdownMemory = struct {
                     }
                 } else |_| {}
             }
+
+            const tombstone_path = try std.fmt.allocPrint(parse_allocator, "{s}/{s}", .{ md, TOMBSTONES_FILENAME });
+            defer parse_allocator.free(tombstone_path);
+            if (std.fs.cwd().readFileAlloc(parse_allocator, tombstone_path, 1024 * 1024)) |content| {
+                const entries = try parseEntries(content, "TOMBSTONES", .daily, parse_allocator);
+                for (entries) |parsed| {
+                    const cloned = try cloneEntry(allocator, parsed);
+                    try all.append(allocator, cloned);
+                }
+            } else |_| {}
         } else |_| {}
 
-        return all.toOwnedSlice(allocator);
+        var collapsed: std.ArrayListUnmanaged(MemoryEntry) = .empty;
+        errdefer {
+            for (collapsed.items) |*e| e.deinit(allocator);
+            collapsed.deinit(allocator);
+        }
+        var mutable_positions: std.StringHashMapUnmanaged(usize) = .empty;
+        defer mutable_positions.deinit(allocator);
+        var tombstoned: std.StringHashMapUnmanaged(void) = .empty;
+        defer tombstoned.deinit(allocator);
+
+        for (all.items) |*entry_ptr| {
+            var entry = entry_ptr.*;
+            if (root.isTombstoneKey(entry.key)) {
+                if (root.tombstoneTargetKey(entry.key)) |target_key| {
+                    try tombstoned.put(allocator, target_key, {});
+                    if (mutable_positions.get(target_key)) |idx| {
+                        collapsed.items[idx].deinit(allocator);
+                        _ = mutable_positions.remove(target_key);
+                        _ = collapsed.swapRemove(idx);
+                        if (idx < collapsed.items.len) {
+                            const moved_key = collapsed.items[idx].key;
+                            if (root.isMutableMemoryEntry(moved_key, collapsed.items[idx].category)) {
+                                try mutable_positions.put(allocator, moved_key, idx);
+                            }
+                        }
+                    }
+                }
+                entry.deinit(allocator);
+                continue;
+            }
+
+            if (root.isMutableMemoryEntry(entry.key, entry.category)) {
+                if (tombstoned.contains(entry.key)) {
+                    entry.deinit(allocator);
+                    continue;
+                }
+                if (mutable_positions.get(entry.key)) |idx| {
+                    const old_key = collapsed.items[idx].key;
+                    _ = mutable_positions.remove(old_key);
+                    collapsed.items[idx].deinit(allocator);
+                    collapsed.items[idx] = entry;
+                    try mutable_positions.put(allocator, collapsed.items[idx].key, idx);
+                } else {
+                    try mutable_positions.put(allocator, entry.key, collapsed.items.len);
+                    try collapsed.append(allocator, entry);
+                }
+                continue;
+            }
+
+            try collapsed.append(allocator, entry);
+        }
+
+        all.deinit(allocator);
+        return collapsed.toOwnedSlice(allocator);
     }
 
     // ── Memory vtable impl ────────────────────────────────────────
@@ -333,15 +503,24 @@ pub const MarkdownMemory = struct {
         defer scratch.deinit();
         const scratch_allocator = scratch.allocator();
 
+        if (root.isTombstoneKey(key)) {
+            try self_.appendTombstone(root.tombstoneTargetKey(key) orelse key, scratch_allocator);
+            return;
+        }
+
+        if (root.isMutableMemoryEntry(key, category) or (category == .core and std.mem.eql(u8, key, LAST_HYGIENE_KEY))) {
+            const path = try self_.corePath(scratch_allocator);
+            try replaceCoreEntryAtomic(path, key, content, scratch_allocator);
+            if (root.isEditableMemoryEntry(key, category)) {
+                try self_.removeTombstoneAtomic(key, scratch_allocator);
+            }
+            return;
+        }
+
         const path = switch (category) {
             .core => try self_.corePath(scratch_allocator),
             else => try self_.dailyPath(scratch_allocator),
         };
-        if (category == .core and std.mem.eql(u8, key, LAST_HYGIENE_KEY)) {
-            try replaceCoreEntryAtomic(path, key, content, scratch_allocator);
-            return;
-        }
-
         const entry_text = try std.fmt.allocPrint(scratch_allocator, "- **{s}**: {s}", .{ key, content });
         try appendToFile(path, entry_text, scratch_allocator);
     }
@@ -773,4 +952,72 @@ test "markdown get prefers newest exact key match" {
     const got = (try mem.memory().get(std.testing.allocator, "duplicate_key")).?;
     defer got.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("second", got.content);
+}
+
+test "markdown mutable core keys replace in place" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+    const memory = mem.memory();
+
+    try memory.store("user_name", "Nova", .core, null);
+    try memory.store("user_name", "Nova Alis", .core, null);
+
+    const memory_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/MEMORY.md", .{base});
+    defer std.testing.allocator.free(memory_path);
+    const content = try std.fs.cwd().readFileAlloc(std.testing.allocator, memory_path, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "- **user_name**: Nova\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "- **user_name**: Nova Alis") != null);
+}
+
+test "markdown tombstones suppress mutable keys from reads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+    const memory = mem.memory();
+
+    try memory.store("user_name", "Nova", .core, null);
+    try mem.appendTombstone("user_name", std.testing.allocator);
+
+    try std.testing.expect((try memory.get(std.testing.allocator, "user_name")) == null);
+    const listed = try memory.list(std.testing.allocator, null, null);
+    defer root.freeEntries(std.testing.allocator, listed);
+    for (listed) |entry| {
+        try std.testing.expect(!std.mem.eql(u8, entry.key, "user_name"));
+    }
+}
+
+test "markdown store removes tombstone for mutable key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+    const memory = mem.memory();
+
+    try mem.appendTombstone("user_name", std.testing.allocator);
+    try memory.store("user_name", "Nova", .core, null);
+
+    const entry = (try memory.get(std.testing.allocator, "user_name")) orelse return error.TestUnexpectedResult;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Nova", entry.content);
+
+    const tombstoned = try mem.readTombstonedKeys(std.testing.allocator);
+    defer {
+        for (tombstoned) |key| std.testing.allocator.free(key);
+        std.testing.allocator.free(tombstoned);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tombstoned.len);
 }
