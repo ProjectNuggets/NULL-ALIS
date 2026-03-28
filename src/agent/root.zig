@@ -3270,6 +3270,8 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
     defer anchor.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_session=agent:zaki-bot:user:1:main") != null);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_channel=app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_lane=main") != null);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
 
     const session_entries = try mem.list(allocator, .conversation, "agent:zaki-bot:user:1:main");
@@ -3299,11 +3301,15 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
     const latest = (try mem.get(allocator, latest_key)) orelse return error.TestUnexpectedResult;
     defer latest.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "channel=app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "lane=main") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "source_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
 
     const timeline_index = (try mem.get(allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
     defer timeline_index.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "channel=app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "lane=main") != null);
     try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "session=agent:zaki-bot:user:1:main") != null);
     try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
 }

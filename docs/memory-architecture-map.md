@@ -41,6 +41,13 @@ Objects:
 - `context_anchor_current`
 - `timeline_index/current`
 
+Provenance behavior:
+- semantic summary bodies stay compact and semantic
+- provenance is stored in metadata surfaces instead:
+  - `summary_latest/{session_id}`
+  - `context_anchor_current`
+  - `timeline_index/current`
+
 Files:
 - `src/agent/commands.zig`
 - `src/memory/lifecycle/summarizer.zig`
@@ -130,6 +137,18 @@ Files:
 This matters because per-turn memory and tool-visible memory are related but not identical.
 Turn enrichment is now smarter than the generic tool default.
 
+Tool-visible provenance:
+- memory tools now derive and display:
+  - `channel`
+  - `lane`
+  - `session`
+- provenance is derived from `session_id` when present, otherwise from summary keys
+
+Files:
+- `src/memory/root.zig`
+- `src/tools/memory_recall.zig`
+- `src/tools/memory_list.zig`
+
 ## 3. Session Boundaries And Summary Triggers
 
 ### What counts as a real session boundary today
@@ -152,6 +171,10 @@ Files:
 
 Product settings map `session_timeout_minutes` into `agent.session_ttl_secs`.
 Default today is `30` minutes.
+
+Important nuance:
+- summaries are not written by an exact wall-clock timer at minute N
+- they are written when session maintenance observes that the idle/TTL boundary has been crossed
 
 Files:
 - `src/user_settings.zig`

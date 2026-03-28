@@ -115,12 +115,21 @@ pub const MemoryRecallTool = struct {
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
+            const provenance = mem_root.deriveMemoryProvenance(entry.session_id, entry.key);
             try buf.appendSlice(allocator, idx_str);
             try buf.appendSlice(allocator, ". [");
             try buf.appendSlice(allocator, entry.key);
-            try buf.appendSlice(allocator, "] (");
+            try buf.appendSlice(allocator, "] [");
             try buf.appendSlice(allocator, entry.category.toString());
-            try buf.appendSlice(allocator, "): ");
+            try buf.appendSlice(allocator, "] channel=");
+            try buf.appendSlice(allocator, provenance.channel);
+            try buf.appendSlice(allocator, " lane=");
+            try buf.appendSlice(allocator, provenance.lane);
+            if (provenance.session_id) |session_id| {
+                try buf.appendSlice(allocator, " session=");
+                try buf.appendSlice(allocator, session_id);
+            }
+            try buf.appendSlice(allocator, ": ");
             try buf.appendSlice(allocator, entry.content);
             try buf.append(allocator, '\n');
         }
@@ -168,15 +177,24 @@ pub const MemoryRecallTool = struct {
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
+            const provenance = mem_root.deriveMemoryProvenance(null, cand.key);
             try buf.appendSlice(allocator, idx_str);
             try buf.appendSlice(allocator, ". [");
             try buf.appendSlice(allocator, cand.key);
-            try buf.appendSlice(allocator, "] (");
+            try buf.appendSlice(allocator, "] [");
             try buf.appendSlice(allocator, cand.source);
+            try buf.appendSlice(allocator, "] channel=");
+            try buf.appendSlice(allocator, provenance.channel);
+            try buf.appendSlice(allocator, " lane=");
+            try buf.appendSlice(allocator, provenance.lane);
+            if (provenance.session_id) |session_id| {
+                try buf.appendSlice(allocator, " session=");
+                try buf.appendSlice(allocator, session_id);
+            }
             var score_buf: [20]u8 = undefined;
-            const score_str = std.fmt.bufPrint(&score_buf, " {d:.2}", .{cand.final_score}) catch "";
+            const score_str = std.fmt.bufPrint(&score_buf, " score={d:.2}", .{cand.final_score}) catch "";
             try buf.appendSlice(allocator, score_str);
-            try buf.appendSlice(allocator, "): ");
+            try buf.appendSlice(allocator, ": ");
             try buf.appendSlice(allocator, cand.snippet);
             try buf.append(allocator, '\n');
         }
@@ -336,6 +354,32 @@ test "memory_recall supports explicit global scope" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "global_fact") != null);
+}
+
+test "memory_recall shows derived provenance" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "timeline_summary/agent:zaki-bot:user:1:thread:rollout/1774400000",
+        "focus: rollout recap",
+        .daily,
+        null,
+    );
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\":\"rollout\",\"scope\":\"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "channel=app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "lane=thread") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "session=agent:zaki-bot:user:1:thread:rollout") != null);
 }
 
 test "memory_recall rejects invalid scope value" {

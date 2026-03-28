@@ -699,10 +699,11 @@ fn updateTimelineIndex(
     focus: []const u8,
     timeline_key: []const u8,
 ) void {
+    const provenance = memory_mod.deriveMemoryProvenance(session_id, timeline_key);
     const new_line = std.fmt.allocPrint(
         allocator,
-        "- at={s} session={s} focus={s} key={s}",
-        .{ now_iso, session_id, truncateUtf8(focus, 140), timeline_key },
+        "- at={s} channel={s} lane={s} session={s} focus={s} key={s}",
+        .{ now_iso, provenance.channel, provenance.lane, session_id, truncateUtf8(focus, 140), timeline_key },
     ) catch return;
     defer allocator.free(new_line);
 
@@ -847,12 +848,13 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
 
     const focus = summarySectionValue(content, "focus:");
     const next = summarySectionValue(content, "next:");
+    const provenance = memory_mod.deriveMemoryProvenance(session_id, timeline_key);
     const latest_key = std.fmt.allocPrint(self.allocator, "summary_latest/{s}", .{session_id}) catch return;
     defer self.allocator.free(latest_key);
     const latest_content = std.fmt.allocPrint(
         self.allocator,
-        "type=summary_latest\nsession={s}\nsource_key={s}\nat={s}\n{s}",
-        .{ session_id, timeline_key, now_iso, content },
+        "type=summary_latest\nsession={s}\nchannel={s}\nlane={s}\nsource_key={s}\nat={s}\n{s}",
+        .{ session_id, provenance.channel, provenance.lane, timeline_key, now_iso, content },
     ) catch return;
     defer self.allocator.free(latest_content);
     if (mem.store(latest_key, latest_content, .core, null)) |_| {
@@ -932,8 +934,8 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
 
     const anchor_content = std.fmt.allocPrint(
         self.allocator,
-        "type=context_anchor\nlast_session={s}\nlast_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\nlast_summary_key=timeline_summary/{s}/{d}\nlast_at={s}",
-        .{ session_id, reason, self.model_name, checkpoint_key, session_id, now_s, now_iso },
+        "type=context_anchor\nlast_session={s}\nlast_channel={s}\nlast_lane={s}\nlast_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\nlast_summary_key=timeline_summary/{s}/{d}\nlast_at={s}",
+        .{ session_id, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).channel, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).lane, reason, self.model_name, checkpoint_key, session_id, now_s, now_iso },
     ) catch return;
     defer self.allocator.free(anchor_content);
     mem.store("context_anchor_current", anchor_content, .core, null) catch return;

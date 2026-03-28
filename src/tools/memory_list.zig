@@ -76,7 +76,18 @@ pub const MemoryListTool = struct {
         for (entries) |entry| {
             if (!include_internal and mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
             if (written >= shown) break;
-            try w.print("  {d}. {s} [{s}] {s}\n", .{ written + 1, entry.key, entry.category.toString(), entry.timestamp });
+            const provenance = mem_root.deriveMemoryProvenance(entry.session_id, entry.key);
+            try w.print("  {d}. {s} [{s}] channel={s} lane={s}", .{
+                written + 1,
+                entry.key,
+                entry.category.toString(),
+                provenance.channel,
+                provenance.lane,
+            });
+            if (provenance.session_id) |session_id| {
+                try w.print(" session={s}", .{session_id});
+            }
+            try w.print(" {s}\n", .{entry.timestamp});
             if (include_content) {
                 const preview = truncateUtf8(entry.content, 120);
                 try w.print("     {s}{s}\n", .{ preview, if (entry.content.len > preview.len) "..." else "" });
@@ -262,4 +273,28 @@ test "memory_list supports explicit global scope" {
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "global_only") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "session_only") != null);
+}
+
+test "memory_list shows derived provenance" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("session_only", "visible in session", .core, "agent:zaki-bot:user:1:main");
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:main" });
+    defer root.clearTurnContext();
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "channel=app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "lane=main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "session=agent:zaki-bot:user:1:main") != null);
 }

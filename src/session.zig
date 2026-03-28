@@ -1259,14 +1259,20 @@ test "evictIdle persists checkpoint before removing idle session" {
     const anchor = (try mem.get(testing.allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=idle_evict") != null);
+    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_channel=evict") != null);
+    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_lane=unknown") != null);
     try testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/evict:checkpoint/") != null);
 
     const latest = (try mem.get(testing.allocator, "summary_latest/evict:checkpoint")) orelse return error.TestUnexpectedResult;
     defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "channel=evict") != null);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "lane=unknown") != null);
     try testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
 
     const timeline_index = (try mem.get(testing.allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
     defer timeline_index.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, timeline_index.content, "channel=evict") != null);
+    try testing.expect(std.mem.indexOf(u8, timeline_index.content, "lane=unknown") != null);
     try testing.expect(std.mem.indexOf(u8, timeline_index.content, "session=evict:checkpoint") != null);
 }
 
@@ -1612,10 +1618,14 @@ test "ttl recycle persists session checkpoint before replacement" {
     const anchor = (try mem.get(testing.allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=ttl_recycle") != null);
+    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_channel=ttl") != null);
+    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_lane=unknown") != null);
     try testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/ttl:checkpoint/") != null);
 
     const latest = (try mem.get(testing.allocator, "summary_latest/ttl:checkpoint")) orelse return error.TestUnexpectedResult;
     defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "channel=ttl") != null);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "lane=unknown") != null);
     try testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
 }
 
@@ -1656,6 +1666,8 @@ test "evictIdle with expired ttl writes summary objects before removal" {
 
     const latest = (try mem.get(testing.allocator, "summary_latest/ttl:evict")) orelse return error.TestUnexpectedResult;
     defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "channel=ttl") != null);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "lane=unknown") != null);
     try testing.expect(std.mem.indexOf(u8, latest.content, "source_key=timeline_summary/ttl:evict/") != null);
 }
 
