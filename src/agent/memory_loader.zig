@@ -12,6 +12,7 @@ const MemoryRuntime = memory_mod.MemoryRuntime;
 /// Default number of memory entries to recall per query.
 const DEFAULT_RECALL_LIMIT: usize = 5;
 const GLOBAL_RECALL_CANDIDATE_LIMIT: usize = 64;
+const TIMELINE_FALLBACK_LIMIT: usize = 2;
 
 /// Maximum total bytes of memory context injected into a message.
 /// Prevents a few large entries from blowing the token budget.
@@ -34,12 +35,97 @@ fn containsKey(entries: []const MemoryEntry, key: []const u8) bool {
     return false;
 }
 
+fn isDurableFactKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "durable_fact/");
+}
+
+fn isSessionSummaryKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "session_summary/");
+}
+
+fn isTimelineSummaryKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "timeline_summary/");
+}
+
+fn isSummaryLatestKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "summary_latest/");
+}
+
+fn isSessionCheckpointKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "session_checkpoint_");
+}
+
+fn summaryLatestKeyForSession(allocator: std.mem.Allocator, session_id: ?[]const u8) !?[]u8 {
+    const sid = session_id orelse return null;
+    return try std.fmt.allocPrint(allocator, "summary_latest/{s}", .{sid});
+}
+
+fn timelinePrefixForSession(allocator: std.mem.Allocator, session_id: ?[]const u8) !?[]u8 {
+    const sid = session_id orelse return null;
+    return try std.fmt.allocPrint(allocator, "timeline_summary/{s}/", .{sid});
+}
+
 fn sanitizeMemoryText(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     // Strip inline image markers from recalled snippets so stale
     // [IMAGE:...] references do not accidentally trigger multimodal mode.
     const parsed = multimodal.parseImageMarkers(allocator, text) catch return try allocator.dupe(u8, text);
     defer allocator.free(parsed.refs);
     return parsed.cleaned_text;
+}
+
+fn ensureHeader(w: anytype, wrote_header: *bool) !void {
+    if (!wrote_header.*) {
+        try w.writeAll("[Memory context]\n");
+        wrote_header.* = true;
+    }
+}
+
+fn appendContextLine(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    wrote_header: *bool,
+    key: []const u8,
+    text: []const u8,
+) !void {
+    try ensureHeader(w, wrote_header);
+    const clipped = truncateUtf8(text, MAX_CONTEXT_BYTES / 2);
+    const sanitized = try sanitizeMemoryText(allocator, clipped);
+    defer allocator.free(sanitized);
+    try std.fmt.format(w, "- {s}: {s}\n", .{ key, sanitized });
+}
+
+fn appendDirectEntry(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    w: anytype,
+    wrote_header: *bool,
+    key: []const u8,
+) !bool {
+    const entry = (try mem.get(allocator, key)) orelse return false;
+    defer entry.deinit(allocator);
+    if (memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content) or memory_mod.isMarkdownLineKey(entry.key)) return false;
+    try appendContextLine(allocator, w, wrote_header, entry.key, entry.content);
+    return true;
+}
+
+fn shouldSkipGenericEntry(
+    key: []const u8,
+    content: []const u8,
+    summary_latest_key: ?[]const u8,
+    current_timeline_prefix: ?[]const u8,
+    has_priority_context: bool,
+) bool {
+    if (memory_mod.isInternalMemoryEntryKeyOrContent(key, content) or memory_mod.isMarkdownLineKey(key)) return true;
+    if (std.mem.eql(u8, key, "context_anchor_current")) return true;
+    if (summary_latest_key) |latest_key| {
+        if (std.mem.eql(u8, key, latest_key)) return true;
+    }
+    if (isSummaryLatestKey(key) or isSessionSummaryKey(key) or isTimelineSummaryKey(key) or isDurableFactKey(key)) return true;
+    if (has_priority_context and isSessionCheckpointKey(key)) return true;
+    if (current_timeline_prefix) |prefix| {
+        if (std.mem.startsWith(u8, key, prefix)) return true;
+    }
+    return false;
 }
 
 /// Build a memory context preamble by searching stored memories.
@@ -77,18 +163,55 @@ pub fn loadContext(
 
     var appended: usize = 0;
     var wrote_header = false;
+    var has_priority_context = false;
+    var timeline_added: usize = 0;
+
+    const summary_latest_key = try summaryLatestKeyForSession(allocator, session_id);
+    defer if (summary_latest_key) |key| allocator.free(key);
+    const current_timeline_prefix = try timelinePrefixForSession(allocator, session_id);
+    defer if (current_timeline_prefix) |prefix| allocator.free(prefix);
+
+    if (summary_latest_key) |key| {
+        if (try appendDirectEntry(allocator, mem, w, &wrote_header, key)) {
+            appended += 1;
+            has_priority_context = true;
+        }
+    }
+    if (try appendDirectEntry(allocator, mem, w, &wrote_header, "context_anchor_current")) {
+        appended += 1;
+        has_priority_context = true;
+    }
+
+    if (global_entries) |entries| {
+        for (entries) |entry| {
+            if (!isDurableFactKey(entry.key)) continue;
+            if (containsKey(scoped_entries, entry.key)) continue;
+            try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+            appended += 1;
+            has_priority_context = true;
+            if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
+        }
+    }
+
+    if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES and global_entries != null) {
+        if (global_entries) |entries| {
+            for (entries) |entry| {
+                if (!isTimelineSummaryKey(entry.key)) continue;
+                if (current_timeline_prefix) |prefix| {
+                    if (std.mem.startsWith(u8, entry.key, prefix)) continue;
+                }
+                try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+                appended += 1;
+                timeline_added += 1;
+                has_priority_context = true;
+                if (timeline_added >= TIMELINE_FALLBACK_LIMIT or appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
+            }
+        }
+    }
 
     for (scoped_entries) |entry| {
-        if (memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content) or memory_mod.isMarkdownLineKey(entry.key)) continue;
-        if (!wrote_header) {
-            try w.writeAll("[Memory context]\n");
-            wrote_header = true;
-        }
-        // Truncate individual entry content to prevent a single large memory from blowing the budget
-        const content = truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
-        const sanitized = try sanitizeMemoryText(allocator, content);
-        defer allocator.free(sanitized);
-        try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });
+        if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+        try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
         appended += 1;
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
@@ -98,16 +221,8 @@ pub fn loadContext(
             for (entries) |entry| {
                 if (entry.session_id != null) continue; // keep scoped isolation (no cross-session bleed)
                 if (containsKey(scoped_entries, entry.key)) continue;
-                if (memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content) or memory_mod.isMarkdownLineKey(entry.key)) continue;
-
-                if (!wrote_header) {
-                    try w.writeAll("[Memory context]\n");
-                    wrote_header = true;
-                }
-                const content = truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
-                const sanitized = try sanitizeMemoryText(allocator, content);
-                defer allocator.free(sanitized);
-                try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });
+                if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+                try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
                 appended += 1;
                 if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
@@ -126,6 +241,7 @@ pub fn loadContext(
 /// when a MemoryRuntime is available.
 pub fn loadContextWithRuntime(
     allocator: std.mem.Allocator,
+    mem: Memory,
     rt: *MemoryRuntime,
     user_message: []const u8,
     session_id: ?[]const u8,
@@ -135,25 +251,73 @@ pub fn loadContextWithRuntime(
     };
     defer memory_mod.retrieval.freeCandidates(allocator, candidates);
 
-    if (candidates.len == 0) return try allocator.dupe(u8, "");
+    var global_entries: ?[]MemoryEntry = null;
+    if (session_id != null) {
+        global_entries = mem.recall(allocator, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch null;
+    }
+    defer if (global_entries) |entries| memory_mod.freeEntries(allocator, entries);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
     var wrote_header = false;
+    var has_priority_context = false;
+    var timeline_added: usize = 0;
+
+    const summary_latest_key = try summaryLatestKeyForSession(allocator, session_id);
+    defer if (summary_latest_key) |key| allocator.free(key);
+    const current_timeline_prefix = try timelinePrefixForSession(allocator, session_id);
+    defer if (current_timeline_prefix) |prefix| allocator.free(prefix);
+
+    if (summary_latest_key) |key| {
+        if (try appendDirectEntry(allocator, mem, w, &wrote_header, key)) {
+            has_priority_context = true;
+        }
+    }
+    if (try appendDirectEntry(allocator, mem, w, &wrote_header, "context_anchor_current")) {
+        has_priority_context = true;
+    }
+
+    if (global_entries) |entries| {
+        for (entries) |entry| {
+            if (!isDurableFactKey(entry.key)) continue;
+            try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+            has_priority_context = true;
+            if (buf.items.len >= MAX_CONTEXT_BYTES) break;
+        }
+    }
+
+    if (buf.items.len < MAX_CONTEXT_BYTES and global_entries != null) {
+        if (global_entries) |entries| {
+            for (entries) |entry| {
+                if (!isTimelineSummaryKey(entry.key)) continue;
+                if (current_timeline_prefix) |prefix| {
+                    if (std.mem.startsWith(u8, entry.key, prefix)) continue;
+                }
+                try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+                timeline_added += 1;
+                has_priority_context = true;
+                if (timeline_added >= TIMELINE_FALLBACK_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
+            }
+        }
+    }
 
     for (candidates) |cand| {
-        if (memory_mod.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet) or memory_mod.isMarkdownLineKey(cand.key)) continue;
-        if (!wrote_header) {
-            try w.writeAll("[Memory context]\n");
-            wrote_header = true;
-        }
-        const snippet = truncateUtf8(cand.snippet, MAX_CONTEXT_BYTES / 2);
-        const sanitized = try sanitizeMemoryText(allocator, snippet);
-        defer allocator.free(sanitized);
-        try std.fmt.format(w, "- {s}: {s}\n", .{ cand.key, sanitized });
+        if (shouldSkipGenericEntry(cand.key, cand.snippet, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+        try appendContextLine(allocator, w, &wrote_header, cand.key, cand.snippet);
         if (buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
+
+    if (buf.items.len < MAX_CONTEXT_BYTES and global_entries != null) {
+        if (global_entries) |entries| {
+            for (entries) |entry| {
+                if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+                try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+                if (buf.items.len >= MAX_CONTEXT_BYTES) break;
+            }
+        }
+    }
+
     if (!wrote_header) return try allocator.dupe(u8, "");
     try w.writeAll("\n");
 
@@ -187,7 +351,7 @@ pub fn enrichMessageWithRuntime(
     session_id: ?[]const u8,
 ) ![]const u8 {
     const context = if (mem_rt) |rt|
-        try loadContextWithRuntime(allocator, rt, user_message, session_id)
+        try loadContextWithRuntime(allocator, mem, rt, user_message, session_id)
     else
         try loadContext(allocator, mem, user_message, session_id);
 
@@ -243,6 +407,82 @@ test "loadContext with session_id includes global entries but not other sessions
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_a_fact") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "global_fact") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_b_fact") == null);
+}
+
+test "loadContext prefers summary latest and anchor for current session" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:zaki-bot:user:1:main",
+        "type=summary_latest\nsession=agent:zaki-bot:user:1:main\nfocus: shipping readiness\ndecisions:\n- keep summaries compact\nopen_loops:\n- validate recall\nnext:\n- ship\n",
+        .core,
+        null,
+    );
+    try mem.store(
+        "context_anchor_current",
+        "type=context_anchor\nlast_session=agent:zaki-bot:user:1:main\nlast_summary_key=timeline_summary/agent:zaki-bot:user:1:main/1774400000\nlast_at=2026-03-25T00:00:00Z",
+        .core,
+        null,
+    );
+    try mem.store("session_fact", "current lane detail", .conversation, "agent:zaki-bot:user:1:main");
+
+    const context = try loadContext(allocator, mem, "validate shipping", "agent:zaki-bot:user:1:main");
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "summary_latest/agent:zaki-bot:user:1:main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "shipping readiness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "context_anchor_current") != null);
+}
+
+test "loadContext includes bounded global timeline summaries from other sessions" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:zaki-bot:user:1:main",
+        "type=summary_latest\nsession=agent:zaki-bot:user:1:main\nfocus: current work\ndecisions:\n- none\nopen_loops:\n- none\nnext:\n- continue\n",
+        .core,
+        null,
+    );
+    try mem.store("timeline_summary/agent:zaki-bot:user:1:telegram/1", "focus: shipping telegram shipping handoff\n\ndecisions:\n- plan rollout\nopen_loops:\n- verify reply latency\nnext:\n- continue on app", .daily, null);
+    try mem.store("timeline_summary/agent:zaki-bot:user:1:other/2", "focus: shipping other channel shipping alignment\n\ndecisions:\n- align settings\nopen_loops:\n- none\nnext:\n- move forward", .daily, null);
+    try mem.store("timeline_summary/agent:zaki-bot:user:1:third/3", "focus: unrelated archive thread\n\ndecisions:\n- none\nopen_loops:\n- none\nnext:\n- none", .daily, null);
+
+    const context = try loadContext(allocator, mem, "shipping", "agent:zaki-bot:user:1:main");
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "timeline_summary/agent:zaki-bot:user:1:telegram/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "timeline_summary/agent:zaki-bot:user:1:other/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "timeline_summary/agent:zaki-bot:user:1:third/3") == null);
+}
+
+test "loadContext skips checkpoint style entries when summary context exists" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:zaki-bot:user:1:main",
+        "type=summary_latest\nsession=agent:zaki-bot:user:1:main\nfocus: compact continuity\ndecisions:\n- prefer summaries\nopen_loops:\n- none\nnext:\n- continue\n",
+        .core,
+        null,
+    );
+    try mem.store("session_checkpoint_1774400000", "type=session_checkpoint\nrecent_user:\n- shipping\n", .daily, null);
+
+    const context = try loadContext(allocator, mem, "shipping", "agent:zaki-bot:user:1:main");
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "summary_latest/agent:zaki-bot:user:1:main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "session_checkpoint_1774400000") == null);
 }
 
 test "truncateUtf8 does not split multi-byte sequences" {
@@ -389,7 +629,7 @@ test "loadContextWithRuntime filters markdown line keys" {
         ._allocator = allocator,
     };
 
-    const context = try loadContextWithRuntime(allocator, &rt, "ZAKI", null);
+    const context = try loadContextWithRuntime(allocator, mem, &rt, "ZAKI", null);
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "MEMORY:8") == null);
@@ -457,7 +697,7 @@ test "loadContextWithRuntime returns empty when only internal entries match" {
         ._allocator = allocator,
     };
 
-    const context = try loadContextWithRuntime(allocator, &rt, "привет", null);
+    const context = try loadContextWithRuntime(allocator, mem, &rt, "привет", null);
     defer allocator.free(context);
     try std.testing.expectEqualStrings("", context);
 }

@@ -587,9 +587,150 @@ fn lifecycleSummaryTimeoutSecs(self: anytype) u64 {
     return @max(@as(u64, 1), @min(configured, hard_cap));
 }
 
-fn lifecycleSummaryFallback(self: anytype, checkpoint_content: []const u8) ?[]u8 {
-    const max_len: usize = @min(checkpoint_content.len, 1200);
-    return self.allocator.dupe(u8, checkpoint_content[0..max_len]) catch null;
+fn effectiveSummarizerConfig(self: anytype) memory_mod.SummarizerConfig {
+    if (self.mem_rt) |rt| return rt.summarizerConfig();
+    return .{
+        .enabled = true,
+        .window_size_tokens = 4000,
+        .summary_max_tokens = 500,
+        .auto_extract_semantic = true,
+    };
+}
+
+fn firstCheckpointBullet(checkpoint_content: []const u8, section: []const u8) ?[]const u8 {
+    const idx = std.mem.indexOf(u8, checkpoint_content, section) orelse return null;
+    const body = checkpoint_content[idx + section.len ..];
+    var iter = std.mem.splitScalar(u8, body, '\n');
+    while (iter.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        if (!std.mem.startsWith(u8, line, "- ")) {
+            if (std.mem.endsWith(u8, line, ":")) break;
+            continue;
+        }
+        return line[2..];
+    }
+    return null;
+}
+
+fn summarySectionValue(summary_text: []const u8, prefix: []const u8) []const u8 {
+    var iter = std.mem.splitScalar(u8, summary_text, '\n');
+    while (iter.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (std.mem.startsWith(u8, line, prefix)) {
+            return std.mem.trim(u8, line[prefix.len..], " \t\r\n");
+        }
+    }
+    return "none";
+}
+
+fn buildStructuredFallbackSummary(self: anytype, checkpoint_content: []const u8) ?[]u8 {
+    const focus = firstCheckpointBullet(checkpoint_content, "recent_user:\n") orelse
+        firstCheckpointBullet(checkpoint_content, "recent_assistant:\n") orelse
+        "recent session recap";
+    return std.fmt.allocPrint(
+        self.allocator,
+        "focus: {s}\n" ++
+            "decisions:\n- none\n" ++
+            "open_loops:\n- none\n" ++
+            "next:\n- review transcript if exact detail is needed\n",
+        .{truncateUtf8(focus, 220)},
+    ) catch null;
+}
+
+fn buildSessionEndSummaryEntries(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    checkpoint_content: []const u8,
+    summarizer_cfg: memory_mod.SummarizerConfig,
+) ![]memory_mod.MessageEntry {
+    const full_entries = try allocator.alloc(memory_mod.MessageEntry, self.history.items.len);
+    errdefer allocator.free(full_entries);
+    for (self.history.items, 0..) |item, idx| {
+        full_entries[idx] = .{
+            .role = roleLabel(item.role),
+            .content = item.content,
+        };
+    }
+
+    if (!memory_mod.shouldSummarize(full_entries, summarizer_cfg)) {
+        return full_entries;
+    }
+
+    allocator.free(full_entries);
+
+    var selected: [4]usize = undefined;
+    var count: usize = 0;
+    var idx = self.history.items.len;
+    while (idx > 0 and count < selected.len) {
+        idx -= 1;
+        const item = self.history.items[idx];
+        if (item.role != .user and item.role != .assistant) continue;
+        selected[count] = idx;
+        count += 1;
+    }
+
+    const entries = try allocator.alloc(memory_mod.MessageEntry, count + 1);
+    entries[0] = .{
+        .role = "system",
+        .content = checkpoint_content,
+    };
+
+    var out_idx: usize = 1;
+    var rev = count;
+    while (rev > 0) {
+        rev -= 1;
+        const item = self.history.items[selected[rev]];
+        entries[out_idx] = .{
+            .role = roleLabel(item.role),
+            .content = item.content,
+        };
+        out_idx += 1;
+    }
+    return entries;
+}
+
+fn updateTimelineIndex(
+    allocator: std.mem.Allocator,
+    mem: memory_mod.Memory,
+    rt: ?*memory_mod.MemoryRuntime,
+    session_id: []const u8,
+    now_iso: []const u8,
+    focus: []const u8,
+    timeline_key: []const u8,
+) void {
+    const new_line = std.fmt.allocPrint(
+        allocator,
+        "- at={s} session={s} focus={s} key={s}",
+        .{ now_iso, session_id, truncateUtf8(focus, 140), timeline_key },
+    ) catch return;
+    defer allocator.free(new_line);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll(new_line) catch return;
+    w.writeByte('\n') catch return;
+
+    if (mem.get(allocator, "timeline_index/current") catch null) |existing| {
+        defer existing.deinit(allocator);
+        var kept: usize = 1;
+        var iter = std.mem.splitScalar(u8, existing.content, '\n');
+        while (iter.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r\n");
+            if (line.len == 0) continue;
+            if (std.mem.eql(u8, line, new_line)) continue;
+            if (kept >= 32) break;
+            w.writeAll(line) catch break;
+            w.writeByte('\n') catch break;
+            kept += 1;
+        }
+    }
+
+    const content = out.toOwnedSlice(allocator) catch return;
+    defer allocator.free(content);
+    mem.store("timeline_index/current", content, .core, null) catch return;
+    if (rt) |mem_rt| mem_rt.syncVectorAfterStore(allocator, "timeline_index/current", content);
 }
 
 fn emitLifecycleSummarizerStage(self: anytype, duration_ms: u64, summarized_count: usize) void {
@@ -601,44 +742,24 @@ fn emitLifecycleSummarizerStage(self: anytype, duration_ms: u64, summarized_coun
     self.observer.recordEvent(&event);
 }
 
-fn maybePersistLifecycleSummary(self: anytype, checkpoint_content: []const u8, session_id: []const u8, reason: []const u8, now_s: i64) void {
+fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, session_id: []const u8, reason: []const u8, now_s: i64, now_iso: []const u8) void {
     const mem = self.mem orelse return;
-    const rt = self.mem_rt orelse return;
-    const summarizer_cfg = rt.summarizerConfig();
+    const rt = self.mem_rt;
+    const summarizer_cfg = effectiveSummarizerConfig(self);
     if (!summarizer_cfg.enabled) return;
-    if (self.history.items.len <= 2) return;
 
-    if (self.lifecycle_summarizer_last_attempt_s != 0 and self.lifecycle_summarizer_cooldown_secs > 0) {
-        const elapsed: u64 = @intCast(@max(@as(i64, 0), now_s - self.lifecycle_summarizer_last_attempt_s));
-        if (elapsed < self.lifecycle_summarizer_cooldown_secs) {
-            return;
-        }
-    }
-
-    const entries = self.allocator.alloc(memory_mod.MessageEntry, self.history.items.len) catch return;
+    const entries = buildSessionEndSummaryEntries(self, self.allocator, checkpoint_content, summarizer_cfg) catch return;
     defer self.allocator.free(entries);
-    for (self.history.items, 0..) |item, idx| {
-        entries[idx] = .{
-            .role = roleLabel(item.role),
-            .content = item.content,
-        };
-    }
-
-    if (!memory_mod.shouldSummarize(entries, summarizer_cfg)) return;
-    const partition = memory_mod.summarizer.partitionMessages(entries, summarizer_cfg);
-    if (partition.to_summarize == 0) return;
-
-    self.lifecycle_summarizer_last_attempt_s = now_s;
     const summarize_start_ms = std.time.milliTimestamp();
     defer {
         const duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - summarize_start_ms));
-        emitLifecycleSummarizerStage(self, duration_ms, partition.to_summarize);
+        emitLifecycleSummarizerStage(self, duration_ms, entries.len);
     }
 
-    const prompt = memory_mod.buildSummarizationPrompt(self.allocator, entries, partition.to_summarize) catch return;
+    const prompt = memory_mod.buildSummarizationPrompt(self.allocator, entries, entries.len) catch return;
     defer self.allocator.free(prompt);
 
-    const summary_system = "Summarize the session checkpoint. Preserve durable facts, decisions, commitments, and open loops. Keep it concise.";
+    const summary_system = "Summarize the ended session into a compact continuity object. Preserve focus, decisions, open loops, next steps, and long-lived facts. Follow the required plain-text structure exactly.";
     var summary_messages: [2]providers.ChatMessage = .{
         .{ .role = .system, .content = summary_system },
         .{ .role = .user, .content = prompt },
@@ -663,9 +784,9 @@ fn maybePersistLifecycleSummary(self: anytype, checkpoint_content: []const u8, s
             self.model_name,
             0.2,
         ) catch {
-            summary_text_owned = lifecycleSummaryFallback(self, checkpoint_content);
+            summary_text_owned = buildStructuredFallbackSummary(self, checkpoint_content);
             if (summary_text_owned) |owned| {
-                log.warn("memory.lifecycle_summarizer fallback=session_checkpoint reason=provider_error session={s} reason_tag={s}", .{
+                log.warn("memory.session_summary fallback=structured reason=provider_error session={s} reason_tag={s}", .{
                     session_id,
                     reason,
                 });
@@ -690,9 +811,9 @@ fn maybePersistLifecycleSummary(self: anytype, checkpoint_content: []const u8, s
         }
 
         parsed_summary = memory_mod.parseSummaryResponse(self.allocator, response.contentOrEmpty(), summarizer_cfg) catch {
-            summary_text_owned = lifecycleSummaryFallback(self, checkpoint_content);
+            summary_text_owned = buildStructuredFallbackSummary(self, checkpoint_content);
             if (summary_text_owned) |owned| {
-                log.warn("memory.lifecycle_summarizer fallback=session_checkpoint reason=parse_error session={s} reason_tag={s}", .{
+                log.warn("memory.session_summary fallback=structured reason=parse_error session={s} reason_tag={s}", .{
                     session_id,
                     reason,
                 });
@@ -711,8 +832,34 @@ fn maybePersistLifecycleSummary(self: anytype, checkpoint_content: []const u8, s
     defer self.allocator.free(summary_key);
 
     if (mem.store(summary_key, content, .conversation, session_id)) |_| {
-        rt.syncVectorAfterStore(self.allocator, summary_key, content);
+        if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, summary_key, content);
     } else |_| {}
+
+    const timeline_key = std.fmt.allocPrint(
+        self.allocator,
+        "timeline_summary/{s}/{d}",
+        .{ session_id, now_s },
+    ) catch return;
+    defer self.allocator.free(timeline_key);
+    if (mem.store(timeline_key, content, .daily, null)) |_| {
+        if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, timeline_key, content);
+    } else |_| {}
+
+    const focus = summarySectionValue(content, "focus:");
+    const next = summarySectionValue(content, "next:");
+    const latest_key = std.fmt.allocPrint(self.allocator, "summary_latest/{s}", .{session_id}) catch return;
+    defer self.allocator.free(latest_key);
+    const latest_content = std.fmt.allocPrint(
+        self.allocator,
+        "type=summary_latest\nsession={s}\nsource_key={s}\nat={s}\n{s}",
+        .{ session_id, timeline_key, now_iso, content },
+    ) catch return;
+    defer self.allocator.free(latest_content);
+    if (mem.store(latest_key, latest_content, .core, null)) |_| {
+        if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, latest_key, latest_content);
+    } else |_| {}
+
+    updateTimelineIndex(self.allocator, mem, rt, session_id, now_iso, focus, timeline_key);
 
     if (parsed_summary) |parsed| {
         for (parsed.extracted_facts, 0..) |fact, idx| {
@@ -723,20 +870,22 @@ fn maybePersistLifecycleSummary(self: anytype, checkpoint_content: []const u8, s
             ) catch continue;
             defer self.allocator.free(fact_key);
             if (mem.store(fact_key, fact.content, .core, null)) |_| {
-                rt.syncVectorAfterStore(self.allocator, fact_key, fact.content);
+                if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, fact_key, fact.content);
             } else |_| {}
         }
-        log.info("memory.lifecycle_summarizer status=ok session={s} reason={s} summarized={d} facts={d}", .{
+        log.info("memory.session_summary status=ok session={s} reason={s} entries={d} facts={d} next={s}", .{
             session_id,
             reason,
-            partition.to_summarize,
+            entries.len,
             parsed.extracted_facts.len,
+            next,
         });
     } else {
-        log.info("memory.lifecycle_summarizer status=fallback session={s} reason={s} summarized={d}", .{
+        log.info("memory.session_summary status=fallback session={s} reason={s} entries={d} next={s}", .{
             session_id,
             reason,
-            partition.to_summarize,
+            entries.len,
+            next,
         });
     }
 }
@@ -783,8 +932,8 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
 
     const anchor_content = std.fmt.allocPrint(
         self.allocator,
-        "type=context_anchor\nlast_session={s}\nlast_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\nlast_at={s}",
-        .{ session_id, reason, self.model_name, checkpoint_key, now_iso },
+        "type=context_anchor\nlast_session={s}\nlast_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\nlast_summary_key=timeline_summary/{s}/{d}\nlast_at={s}",
+        .{ session_id, reason, self.model_name, checkpoint_key, session_id, now_s, now_iso },
     ) catch return;
     defer self.allocator.free(anchor_content);
     mem.store("context_anchor_current", anchor_content, .core, null) catch return;
@@ -792,7 +941,7 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
         rt.syncVectorAfterStore(self.allocator, "context_anchor_current", anchor_content);
     }
 
-    maybePersistLifecycleSummary(self, checkpoint_content, session_id, reason, now_s);
+    persistSessionSemanticSummary(self, checkpoint_content, session_id, reason, now_s, now_iso);
 }
 
 fn clearSessionState(self: anytype, reason: []const u8) void {

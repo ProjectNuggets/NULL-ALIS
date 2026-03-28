@@ -2990,11 +2990,54 @@ test "Agent clearHistory then add messages" {
 
 // ── Slash Command Tests ──────────────────────────────────────────
 
+const TestSummaryProvider = struct {
+    fn chatWithSystem(_: *anyopaque, alloc: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return alloc.dupe(
+            u8,
+            "focus: test summary\n" ++
+                "decisions:\n- none\n" ++
+                "open_loops:\n- none\n" ++
+                "next:\n- none\n",
+        );
+    }
+
+    fn chat(_: *anyopaque, alloc: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        return .{
+            .content = try alloc.dupe(
+                u8,
+                "focus: test summary\n" ++
+                    "decisions:\n- none\n" ++
+                    "open_loops:\n- none\n" ++
+                    "next:\n- none\n",
+            ),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "test-summary-provider";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+var test_summary_provider_state: u8 = 0;
+const test_summary_provider_vtable = providers.Provider.VTable{
+    .chatWithSystem = TestSummaryProvider.chatWithSystem,
+    .chat = TestSummaryProvider.chat,
+    .supportsNativeTools = TestSummaryProvider.supportsNativeTools,
+    .getName = TestSummaryProvider.getName,
+    .deinit = TestSummaryProvider.deinitFn,
+};
+
 fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
     var noop = observability.NoopObserver{};
     return Agent{
         .allocator = allocator,
-        .provider = undefined,
+        .provider = .{ .ptr = @ptrCast(&test_summary_provider_state), .vtable = &test_summary_provider_vtable },
         .tools = &.{},
         .tool_specs = try allocator.alloc(ToolSpec, 0),
         .mem = null,
@@ -3178,7 +3221,7 @@ test "slash /new clears history" {
     try std.testing.expect(!agent.has_system_prompt);
 }
 
-test "slash /new writes session checkpoint and context anchor" {
+test "slash /new writes checkpoint, summary objects, and context anchor" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
@@ -3227,6 +3270,42 @@ test "slash /new writes session checkpoint and context anchor" {
     defer anchor.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_session=agent:zaki-bot:user:1:main") != null);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
+
+    const session_entries = try mem.list(allocator, .conversation, "agent:zaki-bot:user:1:main");
+    defer memory_mod.freeEntries(allocator, session_entries);
+    var found_session_summary = false;
+    for (session_entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "session_summary/agent:zaki-bot:user:1:main/")) continue;
+        found_session_summary = true;
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "focus:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "decisions:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "open_loops:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "next:") != null);
+        break;
+    }
+    try std.testing.expect(found_session_summary);
+
+    var found_timeline_summary = false;
+    for (daily_entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "timeline_summary/agent:zaki-bot:user:1:main/")) continue;
+        found_timeline_summary = true;
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "focus:") != null);
+        break;
+    }
+    try std.testing.expect(found_timeline_summary);
+
+    const latest_key = "summary_latest/agent:zaki-bot:user:1:main";
+    const latest = (try mem.get(allocator, latest_key)) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "source_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
+
+    const timeline_index = (try mem.get(allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
+    defer timeline_index.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "session=agent:zaki-bot:user:1:main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
 }
 
 test "slash /new with empty session does not write checkpoint" {
@@ -3254,6 +3333,53 @@ test "slash /new with empty session does not write checkpoint" {
         defer entry.deinit(allocator);
         return error.TestUnexpectedResult;
     }
+    const latest = try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:main");
+    if (latest) |entry| {
+        defer entry.deinit(allocator);
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "persistSessionCheckpoint caps timeline index to 32 descriptors" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.auto_save = true;
+
+    var i: usize = 0;
+    while (i < 35) : (i += 1) {
+        agent.clearHistory();
+        const session_id = try std.fmt.allocPrint(allocator, "agent:zaki-bot:user:1:thread:test-{d}", .{i});
+        defer allocator.free(session_id);
+        agent.memory_session_id = session_id;
+
+        const message = try std.fmt.allocPrint(allocator, "message {d}", .{i});
+        defer allocator.free(message);
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try allocator.dupe(u8, message),
+        });
+
+        agent.persistSessionCheckpoint("new");
+    }
+
+    const timeline_index = (try mem.get(allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
+    defer timeline_index.deinit(allocator);
+
+    var count: usize = 0;
+    var iter = std.mem.splitScalar(u8, timeline_index.content, '\n');
+    while (iter.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 32), count);
 }
 
 test "slash /reset clears history and switches model" {

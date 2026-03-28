@@ -596,6 +596,17 @@ var test_noop_observer_impl = observability.NoopObserver{};
 const MockProvider = struct {
     response: []const u8,
 
+    const structured_summary_response =
+        \\focus: current session continuity
+        \\decisions:
+        \\- none
+        \\open_loops:
+        \\- none
+        \\next:
+        \\- continue
+        \\Key fact: session continuity preserved
+    ;
+
     const vtable = Provider.VTable{
         .chatWithSystem = mockChatWithSystem,
         .chat = mockChat,
@@ -610,25 +621,27 @@ const MockProvider = struct {
 
     fn mockChatWithSystem(
         ptr: *anyopaque,
-        _: Allocator,
+        allocator: Allocator,
         _: ?[]const u8,
-        _: []const u8,
-        _: []const u8,
+        system_prompt: []const u8,
+        user_prompt: []const u8,
         _: f64,
     ) anyerror![]const u8 {
         const self: *MockProvider = @ptrCast(@alignCast(ptr));
-        return self.response;
+        const payload = if (isSummaryRequest(system_prompt, user_prompt)) structured_summary_response else self.response;
+        return allocator.dupe(u8, payload);
     }
 
     fn mockChat(
         ptr: *anyopaque,
         allocator: Allocator,
-        _: providers.ChatRequest,
+        request: providers.ChatRequest,
         _: []const u8,
         _: f64,
     ) anyerror!providers.ChatResponse {
         const self: *MockProvider = @ptrCast(@alignCast(ptr));
-        return .{ .content = try allocator.dupe(u8, self.response) };
+        const payload = if (chatRequestIsSummary(request)) structured_summary_response else self.response;
+        return .{ .content = try allocator.dupe(u8, payload) };
     }
 
     fn mockSupportsNativeTools(_: *anyopaque) bool {
@@ -637,6 +650,19 @@ const MockProvider = struct {
 
     fn mockGetName(_: *anyopaque) []const u8 {
         return "mock";
+    }
+
+    fn isSummaryRequest(system_prompt: []const u8, user_prompt: []const u8) bool {
+        return std.mem.indexOf(u8, system_prompt, "compact continuity object") != null or
+            std.mem.indexOf(u8, user_prompt, "--- BEGIN CONVERSATION ---") != null;
+    }
+
+    fn chatRequestIsSummary(request: providers.ChatRequest) bool {
+        for (request.messages) |message| {
+            if (std.mem.indexOf(u8, message.content, "compact continuity object") != null) return true;
+            if (std.mem.indexOf(u8, message.content, "--- BEGIN CONVERSATION ---") != null) return true;
+        }
+        return false;
     }
 
     fn mockDeinit(_: *anyopaque) void {}
@@ -1233,6 +1259,15 @@ test "evictIdle persists checkpoint before removing idle session" {
     const anchor = (try mem.get(testing.allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=idle_evict") != null);
+    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/evict:checkpoint/") != null);
+
+    const latest = (try mem.get(testing.allocator, "summary_latest/evict:checkpoint")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
+
+    const timeline_index = (try mem.get(testing.allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
+    defer timeline_index.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, timeline_index.content, "session=evict:checkpoint") != null);
 }
 
 test "evictIdle preserves recent sessions" {
@@ -1577,6 +1612,51 @@ test "ttl recycle persists session checkpoint before replacement" {
     const anchor = (try mem.get(testing.allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=ttl_recycle") != null);
+    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/ttl:checkpoint/") != null);
+
+    const latest = (try mem.get(testing.allocator, "summary_latest/ttl:checkpoint")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
+}
+
+test "evictIdle with expired ttl writes summary objects before removal" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const first_reply = try sm.processMessage("ttl:evict", "hello", null);
+    defer testing.allocator.free(first_reply);
+    try testing.expectEqualStrings("ok", first_reply);
+
+    const session = try sm.getOrCreate("ttl:evict");
+    session.agent.session_ttl_secs = 1;
+    session.last_active = std.time.timestamp() - 1000;
+
+    const evicted = sm.evictIdle(3600);
+    try testing.expectEqual(@as(usize, 1), evicted);
+
+    const daily_entries = try mem.list(testing.allocator, .daily, null);
+    defer memory_mod.freeEntries(testing.allocator, daily_entries);
+
+    var found_ttl_summary = false;
+    for (daily_entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "timeline_summary/ttl:evict/")) continue;
+        if (std.mem.indexOf(u8, entry.content, "focus:") == null) continue;
+        found_ttl_summary = true;
+        break;
+    }
+    try testing.expect(found_ttl_summary);
+
+    const latest = (try mem.get(testing.allocator, "summary_latest/ttl:evict")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "source_key=timeline_summary/ttl:evict/") != null);
 }
 
 test "activation_mode mention blocks unmentioned group turn" {
