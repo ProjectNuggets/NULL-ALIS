@@ -333,7 +333,7 @@ fn normalizeJobForRequest(
                 _ = try replaceOwnedString(allocator, &job.id, target_id);
             }
             _ = try replaceOwnedString(allocator, &job.command, request.command);
-            return applyTenantDefaults(scheduler, allocator, job_id, request.command);
+            return applyTenantDefaults(scheduler, allocator, job.id, request.command);
         },
     }
 }
@@ -556,12 +556,10 @@ fn syncOneShotTiming(
 fn ensureBackgroundRequestAuthorized(
     allocator: std.mem.Allocator,
     workspace_dir: ?[]const u8,
-    scheduler: *CronScheduler,
     request: EnsureRequest,
 ) bool {
     const turn_ctx = root.getTurnContext();
     if (!root.isBackgroundTurnOrigin(turn_ctx.origin)) return true;
-    if (findEnsureWinner(scheduler, request, std.time.timestamp()) != null) return true;
     const dir = workspace_dir orelse return false;
     return heartbeatPolicyAllowsRequest(allocator, dir, request);
 }
@@ -573,8 +571,8 @@ fn ensureScheduleJob(
     workspace_dir: ?[]const u8,
     request: EnsureRequest,
 ) !ToolResult {
-    if (!ensureBackgroundRequestAuthorized(allocator, workspace_dir, scheduler, request)) {
-        return ToolResult.fail("Background schedule ensure requires a matching explicit job in HEARTBEAT automation policy or existing scheduler state");
+    if (!ensureBackgroundRequestAuthorized(allocator, workspace_dir, request)) {
+        return ToolResult.fail("Background schedule ensure requires a matching explicit job in HEARTBEAT automation policy");
     }
 
     const now_s = std.time.timestamp();
@@ -656,7 +654,7 @@ fn applyTenantDefaults(
 ) !void {
     const tenant = root.getTenantContext();
     if (tenant.numeric_user_id == null) return;
-    const job = scheduler.getMutableJob(job_id) orelse return;
+    const job = scheduler.getMutableJob(job_id) orelse return error.JobNotFound;
     job.session_target = .isolated;
 
     const turn = message_tool.MessageTool.getTurnContext();
@@ -1214,7 +1212,7 @@ fn schedule_test_error_is_heap_owned(error_msg: []const u8) bool {
     if (std.mem.eql(u8, error_msg, "Missing 'id' parameter for cancel action")) return false;
     if (std.mem.eql(u8, error_msg, "Missing 'id' parameter")) return false;
     if (std.mem.eql(u8, error_msg, "Failed to load scheduler state")) return false;
-    if (std.mem.eql(u8, error_msg, "Background schedule ensure requires a matching explicit job in HEARTBEAT automation policy or existing scheduler state")) return false;
+    if (std.mem.eql(u8, error_msg, "Background schedule ensure requires a matching explicit job in HEARTBEAT automation policy")) return false;
     return true;
 }
 
@@ -1433,7 +1431,40 @@ test "schedule ensure blocks background auto-create without automation policy" {
     defer free_schedule_test_output_if_owned(result.output);
     defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Automation Policy") != null or std.mem.indexOf(u8, result.error_msg.?, "scheduler state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "automation policy") != null);
+}
+
+test "schedule ensure blocks background repair without automation policy even when job exists" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addJob("0 8 * * *", "echo status");
+    job.enabled = false;
+    job.paused = true;
+    try cron.saveJobs(&scheduler);
+
+    try writeScheduleTestHeartbeat(store.tmp, "# HEARTBEAT.md\n\nGeneral notes only.\n");
+
+    var cfg = config_mod.Config{
+        .workspace_dir = store.workspace_dir,
+        .config_path = "/tmp/nullalis-test-config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var st = ScheduleTool{ .config = &cfg };
+    const t = st.tool();
+    root.setTurnContext(.{ .origin = .heartbeat });
+    defer root.clearTurnContext();
+
+    const parsed = try root.parseTestArgs("{\"action\":\"ensure\",\"kind\":\"command\",\"expression\":\"0 8 * * *\",\"command\":\"echo status\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "automation policy") != null);
 }
 
 test "schedule ensure creates canonical brief job from automation policy" {
@@ -1546,6 +1577,144 @@ test "schedule ensure resumes paused recurring job" {
     const resumed = loaded.getJob(job.id) orelse return error.TestUnexpectedResult;
     try std.testing.expect(resumed.enabled);
     try std.testing.expect(!resumed.paused);
+}
+
+test "schedule ensure repairs paused recurring job from automation policy" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addJob("0 8 * * *", "echo status");
+    job.enabled = false;
+    job.paused = true;
+    try cron.saveJobs(&scheduler);
+
+    try writeScheduleTestHeartbeat(store.tmp,
+        \\# HEARTBEAT.md
+        \\
+        \\## Automation Policy
+        \\
+        \\```json
+        \\{"jobs":[{"kind":"command","expression":"0 8 * * *","command":"echo status"}]}
+        \\```
+    );
+
+    var cfg = config_mod.Config{
+        .workspace_dir = store.workspace_dir,
+        .config_path = "/tmp/nullalis-test-config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var st = ScheduleTool{ .config = &cfg };
+    const t = st.tool();
+    root.setTurnContext(.{ .origin = .heartbeat });
+    defer root.clearTurnContext();
+
+    const parsed = try root.parseTestArgs("{\"action\":\"ensure\",\"kind\":\"command\",\"expression\":\"0 8 * * *\",\"command\":\"echo status\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
+    try std.testing.expect(result.success);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 16, true);
+    defer loaded.deinit();
+    try cron.loadJobsStrict(&loaded);
+    const resumed = loaded.getJob(job.id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(resumed.enabled);
+    try std.testing.expect(!resumed.paused);
+}
+
+test "schedule create with explicit id preserves tenant reminder normalization" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
+
+    var cfg = config_mod.Config{
+        .workspace_dir = store.workspace_dir,
+        .config_path = "/tmp/nullalis-test-config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    root.setTenantContext(.{
+        .user_id = "15",
+        .numeric_user_id = 15,
+        .session_key = "agent:zaki-bot:user:15:main",
+    });
+    defer root.clearTenantContext();
+
+    root.setMessageTurnContext(.{
+        .channel = "telegram",
+        .chat_id = "chat-15",
+    });
+    defer root.clearMessageTurnContext();
+
+    var st = ScheduleTool{ .config = &cfg };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\":\"create\",\"id\":\"custom-reminder\",\"expression\":\"0 8 * * *\",\"command\":\"message \\\"Drink water\\\"\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
+    try std.testing.expect(result.success);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 16, true);
+    defer loaded.deinit();
+    try cron.loadJobsStrict(&loaded);
+    const job = loaded.getJob("custom-reminder") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(cron.JobType.agent, job.job_type);
+    try std.testing.expectEqual(cron.DeliveryMode.always, job.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expectEqualStrings("chat-15", job.delivery.to.?);
+    try std.testing.expectEqualStrings("Drink water", job.command);
+    try std.testing.expect(job.prompt != null);
+}
+
+test "schedule ensure with explicit id preserves tenant reminder normalization" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
+
+    var cfg = config_mod.Config{
+        .workspace_dir = store.workspace_dir,
+        .config_path = "/tmp/nullalis-test-config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    root.setTenantContext(.{
+        .user_id = "15",
+        .numeric_user_id = 15,
+        .session_key = "agent:zaki-bot:user:15:main",
+    });
+    defer root.clearTenantContext();
+
+    root.setMessageTurnContext(.{
+        .channel = "telegram",
+        .chat_id = "chat-15",
+    });
+    defer root.clearMessageTurnContext();
+
+    root.setTurnContext(.{ .origin = .user });
+    defer root.clearTurnContext();
+
+    var st = ScheduleTool{ .config = &cfg };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\":\"ensure\",\"id\":\"custom-reminder\",\"expression\":\"0 8 * * *\",\"command\":\"message \\\"Drink water\\\"\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
+    try std.testing.expect(result.success);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 16, true);
+    defer loaded.deinit();
+    try cron.loadJobsStrict(&loaded);
+    const job = loaded.getJob("custom-reminder") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(cron.JobType.agent, job.job_type);
+    try std.testing.expectEqual(cron.DeliveryMode.always, job.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expectEqualStrings("chat-15", job.delivery.to.?);
+    try std.testing.expectEqualStrings("Drink water", job.command);
+    try std.testing.expect(job.prompt != null);
 }
 
 test "schedule add creates recurring job" {

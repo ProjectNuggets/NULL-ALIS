@@ -1419,18 +1419,8 @@ fn runTenantSchedulerTick(
             continue;
         };
 
-        var healed_before_tick = false;
-        const numeric_user_id = parseNumericUserIdFromDirName(entry.name);
-        for (scheduler.jobs.items) |*job| {
-            const healed = selfHealMorningBriefJob(allocator, config, user_root, numeric_user_id, null, job) catch false;
-            if (healed) {
-                healed_before_tick = true;
-                log.info("scheduler.morning_brief.self_heal backend=file user={s} job={s}", .{ entry.name, job.id });
-            }
-        }
-
         const changed = scheduler.tick(now, event_bus);
-        if (changed or healed_before_tick) {
+        if (changed) {
             cron.saveJobsToPath(&scheduler, cron_path) catch |err| {
                 log.warn("tenant scheduler save failed for user={s}: {}", .{ entry.name, err });
             };
@@ -1486,13 +1476,6 @@ fn runTenantSchedulerTickPostgres(
             };
             continue;
         };
-
-        if (scheduler.jobs.items.len > 0) {
-            if (selfHealMorningBriefJob(allocator, config, user_root, job.user_id, mgr, &scheduler.jobs.items[0]) catch false) {
-                log.info("scheduler.morning_brief.self_heal backend=postgres user={d} job={s}", .{ job.user_id, scheduler.jobs.items[0].id });
-            }
-        }
-
         _ = scheduler.tick(std.time.timestamp(), event_bus);
         if (scheduler.listJobs().len == 0) {
             finish_status = "ok";
