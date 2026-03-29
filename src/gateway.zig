@@ -3865,17 +3865,40 @@ pub fn extractBody(raw: []const u8) ?[]const u8 {
     return body;
 }
 
+fn buildIncomingMessageAgentArgv(
+    allocator: std.mem.Allocator,
+    self_path: []const u8,
+    message: []const u8,
+    session_key: ?[]const u8,
+    user_id: ?[]const u8,
+) ![][]const u8 {
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ self_path, "agent", "-m", message });
+    if (session_key) |value| {
+        try argv.appendSlice(allocator, &.{ "--session", value });
+    }
+    if (user_id) |value| {
+        try argv.appendSlice(allocator, &.{ "--user-id", value });
+    }
+    return try argv.toOwnedSlice(allocator);
+}
+
 /// Process an incoming message by spawning `nullalis agent -m "..."`.
 /// Returns the agent's response text. Caller owns the returned memory.
-pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
+pub fn processIncomingMessage(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+    session_key: ?[]const u8,
+    user_id: ?[]const u8,
+) ![]u8 {
     // Find our own executable path
     var self_buf: [std.fs.max_path_bytes]u8 = undefined;
     const self_path = std.fs.selfExePath(&self_buf) catch "nullalis";
 
-    var child = std.process.Child.init(
-        &[_][]const u8{ self_path, "agent", "-m", message },
-        allocator,
-    );
+    const argv = try buildIncomingMessageAgentArgv(allocator, self_path, message, session_key, user_id);
+    defer allocator.free(argv);
+    var child = std.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
@@ -6325,7 +6348,7 @@ fn handleApiChatStreamSseConnection(
                 return true;
             };
         }
-        break :blk processIncomingMessage(root_allocator, message) catch {
+        break :blk processIncomingMessage(root_allocator, message, session_key, user_id) catch {
             _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
             sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
             return true;
@@ -6626,7 +6649,7 @@ fn handleApiRoute(
                     };
                 };
             }
-            break :blk processIncomingMessage(root_allocator, message) catch {
+            break :blk processIncomingMessage(root_allocator, message, session_key, user_id) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                 return .{
@@ -13195,6 +13218,27 @@ test "resolveChatStreamSessionKey allows non-tenant custom lanes" {
         &fallback_buf,
     );
     try std.testing.expectEqualStrings("local:bench:1", session_key);
+}
+
+test "buildIncomingMessageAgentArgv forwards tenant session context" {
+    const argv = try buildIncomingMessageAgentArgv(
+        std.testing.allocator,
+        "/tmp/nullalis",
+        "hello",
+        "agent:zaki-bot:user:1:main",
+        "1",
+    );
+    defer std.testing.allocator.free(argv);
+
+    try std.testing.expectEqual(@as(usize, 8), argv.len);
+    try std.testing.expectEqualStrings("/tmp/nullalis", argv[0]);
+    try std.testing.expectEqualStrings("agent", argv[1]);
+    try std.testing.expectEqualStrings("-m", argv[2]);
+    try std.testing.expectEqualStrings("hello", argv[3]);
+    try std.testing.expectEqualStrings("--session", argv[4]);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:main", argv[5]);
+    try std.testing.expectEqualStrings("--user-id", argv[6]);
+    try std.testing.expectEqualStrings("1", argv[7]);
 }
 
 test "parseUserChannelBindingsSubpath parses bindings collection route" {

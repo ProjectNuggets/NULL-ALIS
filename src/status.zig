@@ -45,8 +45,9 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
         cfg.memory_backend,
         if (cfg.memory_auto_save) "on" else "off",
     });
-    try w.print("Heartbeat:   {s}\n", .{
-        if (cfg.heartbeat_enabled) "enabled" else "disabled",
+    try w.print("Heartbeat:   enabled={s}, interval={d}m\n", .{
+        if (snapshot.heartbeat_enabled) "true" else "false",
+        snapshot.heartbeat_interval_minutes,
     });
     try w.print("Security:    workspace_only={s}, max_actions/hr={d}\n", .{
         if (cfg.workspace_only) "yes" else "no",
@@ -87,9 +88,7 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
     } else if (cfg.tenant.enabled and std.mem.eql(u8, cfg.state.backend, "postgres")) {
         try w.print("Runtime:     tenant runtime detected; add --user-id <id> for user-scoped integration truth\n", .{});
     }
-    try w.print("Runtime HB:  enabled={s}, interval={d}m, tenant={s}, degraded={s}\n", .{
-        if (snapshot.heartbeat_enabled) "true" else "false",
-        snapshot.heartbeat_interval_minutes,
+    try w.print("Runtime HB:  tenant={s}, degraded={s}\n", .{
         if (snapshot.tenant_enabled) "true" else "false",
         if (snapshot.degraded) "true" else "false",
     });

@@ -86,11 +86,12 @@ pub const RuntimeInfoTool = struct {
         const tenant_ctx = root.getTenantContext();
         const turn_ctx = root.getTurnContext();
         const effective_backend = root.effectiveStateBackend(self.config, tenant_ctx);
-        const scheduler_backend = schedulerTruthLabel(self.config, tenant_ctx, user_id_override);
+        const scheduler_truth = resolveSchedulerTruth(self.config, tenant_ctx, user_id_override);
+        const scheduler_backend = scheduler_truth.toSlice();
         const degraded_reason = root.degradedReason(self.config, tenant_ctx);
         const degraded = degraded_reason.len > 0;
-        const context_incomplete = std.mem.eql(u8, scheduler_backend, "context_missing");
-        const data_source = runtimeDataSourceLabel(tenant_ctx, user_id_override);
+        const context_incomplete = scheduler_truth == .context_missing;
+        const data_source = runtimeDataSourceLabel(self.config, tenant_ctx, user_id_override);
         const heartbeat_cfg = try readEffectiveHeartbeatConfig(allocator, self.config, tenant_ctx, user_id_override);
         const chat_provider_effective = normalizeProviderAlias(self.config.default_provider);
         const embedding_provider_effective = normalizeProviderAlias(self.config.memory.search.provider);
@@ -265,9 +266,9 @@ pub const RuntimeInfoTool = struct {
 
     fn buildIntegrationsJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8) ![]u8 {
         const tenant_ctx = root.getTenantContext();
-        const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
-        const context_incomplete = tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or scoped_numeric_user_id == null);
-        const data_source = runtimeDataSourceLabel(tenant_ctx, user_id_override);
+        const scheduler_truth = resolveSchedulerTruth(self.config, tenant_ctx, user_id_override);
+        const context_incomplete = scheduler_truth == .context_missing;
+        const data_source = runtimeDataSourceLabel(self.config, tenant_ctx, user_id_override);
         const chat_provider_effective = normalizeProviderAlias(self.config.default_provider);
         const embedding_provider_effective = normalizeProviderAlias(self.config.memory.search.provider);
         const chat_fallback_chain = try allocNormalizedFallbackChain(allocator, self.config.reliability.fallback_providers);
@@ -378,9 +379,10 @@ pub const RuntimeInfoTool = struct {
     fn buildSchedulerJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8) ![]u8 {
         const tenant_ctx = root.getTenantContext();
         const effective_backend = root.effectiveStateBackend(self.config, tenant_ctx);
-        const scheduler_backend = schedulerTruthLabel(self.config, tenant_ctx, user_id_override);
+        const scheduler_truth = resolveSchedulerTruth(self.config, tenant_ctx, user_id_override);
+        const scheduler_backend = scheduler_truth.toSlice();
         const scoped_user_id = resolveScopedUserId(tenant_ctx, user_id_override);
-        const context_incomplete = std.mem.eql(u8, scheduler_backend, "context_missing");
+        const context_incomplete = scheduler_truth == .context_missing;
         var lane_snapshot = try lane_metrics.snapshotBackgroundMainReroutes(allocator);
         defer lane_snapshot.deinit(allocator);
 
@@ -427,7 +429,7 @@ pub const RuntimeInfoTool = struct {
         const turn_ctx = root.getTurnContext();
         const tenant_ctx = root.getTenantContext();
         const heartbeat_cfg = try readEffectiveHeartbeatConfig(allocator, self.config, tenant_ctx, user_id_override);
-        const scheduler_truth = schedulerTruthLabel(self.config, tenant_ctx, user_id_override);
+        const scheduler_truth = resolveSchedulerTruth(self.config, tenant_ctx, user_id_override).toSlice();
 
         var runtime_available = false;
         var runtime_last_run_s: ?i64 = null;
@@ -618,11 +620,40 @@ const OwnershipLeaseSnapshot = struct {
     }
 };
 
-fn runtimeDataSourceLabel(tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) []const u8 {
+const SchedulerTruth = enum {
+    postgres,
+    context_missing,
+    file,
+
+    fn toSlice(self: @This()) []const u8 {
+        return switch (self) {
+            .postgres => "postgres",
+            .context_missing => "context_missing",
+            .file => "file",
+        };
+    }
+};
+
+fn resolveSchedulerTruth(
+    config: *const config_mod.Config,
+    tenant_ctx: root.ToolTenantContext,
+    user_id_override: ?[]const u8,
+) SchedulerTruth {
     const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
-    if (tenant_ctx.state_mgr != null and scoped_numeric_user_id != null) return "postgres";
-    if (tenant_ctx.expect_postgres_state) return "context_missing";
-    return "file_fallback";
+    if (tenant_ctx.state_mgr != null and scoped_numeric_user_id != null) return .postgres;
+
+    const tenant_scope_requested = config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres") and
+        (tenant_ctx.expect_postgres_state or resolveScopedUserId(tenant_ctx, user_id_override) != null);
+    if (tenant_scope_requested) return .context_missing;
+    return .file;
+}
+
+fn runtimeDataSourceLabel(
+    config: *const config_mod.Config,
+    tenant_ctx: root.ToolTenantContext,
+    user_id_override: ?[]const u8,
+) []const u8 {
+    return resolveSchedulerTruth(config, tenant_ctx, user_id_override).toSlice();
 }
 
 fn normalizeProviderAlias(provider_name: []const u8) []const u8 {
@@ -1122,19 +1153,6 @@ fn resolveScopedUserId(tenant_ctx: root.ToolTenantContext, user_id_override: ?[]
     return tenant_ctx.user_id;
 }
 
-fn schedulerTruthLabel(
-    config: *const config_mod.Config,
-    tenant_ctx: root.ToolTenantContext,
-    user_id_override: ?[]const u8,
-) []const u8 {
-    const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
-    if (tenant_ctx.state_mgr != null and scoped_numeric_user_id != null) return "postgres";
-    const tenant_scope_requested = config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres") and
-        (tenant_ctx.expect_postgres_state or resolveScopedUserId(tenant_ctx, user_id_override) != null);
-    if (tenant_scope_requested) return "context_missing";
-    return "file";
-}
-
 fn resolveScopedUserRoot(
     allocator: std.mem.Allocator,
     config: *const config_mod.Config,
@@ -1174,7 +1192,7 @@ fn readEffectiveHeartbeatConfig(
             return parsed;
         }
     }
-    if (std.mem.eql(u8, schedulerTruthLabel(config, tenant_ctx, user_id_override), "context_missing")) {
+    if (resolveSchedulerTruth(config, tenant_ctx, user_id_override) == .context_missing) {
         return .{
             .enabled = defaults.enabled,
             .interval_minutes = defaults.interval_minutes,
@@ -1595,6 +1613,27 @@ test "runtime info scheduler reports context missing for tenant postgres scope w
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"scheduler_truth\":\"context_missing\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"tenant_context_attached\":false") != null);
+}
+
+test "runtime info summary aligns scheduler backend and data source for override without tenant context" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = true;
+    cfg.state.backend = "postgres";
+
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    const parsed = try root.parseTestArgs("{\"section\":\"summary\",\"user_id\":\"1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"scheduler_backend\":\"context_missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"data_source\":\"context_missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"context_incomplete\":true") != null);
 }
 
 test "runtime info parseTelegramStateJson supports top-level postgres shape" {
