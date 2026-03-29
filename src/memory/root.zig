@@ -254,6 +254,15 @@ pub const MemoryProvenance = struct {
     lane: []const u8 = "unknown",
 };
 
+pub const TimelineIndexLine = struct {
+    at: []const u8,
+    channel: []const u8,
+    lane: []const u8,
+    session: []const u8,
+    focus: []const u8,
+    key: []const u8,
+};
+
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []MemoryEntry) void {
     for (entries) |*entry| {
         entry.deinit(allocator);
@@ -409,6 +418,106 @@ pub fn deriveSessionIdFromMemoryKey(key: []const u8) ?[]const u8 {
         return if (session_id.len > 0) session_id else null;
     }
     return null;
+}
+
+pub fn isTimelineSummaryKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "timeline_summary/");
+}
+
+pub fn isSummaryLatestKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "summary_latest/");
+}
+
+pub fn parseTimelineSummaryTimestamp(key: []const u8) ?i64 {
+    if (!isTimelineSummaryKey(key)) return null;
+    const session_id = deriveSessionIdFromMemoryKey(key) orelse return null;
+    const prefix_len = "timeline_summary/".len + session_id.len + 1;
+    if (key.len <= prefix_len) return null;
+    return std.fmt.parseInt(i64, key[prefix_len..], 10) catch null;
+}
+
+pub fn timelineSummaryPrefixForSession(allocator: std.mem.Allocator, session_id: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "timeline_summary/{s}/", .{session_id});
+}
+
+pub fn parseTimelineIndexLine(line_raw: []const u8) ?TimelineIndexLine {
+    const line = std.mem.trim(u8, line_raw, " \t\r\n");
+    if (!std.mem.startsWith(u8, line, "- ")) return null;
+    const body = line[2..];
+    const channel_marker = std.mem.indexOf(u8, body, " channel=") orelse return null;
+    const lane_marker = std.mem.indexOf(u8, body, " lane=") orelse return null;
+    const session_marker = std.mem.indexOf(u8, body, " session=") orelse return null;
+    const focus_marker = std.mem.indexOf(u8, body, " focus=") orelse return null;
+    const key_marker = std.mem.indexOf(u8, body, " key=") orelse return null;
+    const at = body["at=".len..channel_marker];
+    const channel = body[channel_marker + " channel=".len .. lane_marker];
+    const lane = body[lane_marker + " lane=".len .. session_marker];
+
+    if (key_marker > session_marker and focus_marker > key_marker) {
+        const session = body[session_marker + " session=".len .. key_marker];
+        const key = body[key_marker + " key=".len .. focus_marker];
+        const focus = body[focus_marker + " focus=".len ..];
+        if (at.len == 0 or session.len == 0 or key.len == 0) return null;
+        return .{
+            .at = at,
+            .channel = channel,
+            .lane = lane,
+            .session = session,
+            .focus = focus,
+            .key = key,
+        };
+    }
+
+    if (focus_marker > session_marker and key_marker > focus_marker) {
+        const session = body[session_marker + " session=".len .. focus_marker];
+        const focus = body[focus_marker + " focus=".len .. key_marker];
+        const key = body[key_marker + " key=".len ..];
+        if (at.len == 0 or session.len == 0 or key.len == 0) return null;
+        return .{
+            .at = at,
+            .channel = channel,
+            .lane = lane,
+            .session = session,
+            .focus = focus,
+            .key = key,
+        };
+    }
+
+    return null;
+}
+
+pub fn extractSummarySection(summary_text: []const u8, prefix: []const u8) []const u8 {
+    var iter = std.mem.splitScalar(u8, summary_text, '\n');
+    while (iter.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (std.mem.startsWith(u8, line, prefix)) {
+            return std.mem.trim(u8, line[prefix.len..], " \t\r\n");
+        }
+    }
+    return "none";
+}
+
+pub fn extractSummaryListSection(
+    allocator: std.mem.Allocator,
+    summary_text: []const u8,
+    header: []const u8,
+) ![]u8 {
+    const idx = std.mem.indexOf(u8, summary_text, header) orelse return allocator.dupe(u8, "none");
+    const body = summary_text[idx + header.len ..];
+    var iter = std.mem.splitScalar(u8, body, '\n');
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var count: usize = 0;
+    while (iter.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        if (!std.mem.startsWith(u8, line, "- ")) break;
+        if (count > 0) try out.appendSlice(allocator, " | ");
+        try out.appendSlice(allocator, std.mem.trim(u8, line[2..], " \t\r\n"));
+        count += 1;
+    }
+    if (count == 0) return allocator.dupe(u8, "none");
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn deriveMemoryProvenance(session_id_opt: ?[]const u8, key: []const u8) MemoryProvenance {
@@ -2218,6 +2327,41 @@ test "deriveSessionIdFromMemoryKey extracts summary session ids" {
         "agent:zaki-bot:user:42:main",
         deriveSessionIdFromMemoryKey("summary_latest/agent:zaki-bot:user:42:main").?,
     );
+}
+
+test "timeline summary helpers identify keys and parse timestamps" {
+    try std.testing.expect(isTimelineSummaryKey("timeline_summary/agent:zaki-bot:user:1:main/1774400000"));
+    try std.testing.expect(isSummaryLatestKey("summary_latest/agent:zaki-bot:user:1:main"));
+    try std.testing.expectEqual(@as(?i64, 1774400000), parseTimelineSummaryTimestamp("timeline_summary/agent:zaki-bot:user:1:main/1774400000"));
+}
+
+test "parseTimelineIndexLine extracts descriptor fields from canonical format" {
+    const parsed = parseTimelineIndexLine("- at=2026-03-29T00:00:00Z channel=telegram lane=thread session=telegram:chat:1 key=timeline_summary/telegram:chat:1/1774400000 focus=shipping key=handoff session=retro") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("2026-03-29T00:00:00Z", parsed.at);
+    try std.testing.expectEqualStrings("telegram", parsed.channel);
+    try std.testing.expectEqualStrings("thread", parsed.lane);
+    try std.testing.expectEqualStrings("telegram:chat:1", parsed.session);
+    try std.testing.expectEqualStrings("shipping key=handoff session=retro", parsed.focus);
+    try std.testing.expectEqualStrings("timeline_summary/telegram:chat:1/1774400000", parsed.key);
+}
+
+test "parseTimelineIndexLine keeps legacy focus-before-key compatibility" {
+    const parsed = parseTimelineIndexLine("- at=2026-03-29T00:00:00Z channel=telegram lane=thread session=telegram:chat:1 focus=shipping plan review key=timeline_summary/telegram:chat:1/1774400000") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("telegram:chat:1", parsed.session);
+    try std.testing.expectEqualStrings("shipping plan review", parsed.focus);
+    try std.testing.expectEqualStrings("timeline_summary/telegram:chat:1/1774400000", parsed.key);
+}
+
+test "summary extraction helpers return scalar and list sections" {
+    const summary =
+        "focus: shipping\n" ++
+        "decisions:\n- keep it tight\n- ship Friday\n" ++
+        "open_loops:\n- verify deploy\n" ++
+        "next:\n- send update\n";
+    try std.testing.expectEqualStrings("shipping", extractSummarySection(summary, "focus:"));
+    const decisions = try extractSummaryListSection(std.testing.allocator, summary, "decisions:\n");
+    defer std.testing.allocator.free(decisions);
+    try std.testing.expectEqualStrings("keep it tight | ship Friday", decisions);
 }
 
 test "deriveMemoryProvenance derives app lane" {

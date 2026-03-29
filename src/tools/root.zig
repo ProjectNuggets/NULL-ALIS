@@ -63,6 +63,7 @@ pub const memory_store = @import("memory_store.zig");
 pub const memory_edit = @import("memory_edit.zig");
 pub const memory_recall = @import("memory_recall.zig");
 pub const memory_list = @import("memory_list.zig");
+pub const memory_timeline = @import("memory_timeline.zig");
 pub const memory_forget = @import("memory_forget.zig");
 pub const schedule = @import("schedule.zig");
 pub const delegate = @import("delegate.zig");
@@ -364,6 +365,10 @@ pub fn allTools(
     const mlt = try allocator.create(memory_list.MemoryListTool);
     mlt.* = .{};
     try list.append(allocator, mlt.tool());
+
+    const mtt = try allocator.create(memory_timeline.MemoryTimelineTool);
+    mtt.* = .{};
+    try list.append(allocator, mtt.tool());
 
     const mft = try allocator.create(memory_forget.MemoryForgetTool);
     mft.* = .{};
@@ -701,6 +706,7 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
     if (std.mem.eql(u8, tool_name, file_read.FileReadTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, memory_recall.MemoryRecallTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, memory_list.MemoryListTool.tool_name)) return null;
+    if (std.mem.eql(u8, tool_name, memory_timeline.MemoryTimelineTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, web_search.WebSearchTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, web_fetch.WebFetchTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, message.MessageTool.tool_name)) return null;
@@ -730,7 +736,7 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
     if (std.mem.eql(u8, tool_name, delegate.DelegateTool.tool_name)) {
         return "Delegate is disabled for background turns";
     }
-    return "Tool is disabled for background turns; allowed: runtime_info, schedule(read), file_read, memory_recall, memory_list, web_search, web_fetch, message, composio(list/read by origin)";
+    return "Tool is disabled for background turns; allowed: runtime_info, schedule(read), file_read, memory_recall, memory_list, memory_timeline, web_search, web_fetch, message, composio(list/read by origin)";
 }
 
 pub fn bindRuntimeInfoTools(tools: []const Tool) void {
@@ -757,6 +763,9 @@ pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
         } else if (t.vtable == &memory_list.MemoryListTool.vtable) {
             const mt: *memory_list.MemoryListTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
+        } else if (t.vtable == &memory_timeline.MemoryTimelineTool.vtable) {
+            const mt: *memory_timeline.MemoryTimelineTool = @ptrCast(@alignCast(t.ptr));
+            mt.memory = memory;
         } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
             const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
@@ -776,6 +785,9 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
             mt.mem_rt = mem_rt;
         } else if (t.vtable == &memory_recall.MemoryRecallTool.vtable) {
             const mt: *memory_recall.MemoryRecallTool = @ptrCast(@alignCast(t.ptr));
+            mt.mem_rt = mem_rt;
+        } else if (t.vtable == &memory_timeline.MemoryTimelineTool.vtable) {
+            const mt: *memory_timeline.MemoryTimelineTool = @ptrCast(@alignCast(t.ptr));
             mt.mem_rt = mem_rt;
         } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
             const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
@@ -940,6 +952,15 @@ test "all background origins allow web search" {
     try std.testing.expect(toolBlockedForCurrentTurn("web_search", args.value.object) == null);
 }
 
+test "background turns allow memory timeline tool" {
+    setTurnContext(.{ .origin = .heartbeat });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"query\":\"Neptune\"}");
+    defer parsed.deinit();
+    try std.testing.expect(toolBlockedForCurrentTurn("memory_timeline", parsed.value.object) == null);
+}
+
 test "background turns allow message tool" {
     setTurnContext(.{ .origin = .scheduler });
     defer clearTurnContext();
@@ -1102,8 +1123,8 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 24 + http_request + web_fetch + web_search + browser = 28
-    try std.testing.expectEqual(@as(usize, 28), tools.len);
+    // base 25 + http_request + web_fetch + web_search + browser = 29
+    try std.testing.expectEqual(@as(usize, 29), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -1116,10 +1137,10 @@ test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
     defer deinitTools(std.testing.allocator, tools);
     // shell + file_read + file_write + file_edit + file_append + git + image_info
-    // + memory_store + memory_edit + memory_recall + memory_list + memory_forget + delegate + schedule
+    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + memory_forget + delegate + schedule
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + spawn = 24
-    try std.testing.expectEqual(@as(usize, 24), tools.len);
+    // + runtime_info + skill_registry + spawn = 25
+    try std.testing.expectEqual(@as(usize, 25), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -1245,7 +1266,7 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    try std.testing.expectEqual(@as(usize, 25), tools.len);
+    try std.testing.expectEqual(@as(usize, 26), tools.len);
 
     var found_message = false;
     for (tools) |t| {

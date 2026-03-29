@@ -702,8 +702,8 @@ fn updateTimelineIndex(
     const provenance = memory_mod.deriveMemoryProvenance(session_id, timeline_key);
     const new_line = std.fmt.allocPrint(
         allocator,
-        "- at={s} channel={s} lane={s} session={s} focus={s} key={s}",
-        .{ now_iso, provenance.channel, provenance.lane, session_id, truncateUtf8(focus, 140), timeline_key },
+        "- at={s} channel={s} lane={s} session={s} key={s} focus={s}",
+        .{ now_iso, provenance.channel, provenance.lane, session_id, timeline_key, truncateUtf8(focus, 140) },
     ) catch return;
     defer allocator.free(new_line);
 

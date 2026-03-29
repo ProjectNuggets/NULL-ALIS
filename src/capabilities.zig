@@ -20,6 +20,7 @@ const core_tool_names = [_][]const u8{
     "memory_edit",
     "memory_recall",
     "memory_list",
+    "memory_timeline",
     "memory_forget",
     "delegate",
     "schedule",
@@ -493,6 +494,7 @@ test "buildManifestJson estimated tools align with runtime naming" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"git_operations\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_append\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"memory_edit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"memory_timeline\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"cron_add\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"cron_update\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"pushover\"") != null);

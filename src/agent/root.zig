@@ -3343,6 +3343,11 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
     try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "lane=main") != null);
     try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "session=agent:zaki-bot:user:1:main") != null);
     try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
+    const session_idx = std.mem.indexOf(u8, timeline_index.content, "session=agent:zaki-bot:user:1:main") orelse return error.TestUnexpectedResult;
+    const key_idx = std.mem.indexOf(u8, timeline_index.content, "key=timeline_summary/agent:zaki-bot:user:1:main/") orelse return error.TestUnexpectedResult;
+    const focus_idx = std.mem.indexOf(u8, timeline_index.content, "focus=") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(session_idx < key_idx);
+    try std.testing.expect(key_idx < focus_idx);
 }
 
 test "slash /new with empty session does not write checkpoint" {
