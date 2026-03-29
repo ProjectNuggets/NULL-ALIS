@@ -142,11 +142,11 @@ pub const MemoryTimelineTool = struct {
             defer allocator.free(latest_key);
             var latest_source_key: ?[]const u8 = null;
             if (try mem.get(allocator, latest_key)) |latest| {
-                const source_key = metadataValue(latest.content, "source_key=");
-                const effective_at = metadataValue(latest.content, "at=") orelse latest.timestamp;
+                const source_key = mem_root.metadataValue(latest.content, "source_key=");
+                const effective_at = mem_root.metadataValue(latest.content, "at=") orelse latest.timestamp;
                 if (summaryMatchesFilters(latest.content, latest.key, source_key, effective_at, filters)) {
                     const source_key_owned = if (source_key) |value| try allocator.dupe(u8, value) else null;
-                    const at_owned = if (metadataValue(latest.content, "at=")) |value| try allocator.dupe(u8, value) else null;
+                    const at_owned = if (mem_root.metadataValue(latest.content, "at=")) |value| try allocator.dupe(u8, value) else null;
                     try views.append(allocator, .{
                         .entry = latest,
                         .source_key_override = source_key_owned,
@@ -274,7 +274,7 @@ pub const MemoryTimelineTool = struct {
             if (!std.mem.eql(u8, derived_session, session_id)) return false;
         }
         if (filters.channel) |channel| {
-            const provenance = mem_root.deriveMemoryProvenance(null, source_key orelse key);
+            const provenance = mem_root.resolveStoredMemoryProvenance(content, null, source_key orelse key);
             if (!std.ascii.eqlIgnoreCase(provenance.channel, channel)) return false;
         }
         if (filters.date_from) |date_from| {
@@ -305,15 +305,6 @@ pub const MemoryTimelineTool = struct {
             if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
         }
         return false;
-    }
-
-    fn metadataValue(content: []const u8, prefix: []const u8) ?[]const u8 {
-        var iter = std.mem.splitScalar(u8, content, '\n');
-        while (iter.next()) |line_raw| {
-            const line = std.mem.trim(u8, line_raw, " \t\r\n");
-            if (std.mem.startsWith(u8, line, prefix)) return line[prefix.len..];
-        }
-        return null;
     }
 
     fn cloneEntry(allocator: std.mem.Allocator, entry: mem_root.MemoryEntry) !mem_root.MemoryEntry {
@@ -351,7 +342,7 @@ pub const MemoryTimelineTool = struct {
         try w.print("Found {d} session summar{s}:\n", .{ views.len, if (views.len == 1) "y" else "ies" });
         for (views, 0..) |view, idx| {
             const source_key = view.source_key_override orelse view.entry.key;
-            const provenance = mem_root.deriveMemoryProvenance(view.entry.session_id, source_key);
+            const provenance = mem_root.resolveStoredMemoryProvenance(view.entry.content, view.entry.session_id, source_key);
             const at = view.at_override orelse view.entry.timestamp;
             const focus = mem_root.extractSummarySection(view.entry.content, "focus:");
             const decisions = try mem_root.extractSummaryListSection(allocator, view.entry.content, "decisions:\n");
@@ -382,6 +373,13 @@ pub const MemoryTimelineTool = struct {
     fn deinitViews(allocator: std.mem.Allocator, views: []SummaryView) void {
         for (views) |*view| view.deinit(allocator);
         allocator.free(views);
+    }
+
+    fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
+        if (s.len <= max_len) return s;
+        var end: usize = max_len;
+        while (end > 0 and s[end] & 0xC0 == 0x80) end -= 1;
+        return s[0..end];
     }
 };
 
@@ -591,4 +589,41 @@ test "memory_timeline session date filter uses summary_latest at metadata" {
 
     try std.testing.expect(result.success);
     try std.testing.expectEqualStrings("No session summaries found.", result.output);
+}
+
+test "memory_timeline falls back to summaries without rewriting legacy index rows" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "timeline_summary/agent:zaki-bot:user:1:thread:telegram:thread:1110331014/1774747162",
+        "focus: telegram recap\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n",
+        .daily,
+        null,
+    );
+    try mem.store(
+        "timeline_index/current",
+        "- at=2026-03-29T01:19:22Z channel=app lane=thread session=agent:zaki-bot:user:1:thread:telegram:thread:1110331014 key=timeline_summary/agent:zaki-bot:user:1:thread:telegram:thread:1110331014/1774747162 focus=telegram recap\n",
+        .core,
+        null,
+    );
+
+    var mt = MemoryTimelineTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"channel\":\"telegram\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "channel=telegram") != null);
+
+    const index_after = (try mem.get(allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
+    defer index_after.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "- at=2026-03-29T01:19:22Z channel=app lane=thread session=agent:zaki-bot:user:1:thread:telegram:thread:1110331014 key=timeline_summary/agent:zaki-bot:user:1:thread:telegram:thread:1110331014/1774747162 focus=telegram recap\n",
+        index_after.content,
+    );
 }

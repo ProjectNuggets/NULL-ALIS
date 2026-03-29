@@ -698,13 +698,17 @@ fn updateTimelineIndex(
     now_iso: []const u8,
     focus: []const u8,
     timeline_key: []const u8,
+    origin: SummaryOrigin,
 ) void {
-    const provenance = memory_mod.deriveMemoryProvenance(session_id, timeline_key);
-    const new_line = std.fmt.allocPrint(
-        allocator,
-        "- at={s} channel={s} lane={s} session={s} key={s} focus={s}",
-        .{ now_iso, provenance.channel, provenance.lane, session_id, timeline_key, truncateUtf8(focus, 140) },
-    ) catch return;
+    const new_line = memory_mod.buildTimelineIndexJsonLine(allocator, .{
+        .at = now_iso,
+        .channel = origin.channel,
+        .lane = origin.lane,
+        .session = session_id,
+        .focus = truncateUtf8(focus, 140),
+        .key = timeline_key,
+        .chat_id = origin.chat_id,
+    }) catch return;
     defer allocator.free(new_line);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -720,9 +724,16 @@ fn updateTimelineIndex(
         while (iter.next()) |line_raw| {
             const line = std.mem.trim(u8, line_raw, " \t\r\n");
             if (line.len == 0) continue;
-            if (std.mem.eql(u8, line, new_line)) continue;
+            const parsed = memory_mod.parseTimelineIndexLine(line_raw) orelse continue;
+            if (std.mem.eql(u8, parsed.key, timeline_key)) continue;
             if (kept >= 32) break;
-            w.writeAll(line) catch break;
+            if (line[0] == '{') {
+                w.writeAll(line) catch break;
+            } else {
+                const normalized = memory_mod.buildTimelineIndexJsonLine(allocator, parsed) catch break;
+                defer allocator.free(normalized);
+                w.writeAll(normalized) catch break;
+            }
             w.writeByte('\n') catch break;
             kept += 1;
         }
@@ -732,6 +743,103 @@ fn updateTimelineIndex(
     defer allocator.free(content);
     mem.store("timeline_index/current", content, .core, null) catch return;
     if (rt) |mem_rt| mem_rt.syncVectorAfterStore(allocator, "timeline_index/current", content);
+}
+
+const SummaryOrigin = struct {
+    channel: []const u8,
+    lane: []const u8,
+    chat_id: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+};
+
+fn resolveSummaryOrigin(self: anytype, session_id: []const u8, key_hint: []const u8) SummaryOrigin {
+    const derived = memory_mod.deriveMemoryProvenance(session_id, key_hint);
+    const turn_ctx = message_tool.MessageTool.getTurnContext();
+    return .{
+        .channel = turn_ctx.channel orelse self.origin_channel orelse derived.channel,
+        .lane = self.origin_lane orelse derived.lane,
+        .chat_id = turn_ctx.chat_id orelse self.origin_chat_id,
+        .account_id = turn_ctx.account_id orelse self.origin_account_id,
+    };
+}
+
+fn appendOriginMetadata(
+    allocator: std.mem.Allocator,
+    origin: SummaryOrigin,
+    body: []const u8,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    try w.print("origin_channel={s}\norigin_lane={s}\n", .{ origin.channel, origin.lane });
+    if (origin.chat_id) |chat_id| {
+        try w.print("origin_chat_id={s}\n", .{chat_id});
+    }
+    if (origin.account_id) |account_id| {
+        try w.print("origin_account_id={s}\n", .{account_id});
+    }
+    try w.writeByte('\n');
+    try w.writeAll(body);
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildSummaryLatestContent(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    origin: SummaryOrigin,
+    source_key: []const u8,
+    at: []const u8,
+    summary_body: []const u8,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    try w.print(
+        "type=summary_latest\nsession={s}\nchannel={s}\nlane={s}\norigin_channel={s}\norigin_lane={s}\n",
+        .{ session_id, origin.channel, origin.lane, origin.channel, origin.lane },
+    );
+    if (origin.chat_id) |chat_id| {
+        try w.print("origin_chat_id={s}\n", .{chat_id});
+    }
+    if (origin.account_id) |account_id| {
+        try w.print("origin_account_id={s}\n", .{account_id});
+    }
+    try w.print("source_key={s}\nat={s}\n{s}", .{ source_key, at, summary_body });
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildContextAnchorContent(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    origin: SummaryOrigin,
+    reason: []const u8,
+    model_name: []const u8,
+    checkpoint_key: []const u8,
+    summary_key: ?[]const u8,
+    at: []const u8,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    try w.print(
+        "type=context_anchor\nlast_session={s}\nlast_channel={s}\nlast_lane={s}\norigin_channel={s}\norigin_lane={s}\n",
+        .{ session_id, origin.channel, origin.lane, origin.channel, origin.lane },
+    );
+    if (origin.chat_id) |chat_id| {
+        try w.print("origin_chat_id={s}\n", .{chat_id});
+    }
+    if (origin.account_id) |account_id| {
+        try w.print("origin_account_id={s}\n", .{account_id});
+    }
+    try w.print(
+        "last_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\n",
+        .{ reason, model_name, checkpoint_key },
+    );
+    if (summary_key) |value| {
+        try w.print("last_summary_key={s}\n", .{value});
+    }
+    try w.print("last_at={s}", .{at});
+    return out.toOwnedSlice(allocator);
 }
 
 fn emitLifecycleSummarizerStage(self: anytype, duration_ms: u64, summarized_count: usize) void {
@@ -831,9 +939,12 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         .{ session_id, now_s },
     ) catch return false;
     defer self.allocator.free(summary_key);
+    const summary_origin = resolveSummaryOrigin(self, session_id, summary_key);
+    const summary_content = appendOriginMetadata(self.allocator, summary_origin, content) catch return false;
+    defer self.allocator.free(summary_content);
 
-    if (mem.store(summary_key, content, .conversation, session_id)) |_| {
-        if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, summary_key, content);
+    if (mem.store(summary_key, summary_content, .conversation, session_id)) |_| {
+        if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, summary_key, summary_content);
     } else |_| {}
 
     const timeline_key = std.fmt.allocPrint(
@@ -842,28 +953,30 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         .{ session_id, now_s },
     ) catch return false;
     defer self.allocator.free(timeline_key);
-    const timeline_written = if (mem.store(timeline_key, content, .daily, null)) |_| blk: {
-        if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, timeline_key, content);
+    const timeline_written = if (mem.store(timeline_key, summary_content, .daily, null)) |_| blk: {
+        if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, timeline_key, summary_content);
         break :blk true;
     } else |_| false;
     if (!timeline_written) return false;
 
     const focus = summarySectionValue(content, "focus:");
     const next = summarySectionValue(content, "next:");
-    const provenance = memory_mod.deriveMemoryProvenance(session_id, timeline_key);
     const latest_key = std.fmt.allocPrint(self.allocator, "summary_latest/{s}", .{session_id}) catch return true;
     defer self.allocator.free(latest_key);
-    const latest_content = std.fmt.allocPrint(
+    const latest_content = buildSummaryLatestContent(
         self.allocator,
-        "type=summary_latest\nsession={s}\nchannel={s}\nlane={s}\nsource_key={s}\nat={s}\n{s}",
-        .{ session_id, provenance.channel, provenance.lane, timeline_key, now_iso, content },
+        session_id,
+        summary_origin,
+        timeline_key,
+        now_iso,
+        content,
     ) catch return true;
     defer self.allocator.free(latest_content);
     if (mem.store(latest_key, latest_content, .core, null)) |_| {
         if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, latest_key, latest_content);
     } else |_| {}
 
-    updateTimelineIndex(self.allocator, mem, rt, session_id, now_iso, focus, timeline_key);
+    updateTimelineIndex(self.allocator, mem, rt, session_id, now_iso, focus, timeline_key, summary_origin);
 
     if (parsed_summary) |parsed| {
         for (parsed.extracted_facts, 0..) |fact, idx| {
@@ -936,19 +1049,22 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
     }
 
     const summary_written = persistSessionSemanticSummary(self, checkpoint_content, session_id, reason, now_s, now_iso);
-    const anchor_content_result = if (summary_written)
-        std.fmt.allocPrint(
-            self.allocator,
-            "type=context_anchor\nlast_session={s}\nlast_channel={s}\nlast_lane={s}\nlast_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\nlast_summary_key=timeline_summary/{s}/{d}\nlast_at={s}",
-            .{ session_id, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).channel, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).lane, reason, self.model_name, checkpoint_key, session_id, now_s, now_iso },
-        )
+    const anchor_origin = resolveSummaryOrigin(self, session_id, checkpoint_key);
+    const summary_key = if (summary_written)
+        std.fmt.allocPrint(self.allocator, "timeline_summary/{s}/{d}", .{ session_id, now_s }) catch null
     else
-        std.fmt.allocPrint(
-            self.allocator,
-            "type=context_anchor\nlast_session={s}\nlast_channel={s}\nlast_lane={s}\nlast_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\nlast_at={s}",
-            .{ session_id, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).channel, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).lane, reason, self.model_name, checkpoint_key, now_iso },
-        );
-    const anchor_content = anchor_content_result catch return;
+        null;
+    defer if (summary_key) |value| self.allocator.free(value);
+    const anchor_content = buildContextAnchorContent(
+        self.allocator,
+        session_id,
+        anchor_origin,
+        reason,
+        self.model_name,
+        checkpoint_key,
+        summary_key,
+        now_iso,
+    ) catch return;
     defer self.allocator.free(anchor_content);
     mem.store("context_anchor_current", anchor_content, .core, null) catch return;
     if (self.mem_rt) |rt| {

@@ -11,6 +11,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const config_types = @import("../config_types.zig");
 const provider_api_key = @import("../providers/api_key.zig");
+const util = @import("../util.zig");
 const log = std.log.scoped(.memory);
 
 // engines/ (Layer A: Primary Store)
@@ -261,6 +262,36 @@ pub const TimelineIndexLine = struct {
     session: []const u8,
     focus: []const u8,
     key: []const u8,
+    chat_id: ?[]const u8 = null,
+};
+
+pub const StoredOriginMetadata = struct {
+    channel: ?[]const u8 = null,
+    lane: ?[]const u8 = null,
+    chat_id: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+};
+
+const LEGACY_WRAPPED_CHANNELS = [_][]const u8{
+    "telegram",
+    "slack",
+    "discord",
+    "whatsapp",
+    "signal",
+    "line",
+    "lark",
+    "mattermost",
+    "zaki_app",
+};
+
+const LEGACY_WRAPPED_LANES = [_][]const u8{
+    "main",
+    "thread",
+    "direct",
+    "group",
+    "channel",
+    "task",
+    "cron",
 };
 
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []MemoryEntry) void {
@@ -440,8 +471,75 @@ pub fn timelineSummaryPrefixForSession(allocator: std.mem.Allocator, session_id:
     return try std.fmt.allocPrint(allocator, "timeline_summary/{s}/", .{session_id});
 }
 
+pub fn metadataValue(content: []const u8, prefix: []const u8) ?[]const u8 {
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    while (iter.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (std.mem.startsWith(u8, line, prefix)) return line[prefix.len..];
+    }
+    return null;
+}
+
+pub fn extractStoredOriginMetadata(content: []const u8) StoredOriginMetadata {
+    return .{
+        .channel = metadataValue(content, "origin_channel=") orelse metadataValue(content, "channel="),
+        .lane = metadataValue(content, "origin_lane=") orelse metadataValue(content, "lane="),
+        .chat_id = metadataValue(content, "origin_chat_id="),
+        .account_id = metadataValue(content, "origin_account_id="),
+    };
+}
+
+fn isKnownLegacyWrappedChannel(channel: []const u8) bool {
+    for (LEGACY_WRAPPED_CHANNELS) |allowed| {
+        if (std.mem.eql(u8, channel, allowed)) return true;
+    }
+    return false;
+}
+
+fn isKnownLegacyWrappedLane(lane: []const u8) bool {
+    for (LEGACY_WRAPPED_LANES) |allowed| {
+        if (std.mem.eql(u8, lane, allowed)) return true;
+    }
+    return false;
+}
+
+fn shouldUseLegacyWrappedFallback(key: []const u8) bool {
+    return std.mem.eql(u8, key, "context_anchor_current") or
+        isSummaryLatestKey(key) or
+        std.mem.startsWith(u8, key, "session_summary/") or
+        isTimelineSummaryKey(key);
+}
+
+fn legacyWrappedOriginFromSessionId(session_id: []const u8) ?MemoryProvenance {
+    const app_prefix = "agent:zaki-bot:user:";
+    if (!std.mem.startsWith(u8, session_id, app_prefix)) return null;
+
+    const rest = session_id[app_prefix.len..];
+    const user_sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    const lane_and_tail = rest[user_sep + 1 ..];
+    const lane_sep = std.mem.indexOfScalar(u8, lane_and_tail, ':') orelse return null;
+    const outer_lane = lane_and_tail[0..lane_sep];
+    if (!std.mem.eql(u8, outer_lane, "thread") and !std.mem.eql(u8, outer_lane, "task") and !std.mem.eql(u8, outer_lane, "cron")) return null;
+
+    const embedded = lane_and_tail[lane_sep + 1 ..];
+    const channel_sep = std.mem.indexOfScalar(u8, embedded, ':') orelse return null;
+    const embedded_channel = embedded[0..channel_sep];
+    if (!isKnownLegacyWrappedChannel(embedded_channel)) return null;
+
+    const embedded_lane = deriveExternalLaneFromSessionId(embedded);
+    if (!isKnownLegacyWrappedLane(embedded_lane)) return null;
+
+    return .{
+        .session_id = session_id,
+        .channel = embedded_channel,
+        .lane = embedded_lane,
+    };
+}
+
 pub fn parseTimelineIndexLine(line_raw: []const u8) ?TimelineIndexLine {
     const line = std.mem.trim(u8, line_raw, " \t\r\n");
+    if (line.len == 0) return null;
+    if (line[0] == '{') return parseTimelineIndexJsonLine(line);
     if (!std.mem.startsWith(u8, line, "- ")) return null;
     const body = line[2..];
     const channel_marker = std.mem.indexOf(u8, body, " channel=") orelse return null;
@@ -484,6 +582,74 @@ pub fn parseTimelineIndexLine(line_raw: []const u8) ?TimelineIndexLine {
     }
 
     return null;
+}
+
+fn parseTimelineIndexJsonLine(line: []const u8) ?TimelineIndexLine {
+    const at = extractJsonStringField(line, "at") orelse return null;
+    const channel = extractJsonStringField(line, "channel") orelse return null;
+    const lane = extractJsonStringField(line, "lane") orelse return null;
+    const session = extractJsonStringField(line, "session") orelse return null;
+    const focus = extractJsonStringField(line, "focus") orelse return null;
+    const key = extractJsonStringField(line, "key") orelse return null;
+    const chat_id = extractJsonStringField(line, "chat_id");
+    return .{
+        .at = at,
+        .channel = channel,
+        .lane = lane,
+        .session = session,
+        .focus = focus,
+        .key = key,
+        .chat_id = chat_id,
+    };
+}
+
+fn extractJsonStringField(line: []const u8, field: []const u8) ?[]const u8 {
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":\"", .{field}) catch return null;
+    const start = std.mem.indexOf(u8, line, needle) orelse return null;
+    var idx = start + needle.len;
+    while (idx < line.len) : (idx += 1) {
+        if (line[idx] == '"' and !isEscapedJsonQuote(line, idx)) {
+            return line[start + needle.len .. idx];
+        }
+    }
+    return null;
+}
+
+fn isEscapedJsonQuote(line: []const u8, quote_idx: usize) bool {
+    if (quote_idx == 0) return false;
+    var idx = quote_idx;
+    var backslashes: usize = 0;
+    while (idx > 0) {
+        idx -= 1;
+        if (line[idx] != '\\') break;
+        backslashes += 1;
+    }
+    return (backslashes % 2) == 1;
+}
+
+pub fn buildTimelineIndexJsonLine(allocator: std.mem.Allocator, row: TimelineIndexLine) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '{');
+    try out.appendSlice(allocator, "\"at\":\"");
+    try util.appendJsonEscaped(&out, allocator, row.at);
+    try out.appendSlice(allocator, "\",\"session\":\"");
+    try util.appendJsonEscaped(&out, allocator, row.session);
+    try out.appendSlice(allocator, "\",\"key\":\"");
+    try util.appendJsonEscaped(&out, allocator, row.key);
+    try out.appendSlice(allocator, "\",\"channel\":\"");
+    try util.appendJsonEscaped(&out, allocator, row.channel);
+    try out.appendSlice(allocator, "\",\"lane\":\"");
+    try util.appendJsonEscaped(&out, allocator, row.lane);
+    if (row.chat_id) |chat_id| {
+        try out.appendSlice(allocator, "\",\"chat_id\":\"");
+        try util.appendJsonEscaped(&out, allocator, chat_id);
+    }
+    try out.appendSlice(allocator, "\",\"focus\":\"");
+    try util.appendJsonEscaped(&out, allocator, row.focus);
+    try out.appendSlice(allocator, "\"}");
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn extractSummarySection(summary_text: []const u8, prefix: []const u8) []const u8 {
@@ -532,23 +698,26 @@ pub fn deriveMemoryProvenance(session_id_opt: ?[]const u8, key: []const u8) Memo
     return .{};
 }
 
-fn embeddedOriginSessionId(session_id: []const u8) ?[]const u8 {
-    const app_prefix = "agent:zaki-bot:user:";
-    if (!std.mem.startsWith(u8, session_id, app_prefix)) return null;
+pub fn resolveStoredMemoryProvenance(content: []const u8, session_id_opt: ?[]const u8, key: []const u8) MemoryProvenance {
+    const session_id = session_id_opt orelse deriveSessionIdFromMemoryKey(key);
+    const stored = extractStoredOriginMetadata(content);
 
-    const rest = session_id[app_prefix.len..];
-    const user_sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
-    const lane_and_tail = rest[user_sep + 1 ..];
+    if (stored.channel != null or stored.lane != null) {
+        const derived = deriveMemoryProvenance(session_id, key);
+        return .{
+            .session_id = derived.session_id,
+            .channel = stored.channel orelse derived.channel,
+            .lane = stored.lane orelse derived.lane,
+        };
+    }
 
-    if (std.mem.eql(u8, lane_and_tail, "main")) return null;
+    if (session_id) |sid| {
+        if (shouldUseLegacyWrappedFallback(key)) {
+            if (legacyWrappedOriginFromSessionId(sid)) |legacy| return legacy;
+        }
+    }
 
-    const lane_sep = std.mem.indexOfScalar(u8, lane_and_tail, ':') orelse return null;
-    const outer_lane = lane_and_tail[0..lane_sep];
-    if (!std.mem.eql(u8, outer_lane, "thread") and !std.mem.eql(u8, outer_lane, "task") and !std.mem.eql(u8, outer_lane, "cron")) return null;
-
-    const embedded = lane_and_tail[lane_sep + 1 ..];
-    if (embedded.len == 0 or std.mem.indexOfScalar(u8, embedded, ':') == null) return null;
-    return embedded;
+    return deriveMemoryProvenance(session_id, key);
 }
 
 fn deriveExternalChannelFromSessionId(session_id: []const u8) []const u8 {
@@ -569,10 +738,7 @@ fn deriveExternalLaneFromSessionId(session_id: []const u8) []const u8 {
 
 fn deriveChannelFromSessionId(session_id: []const u8) []const u8 {
     const app_prefix = "agent:zaki-bot:user:";
-    if (std.mem.startsWith(u8, session_id, app_prefix)) {
-        if (embeddedOriginSessionId(session_id)) |embedded| return deriveExternalChannelFromSessionId(embedded);
-        return "app";
-    }
+    if (std.mem.startsWith(u8, session_id, app_prefix)) return "app";
 
     return deriveExternalChannelFromSessionId(session_id);
 }
@@ -580,7 +746,6 @@ fn deriveChannelFromSessionId(session_id: []const u8) []const u8 {
 fn deriveLaneFromSessionId(session_id: []const u8) []const u8 {
     const app_prefix = "agent:zaki-bot:user:";
     if (std.mem.startsWith(u8, session_id, app_prefix)) {
-        if (embeddedOriginSessionId(session_id)) |embedded| return deriveExternalLaneFromSessionId(embedded);
         const rest = session_id[app_prefix.len..];
         const user_sep = std.mem.indexOfScalar(u8, rest, ':') orelse return "unknown";
         const lane = rest[user_sep + 1 ..];
@@ -2383,6 +2548,39 @@ test "parseTimelineIndexLine keeps legacy focus-before-key compatibility" {
     try std.testing.expectEqualStrings("timeline_summary/telegram:chat:1/1774400000", parsed.key);
 }
 
+test "parseTimelineIndexLine extracts descriptor fields from jsonl format" {
+    const parsed = parseTimelineIndexLine("{\"at\":\"2026-03-29T00:00:00Z\",\"session\":\"telegram:chat:1\",\"key\":\"timeline_summary/telegram:chat:1/1774400000\",\"channel\":\"telegram\",\"lane\":\"thread\",\"chat_id\":\"1110331014\",\"focus\":\"shipping handoff\"}") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("2026-03-29T00:00:00Z", parsed.at);
+    try std.testing.expectEqualStrings("telegram", parsed.channel);
+    try std.testing.expectEqualStrings("thread", parsed.lane);
+    try std.testing.expectEqualStrings("telegram:chat:1", parsed.session);
+    try std.testing.expectEqualStrings("timeline_summary/telegram:chat:1/1774400000", parsed.key);
+    try std.testing.expectEqualStrings("shipping handoff", parsed.focus);
+    try std.testing.expectEqualStrings("1110331014", parsed.chat_id.?);
+}
+
+test "parseTimelineIndexLine handles escaped quotes in jsonl focus" {
+    const parsed = parseTimelineIndexLine("{\"at\":\"2026-03-29T00:00:00Z\",\"session\":\"telegram:chat:1\",\"key\":\"timeline_summary/telegram:chat:1/1774400000\",\"channel\":\"telegram\",\"lane\":\"thread\",\"focus\":\"shipping \\\"priority\\\" review\\\\notes\"}") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("telegram", parsed.channel);
+    try std.testing.expectEqualStrings("timeline_summary/telegram:chat:1/1774400000", parsed.key);
+    try std.testing.expectEqualStrings("shipping \\\"priority\\\" review\\\\notes", parsed.focus);
+}
+
+test "buildTimelineIndexJsonLine emits jsonl row" {
+    const line = try buildTimelineIndexJsonLine(std.testing.allocator, .{
+        .at = "2026-03-29T00:00:00Z",
+        .channel = "telegram",
+        .lane = "thread",
+        .session = "telegram:chat:1",
+        .focus = "shipping handoff",
+        .key = "timeline_summary/telegram:chat:1/1774400000",
+        .chat_id = "1110331014",
+    });
+    defer std.testing.allocator.free(line);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"channel\":\"telegram\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"chat_id\":\"1110331014\"") != null);
+}
+
 test "summary extraction helpers return scalar and list sections" {
     const summary =
         "focus: shipping\n" ++
@@ -2402,18 +2600,28 @@ test "deriveMemoryProvenance derives app lane" {
     try std.testing.expectEqualStrings("agent:zaki-bot:user:42:thread:conv-2", provenance.session_id.?);
 }
 
-test "deriveMemoryProvenance preserves wrapped telegram origin inside user-scoped session" {
-    const provenance = deriveMemoryProvenance("agent:zaki-bot:user:42:thread:telegram:thread:1110331014", "ignored");
+test "deriveMemoryProvenance keeps colonful app thread ids as app" {
+    const provenance = deriveMemoryProvenance("agent:zaki-bot:user:42:thread:project:neptune", "ignored");
+    try std.testing.expectEqualStrings("app", provenance.channel);
+    try std.testing.expectEqualStrings("thread", provenance.lane);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:42:thread:project:neptune", provenance.session_id.?);
+}
+
+test "resolveStoredMemoryProvenance preserves wrapped telegram origin for summaries" {
+    const provenance = resolveStoredMemoryProvenance("focus: legacy\n", null, "timeline_summary/agent:zaki-bot:user:42:thread:telegram:thread:1110331014/1774400000");
     try std.testing.expectEqualStrings("telegram", provenance.channel);
     try std.testing.expectEqualStrings("thread", provenance.lane);
     try std.testing.expectEqualStrings("agent:zaki-bot:user:42:thread:telegram:thread:1110331014", provenance.session_id.?);
 }
 
-test "deriveMemoryProvenance preserves wrapped slack origin inside user-scoped session" {
-    const provenance = deriveMemoryProvenance("agent:zaki-bot:user:42:thread:slack:channel:C12345", "ignored");
-    try std.testing.expectEqualStrings("slack", provenance.channel);
-    try std.testing.expectEqualStrings("channel", provenance.lane);
-    try std.testing.expectEqualStrings("agent:zaki-bot:user:42:thread:slack:channel:C12345", provenance.session_id.?);
+test "resolveStoredMemoryProvenance prefers explicit origin metadata" {
+    const provenance = resolveStoredMemoryProvenance(
+        "origin_channel=telegram\norigin_lane=thread\norigin_chat_id=1110331014\n\nfocus: shipping\n",
+        null,
+        "timeline_summary/agent:zaki-bot:user:42:main/1774400000",
+    );
+    try std.testing.expectEqualStrings("telegram", provenance.channel);
+    try std.testing.expectEqualStrings("thread", provenance.lane);
 }
 
 test "deriveMemoryProvenance derives connector lane" {

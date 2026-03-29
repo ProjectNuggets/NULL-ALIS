@@ -115,7 +115,7 @@ pub const MemoryRecallTool = struct {
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
-            const provenance = mem_root.deriveMemoryProvenance(entry.session_id, entry.key);
+            const provenance = mem_root.resolveStoredMemoryProvenance(entry.content, entry.session_id, entry.key);
             try buf.appendSlice(allocator, idx_str);
             try buf.appendSlice(allocator, ". [");
             try buf.appendSlice(allocator, entry.key);
@@ -177,7 +177,7 @@ pub const MemoryRecallTool = struct {
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
-            const provenance = mem_root.deriveMemoryProvenance(null, cand.key);
+            const provenance = mem_root.resolveStoredMemoryProvenance(cand.snippet, null, cand.key);
             try buf.appendSlice(allocator, idx_str);
             try buf.appendSlice(allocator, ". [");
             try buf.appendSlice(allocator, cand.key);
@@ -380,6 +380,31 @@ test "memory_recall shows derived provenance" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "channel=app") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "lane=thread") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "session=agent:zaki-bot:user:1:thread:rollout") != null);
+}
+
+test "memory_recall prefers explicit origin metadata" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "timeline_summary/agent:zaki-bot:user:1:thread:telegram:thread:1110331014/1774400000",
+        "origin_channel=telegram\norigin_lane=thread\norigin_chat_id=1110331014\n\nfocus: telegram rollout\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n",
+        .daily,
+        null,
+    );
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\":\"telegram\",\"scope\":\"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "channel=telegram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "lane=thread") != null);
 }
 
 test "memory_recall rejects invalid scope value" {

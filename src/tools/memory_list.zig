@@ -76,7 +76,7 @@ pub const MemoryListTool = struct {
         for (entries) |entry| {
             if (!include_internal and mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
             if (written >= shown) break;
-            const provenance = mem_root.deriveMemoryProvenance(entry.session_id, entry.key);
+            const provenance = mem_root.resolveStoredMemoryProvenance(entry.content, entry.session_id, entry.key);
             try w.print("  {d}. {s} [{s}] channel={s} lane={s}", .{
                 written + 1,
                 entry.key,
@@ -297,4 +297,29 @@ test "memory_list shows derived provenance" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "channel=app") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "lane=main") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "session=agent:zaki-bot:user:1:main") != null);
+}
+
+test "memory_list prefers explicit origin metadata" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:zaki-bot:user:1:thread:telegram:thread:1110331014",
+        "type=summary_latest\nsession=agent:zaki-bot:user:1:thread:telegram:thread:1110331014\nchannel=telegram\nlane=thread\norigin_channel=telegram\norigin_lane=thread\nsource_key=timeline_summary/agent:zaki-bot:user:1:thread:telegram:thread:1110331014/1\nat=2026-03-29T12:00:00Z\nfocus: shipping\n",
+        .core,
+        null,
+    );
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10,\"scope\":\"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "channel=telegram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "lane=thread") != null);
 }

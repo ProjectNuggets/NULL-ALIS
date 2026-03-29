@@ -49,6 +49,10 @@ pub const Session = struct {
     last_active: i64,
     last_consolidated: u64 = 0,
     session_key: []const u8, // owned copy
+    origin_channel: ?[]u8 = null,
+    origin_lane: ?[]u8 = null,
+    origin_chat_id: ?[]u8 = null,
+    origin_account_id: ?[]u8 = null,
     turn_count: u64,
     active_refs: usize = 0,
     turn_observers: [2]Observer,
@@ -64,6 +68,10 @@ pub const Session = struct {
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
         allocator.free(self.session_key);
+        if (self.origin_channel) |value| allocator.free(value);
+        if (self.origin_lane) |value| allocator.free(value);
+        if (self.origin_chat_id) |value| allocator.free(value);
+        if (self.origin_account_id) |value| allocator.free(value);
     }
 };
 
@@ -210,6 +218,47 @@ pub const SessionManager = struct {
         return agent;
     }
 
+    fn replaceOptionalOwned(
+        allocator: Allocator,
+        slot: *?[]u8,
+        value: ?[]const u8,
+    ) !void {
+        const incoming = value orelse return;
+        if (slot.*) |existing| {
+            if (std.mem.eql(u8, existing, incoming)) return;
+            allocator.free(existing);
+        }
+        slot.* = try allocator.dupe(u8, incoming);
+    }
+
+    fn refreshSessionOrigin(self: *SessionManager, session: *Session, message_turn_context: ?tools_mod.MessageTurnContext) !void {
+        const derived = memory_mod.deriveMemoryProvenance(session.session_key, "");
+        try replaceOptionalOwned(self.allocator, &session.origin_lane, derived.lane);
+
+        if (message_turn_context) |ctx| {
+            if (ctx.channel) |channel| {
+                try replaceOptionalOwned(self.allocator, &session.origin_channel, channel);
+            } else if (session.origin_channel == null) {
+                try replaceOptionalOwned(self.allocator, &session.origin_channel, derived.channel);
+            }
+            if (ctx.chat_id) |chat_id| {
+                try replaceOptionalOwned(self.allocator, &session.origin_chat_id, chat_id);
+            }
+            if (ctx.account_id) |account_id| {
+                try replaceOptionalOwned(self.allocator, &session.origin_account_id, account_id);
+            }
+        } else if (session.origin_channel == null) {
+            try replaceOptionalOwned(self.allocator, &session.origin_channel, derived.channel);
+        }
+    }
+
+    fn syncSessionOriginToAgent(session: *Session) void {
+        session.agent.origin_channel = session.origin_channel;
+        session.agent.origin_lane = session.origin_lane;
+        session.agent.origin_chat_id = session.origin_chat_id;
+        session.agent.origin_account_id = session.origin_account_id;
+    }
+
     fn sessionIsTtlExpired(session: *const Session, now: i64) bool {
         const ttl = session.agent.session_ttl_secs orelse return false;
         if (ttl == 0) return false;
@@ -221,10 +270,12 @@ pub const SessionManager = struct {
         var replacement_agent = try self.buildSessionAgent(session.session_key);
         errdefer replacement_agent.deinit();
 
+        syncSessionOriginToAgent(session);
         session.agent.persistSessionCheckpoint("ttl_recycle");
 
         var previous_agent = session.agent;
         session.agent = replacement_agent;
+        syncSessionOriginToAgent(session);
         previous_agent.deinit();
 
         session.created_at = now;
@@ -434,6 +485,8 @@ pub const SessionManager = struct {
         }
 
         const now = std.time.timestamp();
+        try self.refreshSessionOrigin(session, options.message_turn_context);
+        syncSessionOriginToAgent(session);
         if (sessionIsTtlExpired(session, now)) {
             try self.recycleSessionInPlace(session, now);
         }
@@ -561,6 +614,7 @@ pub const SessionManager = struct {
             defer session.mutex.unlock();
             const idle_secs: u64 = @intCast(@max(0, now - session.last_active));
             if (idle_secs > max_idle_secs or sessionIsTtlExpired(session, now)) {
+                syncSessionOriginToAgent(session);
                 if (sessionIsTtlExpired(session, now)) {
                     session.agent.persistSessionCheckpoint("ttl_evict");
                 } else {
@@ -1272,9 +1326,9 @@ test "evictIdle persists checkpoint before removing idle session" {
 
     const timeline_index = (try mem.get(testing.allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
     defer timeline_index.deinit(testing.allocator);
-    try testing.expect(std.mem.indexOf(u8, timeline_index.content, "channel=evict") != null);
-    try testing.expect(std.mem.indexOf(u8, timeline_index.content, "lane=unknown") != null);
-    try testing.expect(std.mem.indexOf(u8, timeline_index.content, "session=evict:checkpoint") != null);
+    try testing.expect(std.mem.indexOf(u8, timeline_index.content, "\"channel\":\"evict\"") != null);
+    try testing.expect(std.mem.indexOf(u8, timeline_index.content, "\"lane\":\"unknown\"") != null);
+    try testing.expect(std.mem.indexOf(u8, timeline_index.content, "\"session\":\"evict:checkpoint\"") != null);
 }
 
 test "evictIdle preserves recent sessions" {
@@ -1666,6 +1720,59 @@ test "ttl recycle persists summary objects in fast mode" {
     try testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
 }
 
+test "processMessageWithToolContext stores session origin snapshot" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const reply = try sm.processMessageWithToolContext("agent:zaki-bot:user:1:thread:telegram:thread:1110331014", "hello", null, .{
+        .channel = "telegram",
+        .account_id = "main",
+        .chat_id = "1110331014",
+    });
+    defer testing.allocator.free(reply);
+
+    const session = try sm.getOrCreate("agent:zaki-bot:user:1:thread:telegram:thread:1110331014");
+    try testing.expectEqualStrings("telegram", session.origin_channel.?);
+    try testing.expectEqualStrings("thread", session.origin_lane.?);
+    try testing.expectEqualStrings("1110331014", session.origin_chat_id.?);
+    try testing.expectEqualStrings("main", session.origin_account_id.?);
+}
+
+test "ttl recycle keeps stored telegram origin on summary writes" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const warmup = try sm.processMessageWithToolContext("agent:zaki-bot:user:1:thread:telegram:thread:1110331014", "before", null, .{
+        .channel = "telegram",
+        .account_id = "main",
+        .chat_id = "1110331014",
+    });
+    defer testing.allocator.free(warmup);
+
+    const session = try sm.getOrCreate("agent:zaki-bot:user:1:thread:telegram:thread:1110331014");
+    session.agent.session_ttl_secs = 1;
+    session.last_active = std.time.timestamp() - 60;
+
+    const reply = try sm.processMessage("agent:zaki-bot:user:1:thread:telegram:thread:1110331014", "after", null);
+    defer testing.allocator.free(reply);
+
+    const latest = (try mem.get(testing.allocator, "summary_latest/agent:zaki-bot:user:1:thread:telegram:thread:1110331014")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "origin_channel=telegram") != null);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "origin_lane=thread") != null);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "origin_chat_id=1110331014") != null);
+}
+
 test "evictIdle with expired ttl writes summary objects before removal" {
     var mock = MockProvider{ .response = "ok" };
     var cfg = testConfig();
@@ -1706,6 +1813,71 @@ test "evictIdle with expired ttl writes summary objects before removal" {
     try testing.expect(std.mem.indexOf(u8, latest.content, "channel=ttl") != null);
     try testing.expect(std.mem.indexOf(u8, latest.content, "lane=unknown") != null);
     try testing.expect(std.mem.indexOf(u8, latest.content, "source_key=timeline_summary/ttl:evict/") != null);
+}
+
+test "evictIdle keeps stored telegram origin for idle_evict" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const first_reply = try sm.processMessageWithToolContext("agent:zaki-bot:user:1:thread:telegram:thread:1110331014", "hello", null, .{
+        .channel = "telegram",
+        .account_id = "main",
+        .chat_id = "1110331014",
+    });
+    defer testing.allocator.free(first_reply);
+
+    const session = try sm.getOrCreate("agent:zaki-bot:user:1:thread:telegram:thread:1110331014");
+    session.last_active = std.time.timestamp() - 1000;
+
+    const evicted = sm.evictIdle(120);
+    try testing.expectEqual(@as(usize, 1), evicted);
+
+    const latest = (try mem.get(testing.allocator, "summary_latest/agent:zaki-bot:user:1:thread:telegram:thread:1110331014")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "origin_channel=telegram") != null);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "origin_lane=thread") != null);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "origin_chat_id=1110331014") != null);
+}
+
+test "evictIdle keeps stored telegram origin for ttl_evict" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const first_reply = try sm.processMessageWithToolContext("agent:zaki-bot:user:1:thread:telegram:thread:1110331014", "hello", null, .{
+        .channel = "telegram",
+        .account_id = "main",
+        .chat_id = "1110331014",
+    });
+    defer testing.allocator.free(first_reply);
+
+    const session = try sm.getOrCreate("agent:zaki-bot:user:1:thread:telegram:thread:1110331014");
+    session.agent.session_ttl_secs = 1;
+    session.last_active = std.time.timestamp() - 1000;
+
+    const evicted = sm.evictIdle(3600);
+    try testing.expectEqual(@as(usize, 1), evicted);
+
+    const latest = (try mem.get(testing.allocator, "summary_latest/agent:zaki-bot:user:1:thread:telegram:thread:1110331014")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "origin_channel=telegram") != null);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "origin_lane=thread") != null);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "origin_chat_id=1110331014") != null);
 }
 
 test "activation_mode mention blocks unmentioned group turn" {
