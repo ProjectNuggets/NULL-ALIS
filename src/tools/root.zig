@@ -653,7 +653,7 @@ fn isReadOnlyComposioExecute(args: JsonObjectMap) bool {
 }
 
 const BackgroundOriginPolicy = struct {
-    allow_schedule_write: bool,
+    allow_schedule_ensure: bool,
     allow_composio_read_execute: bool,
 };
 
@@ -661,26 +661,26 @@ fn backgroundPolicyForOrigin(origin: TurnOrigin) BackgroundOriginPolicy {
     return switch (origin) {
         // Periodic autonomous lane; keep permissive for existing heartbeat remediation flows.
         .heartbeat => .{
-            .allow_schedule_write = true,
+            .allow_schedule_ensure = true,
             .allow_composio_read_execute = true,
         },
         // Explicit on-demand wake jobs should be able to read and self-repair.
         .wake => .{
-            .allow_schedule_write = true,
+            .allow_schedule_ensure = true,
             .allow_composio_read_execute = true,
         },
         // User-visible autonomous delivery lane (briefs/reminders).
         .proactive => .{
-            .allow_schedule_write = true,
+            .allow_schedule_ensure = true,
             .allow_composio_read_execute = true,
         },
         // Internal scheduler maintenance lane; keep conservative to avoid self-loop mutation.
         .scheduler => .{
-            .allow_schedule_write = false,
+            .allow_schedule_ensure = false,
             .allow_composio_read_execute = true,
         },
         .user => .{
-            .allow_schedule_write = true,
+            .allow_schedule_ensure = true,
             .allow_composio_read_execute = true,
         },
     };
@@ -693,6 +693,11 @@ fn isReadOnlyScheduleAction(args: JsonObjectMap) bool {
         std.ascii.eqlIgnoreCase(action, "runs");
 }
 
+fn isEnsureScheduleAction(args: JsonObjectMap) bool {
+    const action = getString(args, "action") orelse return false;
+    return std.ascii.eqlIgnoreCase(action, "ensure");
+}
+
 pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]const u8 {
     const turn_ctx = getTurnContext();
     if (!isBackgroundTurnOrigin(turn_ctx.origin)) return null;
@@ -700,8 +705,9 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
 
     if (std.mem.eql(u8, tool_name, runtime_info.RuntimeInfoTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, schedule.ScheduleTool.tool_name)) {
-        if (policy.allow_schedule_write or isReadOnlyScheduleAction(args)) return null;
-        return "Schedule writes are disabled for scheduler-origin maintenance turns";
+        if (isReadOnlyScheduleAction(args)) return null;
+        if (policy.allow_schedule_ensure and isEnsureScheduleAction(args)) return null;
+        return "Background turns may only inspect schedule state or use schedule ensure for canonical reconciliation";
     }
     if (std.mem.eql(u8, tool_name, file_read.FileReadTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, memory_recall.MemoryRecallTool.tool_name)) return null;
@@ -977,16 +983,21 @@ test "scheduler-origin maintenance blocks schedule writes" {
     const parsed = try parseTestArgs("{\"action\":\"create\",\"expression\":\"*/5 * * * *\",\"command\":\"echo hi\"}");
     defer parsed.deinit();
     const blocked = toolBlockedForCurrentTurn("schedule", parsed.value.object) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, blocked, "Schedule writes are disabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "schedule ensure") != null);
 }
 
-test "proactive origin allows schedule writes" {
+test "proactive origin allows schedule ensure only" {
     setTurnContext(.{ .origin = .proactive });
     defer clearTurnContext();
 
+    const ensure_parsed = try parseTestArgs("{\"action\":\"ensure\",\"expression\":\"*/5 * * * *\",\"command\":\"echo hi\"}");
+    defer ensure_parsed.deinit();
+    try std.testing.expect(toolBlockedForCurrentTurn("schedule", ensure_parsed.value.object) == null);
+
     const parsed = try parseTestArgs("{\"action\":\"create\",\"expression\":\"*/5 * * * *\",\"command\":\"echo hi\"}");
     defer parsed.deinit();
-    try std.testing.expect(toolBlockedForCurrentTurn("schedule", parsed.value.object) == null);
+    const blocked = toolBlockedForCurrentTurn("schedule", parsed.value.object) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "schedule ensure") != null);
 }
 
 test "scheduler-origin maintenance allows composio read-only execute" {

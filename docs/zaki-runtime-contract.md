@@ -12,6 +12,11 @@ Current validated baseline:
 - `scheduler_backend = "postgres"`
 - `degraded = false`
 
+Related design note:
+- durable automation uses the contract in [scheduler-automation-contract.md](./scheduler-automation-contract.md)
+- `schedule` is the user-facing durable automation API
+- heartbeat is a wake/reconcile lane, not the source of exact-time scheduling
+
 ## Ownership
 
 - `NULL-ALIS` owns:

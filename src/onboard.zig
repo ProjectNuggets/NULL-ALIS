@@ -2103,9 +2103,19 @@ fn heartbeatTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) !
             return std.fmt.allocPrint(allocator,
                 \\# HEARTBEAT.md - {s}
                 \\
-                \\# Keep this file empty (or with only comments) to skip heartbeat API calls.
+                \\# Heartbeat is a wake/reconcile lane, not the exact-time scheduler.
+                \\# Declare durable scheduled automations in the Automation Policy block below.
+                \\# A job does not exist unless `schedule` shows it.
                 \\
-                \\# Add short recurring tasks below only when the user explicitly wants them.
+                \\## Automation Policy
+                \\
+                \\```json
+                \\{{
+                \\  "jobs": []
+                \\}}
+                \\```
+                \\
+                \\# Add short policy notes below only when the user explicitly wants them.
                 \\
                 \\# Suggested categories:
                 \\# - morning brief
@@ -2797,8 +2807,9 @@ test "zaki templates contain onboarding and proactive guidance" {
 
     const heartbeat = try heartbeatTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(heartbeat);
-    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "skip heartbeat API calls") != null);
-    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "# - morning brief") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "wake/reconcile lane") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "## Automation Policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "\"jobs\": []") != null);
 
     const bootstrap = try bootstrapTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(bootstrap);

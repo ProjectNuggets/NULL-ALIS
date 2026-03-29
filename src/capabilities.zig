@@ -380,6 +380,7 @@ pub fn buildSummaryText(
             "\nScheduling guidance:\n" ++
             "  use `schedule` for user-facing reminders, briefs, reports, and other proactive jobs\n" ++
             "  use `cron_*` only for raw scheduler inspection or operator maintenance\n" ++
+            "  use `schedule ensure` for background reconciliation of canonical jobs backed by explicit policy\n" ++
             "\nNot available in this runtime:\n" ++
             "  channels (disabled in build): {s}\n" ++
             "  memory engines (disabled in build): {s}\n" ++
@@ -452,7 +453,8 @@ pub fn buildPromptSection(
             "- {s}: {s}\n\n" ++
             "### Scheduling Guidance\n" ++
             "- Use `schedule` for user-facing reminders, briefs, reports, and other proactive jobs.\n" ++
-            "- Use `cron_*` only for raw scheduler inspection or operator maintenance.\n\n" ++
+            "- Use `cron_*` only for raw scheduler inspection or operator maintenance.\n" ++
+            "- Use `schedule ensure` for background reconciliation of canonical jobs backed by explicit policy.\n\n" ++
             "### Not available in this runtime\n" ++
             "- Channels disabled in build: {s}\n" ++
             "- Memory backends disabled in build: {s}\n" ++

@@ -1,6 +1,16 @@
 
 # HEARTBEAT.md
 
-# Keep this file empty (or with only comments) to skip heartbeat API calls.
+# Heartbeat is a wake/reconcile lane, not the exact-time scheduler.
+# Put durable time/date/recurrence automations in the Automation Policy block below.
+# A job does not exist unless `schedule` shows it.
 
-# Add tasks below when you want the agent to check something periodically.
+## Automation Policy
+
+```json
+{
+  "jobs": []
+}
+```
+
+# Add short policy notes below when you want the agent to check something periodically.
