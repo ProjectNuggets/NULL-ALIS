@@ -3350,6 +3350,51 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
     try std.testing.expect(key_idx < focus_idx);
 }
 
+test "slash /new keeps wrapped telegram provenance inside user-scoped summaries" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:thread:telegram:thread:1110331014";
+    agent.auto_save = true;
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "What did we decide on Telegram?"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "We agreed to validate the new summary flow."),
+    });
+
+    const response = (try agent.handleSlashCommand("/new")).?;
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("Session cleared.", response);
+
+    const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_session=agent:zaki-bot:user:1:thread:telegram:thread:1110331014") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_channel=telegram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_lane=thread") != null);
+
+    const latest = (try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:thread:telegram:thread:1110331014")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "channel=telegram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "lane=thread") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "source_key=timeline_summary/agent:zaki-bot:user:1:thread:telegram:thread:1110331014/") != null);
+
+    const timeline_index = (try mem.get(allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
+    defer timeline_index.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "channel=telegram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "lane=thread") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "session=agent:zaki-bot:user:1:thread:telegram:thread:1110331014") != null);
+}
+
 test "slash /new with empty session does not write checkpoint" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);

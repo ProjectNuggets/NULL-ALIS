@@ -532,18 +532,55 @@ pub fn deriveMemoryProvenance(session_id_opt: ?[]const u8, key: []const u8) Memo
     return .{};
 }
 
-fn deriveChannelFromSessionId(session_id: []const u8) []const u8 {
+fn embeddedOriginSessionId(session_id: []const u8) ?[]const u8 {
     const app_prefix = "agent:zaki-bot:user:";
-    if (std.mem.startsWith(u8, session_id, app_prefix)) return "app";
+    if (!std.mem.startsWith(u8, session_id, app_prefix)) return null;
 
+    const rest = session_id[app_prefix.len..];
+    const user_sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    const lane_and_tail = rest[user_sep + 1 ..];
+
+    if (std.mem.eql(u8, lane_and_tail, "main")) return null;
+
+    const lane_sep = std.mem.indexOfScalar(u8, lane_and_tail, ':') orelse return null;
+    const outer_lane = lane_and_tail[0..lane_sep];
+    if (!std.mem.eql(u8, outer_lane, "thread") and !std.mem.eql(u8, outer_lane, "task") and !std.mem.eql(u8, outer_lane, "cron")) return null;
+
+    const embedded = lane_and_tail[lane_sep + 1 ..];
+    if (embedded.len == 0 or std.mem.indexOfScalar(u8, embedded, ':') == null) return null;
+    return embedded;
+}
+
+fn deriveExternalChannelFromSessionId(session_id: []const u8) []const u8 {
     const colon_idx = std.mem.indexOfScalar(u8, session_id, ':') orelse return "unknown";
     if (colon_idx == 0) return "unknown";
     return session_id[0..colon_idx];
 }
 
+fn deriveExternalLaneFromSessionId(session_id: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, session_id, ":thread:") != null) return "thread";
+    if (std.mem.indexOf(u8, session_id, ":direct:") != null) return "direct";
+    if (std.mem.indexOf(u8, session_id, ":group:") != null) return "group";
+    if (std.mem.indexOf(u8, session_id, ":channel:") != null) return "channel";
+    if (std.mem.indexOf(u8, session_id, ":task:") != null) return "task";
+    if (std.mem.indexOf(u8, session_id, ":cron:") != null) return "cron";
+    return "unknown";
+}
+
+fn deriveChannelFromSessionId(session_id: []const u8) []const u8 {
+    const app_prefix = "agent:zaki-bot:user:";
+    if (std.mem.startsWith(u8, session_id, app_prefix)) {
+        if (embeddedOriginSessionId(session_id)) |embedded| return deriveExternalChannelFromSessionId(embedded);
+        return "app";
+    }
+
+    return deriveExternalChannelFromSessionId(session_id);
+}
+
 fn deriveLaneFromSessionId(session_id: []const u8) []const u8 {
     const app_prefix = "agent:zaki-bot:user:";
     if (std.mem.startsWith(u8, session_id, app_prefix)) {
+        if (embeddedOriginSessionId(session_id)) |embedded| return deriveExternalLaneFromSessionId(embedded);
         const rest = session_id[app_prefix.len..];
         const user_sep = std.mem.indexOfScalar(u8, rest, ':') orelse return "unknown";
         const lane = rest[user_sep + 1 ..];
@@ -554,13 +591,7 @@ fn deriveLaneFromSessionId(session_id: []const u8) []const u8 {
         return "unknown";
     }
 
-    if (std.mem.indexOf(u8, session_id, ":thread:") != null) return "thread";
-    if (std.mem.indexOf(u8, session_id, ":direct:") != null) return "direct";
-    if (std.mem.indexOf(u8, session_id, ":group:") != null) return "group";
-    if (std.mem.indexOf(u8, session_id, ":channel:") != null) return "channel";
-    if (std.mem.indexOf(u8, session_id, ":task:") != null) return "task";
-    if (std.mem.indexOf(u8, session_id, ":cron:") != null) return "cron";
-    return "unknown";
+    return deriveExternalLaneFromSessionId(session_id);
 }
 
 pub fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
@@ -2369,6 +2400,20 @@ test "deriveMemoryProvenance derives app lane" {
     try std.testing.expectEqualStrings("app", provenance.channel);
     try std.testing.expectEqualStrings("thread", provenance.lane);
     try std.testing.expectEqualStrings("agent:zaki-bot:user:42:thread:conv-2", provenance.session_id.?);
+}
+
+test "deriveMemoryProvenance preserves wrapped telegram origin inside user-scoped session" {
+    const provenance = deriveMemoryProvenance("agent:zaki-bot:user:42:thread:telegram:thread:1110331014", "ignored");
+    try std.testing.expectEqualStrings("telegram", provenance.channel);
+    try std.testing.expectEqualStrings("thread", provenance.lane);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:42:thread:telegram:thread:1110331014", provenance.session_id.?);
+}
+
+test "deriveMemoryProvenance preserves wrapped slack origin inside user-scoped session" {
+    const provenance = deriveMemoryProvenance("agent:zaki-bot:user:42:thread:slack:channel:C12345", "ignored");
+    try std.testing.expectEqualStrings("slack", provenance.channel);
+    try std.testing.expectEqualStrings("channel", provenance.lane);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:42:thread:slack:channel:C12345", provenance.session_id.?);
 }
 
 test "deriveMemoryProvenance derives connector lane" {
