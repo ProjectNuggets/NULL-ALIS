@@ -169,7 +169,7 @@ pub const ProductPresetsConfig = struct {
             .queue_debounce_ms = 0,
         },
         .summarizer = .{
-            .enabled = false,
+            .enabled = true,
             .window_size_tokens = 3000,
             .summary_max_tokens = 300,
             .auto_extract_semantic = true,

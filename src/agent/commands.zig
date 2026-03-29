@@ -743,13 +743,13 @@ fn emitLifecycleSummarizerStage(self: anytype, duration_ms: u64, summarized_coun
     self.observer.recordEvent(&event);
 }
 
-fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, session_id: []const u8, reason: []const u8, now_s: i64, now_iso: []const u8) void {
-    const mem = self.mem orelse return;
+fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, session_id: []const u8, reason: []const u8, now_s: i64, now_iso: []const u8) bool {
+    const mem = self.mem orelse return false;
     const rt = self.mem_rt;
     const summarizer_cfg = effectiveSummarizerConfig(self);
-    if (!summarizer_cfg.enabled) return;
+    if (!summarizer_cfg.enabled) return false;
 
-    const entries = buildSessionEndSummaryEntries(self, self.allocator, checkpoint_content, summarizer_cfg) catch return;
+    const entries = buildSessionEndSummaryEntries(self, self.allocator, checkpoint_content, summarizer_cfg) catch return false;
     defer self.allocator.free(entries);
     const summarize_start_ms = std.time.milliTimestamp();
     defer {
@@ -757,7 +757,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         emitLifecycleSummarizerStage(self, duration_ms, entries.len);
     }
 
-    const prompt = memory_mod.buildSummarizationPrompt(self.allocator, entries, entries.len) catch return;
+    const prompt = memory_mod.buildSummarizationPrompt(self.allocator, entries, entries.len) catch return false;
     defer self.allocator.free(prompt);
 
     const summary_system = "Summarize the ended session into a compact continuity object. Preserve focus, decisions, open loops, next steps, and long-lived facts. Follow the required plain-text structure exactly.";
@@ -793,7 +793,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                 });
                 break :blk owned;
             }
-            return;
+            return false;
         };
         defer {
             if (response.content) |content_part| {
@@ -820,7 +820,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                 });
                 break :blk owned;
             }
-            return;
+            return false;
         };
         break :blk parsed_summary.?.summary;
     };
@@ -829,7 +829,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         self.allocator,
         "session_summary/{s}/{d}",
         .{ session_id, now_s },
-    ) catch return;
+    ) catch return false;
     defer self.allocator.free(summary_key);
 
     if (mem.store(summary_key, content, .conversation, session_id)) |_| {
@@ -840,22 +840,24 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         self.allocator,
         "timeline_summary/{s}/{d}",
         .{ session_id, now_s },
-    ) catch return;
+    ) catch return false;
     defer self.allocator.free(timeline_key);
-    if (mem.store(timeline_key, content, .daily, null)) |_| {
+    const timeline_written = if (mem.store(timeline_key, content, .daily, null)) |_| blk: {
         if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, timeline_key, content);
-    } else |_| {}
+        break :blk true;
+    } else |_| false;
+    if (!timeline_written) return false;
 
     const focus = summarySectionValue(content, "focus:");
     const next = summarySectionValue(content, "next:");
     const provenance = memory_mod.deriveMemoryProvenance(session_id, timeline_key);
-    const latest_key = std.fmt.allocPrint(self.allocator, "summary_latest/{s}", .{session_id}) catch return;
+    const latest_key = std.fmt.allocPrint(self.allocator, "summary_latest/{s}", .{session_id}) catch return true;
     defer self.allocator.free(latest_key);
     const latest_content = std.fmt.allocPrint(
         self.allocator,
         "type=summary_latest\nsession={s}\nchannel={s}\nlane={s}\nsource_key={s}\nat={s}\n{s}",
         .{ session_id, provenance.channel, provenance.lane, timeline_key, now_iso, content },
-    ) catch return;
+    ) catch return true;
     defer self.allocator.free(latest_content);
     if (mem.store(latest_key, latest_content, .core, null)) |_| {
         if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, latest_key, latest_content);
@@ -890,6 +892,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             next,
         });
     }
+    return true;
 }
 
 pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
@@ -932,18 +935,25 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
         rt.syncVectorAfterStore(self.allocator, checkpoint_key, checkpoint_content);
     }
 
-    const anchor_content = std.fmt.allocPrint(
-        self.allocator,
-        "type=context_anchor\nlast_session={s}\nlast_channel={s}\nlast_lane={s}\nlast_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\nlast_summary_key=timeline_summary/{s}/{d}\nlast_at={s}",
-        .{ session_id, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).channel, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).lane, reason, self.model_name, checkpoint_key, session_id, now_s, now_iso },
-    ) catch return;
+    const summary_written = persistSessionSemanticSummary(self, checkpoint_content, session_id, reason, now_s, now_iso);
+    const anchor_content_result = if (summary_written)
+        std.fmt.allocPrint(
+            self.allocator,
+            "type=context_anchor\nlast_session={s}\nlast_channel={s}\nlast_lane={s}\nlast_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\nlast_summary_key=timeline_summary/{s}/{d}\nlast_at={s}",
+            .{ session_id, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).channel, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).lane, reason, self.model_name, checkpoint_key, session_id, now_s, now_iso },
+        )
+    else
+        std.fmt.allocPrint(
+            self.allocator,
+            "type=context_anchor\nlast_session={s}\nlast_channel={s}\nlast_lane={s}\nlast_reason={s}\nlast_model={s}\nlast_checkpoint_key={s}\nlast_at={s}",
+            .{ session_id, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).channel, memory_mod.deriveMemoryProvenance(session_id, checkpoint_key).lane, reason, self.model_name, checkpoint_key, now_iso },
+        );
+    const anchor_content = anchor_content_result catch return;
     defer self.allocator.free(anchor_content);
     mem.store("context_anchor_current", anchor_content, .core, null) catch return;
     if (self.mem_rt) |rt| {
         rt.syncVectorAfterStore(self.allocator, "context_anchor_current", anchor_content);
     }
-
-    persistSessionSemanticSummary(self, checkpoint_content, session_id, reason, now_s, now_iso);
 }
 
 fn clearSessionState(self: anytype, reason: []const u8) void {

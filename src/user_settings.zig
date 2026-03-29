@@ -84,7 +84,7 @@ const mode_mappings = [_]ModeMapping{
         .queue_cap = 8,
         .queue_drop = "newest",
         .max_history_messages = 40,
-        .summarizer_enabled = false,
+        .summarizer_enabled = true,
         .summarizer_window_size_tokens = 3000,
         .summarizer_summary_max_tokens = 300,
     },
@@ -601,6 +601,33 @@ test "resolveSettingsFromConfigJson prefers canonical product settings" {
     try std.testing.expect(!settings.proactive_updates);
     try std.testing.expect(settings.voice_replies);
     try std.testing.expectEqual(@as(u32, 42), settings.session_timeout_minutes);
+}
+
+test "applySettingsToConfig enables fast summarizer without changing fast preset sizing" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(cfg.product_presets.fast.summarizer.enabled);
+
+    applySettingsToConfig(&cfg, .{
+        .assistant_mode = .fast,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 30,
+    });
+
+    try std.testing.expectEqualStrings("latest", cfg.agent.queue_mode);
+    try std.testing.expectEqual(@as(u32, 8), cfg.agent.queue_cap);
+    try std.testing.expectEqualStrings("newest", cfg.agent.queue_drop);
+    try std.testing.expectEqual(@as(u32, 40), cfg.agent.max_history_messages);
+    try std.testing.expect(cfg.memory.summarizer.enabled);
+    try std.testing.expectEqual(@as(u32, 3000), cfg.memory.summarizer.window_size_tokens);
+    try std.testing.expectEqual(@as(u32, 300), cfg.memory.summarizer.summary_max_tokens);
 }
 
 test "resolveSettingsFromConfigJson clamps huge canonical timeout" {

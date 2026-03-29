@@ -18,6 +18,7 @@ const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
 const memory_mod = @import("memory/root.zig");
+const user_settings = @import("user_settings.zig");
 const zaki_state_mod = @import("zaki_state.zig");
 const Memory = memory_mod.Memory;
 const observability = @import("observability.zig");
@@ -1626,6 +1627,42 @@ test "ttl recycle persists session checkpoint before replacement" {
     defer latest.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, latest.content, "channel=ttl") != null);
     try testing.expect(std.mem.indexOf(u8, latest.content, "lane=unknown") != null);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
+}
+
+test "ttl recycle persists summary objects in fast mode" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+    user_settings.applySettingsToConfig(&cfg, .{
+        .assistant_mode = .fast,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 30,
+    });
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const warmup = try sm.processMessage("ttl:fast", "before", null);
+    defer testing.allocator.free(warmup);
+
+    const first = try sm.getOrCreate("ttl:fast");
+    first.agent.session_ttl_secs = 1;
+    first.last_active = std.time.timestamp() - 60;
+
+    const reply = try sm.processMessage("ttl:fast", "after", null);
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("ok", reply);
+
+    const latest = (try mem.get(testing.allocator, "summary_latest/ttl:fast")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
     try testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
 }
 

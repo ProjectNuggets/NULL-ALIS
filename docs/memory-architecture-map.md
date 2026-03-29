@@ -484,3 +484,408 @@ Keep this mental model:
 
 That is the current best shape in the codebase.
 Do not collapse them back into one undifferentiated memory bucket.
+
+## 11. Research To Roadmap Memo
+
+This section translates current memory research and the implementation patterns
+from the repos discussed in this project into a `nullalis`-specific roadmap.
+
+The short version:
+- bigger context windows are helpful but not sufficient
+- transcript replay alone is not a durable memory strategy
+- layered memory beats one giant prompt
+- topic-aware episodic memory is stronger than timestamp-only recall
+- pre-compaction or milestone memory flush is a high-value next step
+
+### What The Research Validates
+
+#### A. Long context alone is unreliable
+
+`Lost in the Middle` showed that models often under-use information placed in
+the middle of long prompts.
+
+What this means for `nullalis`:
+- do not treat larger prompt windows as the main memory strategy
+- keep active turn context compact
+- retrieve high-value memory objects instead of replaying whole history
+
+Source:
+- https://arxiv.org/abs/2307.03172
+
+#### B. Layered memory is the right architectural shape
+
+`MemGPT`, `LongMem`, and later agent-memory work converge on a split between:
+- working memory
+- external memory
+- durable memory
+- retrieval-on-demand
+
+What this means for `nullalis`:
+- the current split between transcript, summaries, durable facts, and archive is directionally correct
+- the next step is to formalize a true mutable state layer
+
+Sources:
+- https://arxiv.org/abs/2310.08560
+- https://arxiv.org/abs/2306.07174
+
+#### C. Episodic memory units should be meaningful, not only chronological
+
+`SeCom`, `Membox`, and newer long-horizon dialogue memory papers all point to
+the same issue: turn-level fragments and naive session dumps are weaker than
+coherent topical/episodic units.
+
+What this means for `nullalis`:
+- `timeline_summary/*` is a good start
+- but session-end summaries alone are not enough for very long sessions
+- the next evolution should be milestone or topic summaries, not more transcript
+
+Sources:
+- https://www.microsoft.com/en-us/research/project/secom/
+- https://arxiv.org/abs/2601.03785
+
+#### D. Structured persistent memory beats transcript carry-forward
+
+`Memori`, `AdaMem`, and `HiMem` all reinforce the same product lesson:
+- keep compact structured memory objects
+- separate current state from episodic history
+- keep raw dialogue as evidence, not the default continuity carrier
+
+What this means for `nullalis`:
+- summary-first continuity is the right base layer
+- future `state/*`, `intention/*`, `pattern/*`, and `learning/*` objects are the right next layer
+
+Sources:
+- https://arxiv.org/abs/2603.19935
+- https://arxiv.org/abs/2603.16496
+- https://arxiv.org/abs/2601.06377
+
+### What The Shared Repos Validate
+
+#### OpenClaw
+
+Strong lessons from OpenClaw:
+- stable prompt files are useful:
+  - `SOUL.md`
+  - `USER.md`
+  - `MEMORY.md`
+- long sessions need a pre-compaction memory flush
+- compaction should preserve active task continuity, not only reduce tokens
+
+What to borrow:
+- a milestone or pre-compaction semantic flush
+- not a transcript-heavy reset model
+
+#### PageIndex
+
+Strong lesson from PageIndex:
+- summaries need an index/discovery layer
+- retrieval should not depend only on time ordering
+
+What to borrow:
+- lightweight flat or topical indices
+- not a full tree or indexing subsystem in the next step
+
+## 12. Nullalis Memory Roadmap
+
+The roadmap below is intentionally phased.
+It is ordered by leverage and safety, not novelty.
+
+### Phase 0: Current Baseline
+
+Status:
+- active transcript in `self.history`
+- summary-first continuity at real session boundaries
+- durable fact extraction from structured summaries
+- provenance-aware summary pointers
+- lifecycle-safe mutable memory for editable `.core` state
+
+Files:
+- `src/agent/root.zig`
+- `src/agent/memory_loader.zig`
+- `src/agent/commands.zig`
+- `src/memory/lifecycle/summarizer.zig`
+- `src/memory/root.zig`
+- `src/memory/engines/markdown.zig`
+- `src/memory/engines/zaki_dual.zig`
+- `src/tools/memory_edit.zig`
+
+### Phase 1: State Layer Formalization
+
+Goal:
+- separate current mutable truth from episodic timeline memory
+
+Add:
+- `state/*`
+- `intention/*`
+- `open_loop/*`
+- `pattern/*`
+- `autonomy/*`
+
+Keep:
+- `session_summary/*` and `timeline_summary/*` append-only
+- transcripts/checkpoints as evidence
+
+Why this phase comes first:
+- the research consistently shows that “current state” must not be mixed with “history”
+- it creates the base for proactive behavior later
+
+Likely files:
+- `src/memory/root.zig`
+- `src/agent/memory_loader.zig`
+- `src/agent/commands.zig`
+- `src/tools/memory_store.zig`
+- `src/tools/memory_edit.zig`
+
+Execution hints:
+- start with key-prefix policy only
+- do not add a new vtable
+- keep the existing `Memory` interface
+- extend lifecycle classification rules for the new mutable key families
+
+### Phase 2: Milestone / Pre-Compaction Memory Flush
+
+Goal:
+- preserve continuity during long uninterrupted sessions
+
+Behavior:
+- if a session becomes too large or too old without a real boundary
+- write a milestone summary
+- do not end the session
+- do not summarize every turn
+
+Why this phase matters:
+- this is the biggest current gap in lifetime continuity
+- OpenClaw validates the practical need
+- the research says episodic memory needs intermediate units, not only final session summaries
+
+Likely files:
+- `src/agent/root.zig`
+- `src/agent/commands.zig`
+- `src/memory/lifecycle/summarizer.zig`
+- `src/session.zig`
+
+Execution hints:
+- trigger on either:
+  - meaningful turn count
+  - transcript bytes
+  - summarizer window overflow
+- write new memory objects, do not rewrite existing session summaries
+- keep the first version session-scoped and simple
+
+### Phase 3: Topic / Project Indices
+
+Goal:
+- improve discoverability without loading more raw history
+
+Add optional indices:
+- `project_index/current`
+- `people_index/current`
+- `open_loops/current`
+- later maybe `pattern_index/current`
+
+Why:
+- PageIndex-style discovery is useful
+- current `timeline_index/current` is only a hot TOC
+
+Likely files:
+- `src/agent/commands.zig`
+- `src/tools/memory_recall.zig`
+- `src/tools/memory_list.zig`
+- `src/agent/memory_loader.zig`
+
+Execution hints:
+- keep indices flat and rolling
+- do not build a tree or graph layer yet
+- store descriptors, not full memory copies
+
+### Phase 4: Proactive State And Pattern Use
+
+Goal:
+- make the agent proactively helpful based on explicit memory structures
+
+Use:
+- `intention/*`
+- `pattern/*`
+- `open_loop/*`
+- `autonomy/*`
+
+Why:
+- proactive behavior should be driven by evidence-backed state
+- not inferred from raw transcript residue
+
+Likely files:
+- `src/agent/memory_loader.zig`
+- `src/agent/prompt.zig`
+- `src/daemon.zig`
+- `src/user_settings.zig`
+
+Execution hints:
+- require policy checks before proactive actions
+- distinguish:
+  - suggest
+  - ask first
+  - never act automatically
+- keep pattern promotion conservative and evidence-based
+
+### Phase 5: Learning And Reflection Layer
+
+Goal:
+- make self-improvement visible and controlled
+
+Add:
+- `learning/*`
+- maybe later a short curated `LEARNING.md`
+
+Why:
+- learnings should improve future behavior
+- but should not silently rewrite identity or user truth
+
+Likely files:
+- `src/agent/commands.zig`
+- `src/memory/root.zig`
+- `src/agent/prompt.zig`
+
+Execution hints:
+- keep it small
+- prefer weekly or session-end reflection over per-turn self-commentary
+- do not inject long reflection logs every turn
+
+## 13. Mode Design Guidance
+
+The product modes should differ by:
+- responsiveness
+- working-memory depth
+- summary richness
+- queue patience
+
+They should not differ by whether core memory exists.
+
+### Status Quo
+
+Current defaults:
+
+`fast`
+- history: `40`
+- queue: `latest`
+- cap: `8`
+- drop: `newest`
+- summary window: `3000`
+- summary max: `300`
+
+`balanced`
+- history: `50`
+- queue: `serial`
+- cap: `12`
+- drop: `summarize`
+- summary window: `4000`
+- summary max: `500`
+
+`deep`
+- history: `80`
+- queue: `serial`
+- cap: `20`
+- drop: `summarize`
+- summary window: `6000`
+- summary max: `700`
+
+### Recommended Future Tuning
+
+`fast`
+- optimize for latency and cost
+- keep continuity compact
+
+Recommended target:
+- history: `35`
+- queue: `latest`
+- cap: `8`
+- drop: `newest`
+- summary window: `2500`
+- summary max: `240`
+
+`balanced`
+- optimize for default product experience
+
+Recommended target:
+- history: `50`
+- queue: `serial`
+- cap: `10`
+- drop: `summarize`
+- summary window: `4500`
+- summary max: `450`
+
+`deep`
+- optimize for high-continuity work and life sessions
+
+Recommended target:
+- history: `70`
+- queue: `serial`
+- cap: `16`
+- drop: `summarize`
+- summary window: `6500`
+- summary max: `750`
+
+Files:
+- `src/config_types.zig`
+- `src/user_settings.zig`
+
+Execution hints:
+- update both `ProductPresetsConfig` and `mode_mappings`
+- test the applied-config path, not only helper mappings
+- avoid hidden mode-only behavior outside queue/history/summarizer/session knobs
+
+## 14. Practical Execution Notes
+
+### What To Build Now
+
+If the goal is strongest progress with low regression risk, build in this order:
+
+1. state layer
+2. milestone/pre-compaction summaries
+3. topic/project indices
+4. proactive use of patterns/intentions/autonomy
+5. learning/reflection layer
+
+### What Not To Build Yet
+
+Delay these until the earlier layers are solid:
+- full knowledge graph memory
+- heavy hierarchical indexing
+- transcript-first long-context strategies
+- unconstrained auto-learning of user traits
+
+### How To Judge Success
+
+A good memory change should make the agent:
+- more stable across sessions
+- more accurate about what is current
+- less noisy
+- better at cross-channel continuity
+- better at preserving long-running work
+
+A bad memory change usually:
+- increases transcript volume in prompt
+- blurs state and history
+- makes forgetting/editing dangerous
+- makes proactive behavior feel creepy or arbitrary
+
+### Current Code Hotspots
+
+When designing or implementing any memory evolution, start here:
+
+`src/agent/memory_loader.zig`
+- what the model actually sees per turn
+
+`src/agent/commands.zig`
+- where summaries, anchors, indices, and promoted facts are written
+
+`src/memory/lifecycle/summarizer.zig`
+- summary shape, parsing, and fact extraction
+
+`src/memory/root.zig`
+- memory lifecycle policy and internal filtering
+
+`src/user_settings.zig`
+- user-facing product mode behavior
+
+`src/config_types.zig`
+- real preset defaults that runtime application uses

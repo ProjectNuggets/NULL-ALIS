@@ -3033,6 +3033,37 @@ const test_summary_provider_vtable = providers.Provider.VTable{
     .deinit = TestSummaryProvider.deinitFn,
 };
 
+const TestInvalidSummaryProvider = struct {
+    fn chatWithSystem(_: *anyopaque, alloc: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return alloc.dupe(u8, "plain text summary without required sections");
+    }
+
+    fn chat(_: *anyopaque, alloc: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        return .{
+            .content = try alloc.dupe(u8, "plain text summary without required sections"),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "test-invalid-summary-provider";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+var test_invalid_summary_provider_state: u8 = 0;
+const test_invalid_summary_provider_vtable = providers.Provider.VTable{
+    .chatWithSystem = TestInvalidSummaryProvider.chatWithSystem,
+    .chat = TestInvalidSummaryProvider.chat,
+    .supportsNativeTools = TestInvalidSummaryProvider.supportsNativeTools,
+    .getName = TestInvalidSummaryProvider.getName,
+    .deinit = TestInvalidSummaryProvider.deinitFn,
+};
+
 fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
     var noop = observability.NoopObserver{};
     return Agent{
@@ -3386,6 +3417,112 @@ test "persistSessionCheckpoint caps timeline index to 32 descriptors" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 32), count);
+}
+
+test "persistSessionCheckpoint omits last_summary_key when summarizer is disabled" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:main";
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "hello"),
+    });
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+        ._summarizer_cfg = .{
+            .enabled = false,
+            .window_size_tokens = 3000,
+            .summary_max_tokens = 300,
+            .auto_extract_semantic = true,
+        },
+    };
+    agent.mem_rt = &rt;
+
+    agent.persistSessionCheckpoint("new");
+
+    const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_checkpoint_key=session_checkpoint_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=") == null);
+
+    const latest = try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:main");
+    if (latest) |entry| {
+        defer entry.deinit(allocator);
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "persistSessionCheckpoint includes last_summary_key when fallback summary is written" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.provider = .{ .ptr = @ptrCast(&test_invalid_summary_provider_state), .vtable = &test_invalid_summary_provider_vtable };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:main";
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "recap this session"),
+    });
+
+    agent.persistSessionCheckpoint("new");
+
+    const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
+
+    const timeline_entries = try mem.list(allocator, .daily, null);
+    defer memory_mod.freeEntries(allocator, timeline_entries);
+    var found_timeline_summary = false;
+    for (timeline_entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "timeline_summary/agent:zaki-bot:user:1:main/")) continue;
+        found_timeline_summary = true;
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "focus: recap this session") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "next:") != null);
+        break;
+    }
+    try std.testing.expect(found_timeline_summary);
 }
 
 test "slash /reset clears history and switches model" {
