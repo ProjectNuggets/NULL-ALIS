@@ -390,27 +390,27 @@ pub fn allTools(
 
     // Cron tools + push notifications
     const cat = try allocator.create(cron_add.CronAddTool);
-    cat.* = .{};
+    cat.* = .{ .config = opts.config };
     try list.append(allocator, cat.tool());
 
     const clt = try allocator.create(cron_list.CronListTool);
-    clt.* = .{};
+    clt.* = .{ .config = opts.config };
     try list.append(allocator, clt.tool());
 
     const crt = try allocator.create(cron_remove.CronRemoveTool);
-    crt.* = .{};
+    crt.* = .{ .config = opts.config };
     try list.append(allocator, crt.tool());
 
     const crst = try allocator.create(cron_runs.CronRunsTool);
-    crst.* = .{};
+    crst.* = .{ .config = opts.config };
     try list.append(allocator, crst.tool());
 
     const crut = try allocator.create(cron_run.CronRunTool);
-    crut.* = .{};
+    crut.* = .{ .config = opts.config };
     try list.append(allocator, crut.tool());
 
     const cupt = try allocator.create(cron_update.CronUpdateTool);
-    cupt.* = .{};
+    cupt.* = .{ .config = opts.config };
     try list.append(allocator, cupt.tool());
 
     const pt = try allocator.create(pushover.PushoverTool);

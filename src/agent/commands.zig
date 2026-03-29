@@ -724,18 +724,21 @@ fn updateTimelineIndex(
         while (iter.next()) |line_raw| {
             const line = std.mem.trim(u8, line_raw, " \t\r\n");
             if (line.len == 0) continue;
-            const parsed = memory_mod.parseTimelineIndexLine(line_raw) orelse continue;
-            if (std.mem.eql(u8, parsed.key, timeline_key)) continue;
-            if (kept >= 32) break;
-            if (line[0] == '{') {
-                w.writeAll(line) catch break;
-            } else {
-                const normalized = memory_mod.buildTimelineIndexJsonLine(allocator, parsed) catch break;
-                defer allocator.free(normalized);
-                w.writeAll(normalized) catch break;
+            {
+                const parsed = memory_mod.parseTimelineIndexLine(allocator, line_raw) catch break orelse continue;
+                defer parsed.deinit(allocator);
+                if (std.mem.eql(u8, parsed.key, timeline_key)) continue;
+                if (kept >= 32) break;
+                if (line[0] == '{') {
+                    w.writeAll(line) catch break;
+                } else {
+                    const normalized = memory_mod.buildTimelineIndexJsonLine(allocator, parsed) catch break;
+                    defer allocator.free(normalized);
+                    w.writeAll(normalized) catch break;
+                }
+                w.writeByte('\n') catch break;
+                kept += 1;
             }
-            w.writeByte('\n') catch break;
-            kept += 1;
         }
     }
 

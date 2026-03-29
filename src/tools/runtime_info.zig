@@ -71,9 +71,9 @@ pub const RuntimeInfoTool = struct {
         else if (std.mem.eql(u8, section, "integrations"))
             try self.buildIntegrationsJson(allocator, user_id_override)
         else if (std.mem.eql(u8, section, "scheduler"))
-            try self.buildSchedulerJson(allocator)
+            try self.buildSchedulerJson(allocator, user_id_override)
         else if (std.mem.eql(u8, section, "heartbeat"))
-            try self.buildHeartbeatJson(allocator)
+            try self.buildHeartbeatJson(allocator, user_id_override)
         else if (std.mem.eql(u8, section, "ops"))
             try self.buildOpsJson(allocator)
         else
@@ -85,13 +85,13 @@ pub const RuntimeInfoTool = struct {
     fn buildSummaryJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8, verbose: bool) ![]u8 {
         const tenant_ctx = root.getTenantContext();
         const turn_ctx = root.getTurnContext();
-        const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
         const effective_backend = root.effectiveStateBackend(self.config, tenant_ctx);
-        const scheduler_backend = root.schedulerBackend(self.config, tenant_ctx);
+        const scheduler_backend = schedulerTruthLabel(self.config, tenant_ctx, user_id_override);
         const degraded_reason = root.degradedReason(self.config, tenant_ctx);
         const degraded = degraded_reason.len > 0;
-        const context_incomplete = tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or scoped_numeric_user_id == null);
+        const context_incomplete = std.mem.eql(u8, scheduler_backend, "context_missing");
         const data_source = runtimeDataSourceLabel(tenant_ctx, user_id_override);
+        const heartbeat_cfg = try readEffectiveHeartbeatConfig(allocator, self.config, tenant_ctx, user_id_override);
         const chat_provider_effective = normalizeProviderAlias(self.config.default_provider);
         const embedding_provider_effective = normalizeProviderAlias(self.config.memory.search.provider);
         const chat_fallback_chain = try allocNormalizedFallbackChain(allocator, self.config.reliability.fallback_providers);
@@ -177,9 +177,9 @@ pub const RuntimeInfoTool = struct {
         try json_util.appendJsonKeyValue(&buf, allocator, "degraded_reason", degraded_reason);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "heartbeat_enabled");
-        try buf.appendSlice(allocator, if (self.config.heartbeat.enabled) "true" else "false");
+        try buf.appendSlice(allocator, if (heartbeat_cfg.enabled) "true" else "false");
         try buf.appendSlice(allocator, ",");
-        try json_util.appendJsonInt(&buf, allocator, "heartbeat_interval_minutes", self.config.heartbeat.interval_minutes);
+        try json_util.appendJsonInt(&buf, allocator, "heartbeat_interval_minutes", heartbeat_cfg.interval_minutes);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonInt(&buf, allocator, "background_main_reroutes_total", @intCast(lane_snapshot.total));
         try buf.appendSlice(allocator, ",");
@@ -375,10 +375,12 @@ pub const RuntimeInfoTool = struct {
         return try buf.toOwnedSlice(allocator);
     }
 
-    fn buildSchedulerJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator) ![]u8 {
+    fn buildSchedulerJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8) ![]u8 {
         const tenant_ctx = root.getTenantContext();
         const effective_backend = root.effectiveStateBackend(self.config, tenant_ctx);
-        const scheduler_backend = root.schedulerBackend(self.config, tenant_ctx);
+        const scheduler_backend = schedulerTruthLabel(self.config, tenant_ctx, user_id_override);
+        const scoped_user_id = resolveScopedUserId(tenant_ctx, user_id_override);
+        const context_incomplete = std.mem.eql(u8, scheduler_backend, "context_missing");
         var lane_snapshot = try lane_metrics.snapshotBackgroundMainReroutes(allocator);
         defer lane_snapshot.deinit(allocator);
 
@@ -389,6 +391,21 @@ pub const RuntimeInfoTool = struct {
         try buf.appendSlice(allocator, if (self.config.scheduler.enabled) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKeyValue(&buf, allocator, "backend", scheduler_backend);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "tenant_context_attached");
+        try buf.appendSlice(allocator, if (!context_incomplete and scoped_user_id != null) "true" else if (tenant_ctx.state_mgr != null and tenant_ctx.numeric_user_id != null) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "scheduler_truth", scheduler_backend);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "scoped_user_id");
+        if (scoped_user_id) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "context_incomplete");
+        try buf.appendSlice(allocator, if (context_incomplete) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKeyValue(&buf, allocator, "state_backend_effective", effective_backend);
         try buf.appendSlice(allocator, ",");
@@ -406,9 +423,11 @@ pub const RuntimeInfoTool = struct {
         return try buf.toOwnedSlice(allocator);
     }
 
-    fn buildHeartbeatJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator) ![]u8 {
+    fn buildHeartbeatJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8) ![]u8 {
         const turn_ctx = root.getTurnContext();
         const tenant_ctx = root.getTenantContext();
+        const heartbeat_cfg = try readEffectiveHeartbeatConfig(allocator, self.config, tenant_ctx, user_id_override);
+        const scheduler_truth = schedulerTruthLabel(self.config, tenant_ctx, user_id_override);
 
         var runtime_available = false;
         var runtime_last_run_s: ?i64 = null;
@@ -417,12 +436,10 @@ pub const RuntimeInfoTool = struct {
         var runtime_last_reason: ?[]u8 = null;
         defer if (runtime_last_reason) |value| allocator.free(value);
 
-        if (self.config.tenant.enabled and tenant_ctx.user_id != null) {
-            const user_id = tenant_ctx.user_id.?;
-            const path = std.fmt.allocPrint(allocator, "{s}/{s}/heartbeat_runtime.json", .{
-                self.config.tenant.data_root,
-                user_id,
-            }) catch null;
+        const user_root = try resolveScopedUserRoot(allocator, self.config, tenant_ctx, user_id_override);
+        defer if (user_root) |value| allocator.free(value);
+        if (user_root) |root_path| {
+            const path = std.fmt.allocPrint(allocator, "{s}/heartbeat_runtime.json", .{root_path}) catch null;
             if (path) |runtime_path| {
                 defer allocator.free(runtime_path);
                 const file = std.fs.openFileAbsolute(runtime_path, .{}) catch null;
@@ -456,9 +473,16 @@ pub const RuntimeInfoTool = struct {
         defer buf.deinit(allocator);
         try buf.appendSlice(allocator, "{");
         try json_util.appendJsonKey(&buf, allocator, "enabled");
-        try buf.appendSlice(allocator, if (self.config.heartbeat.enabled) "true" else "false");
+        try buf.appendSlice(allocator, if (heartbeat_cfg.enabled) "true" else "false");
         try buf.appendSlice(allocator, ",");
-        try json_util.appendJsonInt(&buf, allocator, "interval_minutes", self.config.heartbeat.interval_minutes);
+        try json_util.appendJsonInt(&buf, allocator, "interval_minutes", heartbeat_cfg.interval_minutes);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "data_source", heartbeat_cfg.data_source);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "scheduler_truth", scheduler_truth);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "context_incomplete");
+        try buf.appendSlice(allocator, if (heartbeat_cfg.context_incomplete) "true" else "false");
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKeyValue(&buf, allocator, "current_turn_origin", turn_ctx.origin.toSlice());
         try buf.appendSlice(allocator, ",");
@@ -1033,6 +1057,161 @@ fn deriveUserRoot(workspace_dir: []const u8) []const u8 {
     return std.fs.path.dirname(workspace_dir) orelse workspace_dir;
 }
 
+const EffectiveHeartbeatConfig = struct {
+    enabled: bool,
+    interval_minutes: u32,
+    data_source: []const u8,
+    context_incomplete: bool = false,
+};
+
+fn parseHeartbeatSecondsToMinutes(value: i64) ?u32 {
+    if (value <= 0) return null;
+    const mins_i64 = @max(@as(i64, 1), @divFloor(value + 59, 60));
+    const clamped = @min(mins_i64, @as(i64, std.math.maxInt(u32)));
+    return @intCast(clamped);
+}
+
+fn applyHeartbeatConfigObject(enabled: *bool, interval_minutes: *u32, object: std.json.ObjectMap) void {
+    if (object.get("enabled")) |value| {
+        if (value == .bool) enabled.* = value.bool;
+    }
+    if (object.get("interval_minutes")) |value| {
+        if (value == .integer and value.integer > 0) {
+            const clamped = @min(value.integer, @as(i64, std.math.maxInt(u32)));
+            interval_minutes.* = @intCast(clamped);
+        }
+    }
+    inline for ([_][]const u8{ "intervalSec", "interval_seconds", "interval_sec" }) |field| {
+        if (object.get(field)) |value| {
+            if (value == .integer) {
+                if (parseHeartbeatSecondsToMinutes(value.integer)) |mins| interval_minutes.* = mins;
+            }
+        }
+    }
+}
+
+fn parseHeartbeatConfigJson(raw: []const u8, default_enabled: bool, default_interval_minutes: u32) !EffectiveHeartbeatConfig {
+    var result = EffectiveHeartbeatConfig{
+        .enabled = default_enabled,
+        .interval_minutes = @max(@as(u32, 1), default_interval_minutes),
+        .data_source = "config",
+    };
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "{}")) return result;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), trimmed, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return result;
+
+    applyHeartbeatConfigObject(&result.enabled, &result.interval_minutes, parsed.value.object);
+    if (parsed.value.object.get("heartbeat")) |nested| {
+        if (nested == .object) {
+            applyHeartbeatConfigObject(&result.enabled, &result.interval_minutes, nested.object);
+        }
+    }
+    return result;
+}
+
+fn resolveScopedUserId(tenant_ctx: root.ToolTenantContext, user_id_override: ?[]const u8) ?[]const u8 {
+    if (user_id_override) |user_id| {
+        const trimmed = std.mem.trim(u8, user_id, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return tenant_ctx.user_id;
+}
+
+fn schedulerTruthLabel(
+    config: *const config_mod.Config,
+    tenant_ctx: root.ToolTenantContext,
+    user_id_override: ?[]const u8,
+) []const u8 {
+    const scoped_numeric_user_id = resolveScopedNumericUserId(tenant_ctx, user_id_override);
+    if (tenant_ctx.state_mgr != null and scoped_numeric_user_id != null) return "postgres";
+    const tenant_scope_requested = config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres") and
+        (tenant_ctx.expect_postgres_state or resolveScopedUserId(tenant_ctx, user_id_override) != null);
+    if (tenant_scope_requested) return "context_missing";
+    return "file";
+}
+
+fn resolveScopedUserRoot(
+    allocator: std.mem.Allocator,
+    config: *const config_mod.Config,
+    tenant_ctx: root.ToolTenantContext,
+    user_id_override: ?[]const u8,
+) !?[]u8 {
+    const scoped_user_id = resolveScopedUserId(tenant_ctx, user_id_override) orelse return null;
+    if (config.tenant.data_root.len > 0) {
+        const user_root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tenant.data_root, scoped_user_id });
+        return user_root;
+    }
+    const user_root = try allocator.dupe(u8, deriveUserRoot(config.workspace_dir));
+    return user_root;
+}
+
+fn readEffectiveHeartbeatConfig(
+    allocator: std.mem.Allocator,
+    config: *const config_mod.Config,
+    tenant_ctx: root.ToolTenantContext,
+    user_id_override: ?[]const u8,
+) !EffectiveHeartbeatConfig {
+    const defaults = EffectiveHeartbeatConfig{
+        .enabled = config.heartbeat.enabled,
+        .interval_minutes = @max(@as(u32, 1), config.heartbeat.interval_minutes),
+        .data_source = "config",
+    };
+    if (tenant_ctx.state_mgr) |state_mgr| {
+        if (resolveScopedNumericUserId(tenant_ctx, user_id_override)) |numeric_user_id| {
+            const raw = state_mgr.getHeartbeatJson(allocator, numeric_user_id) catch return EffectiveHeartbeatConfig{
+                .enabled = defaults.enabled,
+                .interval_minutes = defaults.interval_minutes,
+                .data_source = "postgres",
+            };
+            defer allocator.free(raw);
+            var parsed = try parseHeartbeatConfigJson(raw, defaults.enabled, defaults.interval_minutes);
+            parsed.data_source = "postgres";
+            return parsed;
+        }
+    }
+    if (std.mem.eql(u8, schedulerTruthLabel(config, tenant_ctx, user_id_override), "context_missing")) {
+        return .{
+            .enabled = defaults.enabled,
+            .interval_minutes = defaults.interval_minutes,
+            .data_source = "context_missing",
+            .context_incomplete = true,
+        };
+    }
+
+    const user_root = try resolveScopedUserRoot(allocator, config, tenant_ctx, user_id_override);
+    defer if (user_root) |value| allocator.free(value);
+    if (user_root) |root_path| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/heartbeat.json", .{root_path});
+        defer allocator.free(path);
+        const file = std.fs.openFileAbsolute(path, .{}) catch {
+            return .{
+                .enabled = defaults.enabled,
+                .interval_minutes = defaults.interval_minutes,
+                .data_source = "config",
+            };
+        };
+        defer file.close();
+        const raw = file.readToEndAlloc(allocator, 128 * 1024) catch {
+            return .{
+                .enabled = defaults.enabled,
+                .interval_minutes = defaults.interval_minutes,
+                .data_source = "config",
+            };
+        };
+        defer allocator.free(raw);
+        var parsed = try parseHeartbeatConfigJson(raw, defaults.enabled, defaults.interval_minutes);
+        parsed.data_source = "file";
+        return parsed;
+    }
+
+    return defaults;
+}
+
 fn readTelegramState(
     allocator: std.mem.Allocator,
     config: *const config_mod.Config,
@@ -1129,6 +1308,12 @@ fn containsString(values: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, value, needle)) return true;
     }
     return false;
+}
+
+fn writeTestFile(path: []const u8, content: []const u8) !void {
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(content);
 }
 
 test "runtime info tool name" {
@@ -1335,6 +1520,81 @@ test "runtime info telegram snapshot treats invalid override as context missing 
     defer snapshot_mut.deinit(std.testing.allocator);
     try std.testing.expect(snapshot.context_incomplete);
     try std.testing.expectEqualStrings("context_missing", snapshot.data_source);
+}
+
+test "runtime info heartbeat reads effective tenant heartbeat file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const users_root = try std.fs.path.join(std.testing.allocator, &.{ base, "users" });
+    defer std.testing.allocator.free(users_root);
+    try std.fs.makeDirAbsolute(users_root);
+
+    const user_root = try std.fs.path.join(std.testing.allocator, &.{ users_root, "1" });
+    defer std.testing.allocator.free(user_root);
+    try std.fs.makeDirAbsolute(user_root);
+
+    const workspace = try std.fs.path.join(std.testing.allocator, &.{ user_root, "workspace" });
+    defer std.testing.allocator.free(workspace);
+    try std.fs.makeDirAbsolute(workspace);
+
+    const heartbeat_path = try std.fs.path.join(std.testing.allocator, &.{ user_root, "heartbeat.json" });
+    defer std.testing.allocator.free(heartbeat_path);
+    try writeTestFile(heartbeat_path, "{\"enabled\":true,\"intervalSec\":300}\n");
+
+    var cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = true;
+    cfg.tenant.data_root = users_root;
+    cfg.heartbeat.enabled = false;
+    cfg.heartbeat.interval_minutes = 60;
+
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    root.setTenantContext(.{ .user_id = "1", .numeric_user_id = 1 });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"section\":\"heartbeat\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"interval_minutes\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"data_source\":\"file\"") != null);
+}
+
+test "runtime info scheduler reports context missing for tenant postgres scope without state manager" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = true;
+    cfg.state.backend = "postgres";
+
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    root.setTenantContext(.{
+        .user_id = "1",
+        .numeric_user_id = 1,
+        .expect_postgres_state = true,
+    });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"section\":\"scheduler\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"scheduler_truth\":\"context_missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"tenant_context_attached\":false") != null);
 }
 
 test "runtime info parseTelegramStateJson supports top-level postgres shape" {

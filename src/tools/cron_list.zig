@@ -5,7 +5,8 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const loadScheduler = @import("cron_add.zig").loadScheduler;
+const loadSchedulerForContext = @import("cron_add.zig").loadSchedulerForContext;
+const config_mod = @import("../config.zig");
 
 const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
 const TestCronStore = struct {
@@ -30,8 +31,10 @@ const TestCronStore = struct {
 
 /// CronList tool — lists all scheduled cron jobs with their status and next run time.
 pub const CronListTool = struct {
+    config: ?*const config_mod.Config = null,
+
     pub const tool_name = "cron_list";
-    pub const tool_description = "List all scheduled cron jobs with their status and next run time.";
+    pub const tool_description = "Inspect raw cron jobs, their types, status, and next run time. Low-level scheduler inspection surface.";
     pub const tool_params =
         \\{"type":"object","properties":{}}
     ;
@@ -45,26 +48,33 @@ pub const CronListTool = struct {
         };
     }
 
-    pub fn execute(_: *CronListTool, allocator: std.mem.Allocator, _: JsonObjectMap) !ToolResult {
-        var scheduler = loadScheduler(allocator) catch {
-            return ToolResult{ .success = true, .output = try allocator.dupe(u8, "No scheduled cron jobs.") };
+    pub fn execute(self: *CronListTool, allocator: std.mem.Allocator, _: JsonObjectMap) !ToolResult {
+        const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
+            error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
+            else => {
+                return ToolResult{ .success = true, .output = try allocator.dupe(u8, "No scheduled cron jobs.") };
+            },
         };
+        var scheduler = loaded.scheduler;
+        _ = loaded.tenant;
         defer scheduler.deinit();
-
-        const jobs = scheduler.listJobs();
-        if (jobs.len == 0) {
+        if (scheduler.listJobs().len == 0) {
             return ToolResult{ .success = true, .output = try allocator.dupe(u8, "No scheduled cron jobs.") };
         }
+        const jobs = scheduler.listJobs();
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
         const w = buf.writer(allocator);
         for (jobs) |job| {
-            const status: []const u8 = if (job.paused) "paused" else "enabled";
-            try w.print("- {s} | {s} | {s} | next: {d} | cmd: {s}\n", .{
+            const runtime_status: []const u8 = if (job.paused) "paused" else "enabled";
+            const last_status = job.last_status orelse "pending";
+            try w.print("- {s} | {s} | type={s} | runtime={s} | last_status={s} | next: {d} | cmd: {s}\n", .{
                 job.id,
                 job.expression,
-                status,
+                job.job_type.asStr(),
+                runtime_status,
+                last_status,
                 job.next_run_secs,
                 job.command,
             });
@@ -89,23 +99,29 @@ test "cron_list_with_jobs" {
     defer scheduler.deinit();
 
     const job = try scheduler.addJob("*/5 * * * *", "echo hello");
+    job.last_status = "ok";
     try std.testing.expect(scheduler.listJobs().len == 1);
 
     // Format output the same way the tool does, to verify content
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     const w = buf.writer(std.testing.allocator);
-    const status: []const u8 = if (job.paused) "paused" else "enabled";
-    try w.print("- {s} | {s} | {s} | next: {d} | cmd: {s}\n", .{
+    const runtime_status: []const u8 = if (job.paused) "paused" else "enabled";
+    const last_status = job.last_status orelse "pending";
+    try w.print("- {s} | {s} | type={s} | runtime={s} | last_status={s} | next: {d} | cmd: {s}\n", .{
         job.id,
         job.expression,
-        status,
+        job.job_type.asStr(),
+        runtime_status,
+        last_status,
         job.next_run_secs,
         job.command,
     });
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, job.id) != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "type=shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "last_status=ok") != null);
 }
 
 test "cron_list_shows_paused" {
@@ -122,11 +138,14 @@ test "cron_list_shows_paused" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     const w = buf.writer(std.testing.allocator);
-    const status: []const u8 = if (jobs[0].paused) "paused" else "enabled";
-    try w.print("- {s} | {s} | {s} | next: {d} | cmd: {s}\n", .{
+    const runtime_status: []const u8 = if (jobs[0].paused) "paused" else "enabled";
+    const last_status = jobs[0].last_status orelse "pending";
+    try w.print("- {s} | {s} | type={s} | runtime={s} | last_status={s} | next: {d} | cmd: {s}\n", .{
         jobs[0].id,
         jobs[0].expression,
-        status,
+        jobs[0].job_type.asStr(),
+        runtime_status,
+        last_status,
         jobs[0].next_run_secs,
         jobs[0].command,
     });

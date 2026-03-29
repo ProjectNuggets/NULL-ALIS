@@ -931,7 +931,8 @@ pub const CronScheduler = struct {
                                 ) catch null;
                             };
                         }
-                        break :blk self.allocator.dupe(u8, agent_input) catch null;
+                        success = false;
+                        break :blk self.allocator.dupe(u8, "agent runner unavailable") catch null;
                     };
                     job.last_run_secs = now;
                     job.last_status = if (success) "ok" else "error";
@@ -2816,7 +2817,7 @@ test "shell job delivers stdout via bus" {
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "hello_cron") != null);
 }
 
-test "agent job delivers result via bus" {
+test "agent job without runner fails closed and does not deliver prompt text" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
@@ -2841,13 +2842,16 @@ test "agent job delivers result via bus" {
 
     _ = scheduler.tick(std.time.timestamp(), &test_bus);
 
-    // Verify delivery
+    try std.testing.expectEqualStrings("error", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expect(scheduler.jobs.items[0].last_output != null);
+    try std.testing.expectEqualStrings("agent runner unavailable", scheduler.jobs.items[0].last_output.?);
     try std.testing.expect(test_bus.outboundDepth() > 0);
     var msg = test_bus.consumeOutbound().?;
     defer msg.deinit(allocator);
     try std.testing.expectEqualStrings("discord", msg.channel);
     try std.testing.expectEqualStrings("general", msg.chat_id);
-    try std.testing.expectEqualStrings("Summarize today's news", msg.content);
+    try std.testing.expectEqualStrings("agent runner unavailable", msg.content);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "Summarize today's news") == null);
 }
 
 test "agent job uses configured runner when available" {

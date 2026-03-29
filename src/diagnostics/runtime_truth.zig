@@ -105,7 +105,7 @@ pub fn collectRuntimeSnapshot(
     user_id: ?[]const u8,
 ) !RuntimeSnapshot {
     return collectGatewayInternalSnapshot(allocator, cfg, user_id) catch
-        collectLocalFallbackSnapshot(allocator, cfg);
+        collectLocalFallbackSnapshot(allocator, cfg, user_id);
 }
 
 fn collectGatewayInternalSnapshot(
@@ -438,7 +438,7 @@ fn parseGatewayDiagnosticsPayload(allocator: std.mem.Allocator, body: []const u8
     };
 }
 
-fn collectLocalFallbackSnapshot(allocator: std.mem.Allocator, cfg: *const config_mod.Config) !RuntimeSnapshot {
+fn collectLocalFallbackSnapshot(allocator: std.mem.Allocator, cfg: *const config_mod.Config, user_id: ?[]const u8) !RuntimeSnapshot {
     const configured = cfg.state.backend;
     const effective = blk: {
         if (!std.mem.eql(u8, configured, "postgres")) break :blk "file";
@@ -455,6 +455,7 @@ fn collectLocalFallbackSnapshot(allocator: std.mem.Allocator, cfg: *const config
     else
         "";
     const context_incomplete = std.mem.eql(u8, effective, "unknown") or std.mem.eql(u8, scheduler_backend, "unknown");
+    const heartbeat_cfg = try readEffectiveLocalHeartbeatConfig(allocator, cfg, user_id);
 
     return .{
         .source = .local_fallback,
@@ -463,8 +464,8 @@ fn collectLocalFallbackSnapshot(allocator: std.mem.Allocator, cfg: *const config
         .scheduler_backend = try allocator.dupe(u8, scheduler_backend),
         .degraded = degraded_reason.len > 0,
         .degraded_reason = try allocator.dupe(u8, degraded_reason),
-        .heartbeat_enabled = cfg.heartbeat.enabled,
-        .heartbeat_interval_minutes = cfg.heartbeat.interval_minutes,
+        .heartbeat_enabled = heartbeat_cfg.enabled,
+        .heartbeat_interval_minutes = heartbeat_cfg.interval_minutes,
         .tenant_enabled = cfg.tenant.enabled,
         .scheduler_max_tasks_configured = cfg.scheduler.max_tasks,
         .scheduler_max_concurrent_configured = cfg.scheduler.max_concurrent,
@@ -485,6 +486,68 @@ fn collectLocalFallbackSnapshot(allocator: std.mem.Allocator, cfg: *const config
         .stt_transcription_failed = null,
         .stt_transcription_skipped_no_transcriber = null,
     };
+}
+
+const LocalHeartbeatConfig = struct {
+    enabled: bool,
+    interval_minutes: u32,
+};
+
+fn parseHeartbeatSecondsToMinutes(value: i64) ?u32 {
+    if (value <= 0) return null;
+    const mins_i64 = @max(@as(i64, 1), @divFloor(value + 59, 60));
+    const clamped = @min(mins_i64, @as(i64, std.math.maxInt(u32)));
+    return @intCast(clamped);
+}
+
+fn applyHeartbeatConfigObject(enabled: *bool, interval_minutes: *u32, object: std.json.ObjectMap) void {
+    if (object.get("enabled")) |value| {
+        if (value == .bool) enabled.* = value.bool;
+    }
+    if (object.get("interval_minutes")) |value| {
+        if (value == .integer and value.integer > 0) {
+            const clamped = @min(value.integer, @as(i64, std.math.maxInt(u32)));
+            interval_minutes.* = @intCast(clamped);
+        }
+    }
+    inline for ([_][]const u8{ "intervalSec", "interval_seconds", "interval_sec" }) |field| {
+        if (object.get(field)) |value| {
+            if (value == .integer) {
+                if (parseHeartbeatSecondsToMinutes(value.integer)) |mins| interval_minutes.* = mins;
+            }
+        }
+    }
+}
+
+fn readEffectiveLocalHeartbeatConfig(
+    allocator: std.mem.Allocator,
+    cfg: *const config_mod.Config,
+    user_id: ?[]const u8,
+) !LocalHeartbeatConfig {
+    var result = LocalHeartbeatConfig{
+        .enabled = cfg.heartbeat.enabled,
+        .interval_minutes = @max(@as(u32, 1), cfg.heartbeat.interval_minutes),
+    };
+    const scoped_user_id = user_id orelse return result;
+    if (cfg.tenant.data_root.len == 0) return result;
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}/heartbeat.json", .{ cfg.tenant.data_root, scoped_user_id });
+    defer allocator.free(path);
+    const file = std.fs.openFileAbsolute(path, .{}) catch return result;
+    defer file.close();
+    const raw = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(raw);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), raw, .{}) catch return result;
+    defer parsed.deinit();
+    if (parsed.value != .object) return result;
+    applyHeartbeatConfigObject(&result.enabled, &result.interval_minutes, parsed.value.object);
+    if (parsed.value.object.get("heartbeat")) |nested| {
+        if (nested == .object) applyHeartbeatConfigObject(&result.enabled, &result.interval_minutes, nested.object);
+    }
+    return result;
 }
 
 fn normalizeProviderAlias(provider_name: []const u8) []const u8 {
@@ -703,7 +766,7 @@ test "collectLocalFallbackSnapshot marks unknown effective backend when runtime 
     cfg.scheduler.max_tasks = 64;
     cfg.scheduler.max_concurrent = 4;
 
-    var snapshot = try collectLocalFallbackSnapshot(std.testing.allocator, &cfg);
+    var snapshot = try collectLocalFallbackSnapshot(std.testing.allocator, &cfg, null);
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqual(Source.local_fallback, snapshot.source);
     try std.testing.expectEqualStrings("postgres", snapshot.state_backend_configured);

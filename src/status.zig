@@ -22,10 +22,19 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
     defer cfg.deinit();
     var snapshot = try runtime_truth.collectRuntimeSnapshot(allocator, &cfg, user_id);
     defer snapshot.deinit(allocator);
+    const effective_workspace = blk: {
+        if (user_id) |resolved_user_id| {
+            if (cfg.tenant.data_root.len > 0) {
+                break :blk try std.fmt.allocPrint(allocator, "{s}/{s}/workspace", .{ cfg.tenant.data_root, resolved_user_id });
+            }
+        }
+        break :blk try allocator.dupe(u8, cfg.workspace_dir);
+    };
+    defer allocator.free(effective_workspace);
 
     try w.print("nullALIS Status\n\n", .{});
     try w.print("Version:     {s}\n", .{version.string});
-    try w.print("Workspace:   {s}\n", .{cfg.workspace_dir});
+    try w.print("Workspace:   {s}\n", .{effective_workspace});
     try w.print("Config:      {s}\n", .{cfg.config_path});
     try w.print("\n", .{});
     try w.print("Provider:    {s}\n", .{cfg.default_provider});

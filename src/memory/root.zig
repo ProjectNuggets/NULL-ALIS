@@ -263,11 +263,23 @@ pub const TimelineIndexLine = struct {
     focus: []const u8,
     key: []const u8,
     chat_id: ?[]const u8 = null,
+
+    pub fn deinit(self: *const TimelineIndexLine, allocator: std.mem.Allocator) void {
+        allocator.free(self.at);
+        allocator.free(self.channel);
+        allocator.free(self.lane);
+        allocator.free(self.session);
+        allocator.free(self.focus);
+        allocator.free(self.key);
+        if (self.chat_id) |value| allocator.free(value);
+    }
 };
 
 pub const StoredOriginMetadata = struct {
-    channel: ?[]const u8 = null,
-    lane: ?[]const u8 = null,
+    origin_channel: ?[]const u8 = null,
+    origin_lane: ?[]const u8 = null,
+    legacy_channel: ?[]const u8 = null,
+    legacy_lane: ?[]const u8 = null,
     chat_id: ?[]const u8 = null,
     account_id: ?[]const u8 = null,
 };
@@ -482,8 +494,10 @@ pub fn metadataValue(content: []const u8, prefix: []const u8) ?[]const u8 {
 
 pub fn extractStoredOriginMetadata(content: []const u8) StoredOriginMetadata {
     return .{
-        .channel = metadataValue(content, "origin_channel=") orelse metadataValue(content, "channel="),
-        .lane = metadataValue(content, "origin_lane=") orelse metadataValue(content, "lane="),
+        .origin_channel = metadataValue(content, "origin_channel="),
+        .origin_lane = metadataValue(content, "origin_lane="),
+        .legacy_channel = metadataValue(content, "channel="),
+        .legacy_lane = metadataValue(content, "lane="),
         .chat_id = metadataValue(content, "origin_chat_id="),
         .account_id = metadataValue(content, "origin_account_id="),
     };
@@ -536,10 +550,10 @@ fn legacyWrappedOriginFromSessionId(session_id: []const u8) ?MemoryProvenance {
     };
 }
 
-pub fn parseTimelineIndexLine(line_raw: []const u8) ?TimelineIndexLine {
+pub fn parseTimelineIndexLine(allocator: std.mem.Allocator, line_raw: []const u8) !?TimelineIndexLine {
     const line = std.mem.trim(u8, line_raw, " \t\r\n");
     if (line.len == 0) return null;
-    if (line[0] == '{') return parseTimelineIndexJsonLine(line);
+    if (line[0] == '{') return try parseTimelineIndexJsonLine(allocator, line);
     if (!std.mem.startsWith(u8, line, "- ")) return null;
     const body = line[2..];
     const channel_marker = std.mem.indexOf(u8, body, " channel=") orelse return null;
@@ -557,12 +571,12 @@ pub fn parseTimelineIndexLine(line_raw: []const u8) ?TimelineIndexLine {
         const focus = body[focus_marker + " focus=".len ..];
         if (at.len == 0 or session.len == 0 or key.len == 0) return null;
         return .{
-            .at = at,
-            .channel = channel,
-            .lane = lane,
-            .session = session,
-            .focus = focus,
-            .key = key,
+            .at = try allocator.dupe(u8, at),
+            .channel = try allocator.dupe(u8, channel),
+            .lane = try allocator.dupe(u8, lane),
+            .session = try allocator.dupe(u8, session),
+            .focus = try allocator.dupe(u8, focus),
+            .key = try allocator.dupe(u8, key),
         };
     }
 
@@ -572,26 +586,33 @@ pub fn parseTimelineIndexLine(line_raw: []const u8) ?TimelineIndexLine {
         const key = body[key_marker + " key=".len ..];
         if (at.len == 0 or session.len == 0 or key.len == 0) return null;
         return .{
-            .at = at,
-            .channel = channel,
-            .lane = lane,
-            .session = session,
-            .focus = focus,
-            .key = key,
+            .at = try allocator.dupe(u8, at),
+            .channel = try allocator.dupe(u8, channel),
+            .lane = try allocator.dupe(u8, lane),
+            .session = try allocator.dupe(u8, session),
+            .focus = try allocator.dupe(u8, focus),
+            .key = try allocator.dupe(u8, key),
         };
     }
 
     return null;
 }
 
-fn parseTimelineIndexJsonLine(line: []const u8) ?TimelineIndexLine {
-    const at = extractJsonStringField(line, "at") orelse return null;
-    const channel = extractJsonStringField(line, "channel") orelse return null;
-    const lane = extractJsonStringField(line, "lane") orelse return null;
-    const session = extractJsonStringField(line, "session") orelse return null;
-    const focus = extractJsonStringField(line, "focus") orelse return null;
-    const key = extractJsonStringField(line, "key") orelse return null;
-    const chat_id = extractJsonStringField(line, "chat_id");
+fn parseTimelineIndexJsonLine(allocator: std.mem.Allocator, line: []const u8) !?TimelineIndexLine {
+    const at = try extractJsonStringFieldOwned(allocator, line, "at") orelse return null;
+    errdefer allocator.free(at);
+    const channel = try extractJsonStringFieldOwned(allocator, line, "channel") orelse return null;
+    errdefer allocator.free(channel);
+    const lane = try extractJsonStringFieldOwned(allocator, line, "lane") orelse return null;
+    errdefer allocator.free(lane);
+    const session = try extractJsonStringFieldOwned(allocator, line, "session") orelse return null;
+    errdefer allocator.free(session);
+    const focus = try extractJsonStringFieldOwned(allocator, line, "focus") orelse return null;
+    errdefer allocator.free(focus);
+    const key = try extractJsonStringFieldOwned(allocator, line, "key") orelse return null;
+    errdefer allocator.free(key);
+    const chat_id = try extractJsonStringFieldOwned(allocator, line, "chat_id");
+    errdefer if (chat_id) |value| allocator.free(value);
     return .{
         .at = at,
         .channel = channel,
@@ -614,6 +635,38 @@ fn extractJsonStringField(line: []const u8, field: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn extractJsonStringFieldOwned(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    field: []const u8,
+) !?[]u8 {
+    const raw = extractJsonStringField(line, field) orelse return null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var idx: usize = 0;
+    while (idx < raw.len) : (idx += 1) {
+        const ch = raw[idx];
+        if (ch != '\\') {
+            try out.append(allocator, ch);
+            continue;
+        }
+        idx += 1;
+        if (idx >= raw.len) return error.InvalidCharacter;
+        switch (raw[idx]) {
+            '"', '\\', '/' => try out.append(allocator, raw[idx]),
+            'b' => try out.append(allocator, 0x08),
+            'f' => try out.append(allocator, 0x0C),
+            'n' => try out.append(allocator, '\n'),
+            'r' => try out.append(allocator, '\r'),
+            't' => try out.append(allocator, '\t'),
+            'u' => return error.NotSupported,
+            else => return error.InvalidCharacter,
+        }
+    }
+    const owned = try out.toOwnedSlice(allocator);
+    return owned;
 }
 
 fn isEscapedJsonQuote(line: []const u8, quote_idx: usize) bool {
@@ -701,13 +754,17 @@ pub fn deriveMemoryProvenance(session_id_opt: ?[]const u8, key: []const u8) Memo
 pub fn resolveStoredMemoryProvenance(content: []const u8, session_id_opt: ?[]const u8, key: []const u8) MemoryProvenance {
     const session_id = session_id_opt orelse deriveSessionIdFromMemoryKey(key);
     const stored = extractStoredOriginMetadata(content);
+    const explicit_channel = stored.origin_channel;
+    const explicit_lane = stored.origin_lane;
+    const legacy_channel = if (shouldUseLegacyWrappedFallback(key)) stored.legacy_channel else null;
+    const legacy_lane = if (shouldUseLegacyWrappedFallback(key)) stored.legacy_lane else null;
 
-    if (stored.channel != null or stored.lane != null) {
+    if (explicit_channel != null or explicit_lane != null or legacy_channel != null or legacy_lane != null) {
         const derived = deriveMemoryProvenance(session_id, key);
         return .{
             .session_id = derived.session_id,
-            .channel = stored.channel orelse derived.channel,
-            .lane = stored.lane orelse derived.lane,
+            .channel = explicit_channel orelse legacy_channel orelse derived.channel,
+            .lane = explicit_lane orelse legacy_lane orelse derived.lane,
         };
     }
 
@@ -2532,7 +2589,8 @@ test "timeline summary helpers identify keys and parse timestamps" {
 }
 
 test "parseTimelineIndexLine extracts descriptor fields from canonical format" {
-    const parsed = parseTimelineIndexLine("- at=2026-03-29T00:00:00Z channel=telegram lane=thread session=telegram:chat:1 key=timeline_summary/telegram:chat:1/1774400000 focus=shipping key=handoff session=retro") orelse return error.TestUnexpectedResult;
+    const parsed = (try parseTimelineIndexLine(std.testing.allocator, "- at=2026-03-29T00:00:00Z channel=telegram lane=thread session=telegram:chat:1 key=timeline_summary/telegram:chat:1/1774400000 focus=shipping key=handoff session=retro")) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("2026-03-29T00:00:00Z", parsed.at);
     try std.testing.expectEqualStrings("telegram", parsed.channel);
     try std.testing.expectEqualStrings("thread", parsed.lane);
@@ -2542,14 +2600,16 @@ test "parseTimelineIndexLine extracts descriptor fields from canonical format" {
 }
 
 test "parseTimelineIndexLine keeps legacy focus-before-key compatibility" {
-    const parsed = parseTimelineIndexLine("- at=2026-03-29T00:00:00Z channel=telegram lane=thread session=telegram:chat:1 focus=shipping plan review key=timeline_summary/telegram:chat:1/1774400000") orelse return error.TestUnexpectedResult;
+    const parsed = (try parseTimelineIndexLine(std.testing.allocator, "- at=2026-03-29T00:00:00Z channel=telegram lane=thread session=telegram:chat:1 focus=shipping plan review key=timeline_summary/telegram:chat:1/1774400000")) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("telegram:chat:1", parsed.session);
     try std.testing.expectEqualStrings("shipping plan review", parsed.focus);
     try std.testing.expectEqualStrings("timeline_summary/telegram:chat:1/1774400000", parsed.key);
 }
 
 test "parseTimelineIndexLine extracts descriptor fields from jsonl format" {
-    const parsed = parseTimelineIndexLine("{\"at\":\"2026-03-29T00:00:00Z\",\"session\":\"telegram:chat:1\",\"key\":\"timeline_summary/telegram:chat:1/1774400000\",\"channel\":\"telegram\",\"lane\":\"thread\",\"chat_id\":\"1110331014\",\"focus\":\"shipping handoff\"}") orelse return error.TestUnexpectedResult;
+    const parsed = (try parseTimelineIndexLine(std.testing.allocator, "{\"at\":\"2026-03-29T00:00:00Z\",\"session\":\"telegram:chat:1\",\"key\":\"timeline_summary/telegram:chat:1/1774400000\",\"channel\":\"telegram\",\"lane\":\"thread\",\"chat_id\":\"1110331014\",\"focus\":\"shipping handoff\"}")) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("2026-03-29T00:00:00Z", parsed.at);
     try std.testing.expectEqualStrings("telegram", parsed.channel);
     try std.testing.expectEqualStrings("thread", parsed.lane);
@@ -2560,10 +2620,20 @@ test "parseTimelineIndexLine extracts descriptor fields from jsonl format" {
 }
 
 test "parseTimelineIndexLine handles escaped quotes in jsonl focus" {
-    const parsed = parseTimelineIndexLine("{\"at\":\"2026-03-29T00:00:00Z\",\"session\":\"telegram:chat:1\",\"key\":\"timeline_summary/telegram:chat:1/1774400000\",\"channel\":\"telegram\",\"lane\":\"thread\",\"focus\":\"shipping \\\"priority\\\" review\\\\notes\"}") orelse return error.TestUnexpectedResult;
+    const parsed = (try parseTimelineIndexLine(std.testing.allocator, "{\"at\":\"2026-03-29T00:00:00Z\",\"session\":\"telegram:chat:1\",\"key\":\"timeline_summary/telegram:chat:1/1774400000\",\"channel\":\"telegram\",\"lane\":\"thread\",\"focus\":\"shipping \\\"priority\\\" review\\\\notes\"}")) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("telegram", parsed.channel);
     try std.testing.expectEqualStrings("timeline_summary/telegram:chat:1/1774400000", parsed.key);
-    try std.testing.expectEqualStrings("shipping \\\"priority\\\" review\\\\notes", parsed.focus);
+    try std.testing.expectEqualStrings("shipping \"priority\" review\\notes", parsed.focus);
+}
+
+test "timeline index jsonl parse and rebuild preserves escaped fields" {
+    const original = "{\"at\":\"2026-03-29T00:00:00Z\",\"session\":\"telegram:chat:1\",\"key\":\"timeline_summary/telegram:chat:1/1774400000\",\"channel\":\"telegram\",\"lane\":\"thread\",\"chat_id\":\"1110331014\",\"focus\":\"shipping \\\"priority\\\" review\\\\notes\"}";
+    const parsed = (try parseTimelineIndexLine(std.testing.allocator, original)) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit(std.testing.allocator);
+    const rebuilt = try buildTimelineIndexJsonLine(std.testing.allocator, parsed);
+    defer std.testing.allocator.free(rebuilt);
+    try std.testing.expectEqualStrings(original, rebuilt);
 }
 
 test "buildTimelineIndexJsonLine emits jsonl row" {
@@ -2622,6 +2692,16 @@ test "resolveStoredMemoryProvenance prefers explicit origin metadata" {
     );
     try std.testing.expectEqualStrings("telegram", provenance.channel);
     try std.testing.expectEqualStrings("thread", provenance.lane);
+}
+
+test "resolveStoredMemoryProvenance ignores legacy channel metadata on non-summary entries" {
+    const provenance = resolveStoredMemoryProvenance(
+        "channel=telegram\nlane=thread\nnote: plain content\n",
+        "agent:zaki-bot:user:42:main",
+        "user_name",
+    );
+    try std.testing.expectEqualStrings("app", provenance.channel);
+    try std.testing.expectEqualStrings("main", provenance.lane);
 }
 
 test "deriveMemoryProvenance derives connector lane" {

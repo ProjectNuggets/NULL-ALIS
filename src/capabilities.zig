@@ -377,6 +377,9 @@ pub fn buildSummaryText(
             "  memory engines (build): {s}\n" ++
             "  active memory backend: {s}\n" ++
             "  {s}: {s}\n" ++
+            "\nScheduling guidance:\n" ++
+            "  use `schedule` for user-facing reminders, briefs, reports, and other proactive jobs\n" ++
+            "  use `cron_*` only for raw scheduler inspection or operator maintenance\n" ++
             "\nNot available in this runtime:\n" ++
             "  channels (disabled in build): {s}\n" ++
             "  memory engines (disabled in build): {s}\n" ++
@@ -447,6 +450,9 @@ pub fn buildPromptSection(
             "- Memory backends enabled in build: {s}\n" ++
             "- Active memory backend: {s}\n" ++
             "- {s}: {s}\n\n" ++
+            "### Scheduling Guidance\n" ++
+            "- Use `schedule` for user-facing reminders, briefs, reports, and other proactive jobs.\n" ++
+            "- Use `cron_*` only for raw scheduler inspection or operator maintenance.\n\n" ++
             "### Not available in this runtime\n" ++
             "- Channels disabled in build: {s}\n" ++
             "- Memory backends disabled in build: {s}\n" ++
@@ -480,6 +486,7 @@ test "buildSummaryText includes availability sections" {
 
     try std.testing.expect(std.mem.indexOf(u8, summary, "Available in this runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "Not available in this runtime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "use `schedule` for user-facing reminders") != null);
 }
 
 test "buildManifestJson estimated tools align with runtime naming" {

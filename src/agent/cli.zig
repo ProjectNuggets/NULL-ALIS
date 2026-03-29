@@ -19,6 +19,7 @@ const subagent_mod = @import("../subagent.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
 const onboard = @import("../onboard.zig");
+const tenant_runtime_scope = @import("../tenant_runtime_scope.zig");
 
 const Agent = @import("root.zig").Agent;
 
@@ -41,16 +42,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
     defer cfg.deinit();
 
-    cfg.validate() catch |err| {
-        Config.printValidationError(err);
-        return;
-    };
-
-    // Ensure lifecycle parity: seed workspace files on first agent run
-    // so prompts always have the expected bootstrap context.
-    const project_ctx = onboard.projectContextForConfig(&cfg);
-    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &project_ctx);
-
     var out_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&out_buf);
     const w = &bw.interface;
@@ -58,6 +49,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // Parse agent-specific flags
     var message_arg: ?[]const u8 = null;
     var session_id: ?[]const u8 = null;
+    var explicit_user_id: ?[]const u8 = null;
     {
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
@@ -68,9 +60,30 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             } else if ((std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--session")) and i + 1 < args.len) {
                 i += 1;
                 session_id = args[i];
+            } else if (std.mem.eql(u8, arg, "--user-id") and i + 1 < args.len) {
+                i += 1;
+                explicit_user_id = args[i];
             }
         }
     }
+
+    var scoped_runtime = try tenant_runtime_scope.resolveForAgentSession(
+        allocator,
+        &cfg,
+        session_id,
+        explicit_user_id,
+    );
+    defer scoped_runtime.deinit(allocator);
+
+    cfg.validate() catch |err| {
+        Config.printValidationError(err);
+        return;
+    };
+
+    // Ensure lifecycle parity: seed workspace files on first agent run
+    // so prompts always have the expected bootstrap context.
+    const project_ctx = onboard.projectContextForConfig(&cfg);
+    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &project_ctx);
 
     // Create a noop observer
     var noop = observability.NoopObserver{};
@@ -180,6 +193,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             agent.stream_ctx = @ptrCast(&stream_ctx);
         }
 
+        tools_mod.setTenantContext(scoped_runtime.tenantContext(agent.memory_session_id));
+        defer tools_mod.clearTenantContext();
+
         const response = agent.turn(message) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -263,6 +279,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         agent.stream_callback = cliStreamCallback;
         agent.stream_ctx = @ptrCast(&stream_ctx);
     }
+
+    tools_mod.setTenantContext(scoped_runtime.tenantContext(agent.memory_session_id));
+    defer tools_mod.clearTenantContext();
 
     const stdin = std.fs.File.stdin();
     var line_buf: [4096]u8 = undefined;

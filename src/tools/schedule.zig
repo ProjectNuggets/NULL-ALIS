@@ -5,57 +5,17 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const loadScheduler = @import("cron_add.zig").loadScheduler;
+const loadSchedulerForContext = @import("cron_add.zig").loadSchedulerForContext;
+const saveSchedulerForContext = @import("cron_add.zig").saveSchedulerForContext;
 const message_tool = @import("message.zig");
 const runtime_resolver = @import("../delivery/runtime_resolver.zig");
 const config_mod = @import("../config.zig");
 const morning_brief = @import("../morning_brief.zig");
 
-const DEFAULT_MAX_ACTIVE_JOBS: usize = 1024;
 const MIN_ONCE_DELAY_SECS: i64 = 60;
 const MORNING_BRIEF_JOB_ID = morning_brief.MORNING_BRIEF_JOB_ID;
 const MORNING_BRIEF_AGENT_COMMAND = morning_brief.MORNING_BRIEF_AGENT_COMMAND;
 const MORNING_BRIEF_AGENT_PROMPT = morning_brief.MORNING_BRIEF_AGENT_PROMPT;
-
-fn resolveSchedulerMaxTasks(config: ?*const config_mod.Config) usize {
-    if (config) |cfg| return @max(@as(usize, 1), cfg.scheduler.max_tasks);
-    return DEFAULT_MAX_ACTIVE_JOBS;
-}
-
-fn loadSchedulerForContext(allocator: std.mem.Allocator, config: ?*const config_mod.Config) !struct {
-    scheduler: CronScheduler,
-    tenant: root.ToolTenantContext,
-} {
-    const tenant = root.getTenantContext();
-    if (tenant.expect_postgres_state and (tenant.state_mgr == null or tenant.numeric_user_id == null)) {
-        return error.MissingTenantStateContext;
-    }
-    const max_tasks = resolveSchedulerMaxTasks(config);
-    var scheduler = CronScheduler.init(allocator, max_tasks, true);
-    if (tenant.state_mgr) |mgr| {
-        if (tenant.numeric_user_id) |user_id| {
-            scheduler.max_tasks = max_tasks;
-            const jobs_json = try mgr.getJobsJson(allocator, user_id);
-            defer allocator.free(jobs_json);
-            const trimmed = std.mem.trim(u8, jobs_json, " \t\r\n");
-            if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "[]")) {
-                const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
-                defer parsed.deinit();
-                if (parsed.value == .array) {
-                    for (parsed.value.array.items) |item| {
-                        if (item == .object) {
-                            try cron.appendJobFromJsonObject(&scheduler, item.object);
-                        }
-                    }
-                }
-            }
-            return .{ .scheduler = scheduler, .tenant = tenant };
-        }
-    }
-    scheduler = loadScheduler(allocator) catch scheduler;
-    scheduler.max_tasks = max_tasks;
-    return .{ .scheduler = scheduler, .tenant = tenant };
-}
 
 fn validateOnceDelay(delay: []const u8) !void {
     const delay_secs = try cron.parseDuration(delay);
@@ -166,19 +126,6 @@ fn normalizeMorningBriefJob(
     job.burst_window_start_secs = 0;
 }
 
-fn saveSchedulerForContext(scheduler: *CronScheduler, tenant: root.ToolTenantContext) !void {
-    if (tenant.state_mgr) |mgr| {
-        if (tenant.numeric_user_id) |user_id| {
-            const session_key = tenant.session_key orelse "agent:zaki-bot:main";
-            const content = try cron.saveJobsToSlice(scheduler.allocator, scheduler);
-            defer scheduler.allocator.free(content);
-            try mgr.replaceJobsJson(user_id, session_key, content);
-            return;
-        }
-    }
-    try cron.saveJobs(scheduler);
-}
-
 fn parseMessageCommand(command: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, "message ")) return null;
@@ -272,9 +219,9 @@ pub const ScheduleTool = struct {
     config: ?*const config_mod.Config = null,
 
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume";
+    pub const tool_description = "Manage scheduled tasks for the user. Preferred tool for reminders, briefs, recurring follow-ups, and other proactive jobs. Tasks may be agent-managed, delivery-managed, or raw commands depending on the request.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID (optional deterministic ID for create/add/once, required for get/cancel/pause/resume)"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Task intent, reminder text, agent prompt, delivery text, or raw command depending on the task type"},"id":{"type":"string","description":"Task ID (optional deterministic ID for create/add/once, required for get/cancel/pause/resume)"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -380,7 +327,13 @@ pub const ScheduleTool = struct {
             defer scheduler.deinit();
 
             if (morning_brief_request) {
-                if (findMorningBriefJob(scheduler.listJobs())) |existing| {
+                while (findMorningBriefJob(scheduler.listJobs())) |existing| {
+                    if (!existing.enabled) {
+                        const inactive_id = try allocator.dupe(u8, existing.id);
+                        defer allocator.free(inactive_id);
+                        _ = scheduler.removeJob(inactive_id);
+                        continue;
+                    }
                     normalizeMorningBriefJob(&scheduler, allocator, loaded.tenant, existing.id) catch {};
                     saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
                     const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
@@ -394,12 +347,16 @@ pub const ScheduleTool = struct {
 
             if (requested_id) |id| {
                 if (scheduler.getJob(id)) |existing| {
-                    const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
-                        existing.id,
-                        existing.expression,
-                        existing.command,
-                    });
-                    return ToolResult{ .success = true, .output = msg };
+                    if (!existing.enabled) {
+                        _ = scheduler.removeJob(id);
+                    } else {
+                        const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
+                            existing.id,
+                            existing.expression,
+                            existing.command,
+                        });
+                        return ToolResult{ .success = true, .output = msg };
+                    }
                 }
             }
 
@@ -468,7 +425,13 @@ pub const ScheduleTool = struct {
             defer scheduler.deinit();
 
             if (morning_brief_request) {
-                if (findMorningBriefJob(scheduler.listJobs())) |existing| {
+                while (findMorningBriefJob(scheduler.listJobs())) |existing| {
+                    if (!existing.enabled) {
+                        const inactive_id = try allocator.dupe(u8, existing.id);
+                        defer allocator.free(inactive_id);
+                        _ = scheduler.removeJob(inactive_id);
+                        continue;
+                    }
                     normalizeMorningBriefJob(&scheduler, allocator, loaded.tenant, existing.id) catch {};
                     saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
                     const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
@@ -482,12 +445,16 @@ pub const ScheduleTool = struct {
 
             if (requested_id) |id| {
                 if (scheduler.getJob(id)) |existing| {
-                    const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
-                        existing.id,
-                        existing.expression,
-                        existing.command,
-                    });
-                    return ToolResult{ .success = true, .output = msg };
+                    if (!existing.enabled) {
+                        _ = scheduler.removeJob(id);
+                    } else {
+                        const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
+                            existing.id,
+                            existing.expression,
+                            existing.command,
+                        });
+                        return ToolResult{ .success = true, .output = msg };
+                    }
                 }
             }
 
@@ -589,6 +556,7 @@ fn findMatchingRecurringJob(
     command: []const u8,
 ) ?*const cron.CronJob {
     for (jobs) |*job| {
+        if (!job.enabled) continue;
         if (job.one_shot) continue;
         if (!std.mem.eql(u8, job.expression, expression)) continue;
         if (!std.mem.eql(u8, job.command, command)) continue;
@@ -674,6 +642,17 @@ test "schedule findMatchingRecurringJob returns recurring exact match only" {
     try std.testing.expect(!found.?.one_shot);
 
     try std.testing.expect(findMatchingRecurringJob(scheduler.listJobs(), "0 9 * * *", "send morning brief") == null);
+}
+
+test "schedule findMatchingRecurringJob ignores disabled recurring jobs" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("0 8 * * *", "send morning brief");
+    job.enabled = false;
+    job.paused = true;
+
+    try std.testing.expect(findMatchingRecurringJob(scheduler.listJobs(), "0 8 * * *", "send morning brief") == null);
 }
 
 fn schedule_test_output_is_heap_owned(output: []const u8) bool {

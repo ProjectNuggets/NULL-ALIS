@@ -120,10 +120,27 @@ pub const MemoryTimelineTool = struct {
             if (idx == 4 or idx == 7) continue;
             if (!std.ascii.isDigit(ch)) return false;
         }
-        _ = std.fmt.parseInt(u16, value[0..4], 10) catch return false;
-        _ = std.fmt.parseInt(u8, value[5..7], 10) catch return false;
-        _ = std.fmt.parseInt(u8, value[8..10], 10) catch return false;
-        return true;
+        const year = std.fmt.parseInt(u16, value[0..4], 10) catch return false;
+        const month = std.fmt.parseInt(u8, value[5..7], 10) catch return false;
+        const day = std.fmt.parseInt(u8, value[8..10], 10) catch return false;
+        if (month < 1 or month > 12) return false;
+        if (day < 1) return false;
+        return day <= daysInMonth(year, month);
+    }
+
+    fn daysInMonth(year: u16, month: u8) u8 {
+        return switch (month) {
+            1, 3, 5, 7, 8, 10, 12 => 31,
+            4, 6, 9, 11 => 30,
+            2 => if (isLeapYear(year)) 29 else 28,
+            else => 0,
+        };
+    }
+
+    fn isLeapYear(year: u16) bool {
+        if ((year % 4) != 0) return false;
+        if ((year % 100) != 0) return true;
+        return (year % 400) == 0;
     }
 
     fn collectViews(
@@ -201,16 +218,19 @@ pub const MemoryTimelineTool = struct {
         var iter = std.mem.splitScalar(u8, index_entry.content, '\n');
         while (iter.next()) |line| {
             if (views.items.len >= filters.limit) break;
-            const parsed = mem_root.parseTimelineIndexLine(line) orelse continue;
-            if (!descriptorMatchesFilters(parsed, filters)) continue;
-            if (containsSourceKey(views.items, parsed.key)) continue;
+            {
+                const parsed = try mem_root.parseTimelineIndexLine(allocator, line) orelse continue;
+                defer parsed.deinit(allocator);
+                if (!descriptorMatchesFilters(parsed, filters)) continue;
+                if (containsSourceKey(views.items, parsed.key)) continue;
 
-            if (try mem.get(allocator, parsed.key)) |entry| {
-                if (!summaryMatchesFilters(entry.content, entry.key, entry.key, entry.timestamp, filters)) {
-                    entry.deinit(allocator);
-                    continue;
+                if (try mem.get(allocator, parsed.key)) |entry| {
+                    if (!summaryMatchesFilters(entry.content, entry.key, entry.key, entry.timestamp, filters)) {
+                        entry.deinit(allocator);
+                        continue;
+                    }
+                    try views.append(allocator, .{ .entry = entry });
                 }
-                try views.append(allocator, .{ .entry = entry });
             }
         }
     }
@@ -508,6 +528,35 @@ test "memory_timeline rejects malformed date input" {
     const result = try t.execute(allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid date") != null);
+}
+
+test "memory_timeline rejects impossible calendar date" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var mt = MemoryTimelineTool{ .memory = sqlite_mem.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"date_from\":\"2026-02-30\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid date") != null);
+}
+
+test "memory_timeline accepts leap day on leap year" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    var mt = MemoryTimelineTool{ .memory = sqlite_mem.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"date_from\":\"2028-02-29\",\"date_to\":\"2028-02-29\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "No session summaries found.") != null);
 }
 
 test "memory_timeline query searches full summary content after index fetch" {

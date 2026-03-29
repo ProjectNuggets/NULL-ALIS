@@ -1,10 +1,12 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
+const config_mod = @import("../config.zig");
 
 const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
 const TestCronStore = struct {
@@ -29,10 +31,12 @@ const TestCronStore = struct {
 
 /// CronAdd tool — creates a new cron job with either a cron expression or a delay.
 pub const CronAddTool = struct {
+    config: ?*const config_mod.Config = null,
+
     pub const tool_name = "cron_add";
-    pub const tool_description = "Create a scheduled cron job. Provide either 'expression' (cron syntax) or 'delay' (e.g. '30m', '2h') plus 'command'.";
+    pub const tool_description = "Low-level raw cron tool for operator or debug use. Create a scheduled raw command job with either 'expression' (cron syntax) or 'delay' (e.g. '30m', '2h') plus 'command'.";
     pub const tool_params =
-        \\{"type":"object","properties":{"expression":{"type":"string","description":"Cron expression (e.g. '*/5 * * * *')"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"name":{"type":"string","description":"Optional job name"}},"required":["command"]}
+        \\{"type":"object","properties":{"expression":{"type":"string","description":"Cron expression (e.g. '*/5 * * * *')"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Raw command for the scheduler to run; prefer the schedule tool for user-facing reminders, briefs, and proactive jobs"},"name":{"type":"string","description":"Optional job name"}},"required":["command"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -44,7 +48,7 @@ pub const CronAddTool = struct {
         };
     }
 
-    pub fn execute(_: *CronAddTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(self: *CronAddTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const command = root.getString(args, "command") orelse
             return ToolResult.fail("Missing required 'command' parameter");
 
@@ -66,9 +70,12 @@ pub const CronAddTool = struct {
                 return ToolResult.fail("Invalid delay format");
         }
 
-        var scheduler = loadScheduler(allocator) catch {
-            return ToolResult.fail("Failed to load scheduler state");
+        const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
+            error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
+            else => return ToolResult.fail("Failed to load scheduler state"),
         };
+        var scheduler = loaded.scheduler;
+        const tenant = loaded.tenant;
         defer scheduler.deinit();
 
         // Prefer expression (recurring) over delay (one-shot)
@@ -78,7 +85,7 @@ pub const CronAddTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
-            cron.saveJobs(&scheduler) catch {};
+            saveSchedulerForContext(&scheduler, tenant) catch {};
 
             const msg = try std.fmt.allocPrint(allocator, "Created cron job {s}: {s} \u{2192} {s}", .{
                 job.id,
@@ -94,7 +101,7 @@ pub const CronAddTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
-            cron.saveJobs(&scheduler) catch {};
+            saveSchedulerForContext(&scheduler, tenant) catch {};
 
             const msg = try std.fmt.allocPrint(allocator, "Created cron job {s}: {s} \u{2192} {s}", .{
                 job.id,
@@ -114,6 +121,73 @@ pub fn loadScheduler(allocator: std.mem.Allocator) !CronScheduler {
     var scheduler = CronScheduler.init(allocator, 1024, true);
     cron.loadJobs(&scheduler) catch {};
     return scheduler;
+}
+
+pub const LoadedSchedulerContext = struct {
+    scheduler: CronScheduler,
+    tenant: root.ToolTenantContext,
+};
+
+fn resolveSchedulerMaxTasks(config: ?*const config_mod.Config) usize {
+    if (config) |cfg| return @max(@as(usize, 1), cfg.scheduler.max_tasks);
+    return 1024;
+}
+
+pub fn loadSchedulerForContext(allocator: std.mem.Allocator, config: ?*const config_mod.Config) !LoadedSchedulerContext {
+    const tenant = root.getTenantContext();
+    const cfg = config orelse null;
+    const tenant_postgres_expected = blk: {
+        if (tenant.expect_postgres_state) break :blk true;
+        if (cfg) |resolved| {
+            if (resolved.tenant.enabled and std.mem.eql(u8, resolved.state.backend, "postgres") and build_options.enable_postgres and tenant.user_id != null) {
+                break :blk true;
+            }
+        }
+        break :blk false;
+    };
+    if (tenant_postgres_expected and (tenant.state_mgr == null or tenant.numeric_user_id == null)) {
+        return error.MissingTenantStateContext;
+    }
+
+    const max_tasks = resolveSchedulerMaxTasks(config);
+    var scheduler = CronScheduler.init(allocator, max_tasks, true);
+    if (tenant.state_mgr) |mgr| {
+        if (tenant.numeric_user_id) |user_id| {
+            scheduler.max_tasks = max_tasks;
+            const jobs_json = try mgr.getJobsJson(allocator, user_id);
+            defer allocator.free(jobs_json);
+            const trimmed = std.mem.trim(u8, jobs_json, " \t\r\n");
+            if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "[]")) {
+                const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+                defer parsed.deinit();
+                if (parsed.value == .array) {
+                    for (parsed.value.array.items) |item| {
+                        if (item == .object) {
+                            try cron.appendJobFromJsonObject(&scheduler, item.object);
+                        }
+                    }
+                }
+            }
+            return .{ .scheduler = scheduler, .tenant = tenant };
+        }
+    }
+
+    scheduler = loadScheduler(allocator) catch scheduler;
+    scheduler.max_tasks = max_tasks;
+    return .{ .scheduler = scheduler, .tenant = tenant };
+}
+
+pub fn saveSchedulerForContext(scheduler: *CronScheduler, tenant: root.ToolTenantContext) !void {
+    if (tenant.state_mgr) |mgr| {
+        if (tenant.numeric_user_id) |user_id| {
+            const session_key = tenant.session_key orelse "agent:zaki-bot:main";
+            const content = try cron.saveJobsToSlice(scheduler.allocator, scheduler);
+            defer scheduler.allocator.free(content);
+            try mgr.replaceJobsJson(user_id, session_key, content);
+            return;
+        }
+    }
+    try cron.saveJobs(scheduler);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

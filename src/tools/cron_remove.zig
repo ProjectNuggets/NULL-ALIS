@@ -5,7 +5,9 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const loadScheduler = @import("cron_add.zig").loadScheduler;
+const loadSchedulerForContext = @import("cron_add.zig").loadSchedulerForContext;
+const saveSchedulerForContext = @import("cron_add.zig").saveSchedulerForContext;
+const config_mod = @import("../config.zig");
 
 const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
 const TestCronStore = struct {
@@ -30,6 +32,8 @@ const TestCronStore = struct {
 
 /// CronRemove tool — removes a scheduled cron job by its ID.
 pub const CronRemoveTool = struct {
+    config: ?*const config_mod.Config = null,
+
     pub const tool_name = "cron_remove";
     pub const tool_description = "Remove a scheduled cron job by its ID.";
     pub const tool_params =
@@ -45,20 +49,23 @@ pub const CronRemoveTool = struct {
         };
     }
 
-    pub fn execute(_: *CronRemoveTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(self: *CronRemoveTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const job_id = root.getString(args, "job_id") orelse
             return ToolResult.fail("Missing required parameter: job_id");
 
         if (job_id.len == 0)
             return ToolResult.fail("Missing required parameter: job_id");
 
-        var scheduler = loadScheduler(allocator) catch {
-            return ToolResult.fail("Failed to load scheduler state");
+        const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
+            error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
+            else => return ToolResult.fail("Failed to load scheduler state"),
         };
+        var scheduler = loaded.scheduler;
+        const tenant = loaded.tenant;
         defer scheduler.deinit();
 
         if (scheduler.removeJob(job_id)) {
-            cron.saveJobs(&scheduler) catch {};
+            saveSchedulerForContext(&scheduler, tenant) catch {};
             const msg = try std.fmt.allocPrint(allocator, "Removed cron job {s}", .{job_id});
             return ToolResult{ .success = true, .output = msg };
         }

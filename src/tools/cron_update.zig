@@ -5,7 +5,9 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const loadScheduler = @import("cron_add.zig").loadScheduler;
+const loadSchedulerForContext = @import("cron_add.zig").loadSchedulerForContext;
+const saveSchedulerForContext = @import("cron_add.zig").saveSchedulerForContext;
+const config_mod = @import("../config.zig");
 
 const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
 const TestCronStore = struct {
@@ -30,6 +32,8 @@ const TestCronStore = struct {
 
 /// CronUpdate tool — update a cron job's expression, command, or enabled state.
 pub const CronUpdateTool = struct {
+    config: ?*const config_mod.Config = null,
+
     pub const tool_name = "cron_update";
     pub const tool_description = "Update a cron job: change expression, command, or enable/disable it.";
     pub const tool_params =
@@ -45,7 +49,7 @@ pub const CronUpdateTool = struct {
         };
     }
 
-    pub fn execute(_: *CronUpdateTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(self: *CronUpdateTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const job_id = root.getString(args, "job_id") orelse
             return ToolResult.fail("Missing 'job_id' parameter");
 
@@ -63,9 +67,12 @@ pub const CronUpdateTool = struct {
                 return ToolResult.fail("Invalid cron expression");
         }
 
-        var scheduler = loadScheduler(allocator) catch {
-            return ToolResult.fail("Failed to load scheduler state");
+        const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
+            error.MissingTenantStateContext => return ToolResult.fail("Tenant scheduler context is missing for postgres runtime"),
+            else => return ToolResult.fail("Failed to load scheduler state"),
         };
+        var scheduler = loaded.scheduler;
+        const tenant = loaded.tenant;
         defer scheduler.deinit();
 
         const patch = cron.CronJobPatch{
@@ -79,7 +86,7 @@ pub const CronUpdateTool = struct {
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
 
-        cron.saveJobs(&scheduler) catch {};
+        saveSchedulerForContext(&scheduler, tenant) catch {};
 
         // Build summary of what changed
         var buf: std.ArrayList(u8) = .empty;

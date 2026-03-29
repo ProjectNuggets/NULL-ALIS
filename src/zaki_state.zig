@@ -135,6 +135,9 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn getJobsJson(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]u8 {
         return allocator.dupe(u8, "[]");
     }
+    pub fn listJobRuns(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8, _: usize) ![]cron_mod.CronRun {
+        return allocator.alloc(cron_mod.CronRun, 0);
+    }
     pub fn clearJobs(_: *@This(), _: i64) !void {
         return error.PostgresNotEnabled;
     }
@@ -1073,7 +1076,23 @@ const ManagerImpl = struct {
 
     pub fn getJobsJson(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]u8 {
         const q = try self.buildQuery(
-            "SELECT COALESCE(jsonb_agg(raw_job ORDER BY created_at), '[]'::jsonb)::text FROM {schema}.jobs WHERE user_id = $1 AND enabled = TRUE",
+            "SELECT COALESCE(jsonb_agg(job_json ORDER BY created_at), '[]'::jsonb)::text FROM (" ++
+                " SELECT created_at, " ++
+                " jsonb_set(" ++
+                "   jsonb_set(" ++
+                "     jsonb_set(" ++
+                "       jsonb_set(" ++
+                "         jsonb_set(raw_job, '{enabled}', to_jsonb(enabled), true)," ++
+                "         '{paused}', to_jsonb(CASE WHEN enabled THEN COALESCE((raw_job->>'paused')::boolean, false) ELSE TRUE END), true" ++
+                "       )," ++
+                "       '{last_status}', CASE WHEN last_status IS NULL THEN 'null'::jsonb ELSE to_jsonb(last_status) END, true" ++
+                "     )," ++
+                "     '{last_run_secs}', CASE WHEN last_run_at IS NULL THEN 'null'::jsonb ELSE to_jsonb(EXTRACT(EPOCH FROM last_run_at)::bigint) END, true" ++
+                "   )," ++
+                "   '{next_run_secs}', CASE WHEN next_run_at IS NULL THEN 'null'::jsonb ELSE to_jsonb(EXTRACT(EPOCH FROM next_run_at)::bigint) END, true" ++
+                " ) AS job_json" ++
+                " FROM {schema}.jobs WHERE user_id = $1" ++
+                " ) job_rows",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -1084,6 +1103,68 @@ const ManagerImpl = struct {
         defer c.PQclear(result);
         if (c.PQntuples(result) == 0) return allocator.dupe(u8, "[]");
         return dupeResultValue(allocator, result, 0, 0);
+    }
+
+    pub fn listJobRuns(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        job_id: []const u8,
+        limit: usize,
+    ) ![]cron_mod.CronRun {
+        const q = try self.buildQuery(
+            "SELECT EXTRACT(EPOCH FROM started_at)::bigint::text, EXTRACT(EPOCH FROM finished_at)::bigint::text, status, output " ++
+                "FROM {schema}.job_runs WHERE user_id = $1 AND job_id = $2 ORDER BY started_at DESC LIMIT $3::bigint",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const job_id_z = try self.allocator.dupeZ(u8, job_id);
+        defer self.allocator.free(job_id_z);
+        var limit_buf: [32]u8 = undefined;
+        const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+        const params = [_]?[*:0]const u8{ user_s.ptr, job_id_z, limit_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(job_id.len), @intCast(limit_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const rows: usize = @intCast(c.PQntuples(result));
+        const runs = try allocator.alloc(cron_mod.CronRun, rows);
+        var initialized: usize = 0;
+        errdefer {
+            for (runs[0..initialized]) |run| {
+                allocator.free(@constCast(run.job_id));
+                allocator.free(@constCast(run.status));
+                if (run.output) |value| allocator.free(@constCast(value));
+            }
+            allocator.free(runs);
+        }
+
+        for (0..rows) |i| {
+            const row: c_int = @intCast(i);
+            const started_text = try dupeResultValue(allocator, result, row, 0);
+            defer allocator.free(started_text);
+            const finished_text = try dupeResultValue(allocator, result, row, 1);
+            defer allocator.free(finished_text);
+            const started_at_s = try std.fmt.parseInt(i64, started_text, 10);
+            const finished_at_s = try std.fmt.parseInt(i64, finished_text, 10);
+            const output = if (c.PQgetisnull(result, row, 3) == 1)
+                null
+            else
+                try dupeResultValue(allocator, result, row, 3);
+
+            runs[i] = .{
+                .id = @intCast(i + 1),
+                .job_id = try allocator.dupe(u8, job_id),
+                .started_at_s = started_at_s,
+                .finished_at_s = finished_at_s,
+                .status = try dupeResultValue(allocator, result, row, 2),
+                .output = output,
+                .duration_ms = (finished_at_s - started_at_s) * std.time.ms_per_s,
+            };
+            initialized += 1;
+        }
+        return runs;
     }
 
     pub fn clearJobs(self: *Self, user_id: i64) !void {
@@ -2398,7 +2479,7 @@ fn initPostgresTestManagerWithPool(allocator: std.mem.Allocator, pool_max: u32, 
     return mgr;
 }
 
-test "postgres claimed job one-shot completion preserves run history and hides job" {
+test "postgres claimed job one-shot completion preserves run history and disables job in management view" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
@@ -2442,7 +2523,12 @@ test "postgres claimed job one-shot completion preserves run history and hides j
 
     const jobs_after = try mgr.getJobsJson(allocator, 2);
     defer allocator.free(jobs_after);
-    try std.testing.expectEqualStrings("[]", jobs_after);
+    const parsed_jobs = try std.json.parseFromSlice(std.json.Value, allocator, jobs_after, .{});
+    defer parsed_jobs.deinit();
+    try std.testing.expect(parsed_jobs.value == .array);
+    try std.testing.expectEqual(@as(usize, 1), parsed_jobs.value.array.items.len);
+    try std.testing.expectEqualStrings("once-reminder", parsed_jobs.value.array.items[0].object.get("id").?.string);
+    try std.testing.expectEqual(false, parsed_jobs.value.array.items[0].object.get("enabled").?.bool);
 
     const q = try mgr.buildQuery("SELECT COUNT(*) FROM {schema}.job_runs WHERE user_id = $1 AND job_id = $2");
     defer allocator.free(q);
@@ -2556,6 +2642,60 @@ test "postgres claimed recurring job reschedules and records run" {
         allocator.free(future_claim);
     }
     try std.testing.expectEqual(@as(usize, 0), future_claim.len);
+
+    const runs = try mgr.listJobRuns(allocator, 2, "recurring-reminder", 10);
+    defer {
+        for (runs) |run| {
+            allocator.free(@constCast(run.job_id));
+            allocator.free(@constCast(run.status));
+            if (run.output) |value| allocator.free(@constCast(value));
+        }
+        allocator.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqualStrings("recurring-reminder", runs[0].job_id);
+    try std.testing.expectEqualStrings("ok", runs[0].status);
+    try std.testing.expectEqualStrings("ok", runs[0].output.?);
+}
+
+test "postgres getJobsJson includes disabled jobs for management views" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+    try mgr.replaceJobsJson(2, "agent:zaki-bot:user:2:main", "[{\"id\":\"disabled-report\",\"expression\":\"0 9 * * *\",\"command\":\"echo report\",\"enabled\":false,\"paused\":true}]");
+
+    const jobs_json = try mgr.getJobsJson(allocator, 2);
+    defer allocator.free(jobs_json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, jobs_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings("disabled-report", parsed.value.array.items[0].object.get("id").?.string);
+    try std.testing.expectEqual(false, parsed.value.array.items[0].object.get("enabled").?.bool);
 }
 
 test "postgres memory upsert recall list and forget stay user-scoped" {
