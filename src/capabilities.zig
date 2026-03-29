@@ -380,7 +380,10 @@ pub fn buildSummaryText(
             "\nScheduling guidance:\n" ++
             "  use `schedule` for user-facing reminders, briefs, reports, and other proactive jobs\n" ++
             "  use `cron_*` only for raw scheduler inspection or operator maintenance\n" ++
-            "  use `schedule ensure` for background reconciliation of canonical jobs backed by explicit policy\n" ++
+            "  missing durable job: use `schedule ensure` or `schedule create`\n" ++
+            "  paused or disabled durable job: use `schedule resume`\n" ++
+            "  active durable job with last_status=error: inspect with `schedule get`, then use `schedule ensure`; never use `resume` as repair\n" ++
+            "  only wake turns may use `schedule ensure`, and only for jobs declared in `AUTOMATIONS.json`; `HEARTBEAT.md` is wake policy only\n" ++
             "\nNot available in this runtime:\n" ++
             "  channels (disabled in build): {s}\n" ++
             "  memory engines (disabled in build): {s}\n" ++
@@ -454,7 +457,10 @@ pub fn buildPromptSection(
             "### Scheduling Guidance\n" ++
             "- Use `schedule` for user-facing reminders, briefs, reports, and other proactive jobs.\n" ++
             "- Use `cron_*` only for raw scheduler inspection or operator maintenance.\n" ++
-            "- Use `schedule ensure` for background reconciliation of canonical jobs backed by explicit policy.\n\n" ++
+            "- Missing durable job: use `schedule ensure` or `schedule create`.\n" ++
+            "- Paused or disabled durable job: use `schedule resume`.\n" ++
+            "- Active durable job with `last_status=error`: inspect with `schedule get`, then use `schedule ensure`; never use `resume` as repair.\n" ++
+            "- Only wake turns may use `schedule ensure`, and only for jobs declared in `AUTOMATIONS.json`. `HEARTBEAT.md` is wake policy only.\n\n" ++
             "### Not available in this runtime\n" ++
             "- Channels disabled in build: {s}\n" ++
             "- Memory backends disabled in build: {s}\n" ++
@@ -489,6 +495,7 @@ test "buildSummaryText includes availability sections" {
     try std.testing.expect(std.mem.indexOf(u8, summary, "Available in this runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "Not available in this runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "use `schedule` for user-facing reminders") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "AUTOMATIONS.json") != null);
 }
 
 test "buildManifestJson estimated tools align with runtime naming" {

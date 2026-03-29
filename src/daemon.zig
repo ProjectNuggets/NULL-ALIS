@@ -203,10 +203,12 @@ fn sendGatewayControlCommand(host: []const u8, port: u16, path: []const u8, inte
 }
 
 const HEARTBEAT_PROMPT_DEFAULT =
-    "Read HEARTBEAT.md if it exists (workspace context) and treat it as policy, not as proof that jobs already exist. " ++
-    "Heartbeat is a wake/reconcile lane, not the exact-time scheduler. Use runtime_info first, then inspect durable jobs with schedule. " ++
-    "If the explicit Automation Policy block in HEARTBEAT.md defines a canonical job that is missing or drifted, repair it with schedule ensure. " ++
-    "Do not create durable scheduled jobs from free-form prose alone. Do not use heartbeat polling itself as exact-time scheduling. " ++
+    "Read HEARTBEAT.md if it exists (workspace context) and treat it as wake policy only, not as proof that jobs already exist. " ++
+    "If AUTOMATIONS.json exists, treat it as desired durable automation state for canonical scheduled jobs. " ++
+    "Heartbeat is a wake trigger, not the exact-time scheduler. Use runtime_info first, then inspect durable jobs with schedule. " ++
+    "Wake turns may reconcile only canonical jobs declared in AUTOMATIONS.json by using schedule ensure. " ++
+    "Do not create durable scheduled jobs from free-form prose. Resume is not a repair action for jobs in error state. " ++
+    "Do not use heartbeat polling itself as exact-time scheduling. " ++
     "Do not use cron_* for user-facing automation. Do not use shell, composio, message, or exploratory discovery. " ++
     "Reply in exactly one of these forms only: HEARTBEAT_OK or HEARTBEAT_SEND: <single concise user-facing sentence>. Do not output lists, markdown, diagnostics, or explanatory narration.";
 const HEARTBEAT_RUNTIME_FILENAME = "heartbeat_runtime.json";
@@ -884,10 +886,7 @@ fn runTenantHeartbeatForUser(
         return;
     }
 
-    const turn_origin: tools_mod.TurnOrigin = if (forced and !std.mem.eql(u8, reason, "interval"))
-        .wake
-    else
-        .heartbeat;
+    const turn_origin: tools_mod.TurnOrigin = .wake;
 
     const reply = runHeartbeatAgentTurn(allocator, config, user_id, user_root, workspace_path, event_bus, hb_cfg.prompt, turn_origin) catch |err| {
         log.warn("heartbeat agent turn failed for user={s}: {}", .{ user_id, err });

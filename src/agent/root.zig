@@ -27,6 +27,7 @@ const tool_dispatcher = @import("../tool_dispatcher.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const RateTracker = @import("../security/policy.zig").RateTracker;
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -858,7 +859,7 @@ pub const Agent = struct {
             if (!allowed) {
                 return .{ .blocked = .{
                     .name = call.name,
-                    .output = "Rate limit exceeded",
+                    .output = "Action budget exhausted",
                     .success = false,
                     .tool_call_id = call.tool_call_id,
                 } };
@@ -4561,6 +4562,50 @@ test "exec ask always registers pending approval from tool path" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "approval required") != null);
     try std.testing.expect(agent.pending_exec_command != null);
     try std.testing.expectEqualStrings("echo hello", agent.pending_exec_command.?);
+}
+
+test "policy preflight reports action budget exhausted" {
+    const allocator = std.testing.allocator;
+    var tracker = RateTracker.init(allocator, 1);
+    defer tracker.deinit();
+    var policy = SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .max_actions_per_hour = 1,
+        .tracker = &tracker,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 4,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer agent.deinit();
+
+    const call = ParsedToolCall{
+        .name = "runtime_info",
+        .arguments_json = "{}",
+        .tool_call_id = null,
+    };
+
+    const first = agent.preflightToolPolicy(call);
+    try std.testing.expect(first == .allowed);
+
+    const second = agent.preflightToolPolicy(call);
+    try std.testing.expect(second == .blocked);
+    try std.testing.expectEqualStrings("Action budget exhausted", second.blocked.output);
 }
 
 test "slash additional commands are handled" {

@@ -108,6 +108,13 @@ pub const DeliveryConfig = struct {
     best_effort: bool = true,
 };
 
+pub const JobPauseResumeResult = enum {
+    changed,
+    already_paused,
+    already_active,
+    not_found,
+};
+
 pub const CronRun = struct {
     id: u64,
     job_id: []const u8,
@@ -720,25 +727,28 @@ pub const CronScheduler = struct {
     }
 
     /// Pause a job.
-    pub fn pauseJob(self: *CronScheduler, id: []const u8) bool {
+    pub fn pauseJob(self: *CronScheduler, id: []const u8) JobPauseResumeResult {
         for (self.jobs.items) |*job| {
             if (std.mem.eql(u8, job.id, id)) {
+                if (job.paused) return .already_paused;
                 job.paused = true;
-                return true;
+                return .changed;
             }
         }
-        return false;
+        return .not_found;
     }
 
     /// Resume a job.
-    pub fn resumeJob(self: *CronScheduler, id: []const u8) bool {
+    pub fn resumeJob(self: *CronScheduler, id: []const u8) JobPauseResumeResult {
         for (self.jobs.items) |*job| {
             if (std.mem.eql(u8, job.id, id)) {
+                if (!job.paused and job.enabled) return .already_active;
                 job.paused = false;
-                return true;
+                job.enabled = true;
+                return .changed;
             }
         }
-        return false;
+        return .not_found;
     }
 
     /// Get due (non-paused) jobs whose next_run <= now.
@@ -2025,11 +2035,18 @@ pub fn cliPauseJob(allocator: std.mem.Allocator, id: []const u8) !void {
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    if (scheduler.pauseJob(id)) {
-        try saveJobs(&scheduler);
-        log.info("Paused job {s}", .{id});
-    } else {
-        log.warn("Cron job '{s}' not found", .{id});
+    switch (scheduler.pauseJob(id)) {
+        .changed => {
+            try saveJobs(&scheduler);
+            log.info("Paused job {s}", .{id});
+        },
+        .already_paused => {
+            log.info("Cron job {s} is already paused", .{id});
+        },
+        .already_active => unreachable,
+        .not_found => {
+            log.warn("Cron job '{s}' not found", .{id});
+        },
     }
 }
 
@@ -2040,11 +2057,18 @@ pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    if (scheduler.resumeJob(id)) {
-        try saveJobs(&scheduler);
-        log.info("Resumed job {s}", .{id});
-    } else {
-        log.warn("Cron job '{s}' not found", .{id});
+    switch (scheduler.resumeJob(id)) {
+        .changed => {
+            try saveJobs(&scheduler);
+            log.info("Resumed job {s}", .{id});
+        },
+        .already_active => {
+            log.info("Cron job {s} is already active", .{id});
+        },
+        .already_paused => unreachable,
+        .not_found => {
+            log.warn("Cron job '{s}' not found", .{id});
+        },
     }
 }
 
@@ -2248,10 +2272,15 @@ test "CronScheduler pause and resume" {
     defer scheduler.deinit();
 
     const job = try scheduler.addJob("*/5 * * * *", "echo pause");
-    try std.testing.expect(scheduler.pauseJob(job.id));
+    try std.testing.expectEqual(JobPauseResumeResult.changed, scheduler.pauseJob(job.id));
     try std.testing.expect(scheduler.getJob(job.id).?.paused);
-    try std.testing.expect(scheduler.resumeJob(job.id));
+    try std.testing.expectEqual(JobPauseResumeResult.already_paused, scheduler.pauseJob(job.id));
+    job.enabled = false;
+    try std.testing.expectEqual(JobPauseResumeResult.changed, scheduler.resumeJob(job.id));
     try std.testing.expect(!scheduler.getJob(job.id).?.paused);
+    try std.testing.expect(scheduler.getJob(job.id).?.enabled);
+    try std.testing.expectEqual(JobPauseResumeResult.already_active, scheduler.resumeJob(job.id));
+    try std.testing.expectEqual(JobPauseResumeResult.not_found, scheduler.pauseJob("missing-job"));
 }
 
 test "CronScheduler max tasks enforced" {

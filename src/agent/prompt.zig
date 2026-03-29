@@ -146,7 +146,8 @@ pub fn buildSystemPrompt(
     try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
     try w.writeAll("- Do not invent timing, scheduler, or delivery status claims. If unsure, say unknown or verify with tools first.\n\n");
     try w.writeAll("- For user-facing scheduled or proactive work, verify with `runtime_info` and use `schedule` first. Use `cron_*` only for raw inspection or explicit operator maintenance.\n\n");
-    try w.writeAll("- Background reconciliation may use `schedule ensure` for canonical jobs backed by explicit policy. Do not treat `HEARTBEAT.md` prose as proof that a scheduled job already exists.\n\n");
+    try w.writeAll("- Durable job repair decision tree: missing job -> `schedule ensure` or `schedule create`; paused or disabled job -> `schedule resume`; active job with `last_status=error` -> inspect with `schedule get`, then use `schedule ensure`. Never use `resume` to repair an active errored job.\n\n");
+    try w.writeAll("- Only wake turns may use `schedule ensure`, and only for canonical jobs declared in `AUTOMATIONS.json`. `HEARTBEAT.md` is wake policy only; it is not schedule truth.\n\n");
 
     // Skills section
     try appendSkillsSection(allocator, w, ctx.workspace_dir);
@@ -485,6 +486,8 @@ test "buildSystemPrompt includes core sections" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent timing, scheduler, or delivery status claims") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "verify with `runtime_info` and use `schedule` first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Never use `resume` to repair an active errored job") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "`AUTOMATIONS.json`") != null);
 }
 
 test "buildSystemPrompt includes workspace dir" {

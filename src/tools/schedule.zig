@@ -16,7 +16,7 @@ const MIN_ONCE_DELAY_SECS: i64 = 60;
 const MORNING_BRIEF_JOB_ID = morning_brief.MORNING_BRIEF_JOB_ID;
 const MORNING_BRIEF_AGENT_COMMAND = morning_brief.MORNING_BRIEF_AGENT_COMMAND;
 const MORNING_BRIEF_AGENT_PROMPT = morning_brief.MORNING_BRIEF_AGENT_PROMPT;
-const AUTOMATION_POLICY_SECTION = "## Automation Policy";
+const AUTOMATIONS_FILENAME = "AUTOMATIONS.json";
 
 const DesiredJobKind = enum {
     auto,
@@ -42,8 +42,9 @@ const EnsureRequest = struct {
     morning_brief_request: bool = false,
 };
 
-const PolicyMatch = struct {
+const RegistryJobSpec = struct {
     id: ?[]const u8 = null,
+    enabled: bool = false,
     kind: ?[]const u8 = null,
     expression: ?[]const u8 = null,
     delay: ?[]const u8 = null,
@@ -75,7 +76,7 @@ fn buildAgentTaskPrompt(
         .brief => std.fmt.allocPrint(
             allocator,
             "Prepare the scheduled brief now. Brief specification: {s}. " ++
-                "Read HEARTBEAT.md in workspace for exact format and requirements. " ++
+                "Read HEARTBEAT.md in workspace only as wake policy if it is relevant. " ++
                 "Use runtime_info and schedule first for runtime truth. Then gather data using read-only integrations/tools as needed (calendar/email/news/weather). " ++
                 "Deliver one concise Telegram-ready brief suitable for scheduler delivery. Do not call the message tool in this turn; scheduler delivery sends the final output. Do not create/update scheduler jobs in this turn.",
             .{command},
@@ -83,7 +84,7 @@ fn buildAgentTaskPrompt(
         .report => std.fmt.allocPrint(
             allocator,
             "Prepare the scheduled report now. Report specification: {s}. " ++
-                "Read HEARTBEAT.md in workspace for policy and format. Use runtime_info and schedule first for runtime truth. " ++
+                "Read HEARTBEAT.md in workspace only as wake policy if it is relevant. Use runtime_info and schedule first for runtime truth. " ++
                 "Gather data using read-only tools only. Deliver one concise Telegram-ready report suitable for scheduler delivery. " ++
                 "Do not call the message tool in this turn; scheduler delivery sends the final output. Do not create/update scheduler jobs in this turn.",
             .{command},
@@ -91,7 +92,7 @@ fn buildAgentTaskPrompt(
         .follow_up => std.fmt.allocPrint(
             allocator,
             "Perform the scheduled follow-up now. Follow-up specification: {s}. " ++
-                "Read HEARTBEAT.md in workspace for policy. Use runtime_info and schedule first for runtime truth. " ++
+                "Read HEARTBEAT.md in workspace only as wake policy if it is relevant. Use runtime_info and schedule first for runtime truth. " ++
                 "Deliver one concise Telegram-ready follow-up suitable for scheduler delivery. Do not call the message tool in this turn; scheduler delivery sends the final output. Do not create/update scheduler jobs in this turn.",
             .{command},
         ),
@@ -366,46 +367,35 @@ fn parseEchoCommand(command: []const u8) ?[]const u8 {
     return std.mem.trim(u8, content, " \t\r\n");
 }
 
-fn trimPolicyValue(raw: ?[]const u8) ?[]const u8 {
+fn trimRegistryValue(raw: ?[]const u8) ?[]const u8 {
     const value = raw orelse return null;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0) return null;
     return trimmed;
 }
 
-fn extractAutomationPolicyJson(markdown: []const u8) ?[]const u8 {
-    const section_start = std.mem.indexOf(u8, markdown, AUTOMATION_POLICY_SECTION) orelse return null;
-    const rest = markdown[section_start + AUTOMATION_POLICY_SECTION.len ..];
-    const fence_start = std.mem.indexOf(u8, rest, "```json") orelse return null;
-    const after_fence = rest[fence_start + "```json".len ..];
-    const json_start = if (after_fence.len > 0 and after_fence[0] == '\n') after_fence[1..] else after_fence;
-    const fence_end = std.mem.indexOf(u8, json_start, "```") orelse return null;
-    const trimmed = std.mem.trim(u8, json_start[0..fence_end], " \t\r\n");
-    if (trimmed.len == 0) return null;
-    return trimmed;
-}
+fn registryEntryMatchesRequest(entry: RegistryJobSpec, request: EnsureRequest) bool {
+    if (!entry.enabled) return false;
+    const requested_id = request.requested_id orelse return false;
+    const entry_id = trimRegistryValue(entry.id) orelse return false;
+    const entry_command = trimRegistryValue(entry.command) orelse return false;
+    const entry_kind = trimRegistryValue(entry.kind) orelse return false;
 
-fn policyEntryMatchesRequest(entry: PolicyMatch, request: EnsureRequest) bool {
-    if (trimPolicyValue(entry.command) == null) return false;
-    if (!std.mem.eql(u8, trimPolicyValue(entry.command).?, request.command)) return false;
-
-    if (request.requested_id) |requested_id| {
-        const entry_id = trimPolicyValue(entry.id) orelse return false;
-        if (!std.mem.eql(u8, entry_id, requested_id)) return false;
-    }
+    if (!std.mem.eql(u8, entry_id, requested_id)) return false;
+    if (!std.mem.eql(u8, entry_command, request.command)) return false;
+    _ = parseDesiredJobKind(entry_kind);
 
     if (request.kind != .auto) {
-        const entry_kind = trimPolicyValue(entry.kind) orelse return false;
         if (parseDesiredJobKind(entry_kind) != request.kind) return false;
     }
 
     return switch (request.mode) {
         .recurring => blk: {
-            const expr = trimPolicyValue(entry.expression) orelse break :blk false;
+            const expr = trimRegistryValue(entry.expression) orelse break :blk false;
             break :blk std.mem.eql(u8, expr, request.expression.?);
         },
         .once => blk: {
-            const delay = trimPolicyValue(entry.delay) orelse break :blk false;
+            const delay = trimRegistryValue(entry.delay) orelse break :blk false;
             break :blk std.mem.eql(u8, delay, request.delay.?);
         },
     };
@@ -417,36 +407,40 @@ fn oneShotExpressionMatchesDelay(job: *const cron.CronJob, delay: []const u8) bo
     return std.mem.eql(u8, job.expression, expr);
 }
 
-fn heartbeatPolicyAllowsRequest(
+fn automationRegistryAllowsRequest(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
     request: EnsureRequest,
 ) bool {
-    const heartbeat_path = std.fs.path.join(allocator, &.{ workspace_dir, "HEARTBEAT.md" }) catch return false;
-    defer allocator.free(heartbeat_path);
+    if (request.requested_id == null) return false;
 
-    const file = std.fs.openFileAbsolute(heartbeat_path, .{}) catch return false;
+    const registry_path = std.fs.path.join(allocator, &.{ workspace_dir, AUTOMATIONS_FILENAME }) catch return false;
+    defer allocator.free(registry_path);
+
+    const file = std.fs.openFileAbsolute(registry_path, .{}) catch return false;
     defer file.close();
     const content = file.readToEndAlloc(allocator, 256 * 1024) catch return false;
     defer allocator.free(content);
 
-    const policy_json = extractAutomationPolicyJson(content) orelse return false;
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, policy_json, .{}) catch return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
+    const version_value = parsed.value.object.get("version") orelse return false;
+    if (version_value != .integer or version_value.integer != 1) return false;
     const jobs_value = parsed.value.object.get("jobs") orelse return false;
     if (jobs_value != .array) return false;
 
     for (jobs_value.array.items) |entry_value| {
         if (entry_value != .object) continue;
-        const match = PolicyMatch{
+        const match = RegistryJobSpec{
             .id = if (entry_value.object.get("id")) |v| if (v == .string) v.string else null else null,
+            .enabled = if (entry_value.object.get("enabled")) |v| if (v == .bool) v.bool else false else false,
             .kind = if (entry_value.object.get("kind")) |v| if (v == .string) v.string else null else null,
             .expression = if (entry_value.object.get("expression")) |v| if (v == .string) v.string else null else null,
             .delay = if (entry_value.object.get("delay")) |v| if (v == .string) v.string else null else null,
             .command = if (entry_value.object.get("command")) |v| if (v == .string) v.string else null else null,
         };
-        if (policyEntryMatchesRequest(match, request)) return true;
+        if (registryEntryMatchesRequest(match, request)) return true;
     }
 
     return false;
@@ -561,7 +555,7 @@ fn ensureBackgroundRequestAuthorized(
     const turn_ctx = root.getTurnContext();
     if (!root.isBackgroundTurnOrigin(turn_ctx.origin)) return true;
     const dir = workspace_dir orelse return false;
-    return heartbeatPolicyAllowsRequest(allocator, dir, request);
+    return automationRegistryAllowsRequest(allocator, dir, request);
 }
 
 fn ensureScheduleJob(
@@ -572,7 +566,7 @@ fn ensureScheduleJob(
     request: EnsureRequest,
 ) !ToolResult {
     if (!ensureBackgroundRequestAuthorized(allocator, workspace_dir, request)) {
-        return ToolResult.fail("Background schedule ensure requires a matching explicit job in HEARTBEAT automation policy");
+        return ToolResult.fail("Background schedule ensure requires a matching enabled job in AUTOMATIONS.json");
     }
 
     const now_s = std.time.timestamp();
@@ -646,6 +640,55 @@ fn ensureScheduleJob(
     return ToolResult{ .success = true, .output = msg };
 }
 
+fn repairHintForJob(job: *const cron.CronJob) []const u8 {
+    if (job.paused or !job.enabled) return "resume";
+    if (job.last_status) |status| {
+        if (std.ascii.eqlIgnoreCase(status, "error")) return "ensure";
+    }
+    return "none";
+}
+
+fn describePauseResumeResult(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    is_pause: bool,
+    result: cron.JobPauseResumeResult,
+    job: ?*const cron.CronJob,
+) !ToolResult {
+    return switch (result) {
+        .changed => blk: {
+            const verb: []const u8 = if (is_pause) "Paused" else "Resumed";
+            const msg = try std.fmt.allocPrint(allocator, "{s} job {s}", .{ verb, id });
+            break :blk ToolResult{ .success = true, .output = msg };
+        },
+        .already_paused => blk: {
+            const msg = try std.fmt.allocPrint(allocator, "Job {s} is already paused", .{id});
+            break :blk ToolResult{ .success = true, .output = msg };
+        },
+        .already_active => blk: {
+            if (!is_pause and job != null) {
+                const resolved_job = job.?;
+                if (resolved_job.last_status) |status| {
+                    if (std.ascii.eqlIgnoreCase(status, "error")) {
+                        const msg = try std.fmt.allocPrint(
+                            allocator,
+                            "Job {s} is already active but last_status=error; resume does not repair error. Use schedule ensure.",
+                            .{id},
+                        );
+                        break :blk ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    }
+                }
+            }
+            const msg = try std.fmt.allocPrint(allocator, "Job {s} is already active", .{id});
+            break :blk ToolResult{ .success = true, .output = msg };
+        },
+        .not_found => blk: {
+            const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
+            break :blk ToolResult{ .success = false, .output = "", .error_msg = msg };
+        },
+    };
+}
+
 fn applyTenantDefaults(
     scheduler: *CronScheduler,
     allocator: std.mem.Allocator,
@@ -711,7 +754,7 @@ pub const ScheduleTool = struct {
     config: ?*const config_mod.Config = null,
 
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks for the user. Preferred tool for reminders, briefs, recurring follow-ups, and other proactive jobs. Tasks may be agent-managed, delivery-managed, or raw commands depending on the request.";
+    pub const tool_description = "Manage scheduled tasks for the user. Preferred tool for reminders, briefs, recurring follow-ups, and other proactive jobs. Tasks may be agent-managed, delivery-managed, or raw commands depending on the request. Use schedule ensure for canonical durable job repair.";
     pub const tool_params =
         \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","ensure","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Task intent, reminder text, agent prompt, delivery text, or raw command depending on the task type"},"kind":{"type":"string","enum":["command","reminder","brief","report","follow_up"],"description":"Optional durable automation kind used for canonical schedule ensure and richer agent-managed jobs"},"id":{"type":"string","description":"Task ID (optional deterministic ID for create/add/once/ensure, required for get/cancel/pause/resume)"}},"required":["action"]}
     ;
@@ -781,21 +824,23 @@ pub const ScheduleTool = struct {
             defer scheduler.deinit();
 
             if (scheduler.getJob(id)) |job| {
-                const flags: []const u8 = blk: {
-                    if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
-                    if (job.paused) break :blk " [paused]";
-                    if (job.one_shot) break :blk " [one-shot]";
-                    break :blk "";
-                };
                 const status = job.last_status orelse "pending";
-                const msg = try std.fmt.allocPrint(allocator, "Job {s} | {s} | next={d} | status={s}{s}\n  cmd: {s}", .{
-                    job.id,
-                    job.expression,
-                    job.next_run_secs,
-                    status,
-                    flags,
-                    job.command,
-                });
+                const msg = try std.fmt.allocPrint(
+                    allocator,
+                    "Job {s} | {s} | next={d}\n  enabled={s} paused={s} type={s} delivery={s} last_status={s} repair_hint={s}\n  cmd: {s}",
+                    .{
+                        job.id,
+                        job.expression,
+                        job.next_run_secs,
+                        if (job.enabled) "true" else "false",
+                        if (job.paused) "true" else "false",
+                        job.job_type.asStr(),
+                        job.delivery.mode.asStr(),
+                        status,
+                        repairHintForJob(job),
+                        job.command,
+                    },
+                );
                 return ToolResult{ .success = true, .output = msg };
             }
             const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
@@ -1044,16 +1089,12 @@ pub const ScheduleTool = struct {
             defer scheduler.deinit();
 
             const is_pause = std.mem.eql(u8, action, "pause");
-            const found = if (is_pause) scheduler.pauseJob(id) else scheduler.resumeJob(id);
+            const result = if (is_pause) scheduler.pauseJob(id) else scheduler.resumeJob(id);
 
-            if (found) {
+            if (result == .changed) {
                 saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
-                const verb: []const u8 = if (is_pause) "Paused" else "Resumed";
-                const msg = try std.fmt.allocPrint(allocator, "{s} job {s}", .{ verb, id });
-                return ToolResult{ .success = true, .output = msg };
             }
-            const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            return describePauseResumeResult(allocator, id, is_pause, result, scheduler.getJob(id));
         }
 
         const msg = try std.fmt.allocPrint(allocator, "Unknown action '{s}'", .{action});
@@ -1212,7 +1253,7 @@ fn schedule_test_error_is_heap_owned(error_msg: []const u8) bool {
     if (std.mem.eql(u8, error_msg, "Missing 'id' parameter for cancel action")) return false;
     if (std.mem.eql(u8, error_msg, "Missing 'id' parameter")) return false;
     if (std.mem.eql(u8, error_msg, "Failed to load scheduler state")) return false;
-    if (std.mem.eql(u8, error_msg, "Background schedule ensure requires a matching explicit job in HEARTBEAT automation policy")) return false;
+    if (std.mem.eql(u8, error_msg, "Background schedule ensure requires a matching enabled job in AUTOMATIONS.json")) return false;
     return true;
 }
 
@@ -1230,9 +1271,9 @@ fn free_schedule_test_error_if_owned(error_msg: ?[]const u8) void {
     }
 }
 
-fn writeScheduleTestHeartbeat(dir: std.testing.TmpDir, content: []const u8) !void {
+fn writeScheduleTestAutomations(dir: std.testing.TmpDir, content: []const u8) !void {
     try dir.dir.writeFile(.{
-        .sub_path = "HEARTBEAT.md",
+        .sub_path = AUTOMATIONS_FILENAME,
         .data = content,
     });
 }
@@ -1379,6 +1420,108 @@ test "schedule resume nonexistent job returns not found" {
     }
 }
 
+test "schedule get shows diagnostic repair hint for errored active job" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addJob("0 15 * * *", "daily_afternoon_brief");
+    std.testing.allocator.free(job.id);
+    job.id = try std.testing.allocator.dupe(u8, "afternoon-brief");
+    job.job_type = .agent;
+    job.last_status = "error";
+    try cron.saveJobs(&scheduler);
+
+    var cfg = config_mod.Config{
+        .workspace_dir = store.workspace_dir,
+        .config_path = "/tmp/nullalis-test-config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var st = ScheduleTool{ .config = &cfg };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\":\"get\",\"id\":\"afternoon-brief\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "last_status=error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "repair_hint=ensure") != null);
+}
+
+test "schedule resume is honest for active errored job" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addJob("0 15 * * *", "daily_afternoon_brief");
+    std.testing.allocator.free(job.id);
+    job.id = try std.testing.allocator.dupe(u8, "afternoon-brief");
+    job.job_type = .agent;
+    job.last_status = "error";
+    job.paused = false;
+    job.enabled = true;
+    try cron.saveJobs(&scheduler);
+
+    var cfg = config_mod.Config{
+        .workspace_dir = store.workspace_dir,
+        .config_path = "/tmp/nullalis-test-config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var st = ScheduleTool{ .config = &cfg };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\":\"resume\",\"id\":\"afternoon-brief\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "resume does not repair error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "schedule ensure") != null);
+}
+
+test "schedule pause and resume report already states honestly" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addJob("0 9 * * *", "echo hello");
+    std.testing.allocator.free(job.id);
+    job.id = try std.testing.allocator.dupe(u8, "hello-job");
+    job.paused = true;
+    try cron.saveJobs(&scheduler);
+
+    var cfg = config_mod.Config{
+        .workspace_dir = store.workspace_dir,
+        .config_path = "/tmp/nullalis-test-config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var st = ScheduleTool{ .config = &cfg };
+    const t = st.tool();
+
+    const pause_parsed = try root.parseTestArgs("{\"action\":\"pause\",\"id\":\"hello-job\"}");
+    defer pause_parsed.deinit();
+    const pause_result = try t.execute(std.testing.allocator, pause_parsed.value.object);
+    defer free_schedule_test_output_if_owned(pause_result.output);
+    defer free_schedule_test_error_if_owned(pause_result.error_msg);
+    try std.testing.expect(pause_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, pause_result.output, "already paused") != null);
+
+    const resume_parsed = try root.parseTestArgs("{\"action\":\"resume\",\"id\":\"hello-job\"}");
+    defer resume_parsed.deinit();
+    const resume_result = try t.execute(std.testing.allocator, resume_parsed.value.object);
+    defer free_schedule_test_output_if_owned(resume_result.output);
+    defer free_schedule_test_error_if_owned(resume_result.error_msg);
+    try std.testing.expect(resume_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, resume_result.output, "Resumed job hello-job") != null);
+}
+
 test "schedule once creates one-shot task" {
     var st = ScheduleTool{};
     const t = st.tool();
@@ -1392,27 +1535,38 @@ test "schedule once creates one-shot task" {
     }
 }
 
-test "extractAutomationPolicyJson returns fenced policy block" {
-    const markdown =
-        \\# HEARTBEAT.md
-        \\
-        \\## Automation Policy
-        \\
-        \\```json
-        \\{"jobs":[{"id":"morning-brief","kind":"brief","expression":"0 8 * * *","command":"daily_morning_brief"}]}
-        \\```
-        \\
-        \\notes
-    ;
-    const block = extractAutomationPolicyJson(markdown) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, block, "\"jobs\"") != null);
-}
-
-test "schedule ensure blocks background auto-create without automation policy" {
+test "automation registry authorization requires version enabled id and command" {
     var store = try TestCronStore.init();
     defer store.deinit();
 
-    try writeScheduleTestHeartbeat(store.tmp, "# HEARTBEAT.md\n\nGeneral notes only.\n");
+    try writeScheduleTestAutomations(store.tmp,
+        \\{
+        \\  "version": 1,
+        \\  "jobs": [
+        \\    {
+        \\      "id": "morning-brief",
+        \\      "enabled": true,
+        \\      "kind": "brief",
+        \\      "expression": "0 8 * * *",
+        \\      "command": "daily_morning_brief"
+        \\    }
+        \\  ]
+        \\}
+    );
+
+    const request: EnsureRequest = .{
+        .mode = .recurring,
+        .expression = "0 8 * * *",
+        .command = "daily_morning_brief",
+        .requested_id = "morning-brief",
+        .kind = .brief,
+    };
+    try std.testing.expect(automationRegistryAllowsRequest(std.testing.allocator, store.workspace_dir, request));
+}
+
+test "schedule ensure blocks background auto-create without automation registry" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
 
     var cfg = config_mod.Config{
         .workspace_dir = store.workspace_dir,
@@ -1422,7 +1576,7 @@ test "schedule ensure blocks background auto-create without automation policy" {
 
     var st = ScheduleTool{ .config = &cfg };
     const t = st.tool();
-    root.setTurnContext(.{ .origin = .heartbeat });
+    root.setTurnContext(.{ .origin = .wake });
     defer root.clearTurnContext();
 
     const parsed = try root.parseTestArgs("{\"action\":\"ensure\",\"id\":\"morning-brief\",\"kind\":\"brief\",\"expression\":\"0 8 * * *\",\"command\":\"daily_morning_brief\"}");
@@ -1431,10 +1585,10 @@ test "schedule ensure blocks background auto-create without automation policy" {
     defer free_schedule_test_output_if_owned(result.output);
     defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "automation policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "AUTOMATIONS.json") != null);
 }
 
-test "schedule ensure blocks background repair without automation policy even when job exists" {
+test "schedule ensure blocks background repair without automation registry even when job exists" {
     var store = try TestCronStore.init();
     defer store.deinit();
 
@@ -1445,8 +1599,6 @@ test "schedule ensure blocks background repair without automation policy even wh
     job.paused = true;
     try cron.saveJobs(&scheduler);
 
-    try writeScheduleTestHeartbeat(store.tmp, "# HEARTBEAT.md\n\nGeneral notes only.\n");
-
     var cfg = config_mod.Config{
         .workspace_dir = store.workspace_dir,
         .config_path = "/tmp/nullalis-test-config.json",
@@ -1455,30 +1607,35 @@ test "schedule ensure blocks background repair without automation policy even wh
 
     var st = ScheduleTool{ .config = &cfg };
     const t = st.tool();
-    root.setTurnContext(.{ .origin = .heartbeat });
+    root.setTurnContext(.{ .origin = .wake });
     defer root.clearTurnContext();
 
-    const parsed = try root.parseTestArgs("{\"action\":\"ensure\",\"kind\":\"command\",\"expression\":\"0 8 * * *\",\"command\":\"echo status\"}");
+    const parsed = try root.parseTestArgs("{\"action\":\"ensure\",\"id\":\"status-job\",\"kind\":\"command\",\"expression\":\"0 8 * * *\",\"command\":\"echo status\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer free_schedule_test_output_if_owned(result.output);
     defer free_schedule_test_error_if_owned(result.error_msg);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "automation policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "AUTOMATIONS.json") != null);
 }
 
-test "schedule ensure creates canonical brief job from automation policy" {
+test "schedule ensure creates canonical brief job from automation registry" {
     var store = try TestCronStore.init();
     defer store.deinit();
 
-    try writeScheduleTestHeartbeat(store.tmp,
-        \\# HEARTBEAT.md
-        \\
-        \\## Automation Policy
-        \\
-        \\```json
-        \\{"jobs":[{"id":"morning-brief","kind":"brief","expression":"0 8 * * *","command":"daily_morning_brief"}]}
-        \\```
+    try writeScheduleTestAutomations(store.tmp,
+        \\{
+        \\  "version": 1,
+        \\  "jobs": [
+        \\    {
+        \\      "id": "morning-brief",
+        \\      "enabled": true,
+        \\      "kind": "brief",
+        \\      "expression": "0 8 * * *",
+        \\      "command": "daily_morning_brief"
+        \\    }
+        \\  ]
+        \\}
     );
 
     var cfg = config_mod.Config{
@@ -1489,7 +1646,7 @@ test "schedule ensure creates canonical brief job from automation policy" {
 
     var st = ScheduleTool{ .config = &cfg };
     const t = st.tool();
-    root.setTurnContext(.{ .origin = .heartbeat });
+    root.setTurnContext(.{ .origin = .wake });
     defer root.clearTurnContext();
 
     const parsed = try root.parseTestArgs("{\"action\":\"ensure\",\"id\":\"morning-brief\",\"kind\":\"brief\",\"expression\":\"0 8 * * *\",\"command\":\"daily_morning_brief\"}");
@@ -1579,25 +1736,32 @@ test "schedule ensure resumes paused recurring job" {
     try std.testing.expect(!resumed.paused);
 }
 
-test "schedule ensure repairs paused recurring job from automation policy" {
+test "schedule ensure repairs paused recurring job from automation registry" {
     var store = try TestCronStore.init();
     defer store.deinit();
 
     var scheduler = CronScheduler.init(std.testing.allocator, 16, true);
     defer scheduler.deinit();
     const job = try scheduler.addJob("0 8 * * *", "echo status");
+    std.testing.allocator.free(job.id);
+    job.id = try std.testing.allocator.dupe(u8, "status-job");
     job.enabled = false;
     job.paused = true;
     try cron.saveJobs(&scheduler);
 
-    try writeScheduleTestHeartbeat(store.tmp,
-        \\# HEARTBEAT.md
-        \\
-        \\## Automation Policy
-        \\
-        \\```json
-        \\{"jobs":[{"kind":"command","expression":"0 8 * * *","command":"echo status"}]}
-        \\```
+    try writeScheduleTestAutomations(store.tmp,
+        \\{
+        \\  "version": 1,
+        \\  "jobs": [
+        \\    {
+        \\      "id": "status-job",
+        \\      "enabled": true,
+        \\      "kind": "command",
+        \\      "expression": "0 8 * * *",
+        \\      "command": "echo status"
+        \\    }
+        \\  ]
+        \\}
     );
 
     var cfg = config_mod.Config{
@@ -1608,10 +1772,10 @@ test "schedule ensure repairs paused recurring job from automation policy" {
 
     var st = ScheduleTool{ .config = &cfg };
     const t = st.tool();
-    root.setTurnContext(.{ .origin = .heartbeat });
+    root.setTurnContext(.{ .origin = .wake });
     defer root.clearTurnContext();
 
-    const parsed = try root.parseTestArgs("{\"action\":\"ensure\",\"kind\":\"command\",\"expression\":\"0 8 * * *\",\"command\":\"echo status\"}");
+    const parsed = try root.parseTestArgs("{\"action\":\"ensure\",\"id\":\"status-job\",\"kind\":\"command\",\"expression\":\"0 8 * * *\",\"command\":\"echo status\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer free_schedule_test_output_if_owned(result.output);

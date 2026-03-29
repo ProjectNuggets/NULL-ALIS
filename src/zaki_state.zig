@@ -1050,7 +1050,9 @@ const ManagerImpl = struct {
 
         const insert_q = try self.buildQuery(
             "INSERT INTO {schema}.jobs (id, user_id, session_id, kind, schedule_type, cron_expr, timezone, payload, raw_job, enabled, next_run_at, last_run_at, created_at, updated_at) " ++
-                "SELECT COALESCE(elem->>'id', md5(random()::text || clock_timestamp()::text)), $1, $2, " ++
+                "SELECT CASE " ++
+                "WHEN COALESCE(NULLIF(elem->>'id', ''), '') != '' THEN $4 || (elem->>'id') " ++
+                "ELSE $4 || md5(random()::text || clock_timestamp()::text) END, $1, $2, " ++
                 "CASE WHEN COALESCE(elem->>'job_type', 'shell') IN ('agent','delivery','integration','shell') THEN COALESCE(elem->>'job_type', 'shell') ELSE 'shell' END, " ++
                 "CASE WHEN COALESCE(elem->>'expression', '') LIKE '@once:%' THEN 'once' ELSE 'cron' END, " ++
                 "NULLIF(elem->>'expression', ''), COALESCE(elem->>'timezone', 'UTC'), elem, elem, COALESCE((elem->>'enabled')::boolean, true), " ++
@@ -1068,8 +1070,12 @@ const ManagerImpl = struct {
         defer self.allocator.free(session_z);
         const json_z = try self.allocator.dupeZ(u8, json);
         defer self.allocator.free(json_z);
-        const params = [_]?[*:0]const u8{ user_s.ptr, session_z, json_z };
-        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(normalized_session.len), @intCast(json.len) };
+        const job_key_prefix = try std.fmt.allocPrint(self.allocator, "user:{d}:", .{user_id});
+        defer self.allocator.free(job_key_prefix);
+        const job_key_prefix_z = try self.allocator.dupeZ(u8, job_key_prefix);
+        defer self.allocator.free(job_key_prefix_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, session_z, json_z, job_key_prefix_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(normalized_session.len), @intCast(json.len), @intCast(job_key_prefix.len) };
         const insert_result = try self.execParams(insert_q, &params, &lengths);
         c.PQclear(insert_result);
     }
@@ -1114,17 +1120,21 @@ const ManagerImpl = struct {
     ) ![]cron_mod.CronRun {
         const q = try self.buildQuery(
             "SELECT EXTRACT(EPOCH FROM started_at)::bigint::text, EXTRACT(EPOCH FROM finished_at)::bigint::text, status, output " ++
-                "FROM {schema}.job_runs WHERE user_id = $1 AND job_id = $2 ORDER BY started_at DESC LIMIT $3::bigint",
+                "FROM {schema}.job_runs WHERE user_id = $1 AND (job_id = $2 OR job_id = $3) ORDER BY started_at DESC LIMIT $4::bigint",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
-        const job_id_z = try self.allocator.dupeZ(u8, job_id);
-        defer self.allocator.free(job_id_z);
+        const scoped_job_id = try std.fmt.allocPrint(allocator, "user:{d}:{s}", .{ user_id, job_id });
+        defer allocator.free(scoped_job_id);
+        const scoped_job_id_z = try self.allocator.dupeZ(u8, scoped_job_id);
+        defer self.allocator.free(scoped_job_id_z);
+        const raw_job_id_z = try self.allocator.dupeZ(u8, job_id);
+        defer self.allocator.free(raw_job_id_z);
         var limit_buf: [32]u8 = undefined;
         const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
-        const params = [_]?[*:0]const u8{ user_s.ptr, job_id_z, limit_s.ptr };
-        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(job_id.len), @intCast(limit_s.len) };
+        const params = [_]?[*:0]const u8{ user_s.ptr, scoped_job_id_z, raw_job_id_z, limit_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(scoped_job_id.len), @intCast(job_id.len), @intCast(limit_s.len) };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
 
@@ -2517,7 +2527,7 @@ test "postgres claimed job one-shot completion preserves run history and disable
     }
     try std.testing.expectEqual(@as(usize, 1), claimed.len);
     try std.testing.expectEqual(@as(i64, 2), claimed[0].user_id);
-    try std.testing.expectEqualStrings("once-reminder", claimed[0].id);
+    try std.testing.expect(std.mem.startsWith(u8, claimed[0].id, "user:2:once-reminder"));
 
     try mgr.completeClaimedJob(2, claimed[0].id, "test-owner", null, null, "ok", "reminder sent", 5, 6);
 
@@ -2696,6 +2706,63 @@ test "postgres getJobsJson includes disabled jobs for management views" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
     try std.testing.expectEqualStrings("disabled-report", parsed.value.array.items[0].object.get("id").?.string);
     try std.testing.expectEqual(false, parsed.value.array.items[0].object.get("enabled").?.bool);
+}
+
+test "postgres replaceJobsJson scopes stored job ids per user while preserving raw ids" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+    try mgr.provisionUser(42, "/tmp/nullalis-zaki-bot-test-user-42/workspace");
+
+    const jobs_json = "[{\"id\":\"morning-brief\",\"expression\":\"0 8 * * *\",\"command\":\"daily_morning_brief\",\"job_type\":\"agent\"}]";
+    try mgr.replaceJobsJson(2, "agent:zaki-bot:user:2:main", jobs_json);
+    try mgr.replaceJobsJson(42, "agent:zaki-bot:user:42:main", jobs_json);
+
+    const user2_jobs = try mgr.getJobsJson(allocator, 2);
+    defer allocator.free(user2_jobs);
+    const user42_jobs = try mgr.getJobsJson(allocator, 42);
+    defer allocator.free(user42_jobs);
+
+    try std.testing.expect(std.mem.indexOf(u8, user2_jobs, "\"id\":\"morning-brief\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user42_jobs, "\"id\":\"morning-brief\"") != null);
+
+    const q = try mgr.buildQuery("SELECT id, user_id FROM {schema}.jobs ORDER BY user_id ASC");
+    defer allocator.free(q);
+    const result = try mgr.exec(q);
+    defer c.PQclear(result);
+
+    try std.testing.expectEqual(@as(c_int, 2), c.PQntuples(result));
+    const first_id = try dupeResultValue(allocator, result, 0, 0);
+    defer allocator.free(first_id);
+    const second_id = try dupeResultValue(allocator, result, 1, 0);
+    defer allocator.free(second_id);
+
+    try std.testing.expectEqualStrings("user:2:morning-brief", first_id);
+    try std.testing.expectEqualStrings("user:42:morning-brief", second_id);
 }
 
 test "postgres memory upsert recall list and forget stay user-scoped" {

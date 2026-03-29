@@ -129,7 +129,7 @@ test "cron_list_shows_paused" {
     defer scheduler.deinit();
 
     const job = try scheduler.addJob("0 * * * *", "echo paused_test");
-    try std.testing.expect(scheduler.pauseJob(job.id));
+    try std.testing.expectEqual(cron.JobPauseResumeResult.changed, scheduler.pauseJob(job.id));
 
     const jobs = scheduler.listJobs();
     try std.testing.expect(jobs.len == 1);

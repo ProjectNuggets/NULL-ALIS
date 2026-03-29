@@ -57,6 +57,7 @@ const WORKSPACE_TOOLS_TEMPLATE = @embedFile("workspace_templates/TOOLS.md");
 const WORKSPACE_IDENTITY_TEMPLATE = @embedFile("workspace_templates/IDENTITY.md");
 const WORKSPACE_USER_TEMPLATE = @embedFile("workspace_templates/USER.md");
 const WORKSPACE_HEARTBEAT_TEMPLATE = @embedFile("workspace_templates/HEARTBEAT.md");
+const WORKSPACE_AUTOMATIONS_TEMPLATE = @embedFile("workspace_templates/AUTOMATIONS.json");
 const WORKSPACE_BOOTSTRAP_TEMPLATE = @embedFile("workspace_templates/BOOTSTRAP.md");
 // ── Project context ──────────────────────────────────────────────
 
@@ -1696,10 +1697,15 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
     defer allocator.free(user_tmpl);
     try writeIfMissing(allocator, workspace_dir, "USER.md", user_tmpl);
 
-    // HEARTBEAT.md (periodic tasks — loaded by prompt.zig)
+    // HEARTBEAT.md (wake policy — loaded by prompt.zig)
     const heartbeat_tmpl = try heartbeatTemplate(allocator, ctx);
     defer allocator.free(heartbeat_tmpl);
     try writeIfMissing(allocator, workspace_dir, "HEARTBEAT.md", heartbeat_tmpl);
+
+    // AUTOMATIONS.json (desired durable automation registry)
+    const automations_tmpl = try automationTemplate(allocator, ctx);
+    defer allocator.free(automations_tmpl);
+    try writeIfMissing(allocator, workspace_dir, "AUTOMATIONS.json", automations_tmpl);
 
     // BOOTSTRAP.md lifecycle:
     // one-shot onboarding instructions with persisted state marker.
@@ -2103,30 +2109,27 @@ fn heartbeatTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) !
             return std.fmt.allocPrint(allocator,
                 \\# HEARTBEAT.md - {s}
                 \\
-                \\# Heartbeat is a wake/reconcile lane, not the exact-time scheduler.
-                \\# Declare durable scheduled automations in the Automation Policy block below.
+                \\# Heartbeat is a wake policy file, not the exact-time scheduler.
+                \\# Durable scheduled automations live in AUTOMATIONS.json and in the scheduler.
                 \\# A job does not exist unless `schedule` shows it.
                 \\
-                \\## Automation Policy
-                \\
-                \\```json
-                \\{{
-                \\  "jobs": []
-                \\}}
-                \\```
-                \\
-                \\# Add short policy notes below only when the user explicitly wants them.
+                \\# Add short wake policy notes below only when the user explicitly wants them.
                 \\
                 \\# Suggested categories:
-                \\# - morning brief
+                \\# - health checks for scheduled jobs
                 \\# - inbox or message triage after integrations are connected
                 \\# - project status follow-ups
-                \\# - reminders before deadlines
-                \\# - nightly summaries and next-step planning
+                \\# - stale integration warnings
+                \\# - drift or failure alerts
                 \\
             , .{ctx.agent_name});
         },
     }
+}
+
+fn automationTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
+    _ = ctx;
+    return allocator.dupe(u8, WORKSPACE_AUTOMATIONS_TEMPLATE);
 }
 
 fn bootstrapTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
@@ -2785,6 +2788,13 @@ test "heartbeatTemplate is non-empty" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "HEARTBEAT.md") != null);
 }
 
+test "automationTemplate is non-empty" {
+    const tmpl = try automationTemplate(std.testing.allocator, &ProjectContext{});
+    defer std.testing.allocator.free(tmpl);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"version\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"jobs\": []") != null);
+}
+
 test "bootstrapTemplate is non-empty" {
     const tmpl = try bootstrapTemplate(std.testing.allocator, &ProjectContext{});
     defer std.testing.allocator.free(tmpl);
@@ -2807,9 +2817,12 @@ test "zaki templates contain onboarding and proactive guidance" {
 
     const heartbeat = try heartbeatTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(heartbeat);
-    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "wake/reconcile lane") != null);
-    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "## Automation Policy") != null);
-    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "\"jobs\": []") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "wake policy file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "AUTOMATIONS.json") != null);
+
+    const automations = try automationTemplate(std.testing.allocator, &ctx);
+    defer std.testing.allocator.free(automations);
+    try std.testing.expect(std.mem.indexOf(u8, automations, "\"jobs\": []") != null);
 
     const bootstrap = try bootstrapTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(bootstrap);
@@ -2866,9 +2879,9 @@ test "scaffoldWorkspace creates all prompt.zig files" {
 
     // Verify all files that prompt.zig tries to load exist
     const files = [_][]const u8{
-        "MEMORY.md",    "SOUL.md",      "AGENTS.md",
-        "TOOLS.md",     "IDENTITY.md",  "USER.md",
-        "HEARTBEAT.md", "BOOTSTRAP.md",
+        "MEMORY.md",    "SOUL.md",          "AGENTS.md",
+        "TOOLS.md",     "IDENTITY.md",      "USER.md",
+        "HEARTBEAT.md", "AUTOMATIONS.json", "BOOTSTRAP.md",
     };
     for (files) |filename| {
         const file = tmp.dir.openFile(filename, .{}) catch |err| {

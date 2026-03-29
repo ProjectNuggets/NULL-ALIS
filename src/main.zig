@@ -560,11 +560,18 @@ fn runCronPostgres(
         }
         var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
         defer scheduler.deinit();
-        if (scheduler.pauseJob(args[0])) {
-            try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
-            std.debug.print("info(cron): Paused job {s}\n", .{args[0]});
-        } else {
-            std.debug.print("info(cron): Cron job '{s}' not found\n", .{args[0]});
+        switch (scheduler.pauseJob(args[0])) {
+            .changed => {
+                try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
+                std.debug.print("info(cron): Paused job {s}\n", .{args[0]});
+            },
+            .already_paused => {
+                std.debug.print("info(cron): Cron job {s} is already paused\n", .{args[0]});
+            },
+            .already_active => unreachable,
+            .not_found => {
+                std.debug.print("info(cron): Cron job '{s}' not found\n", .{args[0]});
+            },
         }
         return;
     }
@@ -576,11 +583,18 @@ fn runCronPostgres(
         }
         var scheduler = try loadCronSchedulerFromPostgres(allocator, cfg, user_id);
         defer scheduler.deinit();
-        if (scheduler.resumeJob(args[0])) {
-            try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
-            std.debug.print("info(cron): Resumed job {s}\n", .{args[0]});
-        } else {
-            std.debug.print("info(cron): Cron job '{s}' not found\n", .{args[0]});
+        switch (scheduler.resumeJob(args[0])) {
+            .changed => {
+                try saveCronSchedulerToPostgres(allocator, cfg, user_id, &scheduler);
+                std.debug.print("info(cron): Resumed job {s}\n", .{args[0]});
+            },
+            .already_active => {
+                std.debug.print("info(cron): Cron job {s} is already active\n", .{args[0]});
+            },
+            .already_paused => unreachable,
+            .not_found => {
+                std.debug.print("info(cron): Cron job '{s}' not found\n", .{args[0]});
+            },
         }
         return;
     }

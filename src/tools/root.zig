@@ -659,19 +659,19 @@ const BackgroundOriginPolicy = struct {
 
 fn backgroundPolicyForOrigin(origin: TurnOrigin) BackgroundOriginPolicy {
     return switch (origin) {
-        // Periodic autonomous lane; keep permissive for existing heartbeat remediation flows.
+        // Compatibility-only heartbeat lane; do not mutate durable automation.
         .heartbeat => .{
-            .allow_schedule_ensure = true,
+            .allow_schedule_ensure = false,
             .allow_composio_read_execute = true,
         },
-        // Explicit on-demand wake jobs should be able to read and self-repair.
+        // Wake/reconcile turns may inspect and repair canonical durable jobs.
         .wake => .{
             .allow_schedule_ensure = true,
             .allow_composio_read_execute = true,
         },
-        // User-visible autonomous delivery lane (briefs/reminders).
+        // User-visible delivery lane should execute existing jobs, not mutate schedule state.
         .proactive => .{
-            .allow_schedule_ensure = true,
+            .allow_schedule_ensure = false,
             .allow_composio_read_execute = true,
         },
         // Internal scheduler maintenance lane; keep conservative to avoid self-loop mutation.
@@ -707,7 +707,7 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
     if (std.mem.eql(u8, tool_name, schedule.ScheduleTool.tool_name)) {
         if (isReadOnlyScheduleAction(args)) return null;
         if (policy.allow_schedule_ensure and isEnsureScheduleAction(args)) return null;
-        return "Background turns may only inspect schedule state or use schedule ensure for canonical reconciliation";
+        return "Background turns may only inspect schedule state; only wake turns may use schedule ensure for canonical reconciliation";
     }
     if (std.mem.eql(u8, tool_name, file_read.FileReadTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, memory_recall.MemoryRecallTool.tool_name)) return null;
@@ -986,8 +986,8 @@ test "scheduler-origin maintenance blocks schedule writes" {
     try std.testing.expect(std.mem.indexOf(u8, blocked, "schedule ensure") != null);
 }
 
-test "proactive origin allows schedule ensure only" {
-    setTurnContext(.{ .origin = .proactive });
+test "wake origin allows schedule ensure only" {
+    setTurnContext(.{ .origin = .wake });
     defer clearTurnContext();
 
     const ensure_parsed = try parseTestArgs("{\"action\":\"ensure\",\"expression\":\"*/5 * * * *\",\"command\":\"echo hi\"}");
@@ -998,6 +998,16 @@ test "proactive origin allows schedule ensure only" {
     defer parsed.deinit();
     const blocked = toolBlockedForCurrentTurn("schedule", parsed.value.object) orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, blocked, "schedule ensure") != null);
+}
+
+test "proactive origin blocks schedule ensure" {
+    setTurnContext(.{ .origin = .proactive });
+    defer clearTurnContext();
+
+    const ensure_parsed = try parseTestArgs("{\"action\":\"ensure\",\"expression\":\"*/5 * * * *\",\"command\":\"echo hi\"}");
+    defer ensure_parsed.deinit();
+    const blocked = toolBlockedForCurrentTurn("schedule", ensure_parsed.value.object) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "wake turns") != null);
 }
 
 test "scheduler-origin maintenance allows composio read-only execute" {

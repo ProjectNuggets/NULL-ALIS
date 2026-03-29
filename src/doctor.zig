@@ -120,11 +120,13 @@ pub fn runDoctor(
     defer items.deinit(allocator);
     var snapshot = try runtime_truth.collectRuntimeSnapshot(allocator, config, user_id);
     defer snapshot.deinit(allocator);
+    const effective_workspace = try resolveEffectiveWorkspaceDir(allocator, config, user_id);
+    defer allocator.free(effective_workspace);
 
     // Core checks (matching ZeroClaw)
     const runtime_channel_connected = snapshot.telegram_connected != null and snapshot.telegram_connected.?;
     try checkConfigSemantics(allocator, config, runtime_channel_connected, &items);
-    try checkWorkspace(allocator, config, &items);
+    try checkWorkspace(allocator, effective_workspace, &items);
     try checkDaemonState(allocator, config, &items);
     try checkEnvironment(allocator, &items);
     try checkRuntimeSnapshot(allocator, &snapshot, &items);
@@ -166,6 +168,19 @@ pub fn runDoctor(
     if (err_count > 0) {
         try writer.writeAll("Run 'nullalis doctor --fix' or check your config.\n");
     }
+}
+
+fn resolveEffectiveWorkspaceDir(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    user_id: ?[]const u8,
+) ![]u8 {
+    if (user_id) |resolved_user_id| {
+        if (config.tenant.data_root.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}/{s}/workspace", .{ config.tenant.data_root, resolved_user_id });
+        }
+    }
+    return allocator.dupe(u8, config.workspace_dir);
 }
 
 /// Legacy entry point — uses stdout directly.
@@ -292,11 +307,11 @@ pub fn checkConfigSemantics(
 
 pub fn checkWorkspace(
     allocator: std.mem.Allocator,
-    config: *const Config,
+    workspace_dir: []const u8,
     items: *std.ArrayList(DiagItem),
 ) !void {
     const cat = "workspace";
-    const ws = config.workspace_dir;
+    const ws = workspace_dir;
 
     // Check directory exists
     if (std.fs.openDirAbsolute(ws, .{})) |dir| {
@@ -339,6 +354,8 @@ pub fn checkWorkspace(
     // Key workspace files
     checkFileExists(allocator, ws, "SOUL.md", cat, items) catch {};
     checkFileExists(allocator, ws, "AGENTS.md", cat, items) catch {};
+    checkFileExists(allocator, ws, "HEARTBEAT.md", cat, items) catch {};
+    checkFileExists(allocator, ws, "AUTOMATIONS.json", cat, items) catch {};
 }
 
 fn checkFileExists(
@@ -357,6 +374,10 @@ fn checkFileExists(
             try items.append(allocator, DiagItem.ok(cat, "SOUL.md present"));
         } else if (std.mem.eql(u8, name, "AGENTS.md")) {
             try items.append(allocator, DiagItem.ok(cat, "AGENTS.md present"));
+        } else if (std.mem.eql(u8, name, "HEARTBEAT.md")) {
+            try items.append(allocator, DiagItem.ok(cat, "HEARTBEAT.md present"));
+        } else if (std.mem.eql(u8, name, "AUTOMATIONS.json")) {
+            try items.append(allocator, DiagItem.ok(cat, "AUTOMATIONS.json present"));
         } else {
             try items.append(allocator, DiagItem.ok(cat, "file present"));
         }
@@ -365,6 +386,10 @@ fn checkFileExists(
             try items.append(allocator, DiagItem.warn(cat, "SOUL.md not found (optional)"));
         } else if (std.mem.eql(u8, name, "AGENTS.md")) {
             try items.append(allocator, DiagItem.warn(cat, "AGENTS.md not found (optional)"));
+        } else if (std.mem.eql(u8, name, "HEARTBEAT.md")) {
+            try items.append(allocator, DiagItem.warn(cat, "HEARTBEAT.md not found (optional)"));
+        } else if (std.mem.eql(u8, name, "AUTOMATIONS.json")) {
+            try items.append(allocator, DiagItem.warn(cat, "AUTOMATIONS.json not found (optional)"));
         } else {
             try items.append(allocator, DiagItem.warn(cat, "file not found (optional)"));
         }
@@ -1168,6 +1193,19 @@ test "DiagResult defaults" {
     const result = DiagResult{ .name = "test", .ok = true, .message = "all good" };
     try std.testing.expectEqualStrings("test", result.name);
     try std.testing.expect(result.ok);
+}
+
+test "resolveEffectiveWorkspaceDir prefers tenant workspace when user_id is provided" {
+    var cfg = testConfig();
+    cfg.tenant = .{
+        .enabled = true,
+        .data_root = "/tmp/nullclaw-users",
+    };
+
+    const resolved = try resolveEffectiveWorkspaceDir(std.testing.allocator, &cfg, "7");
+    defer std.testing.allocator.free(resolved);
+
+    try std.testing.expectEqualStrings("/tmp/nullclaw-users/7/workspace", resolved);
 }
 
 test "doctor module compiles" {}

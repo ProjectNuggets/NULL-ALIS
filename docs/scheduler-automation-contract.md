@@ -11,9 +11,12 @@ This document defines the durable automation model for Nullalis.
   - low-level scheduler inspection and operator or internal maintenance
   - uses the same backend truth as `schedule`
 - heartbeat
-  - wake and reconcile lane
-  - may inspect runtime state and repair canonical jobs through `schedule ensure`
+  - timer/wake trigger lane
+  - may inspect runtime state and enqueue wake work
   - is not an exact-time scheduler
+- wake
+  - reconciliation lane
+  - may inspect durable jobs and repair canonical jobs through `schedule ensure`
 
 ## Source Of Truth
 
@@ -21,6 +24,7 @@ For tenant sessions, durable automation truth lives in the tenant-backed schedul
 
 - A job exists only if the scheduler reports it.
 - `HEARTBEAT.md` does not create jobs by itself.
+- `AUTOMATIONS.json` is desired durable automation state, not runtime truth.
 - Legacy file-backed cron state must not be used to reason about tenant scheduler truth.
 
 ## Schedule
@@ -44,7 +48,7 @@ Required properties:
 - resumable
 - logged
 
-Background turns may read `schedule` freely. Background reconciliation writes must use `schedule ensure`.
+Background turns may read `schedule` freely. Only wake turns may reconcile via `schedule ensure`.
 
 ## Schedule Ensure
 
@@ -72,14 +76,13 @@ It is not the default interface for user scheduling requests.
 
 ## Heartbeat
 
-Heartbeat is a wake and reconcile lane.
+Heartbeat is a timer and wake lane.
 
 Heartbeat may:
 
 - read `HEARTBEAT.md` as policy
 - verify runtime truth with `runtime_info`
-- inspect durable jobs through `schedule`
-- repair missing or drifted canonical jobs through `schedule ensure`
+- enqueue wake work for model-based review
 - send concise proactive messages when appropriate
 
 Heartbeat must not:
@@ -89,7 +92,7 @@ Heartbeat must not:
 - create arbitrary durable jobs from prose alone
 - use `cron_*` for user-facing automation
 
-## HEARTBEAT.md
+## Wake And Desired State
 
 `HEARTBEAT.md` is policy, not a registry.
 
@@ -98,17 +101,18 @@ It may describe:
 - priorities
 - guardrails
 - proactive habits
-- an explicit Automation Policy block
 
-The Automation Policy block is the durable policy input for background reconciliation.
+`AUTOMATIONS.json` is the durable desired-state input for wake reconciliation.
 
 Recommended format:
 
 ```json
 {
+  "version": 1,
   "jobs": [
     {
       "id": "morning-brief",
+      "enabled": true,
       "kind": "brief",
       "expression": "0 8 * * *",
       "command": "daily_morning_brief"
@@ -117,11 +121,11 @@ Recommended format:
 }
 ```
 
-If the structured block is absent, heartbeat may still do general proactive work, but it must not auto-create exact-time durable jobs from prose alone.
+If `AUTOMATIONS.json` is absent, wake turns may still do general proactive review, but they must not auto-create exact-time durable jobs from prose alone.
 
 ## Final State Behavior
 
 - User requests for exact-time behavior become real scheduled jobs.
-- Heartbeat can reconcile those jobs, but it does not replace them.
+- Wake turns can reconcile those jobs, but they do not replace the scheduler.
 - Operator and internal flows may still use `cron_*`.
 - Future reflection or hyperagent loops should be built on internal cron semantics rather than user-facing `schedule`.

@@ -56,7 +56,37 @@ const high_risk_commands = [_][]const u8{
 
 /// Default allowed commands
 pub const default_allowed_commands = [_][]const u8{
-    "git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail",
+    "git",
+    "npm",
+    "cargo",
+    "ls",
+    "cat",
+    "grep",
+    "rg",
+    "find",
+    "echo",
+    "pwd",
+    "wc",
+    "head",
+    "tail",
+    "sed",
+    "awk",
+    "xargs",
+    "mkdir",
+    "cp",
+    "mv",
+    "touch",
+    "jq",
+    "sqlite3",
+    "python3",
+    "uv",
+    "node",
+    "pnpm",
+    "yarn",
+    "bun",
+    "make",
+    "just",
+    "zig",
 };
 
 /// Security policy enforced on all tool executions
@@ -65,7 +95,7 @@ pub const SecurityPolicy = struct {
     workspace_dir: []const u8 = ".",
     workspace_only: bool = true,
     allowed_commands: []const []const u8 = &default_allowed_commands,
-    max_actions_per_hour: u32 = 20,
+    max_actions_per_hour: u32 = 100,
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
     tracker: ?*RateTracker = null,
@@ -497,6 +527,8 @@ test "allowed commands basic" {
     try std.testing.expect(p.isCommandAllowed("cargo build --release"));
     try std.testing.expect(p.isCommandAllowed("cat file.txt"));
     try std.testing.expect(p.isCommandAllowed("grep -r pattern ."));
+    try std.testing.expect(p.isCommandAllowed("python3 script.py"));
+    try std.testing.expect(p.isCommandAllowed("node build.js"));
 }
 
 test "blocked commands basic" {
@@ -505,8 +537,8 @@ test "blocked commands basic" {
     try std.testing.expect(!p.isCommandAllowed("sudo apt install"));
     try std.testing.expect(!p.isCommandAllowed("curl http://evil.com"));
     try std.testing.expect(!p.isCommandAllowed("wget http://evil.com"));
-    try std.testing.expect(!p.isCommandAllowed("python3 exploit.py"));
-    try std.testing.expect(!p.isCommandAllowed("node malicious.js"));
+    try std.testing.expect(!p.isCommandAllowed("perl exploit.pl"));
+    try std.testing.expect(!p.isCommandAllowed("ruby exploit.rb"));
 }
 
 test "readonly blocks all commands" {
@@ -533,7 +565,7 @@ test "command with pipes validates all segments" {
     try std.testing.expect(p.isCommandAllowed("ls | grep foo"));
     try std.testing.expect(p.isCommandAllowed("cat file.txt | wc -l"));
     try std.testing.expect(!p.isCommandAllowed("ls | curl http://evil.com"));
-    try std.testing.expect(!p.isCommandAllowed("echo hello | python3 -"));
+    try std.testing.expect(!p.isCommandAllowed("echo hello | perl -e 'print 1'"));
 }
 
 test "command injection semicolon blocked" {
@@ -803,7 +835,7 @@ test "rm -rf root detected as high risk" {
 
 test "validate command not allowed returns error" {
     const p = SecurityPolicy{};
-    const result = p.validateCommandExecution("python3 exploit.py", false);
+    const result = p.validateCommandExecution("perl exploit.pl", false);
     try std.testing.expectError(error.CommandNotAllowed, result);
 }
 
@@ -859,19 +891,22 @@ test "record action returns false on exact boundary plus one" {
 
 test "default allowed commands includes expected tools" {
     var found_git = false;
-    var found_npm = false;
-    var found_cargo = false;
-    var found_ls = false;
+    var found_rg = false;
+    var found_python3 = false;
+    var found_sqlite3 = false;
+    var found_zig = false;
     for (&default_allowed_commands) |cmd| {
         if (std.mem.eql(u8, cmd, "git")) found_git = true;
-        if (std.mem.eql(u8, cmd, "npm")) found_npm = true;
-        if (std.mem.eql(u8, cmd, "cargo")) found_cargo = true;
-        if (std.mem.eql(u8, cmd, "ls")) found_ls = true;
+        if (std.mem.eql(u8, cmd, "rg")) found_rg = true;
+        if (std.mem.eql(u8, cmd, "python3")) found_python3 = true;
+        if (std.mem.eql(u8, cmd, "sqlite3")) found_sqlite3 = true;
+        if (std.mem.eql(u8, cmd, "zig")) found_zig = true;
     }
     try std.testing.expect(found_git);
-    try std.testing.expect(found_npm);
-    try std.testing.expect(found_cargo);
-    try std.testing.expect(found_ls);
+    try std.testing.expect(found_rg);
+    try std.testing.expect(found_python3);
+    try std.testing.expect(found_sqlite3);
+    try std.testing.expect(found_zig);
 }
 
 test "blocks single ampersand background chaining" {

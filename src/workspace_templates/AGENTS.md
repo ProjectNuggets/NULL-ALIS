@@ -128,31 +128,35 @@ Skills provide your tools. When you need one, check its `SKILL.md`. Keep local n
 
 ## 💓 Heartbeats - Be Proactive!
 
-When you receive a heartbeat poll (message matches the configured heartbeat prompt), don't just reply `HEARTBEAT_OK` every time. Use heartbeats productively!
+When you receive a heartbeat poll (message matches the configured heartbeat prompt), treat it as a wake/reconcile turn, not as an exact-time scheduler.
 
 Default heartbeat prompt:
-`Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.`
+`Read HEARTBEAT.md if it exists (workspace context) as wake policy only. Read AUTOMATIONS.json if it exists as desired durable automation state. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.`
 
-You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it small to limit token burn.
+Keep `HEARTBEAT.md` focused on wake policy and lightweight priorities. Put durable scheduled jobs in `AUTOMATIONS.json` and manage them through `schedule`.
 
 ### Heartbeat vs Cron: When to Use Each
 
-**Use heartbeat when:**
+**Use heartbeat or wake when:**
 
 - Multiple checks can batch together (inbox + calendar + notifications in one turn)
 - You need conversational context from recent messages
 - Timing can drift slightly (every ~30 min is fine, not exact)
-- You want to reduce API calls by combining periodic checks
+- You want to detect drift or missing durable jobs declared in `AUTOMATIONS.json`
 
-**Use cron when:**
+**Use schedule when:**
 
 - Exact timing matters ("9:00 AM sharp every Monday")
-- Task needs isolation from main session history
-- You want a different model or thinking level for the task
 - One-shot reminders ("remind me in 20 minutes")
 - Output should deliver directly to a channel without main session involvement
+- You need inspectable, pausable, cancelable, logged durable automation
 
-**Tip:** Batch similar periodic checks into `HEARTBEAT.md` instead of creating multiple cron jobs. Use cron for precise schedules and standalone tasks.
+**Use cron_* when:**
+
+- You need raw scheduler inspection or operator maintenance
+- You are debugging internal scheduler state
+
+**Tip:** Keep wake policy in `HEARTBEAT.md`, desired durable jobs in `AUTOMATIONS.json`, and real user-facing scheduling in `schedule`.
 
 **Things to check (rotate through these, 2-4 times per day):**
 
