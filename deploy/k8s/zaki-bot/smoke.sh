@@ -5,7 +5,7 @@ set -euo pipefail
 # Use SMOKE_MODE=app for internal-only smoke where nullalis has no public DNS.
 : "${SMOKE_MODE:=full}"
 
-: "${BASE_URL:?Set BASE_URL (internal: http://nullclaw.zaki-bot-staging.svc.cluster.local or port-forward)}"
+: "${BASE_URL:?Set BASE_URL (internal: http://nullclaw.zaki.svc.cluster.local:3000 or port-forward)}"
 : "${INTERNAL_TOKEN:?Set INTERNAL_TOKEN}"
 : "${USER_ID:?Set USER_ID}"
 
@@ -26,6 +26,7 @@ total_steps=9
 [[ "${SMOKE_MODE}" == "app" ]] && total_steps=5
 
 auth=(-H "X-Internal-Token: ${INTERNAL_TOKEN}")
+user_auth=(-H "X-Internal-Token: ${INTERNAL_TOKEN}" -H "X-Zaki-User-Id: ${USER_ID}")
 json=(-H "Content-Type: application/json")
 
 extract_host() {
@@ -115,12 +116,12 @@ if [[ -n "${EXPECT_SCHEDULER_BACKEND}" ]]; then
 fi
 
 echo "[2/${total_steps}] provision user"
-curl -fsS -X POST "${BASE_URL}/api/v1/users/provision" "${auth[@]}" "${json[@]}" \
+curl -fsS -X POST "${BASE_URL}/api/v1/users/provision" "${user_auth[@]}" "${json[@]}" \
   -d "{\"user_id\":\"${USER_ID}\"}" >/dev/null
 
-echo "[3/${total_steps}] set config/heartbeat/cron"
-curl -fsS -X PATCH "${BASE_URL}/api/v1/users/${USER_ID}/config" "${auth[@]}" "${json[@]}" \
-  -d '{"autonomy":{"enabled":true}}' >/dev/null
+echo "[3/${total_steps}] set settings/heartbeat/cron"
+curl -fsS -X PATCH "${BASE_URL}/api/v1/users/${USER_ID}/settings" "${auth[@]}" "${json[@]}" \
+  -d '{"assistant_mode":"balanced","proactive_updates":true,"voice_replies":false,"session_timeout_minutes":30}' >/dev/null
 
 curl -fsS -X PUT "${BASE_URL}/api/v1/users/${USER_ID}/heartbeat" "${auth[@]}" "${json[@]}" \
   -d '{"enabled":true,"interval_minutes":30}' >/dev/null

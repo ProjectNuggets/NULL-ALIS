@@ -12,6 +12,14 @@ Current validated baseline:
 - `scheduler_backend = "postgres"`
 - `degraded = false`
 
+Frozen ZAKI memory contract:
+- Postgres is the canonical durable source of truth.
+- Markdown is a projection and manual-edit mirror, not the canonical store.
+- Tenant runtime topology is `zaki_dual` in tenant+postgres mode.
+- pgvector is a derived index only.
+- pgvector must live in `zaki_bot.memory_embeddings`, never `public.memory_embeddings`.
+- pgvector rows must be keyed by `(user_id, key)` with `PRIMARY KEY (user_id, key)`.
+
 Related design note:
 - durable automation uses the contract in [scheduler-automation-contract.md](./scheduler-automation-contract.md)
 - `schedule` is the user-facing durable automation API
@@ -59,7 +67,16 @@ The deployed config file should contain non-secret settings only:
 - `tenant.data_root`
 - `state.backend: "postgres"`
 - `state.postgres.schema`
+- `memory.profile: "postgres_hybrid"`
+- `memory.backend: "postgres"`
+- `memory.search.store.kind: "pgvector"`
+- `memory.search.store.pgvector_schema: "zaki_bot"`
+- `memory.search.store.pgvector_table: "memory_embeddings"`
 - runtime pool / timeout knobs as needed
+
+For ZAKI production, omitting the pgvector schema or relying on the default schema is invalid.
+The rendered runtime config must explicitly encode the memory contract above so production cannot
+silently drift back to `public.memory_embeddings`.
 
 ## Required Secret/Env Inputs
 
@@ -110,6 +127,18 @@ For the cleaned-up production layout:
 Posture note:
 - current product posture is internal-service first
 - direct public Telegram webhook delivery to Nullalis is not the canonical deployment baseline in this document
+
+## Runtime Topology Notes
+
+Observed init logs that mention `backend=markdown` during memory initialization are not by
+themselves evidence of drift. Under the ZAKI contract, tenant runtime later promotes into the
+canonical `zaki_dual` topology where:
+
+- Postgres remains canonical for durable state
+- markdown remains the editable projection surface for files like `SOUL.md`
+- pgvector remains the derived retrieval index in `zaki_bot.memory_embeddings`
+
+Any production behavior that writes active pgvector rows into `public.memory_embeddings` is drift.
 
 ## Production Promotion
 
