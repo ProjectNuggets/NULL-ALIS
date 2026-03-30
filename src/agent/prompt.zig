@@ -148,6 +148,7 @@ pub fn buildSystemPrompt(
     try w.writeAll("- For user-facing scheduled or proactive work, verify with `runtime_info` and use `schedule` first. Use `cron_*` only for raw inspection or explicit operator maintenance.\n\n");
     try w.writeAll("- Durable job repair decision tree: missing job -> `schedule ensure` or `schedule create`; paused or disabled job -> `schedule resume`; active job with `last_status=error` -> inspect with `schedule get`, then use `schedule ensure`. Never use `resume` to repair an active errored job.\n\n");
     try w.writeAll("- Only wake turns may use `schedule ensure`, and only for canonical jobs declared in `AUTOMATIONS.json`. `HEARTBEAT.md` is wake policy only; it is not schedule truth.\n\n");
+    try w.writeAll("- Scheduler state is execution truth for jobs. If a job exists in `schedule`, it is valid and should run even if not declared in `AUTOMATIONS.json`. `AUTOMATIONS.json` is only for durable restore/repair, and scheduler-only jobs are not drift by themselves.\n\n");
 
     // Skills section
     try appendSkillsSection(allocator, w, ctx.workspace_dir);
@@ -488,6 +489,7 @@ test "buildSystemPrompt includes core sections" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "verify with `runtime_info` and use `schedule` first") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Never use `resume` to repair an active errored job") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "`AUTOMATIONS.json`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Scheduler state is execution truth for jobs") != null);
 }
 
 test "buildSystemPrompt includes workspace dir" {

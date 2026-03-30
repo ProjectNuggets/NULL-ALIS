@@ -204,9 +204,10 @@ fn sendGatewayControlCommand(host: []const u8, port: u16, path: []const u8, inte
 
 const HEARTBEAT_PROMPT_DEFAULT =
     "Read HEARTBEAT.md if it exists (workspace context) and treat it as wake policy only, not as proof that jobs already exist. " ++
-    "If AUTOMATIONS.json exists, treat it as desired durable automation state for canonical scheduled jobs. " ++
-    "Heartbeat is a wake trigger, not the exact-time scheduler. Use runtime_info first, then inspect durable jobs with schedule. " ++
+    "If AUTOMATIONS.json exists, treat it as desired durable automation state for canonical scheduled jobs, not as the execution truth for all jobs. " ++
+    "Heartbeat is a wake trigger, not the exact-time scheduler. Scheduler state is execution truth: if a job exists in schedule, it is valid and should run even if not declared in AUTOMATIONS.json. Use runtime_info first, then inspect durable jobs with schedule. " ++
     "Wake turns may reconcile only canonical jobs declared in AUTOMATIONS.json by using schedule ensure. " ++
+    "Do not report scheduler-only jobs as drift. Drift means a job declared in AUTOMATIONS.json is missing, broken, unexpectedly paused, or in error. " ++
     "Do not create durable scheduled jobs from free-form prose. Resume is not a repair action for jobs in error state. " ++
     "Do not use heartbeat polling itself as exact-time scheduling. " ++
     "Do not use cron_* for user-facing automation. Do not use shell, composio, message, or exploratory discovery. " ++
@@ -3589,6 +3590,11 @@ test "default heartbeat templates are treated as effectively empty" {
         \\
         \\Keep only tasks the user actually wants automated.
     ));
+}
+
+test "heartbeat prompt treats scheduler as execution truth" {
+    try std.testing.expect(std.mem.indexOf(u8, HEARTBEAT_PROMPT_DEFAULT, "Scheduler state is execution truth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, HEARTBEAT_PROMPT_DEFAULT, "Do not report scheduler-only jobs as drift") != null);
 }
 
 test "commandLooksMorningBrief ignores generic heartbeat commands" {

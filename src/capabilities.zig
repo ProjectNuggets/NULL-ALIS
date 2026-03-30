@@ -384,6 +384,8 @@ pub fn buildSummaryText(
             "  paused or disabled durable job: use `schedule resume`\n" ++
             "  active durable job with last_status=error: inspect with `schedule get`, then use `schedule ensure`; never use `resume` as repair\n" ++
             "  only wake turns may use `schedule ensure`, and only for jobs declared in `AUTOMATIONS.json`; `HEARTBEAT.md` is wake policy only\n" ++
+            "  scheduler state is execution truth; jobs that exist in schedule are valid and should run even if not declared in `AUTOMATIONS.json`\n" ++
+            "  do not treat scheduler-only jobs as drift; drift only applies to declared jobs that are missing, broken, paused unexpectedly, or errored\n" ++
             "\nNot available in this runtime:\n" ++
             "  channels (disabled in build): {s}\n" ++
             "  memory engines (disabled in build): {s}\n" ++
@@ -461,6 +463,8 @@ pub fn buildPromptSection(
             "- Paused or disabled durable job: use `schedule resume`.\n" ++
             "- Active durable job with `last_status=error`: inspect with `schedule get`, then use `schedule ensure`; never use `resume` as repair.\n" ++
             "- Only wake turns may use `schedule ensure`, and only for jobs declared in `AUTOMATIONS.json`. `HEARTBEAT.md` is wake policy only.\n\n" ++
+            "- Scheduler state is execution truth; jobs that exist in `schedule` are valid and should run even if not declared in `AUTOMATIONS.json`.\n" ++
+            "- Do not treat scheduler-only jobs as drift; drift applies only to declared jobs that are missing, broken, paused unexpectedly, or errored.\n\n" ++
             "### Not available in this runtime\n" ++
             "- Channels disabled in build: {s}\n" ++
             "- Memory backends disabled in build: {s}\n" ++
@@ -496,6 +500,7 @@ test "buildSummaryText includes availability sections" {
     try std.testing.expect(std.mem.indexOf(u8, summary, "Not available in this runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "use `schedule` for user-facing reminders") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "AUTOMATIONS.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "scheduler state is execution truth") != null);
 }
 
 test "buildManifestJson estimated tools align with runtime naming" {
