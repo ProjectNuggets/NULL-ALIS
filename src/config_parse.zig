@@ -992,6 +992,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             if (store.get("qdrant_api_key")) |v| if (v == .string) {
                                 self.memory.search.store.qdrant_api_key = try self.allocator.dupe(u8, v.string);
                             };
+                            if (store.get("pgvector_schema")) |v| if (v == .string) {
+                                self.memory.search.store.pgvector_schema = try self.allocator.dupe(u8, v.string);
+                            };
                             if (store.get("pgvector_table")) |v| if (v == .string) {
                                 self.memory.search.store.pgvector_table = try self.allocator.dupe(u8, v.string);
                             };

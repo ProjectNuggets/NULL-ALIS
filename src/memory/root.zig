@@ -1506,6 +1506,10 @@ pub fn initRuntimeWithOptions(
                 };
                 const pgvs = store_pgvector.PgvectorVectorStore.init(allocator, .{
                     .connection_url = pg_url,
+                    .schema_name = if (config.search.store.pgvector_schema.len > 0)
+                        config.search.store.pgvector_schema
+                    else
+                        config.postgres.schema,
                     .table_name = config.search.store.pgvector_table,
                     .dimensions = config.search.dimensions,
                     .pool_max = config.postgres.pool_max,

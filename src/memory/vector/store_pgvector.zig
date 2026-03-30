@@ -33,20 +33,33 @@ const c = if (build_options.enable_postgres) @cImport({
 
 pub const PgvectorConfig = struct {
     connection_url: []const u8,
+    schema_name: []const u8 = "public",
     table_name: []const u8 = "memory_vectors",
     dimensions: u32,
     pool_max: u32 = 4,
     acquire_timeout_ms: u32 = 1_500,
 };
 
-/// Validate that a table name is a safe SQL identifier (alphanumeric + underscore, 1-63 chars).
-/// Prevents SQL injection via user-controlled table names.
-fn validateTableName(name: []const u8) !void {
+/// Validate that a schema or table name is a safe SQL identifier.
+fn validateIdentifier(name: []const u8) !void {
     if (name.len == 0 or name.len > 63) return error.InvalidTableName;
     for (name) |ch| {
         if (!std.ascii.isAlphanumeric(ch) and ch != '_') return error.InvalidTableName;
     }
     if (std.ascii.isDigit(name[0])) return error.InvalidTableName;
+}
+
+fn quoteIdentifier(allocator: Allocator, name: []const u8) ![]u8 {
+    try validateIdentifier(name);
+    return std.fmt.allocPrint(allocator, "\"{s}\"", .{name});
+}
+
+fn buildQualifiedTableName(allocator: Allocator, schema_name: []const u8, table_name: []const u8) ![]u8 {
+    const schema_q = try quoteIdentifier(allocator, schema_name);
+    defer allocator.free(schema_q);
+    const table_q = try quoteIdentifier(allocator, table_name);
+    defer allocator.free(table_q);
+    return std.fmt.allocPrint(allocator, "{s}.{s}", .{ schema_q, table_q });
 }
 
 // ── PgvectorVectorStore ───────────────────────────────────────────
@@ -74,7 +87,9 @@ pub const PoolDebugSnapshot = struct {
 pub const PgvectorVectorStore = struct {
     allocator: Allocator,
     connection_url: []const u8,
+    schema_name: []const u8,
     table_name: []const u8,
+    qualified_table_name: []const u8,
     dimensions: u32,
     owns_self: bool = false,
 
@@ -90,20 +105,27 @@ pub const PgvectorVectorStore = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator, config: PgvectorConfig) !*Self {
-        try validateTableName(config.table_name);
+        try validateIdentifier(config.schema_name);
+        try validateIdentifier(config.table_name);
 
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
         const owned_url = try allocator.dupe(u8, config.connection_url);
         errdefer allocator.free(owned_url);
+        const owned_schema = try allocator.dupe(u8, config.schema_name);
+        errdefer allocator.free(owned_schema);
         const owned_table = try allocator.dupe(u8, config.table_name);
         errdefer allocator.free(owned_table);
+        const owned_qualified = try buildQualifiedTableName(allocator, config.schema_name, config.table_name);
+        errdefer allocator.free(owned_qualified);
 
         self.* = .{
             .allocator = allocator,
             .connection_url = owned_url,
+            .schema_name = owned_schema,
             .table_name = owned_table,
+            .qualified_table_name = owned_qualified,
             .dimensions = config.dimensions,
             .owns_self = true,
             .pool_entries = if (build_options.enable_postgres) .empty else {},
@@ -130,7 +152,9 @@ pub const PgvectorVectorStore = struct {
             self.pool_entries.deinit(self.allocator);
         }
         alloc.free(self.connection_url);
+        alloc.free(self.schema_name);
         alloc.free(self.table_name);
+        alloc.free(self.qualified_table_name);
         if (self.owns_self) alloc.destroy(self);
     }
 
@@ -337,6 +361,24 @@ pub const PgvectorVectorStore = struct {
             }
         }
 
+        {
+            const schema_sql_plain = try std.fmt.allocPrint(self.allocator, "CREATE SCHEMA IF NOT EXISTS \"{s}\"", .{self.schema_name});
+            defer self.allocator.free(schema_sql_plain);
+            const schema_sql = try self.allocator.dupeZ(u8, schema_sql_plain);
+            defer self.allocator.free(schema_sql);
+            const result = c.PQexec(conn, schema_sql.ptr) orelse {
+                conn_healthy = false;
+                return error.PgSchemaFailed;
+            };
+            defer c.PQclear(result);
+            const status = c.PQresultStatus(result);
+            if (status != c.PGRES_COMMAND_OK) {
+                if (c.PQstatus(conn) != c.CONNECTION_OK) conn_healthy = false;
+                log.warn("pgvector schema ensure failed: {s}", .{pqErrorMessage(conn, result)});
+                return error.PgSchemaFailed;
+            }
+        }
+
         if (try self.hasLegacySchema(conn)) {
             try self.resetLegacyTable(conn);
         }
@@ -349,7 +391,7 @@ pub const PgvectorVectorStore = struct {
                     "pgvector dimension mismatch for table '{s}': existing={d} expected={d}; rebuilding vector table",
                     .{ self.table_name, existing_dims, self.dimensions },
                 );
-                const drop_sql_plain = try std.fmt.allocPrint(self.allocator, "DROP TABLE IF EXISTS {s}", .{self.table_name});
+                const drop_sql_plain = try std.fmt.allocPrint(self.allocator, "DROP TABLE IF EXISTS {s}", .{self.qualified_table_name});
                 defer self.allocator.free(drop_sql_plain);
                 const drop_sql = try self.allocator.dupeZ(u8, drop_sql_plain);
                 defer self.allocator.free(drop_sql);
@@ -377,7 +419,7 @@ pub const PgvectorVectorStore = struct {
             \\  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             \\  PRIMARY KEY (user_id, key)
             \\)
-        , .{ self.table_name, self.dimensions });
+        , .{ self.qualified_table_name, self.dimensions });
         defer self.allocator.free(create_sql_plain);
         const create_sql = try self.allocator.dupeZ(u8, create_sql_plain);
         defer self.allocator.free(create_sql);
@@ -390,7 +432,11 @@ pub const PgvectorVectorStore = struct {
             return error.PgSchemaFailed;
         }
 
-        const user_idx_plain = try std.fmt.allocPrint(self.allocator, "CREATE INDEX IF NOT EXISTS {s}_user_id_idx ON {s}(user_id)", .{ self.table_name, self.table_name });
+        const user_idx_plain = try std.fmt.allocPrint(
+            self.allocator,
+            "CREATE INDEX IF NOT EXISTS \"{s}_user_id_idx\" ON {s}(user_id)",
+            .{ self.table_name, self.qualified_table_name },
+        );
         defer self.allocator.free(user_idx_plain);
         const user_idx = try self.allocator.dupeZ(u8, user_idx_plain);
         defer self.allocator.free(user_idx);
@@ -405,11 +451,13 @@ pub const PgvectorVectorStore = struct {
     fn hasLegacySchema(self: *Self, conn: *c.PGconn) !bool {
         const table_z = try self.allocator.dupeZ(u8, self.table_name);
         defer self.allocator.free(table_z);
+        const schema_z = try self.allocator.dupeZ(u8, self.schema_name);
+        defer self.allocator.free(schema_z);
         const sql =
             "SELECT 1 FROM information_schema.columns " ++
-            "WHERE table_schema = current_schema() AND table_name = $1 AND column_name = 'user_id' LIMIT 1";
-        const params = [_][*c]const u8{table_z.ptr};
-        const result = c.PQexecParams(conn, sql, 1, null, &params, null, null, 0) orelse return error.PgQueryFailed;
+            "WHERE table_schema = $1 AND table_name = $2 AND column_name = 'user_id' LIMIT 1";
+        const params = [_][*c]const u8{ schema_z.ptr, table_z.ptr };
+        const result = c.PQexecParams(conn, sql, 2, null, &params, null, null, 0) orelse return error.PgQueryFailed;
         defer c.PQclear(result);
         if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) return error.PgQueryFailed;
         return c.PQntuples(result) == 0 and try self.tableExists(conn);
@@ -418,18 +466,20 @@ pub const PgvectorVectorStore = struct {
     fn tableExists(self: *Self, conn: *c.PGconn) !bool {
         const table_z = try self.allocator.dupeZ(u8, self.table_name);
         defer self.allocator.free(table_z);
+        const schema_z = try self.allocator.dupeZ(u8, self.schema_name);
+        defer self.allocator.free(schema_z);
         const sql =
             "SELECT 1 FROM information_schema.tables " ++
-            "WHERE table_schema = current_schema() AND table_name = $1 LIMIT 1";
-        const params = [_][*c]const u8{table_z.ptr};
-        const result = c.PQexecParams(conn, sql, 1, null, &params, null, null, 0) orelse return error.PgQueryFailed;
+            "WHERE table_schema = $1 AND table_name = $2 LIMIT 1";
+        const params = [_][*c]const u8{ schema_z.ptr, table_z.ptr };
+        const result = c.PQexecParams(conn, sql, 2, null, &params, null, null, 0) orelse return error.PgQueryFailed;
         defer c.PQclear(result);
         if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) return error.PgQueryFailed;
         return c.PQntuples(result) > 0;
     }
 
     fn resetLegacyTable(self: *Self, conn: *c.PGconn) !void {
-        const drop_sql_plain = try std.fmt.allocPrint(self.allocator, "DROP TABLE IF EXISTS {s}", .{self.table_name});
+        const drop_sql_plain = try std.fmt.allocPrint(self.allocator, "DROP TABLE IF EXISTS {s}", .{self.qualified_table_name});
         defer self.allocator.free(drop_sql_plain);
         const drop_sql = try self.allocator.dupeZ(u8, drop_sql_plain);
         defer self.allocator.free(drop_sql);
@@ -444,15 +494,17 @@ pub const PgvectorVectorStore = struct {
     fn readEmbeddingDimensions(self: *Self, conn: *c.PGconn) !?u32 {
         const table_z = try self.allocator.dupeZ(u8, self.table_name);
         defer self.allocator.free(table_z);
+        const schema_z = try self.allocator.dupeZ(u8, self.schema_name);
+        defer self.allocator.free(schema_z);
         const sql =
             "SELECT a.atttypmod FROM pg_attribute a " ++
             "JOIN pg_class c ON c.oid = a.attrelid " ++
             "JOIN pg_namespace n ON n.oid = c.relnamespace " ++
             "WHERE c.relname = $1 AND a.attname = 'embedding' " ++
-            "AND a.attnum > 0 AND NOT a.attisdropped " ++
-            "ORDER BY (n.nspname = current_schema()) DESC LIMIT 1";
-        const params = [_][*c]const u8{table_z.ptr};
-        const result = c.PQexecParams(conn, sql, 1, null, &params, null, null, 0) orelse return error.PgQueryFailed;
+            "AND n.nspname = $2 AND a.attnum > 0 AND NOT a.attisdropped " ++
+            "LIMIT 1";
+        const params = [_][*c]const u8{ table_z.ptr, schema_z.ptr };
+        const result = c.PQexecParams(conn, sql, 2, null, &params, null, null, 0) orelse return error.PgQueryFailed;
         defer c.PQclear(result);
         if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
             log.warn("pgvector dimension query failed: {s}", .{pqErrorMessage(conn, result)});
@@ -528,7 +580,7 @@ pub const PgvectorVectorStore = struct {
             alloc,
             "INSERT INTO {s} (user_id, key, embedding, updated_at) VALUES ($1::bigint, $2, $3::vector, now()) " ++
                 "ON CONFLICT (user_id, key) DO UPDATE SET embedding = $3::vector, updated_at = now()",
-            .{self.table_name},
+            .{self.qualified_table_name},
         );
         defer alloc.free(sql_plain);
         const sql = try alloc.dupeZ(u8, sql_plain);
@@ -573,7 +625,7 @@ pub const PgvectorVectorStore = struct {
             alloc,
             "SELECT key, 1 - (embedding <=> $1::vector) AS similarity " ++
                 "FROM {s} WHERE user_id = $2::bigint ORDER BY embedding <=> $1::vector LIMIT $3::int",
-            .{self.table_name},
+            .{self.qualified_table_name},
         );
         defer alloc.free(sql_plain);
         const sql = try alloc.dupeZ(u8, sql_plain);
@@ -638,7 +690,7 @@ pub const PgvectorVectorStore = struct {
         var user_buf: [32]u8 = undefined;
         const user_str = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
 
-        const sql_plain = try std.fmt.allocPrint(alloc, "DELETE FROM {s} WHERE user_id = $1::bigint AND key = $2", .{self.table_name});
+        const sql_plain = try std.fmt.allocPrint(alloc, "DELETE FROM {s} WHERE user_id = $1::bigint AND key = $2", .{self.qualified_table_name});
         defer alloc.free(sql_plain);
         const sql = try alloc.dupeZ(u8, sql_plain);
         defer alloc.free(sql);
@@ -667,7 +719,7 @@ pub const PgvectorVectorStore = struct {
         defer self.releaseConn(&lease, conn_healthy);
         const conn = lease.conn;
 
-        const sql_plain = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.table_name});
+        const sql_plain = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.qualified_table_name});
         defer self.allocator.free(sql_plain);
         const sql = try self.allocator.dupeZ(u8, sql_plain);
         defer self.allocator.free(sql);
@@ -742,7 +794,7 @@ pub const PgvectorVectorStore = struct {
         }
 
         const entry_count: ?usize = blk: {
-            const count_sql_plain = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.table_name});
+            const count_sql_plain = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.qualified_table_name});
             defer self.allocator.free(count_sql_plain);
             const count_sql = try self.allocator.dupeZ(u8, count_sql_plain);
             defer self.allocator.free(count_sql);
@@ -829,10 +881,27 @@ test "PgvectorVectorStore init and deinit without postgres" {
         .dimensions = 768,
     });
     try std.testing.expectEqualStrings("postgresql://localhost/test", self.connection_url);
+    try std.testing.expectEqualStrings("public", self.schema_name);
     try std.testing.expectEqualStrings("memory_vectors", self.table_name);
+    try std.testing.expectEqualStrings("\"public\".\"memory_vectors\"", self.qualified_table_name);
     try std.testing.expectEqual(@as(u32, 768), self.dimensions);
     try std.testing.expectEqual(@as(u32, 4), self.pool_max);
     self.deinit();
+}
+
+test "PgvectorVectorStore keeps custom schema in qualified table name" {
+    if (build_options.enable_postgres) return;
+    const self = try PgvectorVectorStore.init(std.testing.allocator, .{
+        .connection_url = "postgresql://localhost/test",
+        .schema_name = "zaki_bot",
+        .table_name = "memory_embeddings",
+        .dimensions = 768,
+    });
+    defer self.deinit();
+
+    try std.testing.expectEqualStrings("zaki_bot", self.schema_name);
+    try std.testing.expectEqualStrings("memory_embeddings", self.table_name);
+    try std.testing.expectEqualStrings("\"zaki_bot\".\"memory_embeddings\"", self.qualified_table_name);
 }
 
 test "PgvectorVectorStore produces valid VectorStore vtable" {
@@ -851,21 +920,32 @@ test "PgvectorVectorStore produces valid VectorStore vtable" {
     s.deinitStore();
 }
 
-test "validateTableName rejects SQL injection" {
-    try validateTableName("memory_vectors");
-    try validateTableName("my_table_123");
-    try std.testing.expectError(error.InvalidTableName, validateTableName("memory_vectors; DROP TABLE users;--"));
-    try std.testing.expectError(error.InvalidTableName, validateTableName("table name"));
-    try std.testing.expectError(error.InvalidTableName, validateTableName(""));
-    try std.testing.expectError(error.InvalidTableName, validateTableName("123starts_with_digit"));
-    try std.testing.expectError(error.InvalidTableName, validateTableName("has.dot"));
-    try std.testing.expectError(error.InvalidTableName, validateTableName("has-hyphen"));
+test "validateIdentifier rejects SQL injection" {
+    try validateIdentifier("memory_vectors");
+    try validateIdentifier("my_table_123");
+    try validateIdentifier("zaki_bot");
+    try std.testing.expectError(error.InvalidTableName, validateIdentifier("memory_vectors; DROP TABLE users;--"));
+    try std.testing.expectError(error.InvalidTableName, validateIdentifier("table name"));
+    try std.testing.expectError(error.InvalidTableName, validateIdentifier(""));
+    try std.testing.expectError(error.InvalidTableName, validateIdentifier("123starts_with_digit"));
+    try std.testing.expectError(error.InvalidTableName, validateIdentifier("has.dot"));
+    try std.testing.expectError(error.InvalidTableName, validateIdentifier("has-hyphen"));
 }
 
 test "PgvectorVectorStore init rejects bad table name" {
     const result = PgvectorVectorStore.init(std.testing.allocator, .{
         .connection_url = "postgresql://localhost/test",
         .table_name = "bad; DROP TABLE users;--",
+        .dimensions = 768,
+    });
+    try std.testing.expectError(error.InvalidTableName, result);
+}
+
+test "PgvectorVectorStore init rejects bad schema name" {
+    const result = PgvectorVectorStore.init(std.testing.allocator, .{
+        .connection_url = "postgresql://localhost/test",
+        .schema_name = "bad.schema",
+        .table_name = "memory_vectors",
         .dimensions = 768,
     });
     try std.testing.expectError(error.InvalidTableName, result);
@@ -913,6 +993,7 @@ fn initPostgresTestStoreWithPool(allocator: Allocator, pool_max: u32, acquire_ti
 
     return PgvectorVectorStore.init(allocator, .{
         .connection_url = test_url,
+        .schema_name = "public",
         .table_name = table_name,
         .dimensions = 8,
         .pool_max = pool_max,
@@ -926,7 +1007,7 @@ fn dropPostgresTestTable(self: *PgvectorVectorStore) void {
     var conn_healthy = true;
     defer self.releaseConn(&lease, conn_healthy);
 
-    const sql_plain = std.fmt.allocPrint(self.allocator, "DROP TABLE IF EXISTS {s}", .{self.table_name}) catch return;
+    const sql_plain = std.fmt.allocPrint(self.allocator, "DROP TABLE IF EXISTS {s}", .{self.qualified_table_name}) catch return;
     defer self.allocator.free(sql_plain);
     const sql = self.allocator.dupeZ(u8, sql_plain) catch return;
     defer self.allocator.free(sql);
@@ -1071,7 +1152,9 @@ test "pgvector_pool_releases_on_query_error" {
     }
     const iface = self.store();
     const original_table = self.table_name;
-    self.table_name = "invalid table";
+    const original_qualified = self.qualified_table_name;
+    self.table_name = "missing_table";
+    self.qualified_table_name = "\"public\".\"missing_table\"";
 
     if (iface.count()) |_| {
         return error.TestExpectedError;
@@ -1084,6 +1167,7 @@ test "pgvector_pool_releases_on_query_error" {
     try std.testing.expect(after_error.open_conns <= after_error.pool_max);
 
     self.table_name = original_table;
+    self.qualified_table_name = original_qualified;
     _ = try iface.count();
     const after_recovery = self.debugPoolSnapshot();
     try std.testing.expectEqual(@as(u32, 0), after_recovery.in_use);

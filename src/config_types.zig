@@ -723,6 +723,7 @@ pub const MemoryVectorStoreConfig = struct {
     qdrant_url: []const u8 = "",
     qdrant_api_key: []const u8 = "",
     qdrant_collection: []const u8 = "nullalis_memories",
+    pgvector_schema: []const u8 = "",
     pgvector_table: []const u8 = "memory_embeddings",
 };
 

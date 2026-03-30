@@ -1500,6 +1500,10 @@ fn cleanupTestMemoryKeys(allocator: std.mem.Allocator, cfg: *yc.config.Config) !
     if (cfg.state.postgres.connection_string.len > 0) {
         vector_store = yc.memory.store_pgvector.PgvectorVectorStore.init(allocator, .{
             .connection_url = cfg.state.postgres.connection_string,
+            .schema_name = if (cfg.memory.search.store.pgvector_schema.len > 0)
+                cfg.memory.search.store.pgvector_schema
+            else
+                cfg.state.postgres.schema,
             .table_name = cfg.memory.search.store.pgvector_table,
             .dimensions = 1024,
         }) catch |err| blk: {
