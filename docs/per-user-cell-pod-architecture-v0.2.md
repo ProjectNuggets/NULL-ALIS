@@ -10,6 +10,9 @@ Give each active user a real Kubernetes-backed execution boundary that feels lik
 
 This document is the cleaned-up `v0.2` version of the external full-design draft. It keeps the strong parts of that proposal and corrects the parts that were too optimistic, too heavy, or out of alignment with current repo truth.
 
+Companion planning doc:
+1. [Per-User Cell Pod Delivery Plan v0.2](./per-user-cell-pod-delivery-plan-v0.2.md)
+
 ## Core Decision
 
 Hosted `v0.2` target:
