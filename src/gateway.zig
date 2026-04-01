@@ -4167,6 +4167,18 @@ fn normalizeTenantOwnershipLockConfig(cfg: config_types.TenantConfig) TenantOwne
     return out;
 }
 
+fn normalizedLocalAgentMemoryConfig(cfg: *const Config) config_types.MemoryConfig {
+    var memory_cfg = cfg.memory;
+    if (cfg.tenant.enabled and std.mem.eql(u8, cfg.state.backend, "postgres")) {
+        // In hosted tenant mode, canonical memory lives in ZAKI Postgres tables and is
+        // wrapped by zaki_dual later. The generic Postgres memory engine targets a
+        // different schema, so the shared gateway bootstrap must start from the
+        // markdown leg just like tenant runtime init does.
+        memory_cfg.backend = "markdown";
+    }
+    return memory_cfg;
+}
+
 fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
     const transport_stats = http_util.transport_stats_snapshot();
     const requests_total = state.requests_total.load(.monotonic);
@@ -9454,9 +9466,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             if (provider_bundle_opt) |*bundle| {
                 const provider_i: providers.Provider = bundle.provider();
                 const resolved_api_key = bundle.primaryApiKey();
+                const memory_cfg = normalizedLocalAgentMemoryConfig(cfg);
 
                 // Optional memory backend.
-                mem_rt = memory_mod.initRuntimeWithOptions(allocator, &cfg.memory, cfg.workspace_dir, .{
+                mem_rt = memory_mod.initRuntimeWithOptions(allocator, &memory_cfg, cfg.workspace_dir, .{
                     .providers = cfg.providers,
                     .search_api_key_override = resolved_api_key,
                 });
@@ -10881,6 +10894,47 @@ test "tenant_lock_config_clamps_invalid_values" {
     try std.testing.expectEqual(@as(u32, TENANT_OWNERSHIP_LOCK_WAIT_MS_MAX), normalized.wait_ms);
     try std.testing.expectEqual(@as(u32, TENANT_OWNERSHIP_LOCK_RETRY_MS_MIN), normalized.retry_min_ms);
     try std.testing.expectEqual(@as(u32, TENANT_OWNERSHIP_LOCK_RETRY_MS_MAX), normalized.retry_max_ms);
+}
+
+test "normalizedLocalAgentMemoryConfig remaps tenant postgres memory to markdown" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullalis-test",
+        .config_path = "/tmp/nullalis-test/config.json",
+        .memory = .{
+            .backend = "postgres",
+        },
+        .tenant = .{
+            .enabled = true,
+        },
+        .state = .{
+            .backend = "postgres",
+        },
+        .allocator = std.testing.allocator,
+    };
+
+    const normalized = normalizedLocalAgentMemoryConfig(&cfg);
+    try std.testing.expectEqualStrings("markdown", normalized.backend);
+    try std.testing.expectEqualStrings("postgres", cfg.memory.backend);
+}
+
+test "normalizedLocalAgentMemoryConfig preserves non-tenant postgres backend" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullalis-test",
+        .config_path = "/tmp/nullalis-test/config.json",
+        .memory = .{
+            .backend = "postgres",
+        },
+        .tenant = .{
+            .enabled = false,
+        },
+        .state = .{
+            .backend = "postgres",
+        },
+        .allocator = std.testing.allocator,
+    };
+
+    const normalized = normalizedLocalAgentMemoryConfig(&cfg);
+    try std.testing.expectEqualStrings("postgres", normalized.backend);
 }
 
 test "handleApiRoute settings endpoint derives from legacy config and config GET normalizes overlay" {
