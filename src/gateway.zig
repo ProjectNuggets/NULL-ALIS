@@ -2330,6 +2330,19 @@ fn ensureUserProvisioned(state: *GatewayState, ctx: *const UserContext) !void {
     }
 }
 
+fn prepareBrokerUserForRouting(allocator: std.mem.Allocator, state: *GatewayState, user_id: []const u8) !void {
+    var user_ctx = try resolveUserContext(allocator, state, user_id);
+    defer user_ctx.deinit(allocator);
+
+    var prep_guard = try state.user_preparation_gate.acquire(user_ctx.user_id);
+    defer prep_guard.deinit();
+
+    try ensureUserDirectories(&user_ctx);
+    try ensureUserProvisioned(state, &user_ctx);
+    scaffoldUserWorkspace(allocator, &user_ctx);
+    prep_guard.release();
+}
+
 const GatewayUserIdResolutionError = error{
     MissingUserId,
     UserCellUserMismatch,
@@ -7052,6 +7065,14 @@ fn handleApiChatStreamSseConnection(
         return true;
     };
     if (state.role == .broker) {
+        prepareBrokerUserForRouting(req_allocator, state, user_id) catch |err| {
+            if (isIdentityUserNotFound(err)) {
+                sendSseErrorResponse(stream, req_allocator, "404 Not Found", "unknown_user_id", "unknown user id");
+                return true;
+            }
+            sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
+            return true;
+        };
         const target = extractRequestTarget(raw_request) orelse base_path;
         brokerProxyChatStreamSseConnection(
             req_allocator,
@@ -7552,6 +7573,12 @@ fn handleApiRoute(
             };
         };
         if (state.role == .broker) {
+            prepareBrokerUserForRouting(req_allocator, state, user_id) catch |err| {
+                if (isIdentityUserNotFound(err)) {
+                    return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_user_id\"}" };
+                }
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"state_provisioning_failed\"}" };
+            };
             const target = extractRequestTarget(raw_request) orelse base_path;
             return brokerProxyApiRequest(
                 req_allocator,
@@ -7596,6 +7623,12 @@ fn handleApiRoute(
         };
     };
     if (state.role == .broker) {
+        prepareBrokerUserForRouting(req_allocator, state, scoped_user_id) catch |err| {
+            if (isIdentityUserNotFound(err)) {
+                return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_user_id\"}" };
+            }
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"state_provisioning_failed\"}" };
+        };
         const target = extractRequestTarget(raw_request) orelse base_path;
         return brokerProxyApiRequest(
             req_allocator,
@@ -11938,6 +11971,29 @@ test "users provision route succeeds even when ownership lock is held in file mo
 
     try std.testing.expectEqualStrings("200 OK", response.status);
     try std.testing.expectEqualStrings("{\"status\":\"provisioned\"}", response.body);
+}
+
+test "prepareBrokerUserForRouting bootstraps broker file-mode user state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.role = .broker;
+    state.tenant_enabled = true;
+    state.tenant_data_root = tenant_root;
+
+    try prepareBrokerUserForRouting(std.testing.allocator, &state, "42");
+
+    const workspace_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/42/workspace", .{tenant_root});
+    defer std.testing.allocator.free(workspace_path);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/42/config.json", .{tenant_root});
+    defer std.testing.allocator.free(config_path);
+
+    try std.fs.accessAbsolute(workspace_path, .{});
+    try std.fs.accessAbsolute(config_path, .{});
 }
 
 test "user_cell users provision route rejects mismatched user" {
