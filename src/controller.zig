@@ -142,7 +142,7 @@ const CellRegistry = struct {
                     if (record.cell_url) |previous| self.allocator.free(previous);
                     record.cell_url = owned_cell_url;
                 }
-                record.state = .warm;
+                record.state = if (record.state == .warm) .warm else .pending;
                 record.drain_requested_at_s = null;
             }
             record.updated_at_s = now_s;
@@ -166,7 +166,7 @@ const CellRegistry = struct {
         const record = CellRecord{
             .user_id = owned_user_id,
             .cell_url = owned_cell_url,
-            .state = if (owned_cell_url != null) .warm else .pending,
+            .state = .pending,
             .created_at_s = now_s,
             .updated_at_s = now_s,
             .last_ensured_at_s = now_s,
@@ -1154,7 +1154,7 @@ test "controller ensure creates cell and resolve returns it" {
     try std.testing.expect(std.mem.indexOf(u8, resolve_response.body, "\"service_name\":\"nullalis-cell-42\"") != null);
 }
 
-test "controller ensure stores cell_url and updates existing registration" {
+test "controller ensure stores cell_url and keeps cell pending until readiness" {
     var registry = CellRegistry.init(std.testing.allocator);
     defer registry.deinit();
     const state = ControllerState{
@@ -1169,6 +1169,7 @@ test "controller ensure stores cell_url and updates existing registration" {
     defer if (first_response.allocated) std.testing.allocator.free(@constCast(first_response.body));
     try std.testing.expectEqualStrings("200 OK", first_response.status);
     try std.testing.expect(std.mem.indexOf(u8, first_response.body, "\"cell_url\":\"http://127.0.0.1:3100\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_response.body, "\"state\":\"pending\"") != null);
 
     const second_ensure_raw =
         "POST /internal/cells/ensure HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: svc-prod-token-1234\r\nContent-Length: 54\r\n\r\n{\"user_id\":\"42\",\"cell_url\":\"http://127.0.0.1:3200\"}";
@@ -1176,6 +1177,7 @@ test "controller ensure stores cell_url and updates existing registration" {
     defer if (second_response.allocated) std.testing.allocator.free(@constCast(second_response.body));
     try std.testing.expect(std.mem.indexOf(u8, second_response.body, "\"created\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, second_response.body, "\"cell_url\":\"http://127.0.0.1:3200\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_response.body, "\"state\":\"pending\"") != null);
 }
 
 test "controller ensure without cell_url creates pending cell" {
@@ -1188,6 +1190,18 @@ test "controller ensure without cell_url creates pending cell" {
     try std.testing.expect(result.created);
     try std.testing.expectEqual(ControllerCellState.pending, result.snapshot.state);
     try std.testing.expect(result.snapshot.cell_url == null);
+}
+
+test "controller ensure with cell_url creates pending cell until readiness" {
+    var registry = CellRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var result = try registry.ensure(std.testing.allocator, "42", "http://127.0.0.1:3100");
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.created);
+    try std.testing.expectEqual(ControllerCellState.pending, result.snapshot.state);
+    try std.testing.expectEqualStrings("http://127.0.0.1:3100", result.snapshot.cell_url.?);
 }
 
 test "controller ensure updates existing cell and drain marks draining" {
@@ -1226,6 +1240,9 @@ test "controller status returns all cells summary" {
 
     var ensured_42 = registry.ensure(std.testing.allocator, "42", "http://127.0.0.1:3100") catch unreachable;
     defer ensured_42.deinit(std.testing.allocator);
+    registry.mutex.lock();
+    if (registry.cells.getPtr("42")) |record| record.state = .warm;
+    registry.mutex.unlock();
     var ensured_77 = registry.ensure(std.testing.allocator, "77", null) catch unreachable;
     defer ensured_77.deinit(std.testing.allocator);
     var drained_77 = registry.drain(std.testing.allocator, "77") catch unreachable;
