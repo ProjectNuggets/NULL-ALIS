@@ -569,7 +569,7 @@ pub fn buildPodManifest(
             .{std.json.fmt(token, .{})},
         );
     }
-    try writer.writeAll(",\"envFrom\":[");
+    try writer.writeAll("],\"envFrom\":[");
     try writer.print(
         "{{\"secretRef\":{{\"name\":{f}}}}}",
         .{std.json.fmt(runtime.cell_secret_name, .{})},
@@ -659,6 +659,10 @@ test "buildPodManifest includes controller and advertise args" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"subPath\":\"users/42/workspace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"runAsNonRoot\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"cpu\":\"250m\"") != null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, manifest, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
 }
 
 test "parsePodObservationBody detects ready running pod" {
