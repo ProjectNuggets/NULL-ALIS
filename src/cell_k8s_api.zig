@@ -319,6 +319,77 @@ fn homeSubpath(allocator: std.mem.Allocator, runtime: RuntimeConfig, desired: ce
     );
 }
 
+fn shellQuote(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.append(allocator, '\'');
+    for (value) |char| {
+        if (char == '\'') {
+            try out.appendSlice(allocator, "'\"'\"'");
+        } else {
+            try out.append(allocator, char);
+        }
+    }
+    try out.append(allocator, '\'');
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildUserCellEntrypointCommand(
+    allocator: std.mem.Allocator,
+    desired: cell_spec.DesiredCellSpec,
+    runtime: RuntimeConfig,
+    port_arg: []const u8,
+) ![]u8 {
+    const quoted_user_id = try shellQuote(allocator, desired.user_id);
+    defer allocator.free(quoted_user_id);
+    const quoted_controller_url = try shellQuote(allocator, runtime.controller_url);
+    defer allocator.free(quoted_controller_url);
+    const quoted_advertise_url = try shellQuote(allocator, desired.advertise_url);
+    defer allocator.free(quoted_advertise_url);
+    const quoted_port = try shellQuote(allocator, port_arg);
+    defer allocator.free(quoted_port);
+
+    return std.fmt.allocPrint(
+        allocator,
+        \\set -eu
+        \\
+        \\require_url_userinfo_safe() {{
+        \\  case "$2" in
+        \\    *[!A-Za-z0-9._~-]*)
+        \\      echo "invalid URL-safe value for $1" >&2
+        \\      exit 1
+        \\      ;;
+        \\    *)
+        \\      ;;
+        \\  esac
+        \\}}
+        \\
+        \\POSTGRES_RUNTIME_CONNECTION_STRING="${{NULLCLAW_POSTGRES_CONNECTION_STRING:-${{POSTGRES_CONNECTION_STRING:-}}}}"
+        \\if [ "${{POSTGRES_USE_PGBOUNCER:-false}}" = "true" ]; then
+        \\  if [ -n "${{PGBOUNCER_HOST:-}}" ] && [ -n "${{PGBOUNCER_DB_USER:-}}" ] && [ -n "${{PGBOUNCER_DB_PASSWORD:-}}" ] && [ -n "${{PGBOUNCER_DB_NAME:-}}" ]; then
+        \\    require_url_userinfo_safe PGBOUNCER_DB_USER "${{PGBOUNCER_DB_USER}}"
+        \\    require_url_userinfo_safe PGBOUNCER_DB_PASSWORD "${{PGBOUNCER_DB_PASSWORD}}"
+        \\    require_url_userinfo_safe PGBOUNCER_DB_NAME "${{PGBOUNCER_DB_NAME}}"
+        \\    POSTGRES_RUNTIME_CONNECTION_STRING="postgresql://${{PGBOUNCER_DB_USER}}:${{PGBOUNCER_DB_PASSWORD}}@${{PGBOUNCER_HOST}}:${{PGBOUNCER_PORT:-6432}}/${{PGBOUNCER_DB_NAME}}"
+        \\  elif [ -n "${{PGBOUNCER_CONNECTION_STRING:-}}" ]; then
+        \\    POSTGRES_RUNTIME_CONNECTION_STRING="${{PGBOUNCER_CONNECTION_STRING}}"
+        \\  fi
+        \\fi
+        \\export NULLCLAW_POSTGRES_CONNECTION_STRING="${{POSTGRES_RUNTIME_CONNECTION_STRING}}"
+        \\export POSTGRES_CONNECTION_STRING="${{POSTGRES_RUNTIME_CONNECTION_STRING}}"
+        \\
+        \\exec nullalis gateway --role user_cell --user-id {s} --controller-url {s} --advertise-url {s} --host 0.0.0.0 --port {s}
+    ,
+        .{
+            quoted_user_id,
+            quoted_controller_url,
+            quoted_advertise_url,
+            quoted_port,
+        },
+    );
+}
+
 fn readTrimmedFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
@@ -563,6 +634,8 @@ pub fn buildPodManifest(
     defer allocator.free(port_arg);
     const home_path = try std.fmt.allocPrint(allocator, "{s}/.home", .{runtime.workspace_mount_path});
     defer allocator.free(home_path);
+    const user_cell_entrypoint_command = try buildUserCellEntrypointCommand(allocator, desired, runtime, port_arg);
+    defer allocator.free(user_cell_entrypoint_command);
     const workspace_root_subpath = try workspaceUserRootSubpath(allocator, runtime, desired);
     defer allocator.free(workspace_root_subpath);
     const workspace_subpath = try workspaceSubpath(allocator, runtime, desired);
@@ -598,7 +671,7 @@ pub fn buildPodManifest(
     defer allocator.free(workspace_prep_command);
 
     try writer.print(
-        "{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"name\":{f},\"namespace\":{f},\"labels\":{{\"app.kubernetes.io/name\":\"nullalis-user-cell\",\"nullalis.ai/cell\":{f},\"app.kubernetes.io/managed-by\":\"nullalis-controller\"}}}},\"spec\":{{\"restartPolicy\":\"Always\",\"serviceAccountName\":{f},\"automountServiceAccountToken\":false,\"securityContext\":{{\"fsGroup\":{d}}},\"initContainers\":[{{\"name\":\"prepare-workspace\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"command\":[\"/bin/sh\",\"-lc\",{f}],\"securityContext\":{{\"runAsUser\":0,\"runAsGroup\":0,\"allowPrivilegeEscalation\":false}},\"volumeMounts\":[{{\"name\":\"shared-workspace\",\"mountPath\":{f}}},{{\"name\":\"tmp\",\"mountPath\":\"/tmp\"}}]}}],\"containers\":[{{\"name\":\"nullalis\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"args\":[\"gateway\",\"--role\",\"user_cell\",\"--user-id\",{f},\"--controller-url\",{f},\"--advertise-url\",{f},\"--host\",\"0.0.0.0\",\"--port\",{f}],\"ports\":[{{\"name\":\"http\",\"containerPort\":{d}}}],\"env\":[{{\"name\":\"NULLALIS_CONFIG_PATH\",\"value\":{f}}},{{\"name\":\"NULLCLAW_WORKSPACE\",\"value\":{f}}},{{\"name\":\"HOME\",\"value\":{f}}},{{\"name\":\"NULLCLAW_ALLOW_PUBLIC_BIND\",\"value\":\"true\"}}",
+        "{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"name\":{f},\"namespace\":{f},\"labels\":{{\"app.kubernetes.io/name\":\"nullalis-user-cell\",\"nullalis.ai/cell\":{f},\"app.kubernetes.io/managed-by\":\"nullalis-controller\"}}}},\"spec\":{{\"restartPolicy\":\"Always\",\"serviceAccountName\":{f},\"automountServiceAccountToken\":false,\"securityContext\":{{\"fsGroup\":{d}}},\"initContainers\":[{{\"name\":\"prepare-workspace\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"command\":[\"/bin/sh\",\"-lc\",{f}],\"securityContext\":{{\"runAsUser\":0,\"runAsGroup\":0,\"allowPrivilegeEscalation\":false}},\"volumeMounts\":[{{\"name\":\"shared-workspace\",\"mountPath\":{f}}},{{\"name\":\"tmp\",\"mountPath\":\"/tmp\"}}]}}],\"containers\":[{{\"name\":\"nullalis\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"command\":[\"/bin/sh\",\"-lc\",{f}],\"ports\":[{{\"name\":\"http\",\"containerPort\":{d}}}],\"env\":[{{\"name\":\"NULLALIS_CONFIG_PATH\",\"value\":{f}}},{{\"name\":\"NULLCLAW_WORKSPACE\",\"value\":{f}}},{{\"name\":\"HOME\",\"value\":{f}}},{{\"name\":\"NULLCLAW_ALLOW_PUBLIC_BIND\",\"value\":\"true\"}}",
         .{
             std.json.fmt(desired.pod_name, .{}),
             std.json.fmt(desired.namespace, .{}),
@@ -609,10 +682,7 @@ pub fn buildPodManifest(
             std.json.fmt(workspace_prep_command, .{}),
             std.json.fmt(WORKSPACE_PREP_MOUNT_PATH, .{}),
             std.json.fmt(runtime.cell_image, .{}),
-            std.json.fmt(desired.user_id, .{}),
-            std.json.fmt(runtime.controller_url, .{}),
-            std.json.fmt(desired.advertise_url, .{}),
-            std.json.fmt(port_arg, .{}),
+            std.json.fmt(user_cell_entrypoint_command, .{}),
             desired.service_port,
             std.json.fmt(runtime.config_mount_path, .{}),
             std.json.fmt(runtime.workspace_mount_path, .{}),
@@ -709,8 +779,12 @@ test "buildPodManifest includes controller and advertise args" {
     defer std.testing.allocator.free(manifest);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"kind\":\"Pod\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"--controller-url\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"--advertise-url\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "exec nullalis gateway --role user_cell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "--controller-url 'http://nullalis-controller.zaki.svc.cluster.local:3001'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "--advertise-url 'http://nullalis-cell-42.nullalis-cells-standard.svc.cluster.local:3000'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "POSTGRES_RUNTIME_CONNECTION_STRING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "PGBOUNCER_CONNECTION_STRING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "export NULLCLAW_POSTGRES_CONNECTION_STRING") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"NULLCLAW_INTERNAL_SERVICE_TOKEN\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"serviceAccountName\":\"nullclaw\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"automountServiceAccountToken\":false") != null);
