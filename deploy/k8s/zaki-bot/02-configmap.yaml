@@ -19,6 +19,7 @@ data:
   NULLCLAW_CONTROLLER_PORT: "3001"
   NULLCLAW_CONTROLLER_URL: "http://nullalis-controller.zaki-bot-staging.svc.cluster.local:3001"
   NULLCLAW_CELL_IMAGE: "ghcr.io/nullclaw/nullclaw:REPLACE_TAG"
+  NULLCLAW_CELL_RUNTIME_ENV_CONFIGMAP_NAME: "nullclaw-runtime-config"
   NULLCLAW_CELL_SHARED_WORKSPACE_CLAIM: "nullclaw-data-rwx"
   NULLCLAW_CELL_CONFIG_SUBPATH: ".nullalis/config.json"
   NULLCLAW_CELL_WORKSPACE_SUBPATH_ROOT: "users"
