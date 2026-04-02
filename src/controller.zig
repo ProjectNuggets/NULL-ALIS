@@ -134,6 +134,15 @@ const CellRegistry = struct {
 
         const now_s = std.time.timestamp();
         if (self.cells.getPtr(user_id)) |record| {
+            if (record.state == .draining) {
+                record.updated_at_s = now_s;
+                record.last_ensured_at_s = now_s;
+                record.ensure_count +%= 1;
+                return .{
+                    .snapshot = try snapshotForRecord(allocator, record),
+                    .created = false,
+                };
+            }
             if (cell_url) |value| {
                 const trimmed = std.mem.trim(u8, value, " \t\r\n");
                 if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, record.cell_url orelse "")) {
@@ -1227,6 +1236,24 @@ test "controller ensure updates existing cell and drain marks draining" {
     try std.testing.expectEqualStrings("200 OK", drain_response.status);
     try std.testing.expect(std.mem.indexOf(u8, drain_response.body, "\"found\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, drain_response.body, "\"state\":\"draining\"") != null);
+}
+
+test "controller ensure does not revive draining cell to pending" {
+    var registry = CellRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var ensured = try registry.ensure(std.testing.allocator, "42", "http://127.0.0.1:3100");
+    defer ensured.deinit(std.testing.allocator);
+    var drained = try registry.drain(std.testing.allocator, "42");
+    defer drained.deinit(std.testing.allocator);
+
+    var reensured = try registry.ensure(std.testing.allocator, "42", null);
+    defer reensured.deinit(std.testing.allocator);
+
+    try std.testing.expect(!reensured.created);
+    try std.testing.expectEqual(ControllerCellState.draining, reensured.snapshot.state);
+    try std.testing.expect(reensured.snapshot.drain_requested_at_s != null);
+    try std.testing.expectEqualStrings("http://127.0.0.1:3100", reensured.snapshot.cell_url.?);
 }
 
 test "controller status returns all cells summary" {
