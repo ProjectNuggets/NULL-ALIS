@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nullalis-controller
+  namespace: zaki-bot-staging
+  labels:
+    app.kubernetes.io/name: nullalis-controller
+    app.kubernetes.io/part-of: zaki-bot
+spec:
+  selector:
+    app.kubernetes.io/name: nullalis-controller
+  ports:
+    - name: http
+      port: 3001
+      targetPort: http
+      protocol: TCP

@@ -26,6 +26,7 @@ Compatibility note:
 It includes:
 - Namespace, Secret template, ConfigMap, RWX PVC
 - Deployment with drain/shutdown lifecycle hooks
+- Optional controller deployment for per-user cell lifecycle
 - PgBouncer deployment/service for Postgres connection pooling
 - Litestream sidecar config for SQLite WAL replication to S3
 - Service, Ingress, PDB, HPA
@@ -50,6 +51,9 @@ It includes:
 - `13-pgbouncer-deployment.yaml`
 - `14-pgbouncer-service.yaml`
 - `15-pgbouncer-pdb.yaml`
+- `16-controller-rbac.yaml`
+- `17-controller-service.yaml`
+- `18-controller-deployment.yaml`
 - `kustomization.yaml`
 - `smoke.sh`
 - `stickiness-probe.sh`
@@ -107,7 +111,8 @@ Legacy compatibility note:
 Update these fields before apply:
 1. `03-pvc.yaml`: `storageClassName`.
 2. `05-deployment.yaml`: image tag.
-3. `01-secrets-template.yaml`:
+3. `18-controller-deployment.yaml`: image tag if different from the shared gateway image.
+4. `01-secrets-template.yaml`:
 - `INTERNAL_SERVICE_TOKEN`
 - `TOGETHER_API_KEY`
 - `POSTGRES_CONNECTION_STRING`
@@ -124,12 +129,13 @@ Update these fields before apply:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
  - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (if not using workload identity)
-4. `07-ingress.yaml`: host and TLS secret if different, if you are intentionally using the legacy direct-ingress path.
-5. `02-configmap.yaml`:
+5. `07-ingress.yaml`: host and TLS secret if different, if you are intentionally using the legacy direct-ingress path.
+6. `02-configmap.yaml`:
 - `TELEGRAM_ALLOW_FROM` policy
 - Postgres state tuning (`STATE_BACKEND`, `POSTGRES_SCHEMA`, `POSTGRES_POOL_MAX`, timeout values)
 - PgBouncer toggles/tuning (`POSTGRES_USE_PGBOUNCER`, `PGBOUNCER_*`)
 - Composio toggles (`COMPOSIO_ENABLED`, `COMPOSIO_ENTITY_ID`)
+- gateway/controller rollout contract (`GATEWAY_ROLE`, `NULLCLAW_CONTROLLER_*`, `NULLCLAW_CELL_*`)
 - `LITESTREAM_S3_BUCKET`, `LITESTREAM_S3_PREFIX`
 - `AWS_REGION` (if required by your S3 endpoint)
 

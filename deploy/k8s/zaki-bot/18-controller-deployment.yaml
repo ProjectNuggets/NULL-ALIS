@@ -1,0 +1,111 @@
+# LEGACY / REFERENCE ONLY
+# Production deployment authority lives in zaki-infra. Do not treat this file as the live production source of truth.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nullalis-controller
+  namespace: zaki-bot-staging
+  labels:
+    app.kubernetes.io/name: nullalis-controller
+    app.kubernetes.io/part-of: zaki-bot
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nullalis-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nullalis-controller
+        app.kubernetes.io/part-of: zaki-bot
+    spec:
+      serviceAccountName: nullalis-controller
+      containers:
+        - name: nullalis-controller
+          image: ghcr.io/nullclaw/nullclaw:REPLACE_TAG
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3001
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: nullclaw-runtime-config
+            - secretRef:
+                name: nullclaw-runtime-secrets
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              export NULLALIS_CONFIG_PATH=/tmp/nullalis-controller-config.json
+
+              json_escape() {
+                printf '%s' "$1" | sed \
+                  -e 's/\\/\\\\/g' \
+                  -e 's/"/\\"/g' \
+                  -e ':a' \
+                  -e 'N' \
+                  -e '$!ba' \
+                  -e 's/\n/\\n/g' \
+                  -e 's/\r/\\r/g' \
+                  -e 's/\t/\\t/g'
+              }
+
+              require_uint() {
+                case "$2" in
+                  ''|*[!0-9]*)
+                    echo "invalid integer for $1: $2" >&2
+                    exit 1
+                    ;;
+                  *)
+                    ;;
+                esac
+              }
+
+              require_uint GATEWAY_PORT "${GATEWAY_PORT}"
+              require_uint NULLCLAW_CONTROLLER_PORT "${NULLCLAW_CONTROLLER_PORT}"
+
+              INTERNAL_SERVICE_TOKEN_ESC="$(json_escape "${INTERNAL_SERVICE_TOKEN}")"
+              GATEWAY_HOST_ESC="$(json_escape "${GATEWAY_HOST}")"
+
+              cat > /tmp/nullalis-controller-config.json <<JSON
+              {
+                "gateway": {
+                  "port": ${GATEWAY_PORT},
+                  "host": "${GATEWAY_HOST_ESC}",
+                  "internal_service_tokens": ["${INTERNAL_SERVICE_TOKEN_ESC}"]
+                }
+              }
+              JSON
+
+              exec nullalis controller --host 0.0.0.0 --port "${NULLCLAW_CONTROLLER_PORT}" --cell-namespace "${POD_NAMESPACE}"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

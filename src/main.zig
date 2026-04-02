@@ -25,6 +25,7 @@ const log = std.log.scoped(.main);
 const Command = enum {
     agent,
     gateway,
+    controller,
     service,
     status,
     version,
@@ -48,6 +49,7 @@ fn parseCommand(arg: []const u8) ?Command {
     const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "agent", .agent },
         .{ "gateway", .gateway },
+        .{ "controller", .controller },
         .{ "service", .service },
         .{ "status", .status },
         .{ "version", .version },
@@ -71,6 +73,165 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "-h", .help },
     });
     return command_map.get(arg);
+}
+
+const GatewayRole = yc.gateway.GatewayRole;
+
+const GatewayRoleLaunchOptions = struct {
+    role: GatewayRole = .shared,
+    user_id: ?[]const u8 = null,
+    controller_url: ?[]const u8 = null,
+    advertise_url: ?[]const u8 = null,
+};
+
+const GatewayRoleArgParseResult = union(enum) {
+    ok: GatewayRoleLaunchOptions,
+    invalid_role: []const u8,
+    missing_value: []const u8,
+    unsupported_option: []const u8,
+    unknown_option: []const u8,
+    option_requires_role: struct {
+        option: []const u8,
+        role: GatewayRole,
+    },
+    missing_option_for_role: struct {
+        option: []const u8,
+        role: GatewayRole,
+    },
+    missing_user_id_for_role: GatewayRole,
+};
+
+fn parseGatewayRole(raw: []const u8) ?GatewayRole {
+    if (std.mem.eql(u8, raw, "shared")) return .shared;
+    if (std.mem.eql(u8, raw, "broker")) return .broker;
+    if (std.mem.eql(u8, raw, "user_cell")) return .user_cell;
+    return null;
+}
+
+fn parseGatewayRoleLaunchOptions(sub_args: []const []const u8) GatewayRoleArgParseResult {
+    var out = GatewayRoleLaunchOptions{};
+
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
+        if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--host")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--role")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            out.role = parseGatewayRole(sub_args[i]) orelse return .{ .invalid_role = sub_args[i] };
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--user-id")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            out.user_id = sub_args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--workspace")) {
+            return .{ .unsupported_option = arg };
+        }
+        if (std.mem.eql(u8, arg, "--idle-ttl-secs")) {
+            return .{ .unsupported_option = arg };
+        }
+        if (std.mem.eql(u8, arg, "--controller-url")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            out.controller_url = sub_args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--advertise-url")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            out.advertise_url = sub_args[i];
+            continue;
+        }
+        return .{ .unknown_option = arg };
+    }
+
+    if (out.controller_url != null and out.role == .shared) {
+        return .{
+            .option_requires_role = .{
+                .option = "--controller-url",
+                .role = .broker,
+            },
+        };
+    }
+    if (out.advertise_url != null and out.role != .user_cell) {
+        return .{
+            .option_requires_role = .{
+                .option = "--advertise-url",
+                .role = .user_cell,
+            },
+        };
+    }
+    if (out.role == .user_cell and out.controller_url != null and out.advertise_url == null) {
+        return .{
+            .missing_option_for_role = .{
+                .option = "--advertise-url",
+                .role = .user_cell,
+            },
+        };
+    }
+    if (out.role == .user_cell and out.user_id == null) {
+        return .{ .missing_user_id_for_role = .user_cell };
+    }
+    return .{ .ok = out };
+}
+
+const ControllerBindOptions = struct {
+    host: []const u8,
+    port: u16,
+    cell_namespace: []const u8,
+};
+
+const ControllerBindParseResult = union(enum) {
+    ok: ControllerBindOptions,
+    invalid_port: []const u8,
+    missing_value: []const u8,
+    unknown_option: []const u8,
+};
+
+fn defaultControllerPort(gateway_port: u16) u16 {
+    if (gateway_port == std.math.maxInt(u16)) return gateway_port;
+    return gateway_port + 1;
+}
+
+fn parseControllerBindOptions(default_host: []const u8, default_port: u16, sub_args: []const []const u8) ControllerBindParseResult {
+    var out = ControllerBindOptions{
+        .host = default_host,
+        .port = default_port,
+        .cell_namespace = "default",
+    };
+
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
+        if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            out.port = std.fmt.parseInt(u16, sub_args[i], 10) catch return .{ .invalid_port = sub_args[i] };
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--host")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            out.host = sub_args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--cell-namespace")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            out.cell_namespace = sub_args[i];
+            continue;
+        }
+        return .{ .unknown_option = arg };
+    }
+
+    return .{ .ok = out };
 }
 
 fn parseOptionalUserIdFlag(command_name: []const u8, sub_args: []const []const u8) ?[]const u8 {
@@ -109,6 +270,16 @@ fn gatewayLoopbackHost(host: []const u8) []const u8 {
     if (std.mem.eql(u8, host, "0.0.0.0")) return "127.0.0.1";
     if (std.mem.eql(u8, host, "::")) return "127.0.0.1";
     return host;
+}
+
+fn isLoopbackBindHost(host_raw: []const u8) bool {
+    const host = std.mem.trim(u8, host_raw, " \t\r\n");
+    if (host.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+    if (std.mem.eql(u8, host, "127.0.0.1")) return true;
+    if (std.mem.eql(u8, host, "::1")) return true;
+    if (std.mem.eql(u8, host, "[::1]")) return true;
+    return false;
 }
 
 fn invalidateTenantRuntimeCaches(
@@ -210,6 +381,7 @@ fn runMain(allocator: std.mem.Allocator) !void {
         },
         .help => printUsage(),
         .gateway => try runGateway(allocator, sub_args),
+        .controller => try runController(allocator, sub_args),
         .service => try runService(allocator, sub_args),
         .cron => try runCron(allocator, sub_args),
         .channel => try runChannel(allocator, sub_args),
@@ -261,6 +433,51 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     };
     defer cfg.deinit();
 
+    const role_options = switch (parseGatewayRoleLaunchOptions(sub_args)) {
+        .ok => |options| options,
+        .invalid_role => |value| {
+            std.debug.print("Invalid gateway role: {s}\n", .{value});
+            std.debug.print("Usage: nullalis gateway [--port PORT] [--host HOST] [--role shared|broker|user_cell] [--user-id ID] [--controller-url URL] [--advertise-url URL]\n", .{});
+            std.process.exit(1);
+        },
+        .missing_value => |flag| {
+            std.debug.print("Missing value for {s}\n", .{flag});
+            std.debug.print("Usage: nullalis gateway [--port PORT] [--host HOST] [--role shared|broker|user_cell] [--user-id ID] [--controller-url URL] [--advertise-url URL]\n", .{});
+            std.process.exit(1);
+        },
+        .unsupported_option => |flag| {
+            std.debug.print("Gateway option not implemented yet: {s}\n", .{flag});
+            std.debug.print("Usage: nullalis gateway [--port PORT] [--host HOST] [--role shared|broker|user_cell] [--user-id ID] [--controller-url URL] [--advertise-url URL]\n", .{});
+            std.process.exit(1);
+        },
+        .unknown_option => |flag| {
+            std.debug.print("Unknown gateway option: {s}\n", .{flag});
+            std.debug.print("Usage: nullalis gateway [--port PORT] [--host HOST] [--role shared|broker|user_cell] [--user-id ID] [--controller-url URL] [--advertise-url URL]\n", .{});
+            std.process.exit(1);
+        },
+        .option_requires_role => |info| {
+            if (std.mem.eql(u8, info.option, "--controller-url")) {
+                std.debug.print("Gateway option {s} requires --role broker or user_cell\n", .{info.option});
+            } else if (std.mem.eql(u8, info.option, "--advertise-url")) {
+                std.debug.print("Gateway option {s} requires --role user_cell\n", .{info.option});
+            } else {
+                std.debug.print("Gateway option {s} requires --role {s}\n", .{ info.option, @tagName(info.role) });
+            }
+            std.debug.print("Usage: nullalis gateway [--port PORT] [--host HOST] [--role shared|broker|user_cell] [--user-id ID] [--controller-url URL] [--advertise-url URL]\n", .{});
+            std.process.exit(1);
+        },
+        .missing_option_for_role => |info| {
+            std.debug.print("Gateway role '{s}' requires {s}\n", .{ @tagName(info.role), info.option });
+            std.debug.print("Usage: nullalis gateway [--port PORT] [--host HOST] [--role shared|broker|user_cell] [--user-id ID] [--controller-url URL] [--advertise-url URL]\n", .{});
+            std.process.exit(1);
+        },
+        .missing_user_id_for_role => |role| {
+            std.debug.print("Gateway role '{s}' requires --user-id\n", .{@tagName(role)});
+            std.debug.print("Usage: nullalis gateway [--port PORT] [--host HOST] [--role shared|broker|user_cell] [--user-id ID] [--controller-url URL] [--advertise-url URL]\n", .{});
+            std.process.exit(1);
+        },
+    };
+
     applyGatewayDaemonOverrides(&cfg, sub_args) catch {
         std.debug.print("Invalid port in CLI args.\n", .{});
         std.process.exit(1);
@@ -271,7 +488,90 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
-    try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
+    switch (role_options.role) {
+        .shared => try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port),
+        .broker => {
+            const derived_controller_url = if (role_options.controller_url) |value|
+                value
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "http://{s}:{d}",
+                    .{ gatewayLoopbackHost(cfg.gateway.host), defaultControllerPort(cfg.gateway.port) },
+                );
+            defer if (role_options.controller_url == null) allocator.free(derived_controller_url);
+            try yc.gateway.runWithRole(allocator, cfg.gateway.host, cfg.gateway.port, &cfg, null, .broker, derived_controller_url, null, null);
+        },
+        .user_cell => {
+            if (!cfg.tenant.enabled) {
+                std.debug.print("Gateway role 'user_cell' requires tenant.enabled=true\n", .{});
+                std.process.exit(1);
+            }
+            try yc.gateway.runWithRole(
+                allocator,
+                cfg.gateway.host,
+                cfg.gateway.port,
+                &cfg,
+                null,
+                .user_cell,
+                role_options.controller_url,
+                role_options.advertise_url,
+                role_options.user_id,
+            );
+        },
+    }
+}
+
+fn runController(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    var owned_cfg: ?yc.config.Config = yc.config.Config.load(allocator) catch null;
+    defer if (owned_cfg) |*cfg| cfg.deinit();
+
+    const default_host = if (owned_cfg) |*cfg| cfg.gateway.host else "127.0.0.1";
+    const default_port = if (owned_cfg) |*cfg| defaultControllerPort(cfg.gateway.port) else 3001;
+
+    const bind_options = switch (parseControllerBindOptions(default_host, default_port, sub_args)) {
+        .ok => |options| options,
+        .invalid_port => |value| {
+            std.debug.print("Invalid controller port: {s}\n", .{value});
+            std.debug.print("Usage: nullalis controller [--port PORT] [--host HOST] [--cell-namespace NAMESPACE]\n", .{});
+            std.process.exit(1);
+        },
+        .missing_value => |flag| {
+            std.debug.print("Missing value for {s}\n", .{flag});
+            std.debug.print("Usage: nullalis controller [--port PORT] [--host HOST] [--cell-namespace NAMESPACE]\n", .{});
+            std.process.exit(1);
+        },
+        .unknown_option => |flag| {
+            std.debug.print("Unknown controller option: {s}\n", .{flag});
+            std.debug.print("Usage: nullalis controller [--port PORT] [--host HOST] [--cell-namespace NAMESPACE]\n", .{});
+            std.process.exit(1);
+        },
+    };
+
+    const internal_service_tokens = if (owned_cfg) |*cfg| cfg.gateway.internal_service_tokens else &.{};
+    const production_like_controller = !isLoopbackBindHost(bind_options.host);
+    const token_validation = yc.gateway.validateInternalTokensForMode(
+        internal_service_tokens,
+        production_like_controller,
+    );
+    if (production_like_controller and !token_validation.ok) {
+        std.debug.print(
+            "Controller internal token configuration invalid: {s}\n",
+            .{token_validation.reason orelse "unknown"},
+        );
+        std.process.exit(1);
+    }
+    const internal_auth_required = token_validation.configured or production_like_controller;
+
+    try yc.controller.run(
+        allocator,
+        bind_options.host,
+        bind_options.port,
+        bind_options.cell_namespace,
+        if (owned_cfg) |*cfg| cfg.gateway.port else 3000,
+        internal_service_tokens,
+        internal_auth_required,
+    );
 }
 
 // ── Service ──────────────────────────────────────────────────────
@@ -3311,6 +3611,7 @@ fn printUsage() void {
         \\  onboard     Initialize workspace and configuration
         \\  agent       Start the AI agent loop
         \\  gateway     Start the gateway server (HTTP/WebSocket)
+        \\  controller  Start the hosted cell lifecycle controller
         \\  service     Manage OS service lifecycle (install/start/stop/status/uninstall)
         \\  status      Show system status
         \\  version     Show CLI version
@@ -3331,7 +3632,8 @@ fn printUsage() void {
         \\OPTIONS:
         \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--memory MEM]
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
-        \\  gateway [--port PORT] [--host HOST]
+        \\  gateway [--port PORT] [--host HOST] [--role shared|broker|user_cell] [--user-id ID] [--controller-url URL] [--advertise-url URL]
+        \\  controller [--port PORT] [--host HOST] [--cell-namespace NAMESPACE]
         \\  status [--user-id ID]
         \\  version | --version | -V
         \\  doctor [--user-id ID]
@@ -3367,8 +3669,194 @@ test "parse known commands" {
     try std.testing.expectEqual(.models, parseCommand("models").?);
     try std.testing.expectEqual(.auth, parseCommand("auth").?);
     try std.testing.expectEqual(.update, parseCommand("update").?);
+    try std.testing.expectEqual(.controller, parseCommand("controller").?);
     try std.testing.expect(parseCommand("daemon") == null);
     try std.testing.expect(parseCommand("unknown") == null);
+}
+
+test "parseGatewayRoleLaunchOptions defaults to shared role" {
+    const args = [_][]const u8{ "--port", "3000", "--host", "0.0.0.0" };
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .ok => |options| {
+            try std.testing.expectEqual(GatewayRole.shared, options.role);
+            try std.testing.expect(options.user_id == null);
+            try std.testing.expect(options.controller_url == null);
+            try std.testing.expect(options.advertise_url == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions parses broker role and controller url" {
+    const args = [_][]const u8{
+        "--role",
+        "broker",
+        "--controller-url",
+        "http://127.0.0.1:3001",
+    };
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .ok => |options| {
+            try std.testing.expectEqual(GatewayRole.broker, options.role);
+            try std.testing.expectEqualStrings("http://127.0.0.1:3001", options.controller_url.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions requires user id for user_cell role" {
+    const args = [_][]const u8{ "--role", "user_cell" };
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .missing_user_id_for_role => |role| try std.testing.expectEqual(GatewayRole.user_cell, role),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions rejects invalid role" {
+    const args = [_][]const u8{ "--role", "not-real" };
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .invalid_role => |value| try std.testing.expectEqualStrings("not-real", value),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions rejects unknown option" {
+    const args = [_][]const u8{ "--controller-ulr", "http://127.0.0.1:3001" };
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .unknown_option => |value| try std.testing.expectEqualStrings("--controller-ulr", value),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions rejects unsupported future options" {
+    const args = [_][]const u8{ "--workspace", "/workspace" };
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .unsupported_option => |value| try std.testing.expectEqualStrings("--workspace", value),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions rejects missing short option value" {
+    const args = [_][]const u8{"-p"};
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .missing_value => |value| try std.testing.expectEqualStrings("-p", value),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions rejects unknown short option" {
+    const args = [_][]const u8{"-x"};
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .unknown_option => |value| try std.testing.expectEqualStrings("-x", value),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions rejects controller url in shared role" {
+    const args = [_][]const u8{ "--controller-url", "http://127.0.0.1:3001" };
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .option_requires_role => |info| {
+            try std.testing.expectEqualStrings("--controller-url", info.option);
+            try std.testing.expectEqual(GatewayRole.broker, info.role);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions allows controller url for user_cell role" {
+    const args = [_][]const u8{
+        "--role",
+        "user_cell",
+        "--user-id",
+        "42",
+        "--controller-url",
+        "http://127.0.0.1:3001",
+        "--advertise-url",
+        "http://nullalis-cell-42.zaki.svc.cluster.local:3000",
+    };
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .ok => |options| {
+            try std.testing.expectEqual(GatewayRole.user_cell, options.role);
+            try std.testing.expectEqualStrings("42", options.user_id.?);
+            try std.testing.expectEqualStrings("http://127.0.0.1:3001", options.controller_url.?);
+            try std.testing.expectEqualStrings("http://nullalis-cell-42.zaki.svc.cluster.local:3000", options.advertise_url.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions rejects advertise url outside user_cell role" {
+    const args = [_][]const u8{ "--role", "broker", "--advertise-url", "http://example.invalid:3000" };
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .option_requires_role => |info| {
+            try std.testing.expectEqualStrings("--advertise-url", info.option);
+            try std.testing.expectEqual(GatewayRole.user_cell, info.role);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGatewayRoleLaunchOptions requires advertise url when controller url is set for user_cell" {
+    const args = [_][]const u8{
+        "--role",
+        "user_cell",
+        "--user-id",
+        "42",
+        "--controller-url",
+        "http://127.0.0.1:3001",
+    };
+    switch (parseGatewayRoleLaunchOptions(&args)) {
+        .missing_option_for_role => |info| {
+            try std.testing.expectEqualStrings("--advertise-url", info.option);
+            try std.testing.expectEqual(GatewayRole.user_cell, info.role);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "defaultControllerPort increments gateway port when possible" {
+    try std.testing.expectEqual(@as(u16, 3001), defaultControllerPort(3000));
+    try std.testing.expectEqual(std.math.maxInt(u16), defaultControllerPort(std.math.maxInt(u16)));
+}
+
+test "isLoopbackBindHost recognizes loopback addresses only" {
+    try std.testing.expect(isLoopbackBindHost("127.0.0.1"));
+    try std.testing.expect(isLoopbackBindHost("localhost"));
+    try std.testing.expect(isLoopbackBindHost("::1"));
+    try std.testing.expect(!isLoopbackBindHost("0.0.0.0"));
+    try std.testing.expect(!isLoopbackBindHost("::"));
+    try std.testing.expect(!isLoopbackBindHost("10.0.0.5"));
+}
+
+test "parseControllerBindOptions defaults to gateway host plus one port" {
+    const args = [_][]const u8{};
+    switch (parseControllerBindOptions("127.0.0.1", 3001, &args)) {
+        .ok => |options| {
+            try std.testing.expectEqualStrings("127.0.0.1", options.host);
+            try std.testing.expectEqual(@as(u16, 3001), options.port);
+            try std.testing.expectEqualStrings("default", options.cell_namespace);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseControllerBindOptions parses host and port" {
+    const args = [_][]const u8{ "--host", "0.0.0.0", "--port", "4401", "--cell-namespace", "zaki-bot-staging" };
+    switch (parseControllerBindOptions("127.0.0.1", 3001, &args)) {
+        .ok => |options| {
+            try std.testing.expectEqualStrings("0.0.0.0", options.host);
+            try std.testing.expectEqual(@as(u16, 4401), options.port);
+            try std.testing.expectEqualStrings("zaki-bot-staging", options.cell_namespace);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseControllerBindOptions rejects unknown option" {
+    const args = [_][]const u8{ "--role", "broker" };
+    switch (parseControllerBindOptions("127.0.0.1", 3001, &args)) {
+        .unknown_option => |value| try std.testing.expectEqualStrings("--role", value),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "resolveCronBackendMode auto selects postgres for tenant postgres config" {
