@@ -5,6 +5,7 @@ const cell_spec = @import("cell_spec.zig");
 const SERVICE_ACCOUNT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 const SERVICE_ACCOUNT_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 const KUBE_REQUEST_TIMEOUT_SECS = "10";
+const WORKSPACE_PREP_MOUNT_PATH = "/mnt/nullalis-shared";
 
 pub const RuntimeConfig = struct {
     api_server_url: []const u8,
@@ -297,6 +298,22 @@ fn workspaceSubpath(allocator: std.mem.Allocator, runtime: RuntimeConfig, desire
     );
 }
 
+fn workspaceUserRootSubpath(allocator: std.mem.Allocator, runtime: RuntimeConfig, desired: cell_spec.DesiredCellSpec) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ runtime.workspace_subpath_root, desired.user_id },
+    );
+}
+
+fn homeSubpath(allocator: std.mem.Allocator, runtime: RuntimeConfig, desired: cell_spec.DesiredCellSpec) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/.home",
+        .{ runtime.workspace_subpath_root, desired.user_id },
+    );
+}
+
 fn readTrimmedFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
@@ -541,17 +558,51 @@ pub fn buildPodManifest(
     defer allocator.free(port_arg);
     const home_path = try std.fmt.allocPrint(allocator, "{s}/.home", .{runtime.workspace_mount_path});
     defer allocator.free(home_path);
+    const workspace_root_subpath = try workspaceUserRootSubpath(allocator, runtime, desired);
+    defer allocator.free(workspace_root_subpath);
     const workspace_subpath = try workspaceSubpath(allocator, runtime, desired);
     defer allocator.free(workspace_subpath);
+    const home_subpath = try homeSubpath(allocator, runtime, desired);
+    defer allocator.free(home_subpath);
+    const workspace_prep_command = try std.fmt.allocPrint(
+        allocator,
+        "set -eu; test -f {s}/{s}; mkdir -p {s}/{s} {s}/{s}; chown {d}:{d} {s}/{s} {s}/{s} {s}/{s} 2>/dev/null || true; chmod 0770 {s}/{s} {s}/{s} {s}/{s} 2>/dev/null || true",
+        .{
+            WORKSPACE_PREP_MOUNT_PATH,
+            runtime.config_subpath,
+            WORKSPACE_PREP_MOUNT_PATH,
+            workspace_subpath,
+            WORKSPACE_PREP_MOUNT_PATH,
+            home_subpath,
+            runtime.run_as_user,
+            runtime.run_as_group,
+            WORKSPACE_PREP_MOUNT_PATH,
+            workspace_root_subpath,
+            WORKSPACE_PREP_MOUNT_PATH,
+            workspace_subpath,
+            WORKSPACE_PREP_MOUNT_PATH,
+            home_subpath,
+            WORKSPACE_PREP_MOUNT_PATH,
+            workspace_root_subpath,
+            WORKSPACE_PREP_MOUNT_PATH,
+            workspace_subpath,
+            WORKSPACE_PREP_MOUNT_PATH,
+            home_subpath,
+        },
+    );
+    defer allocator.free(workspace_prep_command);
 
     try writer.print(
-        "{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"name\":{f},\"namespace\":{f},\"labels\":{{\"app.kubernetes.io/name\":\"nullalis-user-cell\",\"nullalis.ai/cell\":{f},\"app.kubernetes.io/managed-by\":\"nullalis-controller\"}}}},\"spec\":{{\"restartPolicy\":\"Always\",\"serviceAccountName\":{f},\"automountServiceAccountToken\":false,\"securityContext\":{{\"fsGroup\":{d}}},\"containers\":[{{\"name\":\"nullalis\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"args\":[\"gateway\",\"--role\",\"user_cell\",\"--user-id\",{f},\"--controller-url\",{f},\"--advertise-url\",{f},\"--host\",\"0.0.0.0\",\"--port\",{f}],\"ports\":[{{\"name\":\"http\",\"containerPort\":{d}}}],\"env\":[{{\"name\":\"NULLALIS_CONFIG_PATH\",\"value\":{f}}},{{\"name\":\"NULLCLAW_WORKSPACE\",\"value\":{f}}},{{\"name\":\"HOME\",\"value\":{f}}},{{\"name\":\"NULLCLAW_ALLOW_PUBLIC_BIND\",\"value\":\"true\"}}",
+        "{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"name\":{f},\"namespace\":{f},\"labels\":{{\"app.kubernetes.io/name\":\"nullalis-user-cell\",\"nullalis.ai/cell\":{f},\"app.kubernetes.io/managed-by\":\"nullalis-controller\"}}}},\"spec\":{{\"restartPolicy\":\"Always\",\"serviceAccountName\":{f},\"automountServiceAccountToken\":false,\"securityContext\":{{\"fsGroup\":{d}}},\"initContainers\":[{{\"name\":\"prepare-workspace\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"command\":[\"/bin/sh\",\"-lc\",{f}],\"securityContext\":{{\"runAsUser\":0,\"runAsGroup\":0,\"allowPrivilegeEscalation\":false}},\"volumeMounts\":[{{\"name\":\"shared-workspace\",\"mountPath\":{f}}},{{\"name\":\"tmp\",\"mountPath\":\"/tmp\"}}]}}],\"containers\":[{{\"name\":\"nullalis\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"args\":[\"gateway\",\"--role\",\"user_cell\",\"--user-id\",{f},\"--controller-url\",{f},\"--advertise-url\",{f},\"--host\",\"0.0.0.0\",\"--port\",{f}],\"ports\":[{{\"name\":\"http\",\"containerPort\":{d}}}],\"env\":[{{\"name\":\"NULLALIS_CONFIG_PATH\",\"value\":{f}}},{{\"name\":\"NULLCLAW_WORKSPACE\",\"value\":{f}}},{{\"name\":\"HOME\",\"value\":{f}}},{{\"name\":\"NULLCLAW_ALLOW_PUBLIC_BIND\",\"value\":\"true\"}}",
         .{
             std.json.fmt(desired.pod_name, .{}),
             std.json.fmt(desired.namespace, .{}),
             std.json.fmt(desired.service_name, .{}),
             std.json.fmt(runtime.cell_service_account_name, .{}),
             runtime.fs_group,
+            std.json.fmt(runtime.cell_image, .{}),
+            std.json.fmt(workspace_prep_command, .{}),
+            std.json.fmt(WORKSPACE_PREP_MOUNT_PATH, .{}),
             std.json.fmt(runtime.cell_image, .{}),
             std.json.fmt(desired.user_id, .{}),
             std.json.fmt(runtime.controller_url, .{}),
@@ -575,7 +626,7 @@ pub fn buildPodManifest(
         .{std.json.fmt(runtime.cell_secret_name, .{})},
     );
     try writer.print(
-        "],\"resources\":{{\"requests\":{{\"cpu\":{f},\"memory\":{f}}},\"limits\":{{\"cpu\":{f},\"memory\":{f}}}}},\"securityContext\":{{\"runAsNonRoot\":true,\"runAsUser\":{d},\"runAsGroup\":{d},\"allowPrivilegeEscalation\":false}},\"volumeMounts\":[{{\"name\":\"shared-workspace\",\"mountPath\":{f},\"subPath\":{f}}},{{\"name\":\"shared-workspace\",\"mountPath\":{f},\"subPath\":{f},\"readOnly\":true}},{{\"name\":\"tmp\",\"mountPath\":\"/tmp\"}}]}}],\"volumes\":[{{\"name\":\"shared-workspace\",\"persistentVolumeClaim\":{{\"claimName\":{f}}}}},{{\"name\":\"tmp\",\"emptyDir\":{{}}}}]}}}}",
+        "],\"startupProbe\":{{\"httpGet\":{{\"path\":\"/ready\",\"port\":\"http\"}},\"failureThreshold\":30,\"periodSeconds\":2,\"timeoutSeconds\":2}},\"readinessProbe\":{{\"httpGet\":{{\"path\":\"/ready\",\"port\":\"http\"}},\"failureThreshold\":3,\"periodSeconds\":2,\"timeoutSeconds\":2}},\"livenessProbe\":{{\"httpGet\":{{\"path\":\"/health\",\"port\":\"http\"}},\"failureThreshold\":3,\"periodSeconds\":10,\"timeoutSeconds\":2}},\"resources\":{{\"requests\":{{\"cpu\":{f},\"memory\":{f}}},\"limits\":{{\"cpu\":{f},\"memory\":{f}}}}},\"securityContext\":{{\"runAsNonRoot\":true,\"runAsUser\":{d},\"runAsGroup\":{d},\"allowPrivilegeEscalation\":false}},\"volumeMounts\":[{{\"name\":\"shared-workspace\",\"mountPath\":{f},\"subPath\":{f}}},{{\"name\":\"shared-workspace\",\"mountPath\":{f},\"subPath\":{f},\"readOnly\":true}},{{\"name\":\"tmp\",\"mountPath\":\"/tmp\"}}]}}],\"volumes\":[{{\"name\":\"shared-workspace\",\"persistentVolumeClaim\":{{\"claimName\":{f}}}}},{{\"name\":\"tmp\",\"emptyDir\":{{}}}}]}}}}",
         .{
             std.json.fmt(runtime.cpu_request, .{}),
             std.json.fmt(runtime.memory_request, .{}),
@@ -653,10 +704,17 @@ test "buildPodManifest includes controller and advertise args" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"NULLCLAW_INTERNAL_SERVICE_TOKEN\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"serviceAccountName\":\"nullclaw\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"automountServiceAccountToken\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"prepare-workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"command\":[\"/bin/sh\",\"-lc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "/mnt/nullalis-shared/.nullalis/config.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "users/42/.home") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"secretRef\":{\"name\":\"nullclaw-runtime-secrets\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"NULLALIS_CONFIG_PATH\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"claimName\":\"nullclaw-data-rwx-v2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"subPath\":\"users/42/workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"startupProbe\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"readinessProbe\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"livenessProbe\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"runAsNonRoot\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"cpu\":\"250m\"") != null);
 

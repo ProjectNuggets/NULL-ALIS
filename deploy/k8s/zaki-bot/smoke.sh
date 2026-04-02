@@ -83,9 +83,9 @@ scheduler_backend="$(jq -r '.startup_self_check.scheduler_backend // ""' <<<"${d
 
 if [[ "${PGBOUNCER_EXPECTED}" == "true" ]]; then
   echo "[1b] verify runtime is routed via PgBouncer"
-  pg_port="$(jq -r '.startup_self_check.pg_port // ""' <<<"${diagnostics_json}")"
+  pg_port="$(jq -r '.startup_self_check.postgres_port // .startup_self_check.pg_port // ""' <<<"${diagnostics_json}")"
   if [[ "${pg_port}" != "6432" ]]; then
-    echo "expected pg_port=6432 (PgBouncer), got: ${pg_port}" >&2
+    echo "expected postgres_port=6432 (PgBouncer), got: ${pg_port}" >&2
     exit 1
   fi
 fi
