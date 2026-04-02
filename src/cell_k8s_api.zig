@@ -14,6 +14,7 @@ pub const RuntimeConfig = struct {
     cell_image: []const u8,
     controller_url: []const u8,
     cell_service_account_name: []const u8,
+    cell_runtime_env_configmap_name: []const u8,
     cell_secret_name: []const u8,
     shared_workspace_claim: []const u8,
     workspace_subpath_root: []const u8,
@@ -35,6 +36,7 @@ pub const RuntimeConfig = struct {
         allocator.free(self.cell_image);
         allocator.free(self.controller_url);
         allocator.free(self.cell_service_account_name);
+        allocator.free(self.cell_runtime_env_configmap_name);
         allocator.free(self.cell_secret_name);
         allocator.free(self.shared_workspace_claim);
         allocator.free(self.workspace_subpath_root);
@@ -213,6 +215,8 @@ fn buildRuntimeConfig(
     errdefer allocator.free(controller_url);
     const cell_service_account_name = try readOptionalEnvOrDefault(allocator, "NULLCLAW_CELL_SERVICE_ACCOUNT_NAME", "default");
     errdefer allocator.free(cell_service_account_name);
+    const cell_runtime_env_configmap_name = try readRequiredEnv(allocator, "NULLCLAW_CELL_RUNTIME_ENV_CONFIGMAP_NAME");
+    errdefer allocator.free(cell_runtime_env_configmap_name);
     const cell_secret_name = try readRequiredEnv(allocator, "NULLCLAW_CELL_SECRET_NAME");
     errdefer allocator.free(cell_secret_name);
     const shared_workspace_claim = try readRequiredEnv(allocator, "NULLCLAW_CELL_SHARED_WORKSPACE_CLAIM");
@@ -244,6 +248,7 @@ fn buildRuntimeConfig(
         .cell_image = owned_cell_image,
         .controller_url = controller_url,
         .cell_service_account_name = cell_service_account_name,
+        .cell_runtime_env_configmap_name = cell_runtime_env_configmap_name,
         .cell_secret_name = cell_secret_name,
         .shared_workspace_claim = shared_workspace_claim,
         .workspace_subpath_root = workspace_subpath_root,
@@ -622,6 +627,10 @@ pub fn buildPodManifest(
     }
     try writer.writeAll("],\"envFrom\":[");
     try writer.print(
+        "{{\"configMapRef\":{{\"name\":{f}}}}},",
+        .{std.json.fmt(runtime.cell_runtime_env_configmap_name, .{})},
+    );
+    try writer.print(
         "{{\"secretRef\":{{\"name\":{f}}}}}",
         .{std.json.fmt(runtime.cell_secret_name, .{})},
     );
@@ -673,6 +682,7 @@ test "buildPodManifest includes controller and advertise args" {
         .cell_image = try std.testing.allocator.dupe(u8, "ghcr.io/projectnuggets/nullalis:test"),
         .controller_url = try std.testing.allocator.dupe(u8, "http://nullalis-controller.zaki.svc.cluster.local:3001"),
         .cell_service_account_name = try std.testing.allocator.dupe(u8, "nullclaw"),
+        .cell_runtime_env_configmap_name = try std.testing.allocator.dupe(u8, "nullclaw-runtime-env"),
         .cell_secret_name = try std.testing.allocator.dupe(u8, "nullclaw-runtime-secrets"),
         .shared_workspace_claim = try std.testing.allocator.dupe(u8, "nullclaw-data-rwx-v2"),
         .workspace_subpath_root = try std.testing.allocator.dupe(u8, "users"),
@@ -708,6 +718,7 @@ test "buildPodManifest includes controller and advertise args" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"command\":[\"/bin/sh\",\"-lc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "/mnt/nullalis-shared/.nullalis/config.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "users/42/.home") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"configMapRef\":{\"name\":\"nullclaw-runtime-env\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"secretRef\":{\"name\":\"nullclaw-runtime-secrets\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"NULLALIS_CONFIG_PATH\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"claimName\":\"nullclaw-data-rwx-v2\"") != null);

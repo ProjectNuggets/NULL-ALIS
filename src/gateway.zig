@@ -480,6 +480,7 @@ pub const GatewayState = struct {
     internal_token_policy_reason: []const u8 = "",
     tenant_enabled: bool = false,
     tenant_data_root: []const u8 = DEFAULT_TENANT_DATA_ROOT,
+    workspace_dir: []const u8 = ".",
     tenant_runtime_cache_max_users: u32 = 2048,
     tenant_runtime_idle_ttl_secs: u32 = 1800,
     ownership_lock_enabled: bool = false,
@@ -645,6 +646,8 @@ const UserContext = struct {
         allocator.free(self.secrets_dir);
     }
 };
+
+const USER_CELL_STATE_DIR = ".nullalis";
 
 const TenantRuntime = struct {
     const TENANT_SEED_SCHEMA_VERSION: []const u8 = "2026-03-18-v1";
@@ -2235,6 +2238,30 @@ fn usesPostgresTenantState(state: *const GatewayState) bool {
     return state.zaki_state != null;
 }
 
+fn userCellUserRootPath(allocator: std.mem.Allocator, workspace_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_path, USER_CELL_STATE_DIR });
+}
+
+fn userCellHeartbeatRuntimePath(allocator: std.mem.Allocator, workspace_path: []const u8) ![]u8 {
+    const user_root = try userCellUserRootPath(allocator, workspace_path);
+    defer allocator.free(user_root);
+    return std.fmt.allocPrint(allocator, "{s}/heartbeat_runtime.json", .{user_root});
+}
+
+fn normalizeWorkspacePath(allocator: std.mem.Allocator, workspace_path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(workspace_path)) {
+        return allocator.dupe(u8, workspace_path);
+    }
+    return std.fs.cwd().realpathAlloc(allocator, workspace_path) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+            defer allocator.free(cwd);
+            break :blk try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, workspace_path });
+        },
+        else => return err,
+    };
+}
+
 fn resolveUserContext(allocator: std.mem.Allocator, state: *const GatewayState, user_id: []const u8) !UserContext {
     if (!isValidIdentifier(user_id)) return error.InvalidUserId;
     if (state.role == .user_cell) {
@@ -2244,11 +2271,16 @@ fn resolveUserContext(allocator: std.mem.Allocator, state: *const GatewayState, 
     if (usesPostgresTenantState(state)) {
         _ = parseNumericUserId(user_id) catch return error.InvalidUserId;
     }
-    const user_root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ state.tenant_data_root, user_id });
-    errdefer allocator.free(user_root);
-
-    const workspace_path = try std.fmt.allocPrint(allocator, "{s}/workspace", .{user_root});
+    const workspace_path = if (state.role == .user_cell)
+        try normalizeWorkspacePath(allocator, state.workspace_dir)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}/workspace", .{ state.tenant_data_root, user_id });
     errdefer allocator.free(workspace_path);
+    const user_root = if (state.role == .user_cell)
+        try userCellUserRootPath(allocator, workspace_path)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ state.tenant_data_root, user_id });
+    errdefer allocator.free(user_root);
     const memory_db_path = try std.fmt.allocPrint(allocator, "{s}/memory.db", .{user_root});
     errdefer allocator.free(memory_db_path);
     const cron_path = try std.fmt.allocPrint(allocator, "{s}/cron.json", .{user_root});
@@ -2490,6 +2522,12 @@ const HeartbeatRuntimeSummary = struct {
     last_run_s: ?i64 = null,
     last_status: ?[]const u8 = null,
     last_reason: ?[]const u8 = null,
+
+    fn deinit(self: *HeartbeatRuntimeSummary, allocator: std.mem.Allocator) void {
+        if (self.last_status) |value| allocator.free(value);
+        if (self.last_reason) |value| allocator.free(value);
+        self.* = .{};
+    }
 };
 
 const NormalizedTelegramReadiness = struct {
@@ -2691,7 +2729,10 @@ fn loadHeartbeatRuntimeSummary(
     if (user_id_opt == null) return .{};
 
     const user_id = user_id_opt.?;
-    const path = std.fmt.allocPrint(allocator, "{s}/{s}/heartbeat_runtime.json", .{ state.tenant_data_root, user_id }) catch return .{};
+    const path = if (state.role == .user_cell)
+        userCellHeartbeatRuntimePath(allocator, state.workspace_dir) catch return .{}
+    else
+        std.fmt.allocPrint(allocator, "{s}/{s}/heartbeat_runtime.json", .{ state.tenant_data_root, user_id }) catch return .{};
     defer allocator.free(path);
 
     const raw = readFileOrDefault(allocator, path, "") catch return .{};
@@ -2706,8 +2747,8 @@ fn loadHeartbeatRuntimeSummary(
     return .{
         .available = true,
         .last_run_s = if (obj.get("last_run_s")) |v| if (v == .integer) @as(?i64, v.integer) else null else null,
-        .last_status = if (obj.get("last_status")) |v| if (v == .string) v.string else null else null,
-        .last_reason = if (obj.get("last_reason")) |v| if (v == .string) v.string else null else null,
+        .last_status = if (obj.get("last_status")) |v| if (v == .string) allocator.dupe(u8, v.string) catch null else null else null,
+        .last_reason = if (obj.get("last_reason")) |v| if (v == .string) allocator.dupe(u8, v.string) catch null else null else null,
     };
 }
 
@@ -5141,7 +5182,8 @@ fn appendHeartbeatRuntimeSummaryJson(
     user_id_opt: ?[]const u8,
     heartbeat_enabled_opt: ?bool,
 ) !void {
-    const summary = loadHeartbeatRuntimeSummary(allocator, state, user_id_opt);
+    var summary = loadHeartbeatRuntimeSummary(allocator, state, user_id_opt);
+    defer summary.deinit(allocator);
     const last_status: ?[]const u8 = if (heartbeat_enabled_opt != null and !heartbeat_enabled_opt.?)
         "disabled"
     else
@@ -5878,7 +5920,8 @@ fn internalDiagnosticsPayload(
         };
         defer allocator.free(onboarding_content);
         onboarding_summary = parseOnboardingStateSummary(onboarding_content);
-        const heartbeat_runtime_summary = loadHeartbeatRuntimeSummary(allocator, state, user_id_opt);
+        var heartbeat_runtime_summary = loadHeartbeatRuntimeSummary(allocator, state, user_id_opt);
+        defer heartbeat_runtime_summary.deinit(allocator);
         if (heartbeat_enabled_normalized) |enabled| {
             proactive_status = proactiveStatusLabel(enabled, heartbeat_runtime_summary);
         }
@@ -10419,6 +10462,7 @@ pub fn runWithRole(
         state.require_explicit_chat_stream_session_key = cfg.gateway.require_explicit_chat_stream_session_key;
         state.tenant_enabled = cfg.tenant.enabled;
         state.tenant_data_root = cfg.tenant.data_root;
+        state.workspace_dir = cfg.workspace_dir;
         state.tenant_runtime_cache_max_users = cfg.tenant.runtime_cache_max_users;
         state.tenant_runtime_idle_ttl_secs = cfg.tenant.runtime_idle_ttl_secs;
         if (std.mem.eql(u8, cfg.state.backend, "postgres")) init_state: {
@@ -11908,6 +11952,7 @@ test "user_cell users provision route rejects mismatched user" {
     state.pinned_user_id = "1";
     state.tenant_enabled = true;
     state.tenant_data_root = tenant_root;
+    state.workspace_dir = tenant_root;
     const internal_tokens = [_][]const u8{"test-internal-token"};
     state.internal_service_tokens = &internal_tokens;
 
@@ -11949,6 +11994,7 @@ test "user_cell chat stream route uses pinned user without header" {
     state.pinned_user_id = "1";
     state.tenant_enabled = true;
     state.tenant_data_root = tenant_root;
+    state.workspace_dir = tenant_root;
     const internal_tokens = [_][]const u8{"test-internal-token"};
     state.internal_service_tokens = &internal_tokens;
 
@@ -13944,6 +13990,55 @@ test "resolveUserContext rejects mismatched user in user_cell mode" {
     gs.pinned_user_id = "42";
 
     try std.testing.expectError(error.UserCellUserMismatch, resolveUserContext(allocator, &gs, "7"));
+}
+
+test "resolveUserContext uses mounted workspace contract in user_cell mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_dir);
+
+    var gs = GatewayState.init(std.testing.allocator);
+    defer gs.deinit();
+    gs.role = .user_cell;
+    gs.pinned_user_id = "42";
+    gs.workspace_dir = workspace_dir;
+
+    var user_ctx = try resolveUserContext(std.testing.allocator, &gs, "42");
+    defer user_ctx.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(workspace_dir, user_ctx.workspace_path);
+    const expected_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.nullalis", .{workspace_dir});
+    defer std.testing.allocator.free(expected_root);
+    try std.testing.expectEqualStrings(expected_root, user_ctx.user_root);
+    const expected_secrets = try std.fmt.allocPrint(std.testing.allocator, "{s}/secrets", .{expected_root});
+    defer std.testing.allocator.free(expected_secrets);
+    try std.testing.expectEqualStrings(expected_secrets, user_ctx.secrets_dir);
+}
+
+test "loadHeartbeatRuntimeSummary reads user_cell runtime state from workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath(".nullalis");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".nullalis/heartbeat_runtime.json",
+        .data = "{\"last_run_s\":123,\"last_status\":\"sent\",\"last_reason\":\"none\"}\n",
+    });
+    const workspace_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_dir);
+
+    var gs = GatewayState.init(std.testing.allocator);
+    defer gs.deinit();
+    gs.role = .user_cell;
+    gs.workspace_dir = workspace_dir;
+
+    var summary = loadHeartbeatRuntimeSummary(std.testing.allocator, &gs, "42");
+    defer summary.deinit(std.testing.allocator);
+    try std.testing.expect(summary.available);
+    try std.testing.expectEqual(@as(?i64, 123), summary.last_run_s);
+    try std.testing.expectEqualStrings("sent", summary.last_status.?);
 }
 
 test "handleBrokerCellControlRoute requires internal auth" {
