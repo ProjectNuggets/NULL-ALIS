@@ -17,3 +17,6 @@ resources:
   - 13-pgbouncer-deployment.yaml
   - 14-pgbouncer-service.yaml
   - 15-pgbouncer-pdb.yaml
+  - 16-controller-rbac.yaml
+  - 17-controller-service.yaml
+  - 18-controller-deployment.yaml

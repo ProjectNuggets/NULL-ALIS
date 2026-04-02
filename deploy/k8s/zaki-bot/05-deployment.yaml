@@ -50,10 +50,10 @@ spec:
             - -c
             - |
               set -eu
-              export HOME=/nullclaw-data
-              export NULLALIS_CONFIG_PATH=/nullclaw-data/.nullalis/config.json
+              export HOME=/data
+              export NULLALIS_CONFIG_PATH=/data/.nullalis/config.json
 
-              mkdir -p /nullclaw-data/.nullalis
+              mkdir -p /data/.nullalis
               mkdir -p "${TENANT_DATA_ROOT}"
 
               POSTGRES_RUNTIME_CONNECTION_STRING="${POSTGRES_CONNECTION_STRING}"
@@ -100,6 +100,17 @@ spec:
               require_uint POSTGRES_POOL_MAX "${POSTGRES_POOL_MAX}"
               require_uint POSTGRES_STATEMENT_TIMEOUT_MS "${POSTGRES_STATEMENT_TIMEOUT_MS}"
               require_uint POSTGRES_LOCK_TIMEOUT_MS "${POSTGRES_LOCK_TIMEOUT_MS}"
+              case "${GATEWAY_ROLE}" in
+                shared|broker) ;;
+                *)
+                  echo "invalid gateway role: ${GATEWAY_ROLE}" >&2
+                  exit 1
+                  ;;
+              esac
+              if [ "${GATEWAY_ROLE}" = "broker" ] && [ -z "${NULLCLAW_CONTROLLER_URL:-}" ]; then
+                echo "broker mode requires NULLCLAW_CONTROLLER_URL" >&2
+                exit 1
+              fi
               TOGETHER_API_KEY_ESC="$(json_escape "${TOGETHER_API_KEY}")"
               INTERNAL_SERVICE_TOKEN_ESC="$(json_escape "${INTERNAL_SERVICE_TOKEN}")"
               GATEWAY_HOST_ESC="$(json_escape "${GATEWAY_HOST}")"
@@ -113,7 +124,7 @@ spec:
               TELEGRAM_WEBHOOK_SECRET_ESC="$(json_escape "${TELEGRAM_WEBHOOK_SECRET}")"
               TELEGRAM_ALLOW_FROM_ESC="$(json_escape "${TELEGRAM_ALLOW_FROM}")"
 
-              cat > /nullclaw-data/.nullalis/config.json <<JSON
+              cat > /data/.nullalis/config.json <<JSON
               {
                 "agents": {
                   "defaults": {
@@ -179,6 +190,9 @@ spec:
               }
               JSON
 
+              if [ "${GATEWAY_ROLE}" = "broker" ]; then
+                exec nullalis gateway --host "${GATEWAY_HOST}" --port "${GATEWAY_PORT}" --role broker --controller-url "${NULLCLAW_CONTROLLER_URL}"
+              fi
               exec nullalis gateway --host "${GATEWAY_HOST}" --port "${GATEWAY_PORT}"
           volumeMounts:
             - name: tenant-data

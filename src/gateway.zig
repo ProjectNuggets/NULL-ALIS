@@ -315,6 +315,29 @@ pub const IdempotencyStore = struct {
 // ── Gateway server ───────────────────────────────────────────────
 
 const TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY: usize = 256;
+const USER_CELL_REGISTRATION_REFRESH_SECS: u64 = 5;
+
+pub const GatewayRole = enum {
+    shared,
+    broker,
+    user_cell,
+};
+
+fn gatewayRoleNeedsLocalAgent(role: GatewayRole, has_event_bus: bool) bool {
+    if (has_event_bus) return false;
+    return switch (role) {
+        .shared => true,
+        .user_cell => false,
+        .broker => false,
+    };
+}
+
+fn gatewayRoleOwnsTenantExecution(role: GatewayRole) bool {
+    return switch (role) {
+        .shared, .user_cell => true,
+        .broker => false,
+    };
+}
 
 const TenantTelegramAsyncJobQueue = struct {
     buf: [TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY]*anyopaque = undefined,
@@ -421,6 +444,12 @@ const UserPreparationGate = struct {
 /// Gateway server state, shared across request handlers.
 pub const GatewayState = struct {
     allocator: std.mem.Allocator,
+    role: GatewayRole = .shared,
+    controller_url: ?[]const u8 = null,
+    advertise_url: ?[]const u8 = null,
+    advertise_url_owned: bool = false,
+    pinned_user_id: ?[]const u8 = null,
+    pinned_user_id_owned: bool = false,
     rate_limiter: GatewayRateLimiter,
     idempotency: IdempotencyStore,
     whatsapp_verify_token: []const u8,
@@ -558,6 +587,12 @@ pub const GatewayState = struct {
         }
         if (self.owner_instance_id_owned and self.owner_instance_id.len > 0) {
             self.allocator.free(self.owner_instance_id);
+        }
+        if (self.advertise_url_owned) {
+            if (self.advertise_url) |value| self.allocator.free(value);
+        }
+        if (self.pinned_user_id_owned) {
+            if (self.pinned_user_id) |value| self.allocator.free(value);
         }
         if (self.zaki_state) |mgr| {
             mgr.deinit();
@@ -1120,6 +1155,11 @@ fn getTenantRuntime(
     config: *const Config,
     user_ctx: *const UserContext,
 ) !*TenantRuntime {
+    if (!gatewayRoleOwnsTenantExecution(state.role)) return error.ExecutionDelegated;
+    if (state.role == .user_cell) {
+        const pinned_user_id = state.pinned_user_id orelse return error.UserCellUserMismatch;
+        if (!std.mem.eql(u8, pinned_user_id, user_ctx.user_id)) return error.UserCellUserMismatch;
+    }
     const now_s = std.time.timestamp();
     state.tenant_runtime_mutex.lock();
     defer state.tenant_runtime_mutex.unlock();
@@ -1184,6 +1224,673 @@ pub const ReadyResponse = struct {
     /// Whether body was allocated and should be freed by caller.
     allocated: bool,
 };
+
+const BrokerCellControlRoute = enum {
+    resolve,
+    ensure,
+    status,
+    drain,
+};
+
+const BrokerCellControlResponse = struct {
+    status: []const u8,
+    body: []const u8,
+    allocated: bool = false,
+};
+
+const BrokerResolvedCell = struct {
+    const State = enum {
+        pending,
+        warm,
+        draining,
+    };
+
+    found: bool,
+    cell_url: ?[]u8 = null,
+    state: State = .pending,
+
+    fn deinit(self: *BrokerResolvedCell, allocator: std.mem.Allocator) void {
+        if (self.cell_url) |cell_url| allocator.free(cell_url);
+        self.* = undefined;
+    }
+};
+
+const BrokerProxyTarget = struct {
+    target_url: []u8,
+    cell_token: []const u8,
+
+    fn deinit(self: *BrokerProxyTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.target_url);
+        self.* = undefined;
+    }
+};
+
+const ParsedUpstreamResponseHeader = struct {
+    status_code: u16,
+    body_offset: usize,
+};
+
+fn brokerCellControlRouteName(route: BrokerCellControlRoute) []const u8 {
+    return switch (route) {
+        .resolve => "resolve",
+        .ensure => "ensure",
+        .status => "status",
+        .drain => "drain",
+    };
+}
+
+fn controllerUrlWithPath(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8) ![]u8 {
+    const trimmed = std.mem.trimRight(u8, base_url, "/");
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ trimmed, path });
+}
+
+fn normalizeAdvertiseUrl(allocator: std.mem.Allocator, raw_url: []const u8) ![]u8 {
+    var trimmed = std.mem.trim(u8, raw_url, " \t\r\n");
+    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
+        trimmed = trimmed[0 .. trimmed.len - 1];
+    }
+    if (trimmed.len == 0) return error.InvalidAdvertiseUrl;
+    if (!std.mem.startsWith(u8, trimmed, "http://") and !std.mem.startsWith(u8, trimmed, "https://")) {
+        return error.InvalidAdvertiseUrl;
+    }
+    return allocator.dupe(u8, trimmed);
+}
+
+fn httpStatusLineFromCode(status_code: u16) []const u8 {
+    return switch (status_code) {
+        200 => "200 OK",
+        201 => "201 Created",
+        202 => "202 Accepted",
+        204 => "204 No Content",
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        403 => "403 Forbidden",
+        404 => "404 Not Found",
+        405 => "405 Method Not Allowed",
+        409 => "409 Conflict",
+        422 => "422 Unprocessable Entity",
+        429 => "429 Too Many Requests",
+        500 => "500 Internal Server Error",
+        501 => "501 Not Implemented",
+        502 => "502 Bad Gateway",
+        503 => "503 Service Unavailable",
+        504 => "504 Gateway Timeout",
+        else => "500 Internal Server Error",
+    };
+}
+
+fn buildCellEnsurePayload(allocator: std.mem.Allocator, user_id: []const u8, cell_url: ?[]const u8) ![]u8 {
+    if (cell_url) |value| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"user_id\":{f},\"cell_url\":{f}}}",
+            .{ std.json.fmt(user_id, .{}), std.json.fmt(value, .{}) },
+        );
+    }
+    return std.fmt.allocPrint(allocator, "{{\"user_id\":{f}}}", .{std.json.fmt(user_id, .{})});
+}
+
+fn extractRequestTarget(raw_request: []const u8) ?[]const u8 {
+    const first_line_end = std.mem.indexOf(u8, raw_request, "\r\n") orelse return null;
+    const first_line = raw_request[0..first_line_end];
+    var parts = std.mem.splitScalar(u8, first_line, ' ');
+    _ = parts.next() orelse return null;
+    return parts.next();
+}
+
+fn performBrokerControllerRequest(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    route: BrokerCellControlRoute,
+    method: []const u8,
+    request_body: ?[]const u8,
+    user_id: ?[]const u8,
+) BrokerCellControlResponse {
+    if (state.role != .broker) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"not found\"}" };
+    }
+    const controller_url = state.controller_url orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"controller_unavailable\"}" };
+    };
+    const controller_token = firstConfiguredInternalServiceToken(state.internal_service_tokens) orelse
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"controller_token_missing\"}" };
+
+    const path = switch (route) {
+        .resolve => "/internal/cells/resolve",
+        .ensure => "/internal/cells/ensure",
+        .status => "/internal/cells/status",
+        .drain => "/internal/cells/drain",
+    };
+    const url = controllerUrlWithPath(allocator, controller_url, path) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"controller_url_invalid\"}" };
+    };
+    defer allocator.free(url);
+
+    const token_header = std.fmt.allocPrint(allocator, "X-Internal-Token: {s}", .{controller_token}) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"controller_headers_failed\"}" };
+    };
+    defer allocator.free(token_header);
+
+    var user_id_header_storage: ?[]u8 = null;
+    defer if (user_id_header_storage) |header| allocator.free(header);
+
+    var headers_buf: [4][]const u8 = undefined;
+    var headers_len: usize = 0;
+    headers_buf[headers_len] = "User-Agent: nullalis-broker/1.0";
+    headers_len += 1;
+    headers_buf[headers_len] = token_header;
+    headers_len += 1;
+    if (user_id) |value| {
+        user_id_header_storage = std.fmt.allocPrint(allocator, "X-Zaki-User-Id: {s}", .{value}) catch null;
+        if (user_id_header_storage) |header| {
+            headers_buf[headers_len] = header;
+            headers_len += 1;
+        }
+    }
+
+    const controller_response = http_util.curlRequest(
+        allocator,
+        method,
+        url,
+        headers_buf[0..headers_len],
+        request_body,
+        null,
+        "10",
+    ) catch {
+        return .{ .status = "502 Bad Gateway", .body = "{\"error\":\"controller_request_failed\"}" };
+    };
+    defer allocator.free(controller_response.body);
+
+    const body = allocator.dupe(u8, controller_response.body) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"controller_response_copy_failed\"}" };
+    };
+    return .{
+        .status = httpStatusLineFromCode(controller_response.status_code),
+        .body = body,
+        .allocated = true,
+    };
+}
+
+fn parseBrokerResolvedCell(allocator: std.mem.Allocator, body: []const u8) !BrokerResolvedCell {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidControllerResponse;
+
+    const found_value = parsed.value.object.get("found") orelse return error.InvalidControllerResponse;
+    if (found_value != .bool) return error.InvalidControllerResponse;
+
+    var out = BrokerResolvedCell{ .found = found_value.bool };
+    if (parsed.value.object.get("cell")) |cell_value| {
+        if (cell_value != .object) return error.InvalidControllerResponse;
+        if (cell_value.object.get("state")) |state_value| {
+            out.state = switch (state_value) {
+                .string => |value| blk: {
+                    if (std.mem.eql(u8, value, "pending")) break :blk .pending;
+                    if (std.mem.eql(u8, value, "warm")) break :blk .warm;
+                    if (std.mem.eql(u8, value, "draining")) break :blk .draining;
+                    return error.InvalidControllerResponse;
+                },
+                else => return error.InvalidControllerResponse,
+            };
+        }
+        if (cell_value.object.get("cell_url")) |cell_url_value| {
+            switch (cell_url_value) {
+                .null => {},
+                .string => |value| out.cell_url = try allocator.dupe(u8, value),
+                else => return error.InvalidControllerResponse,
+            }
+        }
+    }
+    return out;
+}
+
+fn parseUpstreamResponseHeader(buffer: []const u8) !ParsedUpstreamResponseHeader {
+    const header_end = std.mem.indexOf(u8, buffer, "\r\n\r\n") orelse return error.NeedMoreData;
+    const first_line_end = std.mem.indexOf(u8, buffer, "\r\n") orelse return error.InvalidUpstreamResponse;
+    const first_line = buffer[0..first_line_end];
+    if (!std.mem.startsWith(u8, first_line, "HTTP/")) return error.InvalidUpstreamResponse;
+
+    var parts = std.mem.splitScalar(u8, first_line, ' ');
+    _ = parts.next() orelse return error.InvalidUpstreamResponse;
+    const status_code_raw = parts.next() orelse return error.InvalidUpstreamResponse;
+    const status_code = std.fmt.parseInt(u16, status_code_raw, 10) catch return error.InvalidUpstreamResponse;
+    return .{
+        .status_code = status_code,
+        .body_offset = header_end + 4,
+    };
+}
+
+fn resolveBrokerCell(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id: []const u8,
+) !BrokerResolvedCell {
+    const payload = try buildCellEnsurePayload(allocator, user_id, null);
+    defer allocator.free(payload);
+
+    const response = performBrokerControllerRequest(allocator, state, .resolve, "POST", payload, user_id);
+    defer if (response.allocated) allocator.free(@constCast(response.body));
+    if (!std.mem.eql(u8, response.status, "200 OK")) return error.ControllerResolveFailed;
+
+    return parseBrokerResolvedCell(allocator, response.body);
+}
+
+fn ensureBrokerCell(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id: []const u8,
+) !BrokerResolvedCell {
+    const payload = try buildCellEnsurePayload(allocator, user_id, null);
+    defer allocator.free(payload);
+
+    const response = performBrokerControllerRequest(allocator, state, .ensure, "POST", payload, user_id);
+    defer if (response.allocated) allocator.free(@constCast(response.body));
+    if (!std.mem.eql(u8, response.status, "200 OK")) return error.ControllerEnsureFailed;
+
+    return parseBrokerResolvedCell(allocator, response.body);
+}
+
+fn prepareBrokerProxyTarget(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    user_id: []const u8,
+    target: []const u8,
+) !BrokerProxyTarget {
+    var resolved = try resolveBrokerCell(allocator, state, user_id);
+    defer resolved.deinit(allocator);
+
+    if (!resolved.found) {
+        var ensured = try ensureBrokerCell(allocator, state, user_id);
+        defer ensured.deinit(allocator);
+        return switch (ensured.state) {
+            .pending => error.CellPending,
+            .draining => error.CellDraining,
+            .warm => if (ensured.cell_url == null) error.CellUnavailable else .{
+                .target_url = try controllerUrlWithPath(allocator, ensured.cell_url.?, target),
+                .cell_token = firstConfiguredInternalServiceToken(state.internal_service_tokens) orelse return error.CellTokenMissing,
+            },
+        };
+    }
+    switch (resolved.state) {
+        .pending => return error.CellPending,
+        .draining => return error.CellDraining,
+        .warm => {},
+    }
+    if (resolved.cell_url == null) return error.CellUnavailable;
+
+    const cell_token = firstConfiguredInternalServiceToken(state.internal_service_tokens) orelse
+        return error.CellTokenMissing;
+    const target_url = try controllerUrlWithPath(allocator, resolved.cell_url.?, target);
+    return .{
+        .target_url = target_url,
+        .cell_token = cell_token,
+    };
+}
+
+fn brokerProxyFailureResponse(
+    allocator: std.mem.Allocator,
+    content_type: []const u8,
+    status: []const u8,
+    code: []const u8,
+    message: []const u8,
+) RouteResponse {
+    if (std.mem.eql(u8, content_type, "text/event-stream; charset=utf-8")) {
+        const body = sseErrorEvent(allocator, code, message) catch
+            "event: error\ndata: {\"type\":\"error\",\"code\":\"broker_proxy_failed\",\"message\":\"broker proxy failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
+        return .{
+            .status = status,
+            .body = body,
+            .content_type = content_type,
+        };
+    }
+    return .{
+        .status = status,
+        .body = std.fmt.allocPrint(allocator, "{{\"error\":{f}}}", .{std.json.fmt(code, .{})}) catch "{\"error\":\"broker_proxy_failed\"}",
+        .content_type = content_type,
+    };
+}
+
+fn brokerProxyApiRequest(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    raw_request: []const u8,
+    method: []const u8,
+    target: []const u8,
+    user_id: []const u8,
+    content_type: []const u8,
+    timeout_secs: []const u8,
+) RouteResponse {
+    var proxy_target = prepareBrokerProxyTarget(allocator, state, user_id, target) catch |err| {
+        return switch (err) {
+            error.CellPending => brokerProxyFailureResponse(
+                allocator,
+                content_type,
+                "503 Service Unavailable",
+                "cell_starting",
+                "user cell is starting",
+            ),
+            error.CellDraining => brokerProxyFailureResponse(
+                allocator,
+                content_type,
+                "503 Service Unavailable",
+                "cell_draining",
+                "user cell is draining",
+            ),
+            error.CellUnavailable => brokerProxyFailureResponse(
+                allocator,
+                content_type,
+                "503 Service Unavailable",
+                "cell_unavailable",
+                "user cell is not registered",
+            ),
+            error.CellTokenMissing => brokerProxyFailureResponse(
+                allocator,
+                content_type,
+                "503 Service Unavailable",
+                "cell_token_missing",
+                "cell token missing",
+            ),
+            else => brokerProxyFailureResponse(
+                allocator,
+                content_type,
+                "502 Bad Gateway",
+                "controller_request_failed",
+                "controller request failed",
+            ),
+        };
+    };
+    defer proxy_target.deinit(allocator);
+
+    const token_header = std.fmt.allocPrint(allocator, "X-Internal-Token: {s}", .{proxy_target.cell_token}) catch {
+        return brokerProxyFailureResponse(
+            allocator,
+            content_type,
+            "500 Internal Server Error",
+            "cell_headers_failed",
+            "cell headers failed",
+        );
+    };
+    defer allocator.free(token_header);
+    const user_header = std.fmt.allocPrint(allocator, "X-Zaki-User-Id: {s}", .{user_id}) catch {
+        return brokerProxyFailureResponse(
+            allocator,
+            content_type,
+            "500 Internal Server Error",
+            "cell_headers_failed",
+            "cell headers failed",
+        );
+    };
+    defer allocator.free(user_header);
+
+    var content_type_header_storage: ?[]u8 = null;
+    defer if (content_type_header_storage) |value| allocator.free(value);
+
+    var headers_buf: [4][]const u8 = undefined;
+    var headers_len: usize = 0;
+    headers_buf[headers_len] = "User-Agent: nullalis-broker/1.0";
+    headers_len += 1;
+    headers_buf[headers_len] = token_header;
+    headers_len += 1;
+    headers_buf[headers_len] = user_header;
+    headers_len += 1;
+    if (extractHeader(raw_request, "Content-Type")) |header_value| {
+        content_type_header_storage = std.fmt.allocPrint(allocator, "Content-Type: {s}", .{header_value}) catch null;
+        if (content_type_header_storage) |header| {
+            headers_buf[headers_len] = header;
+            headers_len += 1;
+        }
+    }
+
+    const request_body = if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD")) null else extractBody(raw_request);
+    const proxy_response = http_util.curlRequest(
+        allocator,
+        method,
+        proxy_target.target_url,
+        headers_buf[0..headers_len],
+        request_body,
+        null,
+        timeout_secs,
+    ) catch {
+        return brokerProxyFailureResponse(
+            allocator,
+            content_type,
+            "502 Bad Gateway",
+            "cell_request_failed",
+            "user cell request failed",
+        );
+    };
+    return .{
+        .status = httpStatusLineFromCode(proxy_response.status_code),
+        .body = proxy_response.body,
+        .content_type = content_type,
+    };
+}
+
+fn sendStreamingProxyResponseHeader(stream: anytype, status: []const u8, content_type: []const u8) !void {
+    var header_buf: [512]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n",
+        .{ status, content_type },
+    );
+    try stream.writeAll(header);
+}
+
+fn brokerProxyChatStreamSseConnection(
+    allocator: std.mem.Allocator,
+    stream: anytype,
+    state: *const GatewayState,
+    raw_request: []const u8,
+    method: []const u8,
+    target: []const u8,
+    user_id: []const u8,
+) void {
+    var proxy_target = prepareBrokerProxyTarget(allocator, state, user_id, target) catch |err| {
+        switch (err) {
+            error.CellPending => sendSseErrorResponse(stream, allocator, "503 Service Unavailable", "cell_starting", "user cell is starting"),
+            error.CellDraining => sendSseErrorResponse(stream, allocator, "503 Service Unavailable", "cell_draining", "user cell is draining"),
+            error.CellUnavailable => sendSseErrorResponse(stream, allocator, "503 Service Unavailable", "cell_unavailable", "user cell is not registered"),
+            error.CellTokenMissing => sendSseErrorResponse(stream, allocator, "503 Service Unavailable", "cell_token_missing", "cell token missing"),
+            else => sendSseErrorResponse(stream, allocator, "502 Bad Gateway", "controller_request_failed", "controller request failed"),
+        }
+        return;
+    };
+    defer proxy_target.deinit(allocator);
+
+    var argv_buf: [64][]const u8 = undefined;
+    var argc: usize = 0;
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-sS";
+    argc += 1;
+    argv_buf[argc] = "-N";
+    argc += 1;
+    argv_buf[argc] = "--include";
+    argc += 1;
+    argv_buf[argc] = "--max-time";
+    argc += 1;
+    argv_buf[argc] = "3600";
+    argc += 1;
+    argv_buf[argc] = "--request";
+    argc += 1;
+    argv_buf[argc] = method;
+    argc += 1;
+    argv_buf[argc] = "-H";
+    argc += 1;
+    argv_buf[argc] = "User-Agent: nullalis-broker/1.0";
+    argc += 1;
+
+    const token_header = std.fmt.allocPrint(allocator, "X-Internal-Token: {s}", .{proxy_target.cell_token}) catch {
+        sendSseErrorResponse(stream, allocator, "500 Internal Server Error", "cell_headers_failed", "cell headers failed");
+        return;
+    };
+    defer allocator.free(token_header);
+    argv_buf[argc] = "-H";
+    argc += 1;
+    argv_buf[argc] = token_header;
+    argc += 1;
+
+    const user_header = std.fmt.allocPrint(allocator, "X-Zaki-User-Id: {s}", .{user_id}) catch {
+        sendSseErrorResponse(stream, allocator, "500 Internal Server Error", "cell_headers_failed", "cell headers failed");
+        return;
+    };
+    defer allocator.free(user_header);
+    argv_buf[argc] = "-H";
+    argc += 1;
+    argv_buf[argc] = user_header;
+    argc += 1;
+
+    var content_type_header_storage: ?[]u8 = null;
+    defer if (content_type_header_storage) |value| allocator.free(value);
+    if (extractHeader(raw_request, "Content-Type")) |header_value| {
+        content_type_header_storage = std.fmt.allocPrint(allocator, "Content-Type: {s}", .{header_value}) catch null;
+        if (content_type_header_storage) |header| {
+            argv_buf[argc] = "-H";
+            argc += 1;
+            argv_buf[argc] = header;
+            argc += 1;
+        }
+    }
+
+    const request_body = if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD")) null else extractBody(raw_request);
+    if (request_body != null) {
+        argv_buf[argc] = "--data-binary";
+        argc += 1;
+        argv_buf[argc] = "@-";
+        argc += 1;
+    }
+
+    argv_buf[argc] = proxy_target.target_url;
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = if (request_body != null) .Pipe else .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch {
+        sendSseErrorResponse(stream, allocator, "502 Bad Gateway", "cell_request_failed", "user cell request failed");
+        return;
+    };
+
+    if (request_body) |body| {
+        if (child.stdin) |stdin_file| {
+            stdin_file.writeAll(body) catch {
+                stdin_file.close();
+                child.stdin = null;
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                sendSseErrorResponse(stream, allocator, "502 Bad Gateway", "cell_request_failed", "user cell request failed");
+                return;
+            };
+            stdin_file.close();
+            child.stdin = null;
+        } else {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            sendSseErrorResponse(stream, allocator, "502 Bad Gateway", "cell_request_failed", "user cell request failed");
+            return;
+        }
+    }
+
+    var response_started = false;
+    var header_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer header_bytes.deinit(allocator);
+    var read_buf: [4096]u8 = undefined;
+    while (true) {
+        const n = child.stdout.?.read(&read_buf) catch {
+            if (!response_started) {
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                sendSseErrorResponse(stream, allocator, "502 Bad Gateway", "cell_request_failed", "user cell request failed");
+            }
+            return;
+        };
+        if (n == 0) break;
+        const chunk = read_buf[0..n];
+
+        if (!response_started) {
+            header_bytes.appendSlice(allocator, chunk) catch {
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                sendSseErrorResponse(stream, allocator, "500 Internal Server Error", "cell_response_buffer_failed", "user cell response buffering failed");
+                return;
+            };
+
+            const parsed = parseUpstreamResponseHeader(header_bytes.items) catch |err| switch (err) {
+                error.NeedMoreData => continue,
+                else => {
+                    _ = child.kill() catch {};
+                    _ = child.wait() catch {};
+                    sendSseErrorResponse(stream, allocator, "502 Bad Gateway", "cell_response_invalid", "user cell response invalid");
+                    return;
+                },
+            };
+
+            sendStreamingProxyResponseHeader(stream, httpStatusLineFromCode(parsed.status_code), "text/event-stream; charset=utf-8") catch {
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                return;
+            };
+            response_started = true;
+
+            const body_chunk = header_bytes.items[parsed.body_offset..];
+            if (body_chunk.len > 0) {
+                stream.writeAll(body_chunk) catch {
+                    _ = child.kill() catch {};
+                    _ = child.wait() catch {};
+                    return;
+                };
+            }
+            header_bytes.clearRetainingCapacity();
+            continue;
+        }
+
+        stream.writeAll(chunk) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return;
+        };
+    }
+
+    const term = child.wait() catch {
+        if (!response_started) {
+            sendSseErrorResponse(stream, allocator, "502 Bad Gateway", "cell_request_failed", "user cell request failed");
+        }
+        return;
+    };
+
+    if (!response_started) {
+        _ = term;
+        sendSseErrorResponse(stream, allocator, "502 Bad Gateway", "cell_response_invalid", "user cell response invalid");
+    }
+}
+
+fn handleBrokerCellControlRoute(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+    raw: []const u8,
+    method: []const u8,
+    route: BrokerCellControlRoute,
+) BrokerCellControlResponse {
+    const required_method = switch (route) {
+        .status => "GET",
+        .resolve, .ensure, .drain => "POST",
+    };
+    if (!std.mem.eql(u8, method, required_method)) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    if (!validateInternalServiceToken(raw, state)) {
+        return .{ .status = "401 Unauthorized", .body = "{\"error\":\"unauthorized\"}" };
+    }
+    return performBrokerControllerRequest(
+        allocator,
+        state,
+        route,
+        required_method,
+        if (std.mem.eql(u8, required_method, "POST")) extractBody(raw) else null,
+        extractHeader(raw, "X-Zaki-User-Id"),
+    );
+}
 
 /// Handle the /ready endpoint logic. Queries the global health registry
 /// and returns the appropriate HTTP status and JSON body.
@@ -1399,7 +2106,7 @@ fn extractInternalServiceToken(raw: []const u8) ?[]const u8 {
     return null;
 }
 
-const InternalTokenValidationResult = struct {
+pub const InternalTokenValidationResult = struct {
     ok: bool,
     configured: bool,
     reason: ?[]const u8 = null,
@@ -1428,7 +2135,7 @@ fn isInternalTokenDenylisted(token: []const u8) bool {
     return false;
 }
 
-fn validateInternalTokensForMode(
+pub fn validateInternalTokensForMode(
     internal_service_tokens: []const []const u8,
     production_like: bool,
 ) InternalTokenValidationResult {
@@ -1471,6 +2178,14 @@ fn validateInternalTokensForMode(
         .configured = has_non_empty,
         .reason = null,
     };
+}
+
+fn firstConfiguredInternalServiceToken(internal_service_tokens: []const []const u8) ?[]const u8 {
+    for (internal_service_tokens) |token_raw| {
+        const token = std.mem.trim(u8, token_raw, " \t\r\n");
+        if (token.len > 0) return token;
+    }
+    return null;
 }
 
 fn validateInternalServiceTokenWithPolicy(
@@ -1522,6 +2237,10 @@ fn usesPostgresTenantState(state: *const GatewayState) bool {
 
 fn resolveUserContext(allocator: std.mem.Allocator, state: *const GatewayState, user_id: []const u8) !UserContext {
     if (!isValidIdentifier(user_id)) return error.InvalidUserId;
+    if (state.role == .user_cell) {
+        const pinned_user_id = state.pinned_user_id orelse return error.InvalidUserId;
+        if (!std.mem.eql(u8, pinned_user_id, user_id)) return error.UserCellUserMismatch;
+    }
     if (usesPostgresTenantState(state)) {
         _ = parseNumericUserId(user_id) catch return error.InvalidUserId;
     }
@@ -1577,6 +2296,59 @@ fn ensureUserProvisioned(state: *GatewayState, ctx: *const UserContext) !void {
         ensureFileWithDefault(ctx.heartbeat_path, "{}\n") catch {};
         ensureFileWithDefault(ctx.channel_state_path, "{}\n") catch {};
     }
+}
+
+const GatewayUserIdResolutionError = error{
+    MissingUserId,
+    UserCellUserMismatch,
+};
+
+fn resolveGatewayRequestUserId(
+    state: *const GatewayState,
+    primary_user_id: ?[]const u8,
+    fallback_user_id: ?[]const u8,
+    tenant_requires_primary_header: bool,
+) GatewayUserIdResolutionError![]const u8 {
+    if (state.role == .user_cell) {
+        const pinned_user_id = state.pinned_user_id orelse return error.MissingUserId;
+        if (primary_user_id) |value| {
+            if (!std.mem.eql(u8, value, pinned_user_id)) return error.UserCellUserMismatch;
+        }
+        if (fallback_user_id) |value| {
+            if (!std.mem.eql(u8, value, pinned_user_id)) return error.UserCellUserMismatch;
+        }
+        return pinned_user_id;
+    }
+    if (tenant_requires_primary_header and state.tenant_enabled and primary_user_id == null) {
+        return error.MissingUserId;
+    }
+    return primary_user_id orelse fallback_user_id orelse error.MissingUserId;
+}
+
+fn resolveGatewayPathUserId(
+    state: *const GatewayState,
+    path_user_id: []const u8,
+) GatewayUserIdResolutionError![]const u8 {
+    if (state.role == .user_cell) {
+        const pinned_user_id = state.pinned_user_id orelse return error.MissingUserId;
+        if (!std.mem.eql(u8, path_user_id, pinned_user_id)) return error.UserCellUserMismatch;
+        return pinned_user_id;
+    }
+    return path_user_id;
+}
+
+fn resolveGatewayOptionalUserId(
+    state: *const GatewayState,
+    user_id_opt: ?[]const u8,
+) GatewayUserIdResolutionError!?[]const u8 {
+    if (state.role == .user_cell) {
+        const pinned_user_id = state.pinned_user_id orelse return error.MissingUserId;
+        if (user_id_opt) |value| {
+            if (!std.mem.eql(u8, value, pinned_user_id)) return error.UserCellUserMismatch;
+        }
+        return pinned_user_id;
+    }
+    return user_id_opt;
 }
 
 fn isIdentityUserNotFound(err: anyerror) bool {
@@ -2516,6 +3288,10 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
     }
 
     const tenant_runtime = getTenantRuntime(job.state, job.config, &user_ctx) catch |err| {
+        if (err == error.ExecutionDelegated) {
+            log.info("tenant telegram async skipped: gateway role delegates execution", .{});
+            return;
+        }
         log.warn("tenant telegram async runtime init failed: {}", .{err});
         return;
     };
@@ -6224,14 +7000,27 @@ fn handleApiChatStreamSseConnection(
         return true;
     };
     const header_user_id = extractZakiUserId(raw_request);
-    if (state.tenant_enabled and header_user_id == null) {
-        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_user_id", "missing X-Zaki-User-Id");
-        return true;
-    }
-    const user_id = header_user_id orelse jsonStringField(body, "user_id") orelse {
-        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_user_id", "missing X-Zaki-User-Id");
+    const user_id = resolveGatewayRequestUserId(state, header_user_id, jsonStringField(body, "user_id"), true) catch |err| {
+        const response = switch (err) {
+            error.MissingUserId => .{ "400 Bad Request", "missing_user_id", "missing X-Zaki-User-Id" },
+            error.UserCellUserMismatch => .{ "403 Forbidden", "wrong_user_cell", "request does not belong to this user cell" },
+        };
+        sendSseErrorResponse(stream, req_allocator, response[0], response[1], response[2]);
         return true;
     };
+    if (state.role == .broker) {
+        const target = extractRequestTarget(raw_request) orelse base_path;
+        brokerProxyChatStreamSseConnection(
+            req_allocator,
+            stream,
+            state,
+            raw_request,
+            method,
+            target,
+            user_id,
+        );
+        return true;
+    }
 
     var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
         sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "invalid_user", "invalid user");
@@ -6327,9 +7116,13 @@ fn handleApiChatStreamSseConnection(
                 sendSseErrorFrames(stream, req_allocator, "tenant_config_missing", "tenant runtime unavailable");
                 return true;
             };
-            const tenant_runtime = getTenantRuntime(state, cfg, &user_ctx) catch {
+            const tenant_runtime = getTenantRuntime(state, cfg, &user_ctx) catch |err| {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                sendSseErrorFrames(stream, req_allocator, "tenant_runtime_failed", "tenant runtime init failed");
+                if (err == error.ExecutionDelegated) {
+                    sendSseErrorFrames(stream, req_allocator, "execution_delegated", "broker mode does not execute locally");
+                } else {
+                    sendSseErrorFrames(stream, req_allocator, "tenant_runtime_failed", "tenant runtime init failed");
+                }
                 return true;
             };
             break :blk tenant_runtime.processMessage(
@@ -6527,16 +7320,22 @@ fn handleApiRoute(
             const body = sseErrorEvent(req_allocator, "gateway_draining", "gateway draining, retry shortly") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"gateway_draining\",\"message\":\"gateway draining\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
             return .{ .status = "503 Service Unavailable", .body = body, .content_type = "text/event-stream; charset=utf-8" };
         }
-
         const body = extractBody(raw_request) orelse {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
         };
         const header_user_id = extractZakiUserId(raw_request);
-        if (state.tenant_enabled and header_user_id == null) {
-            return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing X-Zaki-User-Id\"}" };
+        const user_id = resolveGatewayRequestUserId(state, header_user_id, jsonStringField(body, "user_id"), true) catch |err| {
+            return switch (err) {
+                error.MissingUserId => .{ .status = "400 Bad Request", .body = "{\"error\":\"missing X-Zaki-User-Id\"}" },
+                error.UserCellUserMismatch => .{ .status = "403 Forbidden", .body = "{\"error\":\"wrong_user_cell\"}" },
+            };
+        };
+        if (state.role == .broker) {
+            return .{
+                .status = "500 Internal Server Error",
+                .body = "{\"error\":\"chat_stream_requires_streaming_path\"}",
+            };
         }
-        const user_id = header_user_id orelse jsonStringField(body, "user_id") orelse
-            return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing X-Zaki-User-Id\"}" };
         var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
         };
@@ -6618,9 +7417,12 @@ fn handleApiRoute(
                         .content_type = "text/event-stream; charset=utf-8",
                     };
                 };
-                const tenant_runtime = getTenantRuntime(state, cfg, &user_ctx) catch {
+                const tenant_runtime = getTenantRuntime(state, cfg, &user_ctx) catch |err| {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                    const err_sse = sseErrorEvent(req_allocator, "tenant_runtime_failed", "tenant runtime init failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"tenant_runtime_failed\",\"message\":\"tenant runtime init failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
+                    const err_sse = if (err == error.ExecutionDelegated)
+                        sseErrorEvent(req_allocator, "execution_delegated", "broker mode does not execute locally") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"execution_delegated\",\"message\":\"broker mode does not execute locally\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n"
+                    else
+                        sseErrorEvent(req_allocator, "tenant_runtime_failed", "tenant runtime init failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"tenant_runtime_failed\",\"message\":\"tenant runtime init failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                     return .{
                         .status = "500 Internal Server Error",
                         .body = err_sse,
@@ -6700,8 +7502,25 @@ fn handleApiRoute(
         }
         const body = extractBody(raw_request);
         const body_user_id = if (body) |b| jsonStringField(b, "user_id") else null;
-        const user_id = extractZakiUserId(raw_request) orelse body_user_id orelse
-            return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing user_id\"}" };
+        const user_id = resolveGatewayRequestUserId(state, extractZakiUserId(raw_request), body_user_id, false) catch |err| {
+            return switch (err) {
+                error.MissingUserId => .{ .status = "400 Bad Request", .body = "{\"error\":\"missing user_id\"}" },
+                error.UserCellUserMismatch => .{ .status = "403 Forbidden", .body = "{\"error\":\"wrong_user_cell\"}" },
+            };
+        };
+        if (state.role == .broker) {
+            const target = extractRequestTarget(raw_request) orelse base_path;
+            return brokerProxyApiRequest(
+                req_allocator,
+                state,
+                raw_request,
+                method,
+                target,
+                user_id,
+                "application/json",
+                "30",
+            );
+        }
 
         var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
@@ -6727,8 +7546,27 @@ fn handleApiRoute(
 
     const parsed = parseUserPath(base_path) orelse
         return .{ .status = "404 Not Found", .body = "{\"error\":\"not found\"}" };
+    const scoped_user_id = resolveGatewayPathUserId(state, parsed.user_id) catch |err| {
+        return switch (err) {
+            error.MissingUserId => .{ .status = "400 Bad Request", .body = "{\"error\":\"missing user_id\"}" },
+            error.UserCellUserMismatch => .{ .status = "403 Forbidden", .body = "{\"error\":\"wrong_user_cell\"}" },
+        };
+    };
+    if (state.role == .broker) {
+        const target = extractRequestTarget(raw_request) orelse base_path;
+        return brokerProxyApiRequest(
+            req_allocator,
+            state,
+            raw_request,
+            method,
+            target,
+            scoped_user_id,
+            "application/json",
+            "30",
+        );
+    }
 
-    var user_ctx = resolveUserContext(req_allocator, state, parsed.user_id) catch {
+    var user_ctx = resolveUserContext(req_allocator, state, scoped_user_id) catch {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
     };
     defer user_ctx.deinit(req_allocator);
@@ -6771,7 +7609,7 @@ fn handleApiRoute(
         if (std.mem.eql(u8, method, "GET")) {
             var onboarding_content: []u8 = undefined;
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 onboarding_content = mgr.getOnboardingJson(req_allocator, user_id) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
                 };
@@ -6789,12 +7627,12 @@ fn handleApiRoute(
             var telegram_readiness = NormalizedTelegramReadiness{};
             defer telegram_readiness.deinit(req_allocator);
             if (build_options.enable_channel_telegram) {
-                telegram_readiness = loadNormalizedTelegramReadiness(req_allocator, state, parsed.user_id, &user_ctx) catch .{};
+                telegram_readiness = loadNormalizedTelegramReadiness(req_allocator, state, scoped_user_id, &user_ctx) catch .{};
             }
-            const heartbeat_enabled_normalized = loadNormalizedHeartbeatEnabled(req_allocator, state, parsed.user_id, user_ctx.heartbeat_path);
+            const heartbeat_enabled_normalized = loadNormalizedHeartbeatEnabled(req_allocator, state, scoped_user_id, user_ctx.heartbeat_path);
             const setup = buildOnboardingSetupResponse(
                 req_allocator,
-                parsed.user_id,
+                scoped_user_id,
                 summary,
                 telegram_readiness,
                 heartbeat_enabled_normalized,
@@ -6857,7 +7695,7 @@ fn handleApiRoute(
             }
             w.writeAll("}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 mgr.putOnboardingJson(user_id, out.items) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
@@ -6879,7 +7717,7 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "config")) {
         if (std.mem.eql(u8, method, "GET")) {
             const raw_content = if (state.zaki_state) |mgr| blk: {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 break :blk mgr.getConfigJson(req_allocator, user_id) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
                 };
@@ -6902,7 +7740,7 @@ fn handleApiRoute(
 
     if (std.mem.eql(u8, parsed.subpath, "settings")) {
         const existing_config = if (state.zaki_state) |mgr| blk: {
-            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
             break :blk mgr.getConfigJson(req_allocator, user_id) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
             };
@@ -6938,7 +7776,7 @@ fn handleApiRoute(
             };
             defer req_allocator.free(merged);
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 mgr.putConfigJson(user_id, merged) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
@@ -6950,7 +7788,7 @@ fn handleApiRoute(
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
             }
-            removeTenantRuntime(state, parsed.user_id);
+            removeTenantRuntime(state, scoped_user_id);
             const response = user_settings.renderSettingsJson(req_allocator, updated_settings) catch "{\"status\":\"updated\"}";
             return .{ .body = response };
         }
@@ -6961,7 +7799,7 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "heartbeat")) {
         if (std.mem.eql(u8, method, "GET")) {
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 const content = mgr.getHeartbeatJson(req_allocator, user_id) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
                 };
@@ -6990,7 +7828,7 @@ fn handleApiRoute(
                 if (enabled) "true" else "false",
             }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 mgr.putHeartbeatJson(user_id, canonical_body) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
@@ -7007,7 +7845,7 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "cron")) {
         if (std.mem.eql(u8, method, "GET")) {
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 const content = mgr.getJobsJson(req_allocator, user_id) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
                 };
@@ -7021,7 +7859,7 @@ fn handleApiRoute(
         if (std.mem.eql(u8, method, "POST") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "PUT")) {
             const body = extractBody(raw_request) orelse "[]\n";
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 mgr.replaceJobsJson(user_id, "main", body) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
@@ -7034,7 +7872,7 @@ fn handleApiRoute(
         }
         if (std.mem.eql(u8, method, "DELETE")) {
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 mgr.clearJobs(user_id) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
                 };
@@ -7059,7 +7897,7 @@ fn handleApiRoute(
             var owned_secret: ?[]u8 = null;
             defer if (owned_secret) |v| req_allocator.free(v);
             const value_text: []const u8 = if (state.zaki_state) |mgr| blk: {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 const secret_value = mgr.getSecret(req_allocator, user_id, secret_key) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
                 };
@@ -7092,7 +7930,7 @@ fn handleApiRoute(
                 }
             }
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 const write_value = if (std.mem.eql(u8, secret_key, "telegram_bot_token"))
                     normalizeTelegramBotToken(value)
                 else
@@ -7113,7 +7951,7 @@ fn handleApiRoute(
         }
         if (std.mem.eql(u8, method, "DELETE")) {
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 const deleted = mgr.deleteSecret(user_id, secret_key) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete failed\"}" };
                 };
@@ -7134,7 +7972,7 @@ fn handleApiRoute(
             .status = "501 Not Implemented",
             .body = "{\"error\":\"state backend does not support channel bindings\"}",
         };
-        const user_id_numeric = parseNumericUserId(parsed.user_id) catch return .{
+        const user_id_numeric = parseNumericUserId(scoped_user_id) catch return .{
             .status = "400 Bad Request",
             .body = "{\"error\":\"invalid user\"}",
         };
@@ -7280,7 +8118,7 @@ fn handleApiRoute(
                 return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid bot_token\"}" };
             }
             if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
                 mgr.putSecret(user_id, "telegram_bot_token", normalized_tok) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
                 };
@@ -7319,12 +8157,12 @@ fn handleApiRoute(
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc failed\"}" };
             };
             if (jsonStringField(body, "webhook_base_url")) |base_url| {
-                break :blk buildWebhookUrlForUser(req_allocator, base_url, parsed.user_id) catch {
+                break :blk buildWebhookUrlForUser(req_allocator, base_url, scoped_user_id) catch {
                     return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid webhook_base_url (https required)\"}" };
                 };
             }
             if (extractHeader(raw_request, "X-Webhook-Base-Url")) |base_header| {
-                break :blk buildWebhookUrlForUser(req_allocator, std.mem.trim(u8, base_header, " \t\r\n"), parsed.user_id) catch {
+                break :blk buildWebhookUrlForUser(req_allocator, std.mem.trim(u8, base_header, " \t\r\n"), scoped_user_id) catch {
                     return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid X-Webhook-Base-Url (https required)\"}" };
                 };
             }
@@ -7392,7 +8230,7 @@ fn handleApiRoute(
         jsonWriteStringArray(sw, allow_from) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"state build failed\"}" };
         sw.print(",\"connected_at\":{d}}}", .{std.time.timestamp()}) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"state build failed\"}" };
         if (state.zaki_state) |mgr| {
-            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
             mgr.putTelegramStateJson(user_id, state_payload.items) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
             };
@@ -7423,7 +8261,7 @@ fn handleApiRoute(
         defer req_allocator.free(secret_path);
         const body_bot_token = jsonStringField(body, "bot_token");
         const stored_bot_token = if (state.zaki_state) |mgr| blk: {
-            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
             const secret_value = mgr.getSecret(req_allocator, user_id, "telegram_bot_token") catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed reading bot token\"}" };
             };
@@ -7451,7 +8289,7 @@ fn handleApiRoute(
         }
 
         if (state.zaki_state) |mgr| {
-            const user_id = parseNumericUserId(parsed.user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
             mgr.deleteTelegramState(user_id) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" };
             };
@@ -7921,9 +8759,14 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         .canonical, .degraded_compat => break :blk canonical_decision.session_key.?,
                     }
                 };
-                const tenant_runtime = getTenantRuntime(ctx.state, cfg, &tenant_user_ctx.?) catch {
-                    ctx.response_status = "500 Internal Server Error";
-                    ctx.response_body = "{\"error\":\"tenant runtime init failed\"}";
+                const tenant_runtime = getTenantRuntime(ctx.state, cfg, &tenant_user_ctx.?) catch |err| {
+                    if (err == error.ExecutionDelegated) {
+                        ctx.response_status = "503 Service Unavailable";
+                        ctx.response_body = "{\"error\":\"execution_delegated\"}";
+                    } else {
+                        ctx.response_status = "500 Internal Server Error";
+                        ctx.response_body = "{\"error\":\"tenant runtime init failed\"}";
+                    }
                     return;
                 };
                 var typing_channel = channels.telegram.TelegramChannel.init(
@@ -8869,7 +9712,7 @@ fn handleAcceptedConnection(
     defer _ = state.in_flight_requests.fetchSub(1, .acq_rel);
 
     // Simple routing — control endpoints + descriptor-driven channel webhooks + ZAKI API.
-    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, drain, undrain, shutdown };
+    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, cell_resolve, cell_ensure, cell_status, cell_drain, drain, undrain, shutdown };
     const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
         .{ "/health", .health },
         .{ "/ready", .ready },
@@ -8879,6 +9722,10 @@ fn handleAcceptedConnection(
         .{ "/internal/diagnostics", .diagnostics },
         .{ "/internal/wake-heartbeat", .wake_heartbeat },
         .{ "/internal/tenant-runtime-cache/invalidate", .invalidate_tenant_runtime_cache },
+        .{ "/internal/cells/resolve", .cell_resolve },
+        .{ "/internal/cells/ensure", .cell_ensure },
+        .{ "/internal/cells/status", .cell_status },
+        .{ "/internal/cells/drain", .cell_drain },
         .{ "/internal/drain", .drain },
         .{ "/internal/undrain", .undrain },
         .{ "/internal/shutdown", .shutdown },
@@ -9111,7 +9958,12 @@ fn handleAcceptedConnection(
                 response_status = "401 Unauthorized";
                 response_body = "{\"error\":\"unauthorized\"}";
             } else {
-                const user_id = extractHeader(raw, "X-Zaki-User-Id");
+                const user_id = resolveGatewayOptionalUserId(state, extractHeader(raw, "X-Zaki-User-Id")) catch {
+                    response_status = "403 Forbidden";
+                    response_body = "{\"error\":\"wrong_user_cell\"}";
+                    sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+                    return;
+                };
                 response_body = internalDiagnosticsPayload(req_allocator, state, user_id) catch "{\"error\":\"diagnostics unavailable\"}";
             }
         },
@@ -9127,7 +9979,7 @@ fn handleAcceptedConnection(
                 const user_id_from_header = extractHeader(raw, "X-Zaki-User-Id");
                 var user_id_owned: ?[]u8 = null;
                 defer if (user_id_owned) |value| req_allocator.free(value);
-                const user_id = blk: {
+                const requested_user_id = blk: {
                     if (body) |b| {
                         if (jsonStringField(b, "user_id")) |value| break :blk value;
                         if (jsonIntField(b, "user_id")) |value| {
@@ -9136,6 +9988,13 @@ fn handleAcceptedConnection(
                         }
                     }
                     break :blk user_id_from_header;
+                };
+
+                const user_id = resolveGatewayOptionalUserId(state, requested_user_id) catch {
+                    response_status = "403 Forbidden";
+                    response_body = "{\"error\":\"wrong_user_cell\"}";
+                    sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+                    return;
                 };
 
                 const reason = if (body) |b| jsonStringField(b, "reason") orelse "internal_wake_hook" else "internal_wake_hook";
@@ -9175,17 +10034,48 @@ fn handleAcceptedConnection(
                 var requested: usize = 0;
                 var removed: usize = 0;
                 var missing: usize = 0;
-                if (request.all) {
+                if (state.role == .user_cell and request.all) {
+                    const pinned_user_id = state.pinned_user_id orelse {
+                        response_status = "400 Bad Request";
+                        response_body = "{\"error\":\"missing user_id\"}";
+                        sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+                        return;
+                    };
+                    requested = 1;
+                    if (state.tenant_runtimes.get(pinned_user_id) != null) {
+                        removeTenantRuntime(state, pinned_user_id);
+                        removed = 1;
+                    } else {
+                        missing = 1;
+                    }
+                } else if (request.all) {
                     requested = state.tenant_runtimes.count();
                     removed = clearAllTenantRuntimes(state);
                 } else {
                     requested = request.user_ids.len;
+                    if (state.role == .user_cell) {
+                        for (request.user_ids) |user_id| {
+                            _ = resolveGatewayPathUserId(state, user_id) catch {
+                                response_status = "403 Forbidden";
+                                response_body = "{\"error\":\"wrong_user_cell\"}";
+                                sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+                                return;
+                            };
+                        }
+                    }
                     for (request.user_ids) |user_id| {
-                        if (state.tenant_runtimes.get(user_id) != null) {
-                            removeTenantRuntime(state, user_id);
-                            removed += 1;
-                        } else {
-                            missing += 1;
+                        if (resolveGatewayPathUserId(state, user_id)) |scoped_user_id| {
+                            if (state.tenant_runtimes.get(scoped_user_id) != null) {
+                                removeTenantRuntime(state, scoped_user_id);
+                                removed += 1;
+                            } else {
+                                missing += 1;
+                            }
+                        } else |_| {
+                            response_status = "403 Forbidden";
+                            response_body = "{\"error\":\"wrong_user_cell\"}";
+                            sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+                            return;
                         }
                     }
                 }
@@ -9196,6 +10086,26 @@ fn handleAcceptedConnection(
                     .{ requested, removed, missing, if (request.all) "true" else "false" },
                 ) catch "{\"error\":\"response build failed\"}";
             }
+        },
+        .cell_resolve => {
+            const response = handleBrokerCellControlRoute(req_allocator, state, raw, method_str, .resolve);
+            response_status = response.status;
+            response_body = response.body;
+        },
+        .cell_ensure => {
+            const response = handleBrokerCellControlRoute(req_allocator, state, raw, method_str, .ensure);
+            response_status = response.status;
+            response_body = response.body;
+        },
+        .cell_status => {
+            const response = handleBrokerCellControlRoute(req_allocator, state, raw, method_str, .status);
+            response_status = response.status;
+            response_body = response.body;
+        },
+        .cell_drain => {
+            const response = handleBrokerCellControlRoute(req_allocator, state, raw, method_str, .drain);
+            response_status = response.status;
+            response_body = response.body;
         },
         .drain => {
             if (!std.mem.eql(u8, method_str, "POST")) {
@@ -9322,10 +10232,95 @@ fn gatewayWorkerMain(ctx: *GatewayWorkerContext) void {
 /// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
+    return runWithRole(allocator, host, port, config_ptr, event_bus, .shared, null, null, null);
+}
+
+fn registerUserCellWithController(
+    allocator: std.mem.Allocator,
+    state: *const GatewayState,
+) !void {
+    if (state.role != .user_cell) return;
+    const controller_url = state.controller_url orelse return;
+    const user_id = state.pinned_user_id orelse return error.UserCellRequiresPinnedUser;
+    const controller_token = firstConfiguredInternalServiceToken(state.internal_service_tokens) orelse
+        return error.ControllerTokenMissing;
+    const advertise_url = state.advertise_url orelse return error.UserCellRequiresAdvertiseUrl;
+    const payload = try buildCellEnsurePayload(allocator, user_id, advertise_url);
+    defer allocator.free(payload);
+
+    const ensure_url = try controllerUrlWithPath(allocator, controller_url, "/internal/cells/ensure");
+    defer allocator.free(ensure_url);
+    const token_header = try std.fmt.allocPrint(allocator, "X-Internal-Token: {s}", .{controller_token});
+    defer allocator.free(token_header);
+
+    const response = try http_util.curlRequest(
+        allocator,
+        "POST",
+        ensure_url,
+        &[_][]const u8{
+            "User-Agent: nullalis-user-cell/1.0",
+            token_header,
+            "Content-Type: application/json",
+        },
+        payload,
+        null,
+        "10",
+    );
+    defer allocator.free(response.body);
+
+    if (response.status_code != 200) return error.ControllerRegistrationFailed;
+}
+
+const UserCellRegistrationContext = struct {
+    state: *const GatewayState,
+};
+
+fn userCellRegistrationMain(ctx: *UserCellRegistrationContext) void {
+    while (!ctx.state.shutdown_requested.load(.acquire)) {
+        var slept_secs: u64 = 0;
+        while (slept_secs < USER_CELL_REGISTRATION_REFRESH_SECS and !ctx.state.shutdown_requested.load(.acquire)) : (slept_secs += 1) {
+            std.Thread.sleep(std.time.ns_per_s);
+        }
+        if (ctx.state.shutdown_requested.load(.acquire)) break;
+
+        registerUserCellWithController(std.heap.page_allocator, ctx.state) catch |err| {
+            log.warn("user cell controller re-registration failed: {}", .{err});
+        };
+    }
+}
+
+pub fn runWithRole(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    config_ptr: ?*const Config,
+    event_bus: ?*bus_mod.Bus,
+    role: GatewayRole,
+    controller_url: ?[]const u8,
+    advertise_url: ?[]const u8,
+    pinned_user_id: ?[]const u8,
+) !void {
     health.markComponentOk("gateway");
+
+    if (role == .user_cell and pinned_user_id == null) {
+        return error.UserCellRequiresPinnedUser;
+    }
+    if (role == .user_cell and controller_url != null and advertise_url == null) {
+        return error.UserCellRequiresAdvertiseUrl;
+    }
 
     var state = GatewayState.init(allocator);
     defer state.deinit();
+    state.role = role;
+    state.controller_url = controller_url;
+    if (advertise_url) |value| {
+        state.advertise_url = try normalizeAdvertiseUrl(allocator, value);
+        state.advertise_url_owned = true;
+    }
+    if (pinned_user_id) |value| {
+        state.pinned_user_id = try allocator.dupe(u8, value);
+        state.pinned_user_id_owned = true;
+    }
     state.event_bus = event_bus;
 
     var owned_config: ?Config = null;
@@ -9339,6 +10334,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
     }
     defer if (owned_config) |*c| c.deinit();
+    if (role == .user_cell and config_opt == null) {
+        return error.UserCellRequiresConfig;
+    }
 
     // Provider runtime bundle (primary + reliability wrapper) must outlive the accept loop.
     var provider_bundle_opt: ?providers.runtime_bundle.RuntimeProviderBundle = null;
@@ -9349,10 +10347,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
     var log_obs_gateway = observability.LogObserver{};
-    const needs_local_agent = event_bus == null;
+    const needs_local_agent = gatewayRoleNeedsLocalAgent(role, event_bus != null);
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
+        if (role == .user_cell and !cfg.tenant.enabled) {
+            return error.UserCellRequiresTenantMode;
+        }
         var postgres_init_error: ?anyerror = null;
         state.rate_limiter = GatewayRateLimiter.init(
             cfg.gateway.pair_rate_limit_per_minute,
@@ -9533,6 +10534,19 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     });
     defer server.deinit();
     setListenerNonBlocking(&server);
+    try registerUserCellWithController(allocator, &state);
+
+    var user_cell_registration_ctx = UserCellRegistrationContext{
+        .state = &state,
+    };
+    const user_cell_registration_thread = if (role == .user_cell and state.controller_url != null)
+        try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, userCellRegistrationMain, .{&user_cell_registration_ctx})
+    else
+        null;
+    defer if (user_cell_registration_thread) |thread| {
+        state.shutdown_requested.store(true, .release);
+        thread.join();
+    };
 
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
@@ -10880,6 +11894,89 @@ test "users provision route succeeds even when ownership lock is held in file mo
 
     try std.testing.expectEqualStrings("200 OK", response.status);
     try std.testing.expectEqualStrings("{\"status\":\"provisioned\"}", response.body);
+}
+
+test "user_cell users provision route rejects mismatched user" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.role = .user_cell;
+    state.pinned_user_id = "1";
+    state.tenant_enabled = true;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"user_id\":\"2\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/users/provision HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "POST",
+        "/api/v1/users/provision",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("403 Forbidden", response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"wrong_user_cell\"}", response.body);
+}
+
+test "user_cell chat stream route uses pinned user without header" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.role = .user_cell;
+    state.pinned_user_id = "1";
+    state.tenant_enabled = true;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"message\":\"hi\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/chat/stream HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "POST",
+        "/api/v1/chat/stream",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("400 Bad Request", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "missing_session_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "missing X-Zaki-User-Id") == null);
 }
 
 test "tenant_lock_config_clamps_invalid_values" {
@@ -12763,6 +13860,177 @@ test "GatewayState event_bus defaults to null" {
     var gs = GatewayState.init(std.testing.allocator);
     defer gs.deinit();
     try std.testing.expect(gs.event_bus == null);
+}
+
+test "gatewayRoleNeedsLocalAgent keeps shared default behavior" {
+    try std.testing.expect(gatewayRoleNeedsLocalAgent(.shared, false));
+    try std.testing.expect(!gatewayRoleNeedsLocalAgent(.shared, true));
+    try std.testing.expect(!gatewayRoleNeedsLocalAgent(.broker, false));
+    try std.testing.expect(!gatewayRoleNeedsLocalAgent(.user_cell, false));
+}
+
+test "gatewayRoleOwnsTenantExecution disables local execution for broker role" {
+    try std.testing.expect(gatewayRoleOwnsTenantExecution(.shared));
+    try std.testing.expect(!gatewayRoleOwnsTenantExecution(.broker));
+    try std.testing.expect(gatewayRoleOwnsTenantExecution(.user_cell));
+}
+
+test "resolveGatewayRequestUserId pins user_cell requests to one user" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.role = .user_cell;
+    state.pinned_user_id = "42";
+
+    try std.testing.expectEqualStrings("42", try resolveGatewayRequestUserId(&state, null, null, true));
+    try std.testing.expectEqualStrings("42", try resolveGatewayRequestUserId(&state, "42", null, true));
+    try std.testing.expectEqualStrings("42", try resolveGatewayRequestUserId(&state, null, "42", true));
+    try std.testing.expectError(error.UserCellUserMismatch, resolveGatewayRequestUserId(&state, "7", null, true));
+    try std.testing.expectError(error.UserCellUserMismatch, resolveGatewayRequestUserId(&state, null, "7", true));
+}
+
+test "runWithRole rejects user_cell mode without pinned user" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullalis-test",
+        .config_path = "/tmp/nullalis-test/config.json",
+        .tenant = .{
+            .enabled = true,
+        },
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expectError(
+        error.UserCellRequiresPinnedUser,
+        runWithRole(std.testing.allocator, "127.0.0.1", 0, &cfg, null, .user_cell, null, null, null),
+    );
+}
+
+test "runWithRole rejects user_cell mode when tenant semantics are disabled" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullalis-test",
+        .config_path = "/tmp/nullalis-test/config.json",
+        .tenant = .{
+            .enabled = false,
+        },
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expectError(
+        error.UserCellRequiresTenantMode,
+        runWithRole(std.testing.allocator, "127.0.0.1", 0, &cfg, null, .user_cell, null, null, "1"),
+    );
+}
+
+test "runWithRole rejects controller-backed user_cell mode without advertise url" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullalis-test",
+        .config_path = "/tmp/nullalis-test/config.json",
+        .tenant = .{
+            .enabled = true,
+        },
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expectError(
+        error.UserCellRequiresAdvertiseUrl,
+        runWithRole(std.testing.allocator, "127.0.0.1", 0, &cfg, null, .user_cell, "http://127.0.0.1:3001", null, "1"),
+    );
+}
+
+test "resolveUserContext rejects mismatched user in user_cell mode" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    gs.role = .user_cell;
+    gs.pinned_user_id = "42";
+
+    try std.testing.expectError(error.UserCellUserMismatch, resolveUserContext(allocator, &gs, "7"));
+}
+
+test "handleBrokerCellControlRoute requires internal auth" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.role = .broker;
+    state.internal_auth_required = true;
+    state.internal_service_tokens = &[_][]const u8{"svc-prod-token-1234"};
+
+    const response = handleBrokerCellControlRoute(std.testing.allocator, &state, "POST /internal/cells/ensure HTTP/1.1\r\nHost: localhost\r\n\r\n", "POST", .ensure);
+    try std.testing.expectEqualStrings("401 Unauthorized", response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"unauthorized\"}", response.body);
+}
+
+test "handleBrokerCellControlRoute returns controller unavailable without controller url" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.role = .broker;
+    state.internal_auth_required = true;
+    state.internal_service_tokens = &[_][]const u8{"svc-prod-token-1234"};
+
+    const raw = "POST /internal/cells/ensure HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: svc-prod-token-1234\r\n\r\n";
+    const response = handleBrokerCellControlRoute(std.testing.allocator, &state, raw, "POST", .ensure);
+    try std.testing.expectEqualStrings("503 Service Unavailable", response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"controller_unavailable\"}", response.body);
+}
+
+test "handleBrokerCellControlRoute hidden outside broker role" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.role = .shared;
+    state.internal_auth_required = true;
+    state.internal_service_tokens = &[_][]const u8{"svc-prod-token-1234"};
+
+    const raw = "GET /internal/cells/status HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: svc-prod-token-1234\r\n\r\n";
+    const response = handleBrokerCellControlRoute(std.testing.allocator, &state, raw, "GET", .status);
+    try std.testing.expectEqualStrings("404 Not Found", response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"not found\"}", response.body);
+}
+
+test "parseBrokerResolvedCell extracts routed cell url" {
+    const body =
+        "{\"status\":\"ok\",\"operation\":\"ensure\",\"user_id\":\"42\",\"found\":true,\"created\":true,\"cell\":{\"user_id\":\"42\",\"cell_url\":\"http://127.0.0.1:3100\",\"state\":\"warm\",\"created_at_s\":1,\"updated_at_s\":1,\"last_ensured_at_s\":1,\"drain_requested_at_s\":null,\"ensure_count\":1}}";
+    var resolved = try parseBrokerResolvedCell(std.testing.allocator, body);
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.found);
+    try std.testing.expectEqual(BrokerResolvedCell.State.warm, resolved.state);
+    try std.testing.expectEqualStrings("http://127.0.0.1:3100", resolved.cell_url.?);
+}
+
+test "parseBrokerResolvedCell extracts pending state without cell url" {
+    const body =
+        "{\"status\":\"ok\",\"operation\":\"ensure\",\"user_id\":\"42\",\"found\":true,\"created\":true,\"cell\":{\"user_id\":\"42\",\"cell_url\":null,\"state\":\"pending\",\"created_at_s\":1,\"updated_at_s\":1,\"last_ensured_at_s\":1,\"drain_requested_at_s\":null,\"ensure_count\":1}}";
+    var resolved = try parseBrokerResolvedCell(std.testing.allocator, body);
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.found);
+    try std.testing.expectEqual(BrokerResolvedCell.State.pending, resolved.state);
+    try std.testing.expect(resolved.cell_url == null);
+}
+
+test "normalizeAdvertiseUrl trims and preserves routable service url" {
+    const normalized = try normalizeAdvertiseUrl(std.testing.allocator, "  http://nullalis-cell-42.zaki.svc.cluster.local:3000/ \n");
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqualStrings("http://nullalis-cell-42.zaki.svc.cluster.local:3000", normalized);
+}
+
+test "normalizeAdvertiseUrl rejects empty or schemeless values" {
+    try std.testing.expectError(error.InvalidAdvertiseUrl, normalizeAdvertiseUrl(std.testing.allocator, "   "));
+    try std.testing.expectError(error.InvalidAdvertiseUrl, normalizeAdvertiseUrl(std.testing.allocator, "nullalis-cell-42:3000"));
+}
+
+test "parseUpstreamResponseHeader parses status and body offset" {
+    const raw = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Test: 1\r\n\r\nevent: token\r\n\r\n";
+    const parsed = try parseUpstreamResponseHeader(raw);
+    try std.testing.expectEqual(@as(u16, 200), parsed.status_code);
+    try std.testing.expectEqualStrings("event: token\r\n\r\n", raw[parsed.body_offset..]);
+}
+
+test "extractRequestTarget returns raw request target with query" {
+    const raw = "POST /api/v1/users/42/onboarding?step=1 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try std.testing.expectEqualStrings("/api/v1/users/42/onboarding?step=1", extractRequestTarget(raw).?);
+}
+
+test "firstConfiguredInternalServiceToken skips blank entries" {
+    const tokens = &[_][]const u8{ "   ", "\t", "svc-prod-token-1234", "other-token" };
+    try std.testing.expectEqualStrings("svc-prod-token-1234", firstConfiguredInternalServiceToken(tokens).?);
+    try std.testing.expect(firstConfiguredInternalServiceToken(&[_][]const u8{ "", "   " }) == null);
 }
 
 test "resolveUserContext rejects non-numeric user ids when postgres tenant state is enabled" {
