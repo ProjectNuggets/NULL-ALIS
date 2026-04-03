@@ -139,6 +139,11 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.context_window_tokens,
         report.context_pressure_percent,
     });
+    try std.fmt.format(w, "  policy: history_limit={d} token_compact_threshold={d} token_trigger={s}\n", .{
+        report.history_trim_limit_messages,
+        report.token_compaction_threshold,
+        boolWord(report.token_compaction_triggered),
+    });
     try std.fmt.format(w, "  tools: {d}\n", .{report.tool_count});
     try std.fmt.format(w, "  by_role: system={d} user={d} assistant={d} tool={d}\n", .{
         report.role_counts.system,
@@ -226,6 +231,9 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
         .token_estimate = report.token_estimate,
         .context_window_tokens = report.context_window_tokens,
         .context_pressure_percent = report.context_pressure_percent,
+        .history_trim_limit_messages = report.history_trim_limit_messages,
+        .token_compaction_threshold = report.token_compaction_threshold,
+        .token_compaction_triggered = report.token_compaction_triggered,
         .tools = report.tool_count,
         .roles = .{
             .system = report.role_counts.system,
@@ -414,6 +422,9 @@ test "context report formatters expose structured details" {
         .token_estimate = 321,
         .context_window_tokens = 1000,
         .context_pressure_percent = 32,
+        .history_trim_limit_messages = 80,
+        .token_compaction_threshold = 750,
+        .token_compaction_triggered = false,
         .tool_count = 3,
         .role_counts = .{ .system = 1, .user = 2, .assistant = 3, .tool = 1 },
         .memory_enabled = true,
@@ -478,6 +489,7 @@ test "context report formatters expose structured details" {
     const detail = try formatDetail(std.testing.allocator, report);
     defer std.testing.allocator.free(detail);
     try std.testing.expect(std.mem.indexOf(u8, detail, "budget: window=1000 pressure=32%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "policy: history_limit=80 token_compact_threshold=750 token_trigger=no") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory: enabled=yes runtime=yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "retrieval: mode=hybrid provider=together vector=pgvector rollout=on") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "cache: stable_prefix=yes refresh_needed=yes reason=workspace") != null);
@@ -492,6 +504,7 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stable_prefix\":{\"available\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"buckets\":{\"stable_prefix\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"context_pressure_percent\":32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"token_compaction_threshold\":750") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"enriched_messages\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"embedding_provider\":\"together\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"memory_context_injected\":true") != null);

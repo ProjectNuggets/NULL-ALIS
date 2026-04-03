@@ -15,6 +15,9 @@ pub const Snapshot = struct {
     token_estimate: u64,
     context_window_tokens: u64,
     context_pressure_percent: u8,
+    history_trim_limit_messages: u32,
+    token_compaction_threshold: u64,
+    token_compaction_triggered: bool,
     tool_count: usize,
     role_counts: RoleCounts,
     memory_enabled: bool,
@@ -213,6 +216,7 @@ pub fn buildSnapshot(self: anytype) Snapshot {
     const memory_context_entries = memory_enriched_messages;
     const token_estimate = if (@hasField(AgentType, "history")) tokenEstimateFromHistory(self.history) else 0;
     const context_window_tokens = if (@hasField(AgentType, "token_limit")) self.token_limit else 0;
+    const token_compaction_threshold = if (context_window_tokens > 0) (context_window_tokens * 3) / 4 else 0;
 
     return .{
         .model_name = if (@hasField(AgentType, "model_name")) self.model_name else "",
@@ -220,6 +224,9 @@ pub fn buildSnapshot(self: anytype) Snapshot {
         .token_estimate = token_estimate,
         .context_window_tokens = context_window_tokens,
         .context_pressure_percent = pressurePercent(token_estimate, context_window_tokens),
+        .history_trim_limit_messages = if (@hasField(AgentType, "max_history_messages")) self.max_history_messages else 0,
+        .token_compaction_threshold = token_compaction_threshold,
+        .token_compaction_triggered = token_compaction_threshold > 0 and token_estimate > token_compaction_threshold,
         .tool_count = if (@hasField(AgentType, "tools")) self.tools.len else 0,
         .role_counts = role_counts,
         .memory_enabled = if (@hasField(AgentType, "mem")) self.mem != null else false,
@@ -393,6 +400,7 @@ test "buildSnapshot counts roles and retrieval state" {
         mem: ?u8,
         mem_rt: ?*FakeMemoryRuntime,
         token_limit: u64,
+        max_history_messages: u32,
         memory_session_id: ?[]const u8,
         conversation_context: ?u8,
         compact_context_enabled: bool,
@@ -409,6 +417,7 @@ test "buildSnapshot counts roles and retrieval state" {
         .mem = 1,
         .mem_rt = &fake_mem_rt,
         .token_limit = 1_000,
+        .max_history_messages = 50,
         .memory_session_id = "agent:test:user:1:main",
         .conversation_context = null,
         .compact_context_enabled = true,
@@ -424,6 +433,9 @@ test "buildSnapshot counts roles and retrieval state" {
     try std.testing.expectEqual(@as(usize, 4), snapshot.history_messages);
     try std.testing.expectEqual(@as(usize, 1), snapshot.memory_enriched_messages);
     try std.testing.expectEqual(@as(u8, 1), snapshot.context_pressure_percent);
+    try std.testing.expectEqual(@as(u32, 50), snapshot.history_trim_limit_messages);
+    try std.testing.expectEqual(@as(u64, 750), snapshot.token_compaction_threshold);
+    try std.testing.expect(!snapshot.token_compaction_triggered);
     try std.testing.expectEqualStrings("together", snapshot.embedding_provider);
     try std.testing.expectEqualStrings("pgvector", snapshot.vector_mode);
     try std.testing.expect(snapshot.has_system_prompt);
