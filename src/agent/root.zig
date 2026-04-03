@@ -1435,7 +1435,12 @@ pub const Agent = struct {
                     const err_name = @errorName(err);
                     if (providers.reliable.isContextExhausted(err_name) and
                         self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
-                        self.forceCompressHistory())
+                        blk: {
+                            const history_before = self.history.items.len;
+                            if (!self.forceCompressHistory()) break :blk false;
+                            self.recordForceCompression(history_before, self.history.items.len);
+                            break :blk true;
+                        })
                     {
                         self.context_was_compacted = true;
                         turn_retry_attempts += 1;
@@ -1477,7 +1482,12 @@ pub const Agent = struct {
                     ) catch |retry_err| {
                         // Context exhaustion recovery: if we have enough history,
                         // force-compress and retry once more
-                        if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
+                        if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and blk: {
+                            const history_before = self.history.items.len;
+                            if (!self.forceCompressHistory()) break :blk false;
+                            self.recordForceCompression(history_before, self.history.items.len);
+                            break :blk true;
+                        }) {
                             self.context_was_compacted = true;
                             turn_retry_attempts += 1;
                             turn_llm_calls += 1;
@@ -1995,7 +2005,11 @@ pub const Agent = struct {
         });
 
         // Compact/trim history so the next turn doesn't start with bloated context
+        const history_before_auto_compact = self.history.items.len;
         self.last_turn_compacted = self.autoCompactHistory() catch false;
+        if (self.last_turn_compacted) {
+            self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+        }
         const trim_stats = self.trimHistoryDetailed();
         self.recordTrimStats(trim_stats);
 
@@ -2214,6 +2228,14 @@ pub const Agent = struct {
 
     fn recordTrimStats(self: *Agent, trim_stats: compaction.TrimStats) void {
         context_builder.recordTrimStats(&self.last_turn_context, trim_stats);
+    }
+
+    fn recordAutoCompaction(self: *Agent, history_before: usize, history_after: usize) void {
+        context_builder.recordAutoCompaction(&self.last_turn_context, history_before, history_after);
+    }
+
+    fn recordForceCompression(self: *Agent, history_before: usize, history_after: usize) void {
+        context_builder.recordForceCompression(&self.last_turn_context, history_before, history_after);
     }
 
     /// Run a single message through the agent and return the response.

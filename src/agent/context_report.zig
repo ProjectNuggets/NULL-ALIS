@@ -220,6 +220,12 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.last_turn.trimmed_bytes,
         report.last_turn.history_messages_after_trim,
     });
+    try std.fmt.format(w, "  compaction: auto_events={d} auto_messages~={d} force_events={d} force_messages={d}\n", .{
+        report.last_turn.auto_compaction_events,
+        report.last_turn.auto_compacted_messages,
+        report.last_turn.force_compression_events,
+        report.last_turn.force_compressed_messages,
+    });
     try std.fmt.format(w, "  memory_select: {s}", .{memory_selection_text});
     return try out.toOwnedSlice(allocator);
 }
@@ -319,6 +325,10 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .trimmed_messages = report.last_turn.trimmed_messages,
             .trimmed_bytes = report.last_turn.trimmed_bytes,
             .history_messages_after_trim = report.last_turn.history_messages_after_trim,
+            .auto_compaction_events = report.last_turn.auto_compaction_events,
+            .auto_compacted_messages = report.last_turn.auto_compacted_messages,
+            .force_compression_events = report.last_turn.force_compression_events,
+            .force_compressed_messages = report.last_turn.force_compressed_messages,
             .memory_selection = .{
                 .available = report.last_turn.memory_selection.available,
                 .candidate_count = report.last_turn.memory_selection.candidate_count,
@@ -468,6 +478,10 @@ test "context report formatters expose structured details" {
             .trimmed_messages = 2,
             .trimmed_bytes = 24,
             .history_messages_after_trim = 5,
+            .auto_compaction_events = 1,
+            .auto_compacted_messages = 8,
+            .force_compression_events = 1,
+            .force_compressed_messages = 3,
             .memory_selection = .{
                 .available = true,
                 .candidate_count = 5,
@@ -496,6 +510,7 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "stable_prefix: entries=1 bytes=128 tokens~=32 cache=stable") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "last_turn: prompt_refresh=yes reason=workspace memory_injected=yes bytes=64 enrich_ms=11 cache_hit=no") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "trim: events=1 removed_messages=2 removed_bytes=24 history_after=5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "compaction: auto_events=1 auto_messages~=8 force_events=1 force_messages=3") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory_select: summary_latest=yes anchor=yes durable=1 timeline=2 search=1 fallback=0 candidates=5 global_candidates=12") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "workspace_fp=77") != null);
 
@@ -509,6 +524,7 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"embedding_provider\":\"together\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"memory_context_injected\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"trimmed_messages\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"auto_compaction_events\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"summary_latest_used\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"workspace_prompt_fingerprint\":77") != null);
 }

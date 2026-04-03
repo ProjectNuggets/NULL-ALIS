@@ -52,6 +52,10 @@ pub const LastTurnContext = struct {
     trimmed_messages: usize = 0,
     trimmed_bytes: usize = 0,
     history_messages_after_trim: usize = 0,
+    auto_compaction_events: usize = 0,
+    auto_compacted_messages: usize = 0,
+    force_compression_events: usize = 0,
+    force_compressed_messages: usize = 0,
     memory_selection: MemorySelection = .{},
 };
 
@@ -345,6 +349,20 @@ pub fn recordTrimStats(last_turn: *LastTurnContext, trim_stats: anytype) void {
     last_turn.history_messages_after_trim = trim_stats.history_after;
 }
 
+pub fn recordAutoCompaction(last_turn: *LastTurnContext, history_before: usize, history_after: usize) void {
+    if (!last_turn.available or history_before <= history_after) return;
+    last_turn.auto_compaction_events += 1;
+    last_turn.auto_compacted_messages += (history_before - history_after) + 1;
+    last_turn.history_messages_after_trim = history_after;
+}
+
+pub fn recordForceCompression(last_turn: *LastTurnContext, history_before: usize, history_after: usize) void {
+    if (!last_turn.available or history_before <= history_after) return;
+    last_turn.force_compression_events += 1;
+    last_turn.force_compressed_messages += history_before - history_after;
+    last_turn.history_messages_after_trim = history_after;
+}
+
 pub fn selectionFromStats(stats: anytype) MemorySelection {
     return .{
         .available = stats.available,
@@ -591,5 +609,20 @@ test "recordTrimStats accumulates removed history" {
     try std.testing.expectEqual(@as(usize, 2), last_turn.trim_events);
     try std.testing.expectEqual(@as(usize, 4), last_turn.trimmed_messages);
     try std.testing.expectEqual(@as(usize, 52), last_turn.trimmed_bytes);
+    try std.testing.expectEqual(@as(usize, 5), last_turn.history_messages_after_trim);
+}
+
+test "record compaction events updates last turn lifecycle" {
+    var last_turn = LastTurnContext{
+        .available = true,
+    };
+
+    recordAutoCompaction(&last_turn, 15, 8);
+    recordForceCompression(&last_turn, 8, 5);
+
+    try std.testing.expectEqual(@as(usize, 1), last_turn.auto_compaction_events);
+    try std.testing.expectEqual(@as(usize, 8), last_turn.auto_compacted_messages);
+    try std.testing.expectEqual(@as(usize, 1), last_turn.force_compression_events);
+    try std.testing.expectEqual(@as(usize, 3), last_turn.force_compressed_messages);
     try std.testing.expectEqual(@as(usize, 5), last_turn.history_messages_after_trim);
 }
