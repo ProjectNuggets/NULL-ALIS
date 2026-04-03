@@ -1309,6 +1309,26 @@ pub const Agent = struct {
             }
         }
 
+        if (self.compact_context_enabled) {
+            // Second-stage guardrail: after the cheap history-count trim above,
+            // run provider-backed auto-compaction only if token pressure is
+            // still high enough to justify summarizing older context.
+            const auto_compact_start_ms = std.time.milliTimestamp();
+            const history_before_auto_compact = self.history.items.len;
+            self.last_turn_compacted = self.autoCompactHistory() catch false;
+            if (self.last_turn_compacted) {
+                self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+                const auto_compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - auto_compact_start_ms));
+                turn_compaction_ms += auto_compact_duration_ms;
+                log.info("turn.stage stage=turn_auto_compaction duration_ms={d}", .{auto_compact_duration_ms});
+                const auto_compact_stage_event = ObserverEvent{ .turn_stage = .{
+                    .stage = "turn_auto_compaction",
+                    .duration_ms = auto_compact_duration_ms,
+                } };
+                self.observer.recordEvent(&auto_compact_stage_event);
+            }
+        }
+
         // Record agent event
         const start_event = ObserverEvent{ .llm_request = .{
             .provider = self.provider.getName(),
@@ -1737,7 +1757,6 @@ pub const Agent = struct {
                 // Keep interactive turns fast: trim history here, but defer
                 // expensive provider-backed compaction to explicit/overflow paths.
                 const compact_start_ms = std.time.milliTimestamp();
-                self.last_turn_compacted = false;
                 const trim_stats = self.trimHistoryDetailed();
                 self.recordTrimStats(trim_stats);
                 const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
@@ -4395,6 +4414,99 @@ test "turn uses trim-only pre-provider compaction for background origins" {
 
     try std.testing.expectEqualStrings("ok", response);
     try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
+}
+
+test "turn auto-compacts on token pressure before provider call" {
+    const PressureProvider = struct {
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const state: *@This() = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            const content = if (state.calls == 1) "compaction summary" else "ok";
+            _ = request;
+            return .{
+                .content = try allocator.dupe(u8, content),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "pressure-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = PressureProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = PressureProvider.chatWithSystem,
+        .chat = PressureProvider.chat,
+        .supportsNativeTools = PressureProvider.supportsNativeTools,
+        .getName = PressureProvider.getName,
+        .deinit = PressureProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .token_limit = 4_000,
+        .max_tokens = 512,
+        .compaction_keep_recent = 2,
+        .compact_context_enabled = true,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    for (0..5) |_| {
+        const user_payload = try allocator.alloc(u8, 2_500);
+        @memset(user_payload, 'u');
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = user_payload,
+        });
+        const assistant_payload = try allocator.alloc(u8, 2_500);
+        @memset(assistant_payload, 'a');
+        try agent.history.append(allocator, .{
+            .role = .assistant,
+            .content = assistant_payload,
+        });
+    }
+
+    const response = try agent.turn("next");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
+    try std.testing.expect(agent.last_turn_compacted);
+    try std.testing.expectEqual(@as(usize, 1), agent.last_turn_context.auto_compaction_events);
+    try std.testing.expect(agent.last_turn_context.auto_compacted_messages > 0);
 }
 
 test "turn refreshes system prompt after workspace markdown change" {
