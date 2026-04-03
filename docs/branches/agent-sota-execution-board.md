@@ -1,7 +1,7 @@
 # Branch Board: agent-sota-execution-board
 
-Status: active execution  
-Owner: agent/runtime  
+Status: active execution
+Owner: agent/runtime
 Last updated: 2026-04-03
 
 ## Purpose
@@ -115,6 +115,7 @@ Keep the per-user cell substrate boring, trustworthy, and measurable while the a
 ### M1. Kernel UX
 
 - Branch: `feat/kernel-ux-v1`
+- Status: review complete, ready for local test
 
 #### Goal
 
