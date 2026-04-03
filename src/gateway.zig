@@ -6929,6 +6929,243 @@ fn SseProgressObserver(comptime StreamType: type) type {
     };
 }
 
+const BufferedSseProgressObserver = struct {
+    allocator: std.mem.Allocator,
+    frames: std.ArrayListUnmanaged(u8) = .empty,
+    stream_failed: bool = false,
+    last_emit_ms: i64 = 0,
+    last_emit_hash: u64 = 0,
+    last_reasoning_emit_ms: i64 = 0,
+    last_reasoning_hash: u64 = 0,
+
+    const Self = @This();
+    const DEDUPE_WINDOW_MS: i64 = 250;
+    const REASONING_DEDUPE_WINDOW_MS: i64 = 450;
+
+    const vtable = Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = name,
+    };
+
+    fn init(allocator: std.mem.Allocator) Self {
+        return .{
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *Self) void {
+        self.frames.deinit(self.allocator);
+    }
+
+    fn observer(self: *Self) Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    fn resolve(ptr: *anyopaque) *Self {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn appendFrame(self: *Self, frame: []const u8) !void {
+        try self.frames.appendSlice(self.allocator, frame);
+    }
+
+    fn shouldSuppressDuplicate(
+        self: *Self,
+        phase: []const u8,
+        state: []const u8,
+        label: []const u8,
+        tool: ?[]const u8,
+        iteration: ?u32,
+    ) bool {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(phase);
+        hasher.update(state);
+        hasher.update(label);
+        if (tool) |tool_name| hasher.update(tool_name);
+        if (iteration) |value| {
+            var iter_buf: [16]u8 = undefined;
+            const iter_text = std.fmt.bufPrint(&iter_buf, "{d}", .{value}) catch "";
+            hasher.update(iter_text);
+        }
+        const hash = hasher.final();
+        const now_ms = std.time.milliTimestamp();
+        if (self.last_emit_hash == hash and now_ms - self.last_emit_ms < DEDUPE_WINDOW_MS) return true;
+        self.last_emit_hash = hash;
+        self.last_emit_ms = now_ms;
+        return false;
+    }
+
+    fn emit(
+        self: *Self,
+        phase: []const u8,
+        state: []const u8,
+        label: []const u8,
+        tool: ?[]const u8,
+        iteration: ?u32,
+        duration_ms: ?u64,
+    ) void {
+        if (self.stream_failed) return;
+        if (self.shouldSuppressDuplicate(phase, state, label, tool, iteration)) return;
+        const frame = sseProgressFrame(self.allocator, phase, state, label, tool, iteration, duration_ms) catch |err| {
+            log.warn("chat.stream.progress encode failed phase={s} state={s}: {}", .{ phase, state, err });
+            return;
+        };
+        defer self.allocator.free(frame);
+        self.appendFrame(frame) catch |err| {
+            log.warn("chat.stream.progress buffer append failed phase={s} state={s}: {}", .{ phase, state, err });
+            self.stream_failed = true;
+            return;
+        };
+    }
+
+    fn shouldSuppressReasoningSummary(
+        self: *Self,
+        summary: []const u8,
+        phase: ?[]const u8,
+        tool: ?[]const u8,
+        iteration: ?u32,
+    ) bool {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(summary);
+        if (phase) |phase_name| hasher.update(phase_name);
+        if (tool) |tool_name| hasher.update(tool_name);
+        if (iteration) |value| {
+            var iter_buf: [16]u8 = undefined;
+            const iter_text = std.fmt.bufPrint(&iter_buf, "{d}", .{value}) catch "";
+            hasher.update(iter_text);
+        }
+        const hash = hasher.final();
+        const now_ms = std.time.milliTimestamp();
+        if (self.last_reasoning_hash == hash and now_ms - self.last_reasoning_emit_ms < REASONING_DEDUPE_WINDOW_MS) {
+            return true;
+        }
+        self.last_reasoning_hash = hash;
+        self.last_reasoning_emit_ms = now_ms;
+        return false;
+    }
+
+    fn emitReasoningSummary(
+        self: *Self,
+        summary: []const u8,
+        phase: ?[]const u8,
+        tool: ?[]const u8,
+        iteration: ?u32,
+    ) void {
+        if (self.stream_failed) return;
+        if (self.shouldSuppressReasoningSummary(summary, phase, tool, iteration)) return;
+        const frame = sseReasoningSummaryFrame(self.allocator, summary, phase, tool, iteration) catch |err| {
+            log.warn("chat.stream.reasoning_summary encode failed phase={s}: {}", .{ phase orelse "n/a", err });
+            return;
+        };
+        defer self.allocator.free(frame);
+        self.appendFrame(frame) catch |err| {
+            log.warn("chat.stream.reasoning_summary buffer append failed phase={s}: {}", .{ phase orelse "n/a", err });
+            self.stream_failed = true;
+            return;
+        };
+    }
+
+    fn emitStage(self: *Self, stage: []const u8, iteration: ?u32, duration_ms: ?u64, count: ?u32) void {
+        _ = count;
+        if (std.mem.eql(u8, stage, "turn_start")) {
+            self.emit("thinking", "start", "Gathering context", null, iteration, duration_ms);
+            self.emitReasoningSummary("Checking context and memory", "thinking", null, iteration);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "memory_enrich")) {
+            self.emit("thinking", "update", "Retrieving memory", null, iteration, duration_ms);
+            self.emitReasoningSummary("Checking context and memory", "thinking", null, iteration);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "turn_compaction") or std.mem.eql(u8, stage, "compact_trim")) {
+            self.emit("thinking", "update", "Trimming context", null, iteration, duration_ms);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "build_provider_messages")) {
+            self.emit("thinking", "update", "Preparing model request", null, iteration, duration_ms);
+            self.emitReasoningSummary("Preparing the model request", "thinking", null, iteration);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "response_cache_hit")) {
+            self.emit("compose", "update", "Using cached response", null, iteration, duration_ms);
+            self.emitReasoningSummary("Reusing a cached answer", "compose", null, iteration);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "parse_provider_response")) {
+            self.emit("thinking", "update", "Processing model response", null, iteration, duration_ms);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "dispatch_tools")) {
+            self.emit("tool", "update", "Running tools", null, iteration, duration_ms);
+            self.emitReasoningSummary("Running tools to verify the answer", "tool", null, iteration);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "tool_reflection")) {
+            self.emit("thinking", "update", "Reflecting on tool results", null, iteration, duration_ms);
+            self.emitReasoningSummary("Reviewing tool results", "thinking", null, iteration);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "compose_final_reply")) {
+            self.emit("compose", "update", "Preparing final reply", null, iteration, duration_ms);
+            self.emitReasoningSummary("Preparing the final answer", "compose", null, iteration);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "finalize_no_tools")) {
+            self.emit("finalize", "update", "Finalizing reply", null, iteration, duration_ms);
+            self.emitReasoningSummary("Finishing the response", "finalize", null, iteration);
+            return;
+        }
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+        const self = resolve(ptr);
+        switch (event.*) {
+            .llm_request => {
+                self.emit("thinking", "start", "Thinking", null, null, null);
+                self.emitReasoningSummary("Thinking through the request", "thinking", null, null);
+            },
+            .llm_response => |e| {
+                if (e.success) {
+                    self.emit("compose", "update", "Model response received", null, null, e.duration_ms);
+                } else {
+                    self.emit("finalize", "error", "Model request failed", null, null, e.duration_ms);
+                }
+            },
+            .tool_call_start => |e| {
+                var label_buf: [160]u8 = undefined;
+                const label = std.fmt.bufPrint(&label_buf, "Using {s}", .{e.tool}) catch "Using tool";
+                self.emit("tool", "start", label, e.tool, null, null);
+                var summary_buf: [196]u8 = undefined;
+                const summary = std.fmt.bufPrint(&summary_buf, "Using {s} to verify the answer", .{e.tool}) catch "Using a tool to verify the answer";
+                self.emitReasoningSummary(summary, "tool", e.tool, null);
+            },
+            .tool_call => |e| {
+                var label_buf: [192]u8 = undefined;
+                const label = if (e.success)
+                    (std.fmt.bufPrint(&label_buf, "{s} completed", .{e.tool}) catch "Tool completed")
+                else
+                    (std.fmt.bufPrint(&label_buf, "{s} failed", .{e.tool}) catch "Tool failed");
+                self.emit("tool", if (e.success) "done" else "error", label, e.tool, null, e.duration_ms);
+            },
+            .tool_iterations_exhausted => self.emit("finalize", "error", "Tool iteration limit reached", null, null, null),
+            .turn_stage => |e| self.emitStage(e.stage, e.iteration, e.duration_ms, e.count),
+            .turn_complete => self.emit("finalize", "done", "Response ready", null, null, null),
+            else => {},
+        }
+    }
+
+    fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flush(_: *anyopaque) void {}
+    fn name(_: *anyopaque) []const u8 {
+        return "sse_progress_buffer";
+    }
+};
+
 fn sseReplyStartFrame(
     allocator: std.mem.Allocator,
     stream_kind: []const u8,
@@ -7011,6 +7248,27 @@ fn sseChatPayload(allocator: std.mem.Allocator, text: []const u8, session_id: []
     const done_frame = try sseDoneFrame(allocator, session_id, message_id);
     defer allocator.free(done_frame);
     try w.writeAll(done_frame);
+    return buf.toOwnedSlice(allocator);
+}
+
+fn sseBufferedChatPayload(
+    allocator: std.mem.Allocator,
+    status_frame: []const u8,
+    ux_frames: []const u8,
+    text: []const u8,
+    session_id: []const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll(status_frame);
+    try w.writeAll(ux_frames);
+
+    const payload = try sseChatPayload(allocator, text, session_id);
+    defer allocator.free(payload);
+    try w.writeAll(payload);
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -7608,6 +7866,13 @@ fn handleApiRoute(
         };
         _ = state.chat_stream_total.fetchAdd(1, .monotonic);
         recordChatStreamLane(state, session_key, user_id, state.tenant_enabled);
+        const status_fallback = "event: status\ndata: {\"type\":\"statusResponse\",\"content\":\"Processing request\"}\n\n";
+        const status_owned = sseStatusFrame(req_allocator, "Processing request") catch null;
+        defer if (status_owned) |frame| req_allocator.free(frame);
+        const status_frame: []const u8 = if (status_owned) |frame| frame else status_fallback;
+        var progress_observer_impl = BufferedSseProgressObserver.init(req_allocator);
+        defer progress_observer_impl.deinit();
+        const progress_observer = progress_observer_impl.observer();
 
         const chat_start_ms = std.time.milliTimestamp();
         const reply = blk: {
@@ -7645,7 +7910,7 @@ fn handleApiRoute(
                         .is_group = false,
                         .is_dm = true,
                     },
-                    null,
+                    progress_observer,
                 ) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                     const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
@@ -7657,7 +7922,9 @@ fn handleApiRoute(
                 };
             }
             if (session_mgr_opt) |sm| {
-                break :blk sm.processMessage(session_key, message, null) catch {
+                break :blk sm.processMessageWithContext(session_key, message, null, .{
+                    .progress_observer = progress_observer,
+                }) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                     const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
                     return .{
@@ -7681,7 +7948,7 @@ fn handleApiRoute(
         defer root_allocator.free(reply);
         const payload_text = if (reply.len > 0) reply else "received";
         const sse_start_ms = std.time.milliTimestamp();
-        const sse = sseChatPayload(req_allocator, payload_text, session_key) catch {
+        const sse = sseBufferedChatPayload(req_allocator, status_frame, progress_observer_impl.frames.items, payload_text, session_key) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build sse\"}" };
         };
         const sse_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - sse_start_ms));
@@ -12219,6 +12486,112 @@ test "user_cell chat stream route uses pinned user without header" {
     try std.testing.expectEqualStrings("400 Bad Request", response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "missing_session_key") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "missing X-Zaki-User-Id") == null);
+}
+
+test "handleApiRoute chat stream includes buffered progress and reasoning summaries" {
+    const TestProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "Hello from buffered SSE"),
+                .tool_calls = &.{},
+                .usage = .{ .prompt_tokens = 8, .completion_tokens = 4, .total_tokens = 12 },
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "test-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{workspace});
+    defer std.testing.allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+
+    var provider_state: u8 = 0;
+    const provider_vtable = providers.Provider.VTable{
+        .chatWithSystem = TestProvider.chatWithSystem,
+        .chat = TestProvider.chat,
+        .supportsNativeTools = TestProvider.supportsNativeTools,
+        .getName = TestProvider.getName,
+        .deinit = TestProvider.deinitFn,
+    };
+    const provider = providers.Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+    var noop = observability.NoopObserver{};
+    var session_mgr = session_mod.SessionManager.init(
+        std.testing.allocator,
+        &cfg,
+        provider,
+        &.{},
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer session_mgr.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = workspace;
+    state.workspace_dir = workspace;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"message\":\"hello\",\"session_key\":\"session:1\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/chat/stream HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "POST",
+        "/api/v1/chat/stream",
+        &state,
+        null,
+        &session_mgr,
+    );
+
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", response.content_type);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "event: status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "event: progress") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "event: reasoning_summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "event: reply_start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"stream_kind\":\"final_reply\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"live\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "Hello from buffered SSE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "event: done") != null);
 }
 
 test "tenant_lock_config_clamps_invalid_values" {
