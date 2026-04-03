@@ -40,6 +40,9 @@ pub const DiagnosticReport = struct {
     rollout_mode: []const u8,
     session_store_active: bool,
     // Extended pipeline stages
+    hybrid_enabled: bool = false,
+    mmr_enabled: bool = false,
+    temporal_decay_enabled: bool = false,
     query_expansion_enabled: bool = false,
     adaptive_retrieval_enabled: bool = false,
     llm_reranker_enabled: bool = false,
@@ -90,13 +93,16 @@ pub fn diagnose(rt: *root.MemoryRuntime) DiagnosticReport {
     const session_store_active = rt.session_store != null;
 
     // Extended pipeline stages
+    const hybrid_on = if (rt._engine) |eng| eng.hybrid_cfg.enabled else false;
+    const mmr_on = if (rt._engine) |eng| eng.mmr_cfg.enabled else false;
+    const temporal_decay_on = if (rt._engine) |eng| eng.temporal_decay_cfg.enabled else false;
     const query_exp = if (rt._engine) |eng| eng.query_expansion_enabled else false;
     const adaptive_on = if (rt._engine) |eng| eng.adaptive_cfg.enabled else false;
     const llm_rerank = if (rt._engine) |eng| eng.llm_reranker_cfg.enabled else false;
     const summarizer_on = rt._summarizer_cfg.enabled;
     const sem_cache_on = rt._semantic_cache != null;
 
-    log.info("doctor: backend={s} healthy={} entries={d} vector={} outbox={} cache={} sources={d} rollout={s} qexp={} adaptive={} reranker={} summarizer={} sem_cache={}", .{
+    log.info("doctor: backend={s} healthy={} entries={d} vector={} outbox={} cache={} sources={d} rollout={s} hybrid={} mmr={} temporal_decay={} qexp={} adaptive={} reranker={} summarizer={} sem_cache={}", .{
         backend_name,
         backend_healthy,
         entry_count,
@@ -105,6 +111,9 @@ pub fn diagnose(rt: *root.MemoryRuntime) DiagnosticReport {
         cache_active,
         retrieval_sources,
         rollout_mode,
+        hybrid_on,
+        mmr_on,
+        temporal_decay_on,
         query_exp,
         adaptive_on,
         llm_rerank,
@@ -126,6 +135,9 @@ pub fn diagnose(rt: *root.MemoryRuntime) DiagnosticReport {
         .retrieval_sources = retrieval_sources,
         .rollout_mode = rollout_mode,
         .session_store_active = session_store_active,
+        .hybrid_enabled = hybrid_on,
+        .mmr_enabled = mmr_on,
+        .temporal_decay_enabled = temporal_decay_on,
         .query_expansion_enabled = query_exp,
         .adaptive_retrieval_enabled = adaptive_on,
         .llm_reranker_enabled = llm_rerank,
@@ -189,6 +201,7 @@ pub fn formatReport(report: DiagnosticReport, allocator: std.mem.Allocator) ![]u
     try w.writeAll("\nRetrieval\n");
     try std.fmt.format(w, "  sources: {d}\n", .{report.retrieval_sources});
     try std.fmt.format(w, "  rollout: {s}\n", .{report.rollout_mode});
+    try std.fmt.format(w, "  hybrid:  {}\n", .{report.hybrid_enabled});
 
     // Session store
     try w.writeAll("\nSession Store\n");
@@ -196,6 +209,8 @@ pub fn formatReport(report: DiagnosticReport, allocator: std.mem.Allocator) ![]u
 
     // Extended pipeline
     try w.writeAll("\nPipeline Stages\n");
+    try std.fmt.format(w, "  mmr:              {}\n", .{report.mmr_enabled});
+    try std.fmt.format(w, "  temporal_decay:   {}\n", .{report.temporal_decay_enabled});
     try std.fmt.format(w, "  query_expansion:  {}\n", .{report.query_expansion_enabled});
     try std.fmt.format(w, "  adaptive:         {}\n", .{report.adaptive_retrieval_enabled});
     try std.fmt.format(w, "  llm_reranker:     {}\n", .{report.llm_reranker_enabled});
@@ -512,6 +527,8 @@ test "formatReport produces valid output" {
     try testing.expect(std.mem.indexOf(u8, text, "Response Cache") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Retrieval") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Session Store") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Pipeline Stages") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "temporal_decay") != null);
 }
 
 test "formatReport with cache stats" {
@@ -546,6 +563,7 @@ test "formatReport with cache stats" {
 
     try testing.expect(std.mem.indexOf(u8, text, "42") != null);
     try testing.expect(std.mem.indexOf(u8, text, "canary") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "hybrid") != null);
     try testing.expect(std.mem.indexOf(u8, text, "1000") != null);
     try testing.expect(std.mem.indexOf(u8, text, "tokens saved") != null);
 }
@@ -598,6 +616,9 @@ test "R3: diagnose on empty system returns valid report with formatReport" {
     try testing.expect(!report.outbox_active);
     try testing.expect(!report.session_store_active);
     try testing.expectEqual(@as(usize, 0), report.retrieval_sources);
+    try testing.expect(!report.hybrid_enabled);
+    try testing.expect(!report.mmr_enabled);
+    try testing.expect(!report.temporal_decay_enabled);
     try testing.expect(!report.query_expansion_enabled);
     try testing.expect(!report.adaptive_retrieval_enabled);
     try testing.expect(!report.llm_reranker_enabled);
