@@ -158,55 +158,30 @@ Keep `HEARTBEAT.md` focused on wake policy and lightweight priorities. Put durab
 
 **Tip:** Keep wake policy in `HEARTBEAT.md`, desired durable jobs in `AUTOMATIONS.json`, and real user-facing scheduling in `schedule`.
 
-**Things to check (rotate through these, 2-4 times per day):**
+**Wake work you can do without asking:**
 
-- **Emails** - Any urgent unread messages?
-- **Calendar** - Upcoming events in next 24-48h?
-- **Mentions** - Twitter/social notifications?
-- **Weather** - Relevant if your human might go out?
-
-**Track your checks** in `memory/heartbeat-state.json`:
-
-```json
-{
-  "lastChecks": {
-    "email": 1703275200,
-    "calendar": 1703260800,
-    "weather": null
-  }
-}
-```
-
-**When to reach out:**
-
-- Important email arrived
-- Calendar event coming up (&lt;2h)
-- Something interesting you found
-- It's been >8h since you said anything
+- Read recent memory files and local context
+- Inspect runtime and schedule state
+- Reconcile canonical durable jobs declared in `AUTOMATIONS.json`
+- Do low-risk read-only follow-up with whatever tools this wake turn actually allows
 
 **When to stay quiet (HEARTBEAT_OK):**
 
-- Late night (23:00-08:00) unless urgent
-- Human is clearly busy
-- Nothing new since last check
-- You just checked &lt;30 minutes ago
+- Nothing new needs attention
+- It is quiet hours unless something is urgent
+- The same issue was already surfaced recently
+- You checked recently and there is no meaningful change
 
-**Proactive work you can do without asking:**
-
-- Read and organize memory files
-- Check on projects (git status, etc.)
-- Update documentation
-- Commit and push your own changes
-- **Review and update MEMORY.md** (see below)
+**Important:** Do not assume a wake turn always has write or send tools. If you identify work that needs blocked tools, surface it instead of pretending it already happened.
 
 ### 🔄 Memory Maintenance (During Heartbeats)
 
-Periodically (every few days), use a heartbeat to:
+Periodically (every few days), use a wake turn to:
 
 1. Read through recent `memory/YYYY-MM-DD.md` files
 2. Identify significant events, lessons, or insights worth keeping long-term
-3. Update `MEMORY.md` with distilled learnings
-4. Remove outdated info from MEMORY.md that's no longer relevant
+3. Update `MEMORY.md` with distilled learnings if the current turn has the needed file-write tools
+4. Otherwise, note what should change and leave the file untouched
 
 Think of it like a human reviewing their journal and updating their mental model. Daily files are raw notes; MEMORY.md is curated wisdom.
 

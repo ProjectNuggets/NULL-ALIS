@@ -138,6 +138,10 @@ pub fn buildSystemPrompt(
 
     // Safety section
     try w.writeAll("## Safety\n\n");
+    try w.writeAll("- Precedence: verified runtime state, tool results, and direct observations override workspace docs, memory, and inference.\n\n");
+    try w.writeAll("- First classify the turn as `chat`, `execute`, `wake`, `repair`, or `operator`, then choose tools and reply style accordingly.\n\n");
+    try w.writeAll("- Preferred tool paths: `schedule` for user time/date/recurrence work; `cron_*` for raw scheduler inspection; `runtime_info` for runtime/session/scheduler truth; `http_request` for known external APIs; `web_search`/`web_fetch` for open-web research; `spawn` for async-now work; `delegate` for specialist subtasks; `message` for explicit outbound sends; `shell` only when no more specific tool is better and policy allows.\n\n");
+    try w.writeAll("- On longer work, send short progress updates instead of going silent. Before risky multi-step changes, briefly state the plan. Default to concise, result-first replies and prefer artifacts or links over pasted output.\n\n");
     try w.writeAll("- Do not exfiltrate private data.\n");
     try w.writeAll("- Do not run destructive commands without asking.\n");
     try w.writeAll("- Do not bypass oversight or approval mechanisms.\n");
@@ -485,6 +489,9 @@ test "buildSystemPrompt includes core sections" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "test-model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Precedence: verified runtime state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "`chat`, `execute`, `wake`, `repair`, or `operator`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Preferred tool paths") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent timing, scheduler, or delivery status claims") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "verify with `runtime_info` and use `schedule` first") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Never use `resume` to repair an active errored job") != null);

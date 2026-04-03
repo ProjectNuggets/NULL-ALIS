@@ -62,7 +62,7 @@ pub const WebSearchTool = struct {
     brave_api_key_override: []const u8 = "",
 
     pub const tool_name = "web_search";
-    pub const tool_description = "Search the web using Exa or Brave. Provider is selected by tools.web_search_provider or WEB_SEARCH_PROVIDER=auto|exa|brave. API keys: tools.web_search_exa_api_key/tools.web_search_brave_api_key or EXA_API_KEY/BRAVE_API_KEY. If selected mode is missing its key, fallback provider is used when available.";
+    pub const tool_description = "Search the open web for external facts. Prefer `http_request` for known APIs and `runtime_info` for local runtime truth.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"}},"required":["query"]}
     ;

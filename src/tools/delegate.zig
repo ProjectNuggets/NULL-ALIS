@@ -21,7 +21,7 @@ pub const DelegateTool = struct {
     depth: u32 = 0,
 
     pub const tool_name = "delegate";
-    pub const tool_description = "Delegate a subtask to a specialized agent. Use when a task benefits from a different model.";
+    pub const tool_description = "Hand a subtask to a specialized agent when specialization materially helps; handle routine work directly.";
     pub const tool_params =
         \\{"type":"object","properties":{"agent":{"type":"string","minLength":1,"description":"Name of the agent to delegate to"},"prompt":{"type":"string","minLength":1,"description":"The task/prompt to send to the sub-agent"},"context":{"type":"string","description":"Optional context to prepend"}},"required":["agent","prompt"]}
     ;

@@ -210,7 +210,7 @@ const HEARTBEAT_PROMPT_DEFAULT =
     "Do not report scheduler-only jobs as drift. Drift means a job declared in AUTOMATIONS.json is missing, broken, unexpectedly paused, or in error. " ++
     "Do not create durable scheduled jobs from free-form prose. Resume is not a repair action for jobs in error state. " ++
     "Do not use heartbeat polling itself as exact-time scheduling. " ++
-    "Do not use cron_* for user-facing automation. Do not use shell, composio, message, or exploratory discovery. " ++
+    "Do not use cron_* for user-facing automation. Do not use shell or message. Do not use composio in heartbeat or wake turns. Use web_search or web_fetch only when directly needed to verify a claim, not for exploratory discovery. " ++
     "Reply in exactly one of these forms only: HEARTBEAT_OK or HEARTBEAT_SEND: <single concise user-facing sentence>. Do not output lists, markdown, diagnostics, or explanatory narration.";
 const HEARTBEAT_RUNTIME_FILENAME = "heartbeat_runtime.json";
 const CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX = "cron.next_heartbeat:";

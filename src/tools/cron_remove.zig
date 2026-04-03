@@ -35,7 +35,7 @@ pub const CronRemoveTool = struct {
     config: ?*const config_mod.Config = null,
 
     pub const tool_name = "cron_remove";
-    pub const tool_description = "Remove a scheduled cron job by its ID.";
+    pub const tool_description = "Low-level raw cron operator tool. Remove a raw scheduled job by ID.";
     pub const tool_params =
         \\{"type":"object","properties":{"job_id":{"type":"string","description":"ID of the cron job to remove"}},"required":["job_id"]}
     ;

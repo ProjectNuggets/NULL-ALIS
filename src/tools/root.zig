@@ -655,6 +655,7 @@ fn isReadOnlyComposioExecute(args: JsonObjectMap) bool {
 const BackgroundOriginPolicy = struct {
     allow_schedule_ensure: bool,
     allow_composio_read_execute: bool,
+    allow_message: bool,
 };
 
 fn backgroundPolicyForOrigin(origin: TurnOrigin) BackgroundOriginPolicy {
@@ -662,26 +663,31 @@ fn backgroundPolicyForOrigin(origin: TurnOrigin) BackgroundOriginPolicy {
         // Compatibility-only heartbeat lane; do not mutate durable automation.
         .heartbeat => .{
             .allow_schedule_ensure = false,
-            .allow_composio_read_execute = true,
+            .allow_composio_read_execute = false,
+            .allow_message = false,
         },
         // Wake/reconcile turns may inspect and repair canonical durable jobs.
         .wake => .{
             .allow_schedule_ensure = true,
-            .allow_composio_read_execute = true,
+            .allow_composio_read_execute = false,
+            .allow_message = false,
         },
         // User-visible delivery lane should execute existing jobs, not mutate schedule state.
         .proactive => .{
             .allow_schedule_ensure = false,
             .allow_composio_read_execute = true,
+            .allow_message = true,
         },
         // Internal scheduler maintenance lane; keep conservative to avoid self-loop mutation.
         .scheduler => .{
             .allow_schedule_ensure = false,
-            .allow_composio_read_execute = true,
+            .allow_composio_read_execute = false,
+            .allow_message = false,
         },
         .user => .{
             .allow_schedule_ensure = true,
             .allow_composio_read_execute = true,
+            .allow_message = true,
         },
     };
 }
@@ -715,19 +721,22 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
     if (std.mem.eql(u8, tool_name, memory_timeline.MemoryTimelineTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, web_search.WebSearchTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, web_fetch.WebFetchTool.tool_name)) return null;
-    if (std.mem.eql(u8, tool_name, message.MessageTool.tool_name)) return null;
+    if (std.mem.eql(u8, tool_name, message.MessageTool.tool_name)) {
+        if (policy.allow_message) return null;
+        return "Message is disabled for this background turn origin";
+    }
 
     if (std.mem.eql(u8, tool_name, composio.ComposioTool.tool_name)) {
         const action = getString(args, "action") orelse "execute";
         if (std.ascii.eqlIgnoreCase(action, "connect")) {
             return "Composio connect is disabled for background turns";
         }
+        if (!policy.allow_composio_read_execute) {
+            return "Composio is disabled for this background turn origin";
+        }
         if (std.ascii.eqlIgnoreCase(action, "list")) return null;
         if (std.ascii.eqlIgnoreCase(action, "execute")) {
-            if (policy.allow_composio_read_execute and isReadOnlyComposioExecute(args)) return null;
-            if (!policy.allow_composio_read_execute) {
-                return "Composio execute is disabled for scheduler-origin maintenance turns";
-            }
+            if (isReadOnlyComposioExecute(args)) return null;
             return "Composio write/unknown execute actions are disabled for background turns";
         }
         return "Composio action is disabled for background turns";
@@ -742,7 +751,7 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
     if (std.mem.eql(u8, tool_name, delegate.DelegateTool.tool_name)) {
         return "Delegate is disabled for background turns";
     }
-    return "Tool is disabled for background turns; allowed: runtime_info, schedule(read), file_read, memory_recall, memory_list, memory_timeline, web_search, web_fetch, message, composio(list/read by origin)";
+    return "Tool is disabled for this background turn; allowed: runtime_info, schedule(read/ensure on wake), file_read, memory_recall, memory_list, memory_timeline, web_search, web_fetch, and proactive-only delivery/integration tools";
 }
 
 pub fn bindRuntimeInfoTools(tools: []const Tool) void {
@@ -967,13 +976,23 @@ test "background turns allow memory timeline tool" {
     try std.testing.expect(toolBlockedForCurrentTurn("memory_timeline", parsed.value.object) == null);
 }
 
-test "background turns allow message tool" {
-    setTurnContext(.{ .origin = .scheduler });
+test "proactive origin allows message tool" {
+    setTurnContext(.{ .origin = .proactive });
     defer clearTurnContext();
 
     const parsed = try parseTestArgs("{\"content\":\"hello\",\"channel\":\"telegram\",\"chat_id\":\"42\"}");
     defer parsed.deinit();
     try std.testing.expect(toolBlockedForCurrentTurn("message", parsed.value.object) == null);
+}
+
+test "wake origin blocks message tool" {
+    setTurnContext(.{ .origin = .wake });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"content\":\"hello\",\"channel\":\"telegram\",\"chat_id\":\"42\"}");
+    defer parsed.deinit();
+    const blocked = toolBlockedForCurrentTurn("message", parsed.value.object) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "disabled") != null);
 }
 
 test "scheduler-origin maintenance blocks schedule writes" {
@@ -1010,8 +1029,8 @@ test "proactive origin blocks schedule ensure" {
     try std.testing.expect(std.mem.indexOf(u8, blocked, "wake turns") != null);
 }
 
-test "scheduler-origin maintenance allows composio read-only execute" {
-    setTurnContext(.{ .origin = .scheduler });
+test "proactive origin allows composio read-only execute" {
+    setTurnContext(.{ .origin = .proactive });
     defer clearTurnContext();
 
     const parsed = try parseTestArgs("{\"action\":\"execute\",\"tool_slug\":\"gmail-list-messages\"}");
@@ -1029,8 +1048,8 @@ test "background turns block composio connect" {
     try std.testing.expect(std.mem.indexOf(u8, blocked, "disabled") != null);
 }
 
-test "background turns allow composio list" {
-    setTurnContext(.{ .origin = .scheduler });
+test "proactive origin allows composio list" {
+    setTurnContext(.{ .origin = .proactive });
     defer clearTurnContext();
 
     const parsed = try parseTestArgs("{\"action\":\"list\",\"app\":\"gmail\"}");
@@ -1038,7 +1057,17 @@ test "background turns allow composio list" {
     try std.testing.expect(toolBlockedForCurrentTurn("composio", parsed.value.object) == null);
 }
 
-test "background turns allow composio read-only execute" {
+test "wake origin blocks composio list" {
+    setTurnContext(.{ .origin = .wake });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{\"action\":\"list\",\"app\":\"gmail\"}");
+    defer parsed.deinit();
+    const blocked = toolBlockedForCurrentTurn("composio", parsed.value.object) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "disabled") != null);
+}
+
+test "background turns allow composio read-only execute only in proactive origin" {
     setTurnContext(.{ .origin = .proactive });
     defer clearTurnContext();
 

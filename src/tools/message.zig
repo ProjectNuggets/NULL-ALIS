@@ -21,7 +21,7 @@ pub const MessageTool = struct {
     outbound_allocator: ?std.mem.Allocator = null,
 
     pub const tool_name = "message";
-    pub const tool_description = "Send a message to a channel. If channel/chat_id are omitted, sends to the current conversation. When a channel has multiple configured accounts, account_id defaults to the current account.";
+    pub const tool_description = "Send an explicit outbound message to a channel or the current conversation. Do not treat it as a heartbeat default.";
     pub const tool_params =
         \\{"type":"object","properties":{"content":{"type":"string","minLength":1,"description":"Message text to send"},"channel":{"type":"string","description":"Target channel (telegram, discord, slack, etc.). Defaults to current."},"account_id":{"type":"string","description":"Target account for multi-account channels. Defaults to current account."},"chat_id":{"type":"string","description":"Target chat/room ID. Defaults to current."}},"required":["content"]}
     ;
