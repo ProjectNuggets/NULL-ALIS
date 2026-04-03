@@ -38,6 +38,9 @@ pub const DiagnosticReport = struct {
     cache_stats: ?CacheStats,
     retrieval_sources: usize,
     rollout_mode: []const u8,
+    retrieval_mode: []const u8 = "n/a",
+    embedding_provider: []const u8 = "n/a",
+    vector_mode: []const u8 = "n/a",
     session_store_active: bool,
     // Extended pipeline stages
     hybrid_enabled: bool = false,
@@ -134,6 +137,9 @@ pub fn diagnose(rt: *root.MemoryRuntime) DiagnosticReport {
         .cache_stats = cache_stats,
         .retrieval_sources = retrieval_sources,
         .rollout_mode = rollout_mode,
+        .retrieval_mode = rt.resolved.retrieval_mode,
+        .embedding_provider = rt.resolved.embedding_provider,
+        .vector_mode = rt.resolved.vector_mode,
         .session_store_active = session_store_active,
         .hybrid_enabled = hybrid_on,
         .mmr_enabled = mmr_on,
@@ -201,6 +207,11 @@ pub fn formatReport(report: DiagnosticReport, allocator: std.mem.Allocator) ![]u
     try w.writeAll("\nRetrieval\n");
     try std.fmt.format(w, "  sources: {d}\n", .{report.retrieval_sources});
     try std.fmt.format(w, "  rollout: {s}\n", .{report.rollout_mode});
+    try std.fmt.format(
+        w,
+        "  effective: mode={s} provider={s} vector={s}\n",
+        .{ report.retrieval_mode, report.embedding_provider, report.vector_mode },
+    );
     try std.fmt.format(w, "  hybrid:  {}\n", .{report.hybrid_enabled});
 
     // Session store
@@ -526,6 +537,7 @@ test "formatReport produces valid output" {
     try testing.expect(std.mem.indexOf(u8, text, "Outbox") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Response Cache") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Retrieval") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "effective: mode=keyword provider=none vector=none") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Session Store") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Pipeline Stages") != null);
     try testing.expect(std.mem.indexOf(u8, text, "temporal_decay") != null);
@@ -555,6 +567,9 @@ test "formatReport with cache stats" {
         },
         .retrieval_sources = 2,
         .rollout_mode = "canary",
+        .retrieval_mode = "hybrid",
+        .embedding_provider = "together",
+        .vector_mode = "pgvector",
         .session_store_active = true,
     };
 
@@ -563,6 +578,7 @@ test "formatReport with cache stats" {
 
     try testing.expect(std.mem.indexOf(u8, text, "42") != null);
     try testing.expect(std.mem.indexOf(u8, text, "canary") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "effective: mode=hybrid provider=together vector=pgvector") != null);
     try testing.expect(std.mem.indexOf(u8, text, "hybrid") != null);
     try testing.expect(std.mem.indexOf(u8, text, "1000") != null);
     try testing.expect(std.mem.indexOf(u8, text, "tokens saved") != null);

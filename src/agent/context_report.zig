@@ -22,6 +22,10 @@ pub const Report = struct {
     compact_context_enabled: bool,
     context_was_compacted: bool,
     workspace_prompt_fingerprint: ?u64,
+    retrieval_mode: []const u8,
+    embedding_provider: []const u8,
+    vector_mode: []const u8,
+    rollout_mode: []const u8,
 };
 
 fn hasMemoryContextPrefix(content: []const u8) bool {
@@ -71,6 +75,10 @@ pub fn fromAgent(self: anytype) Report {
         .compact_context_enabled = if (@hasField(AgentType, "compact_context_enabled")) self.compact_context_enabled else false,
         .context_was_compacted = if (@hasField(AgentType, "context_was_compacted")) self.context_was_compacted else false,
         .workspace_prompt_fingerprint = if (@hasField(AgentType, "workspace_prompt_fingerprint")) self.workspace_prompt_fingerprint else null,
+        .retrieval_mode = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.retrieval_mode else "n/a",
+        .embedding_provider = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.embedding_provider else "n/a",
+        .vector_mode = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.vector_mode else "n/a",
+        .rollout_mode = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.rollout_mode else "n/a",
     };
 }
 
@@ -108,6 +116,7 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
             "  tools: {d}\n" ++
             "  by_role: system={d} user={d} assistant={d} tool={d}\n" ++
             "  memory: enabled={s} runtime={s} session={s} enriched_messages={d}\n" ++
+            "  retrieval: mode={s} provider={s} vector={s} rollout={s}\n" ++
             "  prompt: has_system={s} conversation_context={s} workspace_fp={s}\n" ++
             "  runtime: compact_context={s} compacted_last_turn={s}",
         .{
@@ -123,6 +132,10 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
             boolWord(report.memory_runtime_enabled),
             memory_session_text,
             report.memory_enriched_messages,
+            report.retrieval_mode,
+            report.embedding_provider,
+            report.vector_mode,
+            report.rollout_mode,
             boolWord(report.has_system_prompt),
             boolWord(report.has_conversation_context),
             workspace_fp_text,
@@ -155,6 +168,12 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .conversation_context = report.has_conversation_context,
             .workspace_prompt_fingerprint = report.workspace_prompt_fingerprint,
         },
+        .retrieval = .{
+            .mode = report.retrieval_mode,
+            .embedding_provider = report.embedding_provider,
+            .vector_mode = report.vector_mode,
+            .rollout = report.rollout_mode,
+        },
         .runtime = .{
             .compact_context = report.compact_context_enabled,
             .compacted_last_turn = report.context_was_compacted,
@@ -178,14 +197,30 @@ test "context report counts roles and memory-enriched turns" {
         .{ .role = .assistant, .content = "hi" },
         .{ .role = .tool, .content = "tool output" },
     };
-    var fake_mem_rt: u8 = 1;
     const tools = [_]FakeTool{ 1, 2 };
+    const Resolved = struct {
+        retrieval_mode: []const u8,
+        embedding_provider: []const u8,
+        vector_mode: []const u8,
+        rollout_mode: []const u8,
+    };
+    const FakeMemoryRuntime = struct {
+        resolved: Resolved,
+    };
+    var fake_mem_rt = FakeMemoryRuntime{
+        .resolved = .{
+            .retrieval_mode = "hybrid",
+            .embedding_provider = "together",
+            .vector_mode = "pgvector",
+            .rollout_mode = "on",
+        },
+    };
     const fake = struct {
         model_name: []const u8,
         history: FakeHistory,
         tools: []const FakeTool,
         mem: ?u8,
-        mem_rt: ?*u8,
+        mem_rt: ?*FakeMemoryRuntime,
         memory_session_id: ?[]const u8,
         has_system_prompt: bool,
         conversation_context: ?u8,
@@ -193,11 +228,11 @@ test "context report counts roles and memory-enriched turns" {
         context_was_compacted: bool,
         workspace_prompt_fingerprint: ?u64,
     }{
+        .mem_rt = &fake_mem_rt,
         .model_name = "openai/gpt-5.2",
         .history = .{ .items = &messages },
         .tools = &tools,
         .mem = 1,
-        .mem_rt = &fake_mem_rt,
         .memory_session_id = "agent:test:user:1:main",
         .has_system_prompt = true,
         .conversation_context = null,
@@ -217,6 +252,8 @@ test "context report counts roles and memory-enriched turns" {
     try std.testing.expect(report.memory_runtime_enabled);
     try std.testing.expectEqualStrings("agent:test:user:1:main", report.memory_session_id.?);
     try std.testing.expectEqual(@as(?u64, 42), report.workspace_prompt_fingerprint);
+    try std.testing.expectEqualStrings("together", report.embedding_provider);
+    try std.testing.expectEqualStrings("pgvector", report.vector_mode);
 }
 
 test "context report formatters expose structured details" {
@@ -235,6 +272,10 @@ test "context report formatters expose structured details" {
         .compact_context_enabled = true,
         .context_was_compacted = false,
         .workspace_prompt_fingerprint = 77,
+        .retrieval_mode = "hybrid",
+        .embedding_provider = "together",
+        .vector_mode = "pgvector",
+        .rollout_mode = "on",
     };
 
     const summary = try formatSummary(std.testing.allocator, report);
@@ -244,10 +285,12 @@ test "context report formatters expose structured details" {
     const detail = try formatDetail(std.testing.allocator, report);
     defer std.testing.allocator.free(detail);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory: enabled=yes runtime=yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "retrieval: mode=hybrid provider=together vector=pgvector rollout=on") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "workspace_fp=77") != null);
 
     const json = try formatJson(std.testing.allocator, report);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"enriched_messages\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"embedding_provider\":\"together\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"workspace_prompt_fingerprint\":77") != null);
 }
