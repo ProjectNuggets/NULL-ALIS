@@ -57,10 +57,45 @@ pub const CompactionConfig = struct {
     max_summary_chars: u32 = DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     max_source_chars: u32 = DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
     token_limit: u64 = DEFAULT_TOKEN_LIMIT,
+    max_tokens: u32 = 0,
     message_timeout_secs: u64 = 0,
     max_history_messages: u32 = 50,
     workspace_dir: ?[]const u8 = null,
 };
+
+pub const TokenBudgetPolicy = struct {
+    reply_reserve: u64,
+    tool_reserve: u64,
+    safety_reserve: u64,
+    total_reserve: u64,
+    threshold: u64,
+};
+
+pub fn buildTokenBudgetPolicy(token_limit: u64, max_tokens: u32) TokenBudgetPolicy {
+    if (token_limit == 0) {
+        return .{
+            .reply_reserve = 0,
+            .tool_reserve = 0,
+            .safety_reserve = 0,
+            .total_reserve = 0,
+            .threshold = 0,
+        };
+    }
+
+    const reply_reserve = if (max_tokens > 0) @as(u64, max_tokens) else @as(u64, 8_192);
+    const tool_reserve = @max(@as(u64, 2_048), @min(token_limit / 8, @as(u64, 16_384)));
+    const safety_reserve = @max(@as(u64, 1_024), @min(token_limit / 20, @as(u64, 8_192)));
+    const total_reserve = reply_reserve + tool_reserve + safety_reserve;
+    const threshold_from_reserve = if (token_limit > total_reserve) token_limit - total_reserve else token_limit / 2;
+    const minimum_threshold = (token_limit * 65) / 100;
+    return .{
+        .reply_reserve = reply_reserve,
+        .tool_reserve = tool_reserve,
+        .safety_reserve = safety_reserve,
+        .total_reserve = total_reserve,
+        .threshold = @max(minimum_threshold, threshold_from_reserve),
+    };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public functions
@@ -94,8 +129,10 @@ pub fn autoCompactHistory(
     // Trigger on message count exceeding threshold
     const count_trigger = non_system_count > config.max_history_messages;
 
-    // Trigger on token estimate exceeding 75% of token limit
-    const token_threshold = (config.token_limit * 3) / 4;
+    // Trigger when estimated tokens exceed the usable window after reserving
+    // reply/tool/safety headroom for the current model.
+    const budget_policy = buildTokenBudgetPolicy(config.token_limit, config.max_tokens);
+    const token_threshold = budget_policy.threshold;
     const token_trigger = config.token_limit > 0 and tokenEstimate(history.items) > token_threshold;
 
     if (!count_trigger and !token_trigger) return false;
@@ -275,6 +312,18 @@ test "trimHistoryDetailed reports removed messages and bytes" {
     try std.testing.expectEqual(@as(usize, 3), history.items.len);
     try std.testing.expectEqualStrings("assistant-one", history.items[1].content);
     try std.testing.expectEqualStrings("u2", history.items[2].content);
+}
+
+test "buildTokenBudgetPolicy keeps dynamic headroom" {
+    const kimi = buildTokenBudgetPolicy(262_144, 32_768);
+    try std.testing.expectEqual(@as(u64, 32_768), kimi.reply_reserve);
+    try std.testing.expectEqual(@as(u64, 16_384), kimi.tool_reserve);
+    try std.testing.expectEqual(@as(u64, 8_192), kimi.safety_reserve);
+    try std.testing.expectEqual(@as(u64, 57_344), kimi.total_reserve);
+    try std.testing.expectEqual(@as(u64, 204_800), kimi.threshold);
+
+    const smaller = buildTokenBudgetPolicy(32_768, 8_192);
+    try std.testing.expect(smaller.threshold >= (32_768 * 65) / 100);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
