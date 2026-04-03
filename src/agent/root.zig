@@ -33,6 +33,7 @@ const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
 pub const context_builder = @import("context_builder.zig");
+pub const context_cache = @import("context_cache.zig");
 pub const context_tokens = @import("context_tokens.zig");
 pub const context_report = @import("context_report.zig");
 pub const max_tokens_resolver = @import("max_tokens.zig");

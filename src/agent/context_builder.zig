@@ -1,4 +1,5 @@
 const std = @import("std");
+const context_cache = @import("context_cache.zig");
 const prompt = @import("prompt.zig");
 
 pub const RoleCounts = struct {
@@ -27,6 +28,8 @@ pub const Snapshot = struct {
     embedding_provider: []const u8,
     vector_mode: []const u8,
     rollout_mode: []const u8,
+    stable_prefix_cache: context_cache.StablePrefixState = .{},
+    buckets: context_cache.BucketSet = .{},
     last_turn: LastTurnContext = .{},
 };
 
@@ -70,12 +73,29 @@ fn hasMemoryContextPrefix(content: []const u8) bool {
     return std.mem.startsWith(u8, content, "[Memory context]\n");
 }
 
+fn memoryContextPrefixBytes(content: []const u8) usize {
+    if (!hasMemoryContextPrefix(content)) return 0;
+    if (std.mem.indexOf(u8, content, "\n\n")) |sep_idx| {
+        return sep_idx + 2;
+    }
+    return content.len;
+}
+
 fn tokenEstimateFromHistory(history: anytype) u64 {
     var total_chars: u64 = 0;
     for (history.items) |entry| {
         total_chars += entry.content.len;
     }
     return (total_chars + 3) / 4;
+}
+
+fn conversationContextFingerprintFromAgent(self: anytype) u64 {
+    const AgentType = @TypeOf(self.*);
+    if (!@hasField(AgentType, "conversation_context")) return conversationContextFingerprint(null);
+    if (@TypeOf(self.conversation_context) == ?prompt.ConversationContext) {
+        return conversationContextFingerprint(self.conversation_context);
+    }
+    return conversationContextFingerprint(null);
 }
 
 pub fn conversationContextFingerprint(ctx: ?prompt.ConversationContext) u64 {
@@ -114,20 +134,67 @@ pub fn buildSnapshot(self: anytype) Snapshot {
 
     var role_counts = RoleCounts{};
     var memory_enriched_messages: usize = 0;
+    var stable_prefix_entries: usize = 0;
+    var stable_prefix_bytes: usize = 0;
+    var memory_context_bytes: usize = 0;
+    var recent_history_entries: usize = 0;
+    var recent_history_bytes: usize = 0;
 
     if (@hasField(AgentType, "history")) {
         for (self.history.items) |entry| {
             switch (entry.role) {
-                .system => role_counts.system += 1,
+                .system => {
+                    role_counts.system += 1;
+                    stable_prefix_entries += 1;
+                    stable_prefix_bytes += entry.content.len;
+                },
                 .user => {
                     role_counts.user += 1;
-                    if (hasMemoryContextPrefix(entry.content)) memory_enriched_messages += 1;
+                    recent_history_entries += 1;
+                    const memory_prefix_bytes = memoryContextPrefixBytes(entry.content);
+                    if (memory_prefix_bytes > 0) {
+                        memory_enriched_messages += 1;
+                        memory_context_bytes += memory_prefix_bytes;
+                    }
+                    recent_history_bytes += entry.content.len - @min(entry.content.len, memory_prefix_bytes);
                 },
-                .assistant => role_counts.assistant += 1,
-                .tool => role_counts.tool += 1,
+                .assistant => {
+                    role_counts.assistant += 1;
+                    recent_history_entries += 1;
+                    recent_history_bytes += entry.content.len;
+                },
+                .tool => {
+                    role_counts.tool += 1;
+                    recent_history_entries += 1;
+                    recent_history_bytes += entry.content.len;
+                },
             }
         }
     }
+
+    const has_system_prompt = if (@hasField(AgentType, "has_system_prompt")) self.has_system_prompt else role_counts.system > 0;
+    const has_conversation_context = if (@hasField(AgentType, "conversation_context")) self.conversation_context != null else false;
+    const conversation_context_fingerprint = conversationContextFingerprintFromAgent(self);
+    const system_prompt_has_conversation_context = if (@hasField(AgentType, "system_prompt_has_conversation_context"))
+        self.system_prompt_has_conversation_context
+    else
+        has_system_prompt and has_conversation_context;
+    const prompt_refresh_plan = if (@hasField(AgentType, "has_system_prompt"))
+        buildPromptRefreshPlan(self)
+    else
+        PromptRefreshPlan{
+            .current_time_bucket_min = -1,
+            .workspace_prompt_fingerprint = null,
+            .conversation_context_present = has_conversation_context,
+            .conversation_context_fingerprint = conversation_context_fingerprint,
+            .workspace_prompt_changed = false,
+            .time_bucket_changed = false,
+            .conversation_context_changed = false,
+            .should_refresh_system_prompt = !has_system_prompt,
+        };
+    const stable_prefix_cache = context_cache.buildStablePrefixState(prompt_refresh_plan, has_system_prompt);
+    const last_turn = if (@hasField(AgentType, "last_turn_context")) self.last_turn_context else LastTurnContext{};
+    const memory_context_entries = memory_enriched_messages;
 
     return .{
         .model_name = if (@hasField(AgentType, "model_name")) self.model_name else "",
@@ -139,8 +206,8 @@ pub fn buildSnapshot(self: anytype) Snapshot {
         .memory_runtime_enabled = if (@hasField(AgentType, "mem_rt")) self.mem_rt != null else false,
         .memory_session_id = if (@hasField(AgentType, "memory_session_id")) self.memory_session_id else null,
         .memory_enriched_messages = memory_enriched_messages,
-        .has_system_prompt = if (@hasField(AgentType, "has_system_prompt")) self.has_system_prompt else role_counts.system > 0,
-        .has_conversation_context = if (@hasField(AgentType, "conversation_context")) self.conversation_context != null else false,
+        .has_system_prompt = has_system_prompt,
+        .has_conversation_context = has_conversation_context,
         .compact_context_enabled = if (@hasField(AgentType, "compact_context_enabled")) self.compact_context_enabled else false,
         .context_was_compacted = if (@hasField(AgentType, "context_was_compacted")) self.context_was_compacted else false,
         .workspace_prompt_fingerprint = if (@hasField(AgentType, "workspace_prompt_fingerprint")) self.workspace_prompt_fingerprint else null,
@@ -148,7 +215,39 @@ pub fn buildSnapshot(self: anytype) Snapshot {
         .embedding_provider = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.embedding_provider else "n/a",
         .vector_mode = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.vector_mode else "n/a",
         .rollout_mode = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.rollout_mode else "n/a",
-        .last_turn = if (@hasField(AgentType, "last_turn_context")) self.last_turn_context else .{},
+        .stable_prefix_cache = stable_prefix_cache,
+        .buckets = .{
+            .stable_prefix = .{
+                .entries = stable_prefix_entries,
+                .bytes = stable_prefix_bytes,
+                .active = stable_prefix_entries > 0,
+                .cacheability = .stable,
+            },
+            .memory_context = .{
+                .entries = memory_context_entries,
+                .bytes = memory_context_bytes,
+                .active = memory_context_entries > 0,
+                .cacheability = .dynamic,
+            },
+            .recent_history = .{
+                .entries = recent_history_entries,
+                .bytes = recent_history_bytes,
+                .active = recent_history_entries > 0,
+                .cacheability = .dynamic,
+            },
+            .last_turn_runtime = .{
+                .entries = if (last_turn.available) 1 else 0,
+                .bytes = last_turn.memory_context_bytes,
+                .active = last_turn.available,
+                .cacheability = .per_turn,
+            },
+            .conversation_context = .{
+                .active = has_conversation_context,
+                .embedded_in_stable_prefix = system_prompt_has_conversation_context,
+                .fingerprint = conversation_context_fingerprint,
+            },
+        },
+        .last_turn = last_turn,
     };
 }
 
@@ -168,10 +267,7 @@ pub fn buildPromptRefreshPlan(self: anytype) PromptRefreshPlan {
         @hasField(AgentType, "system_prompt_time_bucket_min") and
         self.system_prompt_time_bucket_min != current_time_bucket_min;
     const conversation_context_present = @hasField(AgentType, "conversation_context") and self.conversation_context != null;
-    const conversation_context_fingerprint = if (@hasField(AgentType, "conversation_context"))
-        conversationContextFingerprint(self.conversation_context)
-    else
-        conversationContextFingerprint(null);
+    const conversation_context_fingerprint = conversationContextFingerprintFromAgent(self);
     const conversation_context_changed = has_system_prompt and
         @hasField(AgentType, "system_prompt_conversation_context_fingerprint") and
         self.system_prompt_conversation_context_fingerprint != conversation_context_fingerprint;
@@ -266,6 +362,9 @@ test "buildSnapshot counts roles and retrieval state" {
         compact_context_enabled: bool,
         context_was_compacted: bool,
         has_system_prompt: bool,
+        system_prompt_has_conversation_context: bool,
+        system_prompt_time_bucket_min: i64,
+        system_prompt_conversation_context_fingerprint: u64,
         workspace_prompt_fingerprint: ?u64,
     }{
         .model_name = "openai/gpt-5.2",
@@ -278,6 +377,9 @@ test "buildSnapshot counts roles and retrieval state" {
         .compact_context_enabled = true,
         .context_was_compacted = false,
         .has_system_prompt = true,
+        .system_prompt_has_conversation_context = false,
+        .system_prompt_time_bucket_min = -1,
+        .system_prompt_conversation_context_fingerprint = 0,
         .workspace_prompt_fingerprint = 42,
     };
 
@@ -288,6 +390,13 @@ test "buildSnapshot counts roles and retrieval state" {
     try std.testing.expectEqualStrings("pgvector", snapshot.vector_mode);
     try std.testing.expect(snapshot.has_system_prompt);
     try std.testing.expectEqual(@as(?u64, 42), snapshot.workspace_prompt_fingerprint);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.buckets.stable_prefix.entries);
+    try std.testing.expectEqual(@as(usize, 13), snapshot.buckets.stable_prefix.bytes);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.buckets.memory_context.entries);
+    try std.testing.expectEqual(@as(usize, 34), snapshot.buckets.memory_context.bytes);
+    try std.testing.expectEqual(@as(usize, 3), snapshot.buckets.recent_history.entries);
+    try std.testing.expectEqual(@as(usize, 18), snapshot.buckets.recent_history.bytes);
+    try std.testing.expect(snapshot.stable_prefix_cache.available);
 }
 
 test "buildPromptRefreshPlan refreshes missing system prompt" {

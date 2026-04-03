@@ -1,5 +1,6 @@
 const std = @import("std");
 const context_builder = @import("context_builder.zig");
+const context_cache = @import("context_cache.zig");
 
 pub const RoleCounts = context_builder.RoleCounts;
 pub const Report = context_builder.Snapshot;
@@ -50,6 +51,41 @@ fn promptRefreshReasonText(allocator: std.mem.Allocator, report: Report) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
+fn stablePrefixRefreshReasonText(allocator: std.mem.Allocator, report: Report) ![]u8 {
+    if (!report.stable_prefix_cache.refresh_needed) {
+        return try allocator.dupe(u8, "n/a");
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    var wrote = false;
+
+    if (report.stable_prefix_cache.cold_start) {
+        try w.writeAll("cold_start");
+        wrote = true;
+    }
+    if (report.stable_prefix_cache.workspace_prompt_changed) {
+        if (wrote) try w.writeAll("+");
+        try w.writeAll("workspace");
+        wrote = true;
+    }
+    if (report.stable_prefix_cache.time_bucket_changed) {
+        if (wrote) try w.writeAll("+");
+        try w.writeAll("clock");
+        wrote = true;
+    }
+    if (report.stable_prefix_cache.conversation_context_changed) {
+        if (wrote) try w.writeAll("+");
+        try w.writeAll("conversation");
+        wrote = true;
+    }
+    if (!wrote) {
+        try w.writeAll("n/a");
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 fn memorySelectionText(allocator: std.mem.Allocator, report: Report) ![]u8 {
     if (!report.last_turn.memory_selection.available) {
         return try allocator.dupe(u8, "n/a");
@@ -86,54 +122,87 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
 
     const refresh_reason_text = try promptRefreshReasonText(allocator, report);
     defer allocator.free(refresh_reason_text);
+    const stable_prefix_reason_text = try stablePrefixRefreshReasonText(allocator, report);
+    defer allocator.free(stable_prefix_reason_text);
     const memory_selection_text = try memorySelectionText(allocator, report);
     defer allocator.free(memory_selection_text);
 
-    return try std.fmt.allocPrint(
-        allocator,
-        "Context detail:\n" ++
-            "  model: {s}\n" ++
-            "  messages: {d}\n" ++
-            "  token_estimate: {d}\n" ++
-            "  tools: {d}\n" ++
-            "  by_role: system={d} user={d} assistant={d} tool={d}\n" ++
-            "  memory: enabled={s} runtime={s} session={s} enriched_messages={d}\n" ++
-            "  retrieval: mode={s} provider={s} vector={s} rollout={s}\n" ++
-            "  prompt: has_system={s} conversation_context={s} workspace_fp={s}\n" ++
-            "  runtime: compact_context={s} compacted_last_turn={s}\n" ++
-            "  last_turn: prompt_refresh={s} reason={s} memory_injected={s} bytes={d} enrich_ms={d} cache_hit={s}\n" ++
-            "  memory_select: {s}",
-        .{
-            report.model_name,
-            report.history_messages,
-            report.token_estimate,
-            report.tool_count,
-            report.role_counts.system,
-            report.role_counts.user,
-            report.role_counts.assistant,
-            report.role_counts.tool,
-            boolWord(report.memory_enabled),
-            boolWord(report.memory_runtime_enabled),
-            memory_session_text,
-            report.memory_enriched_messages,
-            report.retrieval_mode,
-            report.embedding_provider,
-            report.vector_mode,
-            report.rollout_mode,
-            boolWord(report.has_system_prompt),
-            boolWord(report.has_conversation_context),
-            workspace_fp_text,
-            boolWord(report.compact_context_enabled),
-            boolWord(report.context_was_compacted),
-            boolWord(report.last_turn.prompt_refreshed),
-            refresh_reason_text,
-            boolWord(report.last_turn.memory_context_injected),
-            report.last_turn.memory_context_bytes,
-            report.last_turn.memory_enrich_ms,
-            boolWord(report.last_turn.cache_hit),
-            memory_selection_text,
-        },
-    );
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.writeAll("Context detail:\n");
+    try std.fmt.format(w, "  model: {s}\n", .{report.model_name});
+    try std.fmt.format(w, "  messages: {d}\n", .{report.history_messages});
+    try std.fmt.format(w, "  token_estimate: {d}\n", .{report.token_estimate});
+    try std.fmt.format(w, "  tools: {d}\n", .{report.tool_count});
+    try std.fmt.format(w, "  by_role: system={d} user={d} assistant={d} tool={d}\n", .{
+        report.role_counts.system,
+        report.role_counts.user,
+        report.role_counts.assistant,
+        report.role_counts.tool,
+    });
+    try std.fmt.format(w, "  memory: enabled={s} runtime={s} session={s} enriched_messages={d}\n", .{
+        boolWord(report.memory_enabled),
+        boolWord(report.memory_runtime_enabled),
+        memory_session_text,
+        report.memory_enriched_messages,
+    });
+    try std.fmt.format(w, "  retrieval: mode={s} provider={s} vector={s} rollout={s}\n", .{
+        report.retrieval_mode,
+        report.embedding_provider,
+        report.vector_mode,
+        report.rollout_mode,
+    });
+    try std.fmt.format(w, "  prompt: has_system={s} conversation_context={s} workspace_fp={s}\n", .{
+        boolWord(report.has_system_prompt),
+        boolWord(report.has_conversation_context),
+        workspace_fp_text,
+    });
+    try std.fmt.format(w, "  runtime: compact_context={s} compacted_last_turn={s}\n", .{
+        boolWord(report.compact_context_enabled),
+        boolWord(report.context_was_compacted),
+    });
+    try std.fmt.format(w, "  cache: stable_prefix={s} refresh_needed={s} reason={s}\n", .{
+        boolWord(report.stable_prefix_cache.available),
+        boolWord(report.stable_prefix_cache.refresh_needed),
+        stable_prefix_reason_text,
+    });
+    try w.writeAll("  buckets:\n");
+    try std.fmt.format(w, "    stable_prefix: entries={d} bytes={d} cache={s}\n", .{
+        report.buckets.stable_prefix.entries,
+        report.buckets.stable_prefix.bytes,
+        context_cache.cacheabilityText(report.buckets.stable_prefix.cacheability),
+    });
+    try std.fmt.format(w, "    memory_context: entries={d} bytes={d} cache={s}\n", .{
+        report.buckets.memory_context.entries,
+        report.buckets.memory_context.bytes,
+        context_cache.cacheabilityText(report.buckets.memory_context.cacheability),
+    });
+    try std.fmt.format(w, "    recent_history: entries={d} bytes={d} cache={s}\n", .{
+        report.buckets.recent_history.entries,
+        report.buckets.recent_history.bytes,
+        context_cache.cacheabilityText(report.buckets.recent_history.cacheability),
+    });
+    try std.fmt.format(w, "    last_turn_runtime: active={s} bytes={d} cache={s}\n", .{
+        boolWord(report.buckets.last_turn_runtime.active),
+        report.buckets.last_turn_runtime.bytes,
+        context_cache.cacheabilityText(report.buckets.last_turn_runtime.cacheability),
+    });
+    try std.fmt.format(w, "    conversation_context: active={s} embedded_in_prefix={s}\n", .{
+        boolWord(report.buckets.conversation_context.active),
+        boolWord(report.buckets.conversation_context.embedded_in_stable_prefix),
+    });
+    try std.fmt.format(w, "  last_turn: prompt_refresh={s} reason={s} memory_injected={s} bytes={d} enrich_ms={d} cache_hit={s}\n", .{
+        boolWord(report.last_turn.prompt_refreshed),
+        refresh_reason_text,
+        boolWord(report.last_turn.memory_context_injected),
+        report.last_turn.memory_context_bytes,
+        report.last_turn.memory_enrich_ms,
+        boolWord(report.last_turn.cache_hit),
+    });
+    try std.fmt.format(w, "  memory_select: {s}", .{memory_selection_text});
+    return try out.toOwnedSlice(allocator);
 }
 
 pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
@@ -164,6 +233,49 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .embedding_provider = report.embedding_provider,
             .vector_mode = report.vector_mode,
             .rollout = report.rollout_mode,
+        },
+        .cache = .{
+            .stable_prefix = .{
+                .available = report.stable_prefix_cache.available,
+                .refresh_needed = report.stable_prefix_cache.refresh_needed,
+                .cold_start = report.stable_prefix_cache.cold_start,
+                .workspace_prompt_changed = report.stable_prefix_cache.workspace_prompt_changed,
+                .time_bucket_changed = report.stable_prefix_cache.time_bucket_changed,
+                .conversation_context_changed = report.stable_prefix_cache.conversation_context_changed,
+                .workspace_fingerprint = report.stable_prefix_cache.workspace_fingerprint,
+                .time_bucket_min = report.stable_prefix_cache.current_time_bucket_min,
+            },
+        },
+        .buckets = .{
+            .stable_prefix = .{
+                .entries = report.buckets.stable_prefix.entries,
+                .bytes = report.buckets.stable_prefix.bytes,
+                .active = report.buckets.stable_prefix.active,
+                .cacheability = @tagName(report.buckets.stable_prefix.cacheability),
+            },
+            .memory_context = .{
+                .entries = report.buckets.memory_context.entries,
+                .bytes = report.buckets.memory_context.bytes,
+                .active = report.buckets.memory_context.active,
+                .cacheability = @tagName(report.buckets.memory_context.cacheability),
+            },
+            .recent_history = .{
+                .entries = report.buckets.recent_history.entries,
+                .bytes = report.buckets.recent_history.bytes,
+                .active = report.buckets.recent_history.active,
+                .cacheability = @tagName(report.buckets.recent_history.cacheability),
+            },
+            .last_turn_runtime = .{
+                .entries = report.buckets.last_turn_runtime.entries,
+                .bytes = report.buckets.last_turn_runtime.bytes,
+                .active = report.buckets.last_turn_runtime.active,
+                .cacheability = @tagName(report.buckets.last_turn_runtime.cacheability),
+            },
+            .conversation_context = .{
+                .active = report.buckets.conversation_context.active,
+                .embedded_in_stable_prefix = report.buckets.conversation_context.embedded_in_stable_prefix,
+                .fingerprint = report.buckets.conversation_context.fingerprint,
+            },
         },
         .last_turn = .{
             .available = report.last_turn.available,
@@ -267,6 +379,8 @@ test "context report counts roles and memory-enriched turns" {
     try std.testing.expectEqual(@as(?u64, 42), report.workspace_prompt_fingerprint);
     try std.testing.expectEqualStrings("together", report.embedding_provider);
     try std.testing.expectEqualStrings("pgvector", report.vector_mode);
+    try std.testing.expectEqual(@as(usize, 1), report.buckets.stable_prefix.entries);
+    try std.testing.expectEqual(@as(usize, 1), report.buckets.memory_context.entries);
 }
 
 test "context report formatters expose structured details" {
@@ -289,6 +403,20 @@ test "context report formatters expose structured details" {
         .embedding_provider = "together",
         .vector_mode = "pgvector",
         .rollout_mode = "on",
+        .stable_prefix_cache = .{
+            .available = true,
+            .refresh_needed = true,
+            .workspace_prompt_changed = true,
+            .workspace_fingerprint = 77,
+            .current_time_bucket_min = 5,
+        },
+        .buckets = .{
+            .stable_prefix = .{ .entries = 1, .bytes = 128, .active = true, .cacheability = .stable },
+            .memory_context = .{ .entries = 2, .bytes = 64, .active = true, .cacheability = .dynamic },
+            .recent_history = .{ .entries = 6, .bytes = 257, .active = true, .cacheability = .dynamic },
+            .last_turn_runtime = .{ .entries = 1, .bytes = 64, .active = true, .cacheability = .per_turn },
+            .conversation_context = .{ .active = false, .embedded_in_stable_prefix = false, .fingerprint = 0 },
+        },
         .last_turn = .{
             .available = true,
             .prompt_refreshed = true,
@@ -321,12 +449,16 @@ test "context report formatters expose structured details" {
     defer std.testing.allocator.free(detail);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory: enabled=yes runtime=yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "retrieval: mode=hybrid provider=together vector=pgvector rollout=on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "cache: stable_prefix=yes refresh_needed=yes reason=workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "stable_prefix: entries=1 bytes=128 cache=stable") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "last_turn: prompt_refresh=yes reason=workspace memory_injected=yes bytes=64 enrich_ms=11 cache_hit=no") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory_select: summary_latest=yes anchor=yes durable=1 timeline=2 search=1 fallback=0 candidates=5 global_candidates=12") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "workspace_fp=77") != null);
 
     const json = try formatJson(std.testing.allocator, report);
     defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stable_prefix\":{\"available\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"buckets\":{\"stable_prefix\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"enriched_messages\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"embedding_provider\":\"together\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"memory_context_injected\":true") != null);
