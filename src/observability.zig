@@ -169,6 +169,23 @@ pub const VerboseObserver = struct {
         };
     }
 
+    fn turnStageLabel(stage: []const u8) []const u8 {
+        if (std.mem.eql(u8, stage, "turn_start")) return "Gathering context";
+        if (std.mem.eql(u8, stage, "memory_enrich")) return "Retrieving memory";
+        if (std.mem.eql(u8, stage, "turn_compaction") or std.mem.eql(u8, stage, "compact_trim")) return "Trimming context";
+        if (std.mem.eql(u8, stage, "build_provider_messages")) return "Preparing model request";
+        if (std.mem.eql(u8, stage, "response_cache_hit")) return "Using cached response";
+        if (std.mem.eql(u8, stage, "parse_provider_response")) return "Processing model response";
+        if (std.mem.eql(u8, stage, "dispatch_tools")) return "Running tools";
+        if (std.mem.eql(u8, stage, "tool_reflection")) return "Reflecting on tool results";
+        if (std.mem.eql(u8, stage, "compose_final_reply")) return "Preparing final reply";
+        if (std.mem.eql(u8, stage, "finalize_no_tools")) return "Finalizing reply";
+        if (std.mem.eql(u8, stage, "tts_prepare")) return "Preparing audio reply";
+        if (std.mem.eql(u8, stage, "llm_first_token")) return "Model started responding";
+        if (std.mem.eql(u8, stage, "llm_first_token_upper_bound")) return "Waiting for model response";
+        return stage;
+    }
+
     fn verboseRecordEvent(_: *anyopaque, event: *const ObserverEvent) void {
         var buf: [4096]u8 = undefined;
         var bw = std.fs.File.stderr().writer(&buf);
@@ -188,7 +205,7 @@ pub const VerboseObserver = struct {
                 stderr.print("< Tool {s} (success={}, duration_ms={d})\n", .{ e.tool, e.success, e.duration_ms }) catch {};
             },
             .turn_stage => |e| {
-                stderr.print("> Stage {s}\n", .{e.stage}) catch {};
+                stderr.print("> {s}\n", .{turnStageLabel(e.stage)}) catch {};
             },
             .turn_complete => {
                 stderr.print("< Complete\n", .{}) catch {};
@@ -826,6 +843,7 @@ test "VerboseObserver handles all event types" {
         .{ .llm_response = .{ .provider = "test", .model = "test", .duration_ms = 100, .success = true, .error_message = null } },
         .{ .tool_call_start = .{ .tool = "shell" } },
         .{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } },
+        .{ .turn_stage = .{ .stage = "turn_start" } },
         .{ .turn_complete = {} },
         .{ .agent_start = .{ .provider = "test", .model = "test" } },
         .{ .agent_end = .{ .duration_ms = 1000, .tokens_used = 500 } },
@@ -836,6 +854,13 @@ test "VerboseObserver handles all event types" {
     for (&events) |*event| {
         obs.recordEvent(event);
     }
+}
+
+test "VerboseObserver turnStageLabel maps user-facing labels" {
+    try std.testing.expectEqualStrings("Gathering context", VerboseObserver.turnStageLabel("turn_start"));
+    try std.testing.expectEqualStrings("Using cached response", VerboseObserver.turnStageLabel("response_cache_hit"));
+    try std.testing.expectEqualStrings("Preparing final reply", VerboseObserver.turnStageLabel("compose_final_reply"));
+    try std.testing.expectEqualStrings("unknown_stage", VerboseObserver.turnStageLabel("unknown_stage"));
 }
 
 test "MultiObserver fans out metrics" {

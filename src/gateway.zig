@@ -6753,12 +6753,24 @@ fn SseProgressObserver(comptime StreamType: type) type {
 
         fn emitStage(self: *Self, stage: []const u8, iteration: ?u32, duration_ms: ?u64, count: ?u32) void {
             _ = count;
+            if (std.mem.eql(u8, stage, "turn_start")) {
+                self.emit("thinking", "start", "Gathering context", null, iteration, duration_ms);
+                return;
+            }
             if (std.mem.eql(u8, stage, "memory_enrich")) {
                 self.emit("thinking", "update", "Retrieving memory", null, iteration, duration_ms);
                 return;
             }
+            if (std.mem.eql(u8, stage, "turn_compaction") or std.mem.eql(u8, stage, "compact_trim")) {
+                self.emit("thinking", "update", "Trimming context", null, iteration, duration_ms);
+                return;
+            }
             if (std.mem.eql(u8, stage, "build_provider_messages")) {
                 self.emit("thinking", "update", "Preparing model request", null, iteration, duration_ms);
+                return;
+            }
+            if (std.mem.eql(u8, stage, "response_cache_hit")) {
+                self.emit("compose", "update", "Using cached response", null, iteration, duration_ms);
                 return;
             }
             if (std.mem.eql(u8, stage, "parse_provider_response")) {

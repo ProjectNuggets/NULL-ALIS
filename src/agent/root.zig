@@ -1113,6 +1113,11 @@ pub const Agent = struct {
             return response;
         }
 
+        const turn_start_event = ObserverEvent{ .turn_stage = .{
+            .stage = "turn_start",
+        } };
+        self.observer.recordEvent(&turn_start_event);
+
         // Inject system prompt on first turn (or when tracked workspace files changed).
         const current_time_bucket_min = @divFloor(std.time.timestamp(), 60);
         const workspace_fp = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
@@ -1259,6 +1264,12 @@ pub const Agent = struct {
                     // unbounded when many turns short-circuit before finalize.
                     self.last_turn_compacted = false;
                     self.trimHistory();
+                    const cache_hit_event = ObserverEvent{ .turn_stage = .{
+                        .stage = "response_cache_hit",
+                    } };
+                    self.observer.recordEvent(&cache_hit_event);
+                    const complete_event = ObserverEvent{ .turn_complete = {} };
+                    self.observer.recordEvent(&complete_event);
                     return cached_hit.response;
                 }
             }
@@ -1277,6 +1288,12 @@ pub const Agent = struct {
                 // unbounded when many turns short-circuit before finalize.
                 self.last_turn_compacted = false;
                 self.trimHistory();
+                const cache_hit_event = ObserverEvent{ .turn_stage = .{
+                    .stage = "response_cache_hit",
+                } };
+                self.observer.recordEvent(&cache_hit_event);
+                const complete_event = ObserverEvent{ .turn_complete = {} };
+                self.observer.recordEvent(&complete_event);
                 return cached_response;
             }
         }
@@ -4465,14 +4482,50 @@ test "turn uses semantic cache when runtime semantic cache is available" {
         .vtable = &provider_vtable,
     };
 
-    var noop = observability.NoopObserver{};
+    const StageObserver = struct {
+        const Self = @This();
+        turn_start_count: u32 = 0,
+        cache_hit_count: u32 = 0,
+        complete_count: u32 = 0,
+
+        const vtable = Observer.VTable{
+            .record_event = recordEvent,
+            .record_metric = recordMetric,
+            .flush = flush,
+            .name = name,
+        };
+
+        fn observer(self: *Self) Observer {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn recordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            switch (event.*) {
+                .turn_stage => |stage| {
+                    if (std.mem.eql(u8, stage.stage, "turn_start")) self.turn_start_count += 1;
+                    if (std.mem.eql(u8, stage.stage, "response_cache_hit")) self.cache_hit_count += 1;
+                },
+                .turn_complete => self.complete_count += 1,
+                else => {},
+            }
+        }
+
+        fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+        fn flush(_: *anyopaque) void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "semantic-cache-stage-observer";
+        }
+    };
+
+    var stage_observer = StageObserver{};
     var agent = Agent{
         .allocator = allocator,
         .provider = provider,
         .tools = &.{},
         .tool_specs = try allocator.alloc(ToolSpec, 0),
         .mem = null,
-        .observer = noop.observer(),
+        .observer = stage_observer.observer(),
         .model_name = "test-model",
         .temperature = 0.7,
         .workspace_dir = workspace,
@@ -4538,6 +4591,9 @@ test "turn uses semantic cache when runtime semantic cache is available" {
     defer allocator.free(first);
     try std.testing.expectEqualStrings("provider-answer", first);
     try std.testing.expectEqual(@as(u32, 1), provider_state.calls);
+    try std.testing.expectEqual(@as(u32, 1), stage_observer.turn_start_count);
+    try std.testing.expectEqual(@as(u32, 1), stage_observer.complete_count);
+    try std.testing.expectEqual(@as(u32, 0), stage_observer.cache_hit_count);
 
     const sem_stats_after_first = try sem_cache.stats();
     try std.testing.expect(sem_stats_after_first.count >= 1);
@@ -4546,6 +4602,9 @@ test "turn uses semantic cache when runtime semantic cache is available" {
     defer allocator.free(second);
     try std.testing.expectEqualStrings("provider-answer", second);
     try std.testing.expectEqual(@as(u32, 1), provider_state.calls);
+    try std.testing.expectEqual(@as(u32, 2), stage_observer.turn_start_count);
+    try std.testing.expectEqual(@as(u32, 2), stage_observer.complete_count);
+    try std.testing.expectEqual(@as(u32, 1), stage_observer.cache_hit_count);
 
     const sem_stats_after_second = try sem_cache.stats();
     try std.testing.expect(sem_stats_after_second.hits >= 1);
