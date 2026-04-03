@@ -367,6 +367,9 @@ pub const Agent = struct {
     /// Whether context was force-compacted due to exhaustion during the current turn.
     context_was_compacted: bool = false,
 
+    /// Compact explanation of what context was assembled on the last completed turn.
+    last_turn_context: context_builder.LastTurnContext = .{},
+
     /// An owned copy of a ChatMessage, where content is heap-allocated.
     pub const OwnedMessage = struct {
         role: providers.Role,
@@ -1099,7 +1102,6 @@ pub const Agent = struct {
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         const turn_start_ms = std.time.milliTimestamp();
-        self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
         var turn_llm_calls: u32 = 0;
         var turn_retry_attempts: u32 = 0;
@@ -1114,6 +1116,9 @@ pub const Agent = struct {
         if (try self.handleSlashCommand(user_message)) |response| {
             return response;
         }
+
+        self.context_was_compacted = false;
+        self.last_turn_context = .{};
 
         const turn_start_event = ObserverEvent{ .turn_stage = .{
             .stage = "turn_start",
@@ -1204,6 +1209,12 @@ pub const Agent = struct {
             try self.allocator.dupe(u8, user_message);
         const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
         turn_memory_enrich_ms = enrich_duration_ms;
+        self.last_turn_context = context_builder.buildLastTurnContext(
+            prompt_refresh_plan,
+            user_message,
+            enriched,
+            enrich_duration_ms,
+        );
         log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
         const memory_stage_event = ObserverEvent{ .turn_stage = .{
             .stage = "memory_enrich",
@@ -1258,6 +1269,7 @@ pub const Agent = struct {
                         .stage = "response_cache_hit",
                     } };
                     self.observer.recordEvent(&cache_hit_event);
+                    self.last_turn_context.cache_hit = true;
                     const complete_event = ObserverEvent{ .turn_complete = {} };
                     self.observer.recordEvent(&complete_event);
                     return cached_hit.response;
@@ -1282,6 +1294,7 @@ pub const Agent = struct {
                     .stage = "response_cache_hit",
                 } };
                 self.observer.recordEvent(&cache_hit_event);
+                self.last_turn_context.cache_hit = true;
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
                 return cached_response;
@@ -2199,6 +2212,7 @@ pub const Agent = struct {
         self.system_prompt_conversation_context_fingerprint = 0;
         self.workspace_prompt_fingerprint = null;
         self.system_prompt_time_bucket_min = -1;
+        self.last_turn_context = .{};
     }
 
     /// Persist a compact session checkpoint and refresh context anchor.
@@ -3232,6 +3246,46 @@ test "slash /new clears history" {
     try std.testing.expectEqualStrings("Session cleared.", response);
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     try std.testing.expect(!agent.has_system_prompt);
+}
+
+test "slash /context detail preserves last turn context snapshot" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = true,
+        .last_turn_context = .{
+            .available = true,
+            .prompt_refreshed = true,
+            .workspace_prompt_changed = true,
+            .memory_context_injected = true,
+            .memory_context_bytes = 123,
+            .memory_enrich_ms = 9,
+            .cache_hit = false,
+        },
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("/context detail");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "last_turn: prompt_refresh=yes reason=workspace memory_injected=yes bytes=123 enrich_ms=9 cache_hit=no") != null);
+    try std.testing.expect(agent.last_turn_context.available);
+    try std.testing.expectEqual(@as(usize, 123), agent.last_turn_context.memory_context_bytes);
 }
 
 test "slash /new writes checkpoint, summary objects, and context anchor" {

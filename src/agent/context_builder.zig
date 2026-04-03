@@ -27,6 +27,19 @@ pub const Snapshot = struct {
     embedding_provider: []const u8,
     vector_mode: []const u8,
     rollout_mode: []const u8,
+    last_turn: LastTurnContext = .{},
+};
+
+pub const LastTurnContext = struct {
+    available: bool = false,
+    prompt_refreshed: bool = false,
+    workspace_prompt_changed: bool = false,
+    time_bucket_changed: bool = false,
+    conversation_context_changed: bool = false,
+    memory_context_injected: bool = false,
+    memory_context_bytes: usize = 0,
+    memory_enrich_ms: u64 = 0,
+    cache_hit: bool = false,
 };
 
 pub const PromptRefreshPlan = struct {
@@ -122,6 +135,7 @@ pub fn buildSnapshot(self: anytype) Snapshot {
         .embedding_provider = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.embedding_provider else "n/a",
         .vector_mode = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.vector_mode else "n/a",
         .rollout_mode = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.rollout_mode else "n/a",
+        .last_turn = if (@hasField(AgentType, "last_turn_context")) self.last_turn_context else .{},
     };
 }
 
@@ -158,6 +172,30 @@ pub fn buildPromptRefreshPlan(self: anytype) PromptRefreshPlan {
         .time_bucket_changed = time_bucket_changed,
         .conversation_context_changed = conversation_context_changed,
         .should_refresh_system_prompt = !has_system_prompt or workspace_prompt_changed or time_bucket_changed or conversation_context_changed,
+    };
+}
+
+pub fn buildLastTurnContext(
+    plan: PromptRefreshPlan,
+    user_message: []const u8,
+    enriched_message: []const u8,
+    memory_enrich_ms: u64,
+) LastTurnContext {
+    const memory_context_injected = std.mem.startsWith(u8, enriched_message, "[Memory context]\n") and
+        enriched_message.len >= user_message.len and
+        std.mem.endsWith(u8, enriched_message, user_message);
+    const memory_context_bytes = if (memory_context_injected) enriched_message.len - user_message.len else 0;
+
+    return .{
+        .available = true,
+        .prompt_refreshed = plan.should_refresh_system_prompt,
+        .workspace_prompt_changed = plan.workspace_prompt_changed,
+        .time_bucket_changed = plan.time_bucket_changed,
+        .conversation_context_changed = plan.conversation_context_changed,
+        .memory_context_injected = memory_context_injected,
+        .memory_context_bytes = memory_context_bytes,
+        .memory_enrich_ms = memory_enrich_ms,
+        .cache_hit = false,
     };
 }
 
@@ -291,4 +329,34 @@ test "buildPromptRefreshPlan detects clock and conversation changes" {
     try std.testing.expect(plan.time_bucket_changed);
     try std.testing.expect(plan.conversation_context_changed);
     try std.testing.expect(plan.should_refresh_system_prompt);
+}
+
+test "buildLastTurnContext captures injected memory bytes" {
+    const plan = PromptRefreshPlan{
+        .current_time_bucket_min = 1,
+        .workspace_prompt_fingerprint = 7,
+        .conversation_context_present = false,
+        .conversation_context_fingerprint = 0,
+        .workspace_prompt_changed = true,
+        .time_bucket_changed = false,
+        .conversation_context_changed = false,
+        .should_refresh_system_prompt = true,
+    };
+
+    const user_message = "actual user request";
+    const enriched_message = "[Memory context]\n- pref: concise\n\nactual user request";
+    const last_turn = buildLastTurnContext(
+        plan,
+        user_message,
+        enriched_message,
+        12,
+    );
+
+    try std.testing.expect(last_turn.available);
+    try std.testing.expect(last_turn.prompt_refreshed);
+    try std.testing.expect(last_turn.workspace_prompt_changed);
+    try std.testing.expect(last_turn.memory_context_injected);
+    try std.testing.expectEqual(enriched_message.len - user_message.len, last_turn.memory_context_bytes);
+    try std.testing.expectEqual(@as(u64, 12), last_turn.memory_enrich_ms);
+    try std.testing.expect(!last_turn.cache_hit);
 }

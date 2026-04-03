@@ -20,6 +20,36 @@ pub fn formatSummary(allocator: std.mem.Allocator, report: Report) ![]u8 {
     );
 }
 
+fn promptRefreshReasonText(allocator: std.mem.Allocator, report: Report) ![]u8 {
+    if (!report.last_turn.available or !report.last_turn.prompt_refreshed) {
+        return try allocator.dupe(u8, "n/a");
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    var wrote = false;
+
+    if (report.last_turn.workspace_prompt_changed) {
+        try w.writeAll("workspace");
+        wrote = true;
+    }
+    if (report.last_turn.time_bucket_changed) {
+        if (wrote) try w.writeAll("+");
+        try w.writeAll("clock");
+        wrote = true;
+    }
+    if (report.last_turn.conversation_context_changed) {
+        if (wrote) try w.writeAll("+");
+        try w.writeAll("conversation");
+        wrote = true;
+    }
+    if (!wrote) {
+        try w.writeAll("cold_start");
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
     const workspace_fp_text = if (report.workspace_prompt_fingerprint) |fp|
         try std.fmt.allocPrint(allocator, "{d}", .{fp})
@@ -33,6 +63,9 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         try allocator.dupe(u8, "n/a");
     defer allocator.free(memory_session_text);
 
+    const refresh_reason_text = try promptRefreshReasonText(allocator, report);
+    defer allocator.free(refresh_reason_text);
+
     return try std.fmt.allocPrint(
         allocator,
         "Context detail:\n" ++
@@ -44,7 +77,8 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
             "  memory: enabled={s} runtime={s} session={s} enriched_messages={d}\n" ++
             "  retrieval: mode={s} provider={s} vector={s} rollout={s}\n" ++
             "  prompt: has_system={s} conversation_context={s} workspace_fp={s}\n" ++
-            "  runtime: compact_context={s} compacted_last_turn={s}",
+            "  runtime: compact_context={s} compacted_last_turn={s}\n" ++
+            "  last_turn: prompt_refresh={s} reason={s} memory_injected={s} bytes={d} enrich_ms={d} cache_hit={s}",
         .{
             report.model_name,
             report.history_messages,
@@ -67,6 +101,12 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
             workspace_fp_text,
             boolWord(report.compact_context_enabled),
             boolWord(report.context_was_compacted),
+            boolWord(report.last_turn.prompt_refreshed),
+            refresh_reason_text,
+            boolWord(report.last_turn.memory_context_injected),
+            report.last_turn.memory_context_bytes,
+            report.last_turn.memory_enrich_ms,
+            boolWord(report.last_turn.cache_hit),
         },
     );
 }
@@ -99,6 +139,17 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .embedding_provider = report.embedding_provider,
             .vector_mode = report.vector_mode,
             .rollout = report.rollout_mode,
+        },
+        .last_turn = .{
+            .available = report.last_turn.available,
+            .prompt_refreshed = report.last_turn.prompt_refreshed,
+            .workspace_prompt_changed = report.last_turn.workspace_prompt_changed,
+            .time_bucket_changed = report.last_turn.time_bucket_changed,
+            .conversation_context_changed = report.last_turn.conversation_context_changed,
+            .memory_context_injected = report.last_turn.memory_context_injected,
+            .memory_context_bytes = report.last_turn.memory_context_bytes,
+            .memory_enrich_ms = report.last_turn.memory_enrich_ms,
+            .cache_hit = report.last_turn.cache_hit,
         },
         .runtime = .{
             .compact_context = report.compact_context_enabled,
@@ -202,6 +253,17 @@ test "context report formatters expose structured details" {
         .embedding_provider = "together",
         .vector_mode = "pgvector",
         .rollout_mode = "on",
+        .last_turn = .{
+            .available = true,
+            .prompt_refreshed = true,
+            .workspace_prompt_changed = true,
+            .time_bucket_changed = false,
+            .conversation_context_changed = false,
+            .memory_context_injected = true,
+            .memory_context_bytes = 64,
+            .memory_enrich_ms = 11,
+            .cache_hit = false,
+        },
     };
 
     const summary = try formatSummary(std.testing.allocator, report);
@@ -212,11 +274,13 @@ test "context report formatters expose structured details" {
     defer std.testing.allocator.free(detail);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory: enabled=yes runtime=yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "retrieval: mode=hybrid provider=together vector=pgvector rollout=on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "last_turn: prompt_refresh=yes reason=workspace memory_injected=yes bytes=64 enrich_ms=11 cache_hit=no") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "workspace_fp=77") != null);
 
     const json = try formatJson(std.testing.allocator, report);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"enriched_messages\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"embedding_provider\":\"together\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"memory_context_injected\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"workspace_prompt_fingerprint\":77") != null);
 }
