@@ -13,6 +13,7 @@ const config_types = @import("../config_types.zig");
 const config_module = @import("../config.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
+const context_report = @import("context_report.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const util = @import("../util.zig");
@@ -1703,39 +1704,16 @@ fn handleAllowlistCommand(self: anytype, arg: []const u8) ![]const u8 {
 
 fn handleContextCommand(self: anytype, arg: []const u8) ![]const u8 {
     const mode = firstToken(arg);
+    const report = context_report.fromAgent(self);
     if (std.ascii.eqlIgnoreCase(mode, "json")) {
-        return try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"model\":\"{s}\",\"history_messages\":{d},\"token_estimate\":{d},\"tools\":{d}}}",
-            .{ self.model_name, self.history.items.len, self.tokenEstimate(), self.tools.len },
-        );
+        return try context_report.formatJson(self.allocator, report);
     }
 
     if (std.ascii.eqlIgnoreCase(mode, "detail")) {
-        var sys: usize = 0;
-        var usr: usize = 0;
-        var asst: usize = 0;
-        var tool: usize = 0;
-        for (self.history.items) |entry| {
-            switch (entry.role) {
-                .system => sys += 1,
-                .user => usr += 1,
-                .assistant => asst += 1,
-                .tool => tool += 1,
-            }
-        }
-        return try std.fmt.allocPrint(
-            self.allocator,
-            "Context detail:\n  model: {s}\n  messages: {d}\n  token_estimate: {d}\n  tools: {d}\n  by_role: system={d} user={d} assistant={d} tool={d}",
-            .{ self.model_name, self.history.items.len, self.tokenEstimate(), self.tools.len, sys, usr, asst, tool },
-        );
+        return try context_report.formatDetail(self.allocator, report);
     }
 
-    return try std.fmt.allocPrint(
-        self.allocator,
-        "Context: messages={d}, token_estimate={d}, tools={d}",
-        .{ self.history.items.len, self.tokenEstimate(), self.tools.len },
-    );
+    return try context_report.formatSummary(self.allocator, report);
 }
 
 fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {

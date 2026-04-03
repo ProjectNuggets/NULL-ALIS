@@ -115,7 +115,7 @@ Keep the per-user cell substrate boring, trustworthy, and measurable while the a
 ### M1. Kernel UX
 
 - Branch: `feat/kernel-ux-v1`
-- Status: review complete, ready for local test
+- Status: complete for now, app follow-up continues outside this repo
 
 #### Goal
 
@@ -167,10 +167,21 @@ Make the agent crisp, responsive, and pleasant to use without flattening persona
 ### M2. Context Introspection
 
 - Branch: `feat/context-introspection-v1`
+- Status: in progress
 
 #### Goal
 
 Engineer context as a real runtime surface instead of implicit prompt glue.
+
+#### Current Baseline
+
+1. current turns already enrich memory via the retrieval pipeline in [src/agent/memory_loader.zig](/Users/nova/Desktop/nullalis/src/agent/memory_loader.zig) and [src/memory/retrieval/engine.zig](/Users/nova/Desktop/nullalis/src/memory/retrieval/engine.zig)
+2. recall quality today comes from:
+   - scoped session recall plus global durable facts
+   - `summary_latest/*` and `context_anchor_current` priority injection
+   - hybrid retrieval when rollout allows it
+   - temporal decay and optional MMR/LLM reranking
+3. M2 should expose and structure this stack before trying to replace it
 
 #### Evolve
 
