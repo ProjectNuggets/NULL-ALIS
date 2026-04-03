@@ -31,6 +31,7 @@ const MODEL_WINDOWS = [_]ContextWindowEntry{
     .{ .key = "gemini-2.5-pro", .tokens = 200_000 },
     .{ .key = "gemini-2.5-flash", .tokens = 200_000 },
     .{ .key = "gemini-2.0-flash", .tokens = 200_000 },
+    .{ .key = "kimi-k2.5", .tokens = 262_144 },
     .{ .key = "deepseek-v3.2", .tokens = 128_000 },
     .{ .key = "deepseek-chat", .tokens = 128_000 },
     .{ .key = "deepseek-reasoner", .tokens = 128_000 },
@@ -46,8 +47,10 @@ const PROVIDER_WINDOWS = [_]ContextWindowEntry{
     .{ .key = "minimax", .tokens = 200_000 },
     .{ .key = "openai-codex", .tokens = 200_000 },
     .{ .key = "moonshot", .tokens = 256_000 },
+    .{ .key = "moonshotai", .tokens = 256_000 },
     .{ .key = "kimi", .tokens = 262_144 },
     .{ .key = "kimi-coding", .tokens = 262_144 },
+    .{ .key = "together-ai", .tokens = 200_000 },
     .{ .key = "xiaomi", .tokens = 262_144 },
     .{ .key = "ollama", .tokens = 128_000 },
     .{ .key = "qwen", .tokens = 128_000 },
@@ -121,6 +124,7 @@ fn inferFromModelPattern(model_id: []const u8) ?u64 {
     }
 
     if (startsWithIgnoreCase(model_id, "gemini-")) return 200_000;
+    if (startsWithIgnoreCase(model_id, "kimi-k2")) return 262_144;
     if (startsWithIgnoreCase(model_id, "deepseek-")) return 128_000;
     if (startsWithIgnoreCase(model_id, "llama") or startsWithIgnoreCase(model_id, "mixtral-")) return 128_000;
 
@@ -183,12 +187,21 @@ test "lookupContextTokens resolves known model ids" {
     try std.testing.expectEqual(@as(?u64, 128_000), lookupContextTokens("openai/gpt-4.1-mini"));
     try std.testing.expectEqual(@as(?u64, 200_000), lookupContextTokens("claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("mixtral-8x7b-32768"));
+    try std.testing.expectEqual(@as(?u64, 262_144), lookupContextTokens("moonshotai/Kimi-K2.5"));
 }
 
 test "lookupContextTokens handles nested provider refs" {
     try std.testing.expectEqual(
         @as(?u64, 200_000),
         lookupContextTokens("openrouter/anthropic/claude-sonnet-4.6"),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 262_144),
+        lookupContextTokens("openrouter/moonshotai/kimi-k2.5"),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 262_144),
+        lookupContextTokens("together-ai/moonshotai/kimi-k2.5"),
     );
 }
 
