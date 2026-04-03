@@ -6765,16 +6765,20 @@ fn SseProgressObserver(comptime StreamType: type) type {
                 self.emit("thinking", "update", "Processing model response", null, iteration, duration_ms);
                 return;
             }
+            if (std.mem.eql(u8, stage, "dispatch_tools")) {
+                self.emit("tool", "update", "Running tools", null, iteration, duration_ms);
+                return;
+            }
             if (std.mem.eql(u8, stage, "tool_reflection")) {
                 self.emit("thinking", "update", "Reflecting on tool results", null, iteration, duration_ms);
                 return;
             }
             if (std.mem.eql(u8, stage, "compose_final_reply")) {
-                self.emit("compose", "update", "Composing final response", null, iteration, duration_ms);
+                self.emit("compose", "update", "Preparing final reply", null, iteration, duration_ms);
                 return;
             }
             if (std.mem.eql(u8, stage, "finalize_no_tools")) {
-                self.emit("finalize", "update", "Finalizing response", null, iteration, duration_ms);
+                self.emit("finalize", "update", "Finalizing reply", null, iteration, duration_ms);
                 return;
             }
         }

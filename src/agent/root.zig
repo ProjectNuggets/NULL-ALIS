@@ -4165,9 +4165,76 @@ test "turn includes reasoning and usage footer when enabled" {
     const response = try agent.turn("hello");
     defer allocator.free(response);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\nthinking trace") != null);
+    const answer_index = std.mem.indexOf(u8, response, "final answer") orelse return error.TestUnexpectedResult;
+    const reasoning_index = std.mem.indexOf(u8, response, "Reasoning:\nthinking trace") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(answer_index < reasoning_index);
     try std.testing.expect(std.mem.indexOf(u8, response, "[usage] total_tokens=10") != null);
+}
+
+test "turn does not duplicate reasoning in final reply when reasoning mode is stream" {
+    const ProviderState = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "final answer"),
+                .tool_calls = &.{},
+                .usage = .{ .prompt_tokens = 4, .completion_tokens = 6, .total_tokens = 10 },
+                .model = try allocator.dupe(u8, "test-model"),
+                .reasoning_content = try allocator.dupe(u8, "thinking trace"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var state: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = ProviderState.chatWithSystem,
+        .chat = ProviderState.chat,
+        .supportsNativeTools = ProviderState.supportsNativeTools,
+        .getName = ProviderState.getName,
+        .deinit = ProviderState.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &vtable };
+
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const reasoning_cmd = (try agent.handleSlashCommand("/reasoning stream")).?;
+    defer allocator.free(reasoning_cmd);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
     try std.testing.expect(std.mem.indexOf(u8, response, "final answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\n") == null);
 }
 
 test "turn uses trim-only pre-provider compaction for background origins" {

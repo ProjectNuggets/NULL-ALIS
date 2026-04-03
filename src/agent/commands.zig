@@ -2947,21 +2947,23 @@ pub fn composeFinalReply(
     reasoning_content: ?[]const u8,
     usage: providers.TokenUsage,
 ) ![]const u8 {
-    const show_reasoning = self.reasoning_mode != .off and reasoning_content != null and reasoning_content.?.len > 0;
+    const trimmed_base = std.mem.trim(u8, base_text, " \t\r\n");
+    const final_base = if (trimmed_base.len > 0) trimmed_base else base_text;
+    const show_reasoning = self.reasoning_mode == .on and reasoning_content != null and reasoning_content.?.len > 0;
     if (!show_reasoning and self.usage_mode == .off) {
-        return try self.allocator.dupe(u8, base_text);
+        return try self.allocator.dupe(u8, final_base);
     }
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
     const w = out.writer(self.allocator);
 
+    try w.writeAll(final_base);
+
     if (show_reasoning) {
-        try w.writeAll("Reasoning:\n");
+        try w.writeAll("\n\nReasoning:\n");
         try w.writeAll(reasoning_content.?);
-        try w.writeAll("\n\n");
     }
-    try w.writeAll(base_text);
 
     switch (self.usage_mode) {
         .off => {},
