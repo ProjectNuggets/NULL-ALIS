@@ -32,6 +32,7 @@ const RateTracker = @import("../security/policy.zig").RateTracker;
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
+pub const context_builder = @import("context_builder.zig");
 pub const context_tokens = @import("context_tokens.zig");
 pub const context_report = @import("context_report.zig");
 pub const max_tokens_resolver = @import("max_tokens.zig");
@@ -1120,21 +1121,9 @@ pub const Agent = struct {
         self.observer.recordEvent(&turn_start_event);
 
         // Inject system prompt on first turn (or when tracked workspace files changed).
-        const current_time_bucket_min = @divFloor(std.time.timestamp(), 60);
-        const workspace_fp = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
-        if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
-            self.has_system_prompt = false;
-        }
-        if (self.has_system_prompt and self.system_prompt_time_bucket_min != current_time_bucket_min) {
-            self.has_system_prompt = false;
-        }
+        const prompt_refresh_plan = context_builder.buildPromptRefreshPlan(self);
 
-        const turn_has_conversation_context = self.conversation_context != null;
-        const conversation_context_fingerprint = conversationContextFingerprint(self.conversation_context);
-        const conversation_context_changed = self.has_system_prompt and
-            self.system_prompt_conversation_context_fingerprint != conversation_context_fingerprint;
-
-        if (!self.has_system_prompt or conversation_context_changed) {
+        if (prompt_refresh_plan.should_refresh_system_prompt) {
             var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
             defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
             const cfg_for_caps_ptr: ?*const Config = if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded else null;
@@ -1183,10 +1172,10 @@ pub const Agent = struct {
                 });
             }
             self.has_system_prompt = true;
-            self.system_prompt_has_conversation_context = turn_has_conversation_context;
-            self.system_prompt_conversation_context_fingerprint = conversation_context_fingerprint;
-            self.workspace_prompt_fingerprint = workspace_fp;
-            self.system_prompt_time_bucket_min = current_time_bucket_min;
+            self.system_prompt_has_conversation_context = prompt_refresh_plan.conversation_context_present;
+            self.system_prompt_conversation_context_fingerprint = prompt_refresh_plan.conversation_context_fingerprint;
+            self.workspace_prompt_fingerprint = prompt_refresh_plan.workspace_prompt_fingerprint;
+            self.system_prompt_time_bucket_min = prompt_refresh_plan.current_time_bucket_min;
         }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
@@ -2216,37 +2205,6 @@ pub const Agent = struct {
     /// Used by slash resets and session lifecycle hooks (TTL/eviction).
     pub fn persistSessionCheckpoint(self: *Agent, reason: []const u8) void {
         commands.persistSessionCheckpoint(self, reason);
-    }
-
-    fn conversationContextFingerprint(ctx: ?prompt.ConversationContext) u64 {
-        var hasher = std.hash.Fnv1a_64.init();
-        if (ctx) |cc| {
-            hasher.update("present");
-            if (cc.channel) |channel| {
-                hasher.update("channel:");
-                hasher.update(channel);
-            }
-            if (cc.sender_number) |sender_number| {
-                hasher.update("sender_number:");
-                hasher.update(sender_number);
-            }
-            if (cc.sender_uuid) |sender_uuid| {
-                hasher.update("sender_uuid:");
-                hasher.update(sender_uuid);
-            }
-            if (cc.group_id) |group_id| {
-                hasher.update("group_id:");
-                hasher.update(group_id);
-            }
-            if (cc.is_group) |is_group| {
-                hasher.update("is_group:");
-                const b: u8 = if (is_group) 1 else 0;
-                hasher.update(&[_]u8{b});
-            }
-        } else {
-            hasher.update("absent");
-        }
-        return hasher.final();
     }
 
     /// Get total tokens used.

@@ -1,85 +1,11 @@
 const std = @import("std");
+const context_builder = @import("context_builder.zig");
 
-pub const RoleCounts = struct {
-    system: usize = 0,
-    user: usize = 0,
-    assistant: usize = 0,
-    tool: usize = 0,
-};
-
-pub const Report = struct {
-    model_name: []const u8,
-    history_messages: usize,
-    token_estimate: u64,
-    tool_count: usize,
-    role_counts: RoleCounts,
-    memory_enabled: bool,
-    memory_runtime_enabled: bool,
-    memory_session_id: ?[]const u8,
-    memory_enriched_messages: usize,
-    has_system_prompt: bool,
-    has_conversation_context: bool,
-    compact_context_enabled: bool,
-    context_was_compacted: bool,
-    workspace_prompt_fingerprint: ?u64,
-    retrieval_mode: []const u8,
-    embedding_provider: []const u8,
-    vector_mode: []const u8,
-    rollout_mode: []const u8,
-};
-
-fn hasMemoryContextPrefix(content: []const u8) bool {
-    return std.mem.startsWith(u8, content, "[Memory context]\n");
-}
-
-fn tokenEstimateFromHistory(history: anytype) u64 {
-    var total_chars: u64 = 0;
-    for (history.items) |entry| {
-        total_chars += entry.content.len;
-    }
-    return (total_chars + 3) / 4;
-}
+pub const RoleCounts = context_builder.RoleCounts;
+pub const Report = context_builder.Snapshot;
 
 pub fn fromAgent(self: anytype) Report {
-    const AgentType = @TypeOf(self.*);
-
-    var role_counts = RoleCounts{};
-    var memory_enriched_messages: usize = 0;
-
-    if (@hasField(AgentType, "history")) {
-        for (self.history.items) |entry| {
-            switch (entry.role) {
-                .system => role_counts.system += 1,
-                .user => {
-                    role_counts.user += 1;
-                    if (hasMemoryContextPrefix(entry.content)) memory_enriched_messages += 1;
-                },
-                .assistant => role_counts.assistant += 1,
-                .tool => role_counts.tool += 1,
-            }
-        }
-    }
-
-    return .{
-        .model_name = if (@hasField(AgentType, "model_name")) self.model_name else "",
-        .history_messages = if (@hasField(AgentType, "history")) self.history.items.len else 0,
-        .token_estimate = if (@hasField(AgentType, "history")) tokenEstimateFromHistory(self.history) else 0,
-        .tool_count = if (@hasField(AgentType, "tools")) self.tools.len else 0,
-        .role_counts = role_counts,
-        .memory_enabled = if (@hasField(AgentType, "mem")) self.mem != null else false,
-        .memory_runtime_enabled = if (@hasField(AgentType, "mem_rt")) self.mem_rt != null else false,
-        .memory_session_id = if (@hasField(AgentType, "memory_session_id")) self.memory_session_id else null,
-        .memory_enriched_messages = memory_enriched_messages,
-        .has_system_prompt = if (@hasField(AgentType, "has_system_prompt")) self.has_system_prompt else role_counts.system > 0,
-        .has_conversation_context = if (@hasField(AgentType, "conversation_context")) self.conversation_context != null else false,
-        .compact_context_enabled = if (@hasField(AgentType, "compact_context_enabled")) self.compact_context_enabled else false,
-        .context_was_compacted = if (@hasField(AgentType, "context_was_compacted")) self.context_was_compacted else false,
-        .workspace_prompt_fingerprint = if (@hasField(AgentType, "workspace_prompt_fingerprint")) self.workspace_prompt_fingerprint else null,
-        .retrieval_mode = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.retrieval_mode else "n/a",
-        .embedding_provider = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.embedding_provider else "n/a",
-        .vector_mode = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.vector_mode else "n/a",
-        .rollout_mode = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.rollout_mode else "n/a",
-    };
+    return context_builder.buildSnapshot(self);
 }
 
 fn boolWord(value: bool) []const u8 {
