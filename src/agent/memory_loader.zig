@@ -19,6 +19,30 @@ const TIMELINE_FALLBACK_LIMIT: usize = 2;
 /// ~4000 chars ~ 1000 tokens — a safe ceiling for context injection.
 const MAX_CONTEXT_BYTES: usize = 4_000;
 
+pub const SelectionStats = struct {
+    available: bool = false,
+    candidate_count: usize = 0,
+    global_candidate_count: usize = 0,
+    summary_latest_used: bool = false,
+    context_anchor_used: bool = false,
+    durable_fact_count: usize = 0,
+    timeline_summary_count: usize = 0,
+    search_match_count: usize = 0,
+    global_fallback_count: usize = 0,
+    context_bytes: usize = 0,
+    injected: bool = false,
+};
+
+pub const ContextResult = struct {
+    context: []const u8,
+    stats: SelectionStats,
+};
+
+pub const EnrichmentResult = struct {
+    text: []const u8,
+    stats: SelectionStats,
+};
+
 /// Truncate a UTF-8 slice to at most `max_len` bytes without splitting
 /// a multi-byte sequence. Backs up over trailing continuation bytes (0x80..0xBF).
 fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
@@ -138,22 +162,27 @@ fn shouldSkipGenericEntry(
 /// ```
 ///
 /// Returns an empty owned string if no relevant memories are found.
-pub fn loadContext(
+fn loadContextDetailed(
     allocator: std.mem.Allocator,
     mem: Memory,
     user_message: []const u8,
     session_id: ?[]const u8,
-) ![]const u8 {
+) !ContextResult {
+    var stats = SelectionStats{ .available = true };
     const scoped_entries = mem.recall(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
-        return try allocator.dupe(u8, "");
+        return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     };
     defer memory_mod.freeEntries(allocator, scoped_entries);
+    stats.candidate_count = scoped_entries.len;
 
     // When scoped recall is enabled, also include global (session_id = null) memory
     // so long-term facts from memory_store remain visible in session chats.
     var global_entries: ?[]MemoryEntry = null;
     if (session_id != null and scoped_entries.len < DEFAULT_RECALL_LIMIT) {
         global_entries = mem.recall(allocator, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch null;
+    }
+    if (global_entries) |entries| {
+        stats.global_candidate_count = entries.len;
     }
     defer if (global_entries) |entries| memory_mod.freeEntries(allocator, entries);
 
@@ -175,11 +204,13 @@ pub fn loadContext(
         if (try appendDirectEntry(allocator, mem, w, &wrote_header, key)) {
             appended += 1;
             has_priority_context = true;
+            stats.summary_latest_used = true;
         }
     }
     if (try appendDirectEntry(allocator, mem, w, &wrote_header, "context_anchor_current")) {
         appended += 1;
         has_priority_context = true;
+        stats.context_anchor_used = true;
     }
 
     if (global_entries) |entries| {
@@ -189,6 +220,7 @@ pub fn loadContext(
             try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
             appended += 1;
             has_priority_context = true;
+            stats.durable_fact_count += 1;
             if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
         }
     }
@@ -204,6 +236,7 @@ pub fn loadContext(
                 appended += 1;
                 timeline_added += 1;
                 has_priority_context = true;
+                stats.timeline_summary_count += 1;
                 if (timeline_added >= TIMELINE_FALLBACK_LIMIT or appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
         }
@@ -213,6 +246,7 @@ pub fn loadContext(
         if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
         try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
         appended += 1;
+        stats.search_match_count += 1;
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
 
@@ -224,36 +258,44 @@ pub fn loadContext(
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
                 try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
                 appended += 1;
+                stats.global_fallback_count += 1;
                 if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
         }
     }
 
     if (!wrote_header) {
-        return try allocator.dupe(u8, "");
+        return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     }
     try w.writeAll("\n");
+    stats.injected = true;
+    stats.context_bytes = buf.items.len;
 
-    return try buf.toOwnedSlice(allocator);
+    return .{ .context = try buf.toOwnedSlice(allocator), .stats = stats };
 }
 
 /// Load context using the full retrieval pipeline (hybrid search, RRF, etc.)
 /// when a MemoryRuntime is available.
-pub fn loadContextWithRuntime(
+fn loadContextWithRuntimeDetailed(
     allocator: std.mem.Allocator,
     mem: Memory,
     rt: *MemoryRuntime,
     user_message: []const u8,
     session_id: ?[]const u8,
-) ![]const u8 {
+) !ContextResult {
+    var stats = SelectionStats{ .available = true };
     const candidates = rt.search(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
-        return try allocator.dupe(u8, "");
+        return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     };
     defer memory_mod.retrieval.freeCandidates(allocator, candidates);
+    stats.candidate_count = candidates.len;
 
     var global_entries: ?[]MemoryEntry = null;
     if (session_id != null) {
         global_entries = mem.recall(allocator, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch null;
+    }
+    if (global_entries) |entries| {
+        stats.global_candidate_count = entries.len;
     }
     defer if (global_entries) |entries| memory_mod.freeEntries(allocator, entries);
 
@@ -272,10 +314,12 @@ pub fn loadContextWithRuntime(
     if (summary_latest_key) |key| {
         if (try appendDirectEntry(allocator, mem, w, &wrote_header, key)) {
             has_priority_context = true;
+            stats.summary_latest_used = true;
         }
     }
     if (try appendDirectEntry(allocator, mem, w, &wrote_header, "context_anchor_current")) {
         has_priority_context = true;
+        stats.context_anchor_used = true;
     }
 
     if (global_entries) |entries| {
@@ -283,6 +327,7 @@ pub fn loadContextWithRuntime(
             if (!isDurableFactKey(entry.key)) continue;
             try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
             has_priority_context = true;
+            stats.durable_fact_count += 1;
             if (buf.items.len >= MAX_CONTEXT_BYTES) break;
         }
     }
@@ -297,6 +342,7 @@ pub fn loadContextWithRuntime(
                 try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
                 timeline_added += 1;
                 has_priority_context = true;
+                stats.timeline_summary_count += 1;
                 if (timeline_added >= TIMELINE_FALLBACK_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
         }
@@ -305,6 +351,7 @@ pub fn loadContextWithRuntime(
     for (candidates) |cand| {
         if (shouldSkipGenericEntry(cand.key, cand.snippet, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
         try appendContextLine(allocator, w, &wrote_header, cand.key, cand.snippet);
+        stats.search_match_count += 1;
         if (buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
 
@@ -313,15 +360,39 @@ pub fn loadContextWithRuntime(
             for (entries) |entry| {
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
                 try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+                stats.global_fallback_count += 1;
                 if (buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
         }
     }
 
-    if (!wrote_header) return try allocator.dupe(u8, "");
+    if (!wrote_header) return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     try w.writeAll("\n");
+    stats.injected = true;
+    stats.context_bytes = buf.items.len;
 
-    return try buf.toOwnedSlice(allocator);
+    return .{ .context = try buf.toOwnedSlice(allocator), .stats = stats };
+}
+
+pub fn loadContext(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+) ![]const u8 {
+    const result = try loadContextDetailed(allocator, mem, user_message, session_id);
+    return result.context;
+}
+
+pub fn loadContextWithRuntime(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    rt: *MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+) ![]const u8 {
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id);
+    return result.context;
 }
 
 /// Enrich a user message with memory context prepended.
@@ -362,6 +433,33 @@ pub fn enrichMessageWithRuntime(
 
     defer allocator.free(context);
     return try std.fmt.allocPrint(allocator, "{s}{s}", .{ context, user_message });
+}
+
+pub fn enrichMessageWithRuntimeDetailed(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    mem_rt: ?*MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+) !EnrichmentResult {
+    const result = if (mem_rt) |rt|
+        try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id)
+    else
+        try loadContextDetailed(allocator, mem, user_message, session_id);
+
+    if (result.context.len == 0) {
+        allocator.free(result.context);
+        return .{
+            .text = try allocator.dupe(u8, user_message),
+            .stats = result.stats,
+        };
+    }
+
+    defer allocator.free(result.context);
+    return .{
+        .text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.context, user_message }),
+        .stats = result.stats,
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -546,6 +644,46 @@ test "enrichMessageWithRuntime with memories prepends context" {
     try std.testing.expect(std.mem.indexOf(u8, enriched, "Zig is the favorite language") != null);
     // The original message should appear at the end
     try std.testing.expect(std.mem.endsWith(u8, enriched, "language"));
+}
+
+test "enrichMessageWithRuntimeDetailed reports selection stats" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:zaki-bot:user:1:main",
+        "type=summary_latest\nfocus: shipping readiness\n",
+        .core,
+        null,
+    );
+    try mem.store(
+        "context_anchor_current",
+        "type=context_anchor\nlast_session=agent:zaki-bot:user:1:main\n",
+        .core,
+        null,
+    );
+    try mem.store("durable_fact/shipping_pref", "shipping updates should stay concise", .core, null);
+    try mem.store("session_fact", "current lane detail", .conversation, "agent:zaki-bot:user:1:main");
+
+    const enriched = try enrichMessageWithRuntimeDetailed(
+        allocator,
+        mem,
+        null,
+        "shipping",
+        "agent:zaki-bot:user:1:main",
+    );
+    defer allocator.free(enriched.text);
+
+    try std.testing.expect(enriched.stats.available);
+    try std.testing.expect(enriched.stats.injected);
+    try std.testing.expect(enriched.stats.summary_latest_used);
+    try std.testing.expect(enriched.stats.context_anchor_used);
+    try std.testing.expect(enriched.stats.durable_fact_count >= 1);
+    try std.testing.expect(enriched.stats.context_bytes > 0);
+    try std.testing.expect(std.mem.startsWith(u8, enriched.text, "[Memory context]\n"));
 }
 
 test "loadContext filters internal autosave and hygiene entries" {

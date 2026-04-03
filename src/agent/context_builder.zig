@@ -40,6 +40,19 @@ pub const LastTurnContext = struct {
     memory_context_bytes: usize = 0,
     memory_enrich_ms: u64 = 0,
     cache_hit: bool = false,
+    memory_selection: MemorySelection = .{},
+};
+
+pub const MemorySelection = struct {
+    available: bool = false,
+    candidate_count: usize = 0,
+    global_candidate_count: usize = 0,
+    summary_latest_used: bool = false,
+    context_anchor_used: bool = false,
+    durable_fact_count: usize = 0,
+    timeline_summary_count: usize = 0,
+    search_match_count: usize = 0,
+    global_fallback_count: usize = 0,
 };
 
 pub const PromptRefreshPlan = struct {
@@ -177,25 +190,34 @@ pub fn buildPromptRefreshPlan(self: anytype) PromptRefreshPlan {
 
 pub fn buildLastTurnContext(
     plan: PromptRefreshPlan,
-    user_message: []const u8,
-    enriched_message: []const u8,
+    memory_stats: anytype,
     memory_enrich_ms: u64,
 ) LastTurnContext {
-    const memory_context_injected = std.mem.startsWith(u8, enriched_message, "[Memory context]\n") and
-        enriched_message.len >= user_message.len and
-        std.mem.endsWith(u8, enriched_message, user_message);
-    const memory_context_bytes = if (memory_context_injected) enriched_message.len - user_message.len else 0;
-
     return .{
         .available = true,
         .prompt_refreshed = plan.should_refresh_system_prompt,
         .workspace_prompt_changed = plan.workspace_prompt_changed,
         .time_bucket_changed = plan.time_bucket_changed,
         .conversation_context_changed = plan.conversation_context_changed,
-        .memory_context_injected = memory_context_injected,
-        .memory_context_bytes = memory_context_bytes,
+        .memory_context_injected = memory_stats.injected,
+        .memory_context_bytes = memory_stats.context_bytes,
         .memory_enrich_ms = memory_enrich_ms,
         .cache_hit = false,
+        .memory_selection = selectionFromStats(memory_stats),
+    };
+}
+
+pub fn selectionFromStats(stats: anytype) MemorySelection {
+    return .{
+        .available = stats.available,
+        .candidate_count = stats.candidate_count,
+        .global_candidate_count = stats.global_candidate_count,
+        .summary_latest_used = stats.summary_latest_used,
+        .context_anchor_used = stats.context_anchor_used,
+        .durable_fact_count = stats.durable_fact_count,
+        .timeline_summary_count = stats.timeline_summary_count,
+        .search_match_count = stats.search_match_count,
+        .global_fallback_count = stats.global_fallback_count,
     };
 }
 
@@ -343,12 +365,34 @@ test "buildLastTurnContext captures injected memory bytes" {
         .should_refresh_system_prompt = true,
     };
 
-    const user_message = "actual user request";
-    const enriched_message = "[Memory context]\n- pref: concise\n\nactual user request";
+    const stats = struct {
+        available: bool,
+        candidate_count: usize,
+        global_candidate_count: usize,
+        summary_latest_used: bool,
+        context_anchor_used: bool,
+        durable_fact_count: usize,
+        timeline_summary_count: usize,
+        search_match_count: usize,
+        global_fallback_count: usize,
+        context_bytes: usize,
+        injected: bool,
+    }{
+        .available = true,
+        .candidate_count = 5,
+        .global_candidate_count = 12,
+        .summary_latest_used = true,
+        .context_anchor_used = true,
+        .durable_fact_count = 1,
+        .timeline_summary_count = 2,
+        .search_match_count = 1,
+        .global_fallback_count = 0,
+        .context_bytes = 34,
+        .injected = true,
+    };
     const last_turn = buildLastTurnContext(
         plan,
-        user_message,
-        enriched_message,
+        stats,
         12,
     );
 
@@ -356,7 +400,10 @@ test "buildLastTurnContext captures injected memory bytes" {
     try std.testing.expect(last_turn.prompt_refreshed);
     try std.testing.expect(last_turn.workspace_prompt_changed);
     try std.testing.expect(last_turn.memory_context_injected);
-    try std.testing.expectEqual(enriched_message.len - user_message.len, last_turn.memory_context_bytes);
+    try std.testing.expectEqual(@as(usize, 34), last_turn.memory_context_bytes);
     try std.testing.expectEqual(@as(u64, 12), last_turn.memory_enrich_ms);
     try std.testing.expect(!last_turn.cache_hit);
+    try std.testing.expect(last_turn.memory_selection.summary_latest_used);
+    try std.testing.expect(last_turn.memory_selection.context_anchor_used);
+    try std.testing.expectEqual(@as(usize, 2), last_turn.memory_selection.timeline_summary_count);
 }

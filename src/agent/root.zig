@@ -1203,16 +1203,19 @@ pub const Agent = struct {
         // Enrich message with memory context (always returns owned slice; ownership → history)
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
         const enrich_start_ms = std.time.milliTimestamp();
-        const enriched = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, user_message, self.memory_session_id)
+        const enrichment = if (self.mem) |mem|
+            try memory_loader.enrichMessageWithRuntimeDetailed(self.allocator, mem, self.mem_rt, user_message, self.memory_session_id)
         else
-            try self.allocator.dupe(u8, user_message);
+            memory_loader.EnrichmentResult{
+                .text = try self.allocator.dupe(u8, user_message),
+                .stats = .{},
+            };
+        const enriched = enrichment.text;
         const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
         turn_memory_enrich_ms = enrich_duration_ms;
         self.last_turn_context = context_builder.buildLastTurnContext(
             prompt_refresh_plan,
-            user_message,
-            enriched,
+            enrichment.stats,
             enrich_duration_ms,
         );
         log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
