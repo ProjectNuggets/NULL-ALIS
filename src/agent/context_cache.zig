@@ -7,6 +7,7 @@ pub const Cacheability = enum {
 pub const Bucket = struct {
     entries: usize = 0,
     bytes: usize = 0,
+    token_estimate: u64 = 0,
     active: bool = false,
     cacheability: Cacheability = .dynamic,
 };

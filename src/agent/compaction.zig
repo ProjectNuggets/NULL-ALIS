@@ -34,6 +34,14 @@ pub const DEFAULT_COMPACTION_MAX_SOURCE_CHARS: u32 = 12_000;
 /// Default token limit for context window (used by token-based compaction trigger).
 pub const DEFAULT_TOKEN_LIMIT: u64 = config_types.DEFAULT_AGENT_TOKEN_LIMIT;
 
+pub const TrimStats = struct {
+    history_before: usize = 0,
+    history_after: usize = 0,
+    removed_messages: usize = 0,
+    removed_bytes: usize = 0,
+    shrunk_capacity: bool = false,
+};
+
 /// Minimum history length before context exhaustion recovery is attempted.
 pub const CONTEXT_RECOVERY_MIN_HISTORY: usize = 6;
 
@@ -193,23 +201,31 @@ pub fn forceCompressHistory(
 
 /// Trim history to prevent unbounded growth.
 /// Preserves the system prompt (first message) and the most recent messages.
-pub fn trimHistory(
+pub fn trimHistoryDetailed(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
     max_history_messages: u32,
-) void {
+) TrimStats {
+    var stats = TrimStats{
+        .history_before = history.items.len,
+        .history_after = history.items.len,
+    };
+
     const max = max_history_messages;
-    if (history.items.len <= max + 1) return; // +1 for system prompt
+    if (history.items.len <= max + 1) return stats; // +1 for system prompt
 
     const has_system = history.items.len > 0 and history.items[0].role == .system;
     const start: usize = if (has_system) 1 else 0;
     const non_system_count = history.items.len - start;
 
-    if (non_system_count <= max) return;
+    if (non_system_count <= max) return stats;
 
     const to_remove = non_system_count - max;
+    stats.removed_messages = to_remove;
+
     // Free the messages being removed
     for (history.items[start .. start + to_remove]) |*msg| {
+        stats.removed_bytes += msg.content.len;
         msg.deinit(allocator);
     }
 
@@ -217,11 +233,48 @@ pub fn trimHistory(
     const src = history.items[start + to_remove ..];
     std.mem.copyForwards(OwnedMessage, history.items[start..], src);
     history.items.len -= to_remove;
+    stats.history_after = history.items.len;
 
     // Shrink backing array if capacity is much larger than needed
     if (history.capacity > history.items.len * 2 + 8) {
         history.shrinkAndFree(allocator, history.items.len);
+        stats.shrunk_capacity = true;
     }
+
+    return stats;
+}
+
+/// Trim history to prevent unbounded growth.
+/// Preserves the system prompt (first message) and the most recent messages.
+pub fn trimHistory(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged(OwnedMessage),
+    max_history_messages: u32,
+) void {
+    _ = trimHistoryDetailed(allocator, history, max_history_messages);
+}
+
+test "trimHistoryDetailed reports removed messages and bytes" {
+    const allocator = std.testing.allocator;
+    var history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
+    defer {
+        for (history.items) |*msg| msg.deinit(allocator);
+        history.deinit(allocator);
+    }
+
+    try history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u1") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "assistant-one") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u2") });
+
+    const stats = trimHistoryDetailed(allocator, &history, 2);
+    try std.testing.expectEqual(@as(usize, 4), stats.history_before);
+    try std.testing.expectEqual(@as(usize, 3), stats.history_after);
+    try std.testing.expectEqual(@as(usize, 1), stats.removed_messages);
+    try std.testing.expectEqual(@as(usize, 2), stats.removed_bytes);
+    try std.testing.expectEqual(@as(usize, 3), history.items.len);
+    try std.testing.expectEqualStrings("assistant-one", history.items[1].content);
+    try std.testing.expectEqualStrings("u2", history.items[2].content);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

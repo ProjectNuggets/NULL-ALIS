@@ -1236,7 +1236,8 @@ pub const Agent = struct {
             const compact_start_ms = std.time.milliTimestamp();
             // Keep interactive turns deterministic: pre-provider compaction is trim-only.
             self.last_turn_compacted = false;
-            self.trimHistory();
+            const trim_stats = self.trimHistoryDetailed();
+            self.recordTrimStats(trim_stats);
             const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
             turn_compaction_ms = compact_duration_ms;
             log.info("turn.stage stage=turn_compaction duration_ms={d} mode=trim", .{compact_duration_ms});
@@ -1268,7 +1269,8 @@ pub const Agent = struct {
                     // Keep cache-hit turns bounded too; otherwise history can grow
                     // unbounded when many turns short-circuit before finalize.
                     self.last_turn_compacted = false;
-                    self.trimHistory();
+                    const trim_stats = self.trimHistoryDetailed();
+                    self.recordTrimStats(trim_stats);
                     const cache_hit_event = ObserverEvent{ .turn_stage = .{
                         .stage = "response_cache_hit",
                     } };
@@ -1293,7 +1295,8 @@ pub const Agent = struct {
                 // Keep cache-hit turns bounded too; otherwise history can grow
                 // unbounded when many turns short-circuit before finalize.
                 self.last_turn_compacted = false;
-                self.trimHistory();
+                const trim_stats = self.trimHistoryDetailed();
+                self.recordTrimStats(trim_stats);
                 const cache_hit_event = ObserverEvent{ .turn_stage = .{
                     .stage = "response_cache_hit",
                 } };
@@ -1649,7 +1652,8 @@ pub const Agent = struct {
                         .role = .user,
                         .content = try self.allocator.dupe(u8, follow_up_instruction),
                     });
-                    self.trimHistory();
+                    const trim_stats = self.trimHistoryDetailed();
+                    self.recordTrimStats(trim_stats);
                     self.freeResponseFields(&response);
                     forced_follow_through_count += 1;
                     continue;
@@ -1723,7 +1727,8 @@ pub const Agent = struct {
                 // expensive provider-backed compaction to explicit/overflow paths.
                 const compact_start_ms = std.time.milliTimestamp();
                 self.last_turn_compacted = false;
-                self.trimHistory();
+                const trim_stats = self.trimHistoryDetailed();
+                self.recordTrimStats(trim_stats);
                 const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
                 log.info("turn.stage stage=compact_trim iteration={d} duration_ms={d} compacted={}", .{
                     iteration,
@@ -1925,7 +1930,8 @@ pub const Agent = struct {
             self.observer.recordEvent(&reflect_stage_event);
 
             const trim_start_ms = std.time.milliTimestamp();
-            self.trimHistory();
+            const trim_stats = self.trimHistoryDetailed();
+            self.recordTrimStats(trim_stats);
             const trim_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - trim_start_ms));
             log.info("turn.stage stage=trim_history_after_tools iteration={d} duration_ms={d}", .{ iteration, trim_duration_ms });
 
@@ -1990,7 +1996,8 @@ pub const Agent = struct {
 
         // Compact/trim history so the next turn doesn't start with bloated context
         self.last_turn_compacted = self.autoCompactHistory() catch false;
-        self.trimHistory();
+        const trim_stats = self.trimHistoryDetailed();
+        self.recordTrimStats(trim_stats);
 
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
@@ -2196,8 +2203,17 @@ pub const Agent = struct {
     }
 
     /// Trim history to prevent unbounded growth.
+    fn trimHistoryDetailed(self: *Agent) compaction.TrimStats {
+        return compaction.trimHistoryDetailed(self.allocator, &self.history, self.max_history_messages);
+    }
+
+    /// Trim history to prevent unbounded growth.
     fn trimHistory(self: *Agent) void {
-        compaction.trimHistory(self.allocator, &self.history, self.max_history_messages);
+        _ = self.trimHistoryDetailed();
+    }
+
+    fn recordTrimStats(self: *Agent, trim_stats: compaction.TrimStats) void {
+        context_builder.recordTrimStats(&self.last_turn_context, trim_stats);
     }
 
     /// Run a single message through the agent and return the response.

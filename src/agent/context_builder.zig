@@ -13,6 +13,8 @@ pub const Snapshot = struct {
     model_name: []const u8,
     history_messages: usize,
     token_estimate: u64,
+    context_window_tokens: u64,
+    context_pressure_percent: u8,
     tool_count: usize,
     role_counts: RoleCounts,
     memory_enabled: bool,
@@ -43,6 +45,10 @@ pub const LastTurnContext = struct {
     memory_context_bytes: usize = 0,
     memory_enrich_ms: u64 = 0,
     cache_hit: bool = false,
+    trim_events: usize = 0,
+    trimmed_messages: usize = 0,
+    trimmed_bytes: usize = 0,
+    history_messages_after_trim: usize = 0,
     memory_selection: MemorySelection = .{},
 };
 
@@ -87,6 +93,16 @@ fn tokenEstimateFromHistory(history: anytype) u64 {
         total_chars += entry.content.len;
     }
     return (total_chars + 3) / 4;
+}
+
+fn tokenEstimateFromBytes(bytes: usize) u64 {
+    return (@as(u64, @intCast(bytes)) + 3) / 4;
+}
+
+fn pressurePercent(used_tokens: u64, context_window_tokens: u64) u8 {
+    if (context_window_tokens == 0) return 0;
+    const pct = @min(@as(u64, 100), (used_tokens * 100) / context_window_tokens);
+    return @intCast(pct);
 }
 
 fn conversationContextFingerprintFromAgent(self: anytype) u64 {
@@ -195,11 +211,15 @@ pub fn buildSnapshot(self: anytype) Snapshot {
     const stable_prefix_cache = context_cache.buildStablePrefixState(prompt_refresh_plan, has_system_prompt);
     const last_turn = if (@hasField(AgentType, "last_turn_context")) self.last_turn_context else LastTurnContext{};
     const memory_context_entries = memory_enriched_messages;
+    const token_estimate = if (@hasField(AgentType, "history")) tokenEstimateFromHistory(self.history) else 0;
+    const context_window_tokens = if (@hasField(AgentType, "token_limit")) self.token_limit else 0;
 
     return .{
         .model_name = if (@hasField(AgentType, "model_name")) self.model_name else "",
         .history_messages = if (@hasField(AgentType, "history")) self.history.items.len else 0,
-        .token_estimate = if (@hasField(AgentType, "history")) tokenEstimateFromHistory(self.history) else 0,
+        .token_estimate = token_estimate,
+        .context_window_tokens = context_window_tokens,
+        .context_pressure_percent = pressurePercent(token_estimate, context_window_tokens),
         .tool_count = if (@hasField(AgentType, "tools")) self.tools.len else 0,
         .role_counts = role_counts,
         .memory_enabled = if (@hasField(AgentType, "mem")) self.mem != null else false,
@@ -220,24 +240,28 @@ pub fn buildSnapshot(self: anytype) Snapshot {
             .stable_prefix = .{
                 .entries = stable_prefix_entries,
                 .bytes = stable_prefix_bytes,
+                .token_estimate = tokenEstimateFromBytes(stable_prefix_bytes),
                 .active = stable_prefix_entries > 0,
                 .cacheability = .stable,
             },
             .memory_context = .{
                 .entries = memory_context_entries,
                 .bytes = memory_context_bytes,
+                .token_estimate = tokenEstimateFromBytes(memory_context_bytes),
                 .active = memory_context_entries > 0,
                 .cacheability = .dynamic,
             },
             .recent_history = .{
                 .entries = recent_history_entries,
                 .bytes = recent_history_bytes,
+                .token_estimate = tokenEstimateFromBytes(recent_history_bytes),
                 .active = recent_history_entries > 0,
                 .cacheability = .dynamic,
             },
             .last_turn_runtime = .{
                 .entries = if (last_turn.available) 1 else 0,
-                .bytes = last_turn.memory_context_bytes,
+                .bytes = last_turn.memory_context_bytes + last_turn.trimmed_bytes,
+                .token_estimate = tokenEstimateFromBytes(last_turn.memory_context_bytes + last_turn.trimmed_bytes),
                 .active = last_turn.available,
                 .cacheability = .per_turn,
             },
@@ -299,8 +323,19 @@ pub fn buildLastTurnContext(
         .memory_context_bytes = memory_stats.context_bytes,
         .memory_enrich_ms = memory_enrich_ms,
         .cache_hit = false,
+        .history_messages_after_trim = 0,
         .memory_selection = selectionFromStats(memory_stats),
     };
+}
+
+pub fn recordTrimStats(last_turn: *LastTurnContext, trim_stats: anytype) void {
+    if (!last_turn.available) return;
+    if (trim_stats.removed_messages == 0 and trim_stats.removed_bytes == 0 and trim_stats.history_after == trim_stats.history_before) return;
+
+    last_turn.trim_events += 1;
+    last_turn.trimmed_messages += trim_stats.removed_messages;
+    last_turn.trimmed_bytes += trim_stats.removed_bytes;
+    last_turn.history_messages_after_trim = trim_stats.history_after;
 }
 
 pub fn selectionFromStats(stats: anytype) MemorySelection {
@@ -357,6 +392,7 @@ test "buildSnapshot counts roles and retrieval state" {
         tools: []const FakeTool,
         mem: ?u8,
         mem_rt: ?*FakeMemoryRuntime,
+        token_limit: u64,
         memory_session_id: ?[]const u8,
         conversation_context: ?u8,
         compact_context_enabled: bool,
@@ -372,6 +408,7 @@ test "buildSnapshot counts roles and retrieval state" {
         .tools = &tools,
         .mem = 1,
         .mem_rt = &fake_mem_rt,
+        .token_limit = 1_000,
         .memory_session_id = "agent:test:user:1:main",
         .conversation_context = null,
         .compact_context_enabled = true,
@@ -386,16 +423,20 @@ test "buildSnapshot counts roles and retrieval state" {
     const snapshot = buildSnapshot(&fake);
     try std.testing.expectEqual(@as(usize, 4), snapshot.history_messages);
     try std.testing.expectEqual(@as(usize, 1), snapshot.memory_enriched_messages);
+    try std.testing.expectEqual(@as(u8, 1), snapshot.context_pressure_percent);
     try std.testing.expectEqualStrings("together", snapshot.embedding_provider);
     try std.testing.expectEqualStrings("pgvector", snapshot.vector_mode);
     try std.testing.expect(snapshot.has_system_prompt);
     try std.testing.expectEqual(@as(?u64, 42), snapshot.workspace_prompt_fingerprint);
     try std.testing.expectEqual(@as(usize, 1), snapshot.buckets.stable_prefix.entries);
     try std.testing.expectEqual(@as(usize, 13), snapshot.buckets.stable_prefix.bytes);
+    try std.testing.expectEqual(@as(u64, 4), snapshot.buckets.stable_prefix.token_estimate);
     try std.testing.expectEqual(@as(usize, 1), snapshot.buckets.memory_context.entries);
     try std.testing.expectEqual(@as(usize, 34), snapshot.buckets.memory_context.bytes);
+    try std.testing.expectEqual(@as(u64, 9), snapshot.buckets.memory_context.token_estimate);
     try std.testing.expectEqual(@as(usize, 3), snapshot.buckets.recent_history.entries);
     try std.testing.expectEqual(@as(usize, 18), snapshot.buckets.recent_history.bytes);
+    try std.testing.expectEqual(@as(u64, 5), snapshot.buckets.recent_history.token_estimate);
     try std.testing.expect(snapshot.stable_prefix_cache.available);
 }
 
@@ -515,4 +556,28 @@ test "buildLastTurnContext captures injected memory bytes" {
     try std.testing.expect(last_turn.memory_selection.summary_latest_used);
     try std.testing.expect(last_turn.memory_selection.context_anchor_used);
     try std.testing.expectEqual(@as(usize, 2), last_turn.memory_selection.timeline_summary_count);
+}
+
+test "recordTrimStats accumulates removed history" {
+    var last_turn = LastTurnContext{
+        .available = true,
+    };
+
+    recordTrimStats(&last_turn, .{
+        .history_before = 8,
+        .history_after = 5,
+        .removed_messages = 3,
+        .removed_bytes = 42,
+    });
+    recordTrimStats(&last_turn, .{
+        .history_before = 6,
+        .history_after = 5,
+        .removed_messages = 1,
+        .removed_bytes = 10,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), last_turn.trim_events);
+    try std.testing.expectEqual(@as(usize, 4), last_turn.trimmed_messages);
+    try std.testing.expectEqual(@as(usize, 52), last_turn.trimmed_bytes);
+    try std.testing.expectEqual(@as(usize, 5), last_turn.history_messages_after_trim);
 }

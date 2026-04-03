@@ -135,6 +135,10 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
     try std.fmt.format(w, "  model: {s}\n", .{report.model_name});
     try std.fmt.format(w, "  messages: {d}\n", .{report.history_messages});
     try std.fmt.format(w, "  token_estimate: {d}\n", .{report.token_estimate});
+    try std.fmt.format(w, "  budget: window={d} pressure={d}%\n", .{
+        report.context_window_tokens,
+        report.context_pressure_percent,
+    });
     try std.fmt.format(w, "  tools: {d}\n", .{report.tool_count});
     try std.fmt.format(w, "  by_role: system={d} user={d} assistant={d} tool={d}\n", .{
         report.role_counts.system,
@@ -169,24 +173,28 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         stable_prefix_reason_text,
     });
     try w.writeAll("  buckets:\n");
-    try std.fmt.format(w, "    stable_prefix: entries={d} bytes={d} cache={s}\n", .{
+    try std.fmt.format(w, "    stable_prefix: entries={d} bytes={d} tokens~={d} cache={s}\n", .{
         report.buckets.stable_prefix.entries,
         report.buckets.stable_prefix.bytes,
+        report.buckets.stable_prefix.token_estimate,
         context_cache.cacheabilityText(report.buckets.stable_prefix.cacheability),
     });
-    try std.fmt.format(w, "    memory_context: entries={d} bytes={d} cache={s}\n", .{
+    try std.fmt.format(w, "    memory_context: entries={d} bytes={d} tokens~={d} cache={s}\n", .{
         report.buckets.memory_context.entries,
         report.buckets.memory_context.bytes,
+        report.buckets.memory_context.token_estimate,
         context_cache.cacheabilityText(report.buckets.memory_context.cacheability),
     });
-    try std.fmt.format(w, "    recent_history: entries={d} bytes={d} cache={s}\n", .{
+    try std.fmt.format(w, "    recent_history: entries={d} bytes={d} tokens~={d} cache={s}\n", .{
         report.buckets.recent_history.entries,
         report.buckets.recent_history.bytes,
+        report.buckets.recent_history.token_estimate,
         context_cache.cacheabilityText(report.buckets.recent_history.cacheability),
     });
-    try std.fmt.format(w, "    last_turn_runtime: active={s} bytes={d} cache={s}\n", .{
+    try std.fmt.format(w, "    last_turn_runtime: active={s} bytes={d} tokens~={d} cache={s}\n", .{
         boolWord(report.buckets.last_turn_runtime.active),
         report.buckets.last_turn_runtime.bytes,
+        report.buckets.last_turn_runtime.token_estimate,
         context_cache.cacheabilityText(report.buckets.last_turn_runtime.cacheability),
     });
     try std.fmt.format(w, "    conversation_context: active={s} embedded_in_prefix={s}\n", .{
@@ -201,6 +209,12 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.last_turn.memory_enrich_ms,
         boolWord(report.last_turn.cache_hit),
     });
+    try std.fmt.format(w, "  trim: events={d} removed_messages={d} removed_bytes={d} history_after={d}\n", .{
+        report.last_turn.trim_events,
+        report.last_turn.trimmed_messages,
+        report.last_turn.trimmed_bytes,
+        report.last_turn.history_messages_after_trim,
+    });
     try std.fmt.format(w, "  memory_select: {s}", .{memory_selection_text});
     return try out.toOwnedSlice(allocator);
 }
@@ -210,6 +224,8 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
         .model = report.model_name,
         .history_messages = report.history_messages,
         .token_estimate = report.token_estimate,
+        .context_window_tokens = report.context_window_tokens,
+        .context_pressure_percent = report.context_pressure_percent,
         .tools = report.tool_count,
         .roles = .{
             .system = report.role_counts.system,
@@ -250,24 +266,28 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .stable_prefix = .{
                 .entries = report.buckets.stable_prefix.entries,
                 .bytes = report.buckets.stable_prefix.bytes,
+                .token_estimate = report.buckets.stable_prefix.token_estimate,
                 .active = report.buckets.stable_prefix.active,
                 .cacheability = @tagName(report.buckets.stable_prefix.cacheability),
             },
             .memory_context = .{
                 .entries = report.buckets.memory_context.entries,
                 .bytes = report.buckets.memory_context.bytes,
+                .token_estimate = report.buckets.memory_context.token_estimate,
                 .active = report.buckets.memory_context.active,
                 .cacheability = @tagName(report.buckets.memory_context.cacheability),
             },
             .recent_history = .{
                 .entries = report.buckets.recent_history.entries,
                 .bytes = report.buckets.recent_history.bytes,
+                .token_estimate = report.buckets.recent_history.token_estimate,
                 .active = report.buckets.recent_history.active,
                 .cacheability = @tagName(report.buckets.recent_history.cacheability),
             },
             .last_turn_runtime = .{
                 .entries = report.buckets.last_turn_runtime.entries,
                 .bytes = report.buckets.last_turn_runtime.bytes,
+                .token_estimate = report.buckets.last_turn_runtime.token_estimate,
                 .active = report.buckets.last_turn_runtime.active,
                 .cacheability = @tagName(report.buckets.last_turn_runtime.cacheability),
             },
@@ -287,6 +307,10 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .memory_context_bytes = report.last_turn.memory_context_bytes,
             .memory_enrich_ms = report.last_turn.memory_enrich_ms,
             .cache_hit = report.last_turn.cache_hit,
+            .trim_events = report.last_turn.trim_events,
+            .trimmed_messages = report.last_turn.trimmed_messages,
+            .trimmed_bytes = report.last_turn.trimmed_bytes,
+            .history_messages_after_trim = report.last_turn.history_messages_after_trim,
             .memory_selection = .{
                 .available = report.last_turn.memory_selection.available,
                 .candidate_count = report.last_turn.memory_selection.candidate_count,
@@ -388,6 +412,8 @@ test "context report formatters expose structured details" {
         .model_name = "openai/gpt-5.2",
         .history_messages = 7,
         .token_estimate = 321,
+        .context_window_tokens = 1000,
+        .context_pressure_percent = 32,
         .tool_count = 3,
         .role_counts = .{ .system = 1, .user = 2, .assistant = 3, .tool = 1 },
         .memory_enabled = true,
@@ -411,10 +437,10 @@ test "context report formatters expose structured details" {
             .current_time_bucket_min = 5,
         },
         .buckets = .{
-            .stable_prefix = .{ .entries = 1, .bytes = 128, .active = true, .cacheability = .stable },
-            .memory_context = .{ .entries = 2, .bytes = 64, .active = true, .cacheability = .dynamic },
-            .recent_history = .{ .entries = 6, .bytes = 257, .active = true, .cacheability = .dynamic },
-            .last_turn_runtime = .{ .entries = 1, .bytes = 64, .active = true, .cacheability = .per_turn },
+            .stable_prefix = .{ .entries = 1, .bytes = 128, .token_estimate = 32, .active = true, .cacheability = .stable },
+            .memory_context = .{ .entries = 2, .bytes = 64, .token_estimate = 16, .active = true, .cacheability = .dynamic },
+            .recent_history = .{ .entries = 6, .bytes = 257, .token_estimate = 65, .active = true, .cacheability = .dynamic },
+            .last_turn_runtime = .{ .entries = 1, .bytes = 64, .token_estimate = 16, .active = true, .cacheability = .per_turn },
             .conversation_context = .{ .active = false, .embedded_in_stable_prefix = false, .fingerprint = 0 },
         },
         .last_turn = .{
@@ -427,6 +453,10 @@ test "context report formatters expose structured details" {
             .memory_context_bytes = 64,
             .memory_enrich_ms = 11,
             .cache_hit = false,
+            .trim_events = 1,
+            .trimmed_messages = 2,
+            .trimmed_bytes = 24,
+            .history_messages_after_trim = 5,
             .memory_selection = .{
                 .available = true,
                 .candidate_count = 5,
@@ -447,11 +477,13 @@ test "context report formatters expose structured details" {
 
     const detail = try formatDetail(std.testing.allocator, report);
     defer std.testing.allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "budget: window=1000 pressure=32%") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory: enabled=yes runtime=yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "retrieval: mode=hybrid provider=together vector=pgvector rollout=on") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "cache: stable_prefix=yes refresh_needed=yes reason=workspace") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "stable_prefix: entries=1 bytes=128 cache=stable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "stable_prefix: entries=1 bytes=128 tokens~=32 cache=stable") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "last_turn: prompt_refresh=yes reason=workspace memory_injected=yes bytes=64 enrich_ms=11 cache_hit=no") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "trim: events=1 removed_messages=2 removed_bytes=24 history_after=5") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory_select: summary_latest=yes anchor=yes durable=1 timeline=2 search=1 fallback=0 candidates=5 global_candidates=12") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "workspace_fp=77") != null);
 
@@ -459,9 +491,11 @@ test "context report formatters expose structured details" {
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stable_prefix\":{\"available\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"buckets\":{\"stable_prefix\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"context_pressure_percent\":32") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"enriched_messages\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"embedding_provider\":\"together\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"memory_context_injected\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"trimmed_messages\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"summary_latest_used\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"workspace_prompt_fingerprint\":77") != null);
 }
