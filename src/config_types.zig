@@ -717,6 +717,10 @@ pub const QmdLimitsConfig = struct {
     timeout_ms: u32 = 4_000,
 };
 
+pub const DEFAULT_MEMORY_ENRICH_RECALL_LIMIT: usize = 10;
+pub const DEFAULT_MEMORY_TIMELINE_FALLBACK_LIMIT: usize = 2;
+pub const DEFAULT_MEMORY_CONTEXT_MAX_BYTES: usize = 4_000;
+
 pub const MemoryVectorStoreConfig = struct {
     kind: []const u8 = "auto",
     sidecar_path: []const u8 = "",
@@ -776,7 +780,7 @@ pub const MemoryLifecycleConfig = struct {
     hygiene_enabled: bool = true,
     archive_after_days: u32 = 7,
     purge_after_days: u32 = 30,
-    conversation_retention_days: u32 = 30,
+    conversation_retention_days: u32 = 0,
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
     auto_hydrate: bool = true,

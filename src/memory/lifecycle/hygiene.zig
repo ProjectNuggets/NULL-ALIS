@@ -34,7 +34,7 @@ pub const HygieneConfig = struct {
     hygiene_enabled: bool = true,
     archive_after_days: u32 = 7,
     purge_after_days: u32 = 30,
-    conversation_retention_days: u32 = 30,
+    conversation_retention_days: u32 = 0,
     workspace_dir: []const u8 = "",
 };
 
@@ -269,6 +269,32 @@ test "runIfDue no memory first run" {
     const report = runIfDue(std.testing.allocator, cfg, null);
     // Should run but all operations disabled or paths don't exist
     try std.testing.expectEqual(@as(u64, 0), report.totalActions());
+}
+
+test "runIfDue keeps conversation autosaves when retention is forever" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var sqlite_mem = try root.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("autosave_user_1000", "old turn", .conversation, null);
+    try mem.store("autosave_assistant_1001", "old reply", .conversation, null);
+
+    const cfg = HygieneConfig{
+        .hygiene_enabled = true,
+        .archive_after_days = 0,
+        .purge_after_days = 0,
+        .conversation_retention_days = 0,
+        .workspace_dir = "/nonexistent",
+    };
+    const report = runIfDue(std.testing.allocator, cfg, mem);
+    try std.testing.expectEqual(@as(u64, 0), report.pruned_conversation_rows);
+
+    const kept_user = (try mem.get(std.testing.allocator, "autosave_user_1000")) orelse return error.TestUnexpectedResult;
+    defer kept_user.deinit(std.testing.allocator);
+    const kept_assistant = (try mem.get(std.testing.allocator, "autosave_assistant_1001")) orelse return error.TestUnexpectedResult;
+    defer kept_assistant.deinit(std.testing.allocator);
 }
 
 test "pruneConversationRows skips markdown backend search path" {

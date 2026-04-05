@@ -2,7 +2,7 @@
 
 Status: active execution
 Owner: agent/runtime
-Last updated: 2026-04-03
+Last updated: 2026-04-05
 
 ## Purpose
 
@@ -167,7 +167,7 @@ Make the agent crisp, responsive, and pleasant to use without flattening persona
 ### M2. Context Introspection
 
 - Branch: `feat/context-introspection-v1`
-- Status: in progress
+- Status: stabilization complete, sharpening deferred
 
 #### Goal
 
@@ -213,6 +213,193 @@ Engineer context as a real runtime surface instead of implicit prompt glue.
 1. context can be explained and inspected
 2. prompt rebuild churn is reduced
 3. context sections are explicit and budget-aware
+
+#### Stabilization Outcome
+
+The M2 stabilization pass is complete and validated.
+
+What is now true in code:
+
+1. runtime memory truth is primary-backed during runtime
+2. markdown remains startup import plus write mirror
+3. `hot` is raw history only
+4. continuity refresh happens after the final reply on compaction turns
+5. continuity summaries are built from actual post-compaction history
+6. warm retrieval limits are truthful on the hybrid path
+7. audit and index artifacts are hidden from default warm/generic recall
+8. `/context detail` and `/memory doctor` describe the stabilized runtime contract more truthfully
+
+Validation completed:
+
+1. `zig build test --summary all`
+2. `zig build -Doptimize=ReleaseSmall`
+
+Production / deployment note:
+
+1. production must keep `agent.compact_context = true`
+2. the supported continuity model assumes compaction is the active boundary mechanism for:
+   - long-session context control
+   - continuity refresh
+   - session summary/index updates
+3. running with compaction disabled is configuration drift, not a supported production shape
+
+Deployment readiness note:
+
+1. graceful shutdown now flushes active sessions and persists continuity before teardown
+2. markdown mirror output is now more readable and round-trips multiline continuity artifacts more safely for inspection/export
+3. hard-kill shutdowns are still lossy because they bypass graceful flush
+4. true production sign-off still requires one final correctness fix:
+   - startup markdown import must stop overwriting system-managed continuity artifacts in primary storage
+5. branch status for deployment today:
+   - `canary/manual testing`: yes
+   - `full production sign-off`: not yet
+
+#### Concrete Execution Sequence
+
+##### M2A. Context Contract
+
+Lock one canonical turn-packet model:
+- `fixed`
+- `hot`
+- `warm`
+- `cold`
+- `reserve`
+
+Rules:
+- `hot` = raw history only, specifically last `N` raw messages
+- `warm` = `summary_latest`, `context_anchor_current`, `durable_fact/*`, semantic enrich, and recent summaries
+- `cold` = on-demand tools plus session/timeline discovery surfaces and transcripts
+- compaction is normal context management, not only overflow recovery
+
+Acceptance:
+- `/context detail` can explain every lane
+- docs and runtime use the same lane names
+
+##### M2B. Continuity Timing
+
+Make continuity writes a single ordered post-reply cycle.
+
+Rules:
+- summary-producing compaction refresh runs after the final reply exists
+- lifecycle boundaries use the same continuity writer
+- cheap trim does not write durable continuity
+
+Acceptance:
+- compaction turns refresh `summary_latest` and `context_anchor_current` with the actual final turn state
+- no stale-by-one continuity objects
+
+##### M2C. Continuity Source
+
+Summaries must be built from actual post-compaction history, not checkpoint fallback text.
+
+Rules:
+- summarize the real current history after compaction
+- preserve `[Compaction summary]` when it is the continuity carrier
+- keep the current summary schema:
+  - `focus`
+  - `decisions`
+  - `open_loops`
+  - `next`
+
+Acceptance:
+- long sessions preserve continuity semantically, not only in raw transcript
+
+##### M2D. Artifact Roles
+
+Separate memory artifacts into explicit classes:
+- continuity artifacts
+- audit artifacts
+- index artifacts
+
+Rules:
+- continuity artifacts are searchable and injectable
+- audit artifacts are cold deep-dive records
+- index artifacts are discovery surfaces, not normal semantic recall payloads
+
+Acceptance:
+- checkpoints and transcript/autosave records stop polluting normal retrieval
+- cold discovery remains available to the agent
+
+##### M2E. Warm / Cold Truth
+
+Make the hot/warm/cold contract truthful.
+
+Rules:
+- explicit warm top-k must actually work on the hybrid path
+- cold transcript recall is on-demand only
+- session/timeline index information is visible to the agent as cold discovery
+
+Acceptance:
+- diagnostics match runtime behavior
+- the agent can discover what exists in cold memory and choose the right tool
+
+##### M2F. Milestone Summaries
+
+Add continuity-driven summaries in addition to pressure-driven compaction.
+
+Rules:
+- summaries happen on meaningful progress, not only on token pressure
+- examples:
+  - important decision
+  - tool-heavy phase completed
+  - topic shift
+  - continuity interval crossed
+
+Acceptance:
+- marathon sessions maintain continuity without waiting for context stress
+
+##### M2G. Final Introspection
+
+Make `/context detail` and `/memory doctor` the source of truth for M2.
+
+They should show:
+- hot contents
+- warm contents
+- cold discovery surfaces
+- actual recall limit
+- last continuity write reason
+- last compaction reason
+- last milestone summary reason
+
+Acceptance:
+- no known mismatch between diagnostics and runtime behavior
+
+##### M2H. Validation Audits
+
+Close M2 with two explicit audits:
+
+1. retrieval audit
+- what is recalled
+- in what order
+- with what scope
+- with what top-k and redundancy behavior
+
+2. ingestion audit
+- what is written
+- when summaries are written
+- when timeline/index objects are updated
+- when transcripts/checkpoints are written
+
+Acceptance:
+- ingestion and retrieval can be explained end-to-end
+- no hidden continuity wiring remains
+
+#### Deferred Sharpening
+
+These are intentionally deferred and are not blockers to closing M2 stabilization:
+
+1. mode-based recent-summary warm injection
+2. transcript-specific first-class deep-dive tool
+3. fixed prompt truth unification to bootstrap DB-backed canonical content
+
+#### Next Branch
+
+The next branch should focus on fixed prompt truth unification:
+
+1. keep agent behavior stable
+2. make bootstrap-backed prompt truth more canonical
+3. keep workspace `.md` files as mirror / edit / fallback surfaces
+4. avoid reopening the stabilized hot/warm/cold runtime pipeline unless testing shows a real regression
 
 #### Stop / Review Gate
 

@@ -354,6 +354,22 @@ pub fn isInternalMemoryKey(key: []const u8) bool {
         std.mem.startsWith(u8, key, PromptBootstrapKeyPrefix);
 }
 
+pub fn isAuditArtifactKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "session_checkpoint_") or
+        std.mem.startsWith(u8, key, "autosave_user_") or
+        std.mem.startsWith(u8, key, "autosave_assistant_");
+}
+
+pub fn isIndexArtifactKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "timeline_index/current");
+}
+
+pub fn isDefaultHiddenMemoryKey(key: []const u8) bool {
+    return isInternalMemoryKey(key) or
+        isAuditArtifactKey(key) or
+        isIndexArtifactKey(key);
+}
+
 pub fn isTombstoneKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, TombstoneKeyPrefix);
 }
@@ -817,9 +833,9 @@ fn deriveLaneFromSessionId(session_id: []const u8) []const u8 {
 }
 
 pub fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
-    if (isInternalMemoryKey(key)) return true;
+    if (isDefaultHiddenMemoryKey(key)) return true;
     if (extractMarkdownMemoryKey(content)) |extracted| {
-        if (isInternalMemoryKey(extracted)) return true;
+        if (isDefaultHiddenMemoryKey(extracted)) return true;
     }
     return false;
 }
@@ -920,6 +936,7 @@ pub const ResolvedConfig = struct {
     rollout_mode: []const u8,
     vector_sync_mode: []const u8, // "best_effort" | "durable_outbox"
     hygiene_enabled: bool,
+    conversation_retention_days: u32,
     snapshot_enabled: bool,
     cache_enabled: bool,
     semantic_cache_enabled: bool,
@@ -960,6 +977,10 @@ pub const MemoryRuntime = struct {
     _outbox: ?*outbox.VectorOutbox = null,
     _sidecar_db_path: ?[*:0]const u8 = null,
 
+    fn effectiveEngineTopK(limit: usize) u32 {
+        return @intCast(@min(limit, @as(usize, std.math.maxInt(u32))));
+    }
+
     /// High-level search: uses rollout policy to decide keyword-only vs hybrid.
     pub fn search(self: *MemoryRuntime, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) ![]RetrievalCandidate {
         if (!self._search_enabled) return allocator.alloc(RetrievalCandidate, 0);
@@ -979,6 +1000,9 @@ pub const MemoryRuntime = struct {
                 // Use engine if available, else fall back
                 if (self._engine) |engine| {
                     engine.vector_user_id = self._vector_user_id;
+                    const original_top_k = engine.top_k;
+                    engine.top_k = effectiveEngineTopK(limit);
+                    defer engine.top_k = original_top_k;
                     const candidates = try engine.search(allocator, query, session_id);
                     const trimmed = try trimCandidatesToLimit(allocator, candidates, limit);
                     self.hydrateThinCandidatesFromPrimary(allocator, trimmed);
@@ -998,6 +1022,9 @@ pub const MemoryRuntime = struct {
 
                 if (self._engine) |engine| {
                     engine.vector_user_id = self._vector_user_id;
+                    const original_top_k = engine.top_k;
+                    engine.top_k = effectiveEngineTopK(limit);
+                    defer engine.top_k = original_top_k;
                     const hybrid_results = engine.search(allocator, query, session_id) catch |err| {
                         log.warn("shadow hybrid search failed: {}", .{err});
                         return keyword_results;
@@ -1688,8 +1715,10 @@ pub fn initRuntimeWithOptions(
     const source_count: usize = if (engine) |eng| eng.sources.items.len else 0;
     const vector_mode: []const u8 = if (vs_iface == null) "none" else resolved_vector_mode;
     const cache_enabled = resp_cache != null;
-    log.info("memory plan resolved: backend={s} retrieval={s} vector={s} rollout={s} hygiene={} snapshot={} cache={} semantic_cache={} summarizer={} sources={d}", .{
+    const backend_runtime: []const u8 = instance.memory.name();
+    log.info("memory plan resolved: configured_backend={s} runtime_backend={s} retrieval={s} vector={s} rollout={s} hygiene={} snapshot={} cache={} semantic_cache={} summarizer={} sources={d}", .{
         config.backend,
+        backend_runtime,
         retrieval_mode,
         vector_mode,
         config.reliability.rollout_mode,
@@ -1716,6 +1745,7 @@ pub fn initRuntimeWithOptions(
             .rollout_mode = config.reliability.rollout_mode,
             .vector_sync_mode = resolved_vector_sync_mode,
             .hygiene_enabled = config.lifecycle.hygiene_enabled,
+            .conversation_retention_days = config.lifecycle.conversation_retention_days,
             .snapshot_enabled = config.lifecycle.snapshot_enabled,
             .cache_enabled = cache_enabled,
             .semantic_cache_enabled = sem_cache != null,
@@ -1770,6 +1800,7 @@ const test_resolved_cfg: ResolvedConfig = .{
     .rollout_mode = "off",
     .vector_sync_mode = "best_effort",
     .hygiene_enabled = false,
+    .conversation_retention_days = 0,
     .snapshot_enabled = false,
     .cache_enabled = false,
     .semantic_cache_enabled = false,
@@ -2162,6 +2193,61 @@ test "MemoryRuntime.search hybrid path respects caller limit" {
     const results = try rt.search(std.testing.allocator, "alpha", 1, null);
     defer retrieval.freeCandidates(std.testing.allocator, results);
     try std.testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "MemoryRuntime.search shadow hybrid restores engine top_k after caller override" {
+    var backend = memory_lru.InMemoryLruMemory.init(std.testing.allocator, 32);
+    defer backend.deinit();
+
+    const mem = backend.memory();
+    var engine = retrieval.RetrievalEngine.init(std.testing.allocator, .{ .max_results = 2 });
+    defer engine.deinit();
+    var primary = retrieval.PrimaryAdapter.init(mem);
+    try engine.addSource(primary.adapter());
+
+    try mem.store("k1", "alpha one", .core, null);
+    try mem.store("k2", "alpha two", .core, null);
+    try mem.store("k3", "alpha three", .core, null);
+
+    var rt = MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = .{
+            .primary_backend = "memory",
+            .retrieval_mode = "hybrid",
+            .vector_mode = "none",
+            .embedding_provider = "none",
+            .rollout_mode = "shadow",
+            .vector_sync_mode = "best_effort",
+            .hygiene_enabled = false,
+            .conversation_retention_days = 0,
+            .snapshot_enabled = false,
+            .cache_enabled = false,
+            .semantic_cache_enabled = false,
+            .summarizer_enabled = false,
+            .source_count = 1,
+            .fallback_policy = "degrade",
+        },
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = &engine,
+        ._allocator = std.testing.allocator,
+        ._rollout_policy = .{ .mode = .shadow, .canary_percent = 0, .shadow_percent = 100 },
+    };
+
+    const original_top_k = engine.top_k;
+    const results = try rt.search(std.testing.allocator, "alpha", 3, null);
+    defer retrieval.freeCandidates(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqual(original_top_k, engine.top_k);
 }
 
 test "MemoryRuntime.search hydration enriches thin vector-style candidate content" {

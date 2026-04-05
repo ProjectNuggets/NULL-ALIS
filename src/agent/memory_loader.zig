@@ -1,4 +1,5 @@
 const std = @import("std");
+const config_types = @import("../config_types.zig");
 const memory_mod = @import("../memory/root.zig");
 const multimodal = @import("../multimodal.zig");
 const Memory = memory_mod.Memory;
@@ -10,14 +11,14 @@ const MemoryRuntime = memory_mod.MemoryRuntime;
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Default number of memory entries to recall per query.
-const DEFAULT_RECALL_LIMIT: usize = 5;
+const DEFAULT_RECALL_LIMIT: usize = config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT;
 const GLOBAL_RECALL_CANDIDATE_LIMIT: usize = 64;
-const TIMELINE_FALLBACK_LIMIT: usize = 2;
+const TIMELINE_FALLBACK_LIMIT: usize = config_types.DEFAULT_MEMORY_TIMELINE_FALLBACK_LIMIT;
 
 /// Maximum total bytes of memory context injected into a message.
 /// Prevents a few large entries from blowing the token budget.
 /// ~4000 chars ~ 1000 tokens — a safe ceiling for context injection.
-const MAX_CONTEXT_BYTES: usize = 4_000;
+const MAX_CONTEXT_BYTES: usize = config_types.DEFAULT_MEMORY_CONTEXT_MAX_BYTES;
 
 pub const SelectionStats = struct {
     available: bool = false,
@@ -686,6 +687,69 @@ test "enrichMessageWithRuntimeDetailed reports selection stats" {
     try std.testing.expect(std.mem.startsWith(u8, enriched.text, "[Memory context]\n"));
 }
 
+test "loadContextWithRuntime uses warm top-10 recall limit" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var idx: usize = 0;
+    while (idx < 12) : (idx += 1) {
+        const key = try std.fmt.allocPrint(allocator, "warm_fact_{d}", .{idx});
+        defer allocator.free(key);
+        const content = try std.fmt.allocPrint(allocator, "shipping memory result {d}", .{idx});
+        defer allocator.free(content);
+        try mem.store(key, content, .core, null);
+    }
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .conversation_retention_days = 0,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const enriched = try enrichMessageWithRuntimeDetailed(allocator, mem, &rt, "shipping memory", null);
+    defer allocator.free(enriched.text);
+
+    try std.testing.expectEqual(@as(usize, config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT), enriched.stats.candidate_count);
+    try std.testing.expectEqual(@as(usize, config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT), enriched.stats.search_match_count);
+
+    var recalled_lines: usize = 0;
+    var iter = std.mem.splitScalar(u8, enriched.text, '\n');
+    while (iter.next()) |line| {
+        if (std.mem.startsWith(u8, line, "- warm_fact_")) recalled_lines += 1;
+    }
+    try std.testing.expectEqual(@as(usize, config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT), recalled_lines);
+}
+
 test "loadContext filters internal autosave and hygiene entries" {
     const allocator = std.testing.allocator;
 
@@ -705,6 +769,25 @@ test "loadContext filters internal autosave and hygiene entries" {
     try std.testing.expect(std.mem.indexOf(u8, context, "autosave_user_") == null);
     try std.testing.expect(std.mem.indexOf(u8, context, "autosave_assistant_") == null);
     try std.testing.expect(std.mem.indexOf(u8, context, "last_hygiene_at") == null);
+}
+
+test "loadContext filters audit and index artifacts" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("session_checkpoint_1", "type=session_checkpoint\nrecent_user:\n- shipping\n", .daily, null);
+    try mem.store("timeline_index/current", "{\"session\":\"agent:zaki-bot:user:1:main\"}", .core, null);
+    try mem.store("timeline_summary/agent:zaki-bot:user:1:other/1", "focus: shipping rollout", .daily, null);
+
+    const context = try loadContext(allocator, mem, "shipping", "agent:zaki-bot:user:1:main");
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "timeline_summary/agent:zaki-bot:user:1:other/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "session_checkpoint_1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "timeline_index/current") == null);
 }
 
 test "loadContext filters markdown-encoded internal entries" {
@@ -743,6 +826,7 @@ test "loadContextWithRuntime filters markdown line keys" {
         .rollout_mode = "off",
         .vector_sync_mode = "best_effort",
         .hygiene_enabled = false,
+        .conversation_retention_days = 0,
         .snapshot_enabled = false,
         .cache_enabled = false,
         .semantic_cache_enabled = false,
@@ -811,6 +895,7 @@ test "loadContextWithRuntime returns empty when only internal entries match" {
         .rollout_mode = "off",
         .vector_sync_mode = "best_effort",
         .hygiene_enabled = false,
+        .conversation_retention_days = 0,
         .snapshot_enabled = false,
         .cache_enabled = false,
         .semantic_cache_enabled = false,

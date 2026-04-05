@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const config_types = @import("../../config_types.zig");
 const root = @import("../root.zig");
 const registry = @import("../engines/registry.zig");
 const cache_mod = @import("cache.zig");
@@ -41,6 +42,7 @@ pub const DiagnosticReport = struct {
     retrieval_mode: []const u8 = "n/a",
     embedding_provider: []const u8 = "n/a",
     vector_mode: []const u8 = "n/a",
+    conversation_retention_days: u32 = 0,
     session_store_active: bool,
     // Extended pipeline stages
     hybrid_enabled: bool = false,
@@ -140,6 +142,7 @@ pub fn diagnose(rt: *root.MemoryRuntime) DiagnosticReport {
         .retrieval_mode = rt.resolved.retrieval_mode,
         .embedding_provider = rt.resolved.embedding_provider,
         .vector_mode = rt.resolved.vector_mode,
+        .conversation_retention_days = rt.resolved.conversation_retention_days,
         .session_store_active = session_store_active,
         .hybrid_enabled = hybrid_on,
         .mmr_enabled = mmr_on,
@@ -214,6 +217,21 @@ pub fn formatReport(report: DiagnosticReport, allocator: std.mem.Allocator) ![]u
     );
     try std.fmt.format(w, "  hybrid:  {}\n", .{report.hybrid_enabled});
 
+    try w.writeAll("\nContinuity\n");
+    try w.writeAll("  hot:   raw last_n history only\n");
+    try std.fmt.format(
+        w,
+        "  warm:  summary_latest + context_anchor_current + semantic recall top_k={d} + timeline fallback ({d}) + durable facts\n",
+        .{ config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT, config_types.DEFAULT_MEMORY_TIMELINE_FALLBACK_LIMIT },
+    );
+    try w.writeAll("  cold:  memory_recall (semantic), memory_timeline (session/timeline discovery via timeline_index), memory_list (raw records), autosave transcripts (exact-history deep dive)\n");
+    if (report.conversation_retention_days == 0) {
+        try w.writeAll("  transcript_retention: forever\n");
+    } else {
+        try std.fmt.format(w, "  transcript_retention: {d}d\n", .{report.conversation_retention_days});
+    }
+    try w.writeAll("  compaction_refresh: summary-producing compaction writes durable continuity\n");
+
     // Session store
     try w.writeAll("\nSession Store\n");
     try std.fmt.format(w, "  active: {}\n", .{report.session_store_active});
@@ -243,6 +261,7 @@ const test_resolved: root.ResolvedConfig = .{
     .rollout_mode = "off",
     .vector_sync_mode = "best_effort",
     .hygiene_enabled = false,
+    .conversation_retention_days = 0,
     .snapshot_enabled = false,
     .cache_enabled = false,
     .semantic_cache_enabled = false,
@@ -461,7 +480,6 @@ test "diagnose with retrieval engine" {
     var setup = try makeTestRuntime(allocator);
 
     // Create a retrieval engine with a primary adapter
-    const config_types = @import("../../config_types.zig");
     const eng = try allocator.create(retrieval_mod.RetrievalEngine);
     eng.* = retrieval_mod.RetrievalEngine.init(allocator, config_types.MemoryQueryConfig{});
 
@@ -538,6 +556,10 @@ test "formatReport produces valid output" {
     try testing.expect(std.mem.indexOf(u8, text, "Response Cache") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Retrieval") != null);
     try testing.expect(std.mem.indexOf(u8, text, "effective: mode=keyword provider=none vector=none") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Continuity") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "raw last_n history only") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "memory_timeline (session/timeline discovery via timeline_index)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "transcript_retention: forever") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Session Store") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Pipeline Stages") != null);
     try testing.expect(std.mem.indexOf(u8, text, "temporal_decay") != null);
@@ -570,6 +592,7 @@ test "formatReport with cache stats" {
         .retrieval_mode = "hybrid",
         .embedding_provider = "together",
         .vector_mode = "pgvector",
+        .conversation_retention_days = 0,
         .session_store_active = true,
     };
 
@@ -580,6 +603,7 @@ test "formatReport with cache stats" {
     try testing.expect(std.mem.indexOf(u8, text, "canary") != null);
     try testing.expect(std.mem.indexOf(u8, text, "effective: mode=hybrid provider=together vector=pgvector") != null);
     try testing.expect(std.mem.indexOf(u8, text, "hybrid") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "summary_latest + context_anchor_current + semantic recall top_k=10") != null);
     try testing.expect(std.mem.indexOf(u8, text, "1000") != null);
     try testing.expect(std.mem.indexOf(u8, text, "tokens saved") != null);
 }

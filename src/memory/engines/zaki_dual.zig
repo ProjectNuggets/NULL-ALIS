@@ -71,19 +71,16 @@ pub const ZakiDualMemory = struct {
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]root.MemoryEntry {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.syncFromMarkdown(allocator) catch {};
         return self.primary.recall(allocator, query, limit, session_id);
     }
 
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?root.MemoryEntry {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.syncFromMarkdown(allocator) catch {};
         return self.primary.get(allocator, key);
     }
 
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?root.MemoryCategory, session_id: ?[]const u8) anyerror![]root.MemoryEntry {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.syncFromMarkdown(allocator) catch {};
         return self.primary.list(allocator, category, session_id);
     }
 
@@ -180,6 +177,7 @@ test "zaki dual memory ingests manual markdown edits into canonical memory" {
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
     const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
     var mem = dual.memory();
+    try dual.syncFromMarkdown(allocator);
 
     const got = (try mem.get(allocator, "favorite_color")).?;
     defer got.deinit(allocator);
@@ -206,6 +204,7 @@ test "zaki dual memory skips scaffold core lines during sync" {
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
     const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
     var mem = dual.memory();
+    try dual.syncFromMarkdown(allocator);
 
     try std.testing.expect((try mem.get(allocator, "MEMORY:0")) == null);
     const got = (try mem.get(allocator, "favorite_color")).?;
@@ -237,6 +236,7 @@ test "zaki dual memory ignores internal markdown entries during sync" {
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
     const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
     var mem = dual.memory();
+    try dual.syncFromMarkdown(allocator);
 
     const favorite = (try mem.get(allocator, "favorite_color")).?;
     defer favorite.deinit(allocator);
@@ -296,6 +296,45 @@ test "zaki dual memory store clears tombstone for restored mutable key" {
         allocator.free(tombstoned);
     }
     try std.testing.expectEqual(@as(usize, 0), tombstoned.len);
+
+    mem.deinit();
+}
+
+test "zaki dual memory runtime markdown edits do not override canonical primary state until explicit sync" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    var mem = dual.memory();
+
+    try mem.store("favorite_color", "teal", .core, null);
+
+    const memory_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace});
+    defer allocator.free(memory_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = memory_path,
+        .data = "# MEMORY.md - Long-Term Memory\n\n- **favorite_color**: orange\n",
+    });
+
+    const runtime_get = (try mem.get(allocator, "favorite_color")) orelse return error.TestUnexpectedResult;
+    defer runtime_get.deinit(allocator);
+    try std.testing.expectEqualStrings("teal", runtime_get.content);
+
+    const runtime_recall = try mem.recall(allocator, "favorite_color", 5, null);
+    defer root.freeEntries(allocator, runtime_recall);
+    try std.testing.expect(runtime_recall.len >= 1);
+    try std.testing.expectEqualStrings("teal", runtime_recall[0].content);
+
+    try dual.syncFromMarkdown(allocator);
+
+    const imported_get = (try mem.get(allocator, "favorite_color")) orelse return error.TestUnexpectedResult;
+    defer imported_get.deinit(allocator);
+    try std.testing.expectEqualStrings("orange", imported_get.content);
 
     mem.deinit();
 }

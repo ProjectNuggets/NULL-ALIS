@@ -28,6 +28,7 @@ pub const Snapshot = struct {
     memory_enabled: bool,
     memory_runtime_enabled: bool,
     memory_session_id: ?[]const u8,
+    conversation_retention_days: ?u32,
     memory_enriched_messages: usize,
     has_system_prompt: bool,
     has_conversation_context: bool,
@@ -61,6 +62,7 @@ pub const LastTurnContext = struct {
     auto_compacted_messages: usize = 0,
     force_compression_events: usize = 0,
     force_compressed_messages: usize = 0,
+    durable_continuity_refreshed: bool = false,
     memory_selection: MemorySelection = .{},
 };
 
@@ -246,6 +248,7 @@ pub fn buildSnapshot(self: anytype) Snapshot {
         .memory_enabled = if (@hasField(AgentType, "mem")) self.mem != null else false,
         .memory_runtime_enabled = if (@hasField(AgentType, "mem_rt")) self.mem_rt != null else false,
         .memory_session_id = if (@hasField(AgentType, "memory_session_id")) self.memory_session_id else null,
+        .conversation_retention_days = if (@hasField(AgentType, "mem_rt") and self.mem_rt != null) self.mem_rt.?.resolved.conversation_retention_days else null,
         .memory_enriched_messages = memory_enriched_messages,
         .has_system_prompt = has_system_prompt,
         .has_conversation_context = has_conversation_context,
@@ -281,8 +284,8 @@ pub fn buildSnapshot(self: anytype) Snapshot {
             },
             .last_turn_runtime = .{
                 .entries = if (last_turn.available) 1 else 0,
-                .bytes = last_turn.memory_context_bytes + last_turn.trimmed_bytes,
-                .token_estimate = tokenEstimateFromBytes(last_turn.memory_context_bytes + last_turn.trimmed_bytes),
+                .bytes = last_turn.memory_context_bytes,
+                .token_estimate = tokenEstimateFromBytes(last_turn.memory_context_bytes),
                 .active = last_turn.available,
                 .cacheability = .per_turn,
             },
@@ -402,6 +405,7 @@ test "buildSnapshot counts roles and retrieval state" {
         embedding_provider: []const u8,
         vector_mode: []const u8,
         rollout_mode: []const u8,
+        conversation_retention_days: u32,
     };
     const FakeMemoryRuntime = struct {
         resolved: Resolved,
@@ -419,6 +423,7 @@ test "buildSnapshot counts roles and retrieval state" {
             .embedding_provider = "together",
             .vector_mode = "pgvector",
             .rollout_mode = "on",
+            .conversation_retention_days = 0,
         },
     };
     const fake = struct {
@@ -472,6 +477,7 @@ test "buildSnapshot counts roles and retrieval state" {
     try std.testing.expectEqual(@as(u64, 3_372), snapshot.token_total_reserve);
     try std.testing.expectEqualStrings("together", snapshot.embedding_provider);
     try std.testing.expectEqualStrings("pgvector", snapshot.vector_mode);
+    try std.testing.expectEqual(@as(?u32, 0), snapshot.conversation_retention_days);
     try std.testing.expect(snapshot.has_system_prompt);
     try std.testing.expectEqual(@as(?u64, 42), snapshot.workspace_prompt_fingerprint);
     try std.testing.expectEqual(@as(usize, 1), snapshot.buckets.stable_prefix.entries);

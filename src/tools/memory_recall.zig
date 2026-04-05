@@ -16,9 +16,9 @@ pub const MemoryRecallTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_recall";
-    pub const tool_description = "Search long-term memory for relevant facts, preferences, or context.";
+    pub const tool_description = "Search canonical memory for relevant facts, preferences, or context. Defaults to the current session unless scope=global is provided.";
     pub const tool_params =
-        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: session)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}
+        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in canonical memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: session). Use global for durable or cross-session facts."},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -287,6 +287,29 @@ test "memory_recall filters internal bootstrap keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "user_pref") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "__bootstrap.prompt.SOUL.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-soul") == null);
+}
+
+test "memory_recall filters audit and index artifacts by default" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("session_checkpoint_1", "type=session_checkpoint\nrecent_user:\n- shipping\n", .daily, null);
+    try mem.store("timeline_index/current", "{\"session\":\"agent:zaki-bot:user:1:main\"}", .core, null);
+    try mem.store("timeline_summary/agent:zaki-bot:user:1:main/1", "focus: shipping\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n", .daily, null);
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\": \"shipping\", \"scope\": \"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "timeline_summary/agent:zaki-bot:user:1:main/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "session_checkpoint_1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "timeline_index/current") == null);
 }
 
 test "memory_recall filters markdown encoded internal keys" {

@@ -327,12 +327,13 @@ pub const Agent = struct {
     send_mode: SendMode = .inherit,
     last_turn_usage: providers.TokenUsage = .{},
     message_timeout_secs: u64 = 0,
+    provider_reliability_active: bool = false,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
     lifecycle_summarizer_last_attempt_s: i64 = 0,
     lifecycle_summarizer_cooldown_secs: u64 = 900,
-    lifecycle_summarizer_timeout_secs: u64 = 8,
+    lifecycle_summarizer_timeout_secs: u64 = 60,
 
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
@@ -370,6 +371,12 @@ pub const Agent = struct {
 
     /// Compact explanation of what context was assembled on the last completed turn.
     last_turn_context: context_builder.LastTurnContext = .{},
+
+    /// Raw user content for the current turn when provider-facing enrichment is active.
+    current_turn_raw_user: ?[]const u8 = null,
+
+    /// Enriched provider-facing user content for the current turn only.
+    current_turn_enriched_user: ?[]const u8 = null,
 
     /// An owned copy of a ChatMessage, where content is heap-allocated.
     pub const OwnedMessage = struct {
@@ -453,6 +460,9 @@ pub const Agent = struct {
             .activation_mode = parseActivationModeFromConfig(cfg.agent.activation_mode),
             .send_mode = parseSendModeFromConfig(cfg.agent.send_mode),
             .message_timeout_secs = cfg.agent.message_timeout_secs,
+            .provider_reliability_active = cfg.reliability.provider_retries > 0 or
+                cfg.reliability.fallback_providers.len > 0 or
+                cfg.reliability.model_fallbacks.len > 0,
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
@@ -495,6 +505,7 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        self.clearCurrentTurnProviderOverride();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -528,6 +539,20 @@ pub const Agent = struct {
         });
     }
 
+    /// Manual compaction for explicit operator boundaries.
+    pub fn manualCompactHistory(self: *Agent) !bool {
+        return compaction.manualCompactHistory(self.allocator, &self.history, self.provider, self.model_name, .{
+            .keep_recent = self.compaction_keep_recent,
+            .max_summary_chars = self.compaction_max_summary_chars,
+            .max_source_chars = self.compaction_max_source_chars,
+            .token_limit = self.token_limit,
+            .max_tokens = self.max_tokens,
+            .message_timeout_secs = self.message_timeout_secs,
+            .max_history_messages = self.max_history_messages,
+            .workspace_dir = self.workspace_dir,
+        });
+    }
+
     /// Force-compress history for context exhaustion recovery.
     pub fn forceCompressHistory(self: *Agent) bool {
         return compaction.forceCompressHistory(self.allocator, &self.history);
@@ -550,6 +575,28 @@ pub const Agent = struct {
             if (std.mem.eql(u8, fallback_name, provider_name)) return true;
         }
         return false;
+    }
+
+    fn clearCurrentTurnProviderOverride(self: *Agent) void {
+        if (self.current_turn_enriched_user) |enriched| {
+            self.allocator.free(enriched);
+        }
+        self.current_turn_enriched_user = null;
+        self.current_turn_raw_user = null;
+    }
+
+    fn isCurrentTurnRawUser(self: *const Agent, content: []const u8) bool {
+        const current = self.current_turn_raw_user orelse return false;
+        return current.len == content.len and current.ptr == content.ptr;
+    }
+
+    fn providerMessageForOwned(self: *const Agent, msg: *const OwnedMessage) ChatMessage {
+        if (msg.role == .user and self.isCurrentTurnRawUser(msg.content)) {
+            if (self.current_turn_enriched_user) |enriched| {
+                return .{ .role = msg.role, .content = enriched };
+            }
+        }
+        return msg.toChatMessage();
     }
 
     fn providerAuthStatus(self: *const Agent, provider_name: []const u8) []const u8 {
@@ -1121,6 +1168,8 @@ pub const Agent = struct {
 
         self.context_was_compacted = false;
         self.last_turn_context = .{};
+        self.clearCurrentTurnProviderOverride();
+        defer self.clearCurrentTurnProviderOverride();
 
         const turn_start_event = ObserverEvent{ .turn_stage = .{
             .stage = "turn_start",
@@ -1202,7 +1251,7 @@ pub const Agent = struct {
             }
         }
 
-        // Enrich message with memory context (always returns owned slice; ownership → history)
+        // Enrich message with memory context for the current provider-facing turn only.
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
         const enrich_start_ms = std.time.milliTimestamp();
         const enrichment = if (self.mem) |mem|
@@ -1226,25 +1275,25 @@ pub const Agent = struct {
             .duration_ms = enrich_duration_ms,
         } };
         self.observer.recordEvent(&memory_stage_event);
-        errdefer self.allocator.free(enriched);
+        self.current_turn_enriched_user = enriched;
+        errdefer self.clearCurrentTurnProviderOverride();
 
+        const raw_user_history = try self.allocator.dupe(u8, user_message);
+        var raw_user_history_appended = false;
+        errdefer if (!raw_user_history_appended) self.allocator.free(raw_user_history);
         try self.history.append(self.allocator, .{
             .role = .user,
-            .content = enriched,
+            .content = raw_user_history,
         });
+        raw_user_history_appended = true;
+        self.current_turn_raw_user = raw_user_history;
 
         if (self.compact_context_enabled) {
-            const compact_start_ms = std.time.milliTimestamp();
-            // Keep interactive turns deterministic: pre-provider compaction is trim-only.
             self.last_turn_compacted = false;
-            const trim_stats = self.trimHistoryDetailed();
-            self.recordTrimStats(trim_stats);
-            const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
-            turn_compaction_ms = compact_duration_ms;
-            log.info("turn.stage stage=turn_compaction duration_ms={d} mode=trim", .{compact_duration_ms});
+            log.info("turn.stage stage=turn_compaction duration_ms=0 mode=auto", .{});
             const compact_stage_event = ObserverEvent{ .turn_stage = .{
                 .stage = "turn_compaction",
-                .duration_ms = compact_duration_ms,
+                .duration_ms = 0,
             } };
             self.observer.recordEvent(&compact_stage_event);
         }
@@ -1267,11 +1316,14 @@ pub const Agent = struct {
                         .role = .assistant,
                         .content = history_copy,
                     });
-                    // Keep cache-hit turns bounded too; otherwise history can grow
-                    // unbounded when many turns short-circuit before finalize.
-                    self.last_turn_compacted = false;
-                    const trim_stats = self.trimHistoryDetailed();
-                    self.recordTrimStats(trim_stats);
+                    if (self.compact_context_enabled) {
+                        const history_before_auto_compact = self.history.items.len;
+                        self.last_turn_compacted = self.autoCompactHistory() catch false;
+                        if (self.last_turn_compacted) {
+                            self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+                            self.refreshDurableContinuityAfterCompaction();
+                        }
+                    }
                     const cache_hit_event = ObserverEvent{ .turn_stage = .{
                         .stage = "response_cache_hit",
                     } };
@@ -1293,11 +1345,14 @@ pub const Agent = struct {
                     .role = .assistant,
                     .content = history_copy,
                 });
-                // Keep cache-hit turns bounded too; otherwise history can grow
-                // unbounded when many turns short-circuit before finalize.
-                self.last_turn_compacted = false;
-                const trim_stats = self.trimHistoryDetailed();
-                self.recordTrimStats(trim_stats);
+                if (self.compact_context_enabled) {
+                    const history_before_auto_compact = self.history.items.len;
+                    self.last_turn_compacted = self.autoCompactHistory() catch false;
+                    if (self.last_turn_compacted) {
+                        self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+                        self.refreshDurableContinuityAfterCompaction();
+                    }
+                }
                 const cache_hit_event = ObserverEvent{ .turn_stage = .{
                     .stage = "response_cache_hit",
                 } };
@@ -1310,9 +1365,8 @@ pub const Agent = struct {
         }
 
         if (self.compact_context_enabled) {
-            // Second-stage guardrail: after the cheap history-count trim above,
-            // run provider-backed auto-compaction only if token pressure is
-            // still high enough to justify summarizing older context.
+            // Run provider-backed auto-compaction against the full working
+            // session so context boundaries create durable continuity objects.
             const auto_compact_start_ms = std.time.milliTimestamp();
             const history_before_auto_compact = self.history.items.len;
             self.last_turn_compacted = self.autoCompactHistory() catch false;
@@ -1482,6 +1536,8 @@ pub const Agent = struct {
                             self.temperature,
                         ) catch return err;
                     }
+
+                    if (self.provider_reliability_active) return err;
 
                     // Retry once
                     std.Thread.sleep(500 * std.time.ns_per_ms);
@@ -1683,8 +1739,13 @@ pub const Agent = struct {
                         .role = .user,
                         .content = try self.allocator.dupe(u8, follow_up_instruction),
                     });
-                    const trim_stats = self.trimHistoryDetailed();
-                    self.recordTrimStats(trim_stats);
+                    if (self.compact_context_enabled) {
+                        const history_before_auto_compact = self.history.items.len;
+                        self.last_turn_compacted = self.autoCompactHistory() catch false;
+                        if (self.last_turn_compacted) {
+                            self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+                        }
+                    }
                     self.freeResponseFields(&response);
                     forced_follow_through_count += 1;
                     continue;
@@ -1754,36 +1815,44 @@ pub const Agent = struct {
                     .content = try self.allocator.dupe(u8, safe_display_text),
                 });
 
-                // Keep interactive turns fast: trim history here, but defer
-                // expensive provider-backed compaction to explicit/overflow paths.
                 const compact_start_ms = std.time.milliTimestamp();
-                const trim_stats = self.trimHistoryDetailed();
-                self.recordTrimStats(trim_stats);
+                if (self.compact_context_enabled and !self.last_turn_compacted) {
+                    const history_before_auto_compact = self.history.items.len;
+                    self.last_turn_compacted = self.autoCompactHistory() catch false;
+                    if (self.last_turn_compacted) {
+                        self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+                    }
+                }
                 const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
-                log.info("turn.stage stage=compact_trim iteration={d} duration_ms={d} compacted={}", .{
+                log.info("turn.stage stage=post_reply_compaction iteration={d} duration_ms={d} compacted={}", .{
                     iteration,
                     compact_duration_ms,
                     self.last_turn_compacted,
                 });
+                const compact_stage_event = ObserverEvent{ .turn_stage = .{
+                    .stage = "post_reply_compaction",
+                    .iteration = iteration,
+                    .duration_ms = compact_duration_ms,
+                } };
+                self.observer.recordEvent(&compact_stage_event);
 
-                // Auto-save assistant response
+                if (self.last_turn_compacted) {
+                    self.refreshDurableContinuityAfterCompaction();
+                }
+
+                // Auto-save the exact final user-visible reply as cold transcript memory.
                 const autosave_start_ms = std.time.milliTimestamp();
                 if (self.auto_save) {
                     if (self.mem) |mem| {
-                        // Truncate to ~100 bytes on a valid UTF-8 boundary
-                        const summary = if (base_text.len > 100) blk: {
-                            var end: usize = 100;
-                            while (end > 0 and base_text[end] & 0xC0 == 0x80) end -= 1;
-                            break :blk base_text[0..end];
-                        } else base_text;
+                        const visible_reply = if (tts_audio_reply_text) |audio_reply| audio_reply else final_text;
                         const ts: u128 = @bitCast(std.time.nanoTimestamp());
                         const save_key = std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts}) catch null;
                         if (save_key) |key| {
                             defer self.allocator.free(key);
-                            if (mem.store(key, summary, .conversation, self.memory_session_id)) |_| {
+                            if (mem.store(key, visible_reply, .conversation, self.memory_session_id)) |_| {
                                 // Vector sync after auto-save
                                 if (self.mem_rt) |rt| {
-                                    rt.syncVectorAfterStore(self.allocator, key, summary);
+                                    rt.syncVectorAfterStore(self.allocator, key, visible_reply);
                                 }
                             } else |_| {}
                         }
@@ -1959,11 +2028,23 @@ pub const Agent = struct {
             } };
             self.observer.recordEvent(&reflect_stage_event);
 
-            const trim_start_ms = std.time.milliTimestamp();
-            const trim_stats = self.trimHistoryDetailed();
-            self.recordTrimStats(trim_stats);
-            const trim_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - trim_start_ms));
-            log.info("turn.stage stage=trim_history_after_tools iteration={d} duration_ms={d}", .{ iteration, trim_duration_ms });
+            const compact_start_ms = std.time.milliTimestamp();
+            if (self.compact_context_enabled) {
+                const history_before_auto_compact = self.history.items.len;
+                const compacted_after_tools = self.autoCompactHistory() catch false;
+                if (compacted_after_tools) {
+                    self.last_turn_compacted = true;
+                    self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+                }
+            }
+            const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
+            log.info("turn.stage stage=history_maintenance_after_tools iteration={d} duration_ms={d}", .{ iteration, compact_duration_ms });
+            const compact_stage_event = ObserverEvent{ .turn_stage = .{
+                .stage = "history_maintenance_after_tools",
+                .iteration = iteration,
+                .duration_ms = compact_duration_ms,
+            } };
+            self.observer.recordEvent(&compact_stage_event);
 
             // Free provider response fields now that all borrows are consumed.
             self.freeResponseFields(&response);
@@ -2024,15 +2105,13 @@ pub const Agent = struct {
             .content = try self.allocator.dupe(u8, summary_text),
         });
 
-        // Compact/trim history so the next turn doesn't start with bloated context
+        // Compact history so the next turn can continue from a stable boundary.
         const history_before_auto_compact = self.history.items.len;
         self.last_turn_compacted = self.autoCompactHistory() catch false;
         if (self.last_turn_compacted) {
             self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+            self.refreshDurableContinuityAfterCompaction();
         }
-        const trim_stats = self.trimHistoryDetailed();
-        self.recordTrimStats(trim_stats);
-
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
         const total_turn_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - turn_start_ms));
@@ -2155,7 +2234,7 @@ pub const Agent = struct {
     fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator) ![]ChatMessage {
         const m = try arena.alloc(ChatMessage, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
-            m[i] = msg.toChatMessage();
+            m[i] = self.providerMessageForOwned(msg);
         }
 
         // Allow local multimodal reads from:
@@ -2207,7 +2286,7 @@ pub const Agent = struct {
     fn buildMessageSlice(self: *Agent) ![]ChatMessage {
         const messages = try self.allocator.alloc(ChatMessage, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
-            messages[i] = msg.toChatMessage();
+            messages[i] = self.providerMessageForOwned(msg);
         }
         return messages;
     }
@@ -2256,6 +2335,11 @@ pub const Agent = struct {
 
     fn recordForceCompression(self: *Agent, history_before: usize, history_after: usize) void {
         context_builder.recordForceCompression(&self.last_turn_context, history_before, history_after);
+    }
+
+    fn refreshDurableContinuityAfterCompaction(self: *Agent) void {
+        if (!self.last_turn_compacted) return;
+        self.last_turn_context.durable_continuity_refreshed = commands.persistSessionCheckpointDetailed(self, "compaction:auto");
     }
 
     /// Run a single message through the agent and return the response.
@@ -2959,6 +3043,52 @@ test "Agent buildProviderMessages allows workspace image paths" {
     try std.testing.expect(has_image_part);
 }
 
+test "Agent provider messages use current turn enrichment while history stays raw" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const raw = try allocator.dupe(u8, "raw user text");
+    errdefer allocator.free(raw);
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = raw,
+    });
+    agent.current_turn_raw_user = raw;
+    agent.current_turn_enriched_user = try allocator.dupe(u8, "[Memory context]\nraw user text");
+
+    var arena_impl = std.heap.ArenaAllocator.init(allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const provider_messages = try agent.buildProviderMessages(arena);
+    try std.testing.expectEqual(@as(usize, 1), provider_messages.len);
+    try std.testing.expectEqualStrings("[Memory context]\nraw user text", provider_messages[0].content);
+    try std.testing.expectEqualStrings("raw user text", agent.history.items[0].content);
+
+    const flat_messages = try agent.buildMessageSlice();
+    defer allocator.free(flat_messages);
+    try std.testing.expectEqual(@as(usize, 1), flat_messages.len);
+    try std.testing.expectEqualStrings("[Memory context]\nraw user text", flat_messages[0].content);
+}
+
 test "Agent max_tool_iterations default" {
     try std.testing.expectEqual(@as(u32, 25), DEFAULT_MAX_TOOL_ITERATIONS);
 }
@@ -3607,6 +3737,7 @@ test "persistSessionCheckpoint omits last_summary_key when summarizer is disable
         .rollout_mode = "off",
         .vector_sync_mode = "best_effort",
         .hygiene_enabled = false,
+        .conversation_retention_days = 0,
         .snapshot_enabled = false,
         .cache_enabled = false,
         .semantic_cache_enabled = false,
@@ -3684,6 +3815,48 @@ test "persistSessionCheckpoint includes last_summary_key when fallback summary i
         found_timeline_summary = true;
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "focus: recap this session") != null);
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "next:") != null);
+        break;
+    }
+    try std.testing.expect(found_timeline_summary);
+}
+
+test "persistSessionCheckpoint fallback prefers compaction carrier from actual history" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.provider = .{ .ptr = @ptrCast(&test_invalid_summary_provider_state), .vtable = &test_invalid_summary_provider_vtable };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:main";
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "[Compaction summary]\n" ++
+            "- preserved deploy decision and auth issue\n" ++
+            "- keep rollout blocked until token truth is fixed\n"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "continue from there"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "I will continue from there."),
+    });
+
+    agent.persistSessionCheckpoint("compaction:auto");
+
+    const timeline_entries = try mem.list(allocator, .daily, null);
+    defer memory_mod.freeEntries(allocator, timeline_entries);
+    var found_timeline_summary = false;
+    for (timeline_entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "timeline_summary/agent:zaki-bot:user:1:main/")) continue;
+        found_timeline_summary = true;
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "focus: preserved deploy decision and auth issue") != null);
         break;
     }
     try std.testing.expect(found_timeline_summary);
@@ -3895,6 +4068,7 @@ test "slash /memory list hides internal autosave and hygiene entries by default"
         .rollout_mode = "off",
         .vector_sync_mode = "best_effort",
         .hygiene_enabled = false,
+        .conversation_retention_days = 0,
         .snapshot_enabled = false,
         .cache_enabled = false,
         .semantic_cache_enabled = false,
@@ -3947,6 +4121,7 @@ test "slash /memory list includes internal entries when requested" {
         .rollout_mode = "off",
         .vector_sync_mode = "best_effort",
         .hygiene_enabled = false,
+        .conversation_retention_days = 0,
         .snapshot_enabled = false,
         .cache_enabled = false,
         .semantic_cache_enabled = false,
@@ -4021,6 +4196,52 @@ test "slash /compact with short history is a no-op" {
     defer allocator.free(response);
 
     try std.testing.expectEqualStrings("Nothing to compact.", response);
+}
+
+test "slash /compact writes continuity artifacts when compaction succeeds" {
+    if (!@import("build_options").enable_sqlite) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:main";
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+    for (0..3) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "user {d}", .{i}),
+        });
+        try agent.history.append(allocator, .{
+            .role = .assistant,
+            .content = try std.fmt.allocPrint(allocator, "assistant {d}", .{i}),
+        });
+    }
+
+    const response = (try agent.handleSlashCommand("/compact")).?;
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("Context compacted and continuity refreshed.", response);
+    try std.testing.expect(agent.last_turn_compacted);
+    try std.testing.expect(agent.last_turn_context.durable_continuity_refreshed);
+
+    const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=compaction:manual") != null);
+
+    const latest = (try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:main")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
 }
 
 test "slash /think updates reasoning effort" {
@@ -4329,7 +4550,7 @@ test "turn does not duplicate reasoning in final reply when reasoning mode is st
     try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\n") == null);
 }
 
-test "turn uses trim-only pre-provider compaction for background origins" {
+test "turn auto-compacts for background origins when history crosses the boundary" {
     const ProviderState = struct {
         calls: usize = 0,
 
@@ -4413,7 +4634,8 @@ test "turn uses trim-only pre-provider compaction for background origins" {
     defer allocator.free(response);
 
     try std.testing.expectEqualStrings("ok", response);
-    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
+    try std.testing.expect(agent.last_turn_compacted);
 }
 
 test "turn auto-compacts on token pressure before provider call" {
@@ -4507,6 +4729,254 @@ test "turn auto-compacts on token pressure before provider call" {
     try std.testing.expect(agent.last_turn_compacted);
     try std.testing.expectEqual(@as(usize, 1), agent.last_turn_context.auto_compaction_events);
     try std.testing.expect(agent.last_turn_context.auto_compacted_messages > 0);
+}
+
+test "assistant autosave stores the full final visible reply" {
+    if (!@import("build_options").enable_sqlite) return error.SkipZigTest;
+
+    const ReplyProvider = struct {
+        const reply =
+            "This is the full assistant reply that should be persisted exactly as the user saw it, " ++
+            "not a truncated autosave summary.";
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, reply);
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, reply),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "test-reply-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReplyProvider.chatWithSystem,
+        .chat = ReplyProvider.chat,
+        .supportsNativeTools = ReplyProvider.supportsNativeTools,
+        .getName = ReplyProvider.getName,
+        .deinit = ReplyProvider.deinitFn,
+    };
+
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.auto_save = true;
+    agent.memory_session_id = "agent:test:user:1:main";
+
+    const response = try agent.turn("persist this reply");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings(ReplyProvider.reply, response);
+
+    const conversation_entries = try mem.list(allocator, .conversation, agent.memory_session_id);
+    defer memory_mod.freeEntries(allocator, conversation_entries);
+
+    var found_assistant_autosave = false;
+    for (conversation_entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "autosave_assistant_")) continue;
+        found_assistant_autosave = true;
+        try std.testing.expectEqualStrings(ReplyProvider.reply, entry.content);
+    }
+    try std.testing.expect(found_assistant_autosave);
+}
+
+test "auto compaction refreshes durable continuity artifacts" {
+    if (!@import("build_options").enable_sqlite) return error.SkipZigTest;
+
+    const CountingProvider = struct {
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "ok");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "counting-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = CountingProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = CountingProvider.chatWithSystem,
+        .chat = CountingProvider.chat,
+        .supportsNativeTools = CountingProvider.supportsNativeTools,
+        .getName = CountingProvider.getName,
+        .deinit = CountingProvider.deinitFn,
+    };
+
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:test:user:1:main";
+    agent.compact_context_enabled = true;
+    agent.compaction_keep_recent = 2;
+    agent.token_limit = 4_000;
+    agent.max_tokens = 512;
+
+    for (0..5) |_| {
+        const user_payload = try allocator.alloc(u8, 2_500);
+        @memset(user_payload, 'u');
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = user_payload,
+        });
+        const assistant_payload = try allocator.alloc(u8, 2_500);
+        @memset(assistant_payload, 'a');
+        try agent.history.append(allocator, .{
+            .role = .assistant,
+            .content = assistant_payload,
+        });
+    }
+
+    const response = try agent.turn("next");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.calls);
+    try std.testing.expect(agent.last_turn_compacted);
+    try std.testing.expect(agent.last_turn_context.durable_continuity_refreshed);
+
+    const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=compaction:auto") != null);
+
+    const latest = (try mem.get(allocator, "summary_latest/agent:test:user:1:main")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
+}
+
+test "message-count boundary now auto-compacts and refreshes durable continuity" {
+    if (!@import("build_options").enable_sqlite) return error.SkipZigTest;
+
+    const ReplyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "ok");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "trim-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReplyProvider.chatWithSystem,
+        .chat = ReplyProvider.chat,
+        .supportsNativeTools = ReplyProvider.supportsNativeTools,
+        .getName = ReplyProvider.getName,
+        .deinit = ReplyProvider.deinitFn,
+    };
+
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:test:user:1:main";
+    agent.compact_context_enabled = true;
+    agent.max_history_messages = 2;
+    agent.compaction_keep_recent = 1;
+    agent.token_limit = 262_144;
+    agent.max_tokens = 512;
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "old user 1"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "old assistant 1"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "old user 2"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "old assistant 2"),
+    });
+
+    const response = try agent.turn("new turn");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("ok", response);
+
+    try std.testing.expect(agent.last_turn_compacted);
+    try std.testing.expect(agent.last_turn_context.durable_continuity_refreshed);
+    try std.testing.expectEqual(@as(u32, 0), agent.last_turn_context.trim_events);
+
+    const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=compaction:auto") != null);
+
+    const latest = (try mem.get(allocator, "summary_latest/agent:test:user:1:main")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
 }
 
 test "turn refreshes system prompt after workspace markdown change" {
@@ -4729,6 +5199,7 @@ test "turn uses semantic cache when runtime semantic cache is available" {
         .rollout_mode = "off",
         .vector_sync_mode = "best_effort",
         .hygiene_enabled = false,
+        .conversation_retention_days = 0,
         .snapshot_enabled = false,
         .cache_enabled = false,
         .semantic_cache_enabled = true,
@@ -5214,6 +5685,142 @@ test "Agent tool loop frees dynamic tool outputs" {
 
     try std.testing.expectEqualStrings("done", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "turn retries once when provider reliability is inactive" {
+    const FlakyProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) return error.TemporaryFailure;
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "flaky-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = FlakyProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = FlakyProvider.chatWithSystem,
+        .chat = FlakyProvider.chat,
+        .supportsNativeTools = FlakyProvider.supportsNativeTools,
+        .getName = FlakyProvider.getName,
+        .deinit = FlakyProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "turn skips duplicate agent retry when provider reliability is active" {
+    const FlakyProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            return error.TemporaryFailure;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "flaky-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = FlakyProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = FlakyProvider.chatWithSystem,
+        .chat = FlakyProvider.chat,
+        .supportsNativeTools = FlakyProvider.supportsNativeTools,
+        .getName = FlakyProvider.getName,
+        .deinit = FlakyProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .provider_reliability_active = true,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    try std.testing.expectError(error.TemporaryFailure, agent.turn("hello"));
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
 }
 
 test "Agent parallel dispatcher runs safe tool calls concurrently when enabled" {

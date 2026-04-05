@@ -1,4 +1,5 @@
 const std = @import("std");
+const config_types = @import("../config_types.zig");
 const context_builder = @import("context_builder.zig");
 const context_cache = @import("context_cache.zig");
 
@@ -107,6 +108,19 @@ fn memorySelectionText(allocator: std.mem.Allocator, report: Report) ![]u8 {
     );
 }
 
+fn transcriptRetentionText(allocator: std.mem.Allocator, retention_days: ?u32) ![]u8 {
+    const days = retention_days orelse return try allocator.dupe(u8, "n/a");
+    if (days == 0) return try allocator.dupe(u8, "forever");
+    return try std.fmt.allocPrint(allocator, "{d}d", .{days});
+}
+
+fn continuityRefreshReasonText(allocator: std.mem.Allocator, report: Report) ![]u8 {
+    if (!report.last_turn.durable_continuity_refreshed) {
+        return try allocator.dupe(u8, "n/a");
+    }
+    return try allocator.dupe(u8, "compaction:auto");
+}
+
 pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
     const workspace_fp_text = if (report.workspace_prompt_fingerprint) |fp|
         try std.fmt.allocPrint(allocator, "{d}", .{fp})
@@ -126,6 +140,10 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
     defer allocator.free(stable_prefix_reason_text);
     const memory_selection_text = try memorySelectionText(allocator, report);
     defer allocator.free(memory_selection_text);
+    const transcript_retention_text = try transcriptRetentionText(allocator, report.conversation_retention_days);
+    defer allocator.free(transcript_retention_text);
+    const continuity_refresh_reason_text = try continuityRefreshReasonText(allocator, report);
+    defer allocator.free(continuity_refresh_reason_text);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -168,6 +186,27 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.embedding_provider,
         report.vector_mode,
         report.rollout_mode,
+    });
+    try w.writeAll("  continuity:\n");
+    try std.fmt.format(w, "    hot: last_n={d} raw_only=yes\n", .{
+        report.history_trim_limit_messages,
+    });
+    try std.fmt.format(w, "    warm: summary_latest={s} anchor={s} recall_limit={d} timeline_fallback_limit={d} durable={d} timeline={d} search={d} fallback={d}\n", .{
+        boolWord(report.last_turn.memory_selection.summary_latest_used),
+        boolWord(report.last_turn.memory_selection.context_anchor_used),
+        config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT,
+        config_types.DEFAULT_MEMORY_TIMELINE_FALLBACK_LIMIT,
+        report.last_turn.memory_selection.durable_fact_count,
+        report.last_turn.memory_selection.timeline_summary_count,
+        report.last_turn.memory_selection.search_match_count,
+        report.last_turn.memory_selection.global_fallback_count,
+    });
+    try std.fmt.format(w, "    cold: tools=memory_recall,memory_timeline,memory_list discovery=timeline_index transcripts=autosave(exact_history) retention={s}\n", .{
+        transcript_retention_text,
+    });
+    try std.fmt.format(w, "    durable_refresh: triggered={s} reason={s}\n", .{
+        boolWord(report.last_turn.durable_continuity_refreshed),
+        continuity_refresh_reason_text,
     });
     try std.fmt.format(w, "  prompt: has_system={s} conversation_context={s} workspace_fp={s}\n", .{
         boolWord(report.has_system_prompt),
@@ -237,6 +276,11 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
 }
 
 pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
+    const transcript_retention_text = try transcriptRetentionText(allocator, report.conversation_retention_days);
+    defer allocator.free(transcript_retention_text);
+    const continuity_refresh_reason_text = try continuityRefreshReasonText(allocator, report);
+    defer allocator.free(continuity_refresh_reason_text);
+
     return try std.json.Stringify.valueAlloc(allocator, .{
         .model = report.model_name,
         .history_messages = report.history_messages,
@@ -261,6 +305,7 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .enabled = report.memory_enabled,
             .runtime = report.memory_runtime_enabled,
             .session_id = report.memory_session_id,
+            .conversation_retention_days = report.conversation_retention_days,
             .enriched_messages = report.memory_enriched_messages,
         },
         .prompt = .{
@@ -273,6 +318,31 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .embedding_provider = report.embedding_provider,
             .vector_mode = report.vector_mode,
             .rollout = report.rollout_mode,
+        },
+        .continuity = .{
+            .hot = .{
+                .last_n = report.history_trim_limit_messages,
+                .raw_only = true,
+            },
+            .warm = .{
+                .summary_latest = report.last_turn.memory_selection.summary_latest_used,
+                .context_anchor = report.last_turn.memory_selection.context_anchor_used,
+                .recall_limit = config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT,
+                .timeline_fallback_limit = config_types.DEFAULT_MEMORY_TIMELINE_FALLBACK_LIMIT,
+                .durable_facts = report.last_turn.memory_selection.durable_fact_count,
+                .timeline_summaries = report.last_turn.memory_selection.timeline_summary_count,
+                .search_matches = report.last_turn.memory_selection.search_match_count,
+                .fallback_matches = report.last_turn.memory_selection.global_fallback_count,
+            },
+            .cold = .{
+                .tools = .{ "memory_recall", "memory_timeline", "memory_list" },
+                .transcripts = "autosave",
+                .retention_mode = transcript_retention_text,
+            },
+            .durable_refresh = .{
+                .triggered = report.last_turn.durable_continuity_refreshed,
+                .reason = continuity_refresh_reason_text,
+            },
         },
         .cache = .{
             .stable_prefix = .{
@@ -339,6 +409,7 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .auto_compacted_messages = report.last_turn.auto_compacted_messages,
             .force_compression_events = report.last_turn.force_compression_events,
             .force_compressed_messages = report.last_turn.force_compressed_messages,
+            .durable_continuity_refreshed = report.last_turn.durable_continuity_refreshed,
             .memory_selection = .{
                 .available = report.last_turn.memory_selection.available,
                 .candidate_count = report.last_turn.memory_selection.candidate_count,
@@ -380,6 +451,7 @@ test "context report counts roles and memory-enriched turns" {
         embedding_provider: []const u8,
         vector_mode: []const u8,
         rollout_mode: []const u8,
+        conversation_retention_days: u32,
     };
     const FakeMemoryRuntime = struct {
         resolved: Resolved,
@@ -390,6 +462,7 @@ test "context report counts roles and memory-enriched turns" {
             .embedding_provider = "together",
             .vector_mode = "pgvector",
             .rollout_mode = "on",
+            .conversation_retention_days = 0,
         },
     };
     const fake = struct {
@@ -428,6 +501,7 @@ test "context report counts roles and memory-enriched turns" {
     try std.testing.expect(report.memory_enabled);
     try std.testing.expect(report.memory_runtime_enabled);
     try std.testing.expectEqualStrings("agent:test:user:1:main", report.memory_session_id.?);
+    try std.testing.expectEqual(@as(?u32, 0), report.conversation_retention_days);
     try std.testing.expectEqual(@as(?u64, 42), report.workspace_prompt_fingerprint);
     try std.testing.expectEqualStrings("together", report.embedding_provider);
     try std.testing.expectEqualStrings("pgvector", report.vector_mode);
@@ -454,6 +528,7 @@ test "context report formatters expose structured details" {
         .memory_enabled = true,
         .memory_runtime_enabled = true,
         .memory_session_id = "agent:test:user:1:main",
+        .conversation_retention_days = 0,
         .memory_enriched_messages = 2,
         .has_system_prompt = true,
         .has_conversation_context = false,
@@ -496,6 +571,7 @@ test "context report formatters expose structured details" {
             .auto_compacted_messages = 8,
             .force_compression_events = 1,
             .force_compressed_messages = 3,
+            .durable_continuity_refreshed = true,
             .memory_selection = .{
                 .available = true,
                 .candidate_count = 5,
@@ -521,6 +597,10 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "reserve: reply=300 tool=2048 safety=1024 total=3372") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory: enabled=yes runtime=yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "retrieval: mode=hybrid provider=together vector=pgvector rollout=on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "hot: last_n=80 raw_only=yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "warm: summary_latest=yes anchor=yes recall_limit=10 timeline_fallback_limit=2 durable=1 timeline=2 search=1 fallback=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "cold: tools=memory_recall,memory_timeline,memory_list discovery=timeline_index transcripts=autosave(exact_history) retention=forever") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "durable_refresh: triggered=yes reason=compaction:auto") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "cache: stable_prefix=yes refresh_needed=yes reason=workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "stable_prefix: entries=1 bytes=128 tokens~=32 cache=stable") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "last_turn: prompt_refresh=yes reason=workspace memory_injected=yes bytes=64 enrich_ms=11 cache_hit=no") != null);
@@ -537,10 +617,13 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"token_compaction_threshold\":650") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"token_total_reserve\":3372") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"enriched_messages\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"conversation_retention_days\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"embedding_provider\":\"together\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"memory_context_injected\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"trimmed_messages\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"auto_compaction_events\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"durable_continuity_refreshed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"retention_mode\":\"forever\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"summary_latest_used\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"workspace_prompt_fingerprint\":77") != null);
 }

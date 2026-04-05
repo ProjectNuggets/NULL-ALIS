@@ -223,7 +223,9 @@ pub fn buildToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]co
     try w.writeAll("You may use multiple tool calls in a single response. ");
     try w.writeAll("After tool execution, results appear in <tool_result> tags. ");
     try w.writeAll("Continue reasoning with the results until you can give a final answer.\n\n");
-    try w.writeAll("Prefer memory tools (memory_recall, memory_list, memory_timeline, memory_store, memory_edit, memory_forget) for assistant memory tasks instead of shell/sqlite commands.\n\n");
+    try w.writeAll("Prefer memory tools (memory_recall, memory_list, memory_timeline, memory_store, memory_edit, memory_forget) for assistant memory tasks instead of shell/sqlite commands.\n");
+    try w.writeAll("Use `memory_timeline` first to discover or browse session/timeline summaries, `memory_recall` for semantic lookup, and `memory_list` for raw record inspection. Treat transcript/autosave records as exact-history deep dives, not default memory context.\n");
+    try w.writeAll("Important: `memory_recall` and `memory_list` default to `scope=session`; use `scope=global` for durable or cross-session facts. Prompt-loaded workspace docs such as `MEMORY.md` are fallback/context surfaces, not proof that a fact is in canonical semantic memory.\n\n");
     try w.writeAll("### Available Tools\n\n");
 
     for (tools) |t| {
@@ -1163,6 +1165,8 @@ test "buildToolInstructions empty tools" {
     try std.testing.expect(std.mem.indexOf(u8, instructions, "tool_call") != null);
     try std.testing.expect(std.mem.indexOf(u8, instructions, "memory_edit") != null);
     try std.testing.expect(std.mem.indexOf(u8, instructions, "memory_timeline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "semantic lookup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "exact-history deep dives") != null);
 }
 
 test "parseToolCalls three consecutive calls" {

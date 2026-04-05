@@ -853,6 +853,10 @@ const TenantRuntime = struct {
                     .supports_outbox = false,
                 };
                 rt.resolved.primary_backend = "zaki_dual";
+                log.info("memory runtime wrapped: configured_backend={s} runtime_backend={s}", .{
+                    runtime.config.memory.backend,
+                    rt.resolved.primary_backend,
+                });
                 try rebuildTenantMemoryEngine(allocator, rt, &runtime.config.memory, runtime.config.workspace_dir);
             }
         }
@@ -5361,6 +5365,7 @@ const DiagnosticsConfigSnapshot = struct {
     memory_reliability_shadow_hybrid_percent: u32,
     memory_reliability_canary_hybrid_percent: u32,
     memory_reliability_fallback_policy: []const u8,
+    agent_message_timeout_secs: u64,
     provider_retries: u32,
     fallback_provider_count: usize,
     memory_vector_sync_mode_requested: []const u8,
@@ -5452,6 +5457,7 @@ fn loadDiagnosticsConfigSnapshot(
         .memory_reliability_shadow_hybrid_percent = cfg.memory.reliability.shadow_hybrid_percent,
         .memory_reliability_canary_hybrid_percent = cfg.memory.reliability.canary_hybrid_percent,
         .memory_reliability_fallback_policy = cfg.memory.reliability.fallback_policy,
+        .agent_message_timeout_secs = cfg.agent.message_timeout_secs,
         .provider_retries = cfg.reliability.provider_retries,
         .fallback_provider_count = cfg.reliability.fallback_providers.len,
         .memory_vector_sync_mode_requested = requested_sync_mode,
@@ -5765,6 +5771,7 @@ fn internalDiagnosticsPayload(
     var effective_config_hash: ?u64 = null;
     var memory_search_enabled: ?bool = null;
     var memory_summarizer_enabled: ?bool = null;
+    var agent_message_timeout_secs: ?u64 = null;
     var provider_retries: ?u32 = null;
     var fallback_provider_count: ?usize = null;
     var memory_vector_sync_mode: ?[]const u8 = null;
@@ -5791,6 +5798,7 @@ fn internalDiagnosticsPayload(
     var configured_memory_reliability_shadow_hybrid_percent: ?u32 = null;
     var configured_memory_reliability_canary_hybrid_percent: ?u32 = null;
     var configured_memory_reliability_fallback_policy: ?[]const u8 = null;
+    var configured_agent_message_timeout_secs: ?u64 = null;
     var configured_provider_retries: ?u32 = null;
     var configured_fallback_provider_count: ?usize = null;
     var configured_memory_vector_sync_mode_requested: ?[]const u8 = null;
@@ -5844,6 +5852,7 @@ fn internalDiagnosticsPayload(
             configured_memory_reliability_shadow_hybrid_percent = snapshot.memory_reliability_shadow_hybrid_percent;
             configured_memory_reliability_canary_hybrid_percent = snapshot.memory_reliability_canary_hybrid_percent;
             configured_memory_reliability_fallback_policy = snapshot.memory_reliability_fallback_policy;
+            configured_agent_message_timeout_secs = snapshot.agent_message_timeout_secs;
             configured_provider_retries = snapshot.provider_retries;
             configured_fallback_provider_count = snapshot.fallback_provider_count;
             configured_memory_vector_sync_mode_requested = snapshot.memory_vector_sync_mode_requested;
@@ -5879,6 +5888,7 @@ fn internalDiagnosticsPayload(
                 effective_memory_reliability_shadow_hybrid_percent = tenant_runtime.config.memory.reliability.shadow_hybrid_percent;
                 effective_memory_reliability_canary_hybrid_percent = tenant_runtime.config.memory.reliability.canary_hybrid_percent;
                 effective_memory_reliability_fallback_policy = tenant_runtime.config.memory.reliability.fallback_policy;
+                agent_message_timeout_secs = tenant_runtime.config.agent.message_timeout_secs;
                 provider_retries = tenant_runtime.config.reliability.provider_retries;
                 fallback_provider_count = tenant_runtime.config.reliability.fallback_providers.len;
                 effective_tenant_identity_mapping_enforcement = tenant_runtime.config.tenant.identity_mapping_enforcement;
@@ -6032,6 +6042,15 @@ fn internalDiagnosticsPayload(
         try buf.appendSlice(allocator, "null");
     }
     try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "agent_message_timeout_secs");
+    if (agent_message_timeout_secs) |value| {
+        var value_buf: [32]u8 = undefined;
+        const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch "0";
+        try buf.appendSlice(allocator, value_text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(&buf, allocator, "provider_retries");
     if (provider_retries) |value| {
         var value_buf: [32]u8 = undefined;
@@ -6081,6 +6100,15 @@ fn internalDiagnosticsPayload(
     try json_util.appendJsonKey(&buf, allocator, "configured_memory_summarizer_enabled");
     if (configured_memory_summarizer_enabled) |enabled| {
         try buf.appendSlice(allocator, if (enabled) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "configured_agent_message_timeout_secs");
+    if (configured_agent_message_timeout_secs) |value| {
+        var value_buf: [32]u8 = undefined;
+        const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch "0";
+        try buf.appendSlice(allocator, value_text);
     } else {
         try buf.appendSlice(allocator, "null");
     }
@@ -6620,6 +6648,9 @@ fn ownershipLockConflictSseRouteResponse(allocator: std.mem.Allocator, conflict:
 }
 
 const SSE_TOKEN_CHUNK_SIZE: usize = 96;
+const SSE_KEEPALIVE_FRAME: []const u8 = "event: progress\ndata: {\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Still working on the reply\"}\n\n";
+const SSE_KEEPALIVE_INTERVAL_MS: u64 = if (builtin.is_test) 25 else 10_000;
+const SSE_KEEPALIVE_POLL_MS: u64 = if (builtin.is_test) 5 else 250;
 
 fn sseStatusFrame(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -6700,7 +6731,7 @@ fn sseReasoningSummaryFrame(
 fn SseProgressObserver(comptime StreamType: type) type {
     return struct {
         allocator: std.mem.Allocator,
-        stream: StreamType,
+        stream: *StreamType,
         stream_failed: bool = false,
         last_emit_ms: i64 = 0,
         last_emit_hash: u64 = 0,
@@ -6718,7 +6749,7 @@ fn SseProgressObserver(comptime StreamType: type) type {
             .name = name,
         };
 
-        fn init(allocator: std.mem.Allocator, stream: StreamType) Self {
+        fn init(allocator: std.mem.Allocator, stream: *StreamType) Self {
             return .{
                 .allocator = allocator,
                 .stream = stream,
@@ -6778,7 +6809,7 @@ fn SseProgressObserver(comptime StreamType: type) type {
                 return;
             };
             defer self.allocator.free(frame);
-            sendChunkedSseFrame(self.stream, frame) catch |err| {
+            self.stream.sendFrame(frame) catch |err| {
                 log.warn("chat.stream.progress emit failed phase={s} state={s}: {}", .{ phase, state, err });
                 self.stream_failed = true;
                 return;
@@ -6825,7 +6856,7 @@ fn SseProgressObserver(comptime StreamType: type) type {
                 return;
             };
             defer self.allocator.free(frame);
-            sendChunkedSseFrame(self.stream, frame) catch |err| {
+            self.stream.sendFrame(frame) catch |err| {
                 log.warn("chat.stream.reasoning_summary emit failed phase={s}: {}", .{ phase orelse "n/a", err });
                 self.stream_failed = true;
                 return;
@@ -7272,6 +7303,78 @@ fn sseBufferedChatPayload(
     return buf.toOwnedSlice(allocator);
 }
 
+fn LockedSseStream(comptime StreamType: type) type {
+    return struct {
+        stream: StreamType,
+        mutex: std.Thread.Mutex = .{},
+        closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        const Self = @This();
+
+        fn init(stream: StreamType) Self {
+            return .{ .stream = stream };
+        }
+
+        fn sendHeader(self: *Self, status: []const u8) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.closed.load(.acquire)) return error.BrokenPipe;
+            try sendChunkedSseHeader(self.stream, status);
+        }
+
+        fn sendFrame(self: *Self, frame: []const u8) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.closed.load(.acquire)) return error.BrokenPipe;
+            try sendChunkedSseFrame(self.stream, frame);
+        }
+
+        fn finish(self: *Self) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.closed.swap(true, .acq_rel)) return;
+            try finishChunkedSse(self.stream);
+        }
+
+        fn markClosed(self: *Self) void {
+            _ = self.closed.swap(true, .acq_rel);
+        }
+    };
+}
+
+fn SseKeepalive(comptime LockedStreamType: type) type {
+    return struct {
+        stream: *LockedStreamType,
+        stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        const Self = @This();
+
+        fn init(stream: *LockedStreamType) Self {
+            return .{ .stream = stream };
+        }
+
+        fn stop(self: *Self) void {
+            self.stop_flag.store(true, .release);
+        }
+
+        fn run(self: *Self) void {
+            var waited_ms: u64 = 0;
+            while (!self.stop_flag.load(.acquire)) {
+                std.Thread.sleep(SSE_KEEPALIVE_POLL_MS * std.time.ns_per_ms);
+                if (self.stop_flag.load(.acquire)) break;
+                waited_ms += SSE_KEEPALIVE_POLL_MS;
+                if (waited_ms < SSE_KEEPALIVE_INTERVAL_MS) continue;
+                waited_ms = 0;
+                self.stream.sendFrame(SSE_KEEPALIVE_FRAME) catch {
+                    self.stream.markClosed();
+                    self.stop();
+                    break;
+                };
+            }
+        }
+    };
+}
+
 fn sendChunkedSseHeader(stream: anytype, status: []const u8) !void {
     var header_buf: [512]u8 = undefined;
     const header = try std.fmt.bufPrint(
@@ -7323,6 +7426,28 @@ fn sendSseErrorFrames(stream: anytype, allocator: std.mem.Allocator, code: []con
     sendChunkedSseFrame(stream, done_frame) catch return;
 
     finishChunkedSse(stream) catch {};
+}
+
+fn sendLockedSseErrorFrames(stream: anytype, allocator: std.mem.Allocator, code: []const u8, msg: []const u8) void {
+    const error_fallback = "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\n";
+    const error_owned = sseErrorFrame(allocator, code, msg) catch null;
+    defer if (error_owned) |frame| allocator.free(frame);
+    const error_frame: []const u8 = if (error_owned) |frame| frame else error_fallback;
+    stream.sendFrame(error_frame) catch {
+        stream.markClosed();
+        return;
+    };
+
+    const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
+    const done_owned = sseDoneFrame(allocator, null, null) catch null;
+    defer if (done_owned) |frame| allocator.free(frame);
+    const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
+    stream.sendFrame(done_frame) catch {
+        stream.markClosed();
+        return;
+    };
+
+    stream.finish() catch stream.markClosed();
 }
 
 const ChatStreamSessionKeyError = error{
@@ -7553,35 +7678,45 @@ fn handleApiChatStreamSseConnection(
     };
     _ = state.chat_stream_total.fetchAdd(1, .monotonic);
     recordChatStreamLane(state, session_key, user_id, state.tenant_enabled);
-    sendChunkedSseHeader(stream, "200 OK") catch return true;
+    var sse_stream = LockedSseStream(@TypeOf(stream)).init(stream);
+    sse_stream.sendHeader("200 OK") catch return true;
 
     const status_fallback = "event: status\ndata: {\"type\":\"statusResponse\",\"content\":\"Processing request\"}\n\n";
     const status_owned = sseStatusFrame(req_allocator, "Processing request") catch null;
     defer if (status_owned) |frame| req_allocator.free(frame);
     const status_frame: []const u8 = if (status_owned) |frame| frame else status_fallback;
-    sendChunkedSseFrame(stream, status_frame) catch return true;
+    sse_stream.sendFrame(status_frame) catch return true;
 
-    var progress_observer_impl = SseProgressObserver(@TypeOf(stream)).init(req_allocator, stream);
+    var progress_observer_impl = SseProgressObserver(@TypeOf(sse_stream)).init(req_allocator, &sse_stream);
     const progress_observer = progress_observer_impl.observer();
+    var keepalive = SseKeepalive(@TypeOf(sse_stream)).init(&sse_stream);
+    const keepalive_thread: ?std.Thread = std.Thread.spawn(.{}, SseKeepalive(@TypeOf(sse_stream)).run, .{&keepalive}) catch null;
+    var keepalive_joined = false;
+    defer if (!keepalive_joined) {
+        keepalive.stop();
+        if (keepalive_thread) |thread| thread.join();
+    };
 
     const chat_start_ms = std.time.milliTimestamp();
-    const reply = blk: {
+    const ReplyOutcome = union(enum) {
+        ok: []const u8,
+        err: struct { code: []const u8, msg: []const u8 },
+    };
+    const outcome: ReplyOutcome = blk: {
         if (state.tenant_enabled) {
             const cfg = config_opt orelse {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                sendSseErrorFrames(stream, req_allocator, "tenant_config_missing", "tenant runtime unavailable");
-                return true;
+                break :blk .{ .err = .{ .code = "tenant_config_missing", .msg = "tenant runtime unavailable" } };
             };
             const tenant_runtime = getTenantRuntime(state, cfg, &user_ctx) catch |err| {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 if (err == error.ExecutionDelegated) {
-                    sendSseErrorFrames(stream, req_allocator, "execution_delegated", "broker mode does not execute locally");
+                    break :blk .{ .err = .{ .code = "execution_delegated", .msg = "broker mode does not execute locally" } };
                 } else {
-                    sendSseErrorFrames(stream, req_allocator, "tenant_runtime_failed", "tenant runtime init failed");
+                    break :blk .{ .err = .{ .code = "tenant_runtime_failed", .msg = "tenant runtime init failed" } };
                 }
-                return true;
             };
-            break :blk tenant_runtime.processMessage(
+            break :blk .{ .ok = tenant_runtime.processMessage(
                 session_key,
                 message,
                 .{
@@ -7596,24 +7731,32 @@ fn handleApiChatStreamSseConnection(
                 progress_observer,
             ) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
-                return true;
-            };
+                break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
+            } };
         }
         if (session_mgr_opt) |sm| {
-            break :blk sm.processMessageWithContext(session_key, message, null, .{
+            break :blk .{ .ok = sm.processMessageWithContext(session_key, message, null, .{
                 .progress_observer = progress_observer,
             }) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-                sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
-                return true;
-            };
+                break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
+            } };
         }
-        break :blk processIncomingMessage(root_allocator, message, session_key, user_id) catch {
+        break :blk .{ .ok = processIncomingMessage(root_allocator, message, session_key, user_id) catch {
             _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
-            sendSseErrorFrames(stream, req_allocator, "chat_failed", "chat failed");
+            break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
+        } };
+    };
+    keepalive.stop();
+    if (keepalive_thread) |thread| thread.join();
+    keepalive_joined = true;
+
+    const reply = switch (outcome) {
+        .ok => |value| value,
+        .err => |err_payload| {
+            sendLockedSseErrorFrames(&sse_stream, req_allocator, err_payload.code, err_payload.msg);
             return true;
-        };
+        },
     };
     defer root_allocator.free(reply);
 
@@ -7622,18 +7765,18 @@ fn handleApiChatStreamSseConnection(
     const reply_start_owned = sseReplyStartFrame(req_allocator, "final_reply", "buffered_replay", false) catch null;
     defer if (reply_start_owned) |frame| req_allocator.free(frame);
     const reply_start_frame: []const u8 = if (reply_start_owned) |frame| frame else reply_start_fallback;
-    sendChunkedSseFrame(stream, reply_start_frame) catch return true;
+    sse_stream.sendFrame(reply_start_frame) catch return true;
 
     var start: usize = 0;
     var seq: usize = 0;
     while (start < payload_text.len) : (start += SSE_TOKEN_CHUNK_SIZE) {
         const end = @min(start + SSE_TOKEN_CHUNK_SIZE, payload_text.len);
         const token_owned = sseTokenFrame(req_allocator, payload_text[start..end], seq) catch {
-            sendSseErrorFrames(stream, req_allocator, "stream_encode_failed", "failed to encode token frame");
+            sendLockedSseErrorFrames(&sse_stream, req_allocator, "stream_encode_failed", "failed to encode token frame");
             return true;
         };
         defer req_allocator.free(token_owned);
-        sendChunkedSseFrame(stream, token_owned) catch return true;
+        sse_stream.sendFrame(token_owned) catch return true;
         seq += 1;
     }
 
@@ -7641,11 +7784,11 @@ fn handleApiChatStreamSseConnection(
     const done_owned = sseDoneFrame(req_allocator, session_key, std.time.milliTimestamp()) catch null;
     defer if (done_owned) |frame| req_allocator.free(frame);
     const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
-    sendChunkedSseFrame(stream, done_frame) catch {
-        sendSseErrorFrames(stream, req_allocator, "stream_done_failed", "failed to emit done frame");
+    sse_stream.sendFrame(done_frame) catch {
+        sendLockedSseErrorFrames(&sse_stream, req_allocator, "stream_done_failed", "failed to emit done frame");
         return true;
     };
-    finishChunkedSse(stream) catch return true;
+    sse_stream.finish() catch return true;
 
     const chat_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - chat_start_ms));
     const request_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - request_start_ms));
@@ -10248,7 +10391,7 @@ fn handleAcceptedConnection(
         _ = handleApiChatStreamSseConnection(
             allocator,
             req_allocator,
-            conn.stream,
+            &conn.stream,
             raw,
             method_str,
             base_path,
@@ -12594,6 +12737,123 @@ test "handleApiRoute chat stream includes buffered progress and reasoning summar
     try std.testing.expect(std.mem.indexOf(u8, response.body, "event: done") != null);
 }
 
+test "handleApiChatStreamSseConnection emits keepalive comments during slow turns" {
+    const SlowProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            std.Thread.sleep(70 * std.time.ns_per_ms);
+            return .{
+                .content = try allocator.dupe(u8, "Hello after keepalive"),
+                .tool_calls = &.{},
+                .usage = .{ .prompt_tokens = 8, .completion_tokens = 4, .total_tokens = 12 },
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "slow-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const FakeStream = struct {
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn writeAll(self: *@This(), bytes: []const u8) !void {
+            try self.buf.appendSlice(std.testing.allocator, bytes);
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(std.testing.allocator);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{workspace});
+    defer std.testing.allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+
+    var provider_state: u8 = 0;
+    const provider_vtable = providers.Provider.VTable{
+        .chatWithSystem = SlowProvider.chatWithSystem,
+        .chat = SlowProvider.chat,
+        .supportsNativeTools = SlowProvider.supportsNativeTools,
+        .getName = SlowProvider.getName,
+        .deinit = SlowProvider.deinitFn,
+    };
+    const provider = providers.Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+    var noop = observability.NoopObserver{};
+    var session_mgr = session_mod.SessionManager.init(
+        std.testing.allocator,
+        &cfg,
+        provider,
+        &.{},
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer session_mgr.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = workspace;
+    state.workspace_dir = workspace;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"message\":\"hello\",\"session_key\":\"session:slow\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/chat/stream HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    var fake_stream = FakeStream{};
+    defer fake_stream.deinit();
+
+    const handled = handleApiChatStreamSseConnection(
+        std.testing.allocator,
+        req_allocator,
+        &fake_stream,
+        raw_request,
+        "POST",
+        "/api/v1/chat/stream",
+        &state,
+        null,
+        &session_mgr,
+    );
+
+    try std.testing.expect(handled);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "Still working on the reply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "Hello after keepalive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: done") != null);
+}
+
 test "tenant_lock_config_clamps_invalid_values" {
     const cfg = config_types.TenantConfig{
         .ownership_lock_lease_secs = 5,
@@ -14791,6 +15051,7 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"webhook\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"background_main_reroutes_total\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"background_main_reroutes_last_job_id\":\"diag-job\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"agent_message_timeout_secs\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"provider_retries\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"fallback_provider_count\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"memory_vector_sync_mode\":null") != null);
@@ -14798,6 +15059,7 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"control_plane\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"agent.parallel_tools\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"agent.tool_dispatcher\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"configured_agent_message_timeout_secs\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lease_probe\":null") != null);
 }
 

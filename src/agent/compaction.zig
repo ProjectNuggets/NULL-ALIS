@@ -111,7 +111,7 @@ pub fn tokenEstimate(history: []const OwnedMessage) u64 {
 }
 
 /// Auto-compact history when it exceeds max_history_messages or when
-/// estimated token usage exceeds 75% of the configured token limit.
+/// estimated token usage exceeds the dynamic reserve-aware token threshold.
 /// For large histories (>10 messages to summarize), uses multi-part strategy:
 /// splits into halves, summarizes each independently, then merges.
 /// Returns true if compaction was performed.
@@ -137,7 +137,34 @@ pub fn autoCompactHistory(
 
     if (!count_trigger and !token_trigger) return false;
 
-    const keep_recent = @min(config.keep_recent, @as(u32, @intCast(non_system_count)));
+    return compactHistoryKeepingRecent(allocator, history, provider, model_name, config, config.keep_recent);
+}
+
+/// Manual compaction for explicit operator boundaries.
+/// Summarizes older context and keeps the most recent recovery tail intact.
+pub fn manualCompactHistory(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged(OwnedMessage),
+    provider: Provider,
+    model_name: []const u8,
+    config: CompactionConfig,
+) !bool {
+    return compactHistoryKeepingRecent(allocator, history, provider, model_name, config, CONTEXT_RECOVERY_KEEP);
+}
+
+fn compactHistoryKeepingRecent(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged(OwnedMessage),
+    provider: Provider,
+    model_name: []const u8,
+    config: CompactionConfig,
+    requested_keep_recent: usize,
+) !bool {
+    const has_system = history.items.len > 0 and history.items[0].role == .system;
+    const start: usize = if (has_system) 1 else 0;
+    const non_system_count = history.items.len - start;
+
+    const keep_recent: usize = @min(non_system_count, requested_keep_recent);
     const compact_count = non_system_count - keep_recent;
     if (compact_count == 0) return false;
 
@@ -776,6 +803,70 @@ test "forceCompressHistory no-op when history is small" {
     const compressed = forceCompressHistory(allocator, &agent.history);
     try std.testing.expect(!compressed);
     try std.testing.expectEqual(@as(usize, 2), agent.history.items.len);
+}
+
+test "manualCompactHistory summarizes older context and keeps recent recovery tail" {
+    const SummaryProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "- compacted summary");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "- compacted summary"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "summary-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SummaryProvider.chatWithSystem,
+        .chat = SummaryProvider.chat,
+        .supportsNativeTools = SummaryProvider.supportsNativeTools,
+        .getName = SummaryProvider.getName,
+        .deinit = SummaryProvider.deinitFn,
+    };
+    agent.provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..6) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "msg-{d}", .{i}),
+        });
+    }
+
+    const compacted = try manualCompactHistory(allocator, &agent.history, agent.provider, agent.model_name, .{
+        .keep_recent = 20,
+        .max_summary_chars = 500,
+        .max_source_chars = 1_500,
+    });
+    try std.testing.expect(compacted);
+    try std.testing.expectEqual(@as(usize, 6), agent.history.items.len);
+    try std.testing.expect(agent.history.items[0].role == .system);
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expect(std.mem.startsWith(u8, agent.history.items[1].content, "[Compaction summary]\n"));
+    try std.testing.expectEqualStrings("msg-2", agent.history.items[2].content);
+    try std.testing.expectEqualStrings("msg-5", agent.history.items[5].content);
 }
 
 test "CONTEXT_RECOVERY constants" {

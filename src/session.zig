@@ -9,6 +9,7 @@
 //! sessions are processed in parallel.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
@@ -31,6 +32,7 @@ const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const log = std.log.scoped(.session);
 const SESSION_LOCK_WAIT_STAGE = "session_lock_wait";
 const SESSION_LOCK_WAIT_WARN_MS: u64 = 50;
+const SESSION_IDLE_CONTEXT_THRESHOLD_SECS: u64 = 5 * 60;
 
 const DEFAULT_QUEUE_DROP_MESSAGE = "Queue policy dropped this queued turn.";
 const QUEUE_NEWEST_DROP_MESSAGE = "Queue overflow: dropped newest queued turn.";
@@ -127,12 +129,32 @@ pub const SessionManager = struct {
     }
 
     pub fn deinit(self: *SessionManager) void {
+        if (!builtin.is_test) {
+            const flushed = self.flushSessionsForShutdown("shutdown");
+            if (flushed > 0) {
+                log.info("session.shutdown_flush sessions={d}", .{flushed});
+            }
+        }
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit(self.allocator);
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit(self.allocator);
+    }
+
+    pub fn flushSessionsForShutdown(self: *SessionManager, reason: []const u8) usize {
+        var flushed: usize = 0;
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const session = entry.value_ptr.*;
+            session.mutex.lock();
+            syncSessionOriginToAgent(session);
+            session.agent.persistSessionCheckpoint(reason);
+            session.mutex.unlock();
+            flushed += 1;
+        }
+        return flushed;
     }
 
     fn getOrCreateInternal(self: *SessionManager, session_key: []const u8, retain_ref: bool) !*Session {
@@ -485,6 +507,8 @@ pub const SessionManager = struct {
         }
 
         const now = std.time.timestamp();
+        const previous_last_active = session.last_active;
+        const idle_gap_secs: u64 = @intCast(@max(0, now - previous_last_active));
         try self.refreshSessionOrigin(session, options.message_turn_context);
         syncSessionOriginToAgent(session);
         if (sessionIsTtlExpired(session, now)) {
@@ -521,8 +545,16 @@ pub const SessionManager = struct {
             return try self.allocator.dupe(u8, blocked_msg);
         }
 
-        // Set conversation context for this turn (Signal-specific for now)
-        session.agent.conversation_context = conversation_context;
+        var effective_conversation_context = conversation_context;
+        if (conversation_context != null or idle_gap_secs >= SESSION_IDLE_CONTEXT_THRESHOLD_SECS) {
+            var enriched = conversation_context orelse ConversationContext{};
+            enriched.last_interaction_unix_s = previous_last_active;
+            enriched.idle_gap_secs = idle_gap_secs;
+            effective_conversation_context = enriched;
+        }
+
+        // Set conversation context for this turn.
+        session.agent.conversation_context = effective_conversation_context;
         defer session.agent.conversation_context = null;
 
         const base_observer = session.agent.observer;
@@ -905,6 +937,25 @@ test "processMessage refreshes system prompt when conversation context is cleare
     const sys2 = session.agent.history.items[0].content;
     try testing.expect(std.mem.indexOf(u8, sys2, "## Conversation Context") == null);
     try testing.expect(std.mem.indexOf(u8, sys2, sender_uuid) == null);
+}
+
+test "processMessage injects meaningful idle gap into conversation context" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("ctx:idle");
+    session.last_active = std.time.timestamp() - (2 * 60 * 60);
+
+    const resp = try sm.processMessage("ctx:idle", "hello again", null);
+    defer testing.allocator.free(resp);
+
+    try testing.expect(session.agent.history.items.len > 0);
+    const sys = session.agent.history.items[0].content;
+    try testing.expect(std.mem.indexOf(u8, sys, "## Conversation Context") != null);
+    try testing.expect(std.mem.indexOf(u8, sys, "Last interaction in this session:") != null);
+    try testing.expect(std.mem.indexOf(u8, sys, "Idle gap before this turn: about 2 hours") != null);
 }
 
 test "processMessage updates last_active" {
@@ -1329,6 +1380,34 @@ test "evictIdle persists checkpoint before removing idle session" {
     try testing.expect(std.mem.indexOf(u8, timeline_index.content, "\"channel\":\"evict\"") != null);
     try testing.expect(std.mem.indexOf(u8, timeline_index.content, "\"lane\":\"unknown\"") != null);
     try testing.expect(std.mem.indexOf(u8, timeline_index.content, "\"session\":\"evict:checkpoint\"") != null);
+}
+
+test "flushSessionsForShutdown persists continuity for active sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const first_reply = try sm.processMessage("shutdown:checkpoint", "hello", null);
+    defer testing.allocator.free(first_reply);
+    try testing.expectEqualStrings("ok", first_reply);
+
+    const flushed = sm.flushSessionsForShutdown("shutdown");
+    try testing.expectEqual(@as(usize, 1), flushed);
+
+    const anchor = (try mem.get(testing.allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=shutdown") != null);
+
+    const latest = (try mem.get(testing.allocator, "summary_latest/shutdown:checkpoint")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, latest.content, "session=shutdown:checkpoint") != null);
 }
 
 test "evictIdle preserves recent sessions" {

@@ -10,9 +10,9 @@ pub const MemoryListTool = struct {
     memory: ?Memory = null,
 
     pub const tool_name = "memory_list";
-    pub const tool_description = "List memory entries in recency order. Use for requests like 'show first N memory records' without shell/sqlite access.";
+    pub const tool_description = "List canonical memory entries in recency order. Defaults to the current session unless scope=global is provided; use include_internal=true for transcript/autosave inspection.";
     pub const tool_params =
-        \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"scope":{"type":"string","enum":["session","global"],"description":"List scope (default: session)"},"session_id":{"type":"string","description":"Optional explicit session filter override"},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys (default: false)"}}}
+        \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"scope":{"type":"string","enum":["session","global"],"description":"List scope (default: session). Use global for durable or cross-session records."},"session_id":{"type":"string","description":"Optional explicit session filter override"},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys for transcript/audit inspection (default: false)"}}}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -163,6 +163,29 @@ test "memory_list filters internal keys by default" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "user_language") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "autosave_user_") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "last_hygiene_at") == null);
+}
+
+test "memory_list filters audit and index artifacts by default" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("session_checkpoint_1", "type=session_checkpoint\nrecent_user:\n- shipping\n", .daily, null);
+    try mem.store("timeline_index/current", "{\"session\":\"agent:zaki-bot:user:1:main\"}", .core, null);
+    try mem.store("timeline_summary/agent:zaki-bot:user:1:main/1", "focus: shipping", .daily, null);
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10,\"scope\":\"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "timeline_summary/agent:zaki-bot:user:1:main/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "session_checkpoint_1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "timeline_index/current") == null);
 }
 
 test "memory_list include_internal true includes autosave entries" {
