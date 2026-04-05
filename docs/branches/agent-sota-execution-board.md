@@ -248,11 +248,17 @@ Deployment readiness note:
 1. graceful shutdown now flushes active sessions and persists continuity before teardown
 2. markdown mirror output is now more readable and round-trips multiline continuity artifacts more safely for inspection/export
 3. hard-kill shutdowns are still lossy because they bypass graceful flush
-4. true production sign-off still requires one final correctness fix:
-   - startup markdown import must stop overwriting system-managed continuity artifacts in primary storage
-5. branch status for deployment today:
+4. current working assumption:
+   - startup markdown import remains a feature, not a bug
+   - DB remains canonical runtime truth
+   - markdown is expected to mirror DB accurately enough for restart import and human inspection
+5. known strengthening item:
+   - migration/import helpers still mostly assume one-line structured markdown entries (`**key**: value`)
+   - runtime markdown parsing now supports both one-line and multiline block-form entries
+   - if migration tooling is later pointed at mirrored continuity artifacts, it should be upgraded to understand block-form entries too
+6. branch status for deployment today:
    - `canary/manual testing`: yes
-   - `full production sign-off`: not yet
+   - `full production sign-off`: soak-test dependent
 
 #### Concrete Execution Sequence
 
@@ -456,51 +462,149 @@ Upgrade memory from “recalled text” into scoped durable state plus working s
 
 #### Goal
 
-Turn async/background work into a first-class task and artifact engine.
+Turn spawned/background work into a reliable, inspectable, and auditable task engine without overbuilding workflow infrastructure.
+
+#### Deployment Posture
+
+1. Current runtime is ready for canary/manual deployment and soak of `M1` + `M2` behavior.
+2. Current runtime is **not** yet ready to claim reliable detached-task execution.
+3. `M4` is therefore deferred implementation work, not a blocker for current soak of the interaction/memory stack.
+
+#### Current Code Truth
+
+1. Kernel/gateway already understands a `task` lane as routing vocabulary and runtime truth surface.
+2. `spawn` exists and is asynchronous now-work, but it only creates in-memory subagent task state.
+3. `delegate` exists and is synchronous agent-to-agent delegation; keep it that way.
+4. `SubagentManager` runs detached work in OS threads and tracks status in an in-memory map only.
+5. `/subagents` and related commands provide local inspection, but they are not a durable task ledger.
+6. Result delivery is currently best-effort through the bus and route resolution path, which explains the observed “spawned but never returned” failures.
 
 #### Evolve
 
 1. [src/tools/spawn.zig](/Users/nova/Desktop/nullalis/src/tools/spawn.zig)
-2. [src/tools/delegate.zig](/Users/nova/Desktop/nullalis/src/tools/delegate.zig)
-3. [src/subagent.zig](/Users/nova/Desktop/nullalis/src/subagent.zig)
-4. [src/tools/schedule.zig](/Users/nova/Desktop/nullalis/src/tools/schedule.zig)
-5. [src/agent/root.zig](/Users/nova/Desktop/nullalis/src/agent/root.zig)
-6. [src/agent/commands.zig](/Users/nova/Desktop/nullalis/src/agent/commands.zig)
+2. [src/subagent.zig](/Users/nova/Desktop/nullalis/src/subagent.zig)
+3. [src/agent/commands.zig](/Users/nova/Desktop/nullalis/src/agent/commands.zig)
+4. [src/tools/root.zig](/Users/nova/Desktop/nullalis/src/tools/root.zig)
+5. [src/gateway.zig](/Users/nova/Desktop/nullalis/src/gateway.zig)
+6. [src/daemon.zig](/Users/nova/Desktop/nullalis/src/daemon.zig)
+7. [src/tools/delegate.zig](/Users/nova/Desktop/nullalis/src/tools/delegate.zig) only for contract clarity; do not fold it into detached task execution
+8. [src/tools/schedule.zig](/Users/nova/Desktop/nullalis/src/tools/schedule.zig) only to preserve clean scheduler/task separation
 
 #### Add
 
 1. `src/tasks/root.zig`
 2. `src/tasks/types.zig`
 3. `src/tasks/store.zig`
-4. `src/tasks/artifacts.zig`
-5. `src/tasks/executors/shell.zig`
-6. `src/tasks/executors/agent.zig`
-7. `src/tasks/executors/workflow.zig`
-8. `src/tasks/executors/monitor.zig`
-9. `src/tools/task_create.zig`
-10. `src/tools/task_get.zig`
-11. `src/tools/task_list.zig`
-12. `src/tools/task_output.zig`
-13. `src/tools/task_stop.zig`
+4. `src/tools/task_get.zig`
+5. `src/tools/task_list.zig`
+6. `src/tools/task_output.zig`
+7. `src/tools/task_stop.zig`
 
 #### Rewire
 
-1. `spawn` becomes task-backed
-2. `delegate` and `subagent` become executor paths inside the task system
-3. `schedule` stays timed truth and can trigger tasks when appropriate
-4. artifacts become first-class outputs
+1. Reuse the existing kernel `task` lane instead of inventing a second detached-work abstraction.
+2. `spawn` becomes task-backed and durable.
+3. `subagent` writes status/output to the task ledger and reports back to the requester/main session.
+4. `delegate` remains synchronous A2A and is not the first detached-task executor.
+5. `schedule` stays timed truth and may trigger tasks later, but does not become the task ledger.
 
 #### Acceptance
 
-1. background work has lifecycle, output, and artifacts
+1. spawned work has lifecycle, durable status, and durable output
 2. tasks are inspectable and stoppable
-3. `schedule` and `task` semantics stay separate and clear
+3. result delivery failure does not lose task output
+4. restart does not make detached work disappear silently
+5. `schedule` and `task` semantics stay separate and clear
+
+#### Scope Corrections
+
+1. Do **not** start with workflow DAGs, monitor executors, shell executors, or a broad artifacts subsystem.
+2. Do **not** move `delegate` into detached task execution in the first pass.
+3. Do **not** replace the existing lane/canonicalization model; build on top of it.
+4. Treat `M4` as reliability + visibility + durability for spawned subagent work first.
+
+#### Branch Plan
+
+##### Branch 1: `feat/task-inspection-v1`
+
+Goal:
+- Make running and completed subagent work inspectable by the agent itself, not only via slash commands.
+
+Changes:
+- Add `task_list` and `task_get` as LLM-callable tools.
+- Reuse existing `/subagents` list/info formatting where possible.
+- Keep behavior additive and low-risk.
+
+Acceptance:
+- Agent can inspect current subagent tasks programmatically.
+- No execution semantics change yet.
+- Tests green.
+
+##### Branch 2: `feat/task-delivery-reliability-v1`
+
+Goal:
+- Stop silent result loss when subagent completion delivery fails.
+
+Changes:
+- Add delivery fallback persistence inside `SubagentManager` / task ledger.
+- Preserve output even if bus publish or route resolution fails.
+
+Acceptance:
+- Simulated bus or routing failure does not lose terminal task output.
+- Tests cover failed delivery path.
+- Tests green.
+
+##### Branch 3: `feat/task-durability-v1`
+
+Goal:
+- Persist detached task truth across restart.
+
+Changes:
+- Add `src/tasks/*` store and task record types.
+- Back spawned subagent work with durable records.
+- Initialize task store from gateway/runtime startup.
+
+Acceptance:
+- Tasks survive graceful restart.
+- Task status/output are queryable after restart.
+- Release build stays healthy.
+
+##### Branch 4: `feat/task-control-v1`
+
+Goal:
+- Make running subagent work stoppable and auditable.
+
+Changes:
+- Add `task_stop`.
+- Add cancellation path / cancellation flag handling in subagent execution.
+- Mark cancelled/lost states explicitly.
+
+Acceptance:
+- Running task can be cancelled.
+- Cancelled state is visible in task inspection.
+- No deadlock or cleanup regressions.
+
+##### Branch 5: `feat/task-progress-v1`
+
+Goal:
+- Make detached work visible while it is running.
+
+Changes:
+- Add `progress_summary` to task records.
+- Relay queued/running/progress/completed state to requester/main session.
+
+Acceptance:
+- Parent/requester can see task progress.
+- Latest progress remains visible even if live relay is missed.
+- Tests green.
 
 #### Stop / Review Gate
 
-1. prove one real long-running task flow end to end
-2. no ambiguity between task and scheduler ownership
-3. tests green
+1. Prove one real long-running spawned task flow end to end.
+2. Verify no ambiguity between task ownership and scheduler ownership.
+3. Verify `delegate` remains a clear synchronous A2A surface.
+4. Verify detached work survives missed delivery and restart.
+5. Tests green.
 
 ### M5. Policy Capability
 

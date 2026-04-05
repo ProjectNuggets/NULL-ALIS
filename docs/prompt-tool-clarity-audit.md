@@ -248,3 +248,40 @@ When implementation starts, add:
 - Tighten operations; do not duplicate them.
 - Audit all tools, rewrite only the high-impact set.
 - Treat live workspace drift as a separate cleanup choice, not a reason to weaken the repo templates.
+
+## Follow-Up Note: Mirror and Import
+
+Current working assumption for the memory/runtime branch:
+
+- startup markdown import is treated as a feature
+- runtime truth still lives in the primary DB-backed memory path
+- markdown should mirror DB records accurately enough for:
+  - human inspection
+  - export/debugging
+  - restart-time import when needed
+
+What is now true:
+
+- runtime markdown parsing supports both:
+  - one-line structured entries: `- **key**: value`
+  - multiline block-form entries:
+    - `- **key**:`
+    - indented content lines below it
+- multiline continuity artifacts are mirrored in a more readable block form
+- graceful shutdown now flushes active sessions before teardown, reducing loss on normal restarts
+
+Known compatibility note:
+
+- repo runtime parsing is aligned with the new block-form mirror
+- migration/import helpers still mostly assume the older one-line structured form
+- if migration tooling is later used against mirrored continuity artifacts, it should be upgraded to parse block-form entries too
+
+Testing stance:
+
+- keep the current mirror/import design
+- soak test over time across:
+  - normal `/new` boundaries
+  - auto-compaction boundaries
+  - graceful restarts
+  - channel hops
+  - next-day recall
