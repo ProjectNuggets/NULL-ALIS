@@ -1324,6 +1324,7 @@ pub const Agent = struct {
                             self.refreshDurableContinuityAfterCompaction();
                         }
                     }
+                    self.ensureDurableContinuitySeed();
                     const cache_hit_event = ObserverEvent{ .turn_stage = .{
                         .stage = "response_cache_hit",
                     } };
@@ -1353,6 +1354,7 @@ pub const Agent = struct {
                         self.refreshDurableContinuityAfterCompaction();
                     }
                 }
+                self.ensureDurableContinuitySeed();
                 const cache_hit_event = ObserverEvent{ .turn_stage = .{
                     .stage = "response_cache_hit",
                 } };
@@ -1839,6 +1841,7 @@ pub const Agent = struct {
                 if (self.last_turn_compacted) {
                     self.refreshDurableContinuityAfterCompaction();
                 }
+                self.ensureDurableContinuitySeed();
 
                 // Auto-save the exact final user-visible reply as cold transcript memory.
                 const autosave_start_ms = std.time.milliTimestamp();
@@ -2340,6 +2343,25 @@ pub const Agent = struct {
     fn refreshDurableContinuityAfterCompaction(self: *Agent) void {
         if (!self.last_turn_compacted) return;
         self.last_turn_context.durable_continuity_refreshed = commands.persistSessionCheckpointDetailed(self, "compaction:auto");
+    }
+
+    fn ensureDurableContinuitySeed(self: *Agent) void {
+        if (self.last_turn_compacted) return;
+        const mem = self.mem orelse return;
+        const session_id = self.memory_session_id orelse return;
+        if (session_id.len == 0) return;
+
+        const latest_key = std.fmt.allocPrint(self.allocator, "summary_latest/{s}", .{session_id}) catch return;
+        defer self.allocator.free(latest_key);
+
+        const latest = mem.get(self.allocator, latest_key) catch return;
+        if (latest) |entry| {
+            var owned_entry = entry;
+            owned_entry.deinit(self.allocator);
+            return;
+        }
+
+        _ = commands.persistSessionCheckpointDetailed(self, "summary_seed:auto");
     }
 
     /// Run a single message through the agent and return the response.
@@ -3252,6 +3274,35 @@ const test_invalid_summary_provider_vtable = providers.Provider.VTable{
     .deinit = TestInvalidSummaryProvider.deinitFn,
 };
 
+const TestFailingSummaryProvider = struct {
+    fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return error.ProviderUnavailable;
+    }
+
+    fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        return error.ProviderUnavailable;
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "test-failing-summary-provider";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+var test_failing_summary_provider_state: u8 = 0;
+const test_failing_summary_provider_vtable = providers.Provider.VTable{
+    .chatWithSystem = TestFailingSummaryProvider.chatWithSystem,
+    .chat = TestFailingSummaryProvider.chat,
+    .supportsNativeTools = TestFailingSummaryProvider.supportsNativeTools,
+    .getName = TestFailingSummaryProvider.getName,
+    .deinit = TestFailingSummaryProvider.deinitFn,
+};
+
 fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
     var noop = observability.NoopObserver{};
     return Agent{
@@ -3860,6 +3911,41 @@ test "persistSessionCheckpoint fallback prefers compaction carrier from actual h
         break;
     }
     try std.testing.expect(found_timeline_summary);
+}
+
+test "persistSessionCheckpoint summary_seed auto uses deterministic summary without provider call" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.provider = .{ .ptr = @ptrCast(&test_failing_summary_provider_state), .vtable = &test_failing_summary_provider_vtable };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:main";
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "keep the HRS continuity available"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "I will keep the HRS continuity available."),
+    });
+
+    agent.persistSessionCheckpoint("summary_seed:auto");
+
+    const latest = (try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:main")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "HRS continuity available") != null);
+
+    const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=summary_seed:auto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
 }
 
 test "slash /reset clears history and switches model" {
@@ -4550,7 +4636,7 @@ test "turn does not duplicate reasoning in final reply when reasoning mode is st
     try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\n") == null);
 }
 
-test "turn auto-compacts for background origins when history crosses the boundary" {
+test "background origins no longer auto-compact on count boundary without token pressure" {
     const ProviderState = struct {
         calls: usize = 0,
 
@@ -4634,8 +4720,8 @@ test "turn auto-compacts for background origins when history crosses the boundar
     defer allocator.free(response);
 
     try std.testing.expectEqualStrings("ok", response);
-    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
-    try std.testing.expect(agent.last_turn_compacted);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
+    try std.testing.expect(!agent.last_turn_compacted);
 }
 
 test "turn auto-compacts on token pressure before provider call" {
@@ -4877,7 +4963,7 @@ test "auto compaction refreshes durable continuity artifacts" {
     defer allocator.free(response);
 
     try std.testing.expectEqualStrings("ok", response);
-    try std.testing.expectEqual(@as(usize, 3), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
     try std.testing.expect(agent.last_turn_compacted);
     try std.testing.expect(agent.last_turn_context.durable_continuity_refreshed);
 
@@ -4891,7 +4977,7 @@ test "auto compaction refreshes durable continuity artifacts" {
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
 }
 
-test "message-count boundary now auto-compacts and refreshes durable continuity" {
+test "message-count boundary no longer auto-compacts without token pressure" {
     if (!@import("build_options").enable_sqlite) return error.SkipZigTest;
 
     const ReplyProvider = struct {
@@ -4966,17 +5052,17 @@ test "message-count boundary now auto-compacts and refreshes durable continuity"
     defer allocator.free(response);
     try std.testing.expectEqualStrings("ok", response);
 
-    try std.testing.expect(agent.last_turn_compacted);
-    try std.testing.expect(agent.last_turn_context.durable_continuity_refreshed);
+    try std.testing.expect(!agent.last_turn_compacted);
+    try std.testing.expect(!agent.last_turn_context.durable_continuity_refreshed);
     try std.testing.expectEqual(@as(u32, 0), agent.last_turn_context.trim_events);
 
     const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=compaction:auto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=summary_seed:auto") != null);
 
     const latest = (try mem.get(allocator, "summary_latest/agent:test:user:1:main")) orelse return error.TestUnexpectedResult;
     defer latest.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
 }
 
 test "turn refreshes system prompt after workspace markdown change" {
@@ -5064,6 +5150,73 @@ test "turn refreshes system prompt after workspace markdown change" {
     const second = try agent.turn("second");
     defer allocator.free(second);
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "SOUL-V2-UPDATED") != null);
+}
+
+test "normal main-lane turn seeds summary_latest when compaction never runs" {
+    if (!@import("build_options").enable_sqlite) return error.SkipZigTest;
+
+    const ReplyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "ok");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "reply-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReplyProvider.chatWithSystem,
+        .chat = ReplyProvider.chat,
+        .supportsNativeTools = ReplyProvider.supportsNativeTools,
+        .getName = ReplyProvider.getName,
+        .deinit = ReplyProvider.deinitFn,
+    };
+
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:test:user:1:main";
+    agent.compact_context_enabled = false;
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expect(!agent.last_turn_compacted);
+
+    const latest = (try mem.get(allocator, "summary_latest/agent:test:user:1:main")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "source_key=timeline_summary/agent:test:user:1:main/") != null);
+
+    const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_session=agent:test:user:1:main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=summary_seed:auto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:test:user:1:main/") != null);
 }
 
 test "turn uses semantic cache when runtime semantic cache is available" {

@@ -4915,6 +4915,7 @@ fn sendTelegramReplyViaCurlFallback(allocator: std.mem.Allocator, bot_token: []c
 
 fn userFacingAgentError(err: anyerror) []const u8 {
     return switch (err) {
+        error.Timeout => "The model request timed out. Please try again.",
         error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
         error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
         error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -4926,6 +4927,7 @@ fn userFacingAgentError(err: anyerror) []const u8 {
 
 fn userFacingAgentErrorJson(err: anyerror) []const u8 {
     return switch (err) {
+        error.Timeout => "{\"error\":\"request timed out\"}",
         error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "{\"error\":\"network error\"}",
         error.ProviderDoesNotSupportVision => "{\"error\":\"provider does not support image input\"}",
         error.AllProvidersFailed => "{\"error\":\"all providers failed for this request\"}",

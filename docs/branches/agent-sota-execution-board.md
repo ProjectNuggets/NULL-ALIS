@@ -218,6 +218,25 @@ Engineer context as a real runtime surface instead of implicit prompt glue.
 
 The M2 stabilization pass is complete and validated.
 
+#### Deployment Notes
+
+1. Auto compaction now triggers only on real token pressure, not message-count growth.
+2. Auto continuity persistence now seeds `summary_latest/{session}` on normal turns even when compaction never runs.
+3. Auto/session-seed continuity summaries use deterministic structured fallback instead of an extra LLM summarizer round-trip.
+4. Empty or whitespace-only lifecycle summaries are rejected instead of being stored as low-signal continuity.
+5. Warm memory retrieval now overfetches before filtering and adds keyword fallback, but model-facing memory packing is still not bucketed.
+6. `timeline_index/current` is still being written and may still attempt vector embedding until the follow-up semantic-plane cleanup lands.
+7. Watch rollout logs for:
+   - `memory.session_summary status=deterministic`
+   - `turn_auto_compaction`
+   - `vector sync embed failed for key 'timeline_index/current'`
+   - `/context detail` warm-memory selection counts
+8. Expected result after deploy:
+   - fewer hidden pre-reply stalls
+   - more reliable `summary_latest` continuity
+   - better cold recall fallback
+   - warm semantic enrich still needs the planned bucket pass
+
 What is now true in code:
 
 1. runtime memory truth is primary-backed during runtime

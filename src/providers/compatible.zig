@@ -76,6 +76,13 @@ pub const OpenAiCompatibleProvider = struct {
         return s;
     }
 
+    fn mapRequestError(err: anyerror) anyerror {
+        return switch (err) {
+            error.Timeout => error.Timeout,
+            else => error.CompatibleApiError,
+        };
+    }
+
     /// Build the full URL for chat completions.
     /// Detects if base_url already ends with /chat/completions.
     pub fn chatCompletionsUrl(self: OpenAiCompatibleProvider, allocator: std.mem.Allocator) ![]const u8 {
@@ -253,7 +260,7 @@ pub const OpenAiCompatibleProvider = struct {
                 .body = body,
                 .timeout_ms = timeout_ms,
                 .subsystem = .providers,
-            }) catch return error.CompatibleApiError;
+            }) catch |err| return mapRequestError(err);
         } else root.request_with_mode(allocator, .{}, .{
             .method = "POST",
             .url = url,
@@ -261,7 +268,7 @@ pub const OpenAiCompatibleProvider = struct {
             .body = body,
             .timeout_ms = timeout_ms,
             .subsystem = .providers,
-        }) catch return error.CompatibleApiError;
+        }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
 
         return extractResponsesText(allocator, response.body);
@@ -536,7 +543,7 @@ pub const OpenAiCompatibleProvider = struct {
                 .body = body,
                 .timeout_ms = timeout_ms,
                 .subsystem = .providers,
-            }) catch return error.CompatibleApiError;
+            }) catch |err| return mapRequestError(err);
         } else root.request_with_mode(allocator, .{}, .{
             .method = "POST",
             .url = url,
@@ -544,7 +551,7 @@ pub const OpenAiCompatibleProvider = struct {
             .body = body,
             .timeout_ms = timeout_ms,
             .subsystem = .providers,
-        }) catch return error.CompatibleApiError;
+        }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
 
         return parseTextResponse(allocator, response.body) catch |err| {
@@ -590,7 +597,7 @@ pub const OpenAiCompatibleProvider = struct {
                 .body = body,
                 .timeout_ms = timeout_ms,
                 .subsystem = .providers,
-            }) catch return error.CompatibleApiError;
+            }) catch |err| return mapRequestError(err);
         } else root.request_with_mode(allocator, .{}, .{
             .method = "POST",
             .url = url,
@@ -598,7 +605,7 @@ pub const OpenAiCompatibleProvider = struct {
             .body = body,
             .timeout_ms = timeout_ms,
             .subsystem = .providers,
-        }) catch return error.CompatibleApiError;
+        }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
 
         return parseNativeResponse(allocator, response.body);
@@ -1470,4 +1477,9 @@ test "merge_system_into_user streaming body also merges" {
 pub fn requestTimeoutMs(timeout_secs: u64) u32 {
     if (timeout_secs == 0) return 30_000;
     return @intCast(@min(timeout_secs * 1000, std.math.maxInt(u32)));
+}
+
+test "mapRequestError preserves timeout" {
+    try std.testing.expect(OpenAiCompatibleProvider.mapRequestError(error.Timeout) == error.Timeout);
+    try std.testing.expect(OpenAiCompatibleProvider.mapRequestError(error.CurlFailed) == error.CompatibleApiError);
 }

@@ -84,6 +84,18 @@ pub fn isRateLimited(err_msg: []const u8) bool {
             std.mem.indexOf(u8, lower, "too many") != null);
 }
 
+pub fn isTimeout(err_msg: []const u8) bool {
+    var lower_buf: [512]u8 = undefined;
+    const check_len = @min(err_msg.len, lower_buf.len);
+    for (err_msg[0..check_len], 0..) |c, idx| {
+        lower_buf[idx] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..check_len];
+
+    return std.mem.indexOf(u8, lower, "timeout") != null or
+        std.mem.indexOf(u8, lower, "timed out") != null;
+}
+
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
 pub fn parseRetryAfterMs(err_msg: []const u8) ?u64 {
     const prefixes = [_][]const u8{
@@ -291,6 +303,7 @@ pub const ReliableProvider = struct {
 
     fn finalFailureError(self: *const ReliableProvider) anyerror {
         const err_slice = self.lastErrorSlice();
+        if (isTimeout(err_slice)) return error.Timeout;
         if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
         if (isRateLimited(err_slice)) return error.RateLimited;
         if (std.mem.eql(u8, err_slice, "ProviderDoesNotSupportVision")) return error.ProviderDoesNotSupportVision;
@@ -337,6 +350,7 @@ pub const ReliableProvider = struct {
                 const err_slice = self.lastErrorSlice();
 
                 if (isNonRetryable(err_slice)) break;
+                if (isTimeout(err_slice) and self.extras.len > 0) break;
 
                 if (isRateLimited(err_slice)) {
                     if (self.extras.len > 0) break;
@@ -371,6 +385,7 @@ pub const ReliableProvider = struct {
                 const err_slice = self.lastErrorSlice();
 
                 if (isNonRetryable(err_slice)) break;
+                if (isTimeout(err_slice) and self.extras.len > 0) break;
 
                 if (isRateLimited(err_slice)) {
                     if (self.extras.len > 0) break;
@@ -555,6 +570,12 @@ test "isRateLimited detection" {
     try std.testing.expect(isRateLimited("RateLimited"));
     try std.testing.expect(!isRateLimited("401 Unauthorized"));
     try std.testing.expect(!isRateLimited("500 Internal Server Error"));
+}
+
+test "isTimeout detection" {
+    try std.testing.expect(isTimeout("Timeout"));
+    try std.testing.expect(isTimeout("operation timed out"));
+    try std.testing.expect(!isTimeout("RateLimited"));
 }
 
 test "parseRetryAfterMs integer" {
@@ -941,6 +962,42 @@ test "ReliableProvider vtable zero retries fails immediately" {
     try std.testing.expectError(error.AllProvidersFailed, result);
     // With 0 retries, only 1 attempt
     try std.testing.expect(mock.call_count == 1);
+}
+
+test "ReliableProvider timeout returns timeout error" {
+    var mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 100,
+        .fail_error = error.Timeout,
+        .supports_tools = false,
+    };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 0, 50);
+    const prov = reliable.provider();
+
+    const result = prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5);
+    try std.testing.expectError(error.Timeout, result);
+    try std.testing.expect(mock.call_count == 1);
+}
+
+test "ReliableProvider timeout with fallback skips same-provider retries" {
+    var primary = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 100,
+        .fail_error = error.Timeout,
+        .supports_tools = false,
+    };
+    var fallback = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
+
+    const extras = [_]ProviderEntry{
+        .{ .name = "fallback", .provider = fallback.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 2, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    const result = try prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.7);
+    try std.testing.expectEqualStrings("mock response", result);
+    try std.testing.expect(primary.call_count == 1);
+    try std.testing.expect(fallback.call_count == 1);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -13,7 +13,10 @@ const MemoryRuntime = memory_mod.MemoryRuntime;
 /// Default number of memory entries to recall per query.
 const DEFAULT_RECALL_LIMIT: usize = config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT;
 const GLOBAL_RECALL_CANDIDATE_LIMIT: usize = 64;
+const WARM_CANDIDATE_FETCH_LIMIT: usize = @max(DEFAULT_RECALL_LIMIT, GLOBAL_RECALL_CANDIDATE_LIMIT);
 const TIMELINE_FALLBACK_LIMIT: usize = config_types.DEFAULT_MEMORY_TIMELINE_FALLBACK_LIMIT;
+const GLOBAL_RECALL_TOKEN_LIMIT: usize = 6;
+const GLOBAL_RECALL_TOKEN_SEPARATORS = " \t\n\r,.;:!?()[]{}<>\"'/-_";
 
 /// Maximum total bytes of memory context injected into a message.
 /// Prevents a few large entries from blowing the token budget.
@@ -60,6 +63,99 @@ fn containsKey(entries: []const MemoryEntry, key: []const u8) bool {
     return false;
 }
 
+fn containsCandidateKey(entries: []const memory_mod.RetrievalCandidate, key: []const u8) bool {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.key, key)) return true;
+    }
+    return false;
+}
+
+fn cloneCategory(allocator: std.mem.Allocator, category: memory_mod.MemoryCategory) !memory_mod.MemoryCategory {
+    return switch (category) {
+        .custom => |name| memory_mod.MemoryCategory{ .custom = try allocator.dupe(u8, name) },
+        else => category,
+    };
+}
+
+fn cloneEntry(allocator: std.mem.Allocator, entry: MemoryEntry) !MemoryEntry {
+    const id = try allocator.dupe(u8, entry.id);
+    errdefer allocator.free(id);
+    const key = try allocator.dupe(u8, entry.key);
+    errdefer allocator.free(key);
+    const content = try allocator.dupe(u8, entry.content);
+    errdefer allocator.free(content);
+    const timestamp = try allocator.dupe(u8, entry.timestamp);
+    errdefer allocator.free(timestamp);
+    const category = try cloneCategory(allocator, entry.category);
+    errdefer switch (category) {
+        .custom => |name| allocator.free(name),
+        else => {},
+    };
+    const session_id = if (entry.session_id) |sid|
+        try allocator.dupe(u8, sid)
+    else
+        null;
+    errdefer if (session_id) |sid| allocator.free(sid);
+
+    return MemoryEntry{
+        .id = id,
+        .key = key,
+        .content = content,
+        .category = category,
+        .timestamp = timestamp,
+        .session_id = session_id,
+        .score = entry.score,
+    };
+}
+
+fn containsIgnoreCase(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |item| {
+        if (std.ascii.eqlIgnoreCase(item, needle)) return true;
+    }
+    return false;
+}
+
+fn loadGlobalKeywordFallbackEntries(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    user_message: []const u8,
+    limit: usize,
+    current_session_id: ?[]const u8,
+) ![]MemoryEntry {
+    var merged: std.ArrayListUnmanaged(MemoryEntry) = .empty;
+    errdefer {
+        for (merged.items) |*entry| entry.deinit(allocator);
+        merged.deinit(allocator);
+    }
+
+    var seen_terms: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer seen_terms.deinit(allocator);
+
+    var iter = std.mem.tokenizeAny(u8, user_message, GLOBAL_RECALL_TOKEN_SEPARATORS);
+    while (iter.next()) |term| {
+        if (term.len < 3) continue;
+        if (containsIgnoreCase(seen_terms.items, term)) continue;
+        try seen_terms.append(allocator, term);
+        if (seen_terms.items.len > GLOBAL_RECALL_TOKEN_LIMIT) break;
+
+        const recalled = mem.recall(allocator, term, limit, null) catch continue;
+        defer memory_mod.freeEntries(allocator, recalled);
+
+        for (recalled) |entry| {
+            if (current_session_id) |session_id| {
+                if (entry.session_id) |entry_session_id| {
+                    if (std.mem.eql(u8, entry_session_id, session_id)) continue;
+                }
+            }
+            if (containsKey(merged.items, entry.key)) continue;
+            try merged.append(allocator, try cloneEntry(allocator, entry));
+            if (merged.items.len >= limit) return try merged.toOwnedSlice(allocator);
+        }
+    }
+
+    return try merged.toOwnedSlice(allocator);
+}
+
 fn isDurableFactKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "durable_fact/");
 }
@@ -101,6 +197,9 @@ fn sanitizeMemoryText(allocator: std.mem.Allocator, text: []const u8) ![]const u
 fn ensureHeader(w: anytype, wrote_header: *bool) !void {
     if (!wrote_header.*) {
         try w.writeAll("[Memory context]\n");
+        try w.writeAll("Retrieved continuity from the canonical runtime memory store for this turn.\n");
+        try w.writeAll("If a relevant fact appears below, use it instead of saying you do not remember.\n");
+        try w.writeAll("Direct user corrections, tool results, and fresher runtime state override this memory.\n");
         wrote_header.* = true;
     }
 }
@@ -170,7 +269,7 @@ fn loadContextDetailed(
     session_id: ?[]const u8,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
-    const scoped_entries = mem.recall(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
+    const scoped_entries = mem.recall(allocator, user_message, WARM_CANDIDATE_FETCH_LIMIT, session_id) catch {
         return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     };
     defer memory_mod.freeEntries(allocator, scoped_entries);
@@ -179,7 +278,7 @@ fn loadContextDetailed(
     // When scoped recall is enabled, also include global (session_id = null) memory
     // so long-term facts from memory_store remain visible in session chats.
     var global_entries: ?[]MemoryEntry = null;
-    if (session_id != null and scoped_entries.len < DEFAULT_RECALL_LIMIT) {
+    if (session_id != null) {
         global_entries = mem.recall(allocator, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch null;
     }
     if (global_entries) |entries| {
@@ -285,7 +384,7 @@ fn loadContextWithRuntimeDetailed(
     session_id: ?[]const u8,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
-    const candidates = rt.search(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
+    const candidates = rt.search(allocator, user_message, WARM_CANDIDATE_FETCH_LIMIT, session_id) catch {
         return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     };
     defer memory_mod.retrieval.freeCandidates(allocator, candidates);
@@ -295,10 +394,18 @@ fn loadContextWithRuntimeDetailed(
     if (session_id != null) {
         global_entries = mem.recall(allocator, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch null;
     }
+    var global_keyword_entries: ?[]MemoryEntry = null;
+    if (session_id != null) {
+        global_keyword_entries = loadGlobalKeywordFallbackEntries(allocator, mem, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, session_id) catch null;
+    }
     if (global_entries) |entries| {
         stats.global_candidate_count = entries.len;
     }
+    if (global_keyword_entries) |entries| {
+        stats.global_candidate_count += entries.len;
+    }
     defer if (global_entries) |entries| memory_mod.freeEntries(allocator, entries);
+    defer if (global_keyword_entries) |entries| memory_mod.freeEntries(allocator, entries);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -356,9 +463,25 @@ fn loadContextWithRuntimeDetailed(
         if (buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
 
+    if (buf.items.len < MAX_CONTEXT_BYTES and global_keyword_entries != null) {
+        if (global_keyword_entries) |entries| {
+            for (entries) |entry| {
+                if (containsCandidateKey(candidates, entry.key)) continue;
+                if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+                try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+                stats.global_fallback_count += 1;
+                if (buf.items.len >= MAX_CONTEXT_BYTES) break;
+            }
+        }
+    }
+
     if (buf.items.len < MAX_CONTEXT_BYTES and global_entries != null) {
         if (global_entries) |entries| {
             for (entries) |entry| {
+                if (containsCandidateKey(candidates, entry.key)) continue;
+                if (global_keyword_entries) |keyword_entries| {
+                    if (containsKey(keyword_entries, entry.key)) continue;
+                }
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
                 try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
                 stats.global_fallback_count += 1;
@@ -641,6 +764,8 @@ test "enrichMessageWithRuntime with memories prepends context" {
 
     // Should contain [Memory context] header and the stored entry
     try std.testing.expect(std.mem.indexOf(u8, enriched, "[Memory context]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enriched, "Retrieved continuity from the canonical runtime memory store for this turn.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enriched, "use it instead of saying you do not remember") != null);
     try std.testing.expect(std.mem.indexOf(u8, enriched, "user_lang") != null);
     try std.testing.expect(std.mem.indexOf(u8, enriched, "Zig is the favorite language") != null);
     // The original message should appear at the end
@@ -687,7 +812,37 @@ test "enrichMessageWithRuntimeDetailed reports selection stats" {
     try std.testing.expect(std.mem.startsWith(u8, enriched.text, "[Memory context]\n"));
 }
 
-test "loadContextWithRuntime uses warm top-10 recall limit" {
+test "global keyword fallback pulls cross-session entries when exact global recall misses punctuation variant" {
+    const allocator = std.testing.allocator;
+
+    var mem_impl = memory_mod.InMemoryLruMemory.init(allocator, 32);
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    try mem.store("telegram_current", "ALEX from HRS?", .conversation, "agent:zaki-bot:user:1:thread:telegram");
+    try mem.store("main_alex", "ALEX from HRS", .conversation, "agent:zaki-bot:user:1:thread:main");
+    try mem.store("main_hrs", "HRS said yes on the 30GB deal", .conversation, "agent:zaki-bot:user:1:thread:main");
+
+    const exact_global = try mem.recall(allocator, "ALEX from HRS?", 16, null);
+    defer memory_mod.freeEntries(allocator, exact_global);
+    try std.testing.expectEqual(@as(usize, 1), exact_global.len);
+    try std.testing.expectEqualStrings("telegram_current", exact_global[0].key);
+
+    const fallback = try loadGlobalKeywordFallbackEntries(
+        allocator,
+        mem,
+        "ALEX from HRS?",
+        16,
+        "agent:zaki-bot:user:1:thread:telegram",
+    );
+    defer memory_mod.freeEntries(allocator, fallback);
+
+    try std.testing.expect(containsKey(fallback, "main_alex"));
+    try std.testing.expect(containsKey(fallback, "main_hrs"));
+    try std.testing.expect(!containsKey(fallback, "telegram_current"));
+}
+
+test "loadContextWithRuntime caps visible warm matches while overfetching raw candidates" {
     const allocator = std.testing.allocator;
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
@@ -739,15 +894,15 @@ test "loadContextWithRuntime uses warm top-10 recall limit" {
     const enriched = try enrichMessageWithRuntimeDetailed(allocator, mem, &rt, "shipping memory", null);
     defer allocator.free(enriched.text);
 
-    try std.testing.expectEqual(@as(usize, config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT), enriched.stats.candidate_count);
-    try std.testing.expectEqual(@as(usize, config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT), enriched.stats.search_match_count);
+    try std.testing.expectEqual(@as(usize, 12), enriched.stats.candidate_count);
+    try std.testing.expectEqual(@as(usize, 12), enriched.stats.search_match_count);
 
     var recalled_lines: usize = 0;
     var iter = std.mem.splitScalar(u8, enriched.text, '\n');
     while (iter.next()) |line| {
         if (std.mem.startsWith(u8, line, "- warm_fact_")) recalled_lines += 1;
     }
-    try std.testing.expectEqual(@as(usize, config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT), recalled_lines);
+    try std.testing.expectEqual(@as(usize, 12), recalled_lines);
 }
 
 test "loadContext filters internal autosave and hygiene entries" {
@@ -923,4 +1078,62 @@ test "loadContextWithRuntime returns empty when only internal entries match" {
     const context = try loadContextWithRuntime(allocator, mem, &rt, "привет", null);
     defer allocator.free(context);
     try std.testing.expectEqualStrings("", context);
+}
+
+test "loadContextWithRuntime overfetches past internal candidate pollution" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("visible_alex_fact", "alexsignal saturday recap: Alex from HRS came up earlier", .core, null);
+    for (0..20) |i| {
+        const key = try std.fmt.allocPrint(allocator, "autosave_user_{d}", .{i});
+        defer allocator.free(key);
+        const content = try std.fmt.allocPrint(allocator, "alexsignal autosave noise {d}", .{i});
+        defer allocator.free(content);
+        try mem.store(key, content, .conversation, null);
+    }
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .conversation_retention_days = 0,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "alexsignal saturday", null);
+    defer allocator.free(result.context);
+
+    try std.testing.expect(result.stats.candidate_count > config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT);
+    try std.testing.expectEqual(@as(usize, 1), result.stats.search_match_count);
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "visible_alex_fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "autosave_user_") == null);
 }

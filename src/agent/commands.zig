@@ -945,6 +945,11 @@ fn emitLifecycleSummarizerStage(self: anytype, duration_ms: u64, summarized_coun
     self.observer.recordEvent(&event);
 }
 
+fn shouldUseDeterministicSessionSummary(reason: []const u8) bool {
+    return std.mem.eql(u8, reason, "compaction:auto") or
+        std.mem.eql(u8, reason, "summary_seed:auto");
+}
+
 fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, session_id: []const u8, reason: []const u8, now_s: i64, now_iso: []const u8) bool {
     const mem = self.mem orelse return false;
     const rt = self.mem_rt;
@@ -959,22 +964,35 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         emitLifecycleSummarizerStage(self, duration_ms, entries.len);
     }
 
-    const prompt = memory_mod.buildSummarizationPrompt(self.allocator, entries, entries.len) catch return false;
-    defer self.allocator.free(prompt);
-
-    const summary_system = "Summarize the ended session into a compact continuity object. Preserve focus, decisions, open loops, next steps, and long-lived facts. Follow the required plain-text structure exactly.";
-    var summary_messages: [2]providers.ChatMessage = .{
-        .{ .role = .system, .content = summary_system },
-        .{ .role = .user, .content = prompt },
-    };
-    const timeout_secs = lifecycleSummaryTimeoutSecs(self);
-
     var summary_text_owned: ?[]u8 = null;
     defer if (summary_text_owned) |owned| self.allocator.free(owned);
 
     var parsed_summary: ?memory_mod.SummaryResult = null;
     defer if (parsed_summary) |*result| result.deinit(self.allocator);
     const content = blk: {
+        if (shouldUseDeterministicSessionSummary(reason)) {
+            summary_text_owned = buildStructuredFallbackSummary(self, entries, checkpoint_content);
+            if (summary_text_owned) |owned| {
+                log.info("memory.session_summary status=deterministic session={s} reason={s} entries={d}", .{
+                    session_id,
+                    reason,
+                    entries.len,
+                });
+                break :blk owned;
+            }
+            return false;
+        }
+
+        const prompt = memory_mod.buildSummarizationPrompt(self.allocator, entries, entries.len) catch return false;
+        defer self.allocator.free(prompt);
+
+        const summary_system = "Summarize the ended session into a compact continuity object. Preserve focus, decisions, open loops, next steps, and long-lived facts. Follow the required plain-text structure exactly.";
+        var summary_messages: [2]providers.ChatMessage = .{
+            .{ .role = .system, .content = summary_system },
+            .{ .role = .user, .content = prompt },
+        };
+        const timeout_secs = lifecycleSummaryTimeoutSecs(self);
+
         var response = self.provider.chat(
             self.allocator,
             .{

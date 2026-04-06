@@ -419,6 +419,7 @@ pub fn curlRequestResolved(
     switch (term) {
         .Exited => |code| if (code != 0) {
             log.warn("curlRequest failed exit_code={d} reason={s} method={s}", .{ code, curlExitHint(code), method });
+            if (code == 28) return error.Timeout;
             return error.CurlFailed;
         },
         else => {
@@ -560,6 +561,7 @@ pub fn curlRequest(
                     if (proxy != null) "set" else "none",
                 });
             }
+            if (code == 28) return error.Timeout;
             return error.CurlFailed;
         },
         else => {

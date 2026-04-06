@@ -124,10 +124,7 @@ pub fn autoCompactHistory(
 ) !bool {
     const has_system = history.items.len > 0 and history.items[0].role == .system;
     const start: usize = if (has_system) 1 else 0;
-    const non_system_count = history.items.len - start;
-
-    // Trigger on message count exceeding threshold
-    const count_trigger = non_system_count > config.max_history_messages;
+    _ = history.items.len - start;
 
     // Trigger when estimated tokens exceed the usable window after reserving
     // reply/tool/safety headroom for the current model.
@@ -135,7 +132,10 @@ pub fn autoCompactHistory(
     const token_threshold = budget_policy.threshold;
     const token_trigger = config.token_limit > 0 and tokenEstimate(history.items) > token_threshold;
 
-    if (!count_trigger and !token_trigger) return false;
+    // Automatic compaction is reserved for true context pressure only.
+    // Session-boundary continuity is handled by explicit checkpoint paths
+    // such as /new, reset, eviction, or the durable seed writer.
+    if (!token_trigger) return false;
 
     return compactHistoryKeepingRecent(allocator, history, provider, model_name, config, config.keep_recent);
 }
@@ -709,12 +709,12 @@ test "tokenEstimate heuristic accuracy" {
     try std.testing.expectEqual(@as(u64, 100), tokenEstimate(agent.history.items));
 }
 
-test "autoCompactHistory no-op below count and token thresholds" {
+test "autoCompactHistory no-op below token threshold" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
-    // Add a few small messages — well below both thresholds
+    // Add a few small messages — well below the token threshold.
     try agent.history.append(allocator, .{
         .role = .system,
         .content = try allocator.dupe(u8, "system"),
