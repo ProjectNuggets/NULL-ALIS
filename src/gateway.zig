@@ -2475,6 +2475,24 @@ fn writeTelegramChannelState(
     try writeFile(channel_state_path, out.items);
 }
 
+fn writeTelegramFallbackStateFile(path: []const u8, content: []const u8) !void {
+    try writeFile(path, content);
+}
+
+fn deleteTelegramFallbackFiles(
+    telegram_path: []const u8,
+    channel_state_path: []const u8,
+) !void {
+    std.fs.deleteFileAbsolute(telegram_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    std.fs.deleteFileAbsolute(channel_state_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
 fn freeOwnedStringArray(allocator: std.mem.Allocator, values: []const []const u8) void {
     for (values) |item| allocator.free(item);
     allocator.free(values);
@@ -8862,8 +8880,10 @@ fn handleApiRoute(
             mgr.putTelegramStateJson(user_id, state_payload.items) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
             };
+            // Keep local tenant fallback state aligned with Postgres truth.
+            writeTelegramFallbackStateFile(user_ctx.telegram_path, state_payload.items) catch {};
         } else {
-            writeFile(user_ctx.telegram_path, state_payload.items) catch {
+            writeTelegramFallbackStateFile(user_ctx.telegram_path, state_payload.items) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
             };
         }
@@ -8921,14 +8941,16 @@ fn handleApiRoute(
             mgr.deleteTelegramState(user_id) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" };
             };
-        } else {
-            std.fs.deleteFileAbsolute(user_ctx.telegram_path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" },
+            deleteTelegramFallbackFiles(user_ctx.telegram_path, user_ctx.channel_state_path) catch |err| {
+                return .{ .status = "500 Internal Server Error", .body = switch (err) {
+                    else => "{\"error\":\"disconnect failed\"}",
+                } };
             };
-            std.fs.deleteFileAbsolute(user_ctx.channel_state_path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" },
+        } else {
+            deleteTelegramFallbackFiles(user_ctx.telegram_path, user_ctx.channel_state_path) catch |err| {
+                return .{ .status = "500 Internal Server Error", .body = switch (err) {
+                    else => "{\"error\":\"disconnect failed\"}",
+                } };
             };
         }
         return .{ .body = "{\"status\":\"disconnected\",\"channel\":\"telegram\"}" };
@@ -9237,6 +9259,9 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     return;
                 };
                 ctx.state.zaki_state.?.recordTelegramChat(numeric_user_id, tg_account_id, chat_id.?) catch {};
+                if (tenant_channel_state_path) |state_path| {
+                    writeTelegramChannelState(ctx.req_allocator, state_path, tg_account_id, chat_id.?) catch {};
+                }
             } else if (tenant_channel_state_path) |state_path| {
                 writeTelegramChannelState(ctx.req_allocator, state_path, tg_account_id, chat_id.?) catch {};
             }
@@ -14946,6 +14971,42 @@ test "parseUpstreamResponseHeader parses status and body offset" {
     const parsed = try parseUpstreamResponseHeader(raw);
     try std.testing.expectEqual(@as(u16, 200), parsed.status_code);
     try std.testing.expectEqualStrings("event: token\r\n\r\n", raw[parsed.body_offset..]);
+}
+
+test "writeTelegramFallbackStateFile writes telegram fallback state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram.json", .{tmp_root});
+    defer std.testing.allocator.free(path);
+
+    try writeTelegramFallbackStateFile(path, "{\"connected\":true}\n");
+    const content = try readFileOrDefault(std.testing.allocator, path, "");
+    defer if (content.len > 0) std.testing.allocator.free(content);
+
+    try std.testing.expectEqualStrings("{\"connected\":true}\n", content);
+}
+
+test "deleteTelegramFallbackFiles removes local fallback files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const telegram_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram.json", .{tmp_root});
+    defer std.testing.allocator.free(telegram_path);
+    const channel_state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/channel_state.json", .{tmp_root});
+    defer std.testing.allocator.free(channel_state_path);
+
+    try writeFile(telegram_path, "{\"connected\":true}\n");
+    try writeFile(channel_state_path, "{\"telegram\":{\"chat_id\":1}}\n");
+
+    try deleteTelegramFallbackFiles(telegram_path, channel_state_path);
+
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(telegram_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(channel_state_path, .{}));
 }
 
 test "extractRequestTarget returns raw request target with query" {
