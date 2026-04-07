@@ -10,12 +10,8 @@ const saveSchedulerForContext = @import("cron_add.zig").saveSchedulerForContext;
 const message_tool = @import("message.zig");
 const runtime_resolver = @import("../delivery/runtime_resolver.zig");
 const config_mod = @import("../config.zig");
-const morning_brief = @import("../morning_brief.zig");
 
 const MIN_ONCE_DELAY_SECS: i64 = 60;
-const MORNING_BRIEF_JOB_ID = morning_brief.MORNING_BRIEF_JOB_ID;
-const MORNING_BRIEF_AGENT_COMMAND = morning_brief.MORNING_BRIEF_AGENT_COMMAND;
-const MORNING_BRIEF_AGENT_PROMPT = morning_brief.MORNING_BRIEF_AGENT_PROMPT;
 const AUTOMATIONS_FILENAME = "AUTOMATIONS.json";
 
 const DesiredJobKind = enum {
@@ -39,7 +35,6 @@ const EnsureRequest = struct {
     command: []const u8,
     requested_id: ?[]const u8 = null,
     kind: DesiredJobKind = .auto,
-    morning_brief_request: bool = false,
 };
 
 const RegistryJobSpec = struct {
@@ -107,14 +102,6 @@ fn buildAgentTaskPrompt(
 
 fn normalizeIdToken(raw: []const u8) []const u8 {
     return std.mem.trim(u8, raw, " \t\r\n");
-}
-
-fn isMorningBriefId(id: []const u8) bool {
-    return morning_brief.isMorningBriefId(normalizeIdToken(id));
-}
-
-fn shouldCanonicalizeMorningBrief(requested_id: ?[]const u8, created_job_id: []const u8, command: []const u8) bool {
-    return morning_brief.shouldCanonicalize(requested_id, created_job_id, command);
 }
 
 const TelegramDeliveryTarget = struct {
@@ -214,46 +201,6 @@ fn resolveTelegramDeliveryTarget(allocator: std.mem.Allocator, tenant: root.Tool
     return target;
 }
 
-fn normalizeMorningBriefJob(
-    scheduler: *CronScheduler,
-    allocator: std.mem.Allocator,
-    tenant: root.ToolTenantContext,
-    job_id: []const u8,
-) !void {
-    const job = scheduler.getMutableJob(job_id) orelse return error.JobNotFound;
-    job.session_target = .isolated;
-    job.wake_mode = .now;
-    job.job_type = .agent;
-
-    allocator.free(job.command);
-    job.command = try allocator.dupe(u8, MORNING_BRIEF_AGENT_COMMAND);
-
-    if (job.prompt_owned) {
-        if (job.prompt) |existing| allocator.free(existing);
-    }
-    job.prompt = try allocator.dupe(u8, MORNING_BRIEF_AGENT_PROMPT);
-    job.prompt_owned = true;
-
-    if (job.delivery_channel_owned) {
-        if (job.delivery.channel) |existing| allocator.free(existing);
-    }
-    job.delivery.mode = .always;
-    job.delivery.best_effort = true;
-    job.delivery.channel = try allocator.dupe(u8, "telegram");
-    job.delivery_channel_owned = true;
-    if (try resolveTelegramDeliveryTarget(allocator, tenant)) |resolved_target| {
-        var target = resolved_target;
-        defer target.deinit(allocator);
-        if (job.delivery_to_owned) {
-            if (job.delivery.to) |existing| allocator.free(existing);
-        }
-        job.delivery.to = try allocator.dupe(u8, target.chat_id);
-        job.delivery_to_owned = true;
-    }
-
-    resetJobExecutionState(job);
-}
-
 fn normalizeAgentManagedJob(
     scheduler: *CronScheduler,
     allocator: std.mem.Allocator,
@@ -294,10 +241,6 @@ fn normalizeJobForRequest(
     job_id: []const u8,
     request: EnsureRequest,
 ) !void {
-    if (request.kind == .auto and shouldCanonicalizeMorningBrief(request.requested_id, job_id, request.command)) {
-        return normalizeMorningBriefJob(scheduler, allocator, tenant, job_id);
-    }
-
     switch (request.kind) {
         .brief, .report, .follow_up, .reminder => {
             const prompt = try buildAgentTaskPrompt(allocator, request.kind, request.command);
@@ -456,10 +399,8 @@ fn parseEnsureRequest(args: JsonObjectMap) !EnsureRequest {
     }
     if (delay) |value| try validateOnceDelay(value);
 
-    const requested_id_raw = normalizeRequestedId(root.getString(args, "id"));
+    const requested_id = normalizeRequestedId(root.getString(args, "id"));
     const kind = parseDesiredJobKind(root.getString(args, "kind"));
-    const morning_brief_request = shouldCanonicalizeMorningBrief(requested_id_raw, requested_id_raw orelse "", command);
-    const requested_id = if (morning_brief_request) MORNING_BRIEF_JOB_ID else requested_id_raw;
 
     return .{
         .mode = if (expression != null) .recurring else .once,
@@ -468,14 +409,10 @@ fn parseEnsureRequest(args: JsonObjectMap) !EnsureRequest {
         .command = command,
         .requested_id = requested_id,
         .kind = kind,
-        .morning_brief_request = morning_brief_request,
     };
 }
 
 fn jobMatchesEnsureRequest(job: *const cron.CronJob, request: EnsureRequest, now_s: i64) bool {
-    if (request.morning_brief_request) {
-        return isMorningBriefId(job.id) or morning_brief.commandLooksMorningBrief(job.command);
-    }
     if (request.requested_id) |requested_id| {
         if (std.mem.eql(u8, job.id, requested_id)) return true;
     }
@@ -871,16 +808,13 @@ pub const ScheduleTool = struct {
             const expression = root.getString(args, "expression") orelse
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
             const kind = parseDesiredJobKind(root.getString(args, "kind"));
-            const requested_id_raw = normalizeRequestedId(root.getString(args, "id"));
-            const morning_brief_request = shouldCanonicalizeMorningBrief(requested_id_raw, requested_id_raw orelse "", command);
-            const requested_id: ?[]const u8 = if (morning_brief_request) MORNING_BRIEF_JOB_ID else requested_id_raw;
+            const requested_id = normalizeRequestedId(root.getString(args, "id"));
             const request: EnsureRequest = .{
                 .mode = .recurring,
                 .expression = expression,
                 .command = command,
                 .requested_id = requested_id,
                 .kind = kind,
-                .morning_brief_request = morning_brief_request,
             };
 
             const loaded = loadSchedulerForContext(allocator, self.config) catch |err| switch (err) {
@@ -889,25 +823,6 @@ pub const ScheduleTool = struct {
             };
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
-
-            if (morning_brief_request) {
-                while (findMorningBriefJob(scheduler.listJobs())) |existing| {
-                    if (!existing.enabled) {
-                        const inactive_id = try allocator.dupe(u8, existing.id);
-                        defer allocator.free(inactive_id);
-                        _ = scheduler.removeJob(inactive_id);
-                        continue;
-                    }
-                    normalizeJobForRequest(&scheduler, allocator, loaded.tenant, existing.id, request) catch {};
-                    saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
-                    const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
-                        existing.id,
-                        existing.expression,
-                        existing.command,
-                    });
-                    return ToolResult{ .success = true, .output = msg };
-                }
-            }
 
             if (requested_id) |id| {
                 if (scheduler.getJob(id)) |existing| {
@@ -970,16 +885,13 @@ pub const ScheduleTool = struct {
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
             const kind = parseDesiredJobKind(root.getString(args, "kind"));
-            const requested_id_raw = normalizeRequestedId(root.getString(args, "id"));
-            const morning_brief_request = shouldCanonicalizeMorningBrief(requested_id_raw, requested_id_raw orelse "", command);
-            const requested_id: ?[]const u8 = if (morning_brief_request) MORNING_BRIEF_JOB_ID else requested_id_raw;
+            const requested_id = normalizeRequestedId(root.getString(args, "id"));
             const request: EnsureRequest = .{
                 .mode = .once,
                 .delay = delay,
                 .command = command,
                 .requested_id = requested_id,
                 .kind = kind,
-                .morning_brief_request = morning_brief_request,
             };
             validateOnceDelay(delay) catch {
                 return ToolResult.fail("Delay too short; minimum is 60s");
@@ -991,25 +903,6 @@ pub const ScheduleTool = struct {
             };
             var scheduler = loaded.scheduler;
             defer scheduler.deinit();
-
-            if (morning_brief_request) {
-                while (findMorningBriefJob(scheduler.listJobs())) |existing| {
-                    if (!existing.enabled) {
-                        const inactive_id = try allocator.dupe(u8, existing.id);
-                        defer allocator.free(inactive_id);
-                        _ = scheduler.removeJob(inactive_id);
-                        continue;
-                    }
-                    normalizeJobForRequest(&scheduler, allocator, loaded.tenant, existing.id, request) catch {};
-                    saveSchedulerForContext(&scheduler, loaded.tenant) catch {};
-                    const msg = try std.fmt.allocPrint(allocator, "Job {s} already exists | {s} | cmd: {s}", .{
-                        existing.id,
-                        existing.expression,
-                        existing.command,
-                    });
-                    return ToolResult{ .success = true, .output = msg };
-                }
-            }
 
             if (requested_id) |id| {
                 if (scheduler.getJob(id)) |existing| {
@@ -1124,14 +1017,6 @@ fn findMatchingRecurringJob(
     return null;
 }
 
-fn findMorningBriefJob(jobs: []const cron.CronJob) ?*const cron.CronJob {
-    for (jobs) |*job| {
-        if (isMorningBriefId(job.id)) return job;
-        if (morning_brief.commandLooksMorningBrief(job.command)) return job;
-    }
-    return null;
-}
-
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "schedule tool name" {
@@ -1172,20 +1057,6 @@ test "schedule normalizeRequestedId trims and drops empty values" {
     try std.testing.expect(normalizeRequestedId(null) == null);
     try std.testing.expect(normalizeRequestedId("   ") == null);
     try std.testing.expectEqualStrings("morning-brief", normalizeRequestedId("  morning-brief  ").?);
-}
-
-test "schedule canonicalization does not treat generic heartbeat commands as morning brief" {
-    try std.testing.expect(shouldCanonicalizeMorningBrief(null, "job-1", "send morning brief at 8"));
-    try std.testing.expect(shouldCanonicalizeMorningBrief(null, "job-1", "daily_morning_brief"));
-    try std.testing.expect(!shouldCanonicalizeMorningBrief(null, "job-1", "heartbeat run now"));
-}
-
-test "schedule canonicalization trigger matches id legacy and semantic hints" {
-    try std.testing.expect(shouldCanonicalizeMorningBrief("morning-brief", "job-1", "echo hello"));
-    try std.testing.expect(shouldCanonicalizeMorningBrief(null, "job-1", "schedule morning-brief"));
-    try std.testing.expect(shouldCanonicalizeMorningBrief(null, "job-1", "daily_morning_brief"));
-    try std.testing.expect(shouldCanonicalizeMorningBrief(null, "job-1", "send morning brief at 8"));
-    try std.testing.expect(!shouldCanonicalizeMorningBrief(null, "job-1", "echo hello"));
 }
 
 test "schedule findMatchingRecurringJob returns recurring exact match only" {

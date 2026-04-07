@@ -1,17 +1,17 @@
 //! SubagentManager — background task execution via isolated agent instances.
 //!
-//! Spawns subagents in separate OS threads. Each subagent currently executes
-//! a single-turn chatWithSystem completion (no tool loop, no tool access).
-//! Task results are routed via the event bus as system InboundMessages.
-//!
-//! PHASE 2: full agentic loop with restricted tool sets (no message/spawn/delegate)
-//! is not yet implemented. The threading and bus-routing infrastructure is complete.
+//! Spawns subagents in separate OS threads. Each subagent runs a full
+//! ChannelRuntime agent loop (tool access, memory, multi-turn) in an isolated
+//! session ("subagent:{task_id}"). The event bus is not wired to the subagent
+//! runtime, preventing it from sending proactive messages or spawning children.
+//! Task results are routed back to the caller via the event bus as system
+//! InboundMessages once the agent loop completes.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
-const runtime_bundle = @import("providers/runtime_bundle.zig");
+const channel_loop = @import("channel_loop.zig");
 
 const log = std.log.scoped(.subagent);
 
@@ -37,8 +37,7 @@ pub const TaskState = struct {
 };
 
 pub const SubagentConfig = struct {
-    /// Maximum agent loop iterations per subagent.
-    /// TODO(phase2): currently unused — thread runs a single chatWithSystem call.
+    /// Maximum agent loop iterations per subagent (passed to ChannelRuntime).
     max_iterations: u32 = 15,
     max_concurrent: u32 = 4,
 };
@@ -72,13 +71,6 @@ pub const SubagentManager = struct {
     bus: ?*bus_mod.Bus,
     config_ref: *const config_mod.Config,
 
-    // Context needed for creating providers in subagent threads
-    api_key: ?[]const u8,
-    default_provider: []const u8,
-    default_model: ?[]const u8,
-    workspace_dir: []const u8,
-    agents: []const config_mod.NamedAgentConfig,
-    http_enabled: bool,
     completion_runner: ?CompletionRunnerFn = null,
     completion_runner_ctx: ?*anyopaque = null,
 
@@ -96,12 +88,6 @@ pub const SubagentManager = struct {
             .config = subagent_config,
             .bus = bus,
             .config_ref = cfg,
-            .api_key = cfg.defaultProviderKey(),
-            .default_provider = cfg.default_provider,
-            .default_model = cfg.default_model,
-            .workspace_dir = cfg.workspace_dir,
-            .agents = cfg.agents,
-            .http_enabled = cfg.http_request.enabled,
         };
     }
 
@@ -286,47 +272,50 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         ctx.manager.allocator.destroy(ctx);
     }
 
-    const system_prompt = "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
-
-    var cfg_arena = std.heap.ArenaAllocator.init(ctx.manager.allocator);
-    defer cfg_arena.deinit();
-
+    // Test path: injected runner bypasses the full runtime (used in unit tests).
     if (ctx.manager.completion_runner) |runner| {
+        const system_prompt = "You are a background subagent. Complete the assigned task concisely and accurately.";
+        var test_arena = std.heap.ArenaAllocator.init(ctx.manager.allocator);
+        defer test_arena.deinit();
         const result = runner(
             ctx.manager.completion_runner_ctx,
-            cfg_arena.allocator(),
+            test_arena.allocator(),
             system_prompt,
             ctx.task,
         ) catch |err| {
             ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
             return;
         };
-
         ctx.manager.completeTask(ctx.task_id, result, null);
         return;
     }
 
-    var provider_bundle = runtime_bundle.RuntimeProviderBundle.init(cfg_arena.allocator(), ctx.manager.config_ref) catch |err| {
-        ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
-        return;
-    };
-    defer provider_bundle.deinit();
-
-    const model = ctx.manager.config_ref.default_model orelse {
-        ctx.manager.completeTask(ctx.task_id, null, @errorName(error.NoDefaultModel));
-        return;
-    };
-
-    const result = provider_bundle.provider().chatWithSystem(
-        cfg_arena.allocator(),
-        system_prompt,
-        ctx.task,
-        model,
-        ctx.manager.config_ref.default_temperature,
+    // Production path: full ChannelRuntime agent loop in an isolated session.
+    // event_bus=null prevents the subagent from sending proactive messages or
+    // spawning further subagents during its run.
+    var runtime = channel_loop.ChannelRuntime.init(
+        ctx.manager.allocator,
+        ctx.manager.config_ref,
+        null, // event_bus — deliberately omitted for subagent isolation
     ) catch |err| {
         ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
         return;
     };
+    defer runtime.deinit();
+
+    var session_buf: [128]u8 = undefined;
+    const session_key = std.fmt.bufPrint(&session_buf, "subagent:{d}", .{ctx.task_id}) catch "subagent:bg";
+
+    const result = runtime.session_mgr.processMessageWithContext(
+        session_key,
+        ctx.task,
+        null,
+        .{ .turn_origin = .proactive },
+    ) catch |err| {
+        ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
+        return;
+    };
+    defer ctx.manager.allocator.free(result);
 
     ctx.manager.completeTask(ctx.task_id, result, null);
 }
