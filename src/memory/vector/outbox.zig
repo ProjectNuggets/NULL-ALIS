@@ -170,6 +170,11 @@ pub const VectorOutbox = struct {
 
                 if (content) |c_slice| {
                     defer allocator.free(c_slice);
+                    if (!@import("../root.zig").shouldEmbedMemoryEntry(item.key, c_slice)) {
+                        self.deleteItem(item.id) catch {};
+                        success_count += 1;
+                        continue;
+                    }
 
                     // Embed the content
                     const embedding = embed_provider.embed(allocator, c_slice) catch |err| {

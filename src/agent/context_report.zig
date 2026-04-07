@@ -17,8 +17,8 @@ fn boolWord(value: bool) []const u8 {
 pub fn formatSummary(allocator: std.mem.Allocator, report: Report) ![]u8 {
     return try std.fmt.allocPrint(
         allocator,
-        "Context: messages={d}, token_estimate={d}, tools={d}, memory_enriched={d}",
-        .{ report.history_messages, report.token_estimate, report.tool_count, report.memory_enriched_messages },
+        "Context: messages={d}, token_estimate={d}, tools={d}, memory_enriched={d}, last_turn_memory={s}",
+        .{ report.history_messages, report.token_estimate, report.tool_count, report.memory_enriched_messages, boolWord(report.last_turn.memory_context_injected) },
     );
 }
 
@@ -94,7 +94,7 @@ fn memorySelectionText(allocator: std.mem.Allocator, report: Report) ![]u8 {
 
     return try std.fmt.allocPrint(
         allocator,
-        "summary_latest={s} anchor={s} durable={d} timeline={d} search={d} fallback={d} candidates={d} global_candidates={d}",
+        "summary_latest={s} anchor={s} durable={d} timeline={d} search={d} fallback={d} continuity_bucket={d}/{d} semantic_bucket={d}/{d} fallback_bucket={d}/{d} candidates={d} global_candidates={d}",
         .{
             boolWord(report.last_turn.memory_selection.summary_latest_used),
             boolWord(report.last_turn.memory_selection.context_anchor_used),
@@ -102,6 +102,12 @@ fn memorySelectionText(allocator: std.mem.Allocator, report: Report) ![]u8 {
             report.last_turn.memory_selection.timeline_summary_count,
             report.last_turn.memory_selection.search_match_count,
             report.last_turn.memory_selection.global_fallback_count,
+            report.last_turn.memory_selection.continuity_bucket_entries,
+            report.last_turn.memory_selection.continuity_bucket_bytes,
+            report.last_turn.memory_selection.semantic_bucket_entries,
+            report.last_turn.memory_selection.semantic_bucket_bytes,
+            report.last_turn.memory_selection.fallback_bucket_entries,
+            report.last_turn.memory_selection.fallback_bucket_bytes,
             report.last_turn.memory_selection.candidate_count,
             report.last_turn.memory_selection.global_candidate_count,
         },
@@ -175,11 +181,12 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.role_counts.assistant,
         report.role_counts.tool,
     });
-    try std.fmt.format(w, "  memory: enabled={s} runtime={s} session={s} enriched_messages={d}\n", .{
+    try std.fmt.format(w, "  memory: enabled={s} runtime={s} session={s} enriched_messages={d} last_turn_injected={s}\n", .{
         boolWord(report.memory_enabled),
         boolWord(report.memory_runtime_enabled),
         memory_session_text,
         report.memory_enriched_messages,
+        boolWord(report.last_turn.memory_context_injected),
     });
     try std.fmt.format(w, "  retrieval: mode={s} provider={s} vector={s} rollout={s}\n", .{
         report.retrieval_mode,
@@ -191,7 +198,7 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
     try std.fmt.format(w, "    hot: last_n={d} raw_only=yes\n", .{
         report.history_trim_limit_messages,
     });
-    try std.fmt.format(w, "    warm: summary_latest={s} anchor={s} recall_limit={d} timeline_fallback_limit={d} durable={d} timeline={d} search={d} fallback={d}\n", .{
+    try std.fmt.format(w, "    warm: summary_latest={s} anchor={s} recall_limit={d} timeline_fallback_limit={d} durable={d} timeline={d} search={d} fallback={d} continuity_bucket={d}/{d} semantic_bucket={d}/{d} fallback_bucket={d}/{d}\n", .{
         boolWord(report.last_turn.memory_selection.summary_latest_used),
         boolWord(report.last_turn.memory_selection.context_anchor_used),
         config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT,
@@ -200,6 +207,12 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.last_turn.memory_selection.timeline_summary_count,
         report.last_turn.memory_selection.search_match_count,
         report.last_turn.memory_selection.global_fallback_count,
+        report.last_turn.memory_selection.continuity_bucket_entries,
+        report.last_turn.memory_selection.continuity_bucket_bytes,
+        report.last_turn.memory_selection.semantic_bucket_entries,
+        report.last_turn.memory_selection.semantic_bucket_bytes,
+        report.last_turn.memory_selection.fallback_bucket_entries,
+        report.last_turn.memory_selection.fallback_bucket_bytes,
     });
     try std.fmt.format(w, "    cold: tools=memory_recall,memory_timeline,memory_list discovery=timeline_index transcripts=autosave(exact_history) retention={s}\n", .{
         transcript_retention_text,
@@ -333,6 +346,12 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
                 .timeline_summaries = report.last_turn.memory_selection.timeline_summary_count,
                 .search_matches = report.last_turn.memory_selection.search_match_count,
                 .fallback_matches = report.last_turn.memory_selection.global_fallback_count,
+                .continuity_bucket_entries = report.last_turn.memory_selection.continuity_bucket_entries,
+                .continuity_bucket_bytes = report.last_turn.memory_selection.continuity_bucket_bytes,
+                .semantic_bucket_entries = report.last_turn.memory_selection.semantic_bucket_entries,
+                .semantic_bucket_bytes = report.last_turn.memory_selection.semantic_bucket_bytes,
+                .fallback_bucket_entries = report.last_turn.memory_selection.fallback_bucket_entries,
+                .fallback_bucket_bytes = report.last_turn.memory_selection.fallback_bucket_bytes,
             },
             .cold = .{
                 .tools = .{ "memory_recall", "memory_timeline", "memory_list" },
@@ -420,6 +439,12 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
                 .timeline_summary_count = report.last_turn.memory_selection.timeline_summary_count,
                 .search_match_count = report.last_turn.memory_selection.search_match_count,
                 .global_fallback_count = report.last_turn.memory_selection.global_fallback_count,
+                .continuity_bucket_entries = report.last_turn.memory_selection.continuity_bucket_entries,
+                .continuity_bucket_bytes = report.last_turn.memory_selection.continuity_bucket_bytes,
+                .semantic_bucket_entries = report.last_turn.memory_selection.semantic_bucket_entries,
+                .semantic_bucket_bytes = report.last_turn.memory_selection.semantic_bucket_bytes,
+                .fallback_bucket_entries = report.last_turn.memory_selection.fallback_bucket_entries,
+                .fallback_bucket_bytes = report.last_turn.memory_selection.fallback_bucket_bytes,
             },
         },
         .runtime = .{
@@ -577,11 +602,17 @@ test "context report formatters expose structured details" {
                 .candidate_count = 5,
                 .global_candidate_count = 12,
                 .summary_latest_used = true,
-                .context_anchor_used = true,
+                .context_anchor_used = false,
                 .durable_fact_count = 1,
                 .timeline_summary_count = 2,
                 .search_match_count = 1,
                 .global_fallback_count = 0,
+                .continuity_bucket_entries = 1,
+                .continuity_bucket_bytes = 12,
+                .semantic_bucket_entries = 3,
+                .semantic_bucket_bytes = 18,
+                .fallback_bucket_entries = 0,
+                .fallback_bucket_bytes = 0,
             },
         },
     };
@@ -589,6 +620,7 @@ test "context report formatters expose structured details" {
     const summary = try formatSummary(std.testing.allocator, report);
     defer std.testing.allocator.free(summary);
     try std.testing.expect(std.mem.indexOf(u8, summary, "memory_enriched=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "last_turn_memory=yes") != null);
 
     const detail = try formatDetail(std.testing.allocator, report);
     defer std.testing.allocator.free(detail);
@@ -598,7 +630,7 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory: enabled=yes runtime=yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "retrieval: mode=hybrid provider=together vector=pgvector rollout=on") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "hot: last_n=80 raw_only=yes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "warm: summary_latest=yes anchor=yes recall_limit=10 timeline_fallback_limit=2 durable=1 timeline=2 search=1 fallback=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "warm: summary_latest=yes anchor=no recall_limit=10 timeline_fallback_limit=2 durable=1 timeline=2 search=1 fallback=0 continuity_bucket=1/12 semantic_bucket=3/18 fallback_bucket=0/0") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "cold: tools=memory_recall,memory_timeline,memory_list discovery=timeline_index transcripts=autosave(exact_history) retention=forever") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "durable_refresh: triggered=yes reason=compaction:auto") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "cache: stable_prefix=yes refresh_needed=yes reason=workspace") != null);
@@ -606,7 +638,7 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "last_turn: prompt_refresh=yes reason=workspace memory_injected=yes bytes=64 enrich_ms=11 cache_hit=no") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "trim: events=1 removed_messages=2 removed_bytes=24 history_after=5") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "compaction: auto_events=1 auto_messages~=8 force_events=1 force_messages=3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "memory_select: summary_latest=yes anchor=yes durable=1 timeline=2 search=1 fallback=0 candidates=5 global_candidates=12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "memory_select: summary_latest=yes anchor=no durable=1 timeline=2 search=1 fallback=0 continuity_bucket=1/12 semantic_bucket=3/18 fallback_bucket=0/0 candidates=5 global_candidates=12") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "workspace_fp=77") != null);
 
     const json = try formatJson(std.testing.allocator, report);
@@ -626,4 +658,5 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"retention_mode\":\"forever\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"summary_latest_used\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"workspace_prompt_fingerprint\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"semantic_bucket_entries\":3") != null);
 }

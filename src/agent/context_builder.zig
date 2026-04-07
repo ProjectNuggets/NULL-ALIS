@@ -76,6 +76,12 @@ pub const MemorySelection = struct {
     timeline_summary_count: usize = 0,
     search_match_count: usize = 0,
     global_fallback_count: usize = 0,
+    continuity_bucket_entries: usize = 0,
+    continuity_bucket_bytes: usize = 0,
+    semantic_bucket_entries: usize = 0,
+    semantic_bucket_bytes: usize = 0,
+    fallback_bucket_entries: usize = 0,
+    fallback_bucket_bytes: usize = 0,
 };
 
 pub const PromptRefreshPlan = struct {
@@ -387,6 +393,12 @@ pub fn selectionFromStats(stats: anytype) MemorySelection {
         .timeline_summary_count = stats.timeline_summary_count,
         .search_match_count = stats.search_match_count,
         .global_fallback_count = stats.global_fallback_count,
+        .continuity_bucket_entries = stats.continuity_bucket_entries,
+        .continuity_bucket_bytes = stats.continuity_bucket_bytes,
+        .semantic_bucket_entries = stats.semantic_bucket_entries,
+        .semantic_bucket_bytes = stats.semantic_bucket_bytes,
+        .fallback_bucket_entries = stats.fallback_bucket_entries,
+        .fallback_bucket_bytes = stats.fallback_bucket_bytes,
     };
 }
 
@@ -577,6 +589,12 @@ test "buildLastTurnContext captures injected memory bytes" {
         timeline_summary_count: usize,
         search_match_count: usize,
         global_fallback_count: usize,
+        continuity_bucket_entries: usize,
+        continuity_bucket_bytes: usize,
+        semantic_bucket_entries: usize,
+        semantic_bucket_bytes: usize,
+        fallback_bucket_entries: usize,
+        fallback_bucket_bytes: usize,
         context_bytes: usize,
         injected: bool,
     }{
@@ -584,11 +602,17 @@ test "buildLastTurnContext captures injected memory bytes" {
         .candidate_count = 5,
         .global_candidate_count = 12,
         .summary_latest_used = true,
-        .context_anchor_used = true,
+        .context_anchor_used = false,
         .durable_fact_count = 1,
         .timeline_summary_count = 2,
         .search_match_count = 1,
         .global_fallback_count = 0,
+        .continuity_bucket_entries = 1,
+        .continuity_bucket_bytes = 12,
+        .semantic_bucket_entries = 3,
+        .semantic_bucket_bytes = 18,
+        .fallback_bucket_entries = 0,
+        .fallback_bucket_bytes = 0,
         .context_bytes = 34,
         .injected = true,
     };
@@ -606,7 +630,7 @@ test "buildLastTurnContext captures injected memory bytes" {
     try std.testing.expectEqual(@as(u64, 12), last_turn.memory_enrich_ms);
     try std.testing.expect(!last_turn.cache_hit);
     try std.testing.expect(last_turn.memory_selection.summary_latest_used);
-    try std.testing.expect(last_turn.memory_selection.context_anchor_used);
+    try std.testing.expect(!last_turn.memory_selection.context_anchor_used);
     try std.testing.expectEqual(@as(usize, 2), last_turn.memory_selection.timeline_summary_count);
 }
 

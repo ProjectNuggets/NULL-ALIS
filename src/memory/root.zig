@@ -370,6 +370,20 @@ pub fn isDefaultHiddenMemoryKey(key: []const u8) bool {
         isIndexArtifactKey(key);
 }
 
+pub fn isSemanticBookkeepingKey(key: []const u8) bool {
+    return isDefaultHiddenMemoryKey(key) or
+        std.mem.eql(u8, key, "context_anchor_current");
+}
+
+pub fn shouldEmbedMemoryEntry(key: []const u8, content: []const u8) bool {
+    if (isSemanticBookkeepingKey(key)) return false;
+    const chunking = config_types.MemoryChunkingConfig{};
+    // Use a conservative byte ceiling so we stay comfortably under providers
+    // that enforce the configured max_tokens limit during embedding.
+    const max_bytes = @as(usize, chunking.max_tokens) * 3;
+    return content.len <= max_bytes;
+}
+
 pub fn isTombstoneKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, TombstoneKeyPrefix);
 }
@@ -1090,6 +1104,7 @@ pub const MemoryRuntime = struct {
     /// Embeds the content and upserts into the vector store.
     /// Errors are caught and logged, never propagated.
     pub fn syncVectorAfterStore(self: *MemoryRuntime, allocator: std.mem.Allocator, key: []const u8, content: []const u8) void {
+        if (!shouldEmbedMemoryEntry(key, content)) return;
         // Durable mode: enqueue and return (drain happens at turn boundaries / shutdown).
         if (self._outbox) |ob| {
             ob.enqueue(self._vector_user_id, key, "upsert") catch |err| {
@@ -1163,6 +1178,7 @@ pub const MemoryRuntime = struct {
 
         var reindexed: u32 = 0;
         for (entries) |entry| {
+            if (!shouldEmbedMemoryEntry(entry.key, entry.content)) continue;
             const emb = provider.embed(allocator, entry.content) catch |err| {
                 log.warn("reindex: embed failed for key '{s}': {}", .{ entry.key, err });
                 continue;
@@ -2578,6 +2594,22 @@ test "MemoryRuntime.syncVectorAfterStore with no provider is no-op" {
     };
     // Should not crash — just a no-op
     rt.syncVectorAfterStore(std.testing.allocator, "key", "content");
+}
+
+test "shouldEmbedMemoryEntry skips bookkeeping artifacts and oversize content" {
+    try std.testing.expect(!shouldEmbedMemoryEntry("timeline_index/current", "index blob"));
+    try std.testing.expect(!shouldEmbedMemoryEntry("context_anchor_current", "anchor blob"));
+    try std.testing.expect(!shouldEmbedMemoryEntry("session_checkpoint_1", "checkpoint blob"));
+    try std.testing.expect(!shouldEmbedMemoryEntry("autosave_user_1", "hello"));
+    try std.testing.expect(shouldEmbedMemoryEntry("summary_latest/agent:test:user:1:main", "focus: ship"));
+
+    var medium: [1400]u8 = undefined;
+    @memset(&medium, 'a');
+    try std.testing.expect(shouldEmbedMemoryEntry("timeline_summary/agent:test:user:1:main/1", medium[0..]));
+
+    var big: [1700]u8 = undefined;
+    @memset(&big, 'a');
+    try std.testing.expect(!shouldEmbedMemoryEntry("durable_fact/x", big[0..]));
 }
 
 test "MemoryRuntime.drainOutbox with no outbox returns 0" {
