@@ -4,6 +4,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
+const query_expansion = @import("../memory/retrieval/query_expansion.zig");
 const Memory = mem_root.Memory;
 const MemoryEntry = mem_root.MemoryEntry;
 
@@ -16,9 +17,9 @@ pub const MemoryRecallTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_recall";
-    pub const tool_description = "Search long-term memory for relevant facts, preferences, or context.";
+    pub const tool_description = "Search canonical memory for relevant facts, preferences, or context. Defaults to the current session unless scope=global is provided.";
     pub const tool_params =
-        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: session)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}
+        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in canonical memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: session). Use global for durable or cross-session facts."},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -57,12 +58,20 @@ pub const MemoryRecallTool = struct {
             defer mem_root.retrieval.freeCandidates(allocator, candidates);
 
             const visible_candidates = countVisibleCandidates(candidates);
-            if (visible_candidates == 0) {
-                const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
-                return ToolResult{ .success = true, .output = msg };
+            if (visible_candidates > 0) {
+                return formatCandidates(allocator, candidates, visible_candidates);
             }
 
-            return formatCandidates(allocator, candidates, visible_candidates);
+            const fallback_entries = try recallFallbackByKeywords(allocator, m, query, limit, session_id);
+            defer mem_root.freeEntries(allocator, fallback_entries);
+
+            const fallback_visible = countVisibleEntries(fallback_entries);
+            if (fallback_visible > 0) {
+                return formatEntries(allocator, fallback_entries, fallback_visible);
+            }
+
+            const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
+            return ToolResult{ .success = true, .output = msg };
         }
 
         const entries = m.recall(allocator, query, limit, session_id) catch |err| {
@@ -72,12 +81,20 @@ pub const MemoryRecallTool = struct {
         defer mem_root.freeEntries(allocator, entries);
 
         const visible_entries = countVisibleEntries(entries);
-        if (visible_entries == 0) {
-            const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
-            return ToolResult{ .success = true, .output = msg };
+        if (visible_entries > 0) {
+            return formatEntries(allocator, entries, visible_entries);
         }
 
-        return formatEntries(allocator, entries, visible_entries);
+        const fallback_entries = try recallFallbackByKeywords(allocator, m, query, limit, session_id);
+        defer mem_root.freeEntries(allocator, fallback_entries);
+
+        const fallback_visible = countVisibleEntries(fallback_entries);
+        if (fallback_visible > 0) {
+            return formatEntries(allocator, fallback_entries, fallback_visible);
+        }
+
+        const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
+        return ToolResult{ .success = true, .output = msg };
     }
 
     fn countVisibleEntries(entries: []const MemoryEntry) usize {
@@ -96,6 +113,83 @@ pub const MemoryRecallTool = struct {
             count += 1;
         }
         return count;
+    }
+
+    fn recallFallbackByKeywords(
+        allocator: std.mem.Allocator,
+        mem: Memory,
+        query: []const u8,
+        limit: usize,
+        session_id: ?[]const u8,
+    ) ![]MemoryEntry {
+        const keywords = query_expansion.extractKeywords(allocator, query) catch return allocator.alloc(MemoryEntry, 0);
+        defer {
+            for (keywords) |keyword| allocator.free(keyword);
+            allocator.free(keywords);
+        }
+
+        if (keywords.len == 0) return allocator.alloc(MemoryEntry, 0);
+
+        var out: std.ArrayListUnmanaged(MemoryEntry) = .empty;
+        errdefer {
+            for (out.items) |*entry| entry.deinit(allocator);
+            out.deinit(allocator);
+        }
+
+        for (keywords) |keyword| {
+            if (keyword.len < 2) continue;
+            const matches = mem.recall(allocator, keyword, limit, session_id) catch continue;
+            defer mem_root.freeEntries(allocator, matches);
+
+            for (matches) |entry| {
+                if (mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+                if (containsEntryKey(out.items, entry.key)) continue;
+                try out.append(allocator, try cloneEntry(allocator, entry));
+                if (out.items.len >= limit) {
+                    return out.toOwnedSlice(allocator);
+                }
+            }
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn containsEntryKey(entries: []const MemoryEntry, key: []const u8) bool {
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) return true;
+        }
+        return false;
+    }
+
+    fn cloneEntry(allocator: std.mem.Allocator, entry: MemoryEntry) !MemoryEntry {
+        const id = try allocator.dupe(u8, entry.id);
+        errdefer allocator.free(id);
+        const key = try allocator.dupe(u8, entry.key);
+        errdefer allocator.free(key);
+        const content = try allocator.dupe(u8, entry.content);
+        errdefer allocator.free(content);
+        const timestamp = try allocator.dupe(u8, entry.timestamp);
+        errdefer allocator.free(timestamp);
+        const category = switch (entry.category) {
+            .custom => |name| mem_root.MemoryCategory{ .custom = try allocator.dupe(u8, name) },
+            else => entry.category,
+        };
+        errdefer switch (category) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        };
+        const session = if (entry.session_id) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (session) |value| allocator.free(value);
+
+        return .{
+            .id = id,
+            .key = key,
+            .content = content,
+            .category = category,
+            .timestamp = timestamp,
+            .session_id = session,
+            .score = entry.score,
+        };
     }
 
     fn formatEntries(allocator: std.mem.Allocator, entries: []const MemoryEntry, visible_count: usize) !ToolResult {
@@ -289,6 +383,29 @@ test "memory_recall filters internal bootstrap keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-soul") == null);
 }
 
+test "memory_recall filters audit and index artifacts by default" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("session_checkpoint_1", "type=session_checkpoint\nrecent_user:\n- shipping\n", .daily, null);
+    try mem.store("timeline_index/current", "{\"session\":\"agent:zaki-bot:user:1:main\"}", .core, null);
+    try mem.store("timeline_summary/agent:zaki-bot:user:1:main/1", "focus: shipping\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n", .daily, null);
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\": \"shipping\", \"scope\": \"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "timeline_summary/agent:zaki-bot:user:1:main/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "session_checkpoint_1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "timeline_index/current") == null);
+}
+
 test "memory_recall filters markdown encoded internal keys" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
@@ -354,6 +471,31 @@ test "memory_recall supports explicit global scope" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "global_fact") != null);
+}
+
+test "memory_recall falls back to keyword tokens when phrase misses" {
+    const allocator = std.testing.allocator;
+    var mem_impl = mem_root.InMemoryLruMemory.init(allocator, 32);
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    try mem.store(
+        "hrs_deal",
+        "hrs deal confirmed (30gb, kickoff april 7)",
+        .daily,
+        null,
+    );
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\":\"30gb project\",\"scope\":\"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "hrs_deal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "30gb") != null);
 }
 
 test "memory_recall shows derived provenance" {

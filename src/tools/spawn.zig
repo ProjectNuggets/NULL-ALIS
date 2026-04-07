@@ -15,7 +15,7 @@ pub const SpawnTool = struct {
     default_chat_id: ?[]const u8 = null,
 
     pub const tool_name = "spawn";
-    pub const tool_description = "Spawn a background subagent to work on a task asynchronously. Returns a task ID immediately. Results are delivered as system messages when complete.";
+    pub const tool_description = "Start async work now and return immediately. Prefer `schedule` for future or recurring jobs.";
     pub const tool_params =
         \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"description":"The task/prompt for the subagent"},"label":{"type":"string","description":"Optional human-readable label for tracking"}},"required":["task"]}
     ;

@@ -22,6 +22,8 @@ pub const ConversationContext = struct {
     sender_uuid: ?[]const u8 = null,
     group_id: ?[]const u8 = null,
     is_group: ?bool = null,
+    last_interaction_unix_s: ?i64 = null,
+    idle_gap_secs: ?u64 = null,
 };
 
 /// Context passed to prompt sections during construction.
@@ -128,6 +130,15 @@ pub fn buildSystemPrompt(
         if (cc.sender_uuid) |uuid| {
             try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
         }
+        if (cc.last_interaction_unix_s) |timestamp| {
+            try w.writeAll("- Last interaction in this session: ");
+            try appendUtcTimestampLine(w, timestamp);
+        }
+        if (cc.idle_gap_secs) |idle_gap_secs| {
+            try w.writeAll("- Idle gap before this turn: ");
+            try appendHumanizedIdleGap(w, idle_gap_secs);
+            try w.writeByte('\n');
+        }
         try w.writeAll("- IMPORTANT: Use this context as the source of truth for this turn. Do not claim a different channel.\n");
         try w.writeAll("\n");
     }
@@ -138,12 +149,20 @@ pub fn buildSystemPrompt(
 
     // Safety section
     try w.writeAll("## Safety\n\n");
+    try w.writeAll("- Precedence: verified runtime state, tool results, and direct observations override workspace docs, memory, and inference.\n\n");
+    try w.writeAll("- First classify the turn as `chat`, `execute`, `wake`, `repair`, or `operator`, then choose tools and reply style accordingly.\n\n");
+    try w.writeAll("- Preferred tool paths: `schedule` for user time/date/recurrence work; `cron_*` for raw scheduler inspection; `runtime_info` for runtime/session/scheduler truth; `http_request` for known external APIs; `web_search`/`web_fetch` for open-web research; `spawn` for async-now work; `delegate` for specialist subtasks; `message` for explicit outbound sends; `shell` only when no more specific tool is better and policy allows.\n\n");
+    try w.writeAll("- On longer work, send short progress updates instead of going silent. Before risky multi-step changes, briefly state the plan. Default to concise, result-first replies and prefer artifacts or links over pasted output.\n\n");
     try w.writeAll("- Do not exfiltrate private data.\n");
     try w.writeAll("- Do not run destructive commands without asking.\n");
     try w.writeAll("- Do not bypass oversight or approval mechanisms.\n");
     try w.writeAll("- Prefer `trash` over `rm`.\n");
     try w.writeAll("- When in doubt, ask before acting externally.\n\n");
     try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
+    try w.writeAll("- Memory truth model: fixed workspace docs (`AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`, etc.) are contextual guidance and fallback reference. Canonical runtime memory and continuity live in the primary memory store. Do not assume that seeing a fact in `MEMORY.md` means it is semantically queryable.\n\n");
+    try w.writeAll("- When a user turn begins with `[Memory context]`, treat that block as retrieved runtime continuity for the current turn. If it contains a relevant fact, use it and do not say you lack memory unless direct user corrections, tool results, or fresher runtime state contradict it.\n\n");
+    try w.writeAll("- Cold memory is tool-only by default. Use `memory_timeline` first for session/timeline discovery, `memory_recall` for semantic lookup, `memory_list` for raw record inspection, and transcripts only when exact historical detail is required.\n\n");
+    try w.writeAll("- `memory_recall` and `memory_list` default to `scope=session`. Use `scope=global` when looking for durable or cross-session facts.\n\n");
     try w.writeAll("- Do not invent timing, scheduler, or delivery status claims. If unsure, say unknown or verify with tools first.\n\n");
     try w.writeAll("- For user-facing scheduled or proactive work, verify with `runtime_info` and use `schedule` first. Use `cron_*` only for raw inspection or explicit operator maintenance.\n\n");
     try w.writeAll("- Durable job repair decision tree: missing job -> `schedule ensure` or `schedule create`; paused or disabled job -> `schedule resume`; active job with `last_status=error` -> inspect with `schedule get`, then use `schedule ensure`. Never use `resume` to repair an active errored job.\n\n");
@@ -367,6 +386,47 @@ fn appendDateTimeSection(
     try w.writeAll("\n");
 }
 
+fn appendUtcTimestampLine(w: anytype, timestamp: i64) !void {
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+
+    const year = year_day.year;
+    const month = @intFromEnum(month_day.month);
+    const day = month_day.day_index + 1;
+    const hour = day_seconds.getHoursIntoDay();
+    const minute = day_seconds.getMinutesIntoHour();
+
+    try std.fmt.format(w, "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC\n", .{
+        year, month, day, hour, minute,
+    });
+}
+
+fn appendHumanizedIdleGap(w: anytype, idle_gap_secs: u64) !void {
+    if (idle_gap_secs < 60) {
+        try w.writeAll("under a minute");
+        return;
+    }
+    if (idle_gap_secs < 90 * 60) {
+        const minutes = @max(@as(u64, 1), (idle_gap_secs + 30) / 60);
+        try std.fmt.format(w, "about {d} minute{s}", .{ minutes, if (minutes == 1) "" else "s" });
+        return;
+    }
+    if (idle_gap_secs < 36 * 60 * 60) {
+        const hours = @max(@as(u64, 1), (idle_gap_secs + 1800) / 3600);
+        try std.fmt.format(w, "about {d} hour{s}", .{ hours, if (hours == 1) "" else "s" });
+        return;
+    }
+    const days = @max(@as(u64, 1), (idle_gap_secs + 43_200) / 86_400);
+    if (days <= 7) {
+        try std.fmt.format(w, "about {d} day{s}", .{ days, if (days == 1) "" else "s" });
+        return;
+    }
+    try w.writeAll("more than a week");
+}
+
 fn readConfiguredTimezoneHint(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
@@ -485,7 +545,12 @@ test "buildSystemPrompt includes core sections" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "test-model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Precedence: verified runtime state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "`chat`, `execute`, `wake`, `repair`, or `operator`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Preferred tool paths") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent timing, scheduler, or delivery status claims") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Cold memory is tool-only by default") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "When a user turn begins with `[Memory context]`") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "verify with `runtime_info` and use `schedule` first") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Never use `resume` to repair an active errored job") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "`AUTOMATIONS.json`") != null);

@@ -34,6 +34,14 @@ pub const DEFAULT_COMPACTION_MAX_SOURCE_CHARS: u32 = 12_000;
 /// Default token limit for context window (used by token-based compaction trigger).
 pub const DEFAULT_TOKEN_LIMIT: u64 = config_types.DEFAULT_AGENT_TOKEN_LIMIT;
 
+pub const TrimStats = struct {
+    history_before: usize = 0,
+    history_after: usize = 0,
+    removed_messages: usize = 0,
+    removed_bytes: usize = 0,
+    shrunk_capacity: bool = false,
+};
+
 /// Minimum history length before context exhaustion recovery is attempted.
 pub const CONTEXT_RECOVERY_MIN_HISTORY: usize = 6;
 
@@ -49,10 +57,45 @@ pub const CompactionConfig = struct {
     max_summary_chars: u32 = DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     max_source_chars: u32 = DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
     token_limit: u64 = DEFAULT_TOKEN_LIMIT,
+    max_tokens: u32 = 0,
     message_timeout_secs: u64 = 0,
     max_history_messages: u32 = 50,
     workspace_dir: ?[]const u8 = null,
 };
+
+pub const TokenBudgetPolicy = struct {
+    reply_reserve: u64,
+    tool_reserve: u64,
+    safety_reserve: u64,
+    total_reserve: u64,
+    threshold: u64,
+};
+
+pub fn buildTokenBudgetPolicy(token_limit: u64, max_tokens: u32) TokenBudgetPolicy {
+    if (token_limit == 0) {
+        return .{
+            .reply_reserve = 0,
+            .tool_reserve = 0,
+            .safety_reserve = 0,
+            .total_reserve = 0,
+            .threshold = 0,
+        };
+    }
+
+    const reply_reserve = if (max_tokens > 0) @as(u64, max_tokens) else @as(u64, 8_192);
+    const tool_reserve = @max(@as(u64, 2_048), @min(token_limit / 8, @as(u64, 16_384)));
+    const safety_reserve = @max(@as(u64, 1_024), @min(token_limit / 20, @as(u64, 8_192)));
+    const total_reserve = reply_reserve + tool_reserve + safety_reserve;
+    const threshold_from_reserve = if (token_limit > total_reserve) token_limit - total_reserve else token_limit / 2;
+    const minimum_threshold = (token_limit * 65) / 100;
+    return .{
+        .reply_reserve = reply_reserve,
+        .tool_reserve = tool_reserve,
+        .safety_reserve = safety_reserve,
+        .total_reserve = total_reserve,
+        .threshold = @max(minimum_threshold, threshold_from_reserve),
+    };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public functions
@@ -68,7 +111,7 @@ pub fn tokenEstimate(history: []const OwnedMessage) u64 {
 }
 
 /// Auto-compact history when it exceeds max_history_messages or when
-/// estimated token usage exceeds 75% of the configured token limit.
+/// estimated token usage exceeds the dynamic reserve-aware token threshold.
 /// For large histories (>10 messages to summarize), uses multi-part strategy:
 /// splits into halves, summarizes each independently, then merges.
 /// Returns true if compaction was performed.
@@ -81,18 +124,47 @@ pub fn autoCompactHistory(
 ) !bool {
     const has_system = history.items.len > 0 and history.items[0].role == .system;
     const start: usize = if (has_system) 1 else 0;
-    const non_system_count = history.items.len - start;
+    _ = history.items.len - start;
 
-    // Trigger on message count exceeding threshold
-    const count_trigger = non_system_count > config.max_history_messages;
-
-    // Trigger on token estimate exceeding 75% of token limit
-    const token_threshold = (config.token_limit * 3) / 4;
+    // Trigger when estimated tokens exceed the usable window after reserving
+    // reply/tool/safety headroom for the current model.
+    const budget_policy = buildTokenBudgetPolicy(config.token_limit, config.max_tokens);
+    const token_threshold = budget_policy.threshold;
     const token_trigger = config.token_limit > 0 and tokenEstimate(history.items) > token_threshold;
 
-    if (!count_trigger and !token_trigger) return false;
+    // Automatic compaction is reserved for true context pressure only.
+    // Session-boundary continuity is handled by explicit checkpoint paths
+    // such as /new, reset, eviction, or the durable seed writer.
+    if (!token_trigger) return false;
 
-    const keep_recent = @min(config.keep_recent, @as(u32, @intCast(non_system_count)));
+    return compactHistoryKeepingRecent(allocator, history, provider, model_name, config, config.keep_recent);
+}
+
+/// Manual compaction for explicit operator boundaries.
+/// Summarizes older context and keeps the most recent recovery tail intact.
+pub fn manualCompactHistory(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged(OwnedMessage),
+    provider: Provider,
+    model_name: []const u8,
+    config: CompactionConfig,
+) !bool {
+    return compactHistoryKeepingRecent(allocator, history, provider, model_name, config, CONTEXT_RECOVERY_KEEP);
+}
+
+fn compactHistoryKeepingRecent(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged(OwnedMessage),
+    provider: Provider,
+    model_name: []const u8,
+    config: CompactionConfig,
+    requested_keep_recent: usize,
+) !bool {
+    const has_system = history.items.len > 0 and history.items[0].role == .system;
+    const start: usize = if (has_system) 1 else 0;
+    const non_system_count = history.items.len - start;
+
+    const keep_recent: usize = @min(non_system_count, requested_keep_recent);
     const compact_count = non_system_count - keep_recent;
     if (compact_count == 0) return false;
 
@@ -193,23 +265,31 @@ pub fn forceCompressHistory(
 
 /// Trim history to prevent unbounded growth.
 /// Preserves the system prompt (first message) and the most recent messages.
-pub fn trimHistory(
+pub fn trimHistoryDetailed(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
     max_history_messages: u32,
-) void {
+) TrimStats {
+    var stats = TrimStats{
+        .history_before = history.items.len,
+        .history_after = history.items.len,
+    };
+
     const max = max_history_messages;
-    if (history.items.len <= max + 1) return; // +1 for system prompt
+    if (history.items.len <= max + 1) return stats; // +1 for system prompt
 
     const has_system = history.items.len > 0 and history.items[0].role == .system;
     const start: usize = if (has_system) 1 else 0;
     const non_system_count = history.items.len - start;
 
-    if (non_system_count <= max) return;
+    if (non_system_count <= max) return stats;
 
     const to_remove = non_system_count - max;
+    stats.removed_messages = to_remove;
+
     // Free the messages being removed
     for (history.items[start .. start + to_remove]) |*msg| {
+        stats.removed_bytes += msg.content.len;
         msg.deinit(allocator);
     }
 
@@ -217,11 +297,60 @@ pub fn trimHistory(
     const src = history.items[start + to_remove ..];
     std.mem.copyForwards(OwnedMessage, history.items[start..], src);
     history.items.len -= to_remove;
+    stats.history_after = history.items.len;
 
     // Shrink backing array if capacity is much larger than needed
     if (history.capacity > history.items.len * 2 + 8) {
         history.shrinkAndFree(allocator, history.items.len);
+        stats.shrunk_capacity = true;
     }
+
+    return stats;
+}
+
+/// Trim history to prevent unbounded growth.
+/// Preserves the system prompt (first message) and the most recent messages.
+pub fn trimHistory(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged(OwnedMessage),
+    max_history_messages: u32,
+) void {
+    _ = trimHistoryDetailed(allocator, history, max_history_messages);
+}
+
+test "trimHistoryDetailed reports removed messages and bytes" {
+    const allocator = std.testing.allocator;
+    var history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
+    defer {
+        for (history.items) |*msg| msg.deinit(allocator);
+        history.deinit(allocator);
+    }
+
+    try history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u1") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "assistant-one") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u2") });
+
+    const stats = trimHistoryDetailed(allocator, &history, 2);
+    try std.testing.expectEqual(@as(usize, 4), stats.history_before);
+    try std.testing.expectEqual(@as(usize, 3), stats.history_after);
+    try std.testing.expectEqual(@as(usize, 1), stats.removed_messages);
+    try std.testing.expectEqual(@as(usize, 2), stats.removed_bytes);
+    try std.testing.expectEqual(@as(usize, 3), history.items.len);
+    try std.testing.expectEqualStrings("assistant-one", history.items[1].content);
+    try std.testing.expectEqualStrings("u2", history.items[2].content);
+}
+
+test "buildTokenBudgetPolicy keeps dynamic headroom" {
+    const kimi = buildTokenBudgetPolicy(262_144, 32_768);
+    try std.testing.expectEqual(@as(u64, 32_768), kimi.reply_reserve);
+    try std.testing.expectEqual(@as(u64, 16_384), kimi.tool_reserve);
+    try std.testing.expectEqual(@as(u64, 8_192), kimi.safety_reserve);
+    try std.testing.expectEqual(@as(u64, 57_344), kimi.total_reserve);
+    try std.testing.expectEqual(@as(u64, 204_800), kimi.threshold);
+
+    const smaller = buildTokenBudgetPolicy(32_768, 8_192);
+    try std.testing.expect(smaller.threshold >= (32_768 * 65) / 100);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -580,12 +709,12 @@ test "tokenEstimate heuristic accuracy" {
     try std.testing.expectEqual(@as(u64, 100), tokenEstimate(agent.history.items));
 }
 
-test "autoCompactHistory no-op below count and token thresholds" {
+test "autoCompactHistory no-op below token threshold" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
-    // Add a few small messages — well below both thresholds
+    // Add a few small messages — well below the token threshold.
     try agent.history.append(allocator, .{
         .role = .system,
         .content = try allocator.dupe(u8, "system"),
@@ -674,6 +803,70 @@ test "forceCompressHistory no-op when history is small" {
     const compressed = forceCompressHistory(allocator, &agent.history);
     try std.testing.expect(!compressed);
     try std.testing.expectEqual(@as(usize, 2), agent.history.items.len);
+}
+
+test "manualCompactHistory summarizes older context and keeps recent recovery tail" {
+    const SummaryProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "- compacted summary");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "- compacted summary"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "summary-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SummaryProvider.chatWithSystem,
+        .chat = SummaryProvider.chat,
+        .supportsNativeTools = SummaryProvider.supportsNativeTools,
+        .getName = SummaryProvider.getName,
+        .deinit = SummaryProvider.deinitFn,
+    };
+    agent.provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..6) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "msg-{d}", .{i}),
+        });
+    }
+
+    const compacted = try manualCompactHistory(allocator, &agent.history, agent.provider, agent.model_name, .{
+        .keep_recent = 20,
+        .max_summary_chars = 500,
+        .max_source_chars = 1_500,
+    });
+    try std.testing.expect(compacted);
+    try std.testing.expectEqual(@as(usize, 6), agent.history.items.len);
+    try std.testing.expect(agent.history.items[0].role == .system);
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expect(std.mem.startsWith(u8, agent.history.items[1].content, "[Compaction summary]\n"));
+    try std.testing.expectEqualStrings("msg-2", agent.history.items[2].content);
+    try std.testing.expectEqualStrings("msg-5", agent.history.items[5].content);
 }
 
 test "CONTEXT_RECOVERY constants" {

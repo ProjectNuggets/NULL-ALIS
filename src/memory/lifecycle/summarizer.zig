@@ -167,7 +167,11 @@ pub fn parseSummaryResponse(
     llm_response: []const u8,
     config: SummarizerConfig,
 ) !SummaryResult {
-    if (llm_response.len > 0 and !hasRequiredStructuredSections(llm_response)) {
+    const trimmed = std.mem.trim(u8, llm_response, &std.ascii.whitespace);
+    if (trimmed.len == 0) {
+        return error.InvalidSummaryFormat;
+    }
+    if (!hasRequiredStructuredSections(trimmed)) {
         return error.InvalidSummaryFormat;
     }
 
@@ -178,7 +182,7 @@ pub fn parseSummaryResponse(
     }
 
     if (config.auto_extract_semantic) {
-        var line_iter = std.mem.splitScalar(u8, llm_response, '\n');
+        var line_iter = std.mem.splitScalar(u8, trimmed, '\n');
         var fact_idx: usize = 0;
         while (line_iter.next()) |raw_line| {
             const line = std.mem.trim(u8, raw_line, &std.ascii.whitespace);
@@ -205,7 +209,7 @@ pub fn parseSummaryResponse(
         }
     }
 
-    const summary = try allocator.dupe(u8, llm_response);
+    const summary = try allocator.dupe(u8, trimmed);
 
     return SummaryResult{
         .summary = summary,
@@ -400,11 +404,17 @@ test "parseSummaryResponse handles bullet-prefixed facts" {
 }
 
 test "parseSummaryResponse empty response" {
-    var result = try parseSummaryResponse(std.testing.allocator, "", .{});
-    defer result.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.InvalidSummaryFormat,
+        parseSummaryResponse(std.testing.allocator, "", .{}),
+    );
+}
 
-    try std.testing.expectEqual(@as(usize, 0), result.summary.len);
-    try std.testing.expectEqual(@as(usize, 0), result.extracted_facts.len);
+test "parseSummaryResponse whitespace-only response" {
+    try std.testing.expectError(
+        error.InvalidSummaryFormat,
+        parseSummaryResponse(std.testing.allocator, "  \n\t  ", .{}),
+    );
 }
 
 test "parseSummaryResponse rejects unstructured summary" {

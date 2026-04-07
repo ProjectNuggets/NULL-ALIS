@@ -13,6 +13,7 @@ const config_types = @import("../config_types.zig");
 const config_module = @import("../config.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
+const context_report = @import("context_report.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const util = @import("../util.zig");
@@ -376,6 +377,26 @@ test "splitPrimaryModelRef rejects malformed values" {
     try std.testing.expect(splitPrimaryModelRef("provider/") == null);
 }
 
+test "lifecycleSummaryTimeoutSecs inherits message timeout when explicit lifecycle timeout is unset" {
+    const Stub = struct {
+        lifecycle_summarizer_timeout_secs: u64 = 0,
+        message_timeout_secs: u64 = 45,
+    };
+
+    var stub = Stub{};
+    try std.testing.expectEqual(@as(u64, 45), lifecycleSummaryTimeoutSecs(&stub));
+}
+
+test "lifecycleSummaryTimeoutSecs falls back to safer default when all timeouts are unset" {
+    const Stub = struct {
+        lifecycle_summarizer_timeout_secs: u64 = 0,
+        message_timeout_secs: u64 = 0,
+    };
+
+    var stub = Stub{};
+    try std.testing.expectEqual(@as(u64, 60), lifecycleSummaryTimeoutSecs(&stub));
+}
+
 fn setExecNodeId(self: anytype, value: ?[]const u8) !void {
     if (self.exec_node_id_owned and self.exec_node_id != null) {
         self.allocator.free(self.exec_node_id.?);
@@ -582,9 +603,9 @@ fn roleLabel(role: providers.Role) []const u8 {
 }
 
 fn lifecycleSummaryTimeoutSecs(self: anytype) u64 {
-    const hard_cap = if (self.lifecycle_summarizer_timeout_secs > 0) self.lifecycle_summarizer_timeout_secs else @as(u64, 8);
-    const configured = if (self.message_timeout_secs > 0) self.message_timeout_secs else hard_cap;
-    return @max(@as(u64, 1), @min(configured, hard_cap));
+    if (self.lifecycle_summarizer_timeout_secs > 0) return self.lifecycle_summarizer_timeout_secs;
+    if (self.message_timeout_secs > 0) return self.message_timeout_secs;
+    return 60;
 }
 
 fn effectiveSummarizerConfig(self: anytype) memory_mod.SummarizerConfig {
@@ -624,10 +645,52 @@ fn summarySectionValue(summary_text: []const u8, prefix: []const u8) []const u8 
     return "none";
 }
 
-fn buildStructuredFallbackSummary(self: anytype, checkpoint_content: []const u8) ?[]u8 {
-    const focus = firstCheckpointBullet(checkpoint_content, "recent_user:\n") orelse
-        firstCheckpointBullet(checkpoint_content, "recent_assistant:\n") orelse
-        "recent session recap";
+fn compactionCarrierSnippet(content: []const u8) ?[]const u8 {
+    const marker = "[Compaction summary]";
+    if (!std.mem.startsWith(u8, content, marker)) return null;
+
+    const body = if (content.len > marker.len and content[marker.len] == '\n')
+        content[marker.len + 1 ..]
+    else
+        content[marker.len..];
+    var iter = std.mem.splitScalar(u8, body, '\n');
+    while (iter.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "- ")) return line[2..];
+        return line;
+    }
+    return null;
+}
+
+fn fallbackFocusFromEntries(entries: []const memory_mod.MessageEntry) []const u8 {
+    var idx = entries.len;
+    while (idx > 0) {
+        idx -= 1;
+        const entry = entries[idx];
+        if (compactionCarrierSnippet(entry.content)) |snippet| return snippet;
+    }
+
+    idx = entries.len;
+    while (idx > 0) {
+        idx -= 1;
+        const entry = entries[idx];
+        if (std.mem.eql(u8, entry.role, "user") or std.mem.eql(u8, entry.role, "assistant")) {
+            const trimmed = std.mem.trim(u8, entry.content, " \t\r\n");
+            if (trimmed.len > 0) return trimmed;
+        }
+    }
+
+    return "recent session recap";
+}
+
+fn buildStructuredFallbackSummary(self: anytype, entries: []const memory_mod.MessageEntry, checkpoint_content: []const u8) ?[]u8 {
+    const focus = if (entries.len > 0)
+        fallbackFocusFromEntries(entries)
+    else
+        firstCheckpointBullet(checkpoint_content, "recent_user:\n") orelse
+            firstCheckpointBullet(checkpoint_content, "recent_assistant:\n") orelse
+            "recent session recap";
     return std.fmt.allocPrint(
         self.allocator,
         "focus: {s}\n" ++
@@ -657,9 +720,34 @@ fn buildSessionEndSummaryEntries(
         return full_entries;
     }
 
+    var compaction_start: ?usize = null;
+    var scan_idx: usize = self.history.items.len;
+    while (scan_idx > 0) {
+        scan_idx -= 1;
+        const item = self.history.items[scan_idx];
+        if (item.role != .assistant) continue;
+        if (compactionCarrierSnippet(item.content) != null) {
+            compaction_start = scan_idx;
+            break;
+        }
+    }
+
+    if (compaction_start) |start_idx| {
+        allocator.free(full_entries);
+        const count = self.history.items.len - start_idx;
+        const entries = try allocator.alloc(memory_mod.MessageEntry, count);
+        for (self.history.items[start_idx..], 0..) |item, idx| {
+            entries[idx] = .{
+                .role = roleLabel(item.role),
+                .content = item.content,
+            };
+        }
+        return entries;
+    }
+
     allocator.free(full_entries);
 
-    var selected: [4]usize = undefined;
+    var selected: [8]usize = undefined;
     var count: usize = 0;
     var idx = self.history.items.len;
     while (idx > 0 and count < selected.len) {
@@ -670,13 +758,16 @@ fn buildSessionEndSummaryEntries(
         count += 1;
     }
 
-    const entries = try allocator.alloc(memory_mod.MessageEntry, count + 1);
-    entries[0] = .{
-        .role = "system",
-        .content = checkpoint_content,
-    };
-
-    var out_idx: usize = 1;
+    const include_checkpoint = checkpoint_content.len > 0;
+    const entries = try allocator.alloc(memory_mod.MessageEntry, count + @intFromBool(include_checkpoint));
+    var out_idx: usize = 0;
+    if (include_checkpoint) {
+        entries[out_idx] = .{
+            .role = "system",
+            .content = checkpoint_content,
+        };
+        out_idx += 1;
+    }
     var rev = count;
     while (rev > 0) {
         rev -= 1;
@@ -854,6 +945,11 @@ fn emitLifecycleSummarizerStage(self: anytype, duration_ms: u64, summarized_coun
     self.observer.recordEvent(&event);
 }
 
+fn shouldUseDeterministicSessionSummary(reason: []const u8) bool {
+    return std.mem.eql(u8, reason, "compaction:auto") or
+        std.mem.eql(u8, reason, "summary_seed:auto");
+}
+
 fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, session_id: []const u8, reason: []const u8, now_s: i64, now_iso: []const u8) bool {
     const mem = self.mem orelse return false;
     const rt = self.mem_rt;
@@ -868,22 +964,35 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         emitLifecycleSummarizerStage(self, duration_ms, entries.len);
     }
 
-    const prompt = memory_mod.buildSummarizationPrompt(self.allocator, entries, entries.len) catch return false;
-    defer self.allocator.free(prompt);
-
-    const summary_system = "Summarize the ended session into a compact continuity object. Preserve focus, decisions, open loops, next steps, and long-lived facts. Follow the required plain-text structure exactly.";
-    var summary_messages: [2]providers.ChatMessage = .{
-        .{ .role = .system, .content = summary_system },
-        .{ .role = .user, .content = prompt },
-    };
-    const timeout_secs = lifecycleSummaryTimeoutSecs(self);
-
     var summary_text_owned: ?[]u8 = null;
     defer if (summary_text_owned) |owned| self.allocator.free(owned);
 
     var parsed_summary: ?memory_mod.SummaryResult = null;
     defer if (parsed_summary) |*result| result.deinit(self.allocator);
     const content = blk: {
+        if (shouldUseDeterministicSessionSummary(reason)) {
+            summary_text_owned = buildStructuredFallbackSummary(self, entries, checkpoint_content);
+            if (summary_text_owned) |owned| {
+                log.info("memory.session_summary status=deterministic session={s} reason={s} entries={d}", .{
+                    session_id,
+                    reason,
+                    entries.len,
+                });
+                break :blk owned;
+            }
+            return false;
+        }
+
+        const prompt = memory_mod.buildSummarizationPrompt(self.allocator, entries, entries.len) catch return false;
+        defer self.allocator.free(prompt);
+
+        const summary_system = "Summarize the ended session into a compact continuity object. Preserve focus, decisions, open loops, next steps, and long-lived facts. Follow the required plain-text structure exactly.";
+        var summary_messages: [2]providers.ChatMessage = .{
+            .{ .role = .system, .content = summary_system },
+            .{ .role = .user, .content = prompt },
+        };
+        const timeout_secs = lifecycleSummaryTimeoutSecs(self);
+
         var response = self.provider.chat(
             self.allocator,
             .{
@@ -896,7 +1005,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             self.model_name,
             0.2,
         ) catch {
-            summary_text_owned = buildStructuredFallbackSummary(self, checkpoint_content);
+            summary_text_owned = buildStructuredFallbackSummary(self, entries, checkpoint_content);
             if (summary_text_owned) |owned| {
                 log.warn("memory.session_summary fallback=structured reason=provider_error session={s} reason_tag={s}", .{
                     session_id,
@@ -923,7 +1032,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         }
 
         parsed_summary = memory_mod.parseSummaryResponse(self.allocator, response.contentOrEmpty(), summarizer_cfg) catch {
-            summary_text_owned = buildStructuredFallbackSummary(self, checkpoint_content);
+            summary_text_owned = buildStructuredFallbackSummary(self, entries, checkpoint_content);
             if (summary_text_owned) |owned| {
                 log.warn("memory.session_summary fallback=structured reason=parse_error session={s} reason_tag={s}", .{
                     session_id,
@@ -1012,9 +1121,13 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
 }
 
 pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
-    const mem = self.mem orelse return;
-    const session_id = self.memory_session_id orelse return;
-    if (session_id.len == 0) return;
+    _ = persistSessionCheckpointDetailed(self, reason);
+}
+
+pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool {
+    const mem = self.mem orelse return false;
+    const session_id = self.memory_session_id orelse return false;
+    if (session_id.len == 0) return false;
 
     var user_count: usize = 0;
     var assistant_count: usize = 0;
@@ -1022,14 +1135,14 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
         if (item.role == .user) user_count += 1;
         if (item.role == .assistant) assistant_count += 1;
     }
-    if (user_count == 0 and assistant_count == 0) return;
+    if (user_count == 0 and assistant_count == 0) return false;
 
     const now_s = std.time.timestamp();
     var ts_buf: [32]u8 = undefined;
     const now_iso = util.timestamp(&ts_buf);
 
     var key_buf: [96]u8 = undefined;
-    const checkpoint_key = std.fmt.bufPrint(&key_buf, "session_checkpoint_{d}", .{now_s}) catch return;
+    const checkpoint_key = std.fmt.bufPrint(&key_buf, "session_checkpoint_{d}", .{now_s}) catch return false;
 
     var content: std.ArrayListUnmanaged(u8) = .empty;
     defer content.deinit(self.allocator);
@@ -1037,16 +1150,16 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
     w.print(
         "type=session_checkpoint\nreason={s}\nsession={s}\nmodel={s}\nat={s}\ncounts.user={d}\ncounts.assistant={d}\n\n",
         .{ reason, session_id, self.model_name, now_iso, user_count, assistant_count },
-    ) catch return;
-    w.writeAll("recent_user:\n") catch return;
-    appendRecentRoleSnippets(w, self.history.items, .user, 3, 220) catch return;
-    w.writeAll("\nrecent_assistant:\n") catch return;
-    appendRecentRoleSnippets(w, self.history.items, .assistant, 3, 220) catch return;
+    ) catch return false;
+    w.writeAll("recent_user:\n") catch return false;
+    appendRecentRoleSnippets(w, self.history.items, .user, 3, 220) catch return false;
+    w.writeAll("\nrecent_assistant:\n") catch return false;
+    appendRecentRoleSnippets(w, self.history.items, .assistant, 3, 220) catch return false;
 
-    const checkpoint_content = content.toOwnedSlice(self.allocator) catch return;
+    const checkpoint_content = content.toOwnedSlice(self.allocator) catch return false;
     defer self.allocator.free(checkpoint_content);
 
-    mem.store(checkpoint_key, checkpoint_content, .daily, null) catch return;
+    mem.store(checkpoint_key, checkpoint_content, .daily, null) catch return false;
     if (self.mem_rt) |rt| {
         rt.syncVectorAfterStore(self.allocator, checkpoint_key, checkpoint_content);
     }
@@ -1067,12 +1180,13 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
         checkpoint_key,
         summary_key,
         now_iso,
-    ) catch return;
+    ) catch return false;
     defer self.allocator.free(anchor_content);
-    mem.store("context_anchor_current", anchor_content, .core, null) catch return;
+    mem.store("context_anchor_current", anchor_content, .core, null) catch return false;
     if (self.mem_rt) |rt| {
         rt.syncVectorAfterStore(self.allocator, "context_anchor_current", anchor_content);
     }
+    return summary_written;
 }
 
 fn clearSessionState(self: anytype, reason: []const u8) void {
@@ -1703,39 +1817,16 @@ fn handleAllowlistCommand(self: anytype, arg: []const u8) ![]const u8 {
 
 fn handleContextCommand(self: anytype, arg: []const u8) ![]const u8 {
     const mode = firstToken(arg);
+    const report = context_report.fromAgent(self);
     if (std.ascii.eqlIgnoreCase(mode, "json")) {
-        return try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"model\":\"{s}\",\"history_messages\":{d},\"token_estimate\":{d},\"tools\":{d}}}",
-            .{ self.model_name, self.history.items.len, self.tokenEstimate(), self.tools.len },
-        );
+        return try context_report.formatJson(self.allocator, report);
     }
 
     if (std.ascii.eqlIgnoreCase(mode, "detail")) {
-        var sys: usize = 0;
-        var usr: usize = 0;
-        var asst: usize = 0;
-        var tool: usize = 0;
-        for (self.history.items) |entry| {
-            switch (entry.role) {
-                .system => sys += 1,
-                .user => usr += 1,
-                .assistant => asst += 1,
-                .tool => tool += 1,
-            }
-        }
-        return try std.fmt.allocPrint(
-            self.allocator,
-            "Context detail:\n  model: {s}\n  messages: {d}\n  token_estimate: {d}\n  tools: {d}\n  by_role: system={d} user={d} assistant={d} tool={d}",
-            .{ self.model_name, self.history.items.len, self.tokenEstimate(), self.tools.len, sys, usr, asst, tool },
-        );
+        return try context_report.formatDetail(self.allocator, report);
     }
 
-    return try std.fmt.allocPrint(
-        self.allocator,
-        "Context: messages={d}, token_estimate={d}, tools={d}",
-        .{ self.history.items.len, self.tokenEstimate(), self.tools.len },
-    );
+    return try context_report.formatSummary(self.allocator, report);
 }
 
 fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -2947,21 +3038,23 @@ pub fn composeFinalReply(
     reasoning_content: ?[]const u8,
     usage: providers.TokenUsage,
 ) ![]const u8 {
-    const show_reasoning = self.reasoning_mode != .off and reasoning_content != null and reasoning_content.?.len > 0;
+    const trimmed_base = std.mem.trim(u8, base_text, " \t\r\n");
+    const final_base = if (trimmed_base.len > 0) trimmed_base else base_text;
+    const show_reasoning = self.reasoning_mode == .on and reasoning_content != null and reasoning_content.?.len > 0;
     if (!show_reasoning and self.usage_mode == .off) {
-        return try self.allocator.dupe(u8, base_text);
+        return try self.allocator.dupe(u8, final_base);
     }
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
     const w = out.writer(self.allocator);
 
+    try w.writeAll(final_base);
+
     if (show_reasoning) {
-        try w.writeAll("Reasoning:\n");
+        try w.writeAll("\n\nReasoning:\n");
         try w.writeAll(reasoning_content.?);
-        try w.writeAll("\n\n");
     }
-    try w.writeAll(base_text);
 
     switch (self.usage_mode) {
         .off => {},
@@ -3067,7 +3160,12 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "tts") or isSlashName(cmd, "voice")) return try handleTtsCommand(self, cmd.arg);
     if (isSlashName(cmd, "stop")) return try handleStopCommand(self);
     if (isSlashName(cmd, "compact")) {
-        if (self.forceCompressHistory()) {
+        if (try self.manualCompactHistory()) {
+            self.last_turn_compacted = true;
+            self.last_turn_context.durable_continuity_refreshed = persistSessionCheckpointDetailed(self, "compaction:manual");
+            if (self.last_turn_context.durable_continuity_refreshed) {
+                return try self.allocator.dupe(u8, "Context compacted and continuity refreshed.");
+            }
             return try self.allocator.dupe(u8, "Context compacted.");
         }
         return try self.allocator.dupe(u8, "Nothing to compact.");

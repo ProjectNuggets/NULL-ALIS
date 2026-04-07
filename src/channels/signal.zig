@@ -35,6 +35,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
+const TYPING_ALLOCATOR = std.heap.c_allocator;
 const config_types = @import("../config_types.zig");
 const sse_client = @import("../sse_client.zig");
 const platform = @import("../platform.zig");
@@ -718,8 +719,8 @@ pub const SignalChannel = struct {
         var url_buf: [1024]u8 = undefined;
         const url = self.rpcUrl(&url_buf) catch return;
 
-        const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch return;
-        self.allocator.free(resp);
+        const resp = root.http_util.curlPost(TYPING_ALLOCATOR, url, rpc_body, &.{}) catch return;
+        TYPING_ALLOCATOR.free(resp);
     }
 
     pub fn startTyping(self: *SignalChannel, target: []const u8) !void {
@@ -727,11 +728,11 @@ pub const SignalChannel = struct {
 
         try self.stopTyping(target);
 
-        const key_copy = try self.allocator.dupe(u8, target);
-        errdefer self.allocator.free(key_copy);
+        const key_copy = try TYPING_ALLOCATOR.dupe(u8, target);
+        errdefer TYPING_ALLOCATOR.free(key_copy);
 
-        const task = try self.allocator.create(TypingTask);
-        errdefer self.allocator.destroy(task);
+        const task = try TYPING_ALLOCATOR.create(TypingTask);
+        errdefer TYPING_ALLOCATOR.destroy(task);
         task.* = .{
             .channel = self,
             .target = key_copy,
@@ -762,10 +763,10 @@ pub const SignalChannel = struct {
         if (removed_task) |task| {
             task.stop_requested.store(true, .release);
             if (task.thread) |t| t.join();
-            self.allocator.destroy(task);
+            TYPING_ALLOCATOR.destroy(task);
         }
         if (removed_key) |key| {
-            self.allocator.free(key);
+            TYPING_ALLOCATOR.free(key);
         }
     }
 
@@ -780,8 +781,8 @@ pub const SignalChannel = struct {
             const task = entry.value_ptr.*;
             task.stop_requested.store(true, .release);
             if (task.thread) |t| t.join();
-            self.allocator.destroy(task);
-            self.allocator.free(@constCast(entry.key_ptr.*));
+            TYPING_ALLOCATOR.destroy(task);
+            TYPING_ALLOCATOR.free(@constCast(entry.key_ptr.*));
         }
         handles.deinit(self.allocator);
     }

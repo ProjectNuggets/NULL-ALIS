@@ -76,6 +76,13 @@ pub const OpenAiCompatibleProvider = struct {
         return s;
     }
 
+    fn mapRequestError(err: anyerror) anyerror {
+        return switch (err) {
+            error.Timeout => error.Timeout,
+            else => error.CompatibleApiError,
+        };
+    }
+
     /// Build the full URL for chat completions.
     /// Detects if base_url already ends with /chat/completions.
     pub fn chatCompletionsUrl(self: OpenAiCompatibleProvider, allocator: std.mem.Allocator) ![]const u8 {
@@ -229,6 +236,7 @@ pub const OpenAiCompatibleProvider = struct {
         system_prompt: ?[]const u8,
         message: []const u8,
         model: []const u8,
+        timeout_secs: u64,
     ) ![]const u8 {
         const url = try self.responsesUrl(allocator);
         defer allocator.free(url);
@@ -241,6 +249,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
+        const timeout_ms = requestTimeoutMs(timeout_secs);
         const response = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
@@ -249,17 +258,17 @@ pub const OpenAiCompatibleProvider = struct {
                 .url = url,
                 .headers = &.{ auth_hdr, "Content-Type: application/json" },
                 .body = body,
-                .timeout_ms = 30_000,
+                .timeout_ms = timeout_ms,
                 .subsystem = .providers,
-            }) catch return error.CompatibleApiError;
+            }) catch |err| return mapRequestError(err);
         } else root.request_with_mode(allocator, .{}, .{
             .method = "POST",
             .url = url,
             .headers = &.{"Content-Type: application/json"},
             .body = body,
-            .timeout_ms = 30_000,
+            .timeout_ms = timeout_ms,
             .subsystem = .providers,
-        }) catch return error.CompatibleApiError;
+        }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
 
         return extractResponsesText(allocator, response.body);
@@ -523,6 +532,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
+        const timeout_ms = requestTimeoutMs(0);
         const response = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
@@ -531,23 +541,23 @@ pub const OpenAiCompatibleProvider = struct {
                 .url = url,
                 .headers = &.{ auth_hdr, "Content-Type: application/json" },
                 .body = body,
-                .timeout_ms = 30_000,
+                .timeout_ms = timeout_ms,
                 .subsystem = .providers,
-            }) catch return error.CompatibleApiError;
+            }) catch |err| return mapRequestError(err);
         } else root.request_with_mode(allocator, .{}, .{
             .method = "POST",
             .url = url,
             .headers = &.{"Content-Type: application/json"},
             .body = body,
-            .timeout_ms = 30_000,
+            .timeout_ms = timeout_ms,
             .subsystem = .providers,
-        }) catch return error.CompatibleApiError;
+        }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
 
         return parseTextResponse(allocator, response.body) catch |err| {
             // If chat completions failed and responses fallback is enabled, try the responses API
             if (self.supports_responses_fallback) {
-                return self.chatViaResponses(allocator, eff_system, merged_msg orelse message, effective_model) catch {
+                return self.chatViaResponses(allocator, eff_system, merged_msg orelse message, effective_model, 0) catch {
                     return err;
                 };
             }
@@ -576,7 +586,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        const timeout_ms: u32 = if (request.timeout_secs == 0) 30_000 else @intCast(@min(request.timeout_secs * 1000, std.math.maxInt(u32)));
+        const timeout_ms = requestTimeoutMs(request.timeout_secs);
         const response = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
@@ -587,7 +597,7 @@ pub const OpenAiCompatibleProvider = struct {
                 .body = body,
                 .timeout_ms = timeout_ms,
                 .subsystem = .providers,
-            }) catch return error.CompatibleApiError;
+            }) catch |err| return mapRequestError(err);
         } else root.request_with_mode(allocator, .{}, .{
             .method = "POST",
             .url = url,
@@ -595,7 +605,7 @@ pub const OpenAiCompatibleProvider = struct {
             .body = body,
             .timeout_ms = timeout_ms,
             .subsystem = .providers,
-        }) catch return error.CompatibleApiError;
+        }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
 
         return parseNativeResponse(allocator, response.body);
@@ -1131,6 +1141,11 @@ test "supportsStreaming returns true for compatible" {
     try std.testing.expect(prov.supportsStreaming());
 }
 
+test "compatible requestTimeoutMs honors explicit timeout" {
+    try std.testing.expectEqual(@as(u32, 30_000), requestTimeoutMs(0));
+    try std.testing.expectEqual(@as(u32, 120_000), requestTimeoutMs(120));
+}
+
 test "vtable has stream_chat not null" {
     var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer);
     const prov = p.provider();
@@ -1458,4 +1473,13 @@ test "merge_system_into_user streaming body also merges" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     const content = messages.items[0].object.get("content").?.string;
     try std.testing.expect(std.mem.indexOf(u8, content, "[System: Be concise]") != null);
+}
+pub fn requestTimeoutMs(timeout_secs: u64) u32 {
+    if (timeout_secs == 0) return 30_000;
+    return @intCast(@min(timeout_secs * 1000, std.math.maxInt(u32)));
+}
+
+test "mapRequestError preserves timeout" {
+    try std.testing.expect(OpenAiCompatibleProvider.mapRequestError(error.Timeout) == error.Timeout);
+    try std.testing.expect(OpenAiCompatibleProvider.mapRequestError(error.CurlFailed) == error.CompatibleApiError);
 }

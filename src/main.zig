@@ -2900,6 +2900,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
             const reply = session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
+                    error.Timeout => "The model request timed out. Please try again.",
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
                     error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
@@ -3225,6 +3226,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             const reply = session_mgr.processMessage(session_key, msg.content, null) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
+                    error.Timeout => "The model request timed out. Please try again.",
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
                     error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",

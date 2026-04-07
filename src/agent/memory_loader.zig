@@ -1,4 +1,5 @@
 const std = @import("std");
+const config_types = @import("../config_types.zig");
 const memory_mod = @import("../memory/root.zig");
 const multimodal = @import("../multimodal.zig");
 const Memory = memory_mod.Memory;
@@ -10,14 +11,57 @@ const MemoryRuntime = memory_mod.MemoryRuntime;
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Default number of memory entries to recall per query.
-const DEFAULT_RECALL_LIMIT: usize = 5;
+const DEFAULT_RECALL_LIMIT: usize = config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT;
 const GLOBAL_RECALL_CANDIDATE_LIMIT: usize = 64;
-const TIMELINE_FALLBACK_LIMIT: usize = 2;
+const WARM_CANDIDATE_FETCH_LIMIT: usize = @max(DEFAULT_RECALL_LIMIT, GLOBAL_RECALL_CANDIDATE_LIMIT);
+const TIMELINE_FALLBACK_LIMIT: usize = config_types.DEFAULT_MEMORY_TIMELINE_FALLBACK_LIMIT;
+const GLOBAL_RECALL_TOKEN_LIMIT: usize = 6;
+const GLOBAL_RECALL_TOKEN_SEPARATORS = " \t\n\r,.;:!?()[]{}<>\"'/-_";
 
 /// Maximum total bytes of memory context injected into a message.
 /// Prevents a few large entries from blowing the token budget.
 /// ~4000 chars ~ 1000 tokens — a safe ceiling for context injection.
-const MAX_CONTEXT_BYTES: usize = 4_000;
+const MAX_CONTEXT_BYTES: usize = config_types.DEFAULT_MEMORY_CONTEXT_MAX_BYTES;
+const CONTINUITY_BUCKET_MAX_BYTES: usize = 1200;
+const CONTINUITY_ENTRY_MAX_BYTES: usize = 1000;
+const SEMANTIC_BUCKET_MIN_ENTRIES: usize = 4;
+const SEMANTIC_BUCKET_MAX_BYTES: usize = 2200;
+const SEMANTIC_ENTRY_MAX_BYTES: usize = 420;
+const SEARCH_FALLBACK_BUCKET_MAX_ENTRIES: usize = 6;
+const SEARCH_FALLBACK_BUCKET_MAX_BYTES: usize = 1600;
+const FALLBACK_BUCKET_MAX_ENTRIES: usize = 2;
+const FALLBACK_BUCKET_MAX_BYTES: usize = 700;
+const FALLBACK_ENTRY_MAX_BYTES: usize = 320;
+
+pub const SelectionStats = struct {
+    available: bool = false,
+    candidate_count: usize = 0,
+    global_candidate_count: usize = 0,
+    summary_latest_used: bool = false,
+    context_anchor_used: bool = false,
+    durable_fact_count: usize = 0,
+    timeline_summary_count: usize = 0,
+    search_match_count: usize = 0,
+    global_fallback_count: usize = 0,
+    continuity_bucket_entries: usize = 0,
+    continuity_bucket_bytes: usize = 0,
+    semantic_bucket_entries: usize = 0,
+    semantic_bucket_bytes: usize = 0,
+    fallback_bucket_entries: usize = 0,
+    fallback_bucket_bytes: usize = 0,
+    context_bytes: usize = 0,
+    injected: bool = false,
+};
+
+pub const ContextResult = struct {
+    context: []const u8,
+    stats: SelectionStats,
+};
+
+pub const EnrichmentResult = struct {
+    text: []const u8,
+    stats: SelectionStats,
+};
 
 /// Truncate a UTF-8 slice to at most `max_len` bytes without splitting
 /// a multi-byte sequence. Backs up over trailing continuation bytes (0x80..0xBF).
@@ -33,6 +77,99 @@ fn containsKey(entries: []const MemoryEntry, key: []const u8) bool {
         if (std.mem.eql(u8, entry.key, key)) return true;
     }
     return false;
+}
+
+fn containsCandidateKey(entries: []const memory_mod.RetrievalCandidate, key: []const u8) bool {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.key, key)) return true;
+    }
+    return false;
+}
+
+fn cloneCategory(allocator: std.mem.Allocator, category: memory_mod.MemoryCategory) !memory_mod.MemoryCategory {
+    return switch (category) {
+        .custom => |name| memory_mod.MemoryCategory{ .custom = try allocator.dupe(u8, name) },
+        else => category,
+    };
+}
+
+fn cloneEntry(allocator: std.mem.Allocator, entry: MemoryEntry) !MemoryEntry {
+    const id = try allocator.dupe(u8, entry.id);
+    errdefer allocator.free(id);
+    const key = try allocator.dupe(u8, entry.key);
+    errdefer allocator.free(key);
+    const content = try allocator.dupe(u8, entry.content);
+    errdefer allocator.free(content);
+    const timestamp = try allocator.dupe(u8, entry.timestamp);
+    errdefer allocator.free(timestamp);
+    const category = try cloneCategory(allocator, entry.category);
+    errdefer switch (category) {
+        .custom => |name| allocator.free(name),
+        else => {},
+    };
+    const session_id = if (entry.session_id) |sid|
+        try allocator.dupe(u8, sid)
+    else
+        null;
+    errdefer if (session_id) |sid| allocator.free(sid);
+
+    return MemoryEntry{
+        .id = id,
+        .key = key,
+        .content = content,
+        .category = category,
+        .timestamp = timestamp,
+        .session_id = session_id,
+        .score = entry.score,
+    };
+}
+
+fn containsIgnoreCase(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |item| {
+        if (std.ascii.eqlIgnoreCase(item, needle)) return true;
+    }
+    return false;
+}
+
+fn loadGlobalKeywordFallbackEntries(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    user_message: []const u8,
+    limit: usize,
+    current_session_id: ?[]const u8,
+) ![]MemoryEntry {
+    var merged: std.ArrayListUnmanaged(MemoryEntry) = .empty;
+    errdefer {
+        for (merged.items) |*entry| entry.deinit(allocator);
+        merged.deinit(allocator);
+    }
+
+    var seen_terms: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer seen_terms.deinit(allocator);
+
+    var iter = std.mem.tokenizeAny(u8, user_message, GLOBAL_RECALL_TOKEN_SEPARATORS);
+    while (iter.next()) |term| {
+        if (term.len < 3) continue;
+        if (containsIgnoreCase(seen_terms.items, term)) continue;
+        try seen_terms.append(allocator, term);
+        if (seen_terms.items.len > GLOBAL_RECALL_TOKEN_LIMIT) break;
+
+        const recalled = mem.recall(allocator, term, limit, null) catch continue;
+        defer memory_mod.freeEntries(allocator, recalled);
+
+        for (recalled) |entry| {
+            if (current_session_id) |session_id| {
+                if (entry.session_id) |entry_session_id| {
+                    if (std.mem.eql(u8, entry_session_id, session_id)) continue;
+                }
+            }
+            if (containsKey(merged.items, entry.key)) continue;
+            try merged.append(allocator, try cloneEntry(allocator, entry));
+            if (merged.items.len >= limit) return try merged.toOwnedSlice(allocator);
+        }
+    }
+
+    return try merged.toOwnedSlice(allocator);
 }
 
 fn isDurableFactKey(key: []const u8) bool {
@@ -76,6 +213,9 @@ fn sanitizeMemoryText(allocator: std.mem.Allocator, text: []const u8) ![]const u
 fn ensureHeader(w: anytype, wrote_header: *bool) !void {
     if (!wrote_header.*) {
         try w.writeAll("[Memory context]\n");
+        try w.writeAll("Retrieved continuity from the canonical runtime memory store for this turn.\n");
+        try w.writeAll("If a relevant fact appears below, use it instead of saying you do not remember.\n");
+        try w.writeAll("Direct user corrections, tool results, and fresher runtime state override this memory.\n");
         wrote_header.* = true;
     }
 }
@@ -86,9 +226,10 @@ fn appendContextLine(
     wrote_header: *bool,
     key: []const u8,
     text: []const u8,
+    clip_limit: usize,
 ) !void {
     try ensureHeader(w, wrote_header);
-    const clipped = truncateUtf8(text, MAX_CONTEXT_BYTES / 2);
+    const clipped = truncateUtf8(text, clip_limit);
     const sanitized = try sanitizeMemoryText(allocator, clipped);
     defer allocator.free(sanitized);
     try std.fmt.format(w, "- {s}: {s}\n", .{ key, sanitized });
@@ -100,12 +241,53 @@ fn appendDirectEntry(
     w: anytype,
     wrote_header: *bool,
     key: []const u8,
+    clip_limit: usize,
 ) !bool {
     const entry = (try mem.get(allocator, key)) orelse return false;
     defer entry.deinit(allocator);
-    if (memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content) or memory_mod.isMarkdownLineKey(entry.key)) return false;
-    try appendContextLine(allocator, w, wrote_header, entry.key, entry.content);
+    if (shouldSkipLowSignalEntry(entry.key, entry.content)) return false;
+    try appendContextLine(allocator, w, wrote_header, entry.key, entry.content, clip_limit);
     return true;
+}
+
+fn containsString(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
+}
+
+fn markSeenKey(allocator: std.mem.Allocator, seen_keys: *std.ArrayListUnmanaged([]const u8), key: []const u8) !void {
+    if (containsString(seen_keys.items, key)) return;
+    try seen_keys.append(allocator, key);
+}
+
+fn isSemanticContinuityKey(key: []const u8) bool {
+    return isDurableFactKey(key) or isTimelineSummaryKey(key) or isSummaryLatestKey(key);
+}
+
+fn isNegativeDiagnosticKeyOrContent(content: []const u8) bool {
+    const negative_needles = [_][]const u8{
+        "no embeddings",
+        "semantic recall returns nothing",
+        "timeline returns nothing",
+        "recall broken",
+        "no structured session summaries",
+        "the underlying store is empty",
+        "memory_recall returns nothing",
+        "no embeddings in pgvector",
+    };
+    for (negative_needles) |needle| {
+        if (std.ascii.indexOfIgnoreCase(content, needle) != null) return true;
+    }
+    return false;
+}
+
+fn shouldSkipLowSignalEntry(key: []const u8, content: []const u8) bool {
+    return memory_mod.isInternalMemoryEntryKeyOrContent(key, content) or
+        memory_mod.isMarkdownLineKey(key) or
+        std.mem.eql(u8, key, "context_anchor_current") or
+        isNegativeDiagnosticKeyOrContent(content);
 }
 
 fn shouldSkipGenericEntry(
@@ -115,17 +297,47 @@ fn shouldSkipGenericEntry(
     current_timeline_prefix: ?[]const u8,
     has_priority_context: bool,
 ) bool {
-    if (memory_mod.isInternalMemoryEntryKeyOrContent(key, content) or memory_mod.isMarkdownLineKey(key)) return true;
-    if (std.mem.eql(u8, key, "context_anchor_current")) return true;
+    if (shouldSkipLowSignalEntry(key, content)) return true;
     if (summary_latest_key) |latest_key| {
         if (std.mem.eql(u8, key, latest_key)) return true;
     }
-    if (isSummaryLatestKey(key) or isSessionSummaryKey(key) or isTimelineSummaryKey(key) or isDurableFactKey(key)) return true;
+    if (isSessionSummaryKey(key)) return true;
     if (has_priority_context and isSessionCheckpointKey(key)) return true;
     if (current_timeline_prefix) |prefix| {
         if (std.mem.startsWith(u8, key, prefix)) return true;
     }
     return false;
+}
+
+fn canAppendToBucket(
+    current_total_bytes: usize,
+    bucket_bytes: usize,
+    bucket_entries: usize,
+    max_bucket_bytes: usize,
+    max_bucket_entries: ?usize,
+    projected_additional_bytes: usize,
+) bool {
+    if (current_total_bytes >= MAX_CONTEXT_BYTES) return false;
+    if (bucket_bytes >= max_bucket_bytes) return false;
+    if (max_bucket_entries) |limit| {
+        if (bucket_entries >= limit) return false;
+    }
+    return bucket_bytes + projected_additional_bytes <= max_bucket_bytes and current_total_bytes + projected_additional_bytes <= MAX_CONTEXT_BYTES;
+}
+
+fn appendBucketEntry(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    wrote_header: *bool,
+    key: []const u8,
+    text: []const u8,
+    clip_limit: usize,
+    bucket_bytes: *usize,
+) !void {
+    const before = buf.items.len;
+    const w = buf.writer(allocator);
+    try appendContextLine(allocator, w, wrote_header, key, text, clip_limit);
+    bucket_bytes.* += buf.items.len - before;
 }
 
 /// Build a memory context preamble by searching stored memories.
@@ -138,22 +350,27 @@ fn shouldSkipGenericEntry(
 /// ```
 ///
 /// Returns an empty owned string if no relevant memories are found.
-pub fn loadContext(
+fn loadContextDetailed(
     allocator: std.mem.Allocator,
     mem: Memory,
     user_message: []const u8,
     session_id: ?[]const u8,
-) ![]const u8 {
-    const scoped_entries = mem.recall(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
-        return try allocator.dupe(u8, "");
+) !ContextResult {
+    var stats = SelectionStats{ .available = true };
+    const scoped_entries = mem.recall(allocator, user_message, WARM_CANDIDATE_FETCH_LIMIT, session_id) catch {
+        return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     };
     defer memory_mod.freeEntries(allocator, scoped_entries);
+    stats.candidate_count = scoped_entries.len;
 
     // When scoped recall is enabled, also include global (session_id = null) memory
     // so long-term facts from memory_store remain visible in session chats.
     var global_entries: ?[]MemoryEntry = null;
-    if (session_id != null and scoped_entries.len < DEFAULT_RECALL_LIMIT) {
+    if (session_id != null) {
         global_entries = mem.recall(allocator, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch null;
+    }
+    if (global_entries) |entries| {
+        stats.global_candidate_count = entries.len;
     }
     defer if (global_entries) |entries| memory_mod.freeEntries(allocator, entries);
 
@@ -165,6 +382,11 @@ pub fn loadContext(
     var wrote_header = false;
     var has_priority_context = false;
     var timeline_added: usize = 0;
+    var seen_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer seen_keys.deinit(allocator);
+    var continuity_bytes: usize = 0;
+    var semantic_bytes: usize = 0;
+    var fallback_bytes: usize = 0;
 
     const summary_latest_key = try summaryLatestKeyForSession(allocator, session_id);
     defer if (summary_latest_key) |key| allocator.free(key);
@@ -172,23 +394,31 @@ pub fn loadContext(
     defer if (current_timeline_prefix) |prefix| allocator.free(prefix);
 
     if (summary_latest_key) |key| {
-        if (try appendDirectEntry(allocator, mem, w, &wrote_header, key)) {
+        if (try appendDirectEntry(allocator, mem, w, &wrote_header, key, CONTINUITY_ENTRY_MAX_BYTES)) {
             appended += 1;
             has_priority_context = true;
+            stats.summary_latest_used = true;
+            try markSeenKey(allocator, &seen_keys, key);
+            continuity_bytes = @min(buf.items.len, CONTINUITY_BUCKET_MAX_BYTES);
+            stats.continuity_bucket_entries = 1;
+            stats.continuity_bucket_bytes = continuity_bytes;
         }
-    }
-    if (try appendDirectEntry(allocator, mem, w, &wrote_header, "context_anchor_current")) {
-        appended += 1;
-        has_priority_context = true;
     }
 
     if (global_entries) |entries| {
         for (entries) |entry| {
             if (!isDurableFactKey(entry.key)) continue;
             if (containsKey(scoped_entries, entry.key)) continue;
-            try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+            if (containsString(seen_keys.items, entry.key)) continue;
+            const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
+            if (!canAppendToBucket(buf.items.len, semantic_bytes, stats.semantic_bucket_entries, SEMANTIC_BUCKET_MAX_BYTES, null, estimated_bytes)) break;
+            try appendBucketEntry(allocator, &buf, &wrote_header, entry.key, entry.content, SEMANTIC_ENTRY_MAX_BYTES, &semantic_bytes);
             appended += 1;
             has_priority_context = true;
+            stats.durable_fact_count += 1;
+            stats.semantic_bucket_entries += 1;
+            stats.semantic_bucket_bytes = semantic_bytes;
+            try markSeenKey(allocator, &seen_keys, entry.key);
             if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
         }
     }
@@ -200,10 +430,17 @@ pub fn loadContext(
                 if (current_timeline_prefix) |prefix| {
                     if (std.mem.startsWith(u8, entry.key, prefix)) continue;
                 }
-                try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+                if (containsString(seen_keys.items, entry.key)) continue;
+                const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
+                if (!canAppendToBucket(buf.items.len, semantic_bytes, stats.semantic_bucket_entries, SEMANTIC_BUCKET_MAX_BYTES, null, estimated_bytes)) break;
+                try appendBucketEntry(allocator, &buf, &wrote_header, entry.key, entry.content, SEMANTIC_ENTRY_MAX_BYTES, &semantic_bytes);
                 appended += 1;
                 timeline_added += 1;
                 has_priority_context = true;
+                stats.timeline_summary_count += 1;
+                stats.semantic_bucket_entries += 1;
+                stats.semantic_bucket_bytes = semantic_bytes;
+                try markSeenKey(allocator, &seen_keys, entry.key);
                 if (timeline_added >= TIMELINE_FALLBACK_LIMIT or appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
         }
@@ -211,8 +448,26 @@ pub fn loadContext(
 
     for (scoped_entries) |entry| {
         if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
-        try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
-        appended += 1;
+        if (containsString(seen_keys.items, entry.key)) continue;
+        if (isSemanticContinuityKey(entry.key)) {
+            const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
+            if (!canAppendToBucket(buf.items.len, semantic_bytes, stats.semantic_bucket_entries, SEMANTIC_BUCKET_MAX_BYTES, null, estimated_bytes)) continue;
+            try appendBucketEntry(allocator, &buf, &wrote_header, entry.key, entry.content, SEMANTIC_ENTRY_MAX_BYTES, &semantic_bytes);
+            stats.semantic_bucket_entries += 1;
+            stats.semantic_bucket_bytes = semantic_bytes;
+            stats.search_match_count += 1;
+            appended += 1;
+            try markSeenKey(allocator, &seen_keys, entry.key);
+        } else {
+            const estimated_bytes = @min(entry.content.len, FALLBACK_ENTRY_MAX_BYTES) + entry.key.len + 8;
+            if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, FALLBACK_BUCKET_MAX_BYTES, FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) continue;
+            try appendBucketEntry(allocator, &buf, &wrote_header, entry.key, entry.content, FALLBACK_ENTRY_MAX_BYTES, &fallback_bytes);
+            stats.fallback_bucket_entries += 1;
+            stats.fallback_bucket_bytes = fallback_bytes;
+            stats.global_fallback_count += 1;
+            appended += 1;
+            try markSeenKey(allocator, &seen_keys, entry.key);
+        }
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
 
@@ -222,47 +477,73 @@ pub fn loadContext(
                 if (entry.session_id != null) continue; // keep scoped isolation (no cross-session bleed)
                 if (containsKey(scoped_entries, entry.key)) continue;
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
-                try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+                if (containsString(seen_keys.items, entry.key)) continue;
+                const estimated_bytes = @min(entry.content.len, FALLBACK_ENTRY_MAX_BYTES) + entry.key.len + 8;
+                if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, FALLBACK_BUCKET_MAX_BYTES, FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) break;
+                try appendBucketEntry(allocator, &buf, &wrote_header, entry.key, entry.content, FALLBACK_ENTRY_MAX_BYTES, &fallback_bytes);
                 appended += 1;
+                stats.global_fallback_count += 1;
+                stats.fallback_bucket_entries += 1;
+                stats.fallback_bucket_bytes = fallback_bytes;
+                try markSeenKey(allocator, &seen_keys, entry.key);
                 if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
         }
     }
 
     if (!wrote_header) {
-        return try allocator.dupe(u8, "");
+        return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     }
     try w.writeAll("\n");
+    stats.injected = true;
+    stats.context_bytes = buf.items.len;
 
-    return try buf.toOwnedSlice(allocator);
+    return .{ .context = try buf.toOwnedSlice(allocator), .stats = stats };
 }
 
 /// Load context using the full retrieval pipeline (hybrid search, RRF, etc.)
 /// when a MemoryRuntime is available.
-pub fn loadContextWithRuntime(
+fn loadContextWithRuntimeDetailed(
     allocator: std.mem.Allocator,
     mem: Memory,
     rt: *MemoryRuntime,
     user_message: []const u8,
     session_id: ?[]const u8,
-) ![]const u8 {
-    const candidates = rt.search(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
-        return try allocator.dupe(u8, "");
+) !ContextResult {
+    var stats = SelectionStats{ .available = true };
+    const candidates = rt.search(allocator, user_message, WARM_CANDIDATE_FETCH_LIMIT, session_id) catch {
+        return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     };
     defer memory_mod.retrieval.freeCandidates(allocator, candidates);
+    stats.candidate_count = candidates.len;
 
     var global_entries: ?[]MemoryEntry = null;
     if (session_id != null) {
         global_entries = mem.recall(allocator, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch null;
     }
+    var global_keyword_entries: ?[]MemoryEntry = null;
+    if (session_id != null) {
+        global_keyword_entries = loadGlobalKeywordFallbackEntries(allocator, mem, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, session_id) catch null;
+    }
+    if (global_entries) |entries| {
+        stats.global_candidate_count = entries.len;
+    }
+    if (global_keyword_entries) |entries| {
+        stats.global_candidate_count += entries.len;
+    }
     defer if (global_entries) |entries| memory_mod.freeEntries(allocator, entries);
+    defer if (global_keyword_entries) |entries| memory_mod.freeEntries(allocator, entries);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
     var wrote_header = false;
     var has_priority_context = false;
     var timeline_added: usize = 0;
+    var seen_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer seen_keys.deinit(allocator);
+    var continuity_bytes: usize = 0;
+    var semantic_bytes: usize = 0;
+    var fallback_bytes: usize = 0;
 
     const summary_latest_key = try summaryLatestKeyForSession(allocator, session_id);
     defer if (summary_latest_key) |key| allocator.free(key);
@@ -270,19 +551,28 @@ pub fn loadContextWithRuntime(
     defer if (current_timeline_prefix) |prefix| allocator.free(prefix);
 
     if (summary_latest_key) |key| {
-        if (try appendDirectEntry(allocator, mem, w, &wrote_header, key)) {
+        if (try appendDirectEntry(allocator, mem, buf.writer(allocator), &wrote_header, key, CONTINUITY_ENTRY_MAX_BYTES)) {
             has_priority_context = true;
+            stats.summary_latest_used = true;
+            try markSeenKey(allocator, &seen_keys, key);
+            continuity_bytes = @min(buf.items.len, CONTINUITY_BUCKET_MAX_BYTES);
+            stats.continuity_bucket_entries = 1;
+            stats.continuity_bucket_bytes = continuity_bytes;
         }
-    }
-    if (try appendDirectEntry(allocator, mem, w, &wrote_header, "context_anchor_current")) {
-        has_priority_context = true;
     }
 
     if (global_entries) |entries| {
         for (entries) |entry| {
             if (!isDurableFactKey(entry.key)) continue;
-            try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+            if (containsString(seen_keys.items, entry.key)) continue;
+            const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
+            if (!canAppendToBucket(buf.items.len, semantic_bytes, stats.semantic_bucket_entries, SEMANTIC_BUCKET_MAX_BYTES, null, estimated_bytes)) break;
+            try appendBucketEntry(allocator, &buf, &wrote_header, entry.key, entry.content, SEMANTIC_ENTRY_MAX_BYTES, &semantic_bytes);
             has_priority_context = true;
+            stats.durable_fact_count += 1;
+            stats.semantic_bucket_entries += 1;
+            stats.semantic_bucket_bytes = semantic_bytes;
+            try markSeenKey(allocator, &seen_keys, entry.key);
             if (buf.items.len >= MAX_CONTEXT_BYTES) break;
         }
     }
@@ -294,9 +584,16 @@ pub fn loadContextWithRuntime(
                 if (current_timeline_prefix) |prefix| {
                     if (std.mem.startsWith(u8, entry.key, prefix)) continue;
                 }
-                try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+                if (containsString(seen_keys.items, entry.key)) continue;
+                const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
+                if (!canAppendToBucket(buf.items.len, semantic_bytes, stats.semantic_bucket_entries, SEMANTIC_BUCKET_MAX_BYTES, null, estimated_bytes)) break;
+                try appendBucketEntry(allocator, &buf, &wrote_header, entry.key, entry.content, SEMANTIC_ENTRY_MAX_BYTES, &semantic_bytes);
                 timeline_added += 1;
                 has_priority_context = true;
+                stats.timeline_summary_count += 1;
+                stats.semantic_bucket_entries += 1;
+                stats.semantic_bucket_bytes = semantic_bytes;
+                try markSeenKey(allocator, &seen_keys, entry.key);
                 if (timeline_added >= TIMELINE_FALLBACK_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
         }
@@ -304,24 +601,103 @@ pub fn loadContextWithRuntime(
 
     for (candidates) |cand| {
         if (shouldSkipGenericEntry(cand.key, cand.snippet, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
-        try appendContextLine(allocator, w, &wrote_header, cand.key, cand.snippet);
+        if (containsString(seen_keys.items, cand.key)) continue;
+        if (isSemanticContinuityKey(cand.key)) {
+            const estimated_bytes = @min(cand.snippet.len, SEMANTIC_ENTRY_MAX_BYTES) + cand.key.len + 8;
+            if (!canAppendToBucket(buf.items.len, semantic_bytes, stats.semantic_bucket_entries, SEMANTIC_BUCKET_MAX_BYTES, null, estimated_bytes)) continue;
+            try appendBucketEntry(allocator, &buf, &wrote_header, cand.key, cand.snippet, SEMANTIC_ENTRY_MAX_BYTES, &semantic_bytes);
+            stats.semantic_bucket_entries += 1;
+            stats.semantic_bucket_bytes = semantic_bytes;
+        } else {
+            const estimated_bytes = @min(cand.snippet.len, FALLBACK_ENTRY_MAX_BYTES) + cand.key.len + 8;
+            if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, SEARCH_FALLBACK_BUCKET_MAX_BYTES, SEARCH_FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) continue;
+            try appendBucketEntry(allocator, &buf, &wrote_header, cand.key, cand.snippet, FALLBACK_ENTRY_MAX_BYTES, &fallback_bytes);
+            stats.fallback_bucket_entries += 1;
+            stats.fallback_bucket_bytes = fallback_bytes;
+            stats.global_fallback_count += 1;
+        }
+        stats.search_match_count += 1;
+        try markSeenKey(allocator, &seen_keys, cand.key);
         if (buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
 
-    if (buf.items.len < MAX_CONTEXT_BYTES and global_entries != null) {
-        if (global_entries) |entries| {
+    if (buf.items.len < MAX_CONTEXT_BYTES and global_keyword_entries != null) {
+        if (global_keyword_entries) |entries| {
             for (entries) |entry| {
+                if (containsCandidateKey(candidates, entry.key)) continue;
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
-                try appendContextLine(allocator, w, &wrote_header, entry.key, entry.content);
+                if (containsString(seen_keys.items, entry.key)) continue;
+                if (isSemanticContinuityKey(entry.key) and (stats.semantic_bucket_entries < SEMANTIC_BUCKET_MIN_ENTRIES or semantic_bytes < 1600)) {
+                    const semantic_estimated = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
+                    if (canAppendToBucket(buf.items.len, semantic_bytes, stats.semantic_bucket_entries, SEMANTIC_BUCKET_MAX_BYTES, null, semantic_estimated)) {
+                        try appendBucketEntry(allocator, &buf, &wrote_header, entry.key, entry.content, SEMANTIC_ENTRY_MAX_BYTES, &semantic_bytes);
+                        stats.search_match_count += 1;
+                        stats.semantic_bucket_entries += 1;
+                        stats.semantic_bucket_bytes = semantic_bytes;
+                        try markSeenKey(allocator, &seen_keys, entry.key);
+                    }
+                    continue;
+                }
+                const estimated_bytes = @min(entry.content.len, FALLBACK_ENTRY_MAX_BYTES) + entry.key.len + 8;
+                if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, FALLBACK_BUCKET_MAX_BYTES, FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) break;
+                try appendBucketEntry(allocator, &buf, &wrote_header, entry.key, entry.content, FALLBACK_ENTRY_MAX_BYTES, &fallback_bytes);
+                stats.global_fallback_count += 1;
+                stats.fallback_bucket_entries += 1;
+                stats.fallback_bucket_bytes = fallback_bytes;
+                try markSeenKey(allocator, &seen_keys, entry.key);
                 if (buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
         }
     }
 
-    if (!wrote_header) return try allocator.dupe(u8, "");
-    try w.writeAll("\n");
+    if (buf.items.len < MAX_CONTEXT_BYTES and global_entries != null) {
+        if (global_entries) |entries| {
+            for (entries) |entry| {
+                if (containsCandidateKey(candidates, entry.key)) continue;
+                if (global_keyword_entries) |keyword_entries| {
+                    if (containsKey(keyword_entries, entry.key)) continue;
+                }
+                if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+                if (containsString(seen_keys.items, entry.key)) continue;
+                const estimated_bytes = @min(entry.content.len, FALLBACK_ENTRY_MAX_BYTES) + entry.key.len + 8;
+                if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, FALLBACK_BUCKET_MAX_BYTES, FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) break;
+                try appendBucketEntry(allocator, &buf, &wrote_header, entry.key, entry.content, FALLBACK_ENTRY_MAX_BYTES, &fallback_bytes);
+                stats.global_fallback_count += 1;
+                stats.fallback_bucket_entries += 1;
+                stats.fallback_bucket_bytes = fallback_bytes;
+                try markSeenKey(allocator, &seen_keys, entry.key);
+                if (buf.items.len >= MAX_CONTEXT_BYTES) break;
+            }
+        }
+    }
 
-    return try buf.toOwnedSlice(allocator);
+    if (!wrote_header) return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
+    try buf.writer(allocator).writeAll("\n");
+    stats.injected = true;
+    stats.context_bytes = buf.items.len;
+
+    return .{ .context = try buf.toOwnedSlice(allocator), .stats = stats };
+}
+
+pub fn loadContext(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+) ![]const u8 {
+    const result = try loadContextDetailed(allocator, mem, user_message, session_id);
+    return result.context;
+}
+
+pub fn loadContextWithRuntime(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    rt: *MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+) ![]const u8 {
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id);
+    return result.context;
 }
 
 /// Enrich a user message with memory context prepended.
@@ -362,6 +738,33 @@ pub fn enrichMessageWithRuntime(
 
     defer allocator.free(context);
     return try std.fmt.allocPrint(allocator, "{s}{s}", .{ context, user_message });
+}
+
+pub fn enrichMessageWithRuntimeDetailed(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    mem_rt: ?*MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+) !EnrichmentResult {
+    const result = if (mem_rt) |rt|
+        try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id)
+    else
+        try loadContextDetailed(allocator, mem, user_message, session_id);
+
+    if (result.context.len == 0) {
+        allocator.free(result.context);
+        return .{
+            .text = try allocator.dupe(u8, user_message),
+            .stats = result.stats,
+        };
+    }
+
+    defer allocator.free(result.context);
+    return .{
+        .text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.context, user_message }),
+        .stats = result.stats,
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -409,7 +812,7 @@ test "loadContext with session_id includes global entries but not other sessions
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_b_fact") == null);
 }
 
-test "loadContext prefers summary latest and anchor for current session" {
+test "loadContext prefers current-session summary latest without injecting anchor" {
     const allocator = std.testing.allocator;
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
@@ -435,7 +838,7 @@ test "loadContext prefers summary latest and anchor for current session" {
 
     try std.testing.expect(std.mem.indexOf(u8, context, "summary_latest/agent:zaki-bot:user:1:main") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "shipping readiness") != null);
-    try std.testing.expect(std.mem.indexOf(u8, context, "context_anchor_current") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "context_anchor_current") == null);
 }
 
 test "loadContext includes bounded global timeline summaries from other sessions" {
@@ -542,10 +945,187 @@ test "enrichMessageWithRuntime with memories prepends context" {
 
     // Should contain [Memory context] header and the stored entry
     try std.testing.expect(std.mem.indexOf(u8, enriched, "[Memory context]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enriched, "Retrieved continuity from the canonical runtime memory store for this turn.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enriched, "use it instead of saying you do not remember") != null);
     try std.testing.expect(std.mem.indexOf(u8, enriched, "user_lang") != null);
     try std.testing.expect(std.mem.indexOf(u8, enriched, "Zig is the favorite language") != null);
     // The original message should appear at the end
     try std.testing.expect(std.mem.endsWith(u8, enriched, "language"));
+}
+
+test "enrichMessageWithRuntimeDetailed reports selection stats" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:zaki-bot:user:1:main",
+        "type=summary_latest\nfocus: shipping readiness\n",
+        .core,
+        null,
+    );
+    try mem.store(
+        "context_anchor_current",
+        "type=context_anchor\nlast_session=agent:zaki-bot:user:1:main\n",
+        .core,
+        null,
+    );
+    try mem.store("durable_fact/shipping_pref", "shipping updates should stay concise", .core, null);
+    try mem.store("session_fact", "current lane detail", .conversation, "agent:zaki-bot:user:1:main");
+
+    const enriched = try enrichMessageWithRuntimeDetailed(
+        allocator,
+        mem,
+        null,
+        "shipping",
+        "agent:zaki-bot:user:1:main",
+    );
+    defer allocator.free(enriched.text);
+
+    try std.testing.expect(enriched.stats.available);
+    try std.testing.expect(enriched.stats.injected);
+    try std.testing.expect(enriched.stats.summary_latest_used);
+    try std.testing.expect(!enriched.stats.context_anchor_used);
+    try std.testing.expect(enriched.stats.durable_fact_count >= 1);
+    try std.testing.expect(enriched.stats.continuity_bucket_entries >= 1);
+    try std.testing.expect(enriched.stats.semantic_bucket_entries >= 1);
+    try std.testing.expect(enriched.stats.context_bytes > 0);
+    try std.testing.expect(std.mem.startsWith(u8, enriched.text, "[Memory context]\n"));
+    try std.testing.expect(std.mem.indexOf(u8, enriched.text, "context_anchor_current") == null);
+}
+
+test "global keyword fallback pulls cross-session entries when exact global recall misses punctuation variant" {
+    const allocator = std.testing.allocator;
+
+    var mem_impl = memory_mod.InMemoryLruMemory.init(allocator, 32);
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    try mem.store("telegram_current", "ALEX from HRS?", .conversation, "agent:zaki-bot:user:1:thread:telegram");
+    try mem.store("main_alex", "ALEX from HRS", .conversation, "agent:zaki-bot:user:1:thread:main");
+    try mem.store("main_hrs", "HRS said yes on the 30GB deal", .conversation, "agent:zaki-bot:user:1:thread:main");
+
+    const exact_global = try mem.recall(allocator, "ALEX from HRS?", 16, null);
+    defer memory_mod.freeEntries(allocator, exact_global);
+    try std.testing.expectEqual(@as(usize, 1), exact_global.len);
+    try std.testing.expectEqualStrings("telegram_current", exact_global[0].key);
+
+    const fallback = try loadGlobalKeywordFallbackEntries(
+        allocator,
+        mem,
+        "ALEX from HRS?",
+        16,
+        "agent:zaki-bot:user:1:thread:telegram",
+    );
+    defer memory_mod.freeEntries(allocator, fallback);
+
+    try std.testing.expect(containsKey(fallback, "main_alex"));
+    try std.testing.expect(containsKey(fallback, "main_hrs"));
+    try std.testing.expect(!containsKey(fallback, "telegram_current"));
+}
+
+test "loadContextWithRuntime caps visible warm matches while overfetching raw candidates" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var idx: usize = 0;
+    while (idx < 12) : (idx += 1) {
+        const key = try std.fmt.allocPrint(allocator, "warm_fact_{d}", .{idx});
+        defer allocator.free(key);
+        const content = try std.fmt.allocPrint(allocator, "shipping memory result {d}", .{idx});
+        defer allocator.free(content);
+        try mem.store(key, content, .core, null);
+    }
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .conversation_retention_days = 0,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const enriched = try enrichMessageWithRuntimeDetailed(allocator, mem, &rt, "shipping memory", null);
+    defer allocator.free(enriched.text);
+
+    try std.testing.expectEqual(@as(usize, 12), enriched.stats.candidate_count);
+    try std.testing.expect(enriched.stats.search_match_count >= 2);
+    try std.testing.expect(enriched.stats.search_match_count <= SEARCH_FALLBACK_BUCKET_MAX_ENTRIES);
+    try std.testing.expect(enriched.stats.fallback_bucket_entries <= SEARCH_FALLBACK_BUCKET_MAX_ENTRIES);
+    try std.testing.expectEqual(enriched.stats.fallback_bucket_entries, enriched.stats.global_fallback_count);
+
+    var recalled_lines: usize = 0;
+    var iter = std.mem.splitScalar(u8, enriched.text, '\n');
+    while (iter.next()) |line| {
+        if (std.mem.startsWith(u8, line, "- warm_fact_")) recalled_lines += 1;
+    }
+    try std.testing.expect(recalled_lines >= 2);
+    try std.testing.expect(recalled_lines <= SEARCH_FALLBACK_BUCKET_MAX_ENTRIES);
+}
+
+test "loadContext keeps non-runtime fallback on the small bucket" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:test:user:1:main",
+        "focus: active thread",
+        .core,
+        null,
+    );
+
+    for (0..8) |i| {
+        const key = try std.fmt.allocPrint(allocator, "raw_note_{d}", .{i});
+        defer allocator.free(key);
+        const content = try std.fmt.allocPrint(allocator, "shipping raw recall note {d}", .{i});
+        defer allocator.free(content);
+        try mem.store(key, content, .conversation, "agent:test:user:1:main");
+    }
+
+    const result = try loadContextDetailed(allocator, mem, "shipping raw recall", "agent:test:user:1:main");
+    defer allocator.free(result.context);
+
+    try std.testing.expect(result.stats.fallback_bucket_entries <= FALLBACK_BUCKET_MAX_ENTRIES);
+
+    var recalled_lines: usize = 0;
+    var iter = std.mem.splitScalar(u8, result.context, '\n');
+    while (iter.next()) |line| {
+        if (std.mem.startsWith(u8, line, "- raw_note_")) recalled_lines += 1;
+    }
+    try std.testing.expect(recalled_lines <= FALLBACK_BUCKET_MAX_ENTRIES);
 }
 
 test "loadContext filters internal autosave and hygiene entries" {
@@ -567,6 +1147,25 @@ test "loadContext filters internal autosave and hygiene entries" {
     try std.testing.expect(std.mem.indexOf(u8, context, "autosave_user_") == null);
     try std.testing.expect(std.mem.indexOf(u8, context, "autosave_assistant_") == null);
     try std.testing.expect(std.mem.indexOf(u8, context, "last_hygiene_at") == null);
+}
+
+test "loadContext filters audit and index artifacts" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("session_checkpoint_1", "type=session_checkpoint\nrecent_user:\n- shipping\n", .daily, null);
+    try mem.store("timeline_index/current", "{\"session\":\"agent:zaki-bot:user:1:main\"}", .core, null);
+    try mem.store("timeline_summary/agent:zaki-bot:user:1:other/1", "focus: shipping rollout", .daily, null);
+
+    const context = try loadContext(allocator, mem, "shipping", "agent:zaki-bot:user:1:main");
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "timeline_summary/agent:zaki-bot:user:1:other/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "session_checkpoint_1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "timeline_index/current") == null);
 }
 
 test "loadContext filters markdown-encoded internal entries" {
@@ -605,6 +1204,7 @@ test "loadContextWithRuntime filters markdown line keys" {
         .rollout_mode = "off",
         .vector_sync_mode = "best_effort",
         .hygiene_enabled = false,
+        .conversation_retention_days = 0,
         .snapshot_enabled = false,
         .cache_enabled = false,
         .semantic_cache_enabled = false,
@@ -673,6 +1273,7 @@ test "loadContextWithRuntime returns empty when only internal entries match" {
         .rollout_mode = "off",
         .vector_sync_mode = "best_effort",
         .hygiene_enabled = false,
+        .conversation_retention_days = 0,
         .snapshot_enabled = false,
         .cache_enabled = false,
         .semantic_cache_enabled = false,
@@ -700,4 +1301,272 @@ test "loadContextWithRuntime returns empty when only internal entries match" {
     const context = try loadContextWithRuntime(allocator, mem, &rt, "привет", null);
     defer allocator.free(context);
     try std.testing.expectEqualStrings("", context);
+}
+
+test "loadContextWithRuntime overfetches past internal candidate pollution" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("visible_alex_fact", "alexsignal saturday recap: Alex from HRS came up earlier", .core, null);
+    for (0..20) |i| {
+        const key = try std.fmt.allocPrint(allocator, "autosave_user_{d}", .{i});
+        defer allocator.free(key);
+        const content = try std.fmt.allocPrint(allocator, "alexsignal autosave noise {d}", .{i});
+        defer allocator.free(content);
+        try mem.store(key, content, .conversation, null);
+    }
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .conversation_retention_days = 0,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "alexsignal saturday", null);
+    defer allocator.free(result.context);
+
+    try std.testing.expect(result.stats.candidate_count > config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT);
+    try std.testing.expectEqual(@as(usize, 1), result.stats.search_match_count);
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "visible_alex_fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "autosave_user_") == null);
+}
+
+test "loadContextWithRuntime keeps semantic continuity candidates when priority context exists" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:test:user:1:main",
+        "focus: current thread continuity",
+        .core,
+        null,
+    );
+    try mem.store(
+        "context_anchor_current",
+        "type=context_anchor\nlast_session=agent:test:user:1:main\n",
+        .core,
+        null,
+    );
+    try mem.store(
+        "timeline_summary/agent:test:user:1:other/1",
+        "focus: Alex from HRS owns the 30GB project",
+        .daily,
+        null,
+    );
+    try mem.store(
+        "durable_fact/hrs_contact",
+        "Alex is the HRS contact for the 30GB project",
+        .core,
+        null,
+    );
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .conversation_retention_days = 0,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB project", "agent:test:user:1:main");
+    defer allocator.free(result.context);
+
+    try std.testing.expect(result.stats.summary_latest_used);
+    try std.testing.expect(!result.stats.context_anchor_used);
+    try std.testing.expect(result.stats.semantic_bucket_entries >= 2);
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "timeline_summary/agent:test:user:1:other/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "durable_fact/hrs_contact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "context_anchor_current") == null);
+}
+
+test "loadContextWithRuntime keeps valid debug-key memories and filters known troubleshooting noise" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("user_debug_note", "debug checklist: Alex still owns the 30GB project", .conversation, null);
+    try mem.store("pipeline_noise", "semantic recall returns nothing for this broken test case", .conversation, null);
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .conversation_retention_days = 0,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB debug checklist", null);
+    defer allocator.free(result.context);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "user_debug_note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "pipeline_noise") == null);
+}
+
+test "loadContextWithRuntime caps fallback bucket and preserves semantic budget" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:test:user:1:main",
+        "focus: active thread",
+        .core,
+        null,
+    );
+    try mem.store(
+        "timeline_summary/agent:test:user:1:other/1",
+        "focus: 30GB export project with Alex",
+        .daily,
+        null,
+    );
+    try mem.store(
+        "durable_fact/project_owner",
+        "Alex owns the 30GB export delivery",
+        .core,
+        null,
+    );
+    try mem.store(
+        "summary_latest/agent:test:user:1:other",
+        "focus: HRS 30GB project remains active",
+        .core,
+        null,
+    );
+
+    for (0..8) |i| {
+        const key = try std.fmt.allocPrint(allocator, "fallback_note_{d}", .{i});
+        defer allocator.free(key);
+        const content = try std.fmt.allocPrint(allocator, "30GB generic fallback note {d}", .{i});
+        defer allocator.free(content);
+        try mem.store(key, content, .conversation, null);
+    }
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .conversation_retention_days = 0,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "30GB Alex project", "agent:test:user:1:main");
+    defer allocator.free(result.context);
+
+    try std.testing.expect(result.stats.semantic_bucket_entries >= 2);
+    try std.testing.expect(result.stats.semantic_bucket_bytes >= 1);
+    try std.testing.expect(result.stats.fallback_bucket_entries <= SEARCH_FALLBACK_BUCKET_MAX_ENTRIES);
+    try std.testing.expect(result.stats.fallback_bucket_bytes <= FALLBACK_BUCKET_MAX_BYTES);
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "timeline_summary/agent:test:user:1:other/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.context, "durable_fact/project_owner") != null);
 }

@@ -33,6 +33,13 @@ pub const OpenRouterProvider = struct {
         };
     }
 
+    fn mapRequestError(err: anyerror) anyerror {
+        return switch (err) {
+            error.Timeout => error.Timeout,
+            else => error.OpenRouterApiError,
+        };
+    }
+
     /// Build a chat request JSON body.
     pub fn buildRequestBody(
         allocator: std.mem.Allocator,
@@ -277,7 +284,7 @@ pub const OpenRouterProvider = struct {
             .body = body,
             .timeout_ms = 30_000,
             .subsystem = .providers,
-        }) catch return error.OpenRouterApiError;
+        }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
 
         return parseTextResponse(allocator, response.body);
@@ -338,7 +345,7 @@ pub const OpenRouterProvider = struct {
             .body = body,
             .timeout_ms = 30_000,
             .subsystem = .providers,
-        }) catch return error.OpenRouterApiError;
+        }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
 
         return parseTextResponse(allocator, response.body);
@@ -374,7 +381,7 @@ pub const OpenRouterProvider = struct {
             .body = body,
             .timeout_ms = timeout_ms,
             .subsystem = .providers,
-        }) catch return error.OpenRouterApiError;
+        }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
 
         return parseNativeResponse(allocator, response.body);
@@ -774,6 +781,11 @@ test "streamChatImpl fails without key" {
         @ptrCast(&ctx),
     );
     try std.testing.expectError(error.CredentialsNotSet, result);
+}
+
+test "mapRequestError preserves timeout" {
+    try std.testing.expect(OpenRouterProvider.mapRequestError(error.Timeout) == error.Timeout);
+    try std.testing.expect(OpenRouterProvider.mapRequestError(error.CurlFailed) == error.OpenRouterApiError);
 }
 
 fn testCallback(_: *anyopaque, _: root.StreamChunk) void {}

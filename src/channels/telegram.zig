@@ -9,6 +9,7 @@ const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
+const TYPING_ALLOCATOR = std.heap.c_allocator;
 const TELEGRAM_BOT_COMMANDS_JSON =
     \\{"commands":[
     \\{"command":"start","description":"Start a conversation"},
@@ -637,25 +638,25 @@ pub const TelegramChannel = struct {
         if (chat_id.len == 0) return;
 
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_list.deinit(self.allocator);
+        defer body_list.deinit(TYPING_ALLOCATOR);
 
-        body_list.appendSlice(self.allocator, "{\"chat_id\":") catch return;
-        body_list.appendSlice(self.allocator, chat_id) catch return;
-        body_list.appendSlice(self.allocator, ",\"action\":\"typing\"}") catch return;
+        body_list.appendSlice(TYPING_ALLOCATOR, "{\"chat_id\":") catch return;
+        body_list.appendSlice(TYPING_ALLOCATOR, chat_id) catch return;
+        body_list.appendSlice(TYPING_ALLOCATOR, ",\"action\":\"typing\"}") catch return;
 
-        const resp = self.requestJson(self.allocator, "sendChatAction", body_list.items, 10) catch return;
-        self.allocator.free(resp);
+        const resp = self.requestJson(TYPING_ALLOCATOR, "sendChatAction", body_list.items, 10) catch return;
+        TYPING_ALLOCATOR.free(resp);
     }
 
     pub fn startTyping(self: *TelegramChannel, chat_id: []const u8) !void {
         if (chat_id.len == 0) return;
         try self.stopTyping(chat_id);
 
-        const key_copy = try self.allocator.dupe(u8, chat_id);
-        errdefer self.allocator.free(key_copy);
+        const key_copy = try TYPING_ALLOCATOR.dupe(u8, chat_id);
+        errdefer TYPING_ALLOCATOR.free(key_copy);
 
-        const task = try self.allocator.create(TypingTask);
-        errdefer self.allocator.destroy(task);
+        const task = try TYPING_ALLOCATOR.create(TypingTask);
+        errdefer TYPING_ALLOCATOR.destroy(task);
         task.* = .{
             .channel = self,
             .chat_id = key_copy,
@@ -686,10 +687,10 @@ pub const TelegramChannel = struct {
         if (removed_task) |task| {
             task.stop_requested.store(true, .release);
             if (task.thread) |t| t.join();
-            self.allocator.destroy(task);
+            TYPING_ALLOCATOR.destroy(task);
         }
         if (removed_key) |key| {
-            self.allocator.free(key);
+            TYPING_ALLOCATOR.free(key);
         }
     }
 
@@ -704,8 +705,8 @@ pub const TelegramChannel = struct {
             const task = entry.value_ptr.*;
             task.stop_requested.store(true, .release);
             if (task.thread) |t| t.join();
-            self.allocator.destroy(task);
-            self.allocator.free(@constCast(entry.key_ptr.*));
+            TYPING_ALLOCATOR.destroy(task);
+            TYPING_ALLOCATOR.free(@constCast(entry.key_ptr.*));
         }
         handles.deinit(self.allocator);
     }

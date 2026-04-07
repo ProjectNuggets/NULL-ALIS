@@ -137,6 +137,31 @@ pub const MarkdownMemory = struct {
         return false;
     }
 
+    fn formatStructuredEntry(
+        allocator: std.mem.Allocator,
+        key: []const u8,
+        content: []const u8,
+    ) ![]u8 {
+        if (std.mem.indexOfScalar(u8, content, '\n') == null) {
+            return std.fmt.allocPrint(allocator, "- **{s}**: {s}", .{ key, content });
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        const w = out.writer(allocator);
+        try std.fmt.format(w, "- **{s}**:\n", .{key});
+
+        var iter = std.mem.splitScalar(u8, content, '\n');
+        while (iter.next()) |line| {
+            try std.fmt.format(w, "  {s}\n", .{line});
+        }
+
+        if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') {
+            _ = out.pop();
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     fn replaceCoreEntryAtomic(path: []const u8, key: []const u8, content: []const u8, allocator: std.mem.Allocator) !void {
         try ensureDir(path);
 
@@ -150,8 +175,16 @@ pub const MarkdownMemory = struct {
         defer buf.deinit(allocator);
 
         var iter = std.mem.splitScalar(u8, existing, '\n');
+        var skipping_continuation = false;
         while (iter.next()) |line| {
-            if (lineHasStructuredKey(line, key)) continue;
+            if (skipping_continuation) {
+                if (std.mem.startsWith(u8, line, "  ") or (line.len > 0 and line[0] == '\t')) continue;
+                skipping_continuation = false;
+            }
+            if (lineHasStructuredKey(line, key)) {
+                skipping_continuation = true;
+                continue;
+            }
             try buf.appendSlice(allocator, line);
             try buf.append(allocator, '\n');
         }
@@ -162,7 +195,10 @@ pub const MarkdownMemory = struct {
         if (buf.items.len > 0) {
             try buf.append(allocator, '\n');
         }
-        try std.fmt.format(buf.writer(allocator), "- **{s}**: {s}\n", .{ key, content });
+        const formatted = try formatStructuredEntry(allocator, key, content);
+        defer allocator.free(formatted);
+        try buf.appendSlice(allocator, formatted);
+        try buf.append(allocator, '\n');
 
         try writeFileAtomic(path, buf.items, allocator);
     }
@@ -180,8 +216,16 @@ pub const MarkdownMemory = struct {
         defer buf.deinit(allocator);
 
         var iter = std.mem.splitScalar(u8, existing, '\n');
+        var skipping_continuation = false;
         while (iter.next()) |line| {
-            if (lineHasStructuredKey(line, key)) continue;
+            if (skipping_continuation) {
+                if (std.mem.startsWith(u8, line, "  ") or (line.len > 0 and line[0] == '\t')) continue;
+                skipping_continuation = false;
+            }
+            if (lineHasStructuredKey(line, key)) {
+                skipping_continuation = true;
+                continue;
+            }
             try buf.appendSlice(allocator, line);
             try buf.append(allocator, '\n');
         }
@@ -305,9 +349,18 @@ pub const MarkdownMemory = struct {
             entries.deinit(allocator);
         }
 
+        var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer lines.deinit(allocator);
+
+        var split = std.mem.splitScalar(u8, text, '\n');
+        while (split.next()) |line| {
+            try lines.append(allocator, line);
+        }
+
         var line_idx: usize = 0;
-        var iter = std.mem.splitScalar(u8, text, '\n');
-        while (iter.next()) |line| {
+        var i: usize = 0;
+        while (i < lines.items.len) : (i += 1) {
+            const line = lines.items[i];
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0 or trimmed[0] == '#') {
                 continue;
@@ -331,6 +384,37 @@ pub const MarkdownMemory = struct {
                 }
             }
 
+            var content_dup: []u8 = undefined;
+            if (parsed_key != null) {
+                var structured: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer structured.deinit(allocator);
+                if (parsed_content.len > 0) {
+                    try structured.appendSlice(allocator, parsed_content);
+                }
+
+                while (i + 1 < lines.items.len) {
+                    const next_line = lines.items[i + 1];
+                    if (next_line.len == 0) break;
+                    if (std.mem.startsWith(u8, next_line, "  ")) {
+                        if (structured.items.len > 0) try structured.append(allocator, '\n');
+                        try structured.appendSlice(allocator, next_line[2..]);
+                        i += 1;
+                        continue;
+                    }
+                    if (next_line[0] == '\t') {
+                        if (structured.items.len > 0) try structured.append(allocator, '\n');
+                        try structured.appendSlice(allocator, next_line[1..]);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                content_dup = try structured.toOwnedSlice(allocator);
+            } else {
+                content_dup = try dupeEntryBytes(allocator, parsed_content);
+            }
+            errdefer allocator.free(content_dup);
+
             const id = if (parsed_key) |key_slice|
                 try dupeEntryBytes(allocator, key_slice)
             else
@@ -341,8 +425,6 @@ pub const MarkdownMemory = struct {
             else
                 try dupeEntryBytes(allocator, id);
             errdefer allocator.free(key);
-            const content_dup = try dupeEntryBytes(allocator, parsed_content);
-            errdefer allocator.free(content_dup);
             const timestamp = try dupeEntryBytes(allocator, filename);
             errdefer allocator.free(timestamp);
 
@@ -521,7 +603,8 @@ pub const MarkdownMemory = struct {
             .core => try self_.corePath(scratch_allocator),
             else => try self_.dailyPath(scratch_allocator),
         };
-        const entry_text = try std.fmt.allocPrint(scratch_allocator, "- **{s}**: {s}", .{ key, content });
+        const entry_text = try formatStructuredEntry(scratch_allocator, key, content);
+        defer scratch_allocator.free(entry_text);
         try appendToFile(path, entry_text, scratch_allocator);
     }
 
@@ -974,6 +1057,63 @@ test "markdown mutable core keys replace in place" {
 
     try std.testing.expect(std.mem.indexOf(u8, content, "- **user_name**: Nova\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, content, "- **user_name**: Nova Alis") != null);
+}
+
+test "markdown stores multiline structured entries in readable block form" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+    const memory = mem.memory();
+
+    const key = "summary_latest/agent:zaki-bot:user:1:main";
+    const content =
+        "type=summary_latest\n" ++
+        "session=agent:zaki-bot:user:1:main\n" ++
+        "focus: shipping readiness\n" ++
+        "next:\n" ++
+        "- ship";
+    try memory.store(key, content, .core, null);
+
+    const memory_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/MEMORY.md", .{base});
+    defer std.testing.allocator.free(memory_path);
+    const file_content = try std.fs.cwd().readFileAlloc(std.testing.allocator, memory_path, 4096);
+    defer std.testing.allocator.free(file_content);
+
+    try std.testing.expect(std.mem.indexOf(u8, file_content, "- **summary_latest/agent:zaki-bot:user:1:main**:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, file_content, "  type=summary_latest\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, file_content, "  focus: shipping readiness\n") != null);
+
+    const got = (try memory.get(std.testing.allocator, key)).?;
+    defer got.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(content, got.content);
+}
+
+test "markdown parses indented multiline structured entries" {
+    const text =
+        "# MEMORY.md - Long-Term Memory\n\n" ++
+        "- **summary_latest/agent:zaki-bot:user:1:main**:\n" ++
+        "  type=summary_latest\n" ++
+        "  session=agent:zaki-bot:user:1:main\n" ++
+        "  focus: shipping readiness\n" ++
+        "  next:\n" ++
+        "  - ship\n";
+
+    const entries = try MarkdownMemory.parseEntries(text, "MEMORY", .core, std.testing.allocator);
+    defer {
+        for (entries) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("summary_latest/agent:zaki-bot:user:1:main", entries[0].key);
+    try std.testing.expectEqualStrings(
+        "type=summary_latest\nsession=agent:zaki-bot:user:1:main\nfocus: shipping readiness\nnext:\n- ship",
+        entries[0].content,
+    );
 }
 
 test "markdown tombstones suppress mutable keys from reads" {

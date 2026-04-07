@@ -268,7 +268,22 @@ pub const Config = struct {
                 if (std.mem.eql(u8, self.default_provider, "openrouter") and self.reliability.fallback_providers.len == 0) {
                     self.reliability.fallback_providers = &.{"together"};
                 }
+                if (std.mem.eql(u8, self.memory.profile, "markdown_only")) {
+                    self.memory.profile = "postgres_hybrid";
+                }
+                if (std.mem.eql(u8, self.memory.search.provider, "none")) {
+                    self.memory.search.provider = "together";
+                }
             },
+        }
+        self.memory.applyProfileDefaults();
+        if (AppProfile.fromString(self.profile) == .zaki_bot) {
+            if (!self.memory.search.query.hybrid.mmr.enabled) {
+                self.memory.search.query.hybrid.mmr.enabled = true;
+            }
+            if (!self.memory.search.query.hybrid.temporal_decay.enabled) {
+                self.memory.search.query.hybrid.temporal_decay.enabled = true;
+            }
         }
     }
 
@@ -3461,6 +3476,14 @@ test "profile zaki_bot enables http request defaults" {
     try std.testing.expectEqualStrings("moonshotai/kimi-k2.5", cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.reliability.fallback_providers.len);
     try std.testing.expectEqualStrings("together", cfg.reliability.fallback_providers[0]);
+    try std.testing.expectEqualStrings("postgres_hybrid", cfg.memory.profile);
+    try std.testing.expectEqualStrings("postgres", cfg.memory.backend);
+    try std.testing.expectEqualStrings("together", cfg.memory.search.provider);
+    try std.testing.expect(cfg.memory.search.query.hybrid.enabled);
+    try std.testing.expectEqualStrings("pgvector", cfg.memory.search.store.kind);
+    try std.testing.expectEqualStrings("on", cfg.memory.reliability.rollout_mode);
+    try std.testing.expect(cfg.memory.search.query.hybrid.mmr.enabled);
+    try std.testing.expect(cfg.memory.search.query.hybrid.temporal_decay.enabled);
 }
 
 test "profile defaults do not override explicit http request disable" {
