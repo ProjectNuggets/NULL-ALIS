@@ -213,7 +213,10 @@ pub const AgentConfig = struct {
     compact_context: bool = false,
     max_tool_iterations: u32 = 25,
     max_history_messages: u32 = 50,
-    parallel_tools: bool = false,
+    /// Execute independent tool calls concurrently. Default true for per-pod
+    /// deployments where there is no shared scheduler contention. Set to false
+    /// only if a tool has side effects that require strict serial ordering.
+    parallel_tools: bool = true,
     /// Deterministic session canary gate for parallel tool dispatch.
     /// 0 disables parallel dispatch even when enabled; 100 enables all sessions.
     parallel_tools_rollout_percent: u8 = 100,
@@ -610,6 +613,7 @@ pub const MemoryConfig = struct {
     qmd: MemoryQmdConfig = .{},
     lifecycle: MemoryLifecycleConfig = .{},
     response_cache: MemoryResponseCacheConfig = .{},
+    semantic_cache: MemorySemanticCacheConfig = .{},
     reliability: MemoryReliabilityConfig = .{},
     postgres: MemoryPostgresConfig = .{},
     redis: MemoryRedisConfig = .{},
@@ -734,6 +738,11 @@ pub const MemoryVectorStoreConfig = struct {
 pub const MemoryChunkingConfig = struct {
     max_tokens: u32 = 512,
     overlap: u32 = 64,
+
+    /// Approximate bytes per token used consistently across the chunker and the
+    /// embedding gate. Must match chunker.zig's estimate so entries that pass
+    /// shouldEmbedMemoryEntry also fit within a single chunk.
+    pub const CHARS_PER_TOKEN: u32 = 4;
 };
 
 pub const MemorySyncConfig = struct {
@@ -788,6 +797,14 @@ pub const MemoryLifecycleConfig = struct {
 
 pub const MemoryResponseCacheConfig = struct {
     enabled: bool = false,
+    ttl_minutes: u32 = 60,
+    max_entries: u32 = 5_000,
+};
+
+pub const MemorySemanticCacheConfig = struct {
+    enabled: bool = false,
+    /// Cosine similarity threshold above which a cached response is considered a hit.
+    similarity_threshold: f32 = 0.95,
     ttl_minutes: u32 = 60,
     max_entries: u32 = 5_000,
 };

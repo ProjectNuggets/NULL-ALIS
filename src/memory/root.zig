@@ -378,9 +378,11 @@ pub fn isSemanticBookkeepingKey(key: []const u8) bool {
 pub fn shouldEmbedMemoryEntry(key: []const u8, content: []const u8) bool {
     if (isSemanticBookkeepingKey(key)) return false;
     const chunking = config_types.MemoryChunkingConfig{};
-    // Use a conservative byte ceiling so we stay comfortably under providers
-    // that enforce the configured max_tokens limit during embedding.
-    const max_bytes = @as(usize, chunking.max_tokens) * 3;
+    // Use the same chars-per-token estimate as the chunker so entries that pass
+    // this gate are guaranteed to fit within a single chunk (no silent truncation
+    // by the embedding provider). Previously this used *3 while the chunker used
+    // *4, causing valid content to be gated out unnecessarily.
+    const max_bytes = @as(usize, chunking.max_tokens) * config_types.MemoryChunkingConfig.CHARS_PER_TOKEN;
     return content.len <= max_bytes;
 }
 
@@ -1692,7 +1694,7 @@ pub fn initRuntimeWithOptions(
     // ── Lifecycle: semantic cache ──
     var sem_cache: ?*semantic_cache.SemanticCache = null;
     var sem_cache_db_path: ?[*:0]const u8 = null;
-    if (build_options.enable_sqlite and config.response_cache.enabled and embed_provider != null) sem_cache_blk: {
+    if (build_options.enable_sqlite and config.semantic_cache.enabled and embed_provider != null) sem_cache_blk: {
         const sc_path = std.fs.path.joinZ(allocator, &.{ workspace_dir, "semantic_cache.db" }) catch break :sem_cache_blk;
         const sc = allocator.create(semantic_cache.SemanticCache) catch {
             allocator.free(std.mem.span(sc_path.ptr));
@@ -1700,9 +1702,9 @@ pub fn initRuntimeWithOptions(
         };
         sc.* = semantic_cache.SemanticCache.init(
             sc_path.ptr,
-            config.response_cache.ttl_minutes,
-            config.response_cache.max_entries,
-            0.95, // cosine similarity threshold
+            config.semantic_cache.ttl_minutes,
+            config.semantic_cache.max_entries,
+            config.semantic_cache.similarity_threshold,
             embed_provider,
         ) catch {
             allocator.destroy(sc);
@@ -2603,11 +2605,13 @@ test "shouldEmbedMemoryEntry skips bookkeeping artifacts and oversize content" {
     try std.testing.expect(!shouldEmbedMemoryEntry("autosave_user_1", "hello"));
     try std.testing.expect(shouldEmbedMemoryEntry("summary_latest/agent:test:user:1:main", "focus: ship"));
 
+    // max_tokens=512, CHARS_PER_TOKEN=4 → gate is 2048 bytes
     var medium: [1400]u8 = undefined;
     @memset(&medium, 'a');
     try std.testing.expect(shouldEmbedMemoryEntry("timeline_summary/agent:test:user:1:main/1", medium[0..]));
 
-    var big: [1700]u8 = undefined;
+    // 2049 bytes exceeds the 2048-byte gate
+    var big: [2049]u8 = undefined;
     @memset(&big, 'a');
     try std.testing.expect(!shouldEmbedMemoryEntry("durable_fact/x", big[0..]));
 }

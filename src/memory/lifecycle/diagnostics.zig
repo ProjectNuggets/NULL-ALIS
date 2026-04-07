@@ -24,6 +24,13 @@ pub const CacheStats = struct {
     tokens_saved: u64,
 };
 
+pub const SemanticCacheStats = struct {
+    count: usize,
+    hits: u64,
+    tokens_saved: u64,
+    entries_with_embedding: usize,
+};
+
 // ── DiagnosticReport ───────────────────────────────────────────────
 
 pub const DiagnosticReport = struct {
@@ -37,6 +44,7 @@ pub const DiagnosticReport = struct {
     outbox_pending: ?usize,
     cache_active: bool,
     cache_stats: ?CacheStats,
+    semantic_cache_stats: ?SemanticCacheStats,
     retrieval_sources: usize,
     rollout_mode: []const u8,
     retrieval_mode: []const u8 = "n/a",
@@ -85,6 +93,17 @@ pub fn diagnose(rt: *root.MemoryRuntime) DiagnosticReport {
             .count = s.count,
             .hits = s.hits,
             .tokens_saved = s.tokens_saved,
+        };
+    } else null;
+
+    // Semantic cache stats
+    const semantic_cache_stats: ?SemanticCacheStats = if (rt._semantic_cache) |sc| blk: {
+        const s = sc.stats() catch break :blk null;
+        break :blk .{
+            .count = s.count,
+            .hits = s.hits,
+            .tokens_saved = s.tokens_saved,
+            .entries_with_embedding = s.entries_with_embedding,
         };
     } else null;
 
@@ -137,6 +156,7 @@ pub fn diagnose(rt: *root.MemoryRuntime) DiagnosticReport {
         .outbox_pending = outbox_pending,
         .cache_active = cache_active,
         .cache_stats = cache_stats,
+        .semantic_cache_stats = semantic_cache_stats,
         .retrieval_sources = retrieval_sources,
         .rollout_mode = rollout_mode,
         .retrieval_mode = rt.resolved.retrieval_mode,
@@ -204,6 +224,15 @@ pub fn formatReport(report: DiagnosticReport, allocator: std.mem.Allocator) ![]u
         try std.fmt.format(w, "  count:  {d}\n", .{cs.count});
         try std.fmt.format(w, "  hits:   {d}\n", .{cs.hits});
         try std.fmt.format(w, "  tokens saved: {d}\n", .{cs.tokens_saved});
+    }
+
+    try w.writeAll("\nSemantic Cache\n");
+    try std.fmt.format(w, "  active: {}\n", .{report.semantic_cache_active});
+    if (report.semantic_cache_stats) |ss| {
+        try std.fmt.format(w, "  count:            {d}\n", .{ss.count});
+        try std.fmt.format(w, "  hits:             {d}\n", .{ss.hits});
+        try std.fmt.format(w, "  tokens saved:     {d}\n", .{ss.tokens_saved});
+        try std.fmt.format(w, "  with_embedding:   {d}\n", .{ss.entries_with_embedding});
     }
 
     // Retrieval
@@ -311,6 +340,7 @@ test "diagnose with none backend" {
     try testing.expect(report.outbox_pending == null);
     try testing.expect(!report.cache_active);
     try testing.expect(report.cache_stats == null);
+    try testing.expect(report.semantic_cache_stats == null);
     try testing.expectEqual(@as(usize, 0), report.retrieval_sources);
     try testing.expect(!report.session_store_active);
 }
@@ -587,6 +617,7 @@ test "formatReport with cache stats" {
             .hits = 20,
             .tokens_saved = 1000,
         },
+        .semantic_cache_stats = null,
         .retrieval_sources = 2,
         .rollout_mode = "canary",
         .retrieval_mode = "hybrid",
@@ -626,6 +657,7 @@ test "formatReport without optional components" {
         .outbox_pending = null,
         .cache_active = false,
         .cache_stats = null,
+        .semantic_cache_stats = null,
         .retrieval_sources = 0,
         .rollout_mode = "off",
         .session_store_active = false,

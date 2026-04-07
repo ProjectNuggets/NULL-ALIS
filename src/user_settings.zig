@@ -285,11 +285,11 @@ pub fn mergeSettingsIntoConfigJson(
     const root_obj = ensureObject(&root, a);
 
     const product_obj = ensureObjectKey(root_obj, a, "product_settings");
-    putString(product_obj, a, "assistant_mode", settings.assistant_mode.toSlice()) catch {};
-    putString(product_obj, a, "group_activation", settings.group_activation.toSlice()) catch {};
-    putBool(product_obj, a, "proactive_updates", settings.proactive_updates) catch {};
-    putBool(product_obj, a, "voice_replies", settings.voice_replies) catch {};
-    putInt(product_obj, a, "session_timeout_minutes", settings.session_timeout_minutes) catch {};
+    try putString(product_obj, a, "assistant_mode", settings.assistant_mode.toSlice());
+    try putString(product_obj, a, "group_activation", settings.group_activation.toSlice());
+    try putBool(product_obj, a, "proactive_updates", settings.proactive_updates);
+    try putBool(product_obj, a, "voice_replies", settings.voice_replies);
+    try putInt(product_obj, a, "session_timeout_minutes", settings.session_timeout_minutes);
 
     var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
@@ -320,11 +320,11 @@ pub fn normalizeTenantConfigJson(
     }
 
     const product_obj = ensureObjectKey(root_obj, a, "product_settings");
-    putString(product_obj, a, "assistant_mode", settings.assistant_mode.toSlice()) catch {};
-    putString(product_obj, a, "group_activation", settings.group_activation.toSlice()) catch {};
-    putBool(product_obj, a, "proactive_updates", settings.proactive_updates) catch {};
-    putBool(product_obj, a, "voice_replies", settings.voice_replies) catch {};
-    putInt(product_obj, a, "session_timeout_minutes", settings.session_timeout_minutes) catch {};
+    try putString(product_obj, a, "assistant_mode", settings.assistant_mode.toSlice());
+    try putString(product_obj, a, "group_activation", settings.group_activation.toSlice());
+    try putBool(product_obj, a, "proactive_updates", settings.proactive_updates);
+    try putBool(product_obj, a, "voice_replies", settings.voice_replies);
+    try putInt(product_obj, a, "session_timeout_minutes", settings.session_timeout_minutes);
 
     var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {

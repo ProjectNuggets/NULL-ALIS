@@ -1,8 +1,11 @@
 //! SubagentManager — background task execution via isolated agent instances.
 //!
-//! Spawns subagents in separate OS threads with restricted tool sets
-//! (no message, spawn, delegate — to prevent infinite loops).
+//! Spawns subagents in separate OS threads. Each subagent currently executes
+//! a single-turn chatWithSystem completion (no tool loop, no tool access).
 //! Task results are routed via the event bus as system InboundMessages.
+//!
+//! PHASE 2: full agentic loop with restricted tool sets (no message/spawn/delegate)
+//! is not yet implemented. The threading and bus-routing infrastructure is complete.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -34,6 +37,8 @@ pub const TaskState = struct {
 };
 
 pub const SubagentConfig = struct {
+    /// Maximum agent loop iterations per subagent.
+    /// TODO(phase2): currently unused — thread runs a single chatWithSystem call.
     max_iterations: u32 = 15,
     max_concurrent: u32 = 4,
 };

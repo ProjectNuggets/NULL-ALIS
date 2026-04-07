@@ -284,6 +284,12 @@ pub const Config = struct {
             if (!self.memory.search.query.hybrid.temporal_decay.enabled) {
                 self.memory.search.query.hybrid.temporal_decay.enabled = true;
             }
+            // Adaptive retrieval selects query strategy (keyword vs. hybrid) based on
+            // query characteristics. Enable by default for zaki_bot — it's cheap at
+            // query time and measurably improves recall for short/semantic queries.
+            if (!self.memory.retrieval_stages.adaptive_retrieval_enabled) {
+                self.memory.retrieval_stages.adaptive_retrieval_enabled = true;
+            }
         }
     }
 

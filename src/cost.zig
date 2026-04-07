@@ -161,8 +161,11 @@ pub const CostTracker = struct {
         };
         try self.session_records.append(self.allocator, record);
 
-        // Persist to JSONL file
-        self.appendToJsonl(&record) catch {};
+        // Persist to JSONL file — log on failure so cost data loss is visible.
+        self.appendToJsonl(&record) catch |err| {
+            const log = std.log.scoped(.cost);
+            log.warn("cost: failed to write usage record to JSONL ({}); in-memory record retained but may be lost on restart", .{err});
+        };
     }
 
     /// Append a cost record to the JSONL file.

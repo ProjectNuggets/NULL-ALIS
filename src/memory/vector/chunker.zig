@@ -274,12 +274,38 @@ fn splitOnLines(allocator: std.mem.Allocator, text: []const u8, max_chars: usize
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
+        // Flush current buffer if adding this line would overflow.
         if (max_chars > 0 and current.items.len + line.len + 1 > max_chars and current.items.len > 0) {
             try result.append(allocator, try allocator.dupe(u8, current.items));
             current.clearRetainingCapacity();
         }
-        try current.appendSlice(allocator, line);
-        try current.append(allocator, '\n');
+
+        // If a single line is itself larger than max_chars, split it at char
+        // boundaries so we never emit an oversized chunk (e.g. long URLs, base64,
+        // dense autosave content). We split on UTF-8 codepoint boundaries to
+        // avoid producing invalid byte sequences.
+        if (max_chars > 0 and line.len > max_chars) {
+            // Flush any pending content first.
+            if (current.items.len > 0) {
+                try result.append(allocator, try allocator.dupe(u8, current.items));
+                current.clearRetainingCapacity();
+            }
+            var pos: usize = 0;
+            while (pos < line.len) {
+                var end = @min(pos + max_chars, line.len);
+                // Walk back to a valid UTF-8 codepoint boundary.
+                while (end > pos and end < line.len and (line[end] & 0xC0) == 0x80) {
+                    end -= 1;
+                }
+                if (end == pos) end = @min(pos + max_chars, line.len); // safety: no valid boundary found
+                const slice = try allocator.dupe(u8, line[pos..end]);
+                try result.append(allocator, slice);
+                pos = end;
+            }
+        } else {
+            try current.appendSlice(allocator, line);
+            try current.append(allocator, '\n');
+        }
     }
 
     if (current.items.len > 0) {
@@ -495,6 +521,38 @@ test "BOM only text treated as empty" {
     const chunks_slice = try chunkMarkdown(std.testing.allocator, text, 512);
     defer freeChunks(std.testing.allocator, chunks_slice);
     try std.testing.expectEqual(@as(usize, 0), chunks_slice.len);
+}
+
+test "single oversized line is split into multiple chunks under max_tokens" {
+    // Simulate a long autosave or base64 blob with no newlines — this was the
+    // Together.ai overflow bug: splitOnLines would emit the whole line as one chunk.
+    var builder: std.ArrayList(u8) = .empty;
+    defer builder.deinit(std.testing.allocator);
+    // Build a single line of ~2000 chars (well over 512-token * 4 = 2048 char limit at max_tokens=50)
+    for (0..400) |_| try builder.appendSlice(std.testing.allocator, "word ");
+    // Strip trailing newline — pure single-line content
+    const single_line = std.mem.trim(u8, builder.items, "\n");
+    const chunks_slice = try chunkMarkdown(std.testing.allocator, single_line, 50);
+    defer freeChunks(std.testing.allocator, chunks_slice);
+    // Must produce multiple chunks, each under 50*4=200 chars
+    try std.testing.expect(chunks_slice.len > 1);
+    for (chunks_slice) |chunk| {
+        try std.testing.expect(chunk.content.len <= 200);
+    }
+}
+
+test "oversized single line chunks are valid UTF-8" {
+    // Ensure char-level splitting never cuts a multi-byte codepoint.
+    var builder: std.ArrayList(u8) = .empty;
+    defer builder.deinit(std.testing.allocator);
+    // 500 repetitions of 世 (3 bytes each) — 1500 bytes, no newlines
+    for (0..500) |_| try builder.appendSlice(std.testing.allocator, "\xe4\xb8\x96");
+    const chunks_slice = try chunkMarkdown(std.testing.allocator, builder.items, 10);
+    defer freeChunks(std.testing.allocator, chunks_slice);
+    try std.testing.expect(chunks_slice.len > 1);
+    for (chunks_slice) |chunk| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk.content));
+    }
 }
 
 // ── R3 regression tests ───────────────────────────────────────────

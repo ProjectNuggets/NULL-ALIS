@@ -8,8 +8,11 @@ const NamedAgentConfig = config_mod.NamedAgentConfig;
 const runtime_bundle = @import("../providers/runtime_bundle.zig");
 
 /// Delegate tool — delegates a subtask to a named sub-agent with a different
-/// provider/model configuration. Supports depth enforcement to prevent
+/// provider/model configuration. Executes a single-turn chatWithSystem call
+/// against the target agent's provider. Supports depth enforcement to prevent
 /// infinite delegation chains.
+///
+/// PHASE 2: multi-turn agentic loop with per-agent tool sets is not yet implemented.
 pub const DelegateTool = struct {
     /// Named agent configs from the global config (lookup by name).
     agents: []const NamedAgentConfig = &.{},
@@ -21,7 +24,7 @@ pub const DelegateTool = struct {
     depth: u32 = 0,
 
     pub const tool_name = "delegate";
-    pub const tool_description = "Hand a subtask to a specialized agent when specialization materially helps; handle routine work directly.";
+    pub const tool_description = "Hand a subtask to a named specialized agent (single-turn completion); use for tasks where a different model or system prompt materially helps.";
     pub const tool_params =
         \\{"type":"object","properties":{"agent":{"type":"string","minLength":1,"description":"Name of the agent to delegate to"},"prompt":{"type":"string","minLength":1,"description":"The task/prompt to send to the sub-agent"},"context":{"type":"string","description":"Optional context to prepend"}},"required":["agent","prompt"]}
     ;
