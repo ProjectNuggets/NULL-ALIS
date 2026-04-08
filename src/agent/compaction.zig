@@ -240,9 +240,24 @@ fn compactHistoryKeepingRecent(
 ///
 /// NOTE: This is a lossy hard-drop. Callers MUST surface this to the user so
 /// they are aware context continuity has been interrupted.
+/// Maximum characters saved in a compaction archive entry.
+const MAX_ARCHIVE_CHARS: usize = 6_000;
+
 pub fn forceCompressHistory(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
+) bool {
+    return forceCompressHistoryWithArchive(allocator, history, null, null);
+}
+
+/// Force-compress history, optionally archiving dropped messages to memory.
+/// When mem and session_id are provided, dropped messages are saved as a
+/// compaction_archive/* entry before deletion — preventing silent context loss.
+pub fn forceCompressHistoryWithArchive(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged(OwnedMessage),
+    mem: ?@import("../memory/root.zig").Memory,
+    session_id: ?[]const u8,
 ) bool {
     const has_system = history.items.len > 0 and history.items[0].role == .system;
     const start: usize = if (has_system) 1 else 0;
@@ -255,6 +270,11 @@ pub fn forceCompressHistory(
 
     log.warn("compaction: force-compressing history — dropping {} messages (context exhausted, LLM unavailable)", .{to_remove});
 
+    // Archive dropped messages to memory before deletion (best-effort)
+    if (mem) |m| {
+        archiveDroppedMessages(allocator, m, session_id, history.items[start..keep_start], to_remove);
+    }
+
     // Free messages being removed
     for (history.items[start..keep_start]) |*msg| {
         msg.deinit(allocator);
@@ -266,6 +286,46 @@ pub fn forceCompressHistory(
     history.items.len -= to_remove;
 
     return true;
+}
+
+/// Best-effort archive of messages about to be dropped.
+fn archiveDroppedMessages(
+    allocator: std.mem.Allocator,
+    mem: @import("../memory/root.zig").Memory,
+    session_id: ?[]const u8,
+    messages: []const OwnedMessage,
+    count: usize,
+) void {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    std.fmt.format(w, "type=compaction_archive\nmessages_dropped={d}\nreason=context_exhaustion\n\n", .{count}) catch return;
+
+    for (messages) |msg| {
+        if (buf.items.len >= MAX_ARCHIVE_CHARS) {
+            w.writeAll("\n[... remaining messages truncated ...]\n") catch {};
+            break;
+        }
+        const role_str: []const u8 = switch (msg.role) {
+            .user => "user",
+            .assistant => "assistant",
+            .system => "system",
+            .tool => "tool",
+        };
+        std.fmt.format(w, "[{s}] {s}\n\n", .{
+            role_str,
+            if (msg.content.len > 500) msg.content[0..500] else msg.content,
+        }) catch break;
+    }
+
+    const ts: u128 = @bitCast(std.time.nanoTimestamp());
+    const key = std.fmt.allocPrint(allocator, "compaction_archive/{d}", .{ts}) catch return;
+    defer allocator.free(key);
+
+    mem.store(key, buf.items, .conversation, session_id) catch |err| {
+        log.warn("compaction: failed to archive dropped messages: {}", .{err});
+    };
 }
 
 /// Trim history to prevent unbounded growth.

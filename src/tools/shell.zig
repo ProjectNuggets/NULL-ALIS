@@ -8,7 +8,9 @@ const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const config_types = @import("../config_types.zig");
 const tool_sandbox_v1 = @import("tool_sandbox_v1.zig");
+const memory_mod = @import("../memory/root.zig");
 const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullalis_workspace_unavailable__";
+const log = std.log.scoped(.shell_tool);
 
 /// Default maximum shell command execution time (nanoseconds).
 const DEFAULT_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -28,6 +30,10 @@ pub const ShellTool = struct {
     policy: ?*const SecurityPolicy = null,
     sandbox_enabled: bool = false,
     sandbox_backend: config_types.SandboxBackend = .auto,
+    /// Optional memory store for command audit trail.
+    audit_memory: ?memory_mod.Memory = null,
+    /// Session ID for scoping audit entries.
+    audit_session_id: ?[]const u8 = null,
 
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command when policy allows and no more specific tool is better.";
@@ -118,6 +124,9 @@ pub const ShellTool = struct {
         };
         defer allocator.free(result.stderr);
 
+        // Audit trail: log command execution to memory (best-effort)
+        self.recordAuditEntry(allocator, command, effective_cwd, result.success, result.exit_code);
+
         if (result.success) {
             if (result.stdout.len > 0) return ToolResult{ .success = true, .output = result.stdout };
             allocator.free(result.stdout);
@@ -129,6 +138,46 @@ pub const ShellTool = struct {
             return ToolResult{ .success = false, .output = "", .error_msg = err_out };
         }
         return ToolResult{ .success = false, .output = "", .error_msg = "Command terminated by signal" };
+    }
+
+    /// Record a durable audit entry for a shell command execution.
+    fn recordAuditEntry(
+        self: *const ShellTool,
+        allocator: std.mem.Allocator,
+        command: []const u8,
+        cwd: []const u8,
+        success: bool,
+        exit_code: ?u32,
+    ) void {
+        const mem = self.audit_memory orelse return;
+
+        const ts: u128 = @bitCast(std.time.nanoTimestamp());
+        const key = std.fmt.allocPrint(allocator, "audit_shell/{d}", .{ts}) catch return;
+        defer allocator.free(key);
+
+        // Truncate command for audit (keep first 500 chars)
+        const cmd_display = if (command.len > 500) command[0..500] else command;
+        const exit_str = if (exit_code) |code|
+            std.fmt.allocPrint(allocator, "{d}", .{code}) catch "?"
+        else
+            "signal";
+        defer if (exit_code != null) allocator.free(exit_str);
+
+        const entry = std.fmt.allocPrint(
+            allocator,
+            "type=shell_audit\nstatus={s}\nexit={s}\ncwd={s}\ncmd={s}",
+            .{
+                if (success) "ok" else "error",
+                exit_str,
+                cwd,
+                cmd_display,
+            },
+        ) catch return;
+        defer allocator.free(entry);
+
+        mem.store(key, entry, .conversation, self.audit_session_id) catch |err| {
+            log.warn("shell audit: failed to record: {}", .{err});
+        };
     }
 };
 

@@ -820,6 +820,18 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
     }
 }
 
+/// Wire audit memory into tools that support command logging (currently: shell).
+/// Called after memory initialization, similar to bindMemoryRuntime.
+pub fn bindAuditMemory(tools: []const Tool, mem: memory_mod.Memory, session_id: ?[]const u8) void {
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), shell.ShellTool.tool_name)) {
+            const st: *shell.ShellTool = @ptrCast(@alignCast(t.ptr));
+            st.audit_memory = mem;
+            st.audit_session_id = session_id;
+        }
+    }
+}
+
 /// Free all heap-allocated tool structs and the tools slice itself.
 /// Pairs with `allTools` / `defaultTools` / `subagentTools`.
 pub fn deinitTools(allocator: std.mem.Allocator, tools: []const Tool) void {

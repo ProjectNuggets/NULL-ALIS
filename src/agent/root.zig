@@ -558,8 +558,14 @@ pub const Agent = struct {
     }
 
     /// Force-compress history for context exhaustion recovery.
+    /// Archives dropped messages to memory (when available) before deleting them.
     pub fn forceCompressHistory(self: *Agent) bool {
-        return compaction.forceCompressHistory(self.allocator, &self.history);
+        return compaction.forceCompressHistoryWithArchive(
+            self.allocator,
+            &self.history,
+            self.mem,
+            self.memory_session_id,
+        );
     }
 
     fn appendUniqueString(

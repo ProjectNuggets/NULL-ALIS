@@ -429,6 +429,8 @@ pub const ChannelRuntime = struct {
         if (self.mem_rt) |*rt| {
             self.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(tools, rt);
+            // Wire audit trail into shell tool
+            tools_mod.bindAuditMemory(tools, rt.memory, null);
         }
         if (self.subagent_manager) |mgr| {
             if (self.completion_router) |router| {
