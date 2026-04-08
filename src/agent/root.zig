@@ -28,6 +28,7 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const RateTracker = @import("../security/policy.zig").RateTracker;
+const hooks_mod = @import("../hooks.zig");
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -337,6 +338,9 @@ pub const Agent = struct {
 
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
+
+    /// Lifecycle hooks — config-driven shell commands on agent events.
+    hooks: []const hooks_mod.Hook = &.{},
 
     /// Optional streaming callback. When set, turn() uses streamChat() for streaming providers.
     stream_callback: ?providers.StreamCallback = null,
@@ -942,6 +946,12 @@ pub const Agent = struct {
             const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
             self.observer.recordEvent(&tool_start_event);
 
+            hooks_mod.runHooks(self.allocator, self.hooks, .tool_start, .{
+                .tool_name = call.name,
+                .session_key = self.memory_session_id,
+                .workspace_dir = self.workspace_dir,
+            });
+
             const tool_timer = std.time.milliTimestamp();
             const result = self.executeTool(tool_allocator, call);
             const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
@@ -952,6 +962,13 @@ pub const Agent = struct {
                 .success = result.success,
             } };
             self.observer.recordEvent(&tool_event);
+
+            hooks_mod.runHooks(self.allocator, self.hooks, .tool_end, .{
+                .tool_name = call.name,
+                .tool_success = result.success,
+                .session_key = self.memory_session_id,
+                .workspace_dir = self.workspace_dir,
+            });
 
             try results_buf.append(self.allocator, result);
         }
@@ -1186,6 +1203,12 @@ pub const Agent = struct {
             .stage = "turn_start",
         } };
         self.observer.recordEvent(&turn_start_event);
+
+        // Fire turn_start hooks
+        hooks_mod.runHooks(self.allocator, self.hooks, .turn_start, .{
+            .session_key = self.memory_session_id,
+            .workspace_dir = self.workspace_dir,
+        });
 
         // Inject system prompt on first turn (or when tracked workspace files changed).
         const prompt_refresh_plan = context_builder.buildPromptRefreshPlan(self);
@@ -1895,6 +1918,12 @@ pub const Agent = struct {
 
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
+
+                // Fire turn_end hooks
+                hooks_mod.runHooks(self.allocator, self.hooks, .turn_end, .{
+                    .session_key = self.memory_session_id,
+                    .workspace_dir = self.workspace_dir,
+                });
 
                 // Free provider response fields (content, tool_calls, model)
                 // All borrows have been duped into final_text and history at this point.
