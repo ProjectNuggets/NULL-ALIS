@@ -192,7 +192,41 @@ pub fn parseXmlToolCalls(
     };
 }
 
+/// Maximum characters per individual tool result output before truncation.
+/// Matches OpenClaw's default (8000 chars). Prevents a single tool result
+/// from consuming most of the context window.
+const MAX_TOOL_RESULT_CHARS: usize = 8000;
+
+/// Truncate tool output to fit within the context budget.
+/// Keeps the first and last portions so the LLM sees both the beginning
+/// (usually headers/structure) and end (usually the final state/error).
+fn truncateToolOutput(allocator: std.mem.Allocator, output: []const u8, max_chars: usize) ![]const u8 {
+    if (output.len <= max_chars) return try allocator.dupe(u8, output);
+
+    const marker_overhead = 60; // "[... NNNNN characters truncated ...]" + newlines
+    const min_useful = marker_overhead + 40; // at least 40 chars of content
+    if (max_chars < min_useful) {
+        // Too small for head+tail split; just take the head
+        return try std.fmt.allocPrint(allocator, "{s}\n\n[... {d} characters truncated ...]", .{
+            output[0..@min(output.len, max_chars)],
+            output.len -| max_chars,
+        });
+    }
+
+    const budget = max_chars - marker_overhead;
+    const keep_head = budget * 2 / 3;
+    const keep_tail = budget - keep_head;
+    const omitted = output.len - keep_head - keep_tail;
+
+    return try std.fmt.allocPrint(allocator, "{s}\n\n[... {d} characters truncated ...]\n\n{s}", .{
+        output[0..keep_head],
+        omitted,
+        output[output.len - keep_tail ..],
+    });
+}
+
 /// Format tool execution results as XML for the next LLM turn.
+/// Normalizes output: truncates oversized results, structures errors clearly.
 pub fn formatToolResults(allocator: std.mem.Allocator, results: []const ToolExecutionResult) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -200,10 +234,15 @@ pub fn formatToolResults(allocator: std.mem.Allocator, results: []const ToolExec
     try buf.appendSlice(allocator, "[Tool results]\n");
     for (results) |result| {
         const status_str = if (result.success) "ok" else "error";
+
+        // Truncate oversized outputs to prevent context window exhaustion
+        const normalized_output = try truncateToolOutput(allocator, result.output, MAX_TOOL_RESULT_CHARS);
+        defer allocator.free(normalized_output);
+
         try std.fmt.format(buf.writer(allocator), "<tool_result name=\"{s}\" status=\"{s}\">\n{s}\n</tool_result>\n", .{
             result.name,
             status_str,
-            result.output,
+            normalized_output,
         });
     }
 
@@ -1097,6 +1136,41 @@ test "formatToolResults multiple results" {
     try std.testing.expect(std.mem.indexOf(u8, formatted, "search") != null);
     try std.testing.expect(std.mem.indexOf(u8, formatted, "file1.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, formatted, "not found") != null);
+}
+
+test "truncateToolOutput preserves short output" {
+    const allocator = std.testing.allocator;
+    const short = "hello world";
+    const result = try truncateToolOutput(allocator, short, 100);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(short, result);
+}
+
+test "truncateToolOutput truncates oversized output with marker" {
+    const allocator = std.testing.allocator;
+    // Create a 200-char output, truncate to 100
+    const big = "A" ** 200;
+    const result = try truncateToolOutput(allocator, big, 100);
+    defer allocator.free(result);
+    try std.testing.expect(result.len < big.len);
+    try std.testing.expect(std.mem.indexOf(u8, result, "characters truncated") != null);
+    // Should start with A's (head) and end with A's (tail)
+    try std.testing.expect(result[0] == 'A');
+    try std.testing.expect(result[result.len - 1] == 'A');
+}
+
+test "formatToolResults truncates oversized tool output" {
+    const allocator = std.testing.allocator;
+    const big_output = "X" ** (MAX_TOOL_RESULT_CHARS + 1000);
+    const results = [_]ToolExecutionResult{
+        .{ .name = "shell", .output = big_output, .success = true },
+    };
+    const formatted = try formatToolResults(allocator, &results);
+    defer allocator.free(formatted);
+    // The formatted output should contain the truncation marker
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "characters truncated") != null);
+    // And should be smaller than the raw output
+    try std.testing.expect(formatted.len < big_output.len);
 }
 
 // Bug 3 regression: unmatched close brace/bracket must not underflow depth (usize).

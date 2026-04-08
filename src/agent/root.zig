@@ -1447,7 +1447,7 @@ pub const Agent = struct {
                         .model = self.model_name,
                         .temperature = self.temperature,
                         .max_tokens = self.max_tokens,
-                        .tools = null,
+                        .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
@@ -1478,7 +1478,7 @@ pub const Agent = struct {
                 }
                 response = ChatResponse{
                     .content = stream_result.content,
-                    .tool_calls = &.{},
+                    .tool_calls = stream_result.tool_calls,
                     .usage = stream_result.usage,
                     .model = stream_result.model,
                 };
