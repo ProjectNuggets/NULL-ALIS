@@ -150,12 +150,37 @@ pub const MessageEntry = struct {
     content: []const u8,
 };
 
+pub const CompletionEvent = struct {
+    id: []const u8,
+    session_id: []const u8,
+    channel: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    chat_id: ?[]const u8 = null,
+    content: []const u8,
+
+    pub fn deinit(self: *const CompletionEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.session_id);
+        if (self.channel) |value| allocator.free(value);
+        if (self.account_id) |value| allocator.free(value);
+        if (self.chat_id) |value| allocator.free(value);
+        allocator.free(self.content);
+    }
+};
+
 pub fn freeMessages(allocator: std.mem.Allocator, messages: []MessageEntry) void {
     for (messages) |entry| {
         allocator.free(entry.role);
         allocator.free(entry.content);
     }
     allocator.free(messages);
+}
+
+pub fn freeCompletionEvents(allocator: std.mem.Allocator, events: []CompletionEvent) void {
+    for (events) |event| {
+        event.deinit(allocator);
+    }
+    allocator.free(events);
 }
 
 // ── SessionStore vtable interface ─────────────────────────────────
@@ -169,6 +194,9 @@ pub const SessionStore = struct {
         loadMessages: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]MessageEntry,
         clearMessages: *const fn (ptr: *anyopaque, session_id: []const u8) anyerror!void,
         clearAutoSaved: *const fn (ptr: *anyopaque, session_id: ?[]const u8) anyerror!void,
+        saveCompletionEvent: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8, content: []const u8) anyerror![]u8,
+        loadCompletionEvents: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]CompletionEvent,
+        deleteCompletionEvent: *const fn (ptr: *anyopaque, event_id: []const u8) anyerror!void,
     };
 
     pub fn saveMessage(self: SessionStore, session_id: []const u8, role: []const u8, content: []const u8) !void {
@@ -185,6 +213,18 @@ pub const SessionStore = struct {
 
     pub fn clearAutoSaved(self: SessionStore, session_id: ?[]const u8) !void {
         return self.vtable.clearAutoSaved(self.ptr, session_id);
+    }
+
+    pub fn saveCompletionEvent(self: SessionStore, allocator: std.mem.Allocator, session_id: []const u8, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8, content: []const u8) ![]u8 {
+        return self.vtable.saveCompletionEvent(self.ptr, allocator, session_id, channel, account_id, chat_id, content);
+    }
+
+    pub fn loadCompletionEvents(self: SessionStore, allocator: std.mem.Allocator, session_id: []const u8) ![]CompletionEvent {
+        return self.vtable.loadCompletionEvents(self.ptr, allocator, session_id);
+    }
+
+    pub fn deleteCompletionEvent(self: SessionStore, event_id: []const u8) !void {
+        return self.vtable.deleteCompletionEvent(self.ptr, event_id);
     }
 };
 
@@ -378,9 +418,11 @@ pub fn isSemanticBookkeepingKey(key: []const u8) bool {
 pub fn shouldEmbedMemoryEntry(key: []const u8, content: []const u8) bool {
     if (isSemanticBookkeepingKey(key)) return false;
     const chunking = config_types.MemoryChunkingConfig{};
-    // Use a conservative byte ceiling so we stay comfortably under providers
-    // that enforce the configured max_tokens limit during embedding.
-    const max_bytes = @as(usize, chunking.max_tokens) * 3;
+    // Use the same chars-per-token estimate as the chunker so entries that pass
+    // this gate are guaranteed to fit within a single chunk (no silent truncation
+    // by the embedding provider). Previously this used *3 while the chunker used
+    // *4, causing valid content to be gated out unnecessarily.
+    const max_bytes = @as(usize, chunking.max_tokens) * config_types.MemoryChunkingConfig.CHARS_PER_TOKEN;
     return content.len <= max_bytes;
 }
 
@@ -1692,7 +1734,12 @@ pub fn initRuntimeWithOptions(
     // ── Lifecycle: semantic cache ──
     var sem_cache: ?*semantic_cache.SemanticCache = null;
     var sem_cache_db_path: ?[*:0]const u8 = null;
-    if (build_options.enable_sqlite and config.response_cache.enabled and embed_provider != null) sem_cache_blk: {
+    const legacy_semantic_cache_bridge = !config.semantic_cache.enabled and config.response_cache.enabled;
+    const semantic_cache_requested = config.semantic_cache.enabled or legacy_semantic_cache_bridge;
+    if (legacy_semantic_cache_bridge) {
+        log.warn("semantic cache enabled via legacy memory.response_cache.enabled compatibility bridge; migrate to memory.semantic_cache.enabled", .{});
+    }
+    if (build_options.enable_sqlite and semantic_cache_requested and embed_provider != null) sem_cache_blk: {
         const sc_path = std.fs.path.joinZ(allocator, &.{ workspace_dir, "semantic_cache.db" }) catch break :sem_cache_blk;
         const sc = allocator.create(semantic_cache.SemanticCache) catch {
             allocator.free(std.mem.span(sc_path.ptr));
@@ -1700,9 +1747,9 @@ pub fn initRuntimeWithOptions(
         };
         sc.* = semantic_cache.SemanticCache.init(
             sc_path.ptr,
-            config.response_cache.ttl_minutes,
-            config.response_cache.max_entries,
-            0.95, // cosine similarity threshold
+            config.semantic_cache.ttl_minutes,
+            config.semantic_cache.max_entries,
+            config.semantic_cache.similarity_threshold,
             embed_provider,
         ) catch {
             allocator.destroy(sc);
@@ -1954,12 +2001,25 @@ test "SessionStore delegates through vtable" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.call_count += 1;
         }
+        fn implSaveCompletionEvent(_: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, _: ?[]const u8, _: ?[]const u8, _: ?[]const u8, _: []const u8) anyerror![]u8 {
+            return allocator.dupe(u8, session_id);
+        }
+        fn implLoadCompletionEvents(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]CompletionEvent {
+            return allocator.alloc(CompletionEvent, 0);
+        }
+        fn implDeleteCompletionEvent(ptr: *anyopaque, _: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+        }
 
         const sess_vtable = SessionStore.VTable{
             .saveMessage = &implSaveMessage,
             .loadMessages = &implLoadMessages,
             .clearMessages = &implClearMessages,
             .clearAutoSaved = &implClearAutoSaved,
+            .saveCompletionEvent = &implSaveCompletionEvent,
+            .loadCompletionEvents = &implLoadCompletionEvents,
+            .deleteCompletionEvent = &implDeleteCompletionEvent,
         };
     };
 
@@ -1978,6 +2038,17 @@ test "SessionStore delegates through vtable" {
 
     try store.clearAutoSaved(null);
     try std.testing.expectEqual(@as(usize, 3), mock.call_count);
+
+    const event_id = try store.saveCompletionEvent(std.testing.allocator, "s1", "zaki_app", null, "s1", "done");
+    defer std.testing.allocator.free(event_id);
+    try std.testing.expectEqualStrings("s1", event_id);
+
+    const events = try store.loadCompletionEvents(std.testing.allocator, "s1");
+    defer std.testing.allocator.free(events);
+    try std.testing.expectEqual(@as(usize, 0), events.len);
+
+    try store.deleteCompletionEvent("event-1");
+    try std.testing.expectEqual(@as(usize, 4), mock.call_count);
 }
 
 test "freeMessages frees all entries" {
@@ -2100,6 +2171,52 @@ test "initRuntime with cache enabled creates ResponseCache" {
     defer rt.deinit();
     try std.testing.expect(rt.response_cache != null);
     try std.testing.expect(rt._cache_db_path != null);
+}
+
+test "initRuntime legacy response_cache bridge enables semantic cache" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    try requireBackendEnabledForTests("none");
+
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "none",
+        .response_cache = .{
+            .enabled = true,
+        },
+        .search = .{
+            .provider = "openai",
+            .query = .{ .hybrid = .{ .enabled = true } },
+        },
+    }, ws.path) orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expect(rt._semantic_cache != null);
+    try std.testing.expect(rt.resolved.semantic_cache_enabled);
+}
+
+test "initRuntime explicit semantic_cache enables semantic cache" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    try requireBackendEnabledForTests("none");
+
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "none",
+        .semantic_cache = .{
+            .enabled = true,
+        },
+        .search = .{
+            .provider = "openai",
+            .query = .{ .hybrid = .{ .enabled = true } },
+        },
+    }, ws.path) orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expect(rt._semantic_cache != null);
+    try std.testing.expect(rt.resolved.semantic_cache_enabled);
 }
 
 test "initRuntime creates engine with primary source" {
@@ -2603,11 +2720,13 @@ test "shouldEmbedMemoryEntry skips bookkeeping artifacts and oversize content" {
     try std.testing.expect(!shouldEmbedMemoryEntry("autosave_user_1", "hello"));
     try std.testing.expect(shouldEmbedMemoryEntry("summary_latest/agent:test:user:1:main", "focus: ship"));
 
+    // max_tokens=512, CHARS_PER_TOKEN=4 → gate is 2048 bytes
     var medium: [1400]u8 = undefined;
     @memset(&medium, 'a');
     try std.testing.expect(shouldEmbedMemoryEntry("timeline_summary/agent:test:user:1:main/1", medium[0..]));
 
-    var big: [1700]u8 = undefined;
+    // 2049 bytes exceeds the 2048-byte gate
+    var big: [2049]u8 = undefined;
     @memset(&big, 'a');
     try std.testing.expect(!shouldEmbedMemoryEntry("durable_fact/x", big[0..]));
 }

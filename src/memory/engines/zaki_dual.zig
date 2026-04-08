@@ -1,6 +1,8 @@
 const std = @import("std");
 const root = @import("../root.zig");
 
+const log = std.log.scoped(.zaki_dual);
+
 pub const ZakiDualMemory = struct {
     allocator: std.mem.Allocator,
     primary: root.Memory,
@@ -39,7 +41,9 @@ pub const ZakiDualMemory = struct {
             allocator.free(tombstoned_keys);
         }
         for (tombstoned_keys) |target_key| {
-            _ = self.primary.forget(target_key) catch {};
+            _ = self.primary.forget(target_key) catch |err| {
+                log.warn("zaki_dual: syncFromMarkdown failed to forget tombstoned key '{s}': {}", .{ target_key, err });
+            };
         }
 
         const entries = try self.markdown_impl.memory().list(allocator, null, null);
@@ -65,8 +69,17 @@ pub const ZakiDualMemory = struct {
 
     fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: root.MemoryCategory, session_id: ?[]const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        // Postgres (primary) is canonical — write it first and fail hard if it errors.
         try self.primary.store(key, content, category, session_id);
-        try self.markdown_impl.memory().store(key, content, category, session_id);
+        // Markdown is a write-through mirror for human inspection and restart sync.
+        // If it fails, log a warning: on the next restart syncFromMarkdown will see
+        // a stale (or absent) entry for this key and must NOT override the Postgres
+        // value. This is a known limitation — a future timestamp-based merge would
+        // handle it gracefully. For now, surfacing the failure is the safe path.
+        self.markdown_impl.memory().store(key, content, category, session_id) catch |err| {
+            log.warn("zaki_dual: markdown mirror write failed for key '{s}': {} — " ++
+                "Postgres is authoritative; manual MEMORY.md sync may be needed", .{ key, err });
+        };
     }
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]root.MemoryEntry {

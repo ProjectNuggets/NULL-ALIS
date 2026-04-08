@@ -3,6 +3,8 @@ const build_options = @import("build_options");
 const channel_catalog = @import("../channel_catalog.zig");
 const config_mod = @import("../config.zig");
 const http_util = @import("../http_util.zig");
+const zaki_session = @import("../zaki_session.zig");
+const zaki_state = @import("../zaki_state.zig");
 
 pub const Source = enum {
     gateway_internal,
@@ -98,6 +100,485 @@ pub const RuntimeSnapshot = struct {
         if (self.tenant_lease_probe_owner_id) |value| allocator.free(value);
     }
 };
+
+pub const ExecutionTruth = struct {
+    task: []u8,
+    task_key: ?[]u8,
+    owner: []u8,
+    owner_source: []u8,
+    status: []u8,
+    result: []u8,
+    failure: []u8,
+    degraded: bool,
+    degraded_reason: []u8,
+    fallback_active: bool,
+    fallback_reason: []u8,
+    fallback_chain: []u8,
+
+    pub fn deinit(self: *ExecutionTruth, allocator: std.mem.Allocator) void {
+        allocator.free(self.task);
+        if (self.task_key) |value| allocator.free(value);
+        allocator.free(self.owner);
+        allocator.free(self.owner_source);
+        allocator.free(self.status);
+        allocator.free(self.result);
+        allocator.free(self.failure);
+        allocator.free(self.degraded_reason);
+        allocator.free(self.fallback_reason);
+        allocator.free(self.fallback_chain);
+    }
+};
+
+pub const ExecutionTaskFocus = struct {
+    task_snapshot: ?zaki_state.TaskSnapshot = null,
+    task_session_key: ?[]u8 = null,
+    selection_rule: []const u8 = "current_session",
+
+    pub fn deinit(self: *ExecutionTaskFocus, allocator: std.mem.Allocator) void {
+        if (self.task_snapshot) |*snapshot| snapshot.deinit(allocator);
+        if (self.task_session_key) |value| allocator.free(value);
+    }
+};
+
+pub fn deriveExecutionTruth(
+    allocator: std.mem.Allocator,
+    snapshot: *const RuntimeSnapshot,
+    task_snapshot: ?*const zaki_state.TaskSnapshot,
+    session_key: ?[]const u8,
+    owner_hint: ?[]const u8,
+) !ExecutionTruth {
+    const result_label = deriveResultLabel(snapshot, task_snapshot, session_key);
+    const failure_label = deriveFailureLabel(task_snapshot);
+    const degraded = deriveDegraded(snapshot);
+    const owner, const owner_source = deriveOwnerTruth(snapshot, owner_hint);
+    const fallback_active, const fallback_reason = deriveFallbackState(snapshot);
+
+    return .{
+        .task = try allocator.dupe(u8, deriveTaskLabel(session_key)),
+        .task_key = if (session_key) |value| try allocator.dupe(u8, value) else null,
+        .owner = try allocator.dupe(u8, owner),
+        .owner_source = try allocator.dupe(u8, owner_source),
+        .status = try allocator.dupe(u8, deriveStatusLabel(degraded, task_snapshot, session_key, result_label)),
+        .result = try allocator.dupe(u8, result_label),
+        .failure = try allocator.dupe(u8, failure_label),
+        .degraded = degraded,
+        .degraded_reason = try allocator.dupe(u8, deriveDegradedReason(snapshot)),
+        .fallback_active = fallback_active,
+        .fallback_reason = try allocator.dupe(u8, fallback_reason),
+        .fallback_chain = try allocator.dupe(u8, snapshot.chat_fallback_chain),
+    };
+}
+
+fn deriveTaskLabel(session_key: ?[]const u8) []const u8 {
+    const key = session_key orelse return "idle";
+    if (std.mem.indexOf(u8, key, ":task:") != null or std.mem.startsWith(u8, key, "task:")) return "task";
+    if (std.mem.indexOf(u8, key, ":thread:") != null or std.mem.startsWith(u8, key, "thread:")) return "thread";
+    if (std.mem.indexOf(u8, key, ":cron:") != null or std.mem.startsWith(u8, key, "cron:")) return "cron";
+    if (std.mem.endsWith(u8, key, ":main") or std.mem.eql(u8, key, "main")) return "main";
+    return "session";
+}
+
+fn deriveResultLabel(snapshot: *const RuntimeSnapshot, task_snapshot: ?*const zaki_state.TaskSnapshot, session_key: ?[]const u8) []const u8 {
+    if (task_snapshot) |task| {
+        if (task.result) |value| return value;
+        if (std.mem.eql(u8, task.status, "failed")) return "failed";
+        if (std.mem.eql(u8, task.status, "completed")) return "completed";
+        return task.status;
+    }
+    if (snapshot.heartbeat_runtime_last_status) |value| return value;
+    if (snapshot.proactive_last_status) |value| return value;
+    if (session_key != null) return "in_progress";
+    return "none";
+}
+
+fn deriveFailureLabel(task_snapshot: ?*const zaki_state.TaskSnapshot) []const u8 {
+    if (task_snapshot) |task| {
+        if (task.error_msg) |value| return value;
+    }
+    return "";
+}
+
+fn deriveDegraded(snapshot: *const RuntimeSnapshot) bool {
+    return snapshot.degraded or snapshot.context_incomplete;
+}
+
+fn deriveDegradedReason(snapshot: *const RuntimeSnapshot) []const u8 {
+    if (snapshot.degraded_reason.len > 0) return snapshot.degraded_reason;
+    if (snapshot.context_incomplete) return "context_incomplete";
+    return "";
+}
+
+fn deriveStatusLabel(degraded: bool, task_snapshot: ?*const zaki_state.TaskSnapshot, session_key: ?[]const u8, result_label: []const u8) []const u8 {
+    if (degraded) return "degraded";
+    if (task_snapshot) |task| {
+        if (std.mem.eql(u8, task.status, "failed") or task.error_msg != null) return "attention";
+    }
+    if (isAttentionResult(result_label)) return "attention";
+    if (session_key != null) return "active";
+    return "ready";
+}
+
+fn deriveOwnerTruth(snapshot: *const RuntimeSnapshot, owner_hint: ?[]const u8) struct { []const u8, []const u8 } {
+    if (snapshot.tenant_lease_probe_owner_id) |owner_id| {
+        return .{ owner_id, snapshot.tenant_lease_probe_data_source orelse "tenant_lease_probe" };
+    }
+    if (owner_hint) |hint| return .{ hint, "scoped_user_id" };
+    return .{ "unowned", "none" };
+}
+
+fn deriveFallbackState(snapshot: *const RuntimeSnapshot) struct { bool, []const u8 } {
+    if (snapshot.source == .local_fallback) return .{ true, "local_fallback" };
+    if (snapshot.context_incomplete) return .{ true, "context_incomplete" };
+    if (isExplicitFallbackSource(snapshot.provider_data_source)) {
+        return .{ true, snapshot.provider_data_source };
+    }
+    return .{ false, "" };
+}
+
+fn isExplicitFallbackSource(source: []const u8) bool {
+    return std.mem.eql(u8, source, "local_fallback") or
+        std.mem.eql(u8, source, "file_fallback") or
+        std.mem.eql(u8, source, "context_missing");
+}
+
+fn isAttentionResult(result_label: []const u8) bool {
+    return std.mem.indexOf(u8, result_label, "failed") != null or
+        std.mem.indexOf(u8, result_label, "blocked") != null or
+        std.mem.indexOf(u8, result_label, "error") != null or
+        std.mem.indexOf(u8, result_label, "reconnect") != null or
+        std.mem.indexOf(u8, result_label, "timeout") != null;
+}
+
+pub fn collectDurableTaskSnapshot(
+    allocator: std.mem.Allocator,
+    cfg: *const config_mod.Config,
+    state_mgr: ?*zaki_state.Manager,
+    numeric_user_id: ?i64,
+    user_id: ?[]const u8,
+    session_key: ?[]const u8,
+) !?zaki_state.TaskSnapshot {
+    const task_id = parseTaskIdFromSessionKey(session_key orelse return null) orelse return null;
+    if (state_mgr) |mgr| {
+        if (numeric_user_id) |resolved_user_id| {
+            return try mgr.getTaskSnapshot(allocator, resolved_user_id, task_id);
+        }
+    }
+    const ledger_path = try taskLedgerPath(allocator, cfg, user_id);
+    defer allocator.free(ledger_path);
+    return try collectTaskSnapshotFromFile(allocator, ledger_path, task_id);
+}
+
+pub fn collectExecutionTaskFocus(
+    allocator: std.mem.Allocator,
+    cfg: *const config_mod.Config,
+    state_mgr: ?*zaki_state.Manager,
+    numeric_user_id: ?i64,
+    user_id: ?[]const u8,
+    session_key: ?[]const u8,
+) !ExecutionTaskFocus {
+    const current_session_key = session_key orelse return .{};
+    if (isTaskSessionKey(current_session_key)) {
+        return .{
+            .task_snapshot = try collectDurableTaskSnapshot(allocator, cfg, state_mgr, numeric_user_id, user_id, session_key),
+            .selection_rule = "current_session",
+        };
+    }
+    if (!isMainSurfaceSessionKey(current_session_key)) return .{};
+
+    if (state_mgr) |mgr| {
+        if (numeric_user_id) |resolved_user_id| {
+            const snapshots = try mgr.listTaskSnapshots(allocator, resolved_user_id);
+            defer {
+                for (snapshots) |*snapshot| snapshot.deinit(allocator);
+                allocator.free(snapshots);
+            }
+            if (selectFocusedTaskSnapshotIndex(snapshots, current_session_key)) |idx| {
+                return .{
+                    .task_snapshot = try dupeTaskSnapshot(allocator, &snapshots[idx]),
+                    .task_session_key = try deriveTaskSnapshotRuntimeSessionKey(allocator, &snapshots[idx]),
+                    .selection_rule = focusedTaskSelectionRule(&snapshots[idx]),
+                };
+            }
+            return .{};
+        }
+    }
+
+    const ledger_path = try taskLedgerPath(allocator, cfg, user_id);
+    defer allocator.free(ledger_path);
+    return try collectFocusedTaskSnapshotFromFile(allocator, ledger_path, current_session_key);
+}
+
+fn parseTaskIdFromSessionKey(session_key: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, session_key, "task:") and session_key.len > "task:".len) {
+        return session_key["task:".len..];
+    }
+    const marker = ":task:";
+    const idx = std.mem.indexOf(u8, session_key, marker) orelse return null;
+    const task_id = session_key[idx + marker.len ..];
+    if (task_id.len == 0) return null;
+    return task_id;
+}
+
+fn isTaskSessionKey(session_key: []const u8) bool {
+    return std.mem.startsWith(u8, session_key, "task:") or std.mem.indexOf(u8, session_key, ":task:") != null;
+}
+
+fn isMainSurfaceSessionKey(session_key: []const u8) bool {
+    return std.mem.eql(u8, session_key, "main") or std.mem.endsWith(u8, session_key, ":main");
+}
+
+fn deriveLegacyRuntimeSessionKey(allocator: std.mem.Allocator, request_session_key: []const u8, task_id: []const u8) !?[]u8 {
+    const user_id = zaki_session.parseUserIdFromSessionKey(request_session_key) orelse return null;
+    var session_buf: [128]u8 = undefined;
+    const runtime_session_key = zaki_session.userTaskSessionKey(&session_buf, user_id, task_id);
+    return @as(?[]u8, try allocator.dupe(u8, runtime_session_key));
+}
+
+fn taskLedgerPath(allocator: std.mem.Allocator, cfg: *const config_mod.Config, user_id: ?[]const u8) ![]u8 {
+    if (cfg.tenant.enabled and cfg.tenant.data_root.len > 0 and user_id != null) {
+        return std.fmt.allocPrint(allocator, "{s}/{s}/workspace/state/subagent_tasks.jsonl", .{ cfg.tenant.data_root, user_id.? });
+    }
+    return std.fs.path.join(allocator, &.{ cfg.workspace_dir, "state", "subagent_tasks.jsonl" });
+}
+
+fn collectTaskSnapshotFromFile(allocator: std.mem.Allocator, path: []const u8, task_id: []const u8) !?zaki_state.TaskSnapshot {
+    const file = (if (std.fs.path.isAbsolute(path)) std.fs.openFileAbsolute(path, .{}) else std.fs.cwd().openFile(path, .{})) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+    const raw = try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+    defer allocator.free(raw);
+
+    var latest: ?zaki_state.TaskSnapshot = null;
+    errdefer if (latest) |*snapshot| snapshot.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const snapshot = (try parseTaskSnapshotLedgerObject(allocator, parsed.value.object)) orelse continue;
+        errdefer snapshot.deinit(allocator);
+        if (!std.mem.eql(u8, snapshot.id, task_id)) {
+            var discarded = snapshot;
+            discarded.deinit(allocator);
+            continue;
+        }
+
+        if (latest) |*value| value.deinit(allocator);
+        latest = snapshot;
+    }
+    return latest;
+}
+
+fn collectFocusedTaskSnapshotFromFile(allocator: std.mem.Allocator, path: []const u8, request_session_key: []const u8) !ExecutionTaskFocus {
+    const file = (if (std.fs.path.isAbsolute(path)) std.fs.openFileAbsolute(path, .{}) else std.fs.cwd().openFile(path, .{})) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    defer file.close();
+    const raw = try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+    defer allocator.free(raw);
+
+    var active: ?zaki_state.TaskSnapshot = null;
+    var attention: ?zaki_state.TaskSnapshot = null;
+    errdefer {
+        if (active) |*snapshot| snapshot.deinit(allocator);
+        if (attention) |*snapshot| snapshot.deinit(allocator);
+    }
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        var snapshot = (try parseTaskSnapshotLedgerObject(allocator, parsed.value.object)) orelse continue;
+        errdefer snapshot.deinit(allocator);
+        const priority = focusedTaskPriority(&snapshot, request_session_key);
+        if (priority == .ignore) {
+            snapshot.deinit(allocator);
+            continue;
+        }
+
+        if (priority == .active) {
+            if (active) |*existing| {
+                if (!isTaskSnapshotNewer(&snapshot, existing)) {
+                    snapshot.deinit(allocator);
+                    continue;
+                }
+                existing.deinit(allocator);
+            }
+            active = snapshot;
+            continue;
+        }
+
+        if (attention) |*existing| {
+            if (!isTaskSnapshotNewer(&snapshot, existing)) {
+                snapshot.deinit(allocator);
+                continue;
+            }
+            existing.deinit(allocator);
+        }
+        attention = snapshot;
+    }
+
+    if (active) |snapshot| {
+        if (attention) |*value| value.deinit(allocator);
+        return .{
+            .task_session_key = try deriveTaskSnapshotRuntimeSessionKey(allocator, &snapshot),
+            .task_snapshot = snapshot,
+            .selection_rule = "main_active_task",
+        };
+    }
+    if (attention) |snapshot| {
+        return .{
+            .task_session_key = try deriveTaskSnapshotRuntimeSessionKey(allocator, &snapshot),
+            .task_snapshot = snapshot,
+            .selection_rule = "main_attention_task",
+        };
+    }
+    return .{};
+}
+
+fn parseTaskSnapshotLedgerObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !?zaki_state.TaskSnapshot {
+    const id_value = obj.get("id") orelse return null;
+    const status_value = obj.get("status") orelse return null;
+    const label_value = obj.get("label") orelse return null;
+    const prompt_value = obj.get("task_prompt") orelse return null;
+    const started_value = obj.get("started_at") orelse return null;
+    if (id_value != .integer or status_value != .string or label_value != .string or prompt_value != .string or started_value != .integer) return null;
+
+    var id_buf: [32]u8 = undefined;
+    const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{id_value.integer}) catch return null;
+    const request_session_value = if (readObjectString(obj, "request_session_key")) |value|
+        value
+    else if (readObjectString(obj, "session_key")) |value|
+        if (!isTaskSessionKey(value)) value else null
+    else
+        null;
+
+    return .{
+        .id = try allocator.dupe(u8, id_text),
+        .session_id = if (readObjectString(obj, "runtime_session_key")) |value|
+            try allocator.dupe(u8, value)
+        else if (readObjectString(obj, "session_key")) |value|
+            if (isTaskSessionKey(value))
+                try allocator.dupe(u8, value)
+            else
+                try deriveLegacyRuntimeSessionKey(allocator, value, id_text)
+        else
+            null,
+        .request_session_id = if (request_session_value) |value| try allocator.dupe(u8, value) else null,
+        .label = try allocator.dupe(u8, label_value.string),
+        .prompt = try allocator.dupe(u8, prompt_value.string),
+        .status = try allocator.dupe(u8, status_value.string),
+        .result = if (readObjectString(obj, "result")) |value| try allocator.dupe(u8, value) else null,
+        .error_msg = if (readObjectString(obj, "error")) |value| try allocator.dupe(u8, value) else null,
+        .created_at_ms = started_value.integer,
+        .started_at_ms = started_value.integer,
+        .completed_at_ms = if (obj.get("completed_at")) |value| switch (value) {
+            .integer => value.integer,
+            else => null,
+        } else null,
+    };
+}
+
+fn dupeTaskSnapshot(allocator: std.mem.Allocator, snapshot: *const zaki_state.TaskSnapshot) !zaki_state.TaskSnapshot {
+    return .{
+        .id = try allocator.dupe(u8, snapshot.id),
+        .session_id = if (snapshot.session_id) |value| try allocator.dupe(u8, value) else null,
+        .request_session_id = if (snapshot.request_session_id) |value| try allocator.dupe(u8, value) else null,
+        .label = try allocator.dupe(u8, snapshot.label),
+        .prompt = try allocator.dupe(u8, snapshot.prompt),
+        .status = try allocator.dupe(u8, snapshot.status),
+        .result = if (snapshot.result) |value| try allocator.dupe(u8, value) else null,
+        .error_msg = if (snapshot.error_msg) |value| try allocator.dupe(u8, value) else null,
+        .created_at_ms = snapshot.created_at_ms,
+        .started_at_ms = snapshot.started_at_ms,
+        .completed_at_ms = snapshot.completed_at_ms,
+    };
+}
+
+const FocusedTaskPriority = enum {
+    ignore,
+    attention,
+    active,
+};
+
+fn selectFocusedTaskSnapshotIndex(snapshots: []const zaki_state.TaskSnapshot, request_session_key: []const u8) ?usize {
+    var active_idx: ?usize = null;
+    var attention_idx: ?usize = null;
+    for (snapshots, 0..) |*snapshot, idx| {
+        const priority = focusedTaskPriority(snapshot, request_session_key);
+        switch (priority) {
+            .ignore => {},
+            .active => {
+                if (active_idx) |existing_idx| {
+                    if (!isTaskSnapshotNewer(snapshot, &snapshots[existing_idx])) continue;
+                }
+                active_idx = idx;
+            },
+            .attention => {
+                if (attention_idx) |existing_idx| {
+                    if (!isTaskSnapshotNewer(snapshot, &snapshots[existing_idx])) continue;
+                }
+                attention_idx = idx;
+            },
+        }
+    }
+    return active_idx orelse attention_idx;
+}
+
+fn focusedTaskPriority(snapshot: *const zaki_state.TaskSnapshot, request_session_key: []const u8) FocusedTaskPriority {
+    if (!taskSnapshotMatchesRequestSession(snapshot, request_session_key)) return .ignore;
+    if (std.mem.eql(u8, snapshot.status, "running") or std.mem.eql(u8, snapshot.status, "queued")) return .active;
+    if (std.mem.eql(u8, snapshot.status, "failed") or snapshot.error_msg != null) return .attention;
+    return .ignore;
+}
+
+fn focusedTaskSelectionRule(snapshot: *const zaki_state.TaskSnapshot) []const u8 {
+    return if (std.mem.eql(u8, snapshot.status, "running") or std.mem.eql(u8, snapshot.status, "queued"))
+        "main_active_task"
+    else
+        "main_attention_task";
+}
+
+fn taskSnapshotMatchesRequestSession(snapshot: *const zaki_state.TaskSnapshot, request_session_key: []const u8) bool {
+    if (snapshot.request_session_id) |value| return std.mem.eql(u8, value, request_session_key);
+    if (snapshot.session_id) |value| {
+        return !isTaskSessionKey(value) and std.mem.eql(u8, value, request_session_key);
+    }
+    return false;
+}
+
+fn taskSnapshotOrderingMs(snapshot: *const zaki_state.TaskSnapshot) i64 {
+    return snapshot.completed_at_ms orelse snapshot.started_at_ms orelse snapshot.created_at_ms;
+}
+
+fn isTaskSnapshotNewer(candidate: *const zaki_state.TaskSnapshot, current: *const zaki_state.TaskSnapshot) bool {
+    const candidate_ms = taskSnapshotOrderingMs(candidate);
+    const current_ms = taskSnapshotOrderingMs(current);
+    if (candidate_ms != current_ms) return candidate_ms > current_ms;
+    return std.mem.order(u8, candidate.id, current.id) == .gt;
+}
+
+fn deriveTaskSnapshotRuntimeSessionKey(allocator: std.mem.Allocator, snapshot: *const zaki_state.TaskSnapshot) !?[]u8 {
+    if (snapshot.session_id) |value| {
+        if (snapshot.request_session_id == null and !isTaskSessionKey(value)) {
+            return try deriveLegacyRuntimeSessionKey(allocator, value, snapshot.id);
+        }
+        return try allocator.dupe(u8, value);
+    }
+    if (snapshot.request_session_id) |value| {
+        return try deriveLegacyRuntimeSessionKey(allocator, value, snapshot.id);
+    }
+    return null;
+}
 
 pub fn collectRuntimeSnapshot(
     allocator: std.mem.Allocator,
@@ -781,4 +1262,182 @@ test "collectLocalFallbackSnapshot marks unknown effective backend when runtime 
     try std.testing.expectEqualStrings("none", snapshot.chat_fallback_chain);
     try std.testing.expectEqualStrings("none", snapshot.embedding_provider_effective);
     try std.testing.expectEqualStrings("config", snapshot.provider_data_source);
+}
+
+test "deriveExecutionTruth surfaces degraded local fallback compactly" {
+    var snapshot = RuntimeSnapshot{
+        .source = .local_fallback,
+        .state_backend_configured = try std.testing.allocator.dupe(u8, "postgres"),
+        .state_backend_effective = try std.testing.allocator.dupe(u8, "file"),
+        .scheduler_backend = try std.testing.allocator.dupe(u8, "file"),
+        .degraded = true,
+        .degraded_reason = try std.testing.allocator.dupe(u8, "PostgresNotEnabled"),
+        .heartbeat_enabled = false,
+        .heartbeat_interval_minutes = 30,
+        .tenant_enabled = true,
+        .scheduler_max_tasks_configured = 64,
+        .scheduler_max_concurrent_configured = 4,
+        .chat_provider_effective = try std.testing.allocator.dupe(u8, "openrouter"),
+        .chat_fallback_chain = try std.testing.allocator.dupe(u8, "anthropic"),
+        .embedding_provider_effective = try std.testing.allocator.dupe(u8, "none"),
+        .provider_data_source = try std.testing.allocator.dupe(u8, "config"),
+        .tenant_lease_probe_owner_id = try std.testing.allocator.dupe(u8, "node-a"),
+        .tenant_lease_probe_data_source = try std.testing.allocator.dupe(u8, "postgres_lease"),
+        .heartbeat_runtime_last_status = try std.testing.allocator.dupe(u8, "send_failed"),
+    };
+    defer snapshot.deinit(std.testing.allocator);
+
+    var truth = try deriveExecutionTruth(std.testing.allocator, &snapshot, null, "agent:test:user:1:task:ship", "1");
+    defer truth.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("task", truth.task);
+    try std.testing.expectEqualStrings("node-a", truth.owner);
+    try std.testing.expectEqualStrings("degraded", truth.status);
+    try std.testing.expectEqualStrings("send_failed", truth.result);
+    try std.testing.expect(truth.degraded);
+    try std.testing.expectEqualStrings("PostgresNotEnabled", truth.degraded_reason);
+    try std.testing.expect(truth.fallback_active);
+    try std.testing.expectEqualStrings("local_fallback", truth.fallback_reason);
+    try std.testing.expectEqualStrings("anthropic", truth.fallback_chain);
+}
+
+test "deriveExecutionTruth keeps config-backed provider truth non-fallback and owner explicit" {
+    var snapshot = RuntimeSnapshot{
+        .source = .gateway_internal,
+        .state_backend_configured = try std.testing.allocator.dupe(u8, "postgres"),
+        .state_backend_effective = try std.testing.allocator.dupe(u8, "postgres"),
+        .scheduler_backend = try std.testing.allocator.dupe(u8, "postgres"),
+        .degraded = false,
+        .degraded_reason = try std.testing.allocator.dupe(u8, ""),
+        .heartbeat_enabled = true,
+        .heartbeat_interval_minutes = 30,
+        .tenant_enabled = true,
+        .scheduler_max_tasks_configured = 64,
+        .scheduler_max_concurrent_configured = 4,
+        .chat_provider_effective = try std.testing.allocator.dupe(u8, "openrouter"),
+        .chat_fallback_chain = try std.testing.allocator.dupe(u8, "anthropic"),
+        .embedding_provider_effective = try std.testing.allocator.dupe(u8, "openai"),
+        .provider_data_source = try std.testing.allocator.dupe(u8, "config"),
+    };
+    defer snapshot.deinit(std.testing.allocator);
+
+    var truth = try deriveExecutionTruth(std.testing.allocator, &snapshot, null, "agent:test:user:7:main", "7");
+    defer truth.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("active", truth.status);
+    try std.testing.expectEqualStrings("in_progress", truth.result);
+    try std.testing.expectEqualStrings("7", truth.owner);
+    try std.testing.expectEqualStrings("scoped_user_id", truth.owner_source);
+    try std.testing.expect(!truth.degraded);
+    try std.testing.expect(!truth.fallback_active);
+    try std.testing.expectEqualStrings("", truth.fallback_reason);
+}
+
+test "deriveExecutionTruth treats failed task as attention without degrading runtime" {
+    var snapshot = RuntimeSnapshot{
+        .source = .gateway_internal,
+        .state_backend_configured = try std.testing.allocator.dupe(u8, "postgres"),
+        .state_backend_effective = try std.testing.allocator.dupe(u8, "postgres"),
+        .scheduler_backend = try std.testing.allocator.dupe(u8, "postgres"),
+        .degraded = false,
+        .degraded_reason = try std.testing.allocator.dupe(u8, ""),
+        .heartbeat_enabled = true,
+        .heartbeat_interval_minutes = 30,
+        .tenant_enabled = true,
+        .scheduler_max_tasks_configured = 64,
+        .scheduler_max_concurrent_configured = 4,
+        .chat_provider_effective = try std.testing.allocator.dupe(u8, "openrouter"),
+        .chat_fallback_chain = try std.testing.allocator.dupe(u8, "anthropic"),
+        .embedding_provider_effective = try std.testing.allocator.dupe(u8, "openai"),
+        .provider_data_source = try std.testing.allocator.dupe(u8, "config"),
+    };
+    defer snapshot.deinit(std.testing.allocator);
+
+    var task_snapshot = zaki_state.TaskSnapshot{
+        .id = try std.testing.allocator.dupe(u8, "7"),
+        .session_id = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:1:task:7"),
+        .request_session_id = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:1:main"),
+        .label = try std.testing.allocator.dupe(u8, "recover"),
+        .prompt = try std.testing.allocator.dupe(u8, "recover prompt"),
+        .status = try std.testing.allocator.dupe(u8, "failed"),
+        .result = null,
+        .error_msg = try std.testing.allocator.dupe(u8, "process_restarted_before_completion"),
+        .created_at_ms = 42,
+        .started_at_ms = 42,
+        .completed_at_ms = 84,
+    };
+    defer task_snapshot.deinit(std.testing.allocator);
+
+    var truth = try deriveExecutionTruth(std.testing.allocator, &snapshot, &task_snapshot, task_snapshot.session_id.?, "1");
+    defer truth.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("attention", truth.status);
+    try std.testing.expectEqualStrings("failed", truth.result);
+    try std.testing.expectEqualStrings("process_restarted_before_completion", truth.failure);
+    try std.testing.expect(!truth.degraded);
+    try std.testing.expectEqualStrings("", truth.degraded_reason);
+}
+
+test "collectTaskSnapshotFromFile derives runtime lane for legacy requester-only ledger row" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/subagent_tasks.jsonl", .{tmp_root});
+    defer std.testing.allocator.free(path);
+
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(
+        "{\"id\":7,\"status\":\"failed\",\"label\":\"recover\",\"task_summary\":\"recover\",\"task_prompt\":\"recover prompt\",\"session_key\":\"agent:zaki-bot:user:1:main\",\"origin_channel\":\"agent\",\"origin_chat_id\":\"session:recover\",\"result\":null,\"error\":\"process_restarted_before_completion\",\"started_at\":42,\"completed_at\":84}\n",
+    );
+
+    var snapshot = (try collectTaskSnapshotFromFile(std.testing.allocator, path, "7")) orelse return error.TestUnexpectedResult;
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:main", snapshot.request_session_id.?);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:task:7", snapshot.session_id.?);
+}
+
+test "collectExecutionTaskFocus from main prefers newest active task for that lane" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const state_dir = try std.fs.path.join(std.testing.allocator, &.{ workspace, "state" });
+    defer std.testing.allocator.free(state_dir);
+    try std.fs.makeDirAbsolute(state_dir);
+    const ledger_path = try std.fs.path.join(std.testing.allocator, &.{ state_dir, "subagent_tasks.jsonl" });
+    defer std.testing.allocator.free(ledger_path);
+
+    const file = try std.fs.createFileAbsolute(ledger_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(
+        "{\"id\":4,\"status\":\"failed\",\"label\":\"older-failure\",\"task_summary\":\"older-failure\",\"task_prompt\":\"older-failure prompt\",\"request_session_key\":\"agent:zaki-bot:user:1:main\",\"runtime_session_key\":\"agent:zaki-bot:user:1:task:4\",\"error\":\"process_restarted_before_completion\",\"started_at\":42,\"completed_at\":84}\n" ++
+            "{\"id\":5,\"status\":\"running\",\"label\":\"current-run\",\"task_summary\":\"current-run\",\"task_prompt\":\"current-run prompt\",\"request_session_key\":\"agent:zaki-bot:user:1:main\",\"runtime_session_key\":\"agent:zaki-bot:user:1:task:5\",\"started_at\":100}\n" ++
+            "{\"id\":6,\"status\":\"running\",\"label\":\"other-session\",\"task_summary\":\"other-session\",\"task_prompt\":\"other prompt\",\"request_session_key\":\"agent:zaki-bot:user:2:main\",\"runtime_session_key\":\"agent:zaki-bot:user:2:task:6\",\"started_at\":200}\n",
+    );
+
+    var cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var focus = try collectExecutionTaskFocus(
+        std.testing.allocator,
+        &cfg,
+        null,
+        null,
+        "1",
+        "agent:zaki-bot:user:1:main",
+    );
+    defer focus.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("main_active_task", focus.selection_rule);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:task:5", focus.task_session_key.?);
+    try std.testing.expectEqualStrings("5", focus.task_snapshot.?.id);
+    try std.testing.expectEqualStrings("running", focus.task_snapshot.?.status);
 }

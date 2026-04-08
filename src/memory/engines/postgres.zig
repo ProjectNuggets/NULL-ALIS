@@ -666,11 +666,24 @@ const PostgresMemoryImpl = struct {
         }
     }
 
+    fn implSessionSaveCompletionEvent(_: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, _: ?[]const u8, _: ?[]const u8, _: ?[]const u8, _: []const u8) anyerror![]u8 {
+        return allocator.dupe(u8, session_id);
+    }
+
+    fn implSessionLoadCompletionEvents(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]root.CompletionEvent {
+        return allocator.alloc(root.CompletionEvent, 0);
+    }
+
+    fn implSessionDeleteCompletionEvent(_: *anyopaque, _: []const u8) anyerror!void {}
+
     const session_vtable = SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
         .clearMessages = &implSessionClearMessages,
         .clearAutoSaved = &implSessionClearAutoSaved,
+        .saveCompletionEvent = &implSessionSaveCompletionEvent,
+        .loadCompletionEvents = &implSessionLoadCompletionEvents,
+        .deleteCompletionEvent = &implSessionDeleteCompletionEvent,
     };
 
     pub fn sessionStore(self: *Self) SessionStore {

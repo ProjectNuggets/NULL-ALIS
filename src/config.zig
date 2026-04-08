@@ -284,6 +284,12 @@ pub const Config = struct {
             if (!self.memory.search.query.hybrid.temporal_decay.enabled) {
                 self.memory.search.query.hybrid.temporal_decay.enabled = true;
             }
+            // Adaptive retrieval selects query strategy (keyword vs. hybrid) based on
+            // query characteristics. Enable by default for zaki_bot — it's cheap at
+            // query time and measurably improves recall for short/semantic queries.
+            if (!self.memory.retrieval_stages.adaptive_retrieval_enabled) {
+                self.memory.retrieval_stages.adaptive_retrieval_enabled = true;
+            }
         }
     }
 
@@ -1672,6 +1678,50 @@ test "save escapes mcp_servers strings safely" {
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers[0].env.len);
     try std.testing.expectEqualStrings("OPEN\"KEY", loaded.mcp_servers[0].env[0].key);
     try std.testing.expectEqualStrings("ab\\cd\"ef\nz", loaded.mcp_servers[0].env[0].value);
+}
+
+test "parseJson accepts integer semantic cache similarity threshold" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(
+        \\{
+        \\  "memory": {
+        \\    "semantic_cache": {
+        \\      "similarity_threshold": 1
+        \\    }
+        \\  }
+        \\}
+    );
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.memory.semantic_cache.similarity_threshold, 0.0001);
+}
+
+test "parseJson accepts float semantic cache similarity threshold" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(
+        \\{
+        \\  "memory": {
+        \\    "semantic_cache": {
+        \\      "similarity_threshold": 0.9
+        \\    }
+        \\  }
+        \\}
+    );
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), cfg.memory.semantic_cache.similarity_threshold, 0.0001);
 }
 
 test "syncFlatFields propagates nested values" {

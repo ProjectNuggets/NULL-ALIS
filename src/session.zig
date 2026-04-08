@@ -102,6 +102,18 @@ pub const SessionManager = struct {
         progress_observer: ?Observer = null,
     };
 
+    pub const OriginSnapshot = struct {
+        channel: ?[]u8 = null,
+        account_id: ?[]u8 = null,
+        chat_id: ?[]u8 = null,
+
+        pub fn deinit(self: *OriginSnapshot, allocator: Allocator) void {
+            if (self.channel) |value| allocator.free(value);
+            if (self.account_id) |value| allocator.free(value);
+            if (self.chat_id) |value| allocator.free(value);
+        }
+    };
+
     pub fn init(
         allocator: Allocator,
         config: *const Config,
@@ -617,6 +629,62 @@ pub const SessionManager = struct {
         });
 
         return response;
+    }
+
+    pub fn appendAssistantMessage(self: *SessionManager, session_key: []const u8, content: []const u8) !void {
+        const session = try self.acquireSessionForTurn(session_key);
+        defer self.releaseSessionRef(session);
+
+        session.mutex.lock();
+        defer session.mutex.unlock();
+
+        const content_copy = try self.allocator.dupe(u8, content);
+        errdefer self.allocator.free(content_copy);
+        try session.agent.history.append(self.allocator, .{
+            .role = .assistant,
+            .content = content_copy,
+        });
+        session.agent.enforceHistoryBounds();
+        session.last_active = std.time.timestamp();
+
+        if (self.session_store) |store| {
+            store.saveMessage(session_key, "assistant", content) catch {};
+        }
+    }
+
+    pub fn saveCompletionEvent(
+        self: *SessionManager,
+        session_key: []const u8,
+        channel: ?[]const u8,
+        account_id: ?[]const u8,
+        chat_id: ?[]const u8,
+        content: []const u8,
+    ) !?[]u8 {
+        const store = self.session_store orelse return null;
+        return try store.saveCompletionEvent(self.allocator, session_key, channel, account_id, chat_id, content);
+    }
+
+    pub fn loadCompletionEvents(self: *SessionManager, session_key: []const u8) ![]memory_mod.CompletionEvent {
+        const store = self.session_store orelse return self.allocator.alloc(memory_mod.CompletionEvent, 0);
+        return try store.loadCompletionEvents(self.allocator, session_key);
+    }
+
+    pub fn deleteCompletionEvent(self: *SessionManager, event_id: []const u8) !void {
+        if (self.session_store) |store| {
+            try store.deleteCompletionEvent(event_id);
+        }
+    }
+
+    pub fn captureOriginSnapshot(self: *SessionManager, session_key: []const u8) !OriginSnapshot {
+        const session = try self.getOrCreate(session_key);
+        session.mutex.lock();
+        defer session.mutex.unlock();
+
+        return .{
+            .channel = if (session.origin_channel) |value| try self.allocator.dupe(u8, value) else null,
+            .account_id = if (session.origin_account_id) |value| try self.allocator.dupe(u8, value) else null,
+            .chat_id = if (session.origin_chat_id) |value| try self.allocator.dupe(u8, value) else null,
+        };
     }
 
     /// Number of active sessions.
@@ -1305,6 +1373,101 @@ test "session restore enforces max history bound before first turn" {
     try testing.expectEqual(@as(usize, 5), session.agent.historyLen());
     const last = session.agent.history.items[session.agent.history.items.len - 1].content;
     try testing.expectEqualStrings("message-11", last);
+}
+
+test "appendAssistantMessage adds completion to live session history" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    try sm.appendAssistantMessage("append:live", "[Subagent 'research'] completed");
+
+    const session = try sm.getOrCreate("append:live");
+    try testing.expectEqual(@as(usize, 1), session.agent.historyLen());
+    try testing.expect(session.agent.history.items[0].role == .assistant);
+    try testing.expectEqualStrings("[Subagent 'research'] completed", session.agent.history.items[0].content);
+}
+
+test "appendAssistantMessage persists completion to session store" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, sqlite_mem.memory(), store);
+    defer sm.deinit();
+
+    try sm.appendAssistantMessage("append:store", "[Subagent 'research'] completed");
+
+    const entries = try store.loadMessages(testing.allocator, "append:store");
+    defer {
+        for (entries) |entry| {
+            testing.allocator.free(entry.role);
+            testing.allocator.free(entry.content);
+        }
+        testing.allocator.free(entries);
+    }
+
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings("assistant", entries[0].role);
+    try testing.expectEqualStrings("[Subagent 'research'] completed", entries[0].content);
+}
+
+test "completion events roundtrip through session store" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, sqlite_mem.memory(), store);
+    defer sm.deinit();
+
+    const event_id = (try sm.saveCompletionEvent(
+        "completion:store",
+        "zaki_app",
+        null,
+        "completion:store",
+        "[Subagent 'research'] completed",
+    )).?;
+    defer testing.allocator.free(event_id);
+
+    const events = try sm.loadCompletionEvents("completion:store");
+    defer memory_mod.freeCompletionEvents(testing.allocator, events);
+    try testing.expectEqual(@as(usize, 1), events.len);
+    try testing.expectEqualStrings(event_id, events[0].id);
+    try testing.expectEqualStrings("completion:store", events[0].session_id);
+    try testing.expectEqualStrings("zaki_app", events[0].channel.?);
+    try testing.expectEqualStrings("[Subagent 'research'] completed", events[0].content);
+
+    try sm.deleteCompletionEvent(event_id);
+
+    const remaining = try sm.loadCompletionEvents("completion:store");
+    defer memory_mod.freeCompletionEvents(testing.allocator, remaining);
+    try testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "captureOriginSnapshot returns stored session routing metadata" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("origin:snapshot");
+    session.origin_channel = try testing.allocator.dupe(u8, "telegram");
+    session.origin_account_id = try testing.allocator.dupe(u8, "main");
+    session.origin_chat_id = try testing.allocator.dupe(u8, "12345");
+
+    var snapshot = try sm.captureOriginSnapshot("origin:snapshot");
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("telegram", snapshot.channel.?);
+    try testing.expectEqualStrings("main", snapshot.account_id.?);
+    try testing.expectEqualStrings("12345", snapshot.chat_id.?);
 }
 
 // ---------------------------------------------------------------------------

@@ -32,7 +32,6 @@ const heartbeat_wake = @import("heartbeat_wake.zig");
 const json_util = @import("json_util.zig");
 const tools_mod = @import("tools/root.zig");
 const runtime_resolver = @import("delivery/runtime_resolver.zig");
-const morning_brief = @import("morning_brief.zig");
 const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
 const channel_identity_key = @import("channel_identity_key.zig");
 const lane_metrics = @import("lane_metrics.zig");
@@ -46,9 +45,6 @@ const STATUS_FLUSH_SECONDS: u64 = 5;
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
 const MAX_DISPATCHER_WORKERS: u32 = 64;
-const MORNING_BRIEF_JOB_ID = morning_brief.MORNING_BRIEF_JOB_ID;
-const MORNING_BRIEF_AGENT_COMMAND = morning_brief.MORNING_BRIEF_AGENT_COMMAND;
-const MORNING_BRIEF_AGENT_PROMPT = morning_brief.MORNING_BRIEF_AGENT_PROMPT;
 const HEARTBEAT_WAKE_COMMAND = "__wake_heartbeat";
 
 /// Component status for state file serialization.
@@ -458,12 +454,32 @@ fn mapHeartbeatOutcomeState(action: []const u8, reason: []const u8) HeartbeatOut
     return .{ .status = "send_failed", .reason = if (reason.len > 0) reason else "delivery_error" };
 }
 
-fn deliveryOutcomeThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
+fn completionEventIdFromSource(source: []const u8) ?[]const u8 {
+    const prefix = "subagent_completion:";
+    if (!std.mem.startsWith(u8, source, prefix)) return null;
+    const event_id = source[prefix.len..];
+    if (event_id.len == 0) return null;
+    return event_id;
+}
+
+fn deliveryOutcomeThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus, state_mgr_opt: ?*zaki_state.Manager) void {
     _ = state;
     while (event_bus.consumeDeliveryOutcome()) |outcome| {
         defer outcome.deinit(allocator);
-        if (!config.tenant.enabled) continue;
         const source = outcome.source orelse continue;
+
+        if (std.mem.eql(u8, outcome.action, "sent")) {
+            if (completionEventIdFromSource(source)) |event_id| {
+                const user_id = outcome.user_id orelse continue;
+                const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch continue;
+                if (state_mgr_opt) |mgr| {
+                    mgr.deleteCompletionEvent(numeric_user_id, event_id) catch {};
+                }
+                continue;
+            }
+        }
+
+        if (!config.tenant.enabled) continue;
         if (!std.mem.eql(u8, source, "heartbeat")) continue;
         const user_id = outcome.user_id orelse continue;
         const user_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tenant.data_root, user_id }) catch continue;
@@ -638,132 +654,6 @@ fn makeHeartbeatDedupeKey(
     }
     const hash = std.hash.Wyhash.hash(0, content);
     return std.fmt.allocPrint(allocator, "heartbeat:{s}:{s}:{x}", .{ user_id, chat_id, hash });
-}
-
-fn isMorningBriefJobId(id: []const u8) bool {
-    return morning_brief.isMorningBriefId(id);
-}
-
-fn commandLooksMorningBrief(command: []const u8) bool {
-    return morning_brief.commandLooksMorningBrief(command);
-}
-
-fn shouldSelfHealMorningBriefJob(job: *const cron.CronJob) bool {
-    return isMorningBriefJobId(job.id) or commandLooksMorningBrief(job.command);
-}
-
-fn replaceJobOwnedString(
-    allocator: std.mem.Allocator,
-    field: *[]const u8,
-    new_value: []const u8,
-) !bool {
-    if (std.mem.eql(u8, field.*, new_value)) return false;
-    allocator.free(field.*);
-    field.* = try allocator.dupe(u8, new_value);
-    return true;
-}
-
-fn replaceJobOptionalOwnedString(
-    allocator: std.mem.Allocator,
-    field: *?[]const u8,
-    owned: *bool,
-    new_value: []const u8,
-) !bool {
-    if (field.*) |existing| {
-        if (std.mem.eql(u8, existing, new_value)) return false;
-        if (owned.*) allocator.free(existing);
-    }
-    field.* = try allocator.dupe(u8, new_value);
-    owned.* = true;
-    return true;
-}
-
-fn resolveMorningBriefTarget(
-    allocator: std.mem.Allocator,
-    config: *const Config,
-    user_root: ?[]const u8,
-    numeric_user_id: ?i64,
-    state_mgr: ?*zaki_state.Manager,
-) ?[]u8 {
-    var resolved = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
-        .channel = "telegram",
-        .tenant_ctx = .{
-            .state_mgr = state_mgr,
-            .numeric_user_id = numeric_user_id,
-            .expect_postgres_state = config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres"),
-        },
-        .user_root = user_root,
-    }) catch return null;
-    defer resolved.deinit(allocator);
-
-    runtime_resolver.requireConnectedTarget(&resolved) catch return null;
-    const target_id = resolved.target_id orelse return null;
-    return allocator.dupe(u8, target_id) catch null;
-}
-
-fn selfHealMorningBriefJob(
-    allocator: std.mem.Allocator,
-    config: *const Config,
-    user_root: ?[]const u8,
-    numeric_user_id: ?i64,
-    state_mgr: ?*zaki_state.Manager,
-    job: *cron.CronJob,
-) !bool {
-    if (!shouldSelfHealMorningBriefJob(job)) return false;
-
-    var changed = false;
-    changed = (try replaceJobOwnedString(allocator, &job.id, MORNING_BRIEF_JOB_ID)) or changed;
-    changed = (try replaceJobOwnedString(allocator, &job.command, MORNING_BRIEF_AGENT_COMMAND)) or changed;
-    changed = (try replaceJobOptionalOwnedString(allocator, &job.prompt, &job.prompt_owned, MORNING_BRIEF_AGENT_PROMPT)) or changed;
-    changed = (try replaceJobOptionalOwnedString(allocator, &job.delivery.channel, &job.delivery_channel_owned, "telegram")) or changed;
-
-    if (resolveMorningBriefTarget(allocator, config, user_root, numeric_user_id, state_mgr)) |target| {
-        defer allocator.free(target);
-        changed = (try replaceJobOptionalOwnedString(allocator, &job.delivery.to, &job.delivery_to_owned, target)) or changed;
-    }
-
-    if (job.job_type != .agent) {
-        job.job_type = .agent;
-        changed = true;
-    }
-    if (job.session_target != .isolated) {
-        job.session_target = .isolated;
-        changed = true;
-    }
-    if (job.wake_mode != .now) {
-        job.wake_mode = .now;
-        changed = true;
-    }
-    if (job.delivery.mode != .always) {
-        job.delivery.mode = .always;
-        changed = true;
-    }
-    if (!job.delivery.best_effort) {
-        job.delivery.best_effort = true;
-        changed = true;
-    }
-    if (job.last_status != null) {
-        job.last_status = null;
-        changed = true;
-    }
-    if (job.consecutive_failures != 0) {
-        job.consecutive_failures = 0;
-        changed = true;
-    }
-    if (job.cooldown_until_secs != null) {
-        job.cooldown_until_secs = null;
-        changed = true;
-    }
-    if (job.burst_count_in_window != 0) {
-        job.burst_count_in_window = 0;
-        changed = true;
-    }
-    if (job.burst_window_start_secs != 0) {
-        job.burst_window_start_secs = 0;
-        changed = true;
-    }
-
-    return changed;
 }
 
 fn enqueueHeartbeatOutboundMessage(
@@ -2155,10 +2045,26 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Event bus (created before gateway+scheduler so all threads can publish)
     var event_bus = bus_mod.Bus.init();
+    var delivery_state_mgr: ?*zaki_state.Manager = null;
+    defer if (delivery_state_mgr) |mgr| {
+        mgr.deinit();
+        allocator.destroy(mgr);
+    };
+    if (config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres")) {
+        const mgr = allocator.create(zaki_state.Manager) catch null;
+        if (mgr) |state_mgr| {
+            if (zaki_state.Manager.init(allocator, config.state)) |initialized| {
+                state_mgr.* = initialized;
+                delivery_state_mgr = state_mgr;
+            } else |_| {
+                allocator.destroy(state_mgr);
+            }
+        }
+    }
 
     var delivery_outcome_thread: ?std.Thread = null;
     state.markRunning("delivery_outcome");
-    if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, deliveryOutcomeThread, .{ allocator, config, &state, &event_bus })) |thread| {
+    if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, deliveryOutcomeThread, .{ allocator, config, &state, &event_bus, delivery_state_mgr })) |thread| {
         delivery_outcome_thread = thread;
     } else |err| {
         state.markError("delivery_outcome", @errorName(err));
@@ -3535,6 +3441,7 @@ test "deliveryOutcomeThread writes heartbeat runtime terminal state" {
         &cfg,
         &state,
         &event_bus,
+        null,
     });
 
     const outcome = try bus_mod.makeDeliveryOutcome(
@@ -3595,28 +3502,6 @@ test "default heartbeat templates are treated as effectively empty" {
 test "heartbeat prompt treats scheduler as execution truth" {
     try std.testing.expect(std.mem.indexOf(u8, HEARTBEAT_PROMPT_DEFAULT, "Scheduler state is execution truth") != null);
     try std.testing.expect(std.mem.indexOf(u8, HEARTBEAT_PROMPT_DEFAULT, "Do not report scheduler-only jobs as drift") != null);
-}
-
-test "commandLooksMorningBrief ignores generic heartbeat commands" {
-    try std.testing.expect(commandLooksMorningBrief("daily_morning_brief"));
-    try std.testing.expect(commandLooksMorningBrief("send morning brief at 08:00"));
-    try std.testing.expect(!commandLooksMorningBrief("heartbeat run now"));
-}
-
-test "shouldSelfHealMorningBriefJob only matches explicit morning brief identity" {
-    var heartbeat_job = cron.CronJob{
-        .id = "job-heartbeat",
-        .expression = "*/5 * * * *",
-        .command = "heartbeat run now",
-    };
-    try std.testing.expect(!shouldSelfHealMorningBriefJob(&heartbeat_job));
-
-    var brief_job = cron.CronJob{
-        .id = "morning-brief",
-        .expression = "0 8 * * *",
-        .command = "echo legacy",
-    };
-    try std.testing.expect(shouldSelfHealMorningBriefJob(&brief_job));
 }
 
 test "makeHeartbeatDedupeKey stable for same payload" {

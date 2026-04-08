@@ -515,11 +515,29 @@ pub const LucidMemory = struct {
         return self.local.clearAutoSaved(session_id);
     }
 
+    fn implSessionSaveCompletionEvent(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8, content: []const u8) anyerror![]u8 {
+        const self = castSelf(ptr);
+        return self.local.saveCompletionEvent(allocator, session_id, channel, account_id, chat_id, content);
+    }
+
+    fn implSessionLoadCompletionEvents(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]root.CompletionEvent {
+        const self = castSelf(ptr);
+        return self.local.loadCompletionEvents(allocator, session_id);
+    }
+
+    fn implSessionDeleteCompletionEvent(ptr: *anyopaque, event_id: []const u8) anyerror!void {
+        const self = castSelf(ptr);
+        return self.local.deleteCompletionEvent(event_id);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
         .clearMessages = &implSessionClearMessages,
         .clearAutoSaved = &implSessionClearAutoSaved,
+        .saveCompletionEvent = &implSessionSaveCompletionEvent,
+        .loadCompletionEvents = &implSessionLoadCompletionEvents,
+        .deleteCompletionEvent = &implSessionDeleteCompletionEvent,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {

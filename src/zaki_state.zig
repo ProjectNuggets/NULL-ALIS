@@ -75,6 +75,31 @@ pub const UserOwnershipLeaseSnapshot = struct {
     }
 };
 
+pub const TaskSnapshot = struct {
+    id: []u8,
+    session_id: ?[]u8,
+    request_session_id: ?[]u8,
+    label: []u8,
+    prompt: []u8,
+    status: []u8,
+    result: ?[]u8,
+    error_msg: ?[]u8,
+    created_at_ms: i64,
+    started_at_ms: ?i64,
+    completed_at_ms: ?i64,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        if (self.session_id) |value| allocator.free(value);
+        if (self.request_session_id) |value| allocator.free(value);
+        allocator.free(self.label);
+        allocator.free(self.prompt);
+        allocator.free(self.status);
+        if (self.result) |value| allocator.free(value);
+        if (self.error_msg) |value| allocator.free(value);
+    }
+};
+
 pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn init(_: std.mem.Allocator, _: config_types.StateConfig) !@This() {
         return error.PostgresNotEnabled;
@@ -220,6 +245,38 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn getUserOwnershipLeaseSnapshot(_: *@This(), _: std.mem.Allocator, _: i64) error{PostgresNotEnabled}!?UserOwnershipLeaseSnapshot {
         return error.PostgresNotEnabled;
     }
+    pub fn upsertTaskSnapshot(
+        _: *@This(),
+        _: i64,
+        _: []const u8,
+        _: ?[]const u8,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: ?[]const u8,
+        _: ?[]const u8,
+        _: i64,
+        _: ?i64,
+        _: ?i64,
+    ) !void {
+        return error.PostgresNotEnabled;
+    }
+    pub fn getTaskSnapshot(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?TaskSnapshot {
+        return error.PostgresNotEnabled;
+    }
+    pub fn listTaskSnapshots(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]TaskSnapshot {
+        return allocator.alloc(TaskSnapshot, 0);
+    }
+    pub fn saveCompletionEvent(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8, _: ?[]const u8, _: ?[]const u8, _: ?[]const u8, _: []const u8) ![]u8 {
+        return error.PostgresNotEnabled;
+    }
+    pub fn loadCompletionEvents(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8) ![]memory_root.CompletionEvent {
+        return allocator.alloc(memory_root.CompletionEvent, 0);
+    }
+    pub fn deleteCompletionEvent(_: *@This(), _: i64, _: []const u8) !void {
+        return error.PostgresNotEnabled;
+    }
     pub const ClaimedJob = struct {
         id: []u8,
         user_id: i64,
@@ -327,6 +384,9 @@ const ManagerImpl = struct {
                     .loadMessages = loadMessages,
                     .clearMessages = clearMessages,
                     .clearAutoSaved = clearAutoSaved,
+                    .saveCompletionEvent = saveCompletionEventBridge,
+                    .loadCompletionEvents = loadCompletionEventsBridge,
+                    .deleteCompletionEvent = deleteCompletionEventBridge,
                 },
             };
         }
@@ -349,6 +409,21 @@ const ManagerImpl = struct {
         fn clearAutoSaved(ptr: *anyopaque, session_id: ?[]const u8) anyerror!void {
             _ = ptr;
             _ = session_id;
+        }
+
+        fn saveCompletionEventBridge(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8, content: []const u8) anyerror![]u8 {
+            const self: *UserSessionStore = @ptrCast(@alignCast(ptr));
+            return try self.manager.saveCompletionEvent(allocator, self.user_id, session_id, channel, account_id, chat_id, content);
+        }
+
+        fn loadCompletionEventsBridge(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]memory_root.CompletionEvent {
+            const self: *UserSessionStore = @ptrCast(@alignCast(ptr));
+            return try self.manager.loadCompletionEvents(allocator, self.user_id, session_id);
+        }
+
+        fn deleteCompletionEventBridge(ptr: *anyopaque, event_id: []const u8) anyerror!void {
+            const self: *UserSessionStore = @ptrCast(@alignCast(ptr));
+            try self.manager.deleteCompletionEvent(self.user_id, event_id);
         }
     };
 
@@ -637,6 +712,18 @@ const ManagerImpl = struct {
             ,
             "CREATE INDEX IF NOT EXISTS idx_messages_user_created ON {schema}.messages(user_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_messages_session_created ON {schema}.messages(session_id, created_at ASC)",
+            \\CREATE TABLE IF NOT EXISTS {schema}.completion_events (
+            \\    id TEXT PRIMARY KEY,
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    session_id TEXT NOT NULL REFERENCES {schema}.sessions(id) ON DELETE CASCADE,
+            \\    channel TEXT,
+            \\    account_id TEXT,
+            \\    chat_id TEXT,
+            \\    content TEXT NOT NULL,
+            \\    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_completion_events_user_session_created ON {schema}.completion_events(user_id, session_id, created_at ASC, id ASC)",
             \\CREATE TABLE IF NOT EXISTS {schema}.memories (
             \\    id TEXT PRIMARY KEY,
             \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
@@ -768,9 +855,10 @@ const ManagerImpl = struct {
             \\)
             ,
             \\CREATE TABLE IF NOT EXISTS {schema}.tasks (
-            \\    id TEXT PRIMARY KEY,
+            \\    id TEXT NOT NULL,
             \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
             \\    session_id TEXT REFERENCES {schema}.sessions(id) ON DELETE SET NULL,
+            \\    request_session_id TEXT REFERENCES {schema}.sessions(id) ON DELETE SET NULL,
             \\    label TEXT NOT NULL,
             \\    prompt TEXT NOT NULL,
             \\    status TEXT NOT NULL,
@@ -778,9 +866,13 @@ const ManagerImpl = struct {
             \\    error TEXT,
             \\    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             \\    started_at TIMESTAMPTZ,
-            \\    completed_at TIMESTAMPTZ
+            \\    completed_at TIMESTAMPTZ,
+            \\    PRIMARY KEY (user_id, id)
             \\)
             ,
+            "ALTER TABLE {schema}.tasks ADD COLUMN IF NOT EXISTS request_session_id TEXT REFERENCES {schema}.sessions(id) ON DELETE SET NULL",
+            "ALTER TABLE {schema}.tasks DROP CONSTRAINT IF EXISTS tasks_pkey",
+            "ALTER TABLE {schema}.tasks ADD PRIMARY KEY (user_id, id)",
         };
 
         for (statements) |template| {
@@ -1262,6 +1354,124 @@ const ManagerImpl = struct {
         defer self.allocator.free(session_z);
         const params = [_]?[*:0]const u8{ user_s.ptr, session_z };
         const lengths = [_]c_int{ @intCast(user_s.len), @intCast(session_id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    pub fn saveCompletionEvent(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        session_id: []const u8,
+        channel: ?[]const u8,
+        account_id: ?[]const u8,
+        chat_id: ?[]const u8,
+        content: []const u8,
+    ) ![]u8 {
+        try self.ensureSession(user_id, session_id);
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.completion_events (id, user_id, session_id, channel, account_id, chat_id, content) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        );
+        defer self.allocator.free(q);
+
+        const event_id = try self.randomHexId(allocator, 16);
+        errdefer allocator.free(event_id);
+        const event_id_z = try self.allocator.dupeZ(u8, event_id);
+        defer self.allocator.free(event_id_z);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const session_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(session_z);
+        const channel_z = if (channel) |value| try self.allocator.dupeZ(u8, value) else null;
+        defer if (channel_z) |value| self.allocator.free(value);
+        const account_z = if (account_id) |value| try self.allocator.dupeZ(u8, value) else null;
+        defer if (account_z) |value| self.allocator.free(value);
+        const chat_z = if (chat_id) |value| try self.allocator.dupeZ(u8, value) else null;
+        defer if (chat_z) |value| self.allocator.free(value);
+        const content_z = try self.allocator.dupeZ(u8, content);
+        defer self.allocator.free(content_z);
+
+        const params = [_]?[*:0]const u8{
+            event_id_z,
+            user_s.ptr,
+            session_z,
+            if (channel_z) |value| value else null,
+            if (account_z) |value| value else null,
+            if (chat_z) |value| value else null,
+            content_z,
+        };
+        const lengths = [_]c_int{
+            @intCast(event_id.len),
+            @intCast(user_s.len),
+            @intCast(session_id.len),
+            @intCast(if (channel) |value| value.len else 0),
+            @intCast(if (account_id) |value| value.len else 0),
+            @intCast(if (chat_id) |value| value.len else 0),
+            @intCast(content.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+        return event_id;
+    }
+
+    pub fn loadCompletionEvents(self: *Self, allocator: std.mem.Allocator, user_id: i64, session_id: []const u8) ![]memory_root.CompletionEvent {
+        const q = try self.buildQuery(
+            "SELECT id, session_id, channel, account_id, chat_id, content FROM {schema}.completion_events WHERE user_id = $1 AND session_id = $2 ORDER BY created_at ASC, id ASC",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const session_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(session_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, session_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(session_id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const rows: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc(memory_root.CompletionEvent, rows);
+        var initialized: usize = 0;
+        errdefer {
+            memory_root.freeCompletionEvents(allocator, out[0..initialized]);
+            allocator.free(out);
+        }
+
+        for (0..rows) |i| {
+            const row: c_int = @intCast(i);
+            const id = try dupeResultValue(allocator, result, row, 0);
+            errdefer allocator.free(id);
+            const resolved_session = try dupeResultValue(allocator, result, row, 1);
+            errdefer allocator.free(resolved_session);
+            const event_content = try dupeResultValue(allocator, result, row, 5);
+            errdefer allocator.free(event_content);
+
+            out[i] = .{
+                .id = id,
+                .session_id = resolved_session,
+                .channel = try dupeNullableResultValue(allocator, result, row, 2),
+                .account_id = try dupeNullableResultValue(allocator, result, row, 3),
+                .chat_id = try dupeNullableResultValue(allocator, result, row, 4),
+                .content = event_content,
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    pub fn deleteCompletionEvent(self: *Self, user_id: i64, event_id: []const u8) !void {
+        const q = try self.buildQuery(
+            "DELETE FROM {schema}.completion_events WHERE user_id = $1 AND id = $2",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const event_z = try self.allocator.dupeZ(u8, event_id);
+        defer self.allocator.free(event_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, event_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(event_id.len) };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
     }
@@ -1819,6 +2029,145 @@ const ManagerImpl = struct {
         };
     }
 
+    pub fn upsertTaskSnapshot(
+        self: *Self,
+        user_id: i64,
+        task_id: []const u8,
+        session_id: ?[]const u8,
+        request_session_id: ?[]const u8,
+        label: []const u8,
+        prompt: []const u8,
+        status: []const u8,
+        result_text: ?[]const u8,
+        error_text: ?[]const u8,
+        created_at_ms: i64,
+        started_at_ms: ?i64,
+        completed_at_ms: ?i64,
+    ) !void {
+        if (session_id) |sid| try self.ensureSession(user_id, sid);
+        if (request_session_id) |sid| try self.ensureSession(user_id, sid);
+
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.tasks (id, user_id, session_id, request_session_id, label, prompt, status, result, error, created_at, started_at, completed_at) " ++
+                "VALUES ($1, $2, CASE WHEN $3 = '' THEN NULL ELSE $3 END, CASE WHEN $4 = '' THEN NULL ELSE $4 END, $5, $6, $7, CASE WHEN $8 = '' THEN NULL ELSE $8 END, CASE WHEN $9 = '' THEN NULL ELSE $9 END, " ++
+                "TO_TIMESTAMP($10::double precision / 1000.0), CASE WHEN $11 = '' THEN NULL ELSE TO_TIMESTAMP($11::double precision / 1000.0) END, CASE WHEN $12 = '' THEN NULL ELSE TO_TIMESTAMP($12::double precision / 1000.0) END) " ++
+                "ON CONFLICT (user_id, id) DO UPDATE SET session_id = EXCLUDED.session_id, request_session_id = EXCLUDED.request_session_id, label = EXCLUDED.label, prompt = EXCLUDED.prompt, status = EXCLUDED.status, result = EXCLUDED.result, error = EXCLUDED.error, created_at = EXCLUDED.created_at, started_at = EXCLUDED.started_at, completed_at = EXCLUDED.completed_at",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const task_id_z = try self.allocator.dupeZ(u8, task_id);
+        defer self.allocator.free(task_id_z);
+        const session_value = session_id orelse "";
+        const session_z = try self.allocator.dupeZ(u8, session_value);
+        defer self.allocator.free(session_z);
+        const request_session_value = request_session_id orelse "";
+        const request_session_z = try self.allocator.dupeZ(u8, request_session_value);
+        defer self.allocator.free(request_session_z);
+        const label_z = try self.allocator.dupeZ(u8, label);
+        defer self.allocator.free(label_z);
+        const prompt_z = try self.allocator.dupeZ(u8, prompt);
+        defer self.allocator.free(prompt_z);
+        const status_z = try self.allocator.dupeZ(u8, status);
+        defer self.allocator.free(status_z);
+        const result_value = result_text orelse "";
+        const result_z = try self.allocator.dupeZ(u8, result_value);
+        defer self.allocator.free(result_z);
+        const error_value = error_text orelse "";
+        const error_z = try self.allocator.dupeZ(u8, error_value);
+        defer self.allocator.free(error_z);
+        var created_buf: [32]u8 = undefined;
+        const created_s = try std.fmt.bufPrintZ(&created_buf, "{d}", .{created_at_ms});
+        var started_buf: [32]u8 = undefined;
+        const started_s = if (started_at_ms) |value| try std.fmt.bufPrintZ(&started_buf, "{d}", .{value}) else "";
+        var completed_buf: [32]u8 = undefined;
+        const completed_s = if (completed_at_ms) |value| try std.fmt.bufPrintZ(&completed_buf, "{d}", .{value}) else "";
+
+        const params = [_]?[*:0]const u8{
+            task_id_z,
+            user_s.ptr,
+            session_z,
+            request_session_z,
+            label_z,
+            prompt_z,
+            status_z,
+            result_z,
+            error_z,
+            created_s.ptr,
+            if (started_at_ms != null) started_s.ptr else null,
+            if (completed_at_ms != null) completed_s.ptr else null,
+        };
+        const lengths = [_]c_int{
+            @intCast(task_id.len),
+            @intCast(user_s.len),
+            @intCast(session_value.len),
+            @intCast(request_session_value.len),
+            @intCast(label.len),
+            @intCast(prompt.len),
+            @intCast(status.len),
+            @intCast(result_value.len),
+            @intCast(error_value.len),
+            @intCast(created_s.len),
+            @intCast(if (started_at_ms != null) started_s.len else 0),
+            @intCast(if (completed_at_ms != null) completed_s.len else 0),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    pub fn getTaskSnapshot(self: *Self, allocator: std.mem.Allocator, user_id: i64, task_id: []const u8) !?TaskSnapshot {
+        const q = try self.buildQuery(
+            "SELECT id, session_id, request_session_id, label, prompt, status, result, error, " ++
+                "COALESCE((EXTRACT(EPOCH FROM created_at) * 1000)::bigint::text, '0'), " ++
+                "CASE WHEN started_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM started_at) * 1000)::bigint::text END, " ++
+                "CASE WHEN completed_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM completed_at) * 1000)::bigint::text END " ++
+                "FROM {schema}.tasks WHERE user_id = $1 AND id = $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const task_id_z = try self.allocator.dupeZ(u8, task_id);
+        defer self.allocator.free(task_id_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, task_id_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(task_id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+        return try decodeTaskSnapshotRow(allocator, result, 0);
+    }
+
+    pub fn listTaskSnapshots(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]TaskSnapshot {
+        const q = try self.buildQuery(
+            "SELECT id, session_id, request_session_id, label, prompt, status, result, error, " ++
+                "COALESCE((EXTRACT(EPOCH FROM created_at) * 1000)::bigint::text, '0'), " ++
+                "CASE WHEN started_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM started_at) * 1000)::bigint::text END, " ++
+                "CASE WHEN completed_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM completed_at) * 1000)::bigint::text END " ++
+                "FROM {schema}.tasks WHERE user_id = $1 ORDER BY created_at ASC, id ASC",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const rows: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc(TaskSnapshot, rows);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*entry| entry.deinit(allocator);
+            allocator.free(out);
+        }
+
+        for (0..rows) |i| {
+            out[i] = try decodeTaskSnapshotRow(allocator, result, @intCast(i));
+            initialized += 1;
+        }
+        return out;
+    }
+
     pub fn claimDueJobs(self: *Self, allocator: std.mem.Allocator, owner_id: []const u8, now_s: i64, lease_secs: u64, limit: usize) ![]ClaimedJob {
         const q = try self.buildQuery(
             "WITH due AS (" ++
@@ -1953,6 +2302,39 @@ const ManagerImpl = struct {
         const lengths = [_]c_int{ @intCast(session_id.len), @intCast(user_s.len), @intCast(kind.len), @intCast(title.len) };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
+    }
+
+    fn decodeTaskSnapshotRow(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int) !TaskSnapshot {
+        const created_at_text = try dupeResultValue(allocator, result, row, 8);
+        defer allocator.free(created_at_text);
+
+        var started_at_ms: ?i64 = null;
+        if (c.PQgetisnull(result, row, 9) == 0) {
+            const started_at_text = try dupeResultValue(allocator, result, row, 9);
+            defer allocator.free(started_at_text);
+            started_at_ms = try std.fmt.parseInt(i64, started_at_text, 10);
+        }
+
+        var completed_at_ms: ?i64 = null;
+        if (c.PQgetisnull(result, row, 10) == 0) {
+            const completed_at_text = try dupeResultValue(allocator, result, row, 10);
+            defer allocator.free(completed_at_text);
+            completed_at_ms = try std.fmt.parseInt(i64, completed_at_text, 10);
+        }
+
+        return .{
+            .id = try dupeResultValue(allocator, result, row, 0),
+            .session_id = if (c.PQgetisnull(result, row, 1) == 1) null else try dupeResultValue(allocator, result, row, 1),
+            .request_session_id = if (c.PQgetisnull(result, row, 2) == 1) null else try dupeResultValue(allocator, result, row, 2),
+            .label = try dupeResultValue(allocator, result, row, 3),
+            .prompt = try dupeResultValue(allocator, result, row, 4),
+            .status = try dupeResultValue(allocator, result, row, 5),
+            .result = if (c.PQgetisnull(result, row, 6) == 1) null else try dupeResultValue(allocator, result, row, 6),
+            .error_msg = if (c.PQgetisnull(result, row, 7) == 1) null else try dupeResultValue(allocator, result, row, 7),
+            .created_at_ms = try std.fmt.parseInt(i64, created_at_text, 10),
+            .started_at_ms = started_at_ms,
+            .completed_at_ms = completed_at_ms,
+        };
     }
 
     fn queryMemories(self: *Self, allocator: std.mem.Allocator, template: []const u8, user_id: i64, value1: ?[]const u8, value2: ?[]const u8) ![]memory_root.MemoryEntry {
@@ -2416,6 +2798,10 @@ fn canIgnoreMigrateError(template: []const u8, raw_err: [*c]const u8) bool {
     if (std.mem.startsWith(u8, template, "ALTER TABLE") and std.mem.indexOf(u8, template, "DROP CONSTRAINT IF EXISTS") != null) {
         return std.mem.indexOf(u8, err_text, "does not exist") != null;
     }
+    if (std.mem.startsWith(u8, template, "ALTER TABLE") and std.mem.indexOf(u8, template, "ADD PRIMARY KEY (user_id, id)") != null) {
+        return std.mem.indexOf(u8, err_text, "multiple primary keys for table") != null or
+            std.mem.indexOf(u8, err_text, "already exists") != null;
+    }
     return false;
 }
 
@@ -2457,6 +2843,12 @@ test "canIgnoreMigrateError tolerates create table duplicate typname race" {
 test "canIgnoreMigrateError tolerates create unique index duplicate race" {
     const tpl = "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_user_key ON {schema}.memories(user_id, key)";
     const err_text: [:0]const u8 = "ERROR:  duplicate key value violates unique constraint \"pg_class_relname_nsp_index\"";
+    try std.testing.expect(canIgnoreMigrateError(tpl, err_text.ptr));
+}
+
+test "canIgnoreMigrateError tolerates tasks add primary key race" {
+    const tpl = "ALTER TABLE {schema}.tasks ADD PRIMARY KEY (user_id, id)";
+    const err_text: [:0]const u8 = "ERROR:  multiple primary keys for table \"tasks\" are not allowed";
     try std.testing.expect(canIgnoreMigrateError(tpl, err_text.ptr));
 }
 
@@ -3044,6 +3436,158 @@ test "postgres_pool_reuses_connections" {
     try std.testing.expect(final_snapshot.open_conns >= 1);
     try std.testing.expect(final_snapshot.open_conns <= 2);
     try std.testing.expect(final_snapshot.open_conns <= first_snapshot.open_conns + 1);
+}
+
+test "postgres task snapshots isolate same compact task id per user" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try initPostgresTestManagerWithPool(allocator, 2, 500);
+    defer mgr.deinit();
+    try mgr.provisionUser(1, "/tmp/nullalis-zaki-bot-test-user-1/workspace");
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    try mgr.upsertTaskSnapshot(
+        1,
+        "1",
+        "agent:zaki-bot:user:1:task:1",
+        "agent:zaki-bot:user:1:main",
+        "user-1-label",
+        "user-1-prompt",
+        "running",
+        null,
+        null,
+        1000,
+        1001,
+        null,
+    );
+    try mgr.upsertTaskSnapshot(
+        2,
+        "1",
+        "agent:zaki-bot:user:2:task:1",
+        "agent:zaki-bot:user:2:main",
+        "user-2-label",
+        "user-2-prompt",
+        "completed",
+        "done",
+        null,
+        2000,
+        2001,
+        2002,
+    );
+
+    var user_1_snapshot = (try mgr.getTaskSnapshot(allocator, 1, "1")).?;
+    defer user_1_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:task:1", user_1_snapshot.session_id.?);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:main", user_1_snapshot.request_session_id.?);
+    try std.testing.expectEqualStrings("user-1-label", user_1_snapshot.label);
+    try std.testing.expectEqualStrings("user-1-prompt", user_1_snapshot.prompt);
+    try std.testing.expectEqualStrings("running", user_1_snapshot.status);
+    try std.testing.expect(user_1_snapshot.result == null);
+
+    var user_2_snapshot = (try mgr.getTaskSnapshot(allocator, 2, "1")).?;
+    defer user_2_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:2:task:1", user_2_snapshot.session_id.?);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:2:main", user_2_snapshot.request_session_id.?);
+    try std.testing.expectEqualStrings("user-2-label", user_2_snapshot.label);
+    try std.testing.expectEqualStrings("user-2-prompt", user_2_snapshot.prompt);
+    try std.testing.expectEqualStrings("completed", user_2_snapshot.status);
+    try std.testing.expectEqualStrings("done", user_2_snapshot.result.?);
+
+    const user_1_tasks = try mgr.listTaskSnapshots(allocator, 1);
+    defer {
+        for (user_1_tasks) |*entry| entry.deinit(allocator);
+        allocator.free(user_1_tasks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), user_1_tasks.len);
+    try std.testing.expectEqualStrings("1", user_1_tasks[0].id);
+    try std.testing.expectEqualStrings("user-1-label", user_1_tasks[0].label);
+
+    const user_2_tasks = try mgr.listTaskSnapshots(allocator, 2);
+    defer {
+        for (user_2_tasks) |*entry| entry.deinit(allocator);
+        allocator.free(user_2_tasks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), user_2_tasks.len);
+    try std.testing.expectEqualStrings("1", user_2_tasks[0].id);
+    try std.testing.expectEqualStrings("user-2-label", user_2_tasks[0].label);
+}
+
+test "postgres migrate upgrades legacy global task keying to user scoped keys" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try initPostgresTestManagerWithPool(allocator, 2, 500);
+    defer mgr.deinit();
+
+    const drop_query = try mgr.buildQuery("DROP TABLE IF EXISTS {schema}.tasks CASCADE");
+    defer allocator.free(drop_query);
+    const drop_result = try mgr.exec(drop_query);
+    c.PQclear(drop_result);
+
+    const legacy_query = try mgr.buildQuery(
+        \\CREATE TABLE {schema}.tasks (
+        \\    id TEXT PRIMARY KEY,
+        \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+        \\    session_id TEXT REFERENCES {schema}.sessions(id) ON DELETE SET NULL,
+        \\    label TEXT NOT NULL,
+        \\    prompt TEXT NOT NULL,
+        \\    status TEXT NOT NULL,
+        \\    result TEXT,
+        \\    error TEXT,
+        \\    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        \\    started_at TIMESTAMPTZ,
+        \\    completed_at TIMESTAMPTZ
+        \\)
+        ,
+    );
+    defer allocator.free(legacy_query);
+    const legacy_result = try mgr.exec(legacy_query);
+    c.PQclear(legacy_result);
+
+    try mgr.migrate();
+    try mgr.provisionUser(1, "/tmp/nullalis-zaki-bot-test-user-1/workspace");
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    try mgr.upsertTaskSnapshot(
+        1,
+        "1",
+        "agent:zaki-bot:user:1:task:1",
+        "agent:zaki-bot:user:1:main",
+        "after-migrate-user-1",
+        "prompt-a",
+        "completed",
+        "ok-a",
+        null,
+        3000,
+        3001,
+        3002,
+    );
+    try mgr.upsertTaskSnapshot(
+        2,
+        "1",
+        "agent:zaki-bot:user:2:task:1",
+        "agent:zaki-bot:user:2:main",
+        "after-migrate-user-2",
+        "prompt-b",
+        "failed",
+        null,
+        "err-b",
+        4000,
+        4001,
+        4002,
+    );
+
+    var user_1_snapshot = (try mgr.getTaskSnapshot(allocator, 1, "1")).?;
+    defer user_1_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("after-migrate-user-1", user_1_snapshot.label);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:main", user_1_snapshot.request_session_id.?);
+
+    var user_2_snapshot = (try mgr.getTaskSnapshot(allocator, 2, "1")).?;
+    defer user_2_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("after-migrate-user-2", user_2_snapshot.label);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:2:main", user_2_snapshot.request_session_id.?);
+    try std.testing.expectEqualStrings("err-b", user_2_snapshot.error_msg.?);
 }
 
 test "putOnboardingJson updates onboarding row and mirrored user flags" {

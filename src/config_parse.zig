@@ -1290,6 +1290,27 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 }
             }
 
+            // semantic_cache
+            if (mem.object.get("semantic_cache")) |sc_val| {
+                if (sc_val == .object) {
+                    const sc = sc_val.object;
+                    if (sc.get("enabled")) |v| if (v == .bool) {
+                        self.memory.semantic_cache.enabled = v.bool;
+                    };
+                    if (sc.get("similarity_threshold")) |v| switch (v) {
+                        .float => self.memory.semantic_cache.similarity_threshold = @floatCast(v.float),
+                        .integer => self.memory.semantic_cache.similarity_threshold = @floatFromInt(v.integer),
+                        else => {},
+                    };
+                    if (sc.get("ttl_minutes")) |v| if (v == .integer) {
+                        self.memory.semantic_cache.ttl_minutes = @intCast(v.integer);
+                    };
+                    if (sc.get("max_entries")) |v| if (v == .integer) {
+                        self.memory.semantic_cache.max_entries = @intCast(v.integer);
+                    };
+                }
+            }
+
             // reliability
             if (mem.object.get("reliability")) |rel_val| {
                 if (rel_val == .object) {

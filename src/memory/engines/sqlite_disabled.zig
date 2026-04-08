@@ -230,11 +230,27 @@ pub const SqliteMemory = struct {
         return self_.clearAutoSaved(session_id);
     }
 
+    fn implSessionSaveCompletionEvent(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: ?[]const u8, _: ?[]const u8, _: []const u8) anyerror![]u8 {
+        return error.SqliteDisabled;
+    }
+
+    fn implSessionLoadCompletionEvents(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]root.CompletionEvent {
+        _ = allocator;
+        return error.SqliteDisabled;
+    }
+
+    fn implSessionDeleteCompletionEvent(_: *anyopaque, _: []const u8) anyerror!void {
+        return error.SqliteDisabled;
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
         .clearMessages = &implSessionClearMessages,
         .clearAutoSaved = &implSessionClearAutoSaved,
+        .saveCompletionEvent = &implSessionSaveCompletionEvent,
+        .loadCompletionEvents = &implSessionLoadCompletionEvents,
+        .deleteCompletionEvent = &implSessionDeleteCompletionEvent,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {

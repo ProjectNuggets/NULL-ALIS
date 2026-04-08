@@ -33,6 +33,87 @@ const channels_mod = @import("channels/root.zig");
 const log = std.log.scoped(.channel_loop);
 const TELEGRAM_OFFSET_STORE_VERSION: i64 = 1;
 
+pub const LocalOutboundDispatchFn = *const fn (
+    ctx: ?*anyopaque,
+    outbound: *const bus_mod.OutboundMessage,
+) anyerror!void;
+
+const SubagentCompletionRouter = struct {
+    session_mgr: *session_mod.SessionManager,
+    event_bus: ?*bus_mod.Bus,
+    local_outbound_dispatch: ?LocalOutboundDispatchFn = null,
+    local_outbound_dispatch_ctx: ?*anyopaque = null,
+};
+
+fn shouldEmitCompletionOutbound(channel: ?[]const u8, chat_id: ?[]const u8) bool {
+    const resolved_channel = channel orelse return false;
+    _ = chat_id orelse return false;
+    return !std.mem.eql(u8, resolved_channel, "agent") and
+        !std.mem.eql(u8, resolved_channel, "system") and
+        !std.mem.eql(u8, resolved_channel, "zaki_app");
+}
+
+fn appendSubagentCompletionToSession(
+    ctx: ?*anyopaque,
+    session_key: []const u8,
+    content: []const u8,
+) anyerror!void {
+    const router: *SubagentCompletionRouter = @ptrCast(@alignCast(ctx.?));
+    var origin = try router.session_mgr.captureOriginSnapshot(session_key);
+    defer origin.deinit(router.session_mgr.allocator);
+
+    try router.session_mgr.appendAssistantMessage(session_key, content);
+    const completion_event_id = try router.session_mgr.saveCompletionEvent(session_key, origin.channel, origin.account_id, origin.chat_id, content);
+    defer if (completion_event_id) |value| router.session_mgr.allocator.free(value);
+
+    if (!shouldEmitCompletionOutbound(origin.channel, origin.chat_id)) return;
+
+    const user_id = zaki_session.parseUserIdFromSessionKey(session_key);
+    const source_tag = if (completion_event_id) |event_id|
+        try std.fmt.allocPrint(router.session_mgr.allocator, "subagent_completion:{s}", .{event_id})
+    else
+        null;
+    defer if (source_tag) |value| router.session_mgr.allocator.free(value);
+    var outbound = if (origin.account_id) |account_id|
+        try bus_mod.makeOutboundWithAccountAnnotated(
+            router.session_mgr.allocator,
+            origin.channel.?,
+            account_id,
+            origin.chat_id.?,
+            content,
+            source_tag orelse "subagent",
+            user_id,
+            null,
+        )
+    else
+        try bus_mod.makeOutboundAnnotated(
+            router.session_mgr.allocator,
+            origin.channel.?,
+            origin.chat_id.?,
+            content,
+            source_tag orelse "subagent",
+            user_id,
+            null,
+        );
+    var outbound_transferred = false;
+    defer if (!outbound_transferred) outbound.deinit(router.session_mgr.allocator);
+
+    if (router.event_bus) |event_bus| {
+        event_bus.publishOutbound(outbound) catch {
+            return;
+        };
+        outbound_transferred = true;
+        return;
+    }
+
+    if (router.local_outbound_dispatch) |dispatch| {
+        try dispatch(router.local_outbound_dispatch_ctx, &outbound);
+        if (completion_event_id) |event_id| {
+            try router.session_mgr.deleteCompletionEvent(event_id);
+        }
+    }
+}
+
 fn extractTelegramBotId(bot_token: []const u8) ?[]const u8 {
     const colon_pos = std.mem.indexOfScalar(u8, bot_token, ':') orelse return null;
     if (colon_pos == 0) return null;
@@ -216,12 +297,33 @@ pub const ChannelRuntime = struct {
     mem_rt: ?memory_mod.MemoryRuntime,
     noop_obs: *observability.NoopObserver,
     subagent_manager: ?*subagent_mod.SubagentManager,
+    completion_router: ?*SubagentCompletionRouter,
     policy_tracker: *security.RateTracker,
     security_policy: *security.SecurityPolicy,
     event_bus: ?*bus_mod.Bus,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config, event_bus: ?*bus_mod.Bus) !*ChannelRuntime {
+        return initWithProfile(allocator, config, event_bus, .main);
+    }
+
+    pub fn attachCompletionOutboundDispatch(
+        self: *ChannelRuntime,
+        ctx: ?*anyopaque,
+        dispatch: LocalOutboundDispatchFn,
+    ) void {
+        if (self.completion_router) |router| {
+            router.local_outbound_dispatch_ctx = ctx;
+            router.local_outbound_dispatch = dispatch;
+        }
+    }
+
+    pub fn initWithProfile(
+        allocator: std.mem.Allocator,
+        config: *const Config,
+        event_bus: ?*bus_mod.Bus,
+        tool_profile: tools_mod.ToolProfile,
+    ) !*ChannelRuntime {
         var runtime_provider = try provider_runtime.RuntimeProviderBundle.init(allocator, config);
         errdefer runtime_provider.deinit();
 
@@ -241,11 +343,13 @@ pub const ChannelRuntime = struct {
         const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
         errdefer if (subagent_manager) |mgr| allocator.destroy(mgr);
         if (subagent_manager) |mgr| {
-            mgr.* = subagent_mod.SubagentManager.init(allocator, config, null, .{});
+            mgr.* = subagent_mod.SubagentManager.init(allocator, config, event_bus, .{});
             errdefer {
                 mgr.deinit();
             }
         }
+        const completion_router = if (subagent_manager != null) allocator.create(SubagentCompletionRouter) catch null else null;
+        errdefer if (completion_router) |router| allocator.destroy(router);
 
         const policy_tracker = try allocator.create(security.RateTracker);
         errdefer allocator.destroy(policy_tracker);
@@ -267,6 +371,7 @@ pub const ChannelRuntime = struct {
 
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
+            .tool_profile = tool_profile,
             .config = config,
             .http_enabled = config.http_request.enabled,
             .browser_enabled = config.browser.enabled,
@@ -313,6 +418,7 @@ pub const ChannelRuntime = struct {
             .mem_rt = mem_rt,
             .noop_obs = noop_obs,
             .subagent_manager = subagent_manager,
+            .completion_router = completion_router,
             .policy_tracker = policy_tracker,
             .security_policy = security_policy,
             .event_bus = event_bus,
@@ -323,6 +429,15 @@ pub const ChannelRuntime = struct {
         if (self.mem_rt) |*rt| {
             self.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(tools, rt);
+        }
+        if (self.subagent_manager) |mgr| {
+            if (self.completion_router) |router| {
+                router.* = .{
+                    .session_mgr = &self.session_mgr,
+                    .event_bus = event_bus,
+                };
+                mgr.attachCompletionDelivery(@ptrCast(router), appendSubagentCompletionToSession);
+            }
         }
         return self;
     }
@@ -335,6 +450,7 @@ pub const ChannelRuntime = struct {
             mgr.deinit();
             alloc.destroy(mgr);
         }
+        if (self.completion_router) |router| alloc.destroy(router);
         if (self.mem_rt) |*rt| rt.deinit();
         self.provider_bundle.deinit();
         self.policy_tracker.deinit();
@@ -1233,6 +1349,155 @@ fn testTelegramSessionManager(
         null,
         null,
     );
+}
+
+test "ChannelRuntime wires event bus into subagent manager" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var cfg = testTelegramConfig();
+    cfg.workspace_dir = workspace;
+    cfg.config_path = config_path;
+
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const runtime = try ChannelRuntime.init(allocator, &cfg, &eb);
+    defer runtime.deinit();
+
+    const mgr = runtime.subagent_manager orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?*bus_mod.Bus, &eb), mgr.bus);
+}
+
+test "ChannelRuntime wires local subagent completion delivery" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var cfg = testTelegramConfig();
+    cfg.workspace_dir = workspace;
+    cfg.config_path = config_path;
+
+    const runtime = try ChannelRuntime.init(allocator, &cfg, null);
+    defer runtime.deinit();
+
+    const mgr = runtime.subagent_manager orelse return error.TestUnexpectedResult;
+    try std.testing.expect(mgr.completion_delivery != null);
+}
+
+test "subagent completion appends parent session and emits outbound message" {
+    const allocator = std.testing.allocator;
+    var mock = MockTelegramProvider{ .response = "ok" };
+    const cfg = testTelegramConfig();
+    var session_mgr = testTelegramSessionManager(allocator, &mock, &cfg);
+    defer session_mgr.deinit();
+
+    const session = try session_mgr.getOrCreate("agent:zaki-bot:user:1:main");
+    session.origin_channel = try allocator.dupe(u8, "telegram");
+    session.origin_account_id = try allocator.dupe(u8, "main");
+    session.origin_chat_id = try allocator.dupe(u8, "12345");
+
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var router = SubagentCompletionRouter{
+        .session_mgr = &session_mgr,
+        .event_bus = &event_bus,
+    };
+
+    try appendSubagentCompletionToSession(@ptrCast(&router), "agent:zaki-bot:user:1:main", "[Subagent 'research'] completed\nanswer");
+
+    try std.testing.expectEqual(@as(usize, 1), session.agent.historyLen());
+    try std.testing.expectEqualStrings("[Subagent 'research'] completed\nanswer", session.agent.history.items[0].content);
+    try std.testing.expectEqual(@as(usize, 1), event_bus.outboundDepth());
+
+    var outbound = event_bus.consumeOutbound() orelse return error.TestUnexpectedResult;
+    defer outbound.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", outbound.channel);
+    try std.testing.expectEqualStrings("main", outbound.account_id.?);
+    try std.testing.expectEqualStrings("12345", outbound.chat_id);
+    try std.testing.expectEqualStrings("[Subagent 'research'] completed\nanswer", outbound.content);
+}
+
+test "subagent completion keeps zaki_app results pending instead of emitting outbound" {
+    const allocator = std.testing.allocator;
+    var mock = MockTelegramProvider{ .response = "ok" };
+    const cfg = testTelegramConfig();
+    var session_mgr = testTelegramSessionManager(allocator, &mock, &cfg);
+    defer session_mgr.deinit();
+
+    const session_key = "agent:zaki-bot:user:1:main";
+    const session = try session_mgr.getOrCreate(session_key);
+    session.origin_channel = try allocator.dupe(u8, "zaki_app");
+    session.origin_chat_id = try allocator.dupe(u8, session_key);
+
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var router = SubagentCompletionRouter{
+        .session_mgr = &session_mgr,
+        .event_bus = &event_bus,
+    };
+
+    try appendSubagentCompletionToSession(@ptrCast(&router), session_key, "[Subagent 'research'] completed\nanswer");
+    try std.testing.expectEqual(@as(usize, 1), session.agent.historyLen());
+    try std.testing.expectEqualStrings("[Subagent 'research'] completed\nanswer", session.agent.history.items[0].content);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.outboundDepth());
+}
+
+test "subagent completion uses local outbound dispatch when runtime has no bus" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var cfg = testTelegramConfig();
+    cfg.workspace_dir = workspace;
+    cfg.config_path = config_path;
+
+    const runtime = try ChannelRuntime.init(allocator, &cfg, null);
+    defer runtime.deinit();
+
+    const DispatchRecorder = struct {
+        const Self = @This();
+        called: bool = false,
+
+        fn dispatch(ctx: ?*anyopaque, outbound: *const bus_mod.OutboundMessage) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.called = true;
+            try std.testing.expectEqualStrings("telegram", outbound.channel);
+            try std.testing.expectEqualStrings("12345", outbound.chat_id);
+            try std.testing.expectEqualStrings("[Subagent 'research'] completed\nanswer", outbound.content);
+        }
+    };
+
+    var recorder = DispatchRecorder{};
+    runtime.attachCompletionOutboundDispatch(@ptrCast(&recorder), DispatchRecorder.dispatch);
+
+    const session = try runtime.session_mgr.getOrCreate("agent:zaki-bot:user:1:main");
+    session.origin_channel = try allocator.dupe(u8, "telegram");
+    session.origin_chat_id = try allocator.dupe(u8, "12345");
+
+    const mgr = runtime.subagent_manager orelse return error.TestUnexpectedResult;
+    const delivery = mgr.completion_delivery orelse return error.TestUnexpectedResult;
+    try delivery(mgr.completion_delivery_ctx, "agent:zaki-bot:user:1:main", "[Subagent 'research'] completed\nanswer");
+
+    try std.testing.expect(recorder.called);
 }
 
 test "processTelegramMessages replies through direct telegram send path" {

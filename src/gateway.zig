@@ -49,6 +49,8 @@ const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
 const lane_metrics = @import("lane_metrics.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
+const channel_manager = @import("channel_manager.zig");
+const channel_dispatch = @import("channels/dispatch.zig");
 const bus_mod = @import("bus.zig");
 const log = std.log.scoped(.gateway);
 
@@ -316,6 +318,8 @@ pub const IdempotencyStore = struct {
 
 const TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY: usize = 256;
 const USER_CELL_REGISTRATION_REFRESH_SECS: u64 = 5;
+const TENANT_RUNTIME_MAINTENANCE_INTERVAL_SECS: i64 = 1;
+const GATEWAY_SESSION_LOCK_WAIT_STAGE: []const u8 = "session_lock_wait";
 
 pub const GatewayRole = enum {
     shared,
@@ -337,6 +341,117 @@ fn gatewayRoleOwnsTenantExecution(role: GatewayRole) bool {
         .shared, .user_cell => true,
         .broker => false,
     };
+}
+
+fn appendSubagentCompletionToGatewaySession(
+    ctx: ?*anyopaque,
+    session_key: []const u8,
+    content: []const u8,
+) anyerror!void {
+    const router: *SubagentCompletionRouter = @ptrCast(@alignCast(ctx.?));
+    var origin = try router.session_mgr.captureOriginSnapshot(session_key);
+    defer origin.deinit(router.session_mgr.allocator);
+
+    try router.session_mgr.appendAssistantMessage(session_key, content);
+    const completion_event_id = try router.session_mgr.saveCompletionEvent(session_key, origin.channel, origin.account_id, origin.chat_id, content);
+    defer if (completion_event_id) |value| router.session_mgr.allocator.free(value);
+
+    if (origin.channel) |channel_name| {
+        if (std.mem.eql(u8, channel_name, "zaki_app")) {
+            if (completion_event_id) |event_id| {
+                const user_scope = zaki_session.parseUserIdFromSessionKey(session_key) orelse "";
+                _ = router.state.app_event_subscribers.publish(event_id, user_scope, session_key, content) catch false;
+            }
+            return;
+        }
+    }
+
+    if (!shouldEmitSubagentCompletionOutbound(origin.channel, origin.chat_id)) return;
+
+    const user_id = zaki_session.parseUserIdFromSessionKey(session_key);
+    const source_tag = if (completion_event_id) |event_id|
+        try std.fmt.allocPrint(router.session_mgr.allocator, "subagent_completion:{s}", .{event_id})
+    else
+        null;
+    defer if (source_tag) |value| router.session_mgr.allocator.free(value);
+    var outbound = if (origin.account_id) |account_id|
+        try bus_mod.makeOutboundWithAccountAnnotated(
+            router.session_mgr.allocator,
+            origin.channel.?,
+            account_id,
+            origin.chat_id.?,
+            content,
+            source_tag orelse "subagent",
+            user_id,
+            null,
+        )
+    else
+        try bus_mod.makeOutboundAnnotated(
+            router.session_mgr.allocator,
+            origin.channel.?,
+            origin.chat_id.?,
+            content,
+            source_tag orelse "subagent",
+            user_id,
+            null,
+        );
+    var outbound_transferred = false;
+    defer if (!outbound_transferred) outbound.deinit(router.session_mgr.allocator);
+
+    if (router.event_bus) |event_bus| {
+        event_bus.publishOutbound(outbound) catch |err| {
+            if (err != error.Closed) {
+                try dispatchSubagentCompletionLocally(router.session_mgr.allocator, router.config, &outbound);
+                if (completion_event_id) |event_id| {
+                    try router.session_mgr.deleteCompletionEvent(event_id);
+                }
+            }
+            return;
+        };
+        outbound_transferred = true;
+        return;
+    }
+
+    try dispatchSubagentCompletionLocally(router.session_mgr.allocator, router.config, &outbound);
+    if (completion_event_id) |event_id| {
+        try router.session_mgr.deleteCompletionEvent(event_id);
+    }
+}
+
+const SubagentCompletionRouter = struct {
+    session_mgr: *session_mod.SessionManager,
+    event_bus: ?*bus_mod.Bus,
+    config: *const Config,
+    state: *GatewayState,
+};
+
+fn shouldEmitSubagentCompletionOutbound(channel: ?[]const u8, chat_id: ?[]const u8) bool {
+    const resolved_channel = channel orelse return false;
+    _ = chat_id orelse return false;
+    return !std.mem.eql(u8, resolved_channel, "agent") and
+        !std.mem.eql(u8, resolved_channel, "system") and
+        !std.mem.eql(u8, resolved_channel, "zaki_app");
+}
+
+fn dispatchSubagentCompletionLocally(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    outbound: *const bus_mod.OutboundMessage,
+) !void {
+    var registry = channel_dispatch.ChannelRegistry.init(allocator);
+    defer registry.deinit();
+
+    const mgr = try channel_manager.ChannelManager.init(allocator, cfg, &registry);
+    defer mgr.deinit();
+    try mgr.collectConfiguredChannels();
+
+    var stats = channel_dispatch.DispatchStats{};
+    var tenant_ctx = channel_dispatch.TenantDispatchContext{
+        .enabled = cfg.tenant.enabled,
+        .data_root = cfg.tenant.data_root,
+        .allow_telegram_fallback = cfg.tenant.enabled,
+    };
+    channel_dispatch.dispatchOutboundMessage(allocator, null, &registry, &stats, &tenant_ctx, outbound);
 }
 
 const TenantTelegramAsyncJobQueue = struct {
@@ -380,6 +495,176 @@ const TenantTelegramAsyncJobQueue = struct {
         defer self.mutex.unlock();
         self.closed = true;
         self.not_empty.broadcast();
+    }
+};
+
+const LiveAppCompletionEvent = struct {
+    id: []u8,
+    session_key: []u8,
+    content: []u8,
+
+    fn initOwned(allocator: std.mem.Allocator, event_id: []const u8, session_key: []const u8, content: []const u8) !LiveAppCompletionEvent {
+        return .{
+            .id = try allocator.dupe(u8, event_id),
+            .session_key = try allocator.dupe(u8, session_key),
+            .content = try allocator.dupe(u8, content),
+        };
+    }
+
+    fn deinit(self: *LiveAppCompletionEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.session_key);
+        allocator.free(self.content);
+    }
+};
+
+const AppEventsSubscriber = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    queue: std.ArrayListUnmanaged(LiveAppCompletionEvent) = .empty,
+    delivered_ids: std.StringHashMapUnmanaged(void) = .empty,
+    closed: bool = false,
+
+    const WaitResult = union(enum) {
+        event: LiveAppCompletionEvent,
+        timeout,
+        closed,
+    };
+
+    fn close(self: *AppEventsSubscriber) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closed = true;
+        self.cond.broadcast();
+    }
+
+    fn deinit(self: *AppEventsSubscriber, allocator: std.mem.Allocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.queue.items.len > 0) {
+            var event = self.queue.pop().?;
+            event.deinit(allocator);
+        }
+        self.queue.deinit(allocator);
+        var it = self.delivered_ids.iterator();
+        while (it.next()) |entry| {
+            allocator.free(@constCast(entry.key_ptr.*));
+        }
+        self.delivered_ids.deinit(allocator);
+    }
+
+    fn enqueue(self: *AppEventsSubscriber, allocator: std.mem.Allocator, event_id: []const u8, session_key: []const u8, content: []const u8) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return false;
+        if (self.delivered_ids.contains(event_id)) return false;
+        for (self.queue.items) |queued| {
+            if (std.mem.eql(u8, queued.id, event_id)) return false;
+        }
+        try self.queue.append(allocator, try LiveAppCompletionEvent.initOwned(allocator, event_id, session_key, content));
+        self.cond.signal();
+        return true;
+    }
+
+    fn removeQueuedEventLocked(self: *AppEventsSubscriber, allocator: std.mem.Allocator, event_id: []const u8) void {
+        var idx: usize = 0;
+        while (idx < self.queue.items.len) {
+            if (std.mem.eql(u8, self.queue.items[idx].id, event_id)) {
+                var event = self.queue.orderedRemove(idx);
+                event.deinit(allocator);
+                continue;
+            }
+            idx += 1;
+        }
+    }
+
+    fn markDelivered(self: *AppEventsSubscriber, allocator: std.mem.Allocator, event_id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.delivered_ids.contains(event_id)) {
+            const owned = try allocator.dupe(u8, event_id);
+            errdefer allocator.free(owned);
+            try self.delivered_ids.put(allocator, owned, {});
+        }
+        self.removeQueuedEventLocked(allocator, event_id);
+    }
+
+    fn waitForEvent(self: *AppEventsSubscriber, wait_ns: u64) WaitResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.queue.items.len == 0 and !self.closed) {
+            self.cond.timedWait(&self.mutex, wait_ns) catch |err| switch (err) {
+                error.Timeout => return .timeout,
+            };
+        }
+        if (self.queue.items.len == 0) return .closed;
+        return .{ .event = self.queue.orderedRemove(0) };
+    }
+};
+
+const AppEventSubscriberRegistry = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    subscribers: std.StringHashMapUnmanaged(*AppEventsSubscriber) = .empty,
+
+    fn init(allocator: std.mem.Allocator) AppEventSubscriberRegistry {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *AppEventSubscriberRegistry) void {
+        self.closeAll();
+        var it = self.subscribers.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+        }
+        self.subscribers.deinit(self.allocator);
+    }
+
+    fn keyFor(allocator: std.mem.Allocator, user_id: []const u8, session_key: []const u8) ![]u8 {
+        _ = user_id;
+        return allocator.dupe(u8, session_key);
+    }
+
+    fn register(self: *AppEventSubscriberRegistry, user_id: []const u8, session_key: []const u8, subscriber: *AppEventsSubscriber) !void {
+        const key = try keyFor(self.allocator, user_id, session_key);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (try self.subscribers.fetchPut(self.allocator, key, subscriber)) |previous| {
+            previous.value.close();
+            self.allocator.free(@constCast(previous.key));
+        }
+    }
+
+    fn unregister(self: *AppEventSubscriberRegistry, user_id: []const u8, session_key: []const u8, subscriber: *AppEventsSubscriber) void {
+        const key = keyFor(self.allocator, user_id, session_key) catch return;
+        defer self.allocator.free(key);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.subscribers.getEntry(key)) |entry| {
+            if (entry.value_ptr.* == subscriber) {
+                const removed = self.subscribers.fetchRemove(key).?;
+                self.allocator.free(@constCast(removed.key));
+            }
+        }
+    }
+
+    fn publish(self: *AppEventSubscriberRegistry, event_id: []const u8, user_id: []const u8, session_key: []const u8, content: []const u8) !bool {
+        const key = try keyFor(self.allocator, user_id, session_key);
+        defer self.allocator.free(key);
+        self.mutex.lock();
+        const subscriber = self.subscribers.get(key);
+        self.mutex.unlock();
+        if (subscriber == null) return false;
+        return try subscriber.?.enqueue(self.allocator, event_id, session_key, content);
+    }
+
+    fn closeAll(self: *AppEventSubscriberRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.subscribers.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.close();
+        }
     }
 };
 
@@ -491,6 +776,7 @@ pub const GatewayState = struct {
     owner_instance_id: []const u8 = "",
     owner_instance_id_owned: bool = false,
     user_preparation_gate: UserPreparationGate,
+    app_event_subscribers: AppEventSubscriberRegistry,
     tenant_runtime_mutex: std.Thread.Mutex = .{},
     tenant_runtimes: std.StringHashMapUnmanaged(*TenantRuntime) = .empty,
     tenant_telegram_queue: TenantTelegramAsyncJobQueue = .{},
@@ -549,6 +835,7 @@ pub const GatewayState = struct {
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
     zaki_state: ?*zaki_state_mod.Manager = null,
+    lifecycle_metrics: LifecycleMetrics = .{},
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
         return initWithVerifyToken(allocator, "");
@@ -564,11 +851,13 @@ pub const GatewayState = struct {
             .whatsapp_access_token = "",
             .telegram_bot_token = "",
             .user_preparation_gate = UserPreparationGate.init(allocator),
+            .app_event_subscribers = AppEventSubscriberRegistry.init(allocator),
             .pairing_guard = null,
         };
     }
 
     pub fn deinit(self: *GatewayState) void {
+        self.app_event_subscribers.deinit();
         self.tenant_telegram_queue.close();
         if (self.tenant_telegram_worker) |worker| {
             worker.join();
@@ -620,6 +909,95 @@ pub const GatewayState = struct {
     fn chatFallbackChain(self: *const GatewayState) []const u8 {
         return self.chat_fallback_chain_buf[0..self.chat_fallback_chain_len];
     }
+
+    fn closeAppEventSubscribers(self: *GatewayState) void {
+        self.app_event_subscribers.closeAll();
+    }
+};
+
+/// Exported lifecycle tax metrics for gateway-hosted agent work.
+/// These series are intentionally coarse and stable so operators can separate
+/// turn latency from lock wait, compaction, continuity refresh, and pruning.
+const LifecycleMetrics = struct {
+    lock_wait_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    lock_wait_duration_ms_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    compaction_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    compaction_duration_ms_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    continuity_refresh_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    continuity_refresh_duration_ms_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    pruning_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    pruning_duration_ms_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    tenant_runtime_pruned_idle_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    tenant_runtime_pruned_capacity_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn recordLifecycleStage(self: *LifecycleMetrics, stage: []const u8, duration_ms: u64) void {
+        if (std.mem.eql(u8, stage, GATEWAY_SESSION_LOCK_WAIT_STAGE)) {
+            _ = self.lock_wait_total.fetchAdd(1, .monotonic);
+            _ = self.lock_wait_duration_ms_total.fetchAdd(duration_ms, .monotonic);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "turn_auto_compaction") or
+            std.mem.eql(u8, stage, "post_reply_compaction") or
+            std.mem.eql(u8, stage, "compact_trim"))
+        {
+            _ = self.compaction_total.fetchAdd(1, .monotonic);
+            _ = self.compaction_duration_ms_total.fetchAdd(duration_ms, .monotonic);
+            return;
+        }
+        if (std.mem.eql(u8, stage, "continuity_refresh")) {
+            _ = self.continuity_refresh_total.fetchAdd(1, .monotonic);
+            _ = self.continuity_refresh_duration_ms_total.fetchAdd(duration_ms, .monotonic);
+            return;
+        }
+    }
+
+    fn recordPruning(self: *LifecycleMetrics, duration_ms: u64, idle_removed: usize, capacity_removed: usize) void {
+        const total_removed = idle_removed + capacity_removed;
+        if (total_removed == 0) return;
+        _ = self.pruning_total.fetchAdd(@intCast(total_removed), .monotonic);
+        _ = self.pruning_duration_ms_total.fetchAdd(duration_ms, .monotonic);
+        _ = self.tenant_runtime_pruned_idle_total.fetchAdd(@intCast(idle_removed), .monotonic);
+        _ = self.tenant_runtime_pruned_capacity_total.fetchAdd(@intCast(capacity_removed), .monotonic);
+    }
+};
+
+const LifecycleMetricsObserver = struct {
+    metrics: *LifecycleMetrics,
+
+    const vtable = Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = name,
+    };
+
+    fn observer(self: *LifecycleMetricsObserver) Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    fn resolve(ptr: *anyopaque) *LifecycleMetricsObserver {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+        const self = resolve(ptr);
+        switch (event.*) {
+            .turn_stage => |stage| {
+                const duration_ms = stage.duration_ms orelse return;
+                self.metrics.recordLifecycleStage(stage.stage, duration_ms);
+            },
+            else => {},
+        }
+    }
+
+    fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flush(_: *anyopaque) void {}
+    fn name(_: *anyopaque) []const u8 {
+        return "gateway_lifecycle_metrics";
+    }
 };
 
 const UserContext = struct {
@@ -662,9 +1040,13 @@ const TenantRuntime = struct {
     pg_session_store: ?*zaki_state_mod.Manager.UserSessionStore,
     state_mgr: ?*zaki_state_mod.Manager,
     subagent_manager: ?*subagent_mod.SubagentManager,
+    completion_router: ?*SubagentCompletionRouter,
     sec_tracker: ?security.RateTracker,
     sec_policy: ?security.SecurityPolicy,
     log_obs: *observability.LogObserver,
+    metrics_obs: LifecycleMetricsObserver,
+    observer_slots: [2]Observer,
+    observer_multi: observability.MultiObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: std.atomic.Value(i64),
     effective_config_source: []const u8,
@@ -699,6 +1081,8 @@ const TenantRuntime = struct {
         user_ctx: *const UserContext,
         event_bus: ?*bus_mod.Bus,
         state_mgr: ?*zaki_state_mod.Manager,
+        gateway_state: *GatewayState,
+        lifecycle_metrics: *LifecycleMetrics,
     ) !*TenantRuntime {
         const runtime = try allocator.create(TenantRuntime);
         errdefer allocator.destroy(runtime);
@@ -719,9 +1103,13 @@ const TenantRuntime = struct {
             .pg_session_store = null,
             .state_mgr = state_mgr,
             .subagent_manager = null,
+            .completion_router = null,
             .sec_tracker = null,
             .sec_policy = null,
             .log_obs = undefined,
+            .metrics_obs = .{ .metrics = lifecycle_metrics },
+            .observer_slots = undefined,
+            .observer_multi = .{ .observers = &.{} },
             .session_mgr = undefined,
             .last_used_s = std.atomic.Value(i64).init(std.time.timestamp()),
             .effective_config_source = "file_config",
@@ -802,7 +1190,8 @@ const TenantRuntime = struct {
         }
         // User config JSON must never override the per-tenant workspace root.
         runtime.config.workspace_dir = runtime.workspace_path;
-        // Canonical tenant lane policy: app continuity stays on main, channels use thread/task/cron lanes.
+        // Canonical tenant lane policy: app continuity and Telegram DMs share main,
+        // while group/topic channels continue to use scoped thread/task/cron lanes.
         runtime.config.session.cross_channel_shared_main = false;
 
         runtime.provider_bundle = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &runtime.config);
@@ -864,12 +1253,18 @@ const TenantRuntime = struct {
         const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
         if (subagent_manager) |mgr| {
             mgr.* = subagent_mod.SubagentManager.init(allocator, &runtime.config, event_bus, .{});
+            if (state_mgr) |tenant_state_mgr| {
+                const numeric_user_id = std.fmt.parseInt(i64, user_ctx.user_id, 10) catch return error.InvalidTenantUserId;
+                mgr.attachPostgresLedger(tenant_state_mgr, numeric_user_id);
+            }
         }
         runtime.subagent_manager = subagent_manager;
         errdefer if (runtime.subagent_manager) |mgr| {
             mgr.deinit();
             allocator.destroy(mgr);
         };
+        runtime.completion_router = if (runtime.subagent_manager != null) allocator.create(SubagentCompletionRouter) catch null else null;
+        errdefer if (runtime.completion_router) |router| allocator.destroy(router);
 
         runtime.tools = tools_mod.allTools(allocator, runtime.config.workspace_dir, .{
             .config = &runtime.config,
@@ -893,6 +1288,11 @@ const TenantRuntime = struct {
         errdefer allocator.destroy(log_obs);
         log_obs.* = .{};
         runtime.log_obs = log_obs;
+        runtime.observer_slots = .{
+            runtime.log_obs.observer(),
+            runtime.metrics_obs.observer(),
+        };
+        runtime.observer_multi = .{ .observers = runtime.observer_slots[0..] };
 
         const mem_opt: ?memory_mod.Memory = if (runtime.mem_rt) |rt| rt.memory else null;
         runtime.session_mgr = session_mod.SessionManager.init(
@@ -901,7 +1301,7 @@ const TenantRuntime = struct {
             provider_i,
             runtime.tools,
             mem_opt,
-            runtime.log_obs.observer(),
+            runtime.observer_multi.observer(),
             if (runtime.pg_session_store) |store| store.sessionStore() else if (runtime.mem_rt) |rt| rt.session_store else null,
             if (runtime.mem_rt) |*rt| rt.response_cache else null,
         );
@@ -914,6 +1314,17 @@ const TenantRuntime = struct {
         if (runtime.mem_rt) |*rt| {
             runtime.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(runtime.tools, rt);
+        }
+        if (runtime.subagent_manager) |mgr| {
+            if (runtime.completion_router) |router| {
+                router.* = .{
+                    .session_mgr = &runtime.session_mgr,
+                    .event_bus = event_bus,
+                    .config = &runtime.config,
+                    .state = gateway_state,
+                };
+                mgr.attachCompletionDelivery(@ptrCast(router), appendSubagentCompletionToGatewaySession);
+            }
         }
 
         log.info("tenant.runtime.config user={s} source={s} hash={x}", .{
@@ -981,6 +1392,9 @@ const TenantRuntime = struct {
             mgr.deinit();
             self.allocator.destroy(mgr);
         }
+        if (self.completion_router) |router| {
+            self.allocator.destroy(router);
+        }
         if (self.pg_session_store) |store| {
             store.deinit();
             self.allocator.destroy(store);
@@ -1016,9 +1430,6 @@ const TenantRuntime = struct {
             .message_turn_context = message_turn_context,
             .progress_observer = progress_observer,
         });
-        if (self.config.agent.session_idle_timeout_secs > 0) {
-            _ = self.session_mgr.evictIdle(self.config.agent.session_idle_timeout_secs);
-        }
         return response;
     }
 };
@@ -1113,6 +1524,14 @@ fn parseTenantRuntimeInvalidationRequest(
 }
 
 fn pruneTenantRuntimeCache(state: *GatewayState, now_s: i64) void {
+    const prune_start_ms = std.time.milliTimestamp();
+    var idle_removed: usize = 0;
+    var capacity_removed: usize = 0;
+    defer {
+        const duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - prune_start_ms));
+        state.lifecycle_metrics.recordPruning(duration_ms, idle_removed, capacity_removed);
+    }
+
     const ttl_s: i64 = @intCast(state.tenant_runtime_idle_ttl_secs);
     if (ttl_s > 0 and state.tenant_runtimes.count() > 0) {
         var stale_keys: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -1131,11 +1550,12 @@ fn pruneTenantRuntimeCache(state: *GatewayState, now_s: i64) void {
         }
         for (stale_keys.items) |key| {
             removeTenantRuntime(state, key);
+            idle_removed += 1;
         }
     }
 
     const max_users: usize = @intCast(@max(@as(u32, 1), state.tenant_runtime_cache_max_users));
-    while (state.tenant_runtimes.count() >= max_users and state.tenant_runtimes.count() > 0) {
+    while (state.tenant_runtimes.count() > max_users and state.tenant_runtimes.count() > 0) {
         var oldest_key: ?[]u8 = null;
         var oldest_ts: i64 = std.math.maxInt(i64);
         var it = state.tenant_runtimes.iterator();
@@ -1151,10 +1571,24 @@ fn pruneTenantRuntimeCache(state: *GatewayState, now_s: i64) void {
         if (oldest_key) |key| {
             defer state.allocator.free(key);
             removeTenantRuntime(state, key);
+            capacity_removed += 1;
         } else {
             break;
         }
     }
+}
+
+fn runTenantRuntimeMaintenance(state: *GatewayState, now_s: i64) void {
+    state.tenant_runtime_mutex.lock();
+    defer state.tenant_runtime_mutex.unlock();
+    var it = state.tenant_runtimes.iterator();
+    while (it.next()) |entry| {
+        const runtime = entry.value_ptr.*;
+        if (runtime.config.agent.session_idle_timeout_secs > 0) {
+            _ = runtime.session_mgr.evictIdle(runtime.config.agent.session_idle_timeout_secs);
+        }
+    }
+    pruneTenantRuntimeCache(state, now_s);
 }
 
 fn getTenantRuntime(
@@ -1171,14 +1605,12 @@ fn getTenantRuntime(
     state.tenant_runtime_mutex.lock();
     defer state.tenant_runtime_mutex.unlock();
 
-    pruneTenantRuntimeCache(state, now_s);
-
     if (state.tenant_runtimes.get(user_ctx.user_id)) |runtime| {
         runtime.last_used_s.store(now_s, .release);
         return runtime;
     }
 
-    const runtime = try TenantRuntime.init(state.allocator, config, user_ctx, state.event_bus, state.zaki_state);
+    const runtime = try TenantRuntime.init(state.allocator, config, user_ctx, state.event_bus, state.zaki_state, state, &state.lifecycle_metrics);
     if (runtime.session_mgr.policy != null) {
         state.tenant_runtime_policy_attached.store(true, .monotonic);
     }
@@ -2473,6 +2905,55 @@ fn writeTelegramChannelState(
     try w.print("\",\"chat_id\":{d},\"updated_at_s\":{d}}}", .{ chat_id, std.time.timestamp() });
     try w.writeAll("}");
     try writeFile(channel_state_path, out.items);
+}
+
+fn writeTelegramFallbackStateFile(path: []const u8, content: []const u8) !void {
+    try writeFile(path, content);
+}
+
+fn syncTelegramSecretFallbackBestEffort(secret_path: []const u8, content: []const u8) bool {
+    writeFile(secret_path, content) catch |err| {
+        log.warn("telegram local secret fallback sync failed path={s}: {}", .{ secret_path, err });
+        return false;
+    };
+    return true;
+}
+
+fn syncTelegramStateFallbackBestEffort(telegram_path: []const u8, content: []const u8) bool {
+    writeTelegramFallbackStateFile(telegram_path, content) catch |err| {
+        log.warn("telegram local state fallback sync failed path={s}: {}", .{ telegram_path, err });
+        return false;
+    };
+    return true;
+}
+
+fn deleteTelegramFallbackFilesBestEffort(
+    telegram_path: []const u8,
+    channel_state_path: []const u8,
+) bool {
+    deleteTelegramFallbackFiles(telegram_path, channel_state_path) catch |err| {
+        log.warn("telegram local fallback cleanup failed telegram_path={s} channel_state_path={s}: {}", .{
+            telegram_path,
+            channel_state_path,
+            err,
+        });
+        return false;
+    };
+    return true;
+}
+
+fn deleteTelegramFallbackFiles(
+    telegram_path: []const u8,
+    channel_state_path: []const u8,
+) !void {
+    std.fs.deleteFileAbsolute(telegram_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    std.fs.deleteFileAbsolute(channel_state_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn freeOwnedStringArray(allocator: std.mem.Allocator, values: []const []const u8) void {
@@ -4425,6 +4906,23 @@ fn resolveTenantTelegramLane(
     topic_buf: []u8,
     lane_buf: []u8,
 ) TenantTelegramLaneResolution {
+    const topic_key = if (body_opt) |body|
+        telegramThreadKey(allocator, body, topic_buf)
+    else
+        null;
+    const is_group_chat = if (body_opt) |body|
+        telegramChatIsGroup(allocator, body)
+    else
+        chat_id < 0;
+
+    if (!is_group_chat and topic_key == null) {
+        return .{
+            .fallback_session_key = zaki_session.userMainSessionKey(fallback_buf, user_id),
+            .lane = .main,
+            .canonical_thread_key = null,
+        };
+    }
+
     if (use_shared_main) {
         return .{
             .fallback_session_key = zaki_session.userMainSessionKey(fallback_buf, user_id),
@@ -4433,10 +4931,6 @@ fn resolveTenantTelegramLane(
         };
     }
 
-    const topic_key = if (body_opt) |body|
-        telegramThreadKey(allocator, body, topic_buf)
-    else
-        null;
     const canonical_thread_key = buildTelegramCanonicalThreadKey(chat_id, topic_key, lane_buf);
     const fallback_session_key = if (canonical_thread_key) |thread_key|
         zaki_session.userThreadSessionKey(fallback_buf, user_id, thread_key)
@@ -5040,6 +5534,16 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
     const in_flight_requests = state.in_flight_requests.load(.monotonic);
     const drain_rejected_total = state.drain_rejected_total.load(.monotonic);
     const overload_rejected_total = state.overload_rejected_total.load(.monotonic);
+    const lifecycle_lock_wait_total = state.lifecycle_metrics.lock_wait_total.load(.monotonic);
+    const lifecycle_lock_wait_duration_ms_total = state.lifecycle_metrics.lock_wait_duration_ms_total.load(.monotonic);
+    const lifecycle_compaction_total = state.lifecycle_metrics.compaction_total.load(.monotonic);
+    const lifecycle_compaction_duration_ms_total = state.lifecycle_metrics.compaction_duration_ms_total.load(.monotonic);
+    const lifecycle_continuity_refresh_total = state.lifecycle_metrics.continuity_refresh_total.load(.monotonic);
+    const lifecycle_continuity_refresh_duration_ms_total = state.lifecycle_metrics.continuity_refresh_duration_ms_total.load(.monotonic);
+    const lifecycle_pruning_total = state.lifecycle_metrics.pruning_total.load(.monotonic);
+    const lifecycle_pruning_duration_ms_total = state.lifecycle_metrics.pruning_duration_ms_total.load(.monotonic);
+    const tenant_runtime_pruned_idle_total = state.lifecycle_metrics.tenant_runtime_pruned_idle_total.load(.monotonic);
+    const tenant_runtime_pruned_capacity_total = state.lifecycle_metrics.tenant_runtime_pruned_capacity_total.load(.monotonic);
     const draining = state.draining.load(.acquire);
     const shutdown_requested = state.shutdown_requested.load(.acquire);
     const pool = http_native.pool_mod.globalPool(.{}, http_native.closePooledConnForGateway);
@@ -5126,6 +5630,22 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\# HELP nullalis_gateway_shutdown_requested Whether shutdown has been requested.
         \\# TYPE nullalis_gateway_shutdown_requested gauge
         \\nullalis_gateway_shutdown_requested {d}
+        \\# HELP nullalis_gateway_lifecycle_stage_total Total lifecycle-tax events separated from core turn execution.
+        \\# TYPE nullalis_gateway_lifecycle_stage_total counter
+        \\nullalis_gateway_lifecycle_stage_total{{stage="lock_wait"}} {d}
+        \\nullalis_gateway_lifecycle_stage_total{{stage="compaction"}} {d}
+        \\nullalis_gateway_lifecycle_stage_total{{stage="continuity_refresh"}} {d}
+        \\nullalis_gateway_lifecycle_stage_total{{stage="pruning"}} {d}
+        \\# HELP nullalis_gateway_lifecycle_stage_duration_ms_total Total lifecycle-tax milliseconds by stage.
+        \\# TYPE nullalis_gateway_lifecycle_stage_duration_ms_total counter
+        \\nullalis_gateway_lifecycle_stage_duration_ms_total{{stage="lock_wait"}} {d}
+        \\nullalis_gateway_lifecycle_stage_duration_ms_total{{stage="compaction"}} {d}
+        \\nullalis_gateway_lifecycle_stage_duration_ms_total{{stage="continuity_refresh"}} {d}
+        \\nullalis_gateway_lifecycle_stage_duration_ms_total{{stage="pruning"}} {d}
+        \\# HELP nullalis_gateway_tenant_runtime_pruned_total Total tenant runtimes removed by maintenance reason.
+        \\# TYPE nullalis_gateway_tenant_runtime_pruned_total counter
+        \\nullalis_gateway_tenant_runtime_pruned_total{{reason="idle"}} {d}
+        \\nullalis_gateway_tenant_runtime_pruned_total{{reason="capacity"}} {d}
         \\
     ,
         .{
@@ -5141,6 +5661,16 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             overload_rejected_total,
             if (draining) @as(u8, 1) else @as(u8, 0),
             if (shutdown_requested) @as(u8, 1) else @as(u8, 0),
+            lifecycle_lock_wait_total,
+            lifecycle_compaction_total,
+            lifecycle_continuity_refresh_total,
+            lifecycle_pruning_total,
+            lifecycle_lock_wait_duration_ms_total,
+            lifecycle_compaction_duration_ms_total,
+            lifecycle_continuity_refresh_duration_ms_total,
+            lifecycle_pruning_duration_ms_total,
+            tenant_runtime_pruned_idle_total,
+            tenant_runtime_pruned_capacity_total,
         },
     );
     try w.print(
@@ -7218,6 +7748,16 @@ fn sseReplyStartFrame(
     return buf.toOwnedSlice(allocator);
 }
 
+fn sseReadyFrame(allocator: std.mem.Allocator, session_key: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: ready\ndata: {\"type\":\"ready\",\"session_key\":\"");
+    try jsonEscapeInto(w, session_key);
+    try w.writeAll("\"}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
 fn sseErrorFrame(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -7226,6 +7766,25 @@ fn sseErrorFrame(allocator: std.mem.Allocator, code: []const u8, msg: []const u8
     try jsonEscapeInto(w, code);
     try w.writeAll("\",\"message\":\"");
     try jsonEscapeInto(w, msg);
+    try w.writeAll("\"}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn sseSubagentCompletionFrame(
+    allocator: std.mem.Allocator,
+    event_id: []const u8,
+    session_key: []const u8,
+    content: []const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: subagent_completion\ndata: {\"type\":\"subagent_completion\",\"event_id\":\"");
+    try jsonEscapeInto(w, event_id);
+    try w.writeAll("\",\"session_key\":\"");
+    try jsonEscapeInto(w, session_key);
+    try w.writeAll("\",\"content\":\"");
+    try jsonEscapeInto(w, content);
     try w.writeAll("\"}\n\n");
     return buf.toOwnedSlice(allocator);
 }
@@ -7543,6 +8102,235 @@ fn resolveChatStreamSessionKey(
     return zaki_session.userMainSessionKey(fallback_buf, user_id);
 }
 
+fn resolveChatEventsSessionKey(
+    target: []const u8,
+    user_id: []const u8,
+    tenant_enabled: bool,
+) ChatStreamSessionKeyError![]const u8 {
+    const requested = parseQueryParam(target, "session_key") orelse return error.MissingSessionKey;
+    const trimmed = std.mem.trim(u8, requested, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > 255) return error.InvalidSessionKey;
+    if (std.mem.indexOfAny(u8, trimmed, "\r\n") != null) return error.InvalidSessionKey;
+    if (tenant_enabled) {
+        if (!sessionKeyOwnedByUser(trimmed, user_id)) return error.SessionKeyUserMismatch;
+        if (!sessionKeyHasAllowedTenantLane(trimmed, user_id)) return error.InvalidSessionLane;
+    }
+    return trimmed;
+}
+
+fn handleApiChatEventsSseConnection(
+    root_allocator: std.mem.Allocator,
+    req_allocator: std.mem.Allocator,
+    stream: anytype,
+    raw_request: []const u8,
+    method: []const u8,
+    base_path: []const u8,
+    state: *GatewayState,
+    config_opt: ?*const Config,
+    session_mgr_opt: ?*session_mod.SessionManager,
+) bool {
+    _ = root_allocator;
+    if (!std.mem.eql(u8, base_path, "/api/v1/chat/events")) return false;
+
+    if (!validateInternalServiceToken(raw_request, state)) {
+        sendSseErrorResponse(stream, req_allocator, "401 Unauthorized", "unauthorized", "unauthorized");
+        return true;
+    }
+    if (!std.mem.eql(u8, method, "GET")) {
+        sendSseErrorResponse(stream, req_allocator, "405 Method Not Allowed", "method_not_allowed", "method not allowed");
+        return true;
+    }
+    if (state.draining.load(.acquire)) {
+        sendSseErrorResponse(stream, req_allocator, "503 Service Unavailable", "gateway_draining", "gateway draining, retry shortly");
+        return true;
+    }
+
+    const header_user_id = extractZakiUserId(raw_request);
+    const user_id = resolveGatewayRequestUserId(state, header_user_id, null, true) catch |err| {
+        const response = switch (err) {
+            error.MissingUserId => .{ "400 Bad Request", "missing_user_id", "missing X-Zaki-User-Id" },
+            error.UserCellUserMismatch => .{ "403 Forbidden", "wrong_user_cell", "request does not belong to this user cell" },
+        };
+        sendSseErrorResponse(stream, req_allocator, response[0], response[1], response[2]);
+        return true;
+    };
+
+    if (state.role == .broker) {
+        prepareBrokerUserForRouting(req_allocator, state, user_id) catch |err| {
+            if (isIdentityUserNotFound(err)) {
+                sendSseErrorResponse(stream, req_allocator, "404 Not Found", "unknown_user_id", "unknown user id");
+                return true;
+            }
+            sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
+            return true;
+        };
+        const target = extractRequestTarget(raw_request) orelse base_path;
+        brokerProxyChatStreamSseConnection(
+            req_allocator,
+            stream,
+            state,
+            raw_request,
+            method,
+            target,
+            user_id,
+        );
+        return true;
+    }
+
+    var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "invalid_user", "invalid user");
+        return true;
+    };
+    defer user_ctx.deinit(req_allocator);
+
+    var prep_guard = state.user_preparation_gate.acquire(user_ctx.user_id) catch {
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "preparation_gate_failed", "user preparation gate failed");
+        return true;
+    };
+    defer prep_guard.deinit();
+
+    ensureUserDirectories(&user_ctx) catch {
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
+        return true;
+    };
+    ensureUserProvisioned(state, &user_ctx) catch |err| {
+        if (isIdentityUserNotFound(err)) {
+            sendSseErrorResponse(stream, req_allocator, "404 Not Found", "unknown_user_id", "unknown user id");
+            return true;
+        }
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "provisioning_failed", "user provisioning failed");
+        return true;
+    };
+    scaffoldUserWorkspace(req_allocator, &user_ctx);
+    prep_guard.release();
+
+    var ownership_lock = maybeAcquireTenantOwnershipLock(req_allocator, state, user_ctx.user_id, user_ctx.user_root) catch {
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "tenant_lock_failed", "tenant ownership lock failed");
+        return true;
+    };
+    defer ownership_lock.deinit();
+    switch (ownership_lock) {
+        .disabled => {},
+        .acquired => {},
+        .conflict => |*conflict| {
+            recordTenantLockConflict(state, .chat_stream_sse);
+            sendSseOwnershipLockConflictResponse(stream, req_allocator, conflict);
+            return true;
+        },
+    }
+
+    const target = extractRequestTarget(raw_request) orelse base_path;
+    const session_key = resolveChatEventsSessionKey(target, user_id, state.tenant_enabled) catch |err| {
+        const code: []const u8 = switch (err) {
+            error.InvalidSessionKey => "invalid_session_key",
+            error.SessionKeyUserMismatch => "session_key_user_mismatch",
+            error.InvalidSessionLane => "invalid_session_lane",
+            error.MissingSessionKey => "missing_session_key",
+        };
+        const msg: []const u8 = switch (err) {
+            error.InvalidSessionKey => "invalid session_key",
+            error.SessionKeyUserMismatch => "session_key must belong to the authenticated user",
+            error.InvalidSessionLane => "session_key must use lane main|thread:<id>|task:<id>|cron:<id>",
+            error.MissingSessionKey => "session_key is required",
+        };
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", code, msg);
+        return true;
+    };
+
+    var completion_session_mgr: ?*session_mod.SessionManager = null;
+    if (state.tenant_enabled) {
+        const cfg = config_opt orelse {
+            sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "tenant_config_missing", "tenant runtime unavailable");
+            return true;
+        };
+        const tenant_runtime = getTenantRuntime(state, cfg, &user_ctx) catch |err| {
+            if (err == error.ExecutionDelegated) {
+                sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "execution_delegated", "broker mode does not execute locally");
+            } else {
+                sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "tenant_runtime_failed", "tenant runtime init failed");
+            }
+            return true;
+        };
+        completion_session_mgr = &tenant_runtime.session_mgr;
+    } else if (session_mgr_opt) |sm| {
+        completion_session_mgr = sm;
+    } else {
+        sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "session_store_unavailable", "session manager unavailable");
+        return true;
+    }
+
+    const sm = completion_session_mgr.?;
+    var sse_stream = LockedSseStream(@TypeOf(stream)).init(stream);
+    sse_stream.sendHeader("200 OK") catch return true;
+
+    const ready_owned = sseReadyFrame(req_allocator, session_key) catch null;
+    defer if (ready_owned) |frame| req_allocator.free(frame);
+    const ready_frame: []const u8 = if (ready_owned) |frame| frame else "event: ready\ndata: {\"type\":\"ready\"}\n\n";
+    sse_stream.sendFrame(ready_frame) catch return true;
+
+    var subscriber = AppEventsSubscriber{};
+    defer subscriber.deinit(state.allocator);
+    state.app_event_subscribers.register(user_id, session_key, &subscriber) catch {
+        sendLockedSseErrorFrames(&sse_stream, req_allocator, "subscription_failed", "failed to attach live completion subscription");
+        return true;
+    };
+    defer state.app_event_subscribers.unregister(user_id, session_key, &subscriber);
+
+    const pending_completion_events = sm.loadCompletionEvents(session_key) catch &.{};
+    defer if (pending_completion_events.len > 0) {
+        memory_mod.freeCompletionEvents(sm.allocator, @constCast(pending_completion_events));
+    };
+    for (pending_completion_events) |event| {
+        const frame = sseSubagentCompletionFrame(req_allocator, event.id, event.session_id, event.content) catch {
+            sendLockedSseErrorFrames(&sse_stream, req_allocator, "stream_encode_failed", "failed to encode completion frame");
+            return true;
+        };
+        sse_stream.sendFrame(frame) catch {
+            req_allocator.free(frame);
+            sse_stream.markClosed();
+            return true;
+        };
+        req_allocator.free(frame);
+        subscriber.markDelivered(state.allocator, event.id) catch {};
+        sm.deleteCompletionEvent(event.id) catch {};
+    }
+
+    while (!state.shutdown_requested.load(.acquire)) {
+        const result = subscriber.waitForEvent(SSE_KEEPALIVE_INTERVAL_MS * std.time.ns_per_ms);
+        switch (result) {
+            .timeout => {
+                sse_stream.sendFrame(SSE_KEEPALIVE_FRAME) catch {
+                    sse_stream.markClosed();
+                    return true;
+                };
+            },
+            .closed => break,
+            .event => |event| {
+                defer {
+                    var owned = event;
+                    owned.deinit(state.allocator);
+                }
+                const frame = sseSubagentCompletionFrame(req_allocator, event.id, event.session_key, event.content) catch {
+                    sendLockedSseErrorFrames(&sse_stream, req_allocator, "stream_encode_failed", "failed to encode completion frame");
+                    return true;
+                };
+                sse_stream.sendFrame(frame) catch {
+                    req_allocator.free(frame);
+                    sse_stream.markClosed();
+                    return true;
+                };
+                req_allocator.free(frame);
+                subscriber.markDelivered(state.allocator, event.id) catch {};
+                sm.deleteCompletionEvent(event.id) catch {};
+            },
+        }
+    }
+
+    subscriber.close();
+    sse_stream.finish() catch sse_stream.markClosed();
+    return true;
+}
+
 fn handleApiChatStreamSseConnection(
     root_allocator: std.mem.Allocator,
     req_allocator: std.mem.Allocator,
@@ -7727,6 +8515,7 @@ fn handleApiChatStreamSseConnection(
                 },
                 .{
                     .channel = "zaki_app",
+                    .chat_id = session_key,
                     .is_group = false,
                     .is_dm = true,
                 },
@@ -7738,6 +8527,12 @@ fn handleApiChatStreamSseConnection(
         }
         if (session_mgr_opt) |sm| {
             break :blk .{ .ok = sm.processMessageWithContext(session_key, message, null, .{
+                .message_turn_context = .{
+                    .channel = "zaki_app",
+                    .chat_id = session_key,
+                    .is_group = false,
+                    .is_dm = true,
+                },
                 .progress_observer = progress_observer,
             }) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
@@ -7762,7 +8557,10 @@ fn handleApiChatStreamSseConnection(
     };
     defer root_allocator.free(reply);
 
-    const payload_text = if (reply.len > 0) reply else "received";
+    const payload_text = if (reply.len > 0)
+        reply
+    else
+        "received";
     const reply_start_fallback = "event: reply_start\ndata: {\"type\":\"reply_start\",\"stream_kind\":\"final_reply\",\"delivery_mode\":\"buffered_replay\",\"live\":false}\n\n";
     const reply_start_owned = sseReplyStartFrame(req_allocator, "final_reply", "buffered_replay", false) catch null;
     defer if (reply_start_owned) |frame| req_allocator.free(frame);
@@ -8052,6 +8850,7 @@ fn handleApiRoute(
                     },
                     .{
                         .channel = "zaki_app",
+                        .chat_id = session_key,
                         .is_group = false,
                         .is_dm = true,
                     },
@@ -8068,6 +8867,12 @@ fn handleApiRoute(
             }
             if (session_mgr_opt) |sm| {
                 break :blk sm.processMessageWithContext(session_key, message, null, .{
+                    .message_turn_context = .{
+                        .channel = "zaki_app",
+                        .chat_id = session_key,
+                        .is_group = false,
+                        .is_dm = true,
+                    },
                     .progress_observer = progress_observer,
                 }) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
@@ -8091,7 +8896,11 @@ fn handleApiRoute(
         };
         const chat_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - chat_start_ms));
         defer root_allocator.free(reply);
-        const payload_text = if (reply.len > 0) reply else "received";
+        const payload_text = if (reply.len > 0)
+            req_allocator.dupe(u8, reply) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" }
+        else
+            req_allocator.dupe(u8, "received") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" };
+        defer req_allocator.free(payload_text);
         const sse_start_ms = std.time.milliTimestamp();
         const sse = sseBufferedChatPayload(req_allocator, status_frame, progress_observer_impl.frames.items, payload_text, session_key) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build sse\"}" };
@@ -8109,6 +8918,13 @@ fn handleApiRoute(
             .status = "200 OK",
             .body = sse,
             .content_type = "text/event-stream; charset=utf-8",
+        };
+    }
+
+    if (std.mem.eql(u8, base_path, "/api/v1/chat/events")) {
+        return .{
+            .status = "500 Internal Server Error",
+            .body = "{\"error\":\"chat_events_requires_streaming_path\"}",
         };
     }
 
@@ -8750,8 +9566,8 @@ fn handleApiRoute(
                 mgr.putSecret(user_id, "telegram_bot_token", normalized_tok) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
                 };
-                // Keep file secret in sync for local tenant runtime fallback.
-                writeFile(secret_path, normalized_tok) catch {};
+                // Best-effort local fallback sync for degraded/local tenant runtime reads.
+                _ = syncTelegramSecretFallbackBestEffort(secret_path, normalized_tok);
             } else {
                 writeFile(secret_path, normalized_tok) catch {
                     return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed storing bot token\"}" };
@@ -8862,8 +9678,10 @@ fn handleApiRoute(
             mgr.putTelegramStateJson(user_id, state_payload.items) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
             };
+            // Best-effort local fallback sync for degraded/local tenant runtime reads.
+            _ = syncTelegramStateFallbackBestEffort(user_ctx.telegram_path, state_payload.items);
         } else {
-            writeFile(user_ctx.telegram_path, state_payload.items) catch {
+            writeTelegramFallbackStateFile(user_ctx.telegram_path, state_payload.items) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
             };
         }
@@ -8921,14 +9739,12 @@ fn handleApiRoute(
             mgr.deleteTelegramState(user_id) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" };
             };
+            _ = deleteTelegramFallbackFilesBestEffort(user_ctx.telegram_path, user_ctx.channel_state_path);
         } else {
-            std.fs.deleteFileAbsolute(user_ctx.telegram_path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" },
-            };
-            std.fs.deleteFileAbsolute(user_ctx.channel_state_path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"disconnect failed\"}" },
+            deleteTelegramFallbackFiles(user_ctx.telegram_path, user_ctx.channel_state_path) catch |err| {
+                return .{ .status = "500 Internal Server Error", .body = switch (err) {
+                    else => "{\"error\":\"disconnect failed\"}",
+                } };
             };
         }
         return .{ .body = "{\"status\":\"disconnected\",\"channel\":\"telegram\"}" };
@@ -9237,6 +10053,9 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     return;
                 };
                 ctx.state.zaki_state.?.recordTelegramChat(numeric_user_id, tg_account_id, chat_id.?) catch {};
+                if (tenant_channel_state_path) |state_path| {
+                    writeTelegramChannelState(ctx.req_allocator, state_path, tg_account_id, chat_id.?) catch {};
+                }
             } else if (tenant_channel_state_path) |state_path| {
                 writeTelegramChannelState(ctx.req_allocator, state_path, tg_account_id, chat_id.?) catch {};
             }
@@ -9514,7 +10333,13 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     zaki_session.userMainSessionKey(&kb, scoped_user_id.?)
                 else
                     telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
-                const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, null) catch |err| blk: {
+                const reply: ?[]const u8 = sm.processMessageWithToolContext(sk, msg_text.?, null, .{
+                    .channel = "telegram",
+                    .account_id = tg_account_id,
+                    .chat_id = cid_str,
+                    .is_group = is_group,
+                    .is_dm = !is_group,
+                }) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
                         sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch |send_err| {
                             log.warn("telegram webhook sync error-reply send failed: {}", .{send_err});
@@ -10127,7 +10952,13 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                     }) catch null;
                     _ = publishToBus(eb, ctx.state.allocator, "line", uid, line_target, text, sk, meta);
                 } else if (ctx.session_mgr_opt) |sm| {
-                    const reply: ?[]const u8 = sm.processMessage(sk, text, null) catch |err| blk: {
+                    const reply: ?[]const u8 = sm.processMessageWithToolContext(sk, text, null, .{
+                        .channel = "line",
+                        .account_id = line_account_id,
+                        .chat_id = line_target,
+                        .is_group = std.mem.eql(u8, line_peer.kind, "group"),
+                        .is_dm = std.mem.eql(u8, line_peer.kind, "direct"),
+                    }) catch |err| blk: {
                         if (evt.reply_token) |rt| {
                             var line_ch = channels.line.LineChannel.init(ctx.req_allocator, .{
                                 .access_token = line_access_token,
@@ -10248,7 +11079,13 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
             }) catch null;
             _ = publishToBus(eb, ctx.state.allocator, "lark", msg.sender, msg.sender, msg.content, sk, meta);
         } else if (ctx.session_mgr_opt) |sm| {
-            const reply: ?[]const u8 = sm.processMessage(sk, msg.content, null) catch |err| blk: {
+            const reply: ?[]const u8 = sm.processMessageWithToolContext(sk, msg.content, null, .{
+                .channel = "lark",
+                .account_id = lark_account_id,
+                .chat_id = msg.sender,
+                .is_group = msg.is_group,
+                .is_dm = !msg.is_group,
+            }) catch |err| blk: {
                 lark_ch.sendMessage(msg.sender, userFacingAgentError(err)) catch {};
                 break :blk null;
             };
@@ -10360,6 +11197,7 @@ fn handleAcceptedConnection(
     });
     const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
     const is_chat_stream_path = std.mem.eql(u8, base_path, "/api/v1/chat/stream");
+    const is_chat_events_path = std.mem.eql(u8, base_path, "/api/v1/chat/events");
     const is_post = std.mem.eql(u8, method_str, "POST");
     var response_status: []const u8 = "200 OK";
     var response_body: []const u8 = "";
@@ -10372,6 +11210,7 @@ fn handleAcceptedConnection(
         std.mem.eql(u8, base_path, "/ready") or
         std.mem.eql(u8, base_path, "/metrics") or
         is_chat_stream_path or
+        is_chat_events_path or
         is_internal_path;
     const overload_retry_after_secs: u16 = if (config_opt) |cfg|
         @max(@as(u16, 1), cfg.gateway.overload_retry_after_secs)
@@ -10391,6 +11230,19 @@ fn handleAcceptedConnection(
 
     if (is_chat_stream_path) {
         _ = handleApiChatStreamSseConnection(
+            allocator,
+            req_allocator,
+            &conn.stream,
+            raw,
+            method_str,
+            base_path,
+            state,
+            config_opt,
+            session_mgr_opt,
+        );
+        return;
+    } else if (is_chat_events_path) {
+        _ = handleApiChatEventsSseConnection(
             allocator,
             req_allocator,
             &conn.stream,
@@ -10498,7 +11350,12 @@ fn handleAcceptedConnection(
                             _ = publishToBus(eb, state.allocator, "webhook", bearer orelse "anon", session_key, msg_text, session_key, null);
                             response_body = "{\"status\":\"received\"}";
                         } else if (session_mgr_opt) |sm| {
-                            const reply: ?[]const u8 = sm.processMessage(session_key, msg_text, null) catch |err| blk: {
+                            const reply: ?[]const u8 = sm.processMessageWithToolContext(session_key, msg_text, null, .{
+                                .channel = "webhook",
+                                .chat_id = session_key,
+                                .is_group = false,
+                                .is_dm = true,
+                            }) catch |err| blk: {
                                 response_body = userFacingAgentErrorJson(err);
                                 break :blk null;
                             };
@@ -10770,6 +11627,7 @@ fn handleAcceptedConnection(
             } else {
                 state.draining.store(true, .release);
                 state.shutdown_requested.store(true, .release);
+                state.closeAppEventSubscribers();
                 response_body = "{\"status\":\"shutdown_requested\"}";
             }
         },
@@ -10972,9 +11830,13 @@ pub fn runWithRole(
     var tools_slice: []const tools_mod.Tool = &.{};
     var mem_rt: ?memory_mod.MemoryRuntime = null;
     var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
+    var completion_router_opt: ?*SubagentCompletionRouter = null;
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
     var log_obs_gateway = observability.LogObserver{};
+    var metrics_obs_gateway = LifecycleMetricsObserver{ .metrics = &state.lifecycle_metrics };
+    var gateway_observer_slots: [2]Observer = undefined;
+    var gateway_observer_multi = observability.MultiObserver{ .observers = &.{} };
     const needs_local_agent = gatewayRoleNeedsLocalAgent(role, event_bus != null);
 
     if (config_opt) |cfg_ptr| {
@@ -11108,6 +11970,7 @@ pub fn runWithRole(
                 if (subagent_manager) |mgr| {
                     mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, .{});
                     subagent_manager_opt = mgr;
+                    completion_router_opt = allocator.create(SubagentCompletionRouter) catch null;
                 }
 
                 // Tools.
@@ -11128,7 +11991,12 @@ pub fn runWithRole(
                 }) catch &.{};
 
                 const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
-                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, log_obs_gateway.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+                gateway_observer_slots = .{
+                    log_obs_gateway.observer(),
+                    metrics_obs_gateway.observer(),
+                };
+                gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
+                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, gateway_observer_multi.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
                 }
@@ -11137,6 +12005,19 @@ pub fn runWithRole(
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
                 }
                 session_mgr_opt = sm;
+                if (subagent_manager_opt) |mgr| {
+                    if (session_mgr_opt) |*session_mgr| {
+                        if (completion_router_opt) |router| {
+                            router.* = .{
+                                .session_mgr = session_mgr,
+                                .event_bus = event_bus,
+                                .config = cfg,
+                                .state = &state,
+                            };
+                            mgr.attachCompletionDelivery(@ptrCast(router), appendSubagentCompletionToGatewaySession);
+                        }
+                    }
+                }
             }
         }
 
@@ -11152,6 +12033,7 @@ pub fn runWithRole(
         mgr.deinit();
         allocator.destroy(mgr);
     };
+    defer if (completion_router_opt) |router| allocator.destroy(router);
     defer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
     defer if (session_mgr_opt) |*sm| sm.deinit();
     defer if (sec_tracker_opt) |*tracker| tracker.deinit();
@@ -11233,6 +12115,8 @@ pub fn runWithRole(
         for (worker_threads) |thread| thread.join();
     }
 
+    var last_tenant_runtime_maintenance_s: i64 = 0;
+
     // Accept loop — one acceptor thread, bounded queue + worker pool.
     while (true) {
         if (state.shutdown_requested.load(.acquire) and
@@ -11244,6 +12128,11 @@ pub fn runWithRole(
 
         const conn = server.accept() catch |err| switch (err) {
             error.WouldBlock => {
+                const now_s = std.time.timestamp();
+                if (now_s - last_tenant_runtime_maintenance_s >= TENANT_RUNTIME_MAINTENANCE_INTERVAL_SECS) {
+                    runTenantRuntimeMaintenance(&state, now_s);
+                    last_tenant_runtime_maintenance_s = now_s;
+                }
                 std.Thread.sleep(50 * std.time.ns_per_ms);
                 continue;
             },
@@ -12739,6 +13628,412 @@ test "handleApiRoute chat stream includes buffered progress and reasoning summar
     try std.testing.expect(std.mem.indexOf(u8, response.body, "event: done") != null);
 }
 
+test "handleApiRoute chat stream leaves pending subagent completions for dedicated events stream" {
+    const TestProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "Main reply"),
+                .tool_calls = &.{},
+                .usage = .{ .prompt_tokens = 8, .completion_tokens = 4, .total_tokens = 12 },
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "test-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{workspace});
+    defer std.testing.allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    var provider_state: u8 = 0;
+    const provider_vtable = providers.Provider.VTable{
+        .chatWithSystem = TestProvider.chatWithSystem,
+        .chat = TestProvider.chat,
+        .supportsNativeTools = TestProvider.supportsNativeTools,
+        .getName = TestProvider.getName,
+        .deinit = TestProvider.deinitFn,
+    };
+    const provider = providers.Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+    var noop = observability.NoopObserver{};
+    var session_mgr = session_mod.SessionManager.init(
+        std.testing.allocator,
+        &cfg,
+        provider,
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        store,
+        null,
+    );
+    defer session_mgr.deinit();
+
+    const pending_event_id = (try session_mgr.saveCompletionEvent(
+        "session:1",
+        "zaki_app",
+        null,
+        "session:1",
+        "[Subagent 'research'] completed\nanswer",
+    )).?;
+    defer std.testing.allocator.free(pending_event_id);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = workspace;
+    state.workspace_dir = workspace;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"message\":\"hello\",\"session_key\":\"session:1\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/chat/stream HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "POST",
+        "/api/v1/chat/stream",
+        &state,
+        null,
+        &session_mgr,
+    );
+
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "Main reply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "[Subagent 'research'] completed") == null);
+
+    const remaining = try session_mgr.loadCompletionEvents("session:1");
+    defer memory_mod.freeCompletionEvents(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+}
+
+test "handleApiChatEventsSseConnection replays pending completions and clears them" {
+    const FakeStream = struct {
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn writeAll(self: *@This(), bytes: []const u8) !void {
+            try self.buf.appendSlice(std.testing.allocator, bytes);
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(std.testing.allocator);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{workspace});
+    defer std.testing.allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    var provider_state: u8 = 0;
+    const provider_vtable = providers.Provider.VTable{
+        .chatWithSystem = struct {
+            fn call(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+                return allocator.dupe(u8, "");
+            }
+        }.call,
+        .chat = struct {
+            fn call(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+                return .{
+                    .content = try allocator.dupe(u8, "unused"),
+                    .tool_calls = &.{},
+                    .usage = .{ .prompt_tokens = 1, .completion_tokens = 1, .total_tokens = 2 },
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+        }.call,
+        .supportsNativeTools = struct {
+            fn call(_: *anyopaque) bool {
+                return false;
+            }
+        }.call,
+        .getName = struct {
+            fn call(_: *anyopaque) []const u8 {
+                return "test-provider";
+            }
+        }.call,
+        .deinit = struct {
+            fn call(_: *anyopaque) void {}
+        }.call,
+    };
+    const provider = providers.Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+    var noop = observability.NoopObserver{};
+    var session_mgr = session_mod.SessionManager.init(
+        std.testing.allocator,
+        &cfg,
+        provider,
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        store,
+        null,
+    );
+    defer session_mgr.deinit();
+
+    const event_id = (try session_mgr.saveCompletionEvent(
+        "session:events",
+        "zaki_app",
+        null,
+        "session:events",
+        "[Subagent 'research'] completed\nanswer",
+    )).?;
+    defer std.testing.allocator.free(event_id);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = workspace;
+    state.workspace_dir = workspace;
+    state.shutdown_requested.store(true, .release);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/chat/events?session_key=session:events HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n",
+        .{},
+    );
+
+    var fake_stream = FakeStream{};
+    defer fake_stream.deinit();
+
+    const handled = handleApiChatEventsSseConnection(
+        std.testing.allocator,
+        req_allocator,
+        &fake_stream,
+        raw_request,
+        "GET",
+        "/api/v1/chat/events",
+        &state,
+        null,
+        &session_mgr,
+    );
+
+    try std.testing.expect(handled);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: subagent_completion") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "\"session_key\":\"session:events\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "answer") != null);
+
+    const remaining = try session_mgr.loadCompletionEvents("session:events");
+    defer memory_mod.freeCompletionEvents(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "handleApiChatEventsSseConnection delivers live completions to active subscriber" {
+    const FakeStream = struct {
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn writeAll(self: *@This(), bytes: []const u8) !void {
+            try self.buf.appendSlice(std.testing.allocator, bytes);
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(std.testing.allocator);
+        }
+    };
+
+    const EventsThread = struct {
+        fn run(ctx: *@This().Context) void {
+            var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer req_arena.deinit();
+            const req_allocator = req_arena.allocator();
+            const raw_request = std.fmt.allocPrint(
+                req_allocator,
+                "GET /api/v1/chat/events?session_key={s} HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n",
+                .{ctx.session_key},
+            ) catch return;
+            _ = handleApiChatEventsSseConnection(
+                std.testing.allocator,
+                req_allocator,
+                ctx.stream,
+                raw_request,
+                "GET",
+                "/api/v1/chat/events",
+                ctx.state,
+                null,
+                ctx.session_mgr,
+            );
+        }
+
+        const Context = struct {
+            state: *GatewayState,
+            session_mgr: *session_mod.SessionManager,
+            stream: *FakeStream,
+            session_key: []const u8,
+        };
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{workspace});
+    defer std.testing.allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    var provider_state: u8 = 0;
+    const provider_vtable = providers.Provider.VTable{
+        .chatWithSystem = struct {
+            fn call(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+                return allocator.dupe(u8, "");
+            }
+        }.call,
+        .chat = struct {
+            fn call(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+                return .{
+                    .content = try allocator.dupe(u8, "unused"),
+                    .tool_calls = &.{},
+                    .usage = .{ .prompt_tokens = 1, .completion_tokens = 1, .total_tokens = 2 },
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+        }.call,
+        .supportsNativeTools = struct {
+            fn call(_: *anyopaque) bool {
+                return false;
+            }
+        }.call,
+        .getName = struct {
+            fn call(_: *anyopaque) []const u8 {
+                return "test-provider";
+            }
+        }.call,
+        .deinit = struct {
+            fn call(_: *anyopaque) void {}
+        }.call,
+    };
+    const provider = providers.Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+    var noop = observability.NoopObserver{};
+    var session_mgr = session_mod.SessionManager.init(
+        std.testing.allocator,
+        &cfg,
+        provider,
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        store,
+        null,
+    );
+    defer session_mgr.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = workspace;
+    state.workspace_dir = workspace;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var fake_stream = FakeStream{};
+    defer fake_stream.deinit();
+    var ctx = EventsThread.Context{
+        .state = &state,
+        .session_mgr = &session_mgr,
+        .stream = &fake_stream,
+        .session_key = "session:live",
+    };
+    const thread = try std.Thread.spawn(.{}, EventsThread.run, .{&ctx});
+
+    var subscriber_ready = false;
+    for (0..50) |_| {
+        state.app_event_subscribers.mutex.lock();
+        subscriber_ready = state.app_event_subscribers.subscribers.contains("session:live");
+        state.app_event_subscribers.mutex.unlock();
+        if (subscriber_ready) break;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(subscriber_ready);
+
+    const content = "[Subagent 'research'] completed\nlive answer";
+    const event_id = (try session_mgr.saveCompletionEvent("session:live", "zaki_app", null, "session:live", content)).?;
+    defer std.testing.allocator.free(event_id);
+
+    const published = try state.app_event_subscribers.publish(event_id, "1", "session:live", content);
+    try std.testing.expect(published);
+
+    var delivered = false;
+    for (0..50) |_| {
+        const remaining = try session_mgr.loadCompletionEvents("session:live");
+        defer memory_mod.freeCompletionEvents(std.testing.allocator, remaining);
+        if (remaining.len == 0) {
+            delivered = true;
+            break;
+        }
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(delivered);
+
+    state.shutdown_requested.store(true, .release);
+    state.closeAppEventSubscribers();
+    thread.join();
+
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: subagent_completion") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "live answer") != null);
+}
+
 test "handleApiChatStreamSseConnection emits keepalive comments during slow turns" {
     const SlowProvider = struct {
         fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
@@ -13801,7 +15096,7 @@ test "tenantTelegramUsesSharedMain is locked off for tenant lane determinism" {
     try std.testing.expect(!tenantTelegramUsesSharedMain(&cfg));
 }
 
-test "resolveTenantTelegramLane routes direct chats to thread lane by chat id" {
+test "resolveTenantTelegramLane routes direct chats to canonical main lane" {
     var fallback_buf: [128]u8 = undefined;
     var topic_buf: [32]u8 = undefined;
     var lane_buf: [64]u8 = undefined;
@@ -13819,8 +15114,9 @@ test "resolveTenantTelegramLane routes direct chats to thread lane by chat id" {
         &lane_buf,
     );
 
-    try std.testing.expectEqual(inbound_canonicalizer.CanonicalSessionLane.thread, lane.lane);
-    try std.testing.expectEqualStrings("123456789", lane.canonical_thread_key.?);
+    try std.testing.expectEqual(inbound_canonicalizer.CanonicalSessionLane.main, lane.lane);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:main", lane.fallback_session_key);
+    try std.testing.expect(lane.canonical_thread_key == null);
 }
 
 test "resolveTenantTelegramLane appends topic id for forum messages" {
@@ -14813,6 +16109,142 @@ test "runWithRole rejects controller-backed user_cell mode without advertise url
     );
 }
 
+fn makeTenantRuntimeTestConfig(
+    allocator: std.mem.Allocator,
+    tenant_root: []const u8,
+    base_config_path: []const u8,
+) Config {
+    var cfg = Config{
+        .workspace_dir = tenant_root,
+        .config_path = base_config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+    };
+    cfg.tenant.enabled = true;
+    cfg.memory.search.enabled = false;
+    cfg.browser.enabled = false;
+    cfg.http_request.enabled = false;
+    return cfg;
+}
+
+fn provisionTenantRuntimeTestUser(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    user_id: []const u8,
+) !UserContext {
+    var user_ctx = try resolveUserContext(allocator, state, user_id);
+    errdefer user_ctx.deinit(allocator);
+    try ensureUserProvisioned(state, &user_ctx);
+    return user_ctx;
+}
+
+test "getTenantRuntime does not prune inline on request path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const base_config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/base-config.json", .{tenant_root});
+    defer std.testing.allocator.free(base_config_path);
+    try writeFile(base_config_path, "{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openrouter/test/mock-model\"}}},\"memory\":{\"search\":{\"enabled\":false}}}\n");
+
+    var cfg = makeTenantRuntimeTestConfig(std.testing.allocator, tenant_root, base_config_path);
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.tenant_data_root = tenant_root;
+    state.tenant_runtime_cache_max_users = 1;
+    state.tenant_runtime_idle_ttl_secs = 0;
+
+    var user_ctx_1 = try provisionTenantRuntimeTestUser(std.testing.allocator, &state, "1");
+    defer user_ctx_1.deinit(std.testing.allocator);
+    const runtime_1 = try getTenantRuntime(&state, &cfg, &user_ctx_1);
+
+    var user_ctx_2 = try provisionTenantRuntimeTestUser(std.testing.allocator, &state, "2");
+    defer user_ctx_2.deinit(std.testing.allocator);
+    const runtime_2 = try getTenantRuntime(&state, &cfg, &user_ctx_2);
+
+    try std.testing.expect(runtime_1 != runtime_2);
+    try std.testing.expectEqual(@as(usize, 2), state.tenant_runtimes.count());
+
+    state.tenant_runtime_mutex.lock();
+    defer state.tenant_runtime_mutex.unlock();
+    try std.testing.expect(state.tenant_runtimes.get("1") != null);
+    try std.testing.expect(state.tenant_runtimes.get("2") != null);
+}
+
+test "tenant runtime maintenance prunes cache outside request path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const base_config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/base-config.json", .{tenant_root});
+    defer std.testing.allocator.free(base_config_path);
+    try writeFile(base_config_path, "{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openrouter/test/mock-model\"}}},\"memory\":{\"search\":{\"enabled\":false}}}\n");
+
+    var cfg = makeTenantRuntimeTestConfig(std.testing.allocator, tenant_root, base_config_path);
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.tenant_data_root = tenant_root;
+    state.tenant_runtime_cache_max_users = 1;
+    state.tenant_runtime_idle_ttl_secs = 0;
+
+    var user_ctx_1 = try provisionTenantRuntimeTestUser(std.testing.allocator, &state, "1");
+    defer user_ctx_1.deinit(std.testing.allocator);
+    const runtime_1 = try getTenantRuntime(&state, &cfg, &user_ctx_1);
+
+    var user_ctx_2 = try provisionTenantRuntimeTestUser(std.testing.allocator, &state, "2");
+    defer user_ctx_2.deinit(std.testing.allocator);
+    const runtime_2 = try getTenantRuntime(&state, &cfg, &user_ctx_2);
+
+    runtime_1.last_used_s.store(10, .release);
+    runtime_2.last_used_s.store(20, .release);
+
+    runTenantRuntimeMaintenance(&state, 20);
+
+    state.tenant_runtime_mutex.lock();
+    defer state.tenant_runtime_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), state.tenant_runtimes.count());
+    try std.testing.expect(state.tenant_runtimes.get("1") == null);
+    try std.testing.expect(state.tenant_runtimes.get("2") != null);
+}
+
+test "tenant runtime maintenance evicts idle sessions outside request path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const base_config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/base-config.json", .{tenant_root});
+    defer std.testing.allocator.free(base_config_path);
+    try writeFile(base_config_path, "{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openrouter/test/mock-model\"}}},\"memory\":{\"search\":{\"enabled\":false}}}\n");
+
+    var cfg = makeTenantRuntimeTestConfig(std.testing.allocator, tenant_root, base_config_path);
+    cfg.agent.session_idle_timeout_secs = 60;
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.tenant_data_root = tenant_root;
+
+    var user_ctx = try provisionTenantRuntimeTestUser(std.testing.allocator, &state, "1");
+    defer user_ctx.deinit(std.testing.allocator);
+    const runtime = try getTenantRuntime(&state, &cfg, &user_ctx);
+
+    const session = try runtime.session_mgr.getOrCreate("agent:zaki-bot:user:1:thread:tg:111");
+    session.last_active = 0;
+    try std.testing.expectEqual(@as(usize, 1), runtime.session_mgr.sessionCount());
+
+    runTenantRuntimeMaintenance(&state, std.time.timestamp());
+
+    try std.testing.expectEqual(@as(usize, 0), runtime.session_mgr.sessionCount());
+}
+
 test "resolveUserContext rejects mismatched user in user_cell mode" {
     const allocator = std.testing.allocator;
     var gs = GatewayState.init(allocator);
@@ -14946,6 +16378,76 @@ test "parseUpstreamResponseHeader parses status and body offset" {
     const parsed = try parseUpstreamResponseHeader(raw);
     try std.testing.expectEqual(@as(u16, 200), parsed.status_code);
     try std.testing.expectEqualStrings("event: token\r\n\r\n", raw[parsed.body_offset..]);
+}
+
+test "writeTelegramFallbackStateFile writes telegram fallback state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram.json", .{tmp_root});
+    defer std.testing.allocator.free(path);
+
+    try writeTelegramFallbackStateFile(path, "{\"connected\":true}\n");
+    const content = try readFileOrDefault(std.testing.allocator, path, "");
+    defer if (content.len > 0) std.testing.allocator.free(content);
+
+    try std.testing.expectEqualStrings("{\"connected\":true}\n", content);
+}
+
+test "syncTelegramStateFallbackBestEffort surfaces failure without throwing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing/telegram.json", .{tmp_root});
+    defer std.testing.allocator.free(path);
+
+    const ok = syncTelegramStateFallbackBestEffort(path, "{\"connected\":true}\n");
+    try std.testing.expect(!ok);
+}
+
+test "syncTelegramSecretFallbackBestEffort surfaces failure without throwing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing/telegram_bot_token", .{tmp_root});
+    defer std.testing.allocator.free(path);
+
+    const ok = syncTelegramSecretFallbackBestEffort(path, "123:abc");
+    try std.testing.expect(!ok);
+}
+
+test "deleteTelegramFallbackFilesBestEffort surfaces failure without throwing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+
+    const ok = deleteTelegramFallbackFilesBestEffort(tmp_root, tmp_root);
+    try std.testing.expect(!ok);
+}
+
+test "deleteTelegramFallbackFiles removes local fallback files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const telegram_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/telegram.json", .{tmp_root});
+    defer std.testing.allocator.free(telegram_path);
+    const channel_state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/channel_state.json", .{tmp_root});
+    defer std.testing.allocator.free(channel_state_path);
+
+    try writeFile(telegram_path, "{\"connected\":true}\n");
+    try writeFile(channel_state_path, "{\"telegram\":{\"chat_id\":1}}\n");
+
+    try deleteTelegramFallbackFiles(telegram_path, channel_state_path);
+
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(telegram_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(channel_state_path, .{}));
 }
 
 test "extractRequestTarget returns raw request target with query" {
@@ -15214,6 +16716,44 @@ test "metricsPayload includes chat stream lane and session key counters" {
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_chat_stream_lanes_total{lane=\"task\"} 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_chat_stream_session_key_rejections_total{reason=\"wrong_user\"} 1") != null);
+}
+
+test "metricsPayload includes lifecycle timing series" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var obs = LifecycleMetricsObserver{ .metrics = &gs.lifecycle_metrics };
+    const lock_wait_event = ObserverEvent{ .turn_stage = .{
+        .stage = GATEWAY_SESSION_LOCK_WAIT_STAGE,
+        .duration_ms = 12,
+    } };
+    obs.observer().recordEvent(&lock_wait_event);
+    const compaction_event = ObserverEvent{ .turn_stage = .{
+        .stage = "turn_auto_compaction",
+        .duration_ms = 34,
+    } };
+    obs.observer().recordEvent(&compaction_event);
+    const continuity_event = ObserverEvent{ .turn_stage = .{
+        .stage = "continuity_refresh",
+        .duration_ms = 9,
+    } };
+    obs.observer().recordEvent(&continuity_event);
+    gs.lifecycle_metrics.recordPruning(7, 2, 1);
+
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_lifecycle_stage_total{stage=\"lock_wait\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_lifecycle_stage_duration_ms_total{stage=\"lock_wait\"} 12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_lifecycle_stage_total{stage=\"compaction\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_lifecycle_stage_duration_ms_total{stage=\"compaction\"} 34") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_lifecycle_stage_total{stage=\"continuity_refresh\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_lifecycle_stage_duration_ms_total{stage=\"continuity_refresh\"} 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_lifecycle_stage_total{stage=\"pruning\"} 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_lifecycle_stage_duration_ms_total{stage=\"pruning\"} 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_tenant_runtime_pruned_total{reason=\"idle\"} 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_tenant_runtime_pruned_total{reason=\"capacity\"} 1") != null);
 }
 
 // ── jsonEscapeInto tests ────────────────────────────────────────

@@ -237,6 +237,9 @@ fn compactHistoryKeepingRecent(
 /// Keeps system prompt (if any) + last CONTEXT_RECOVERY_KEEP messages.
 /// Everything in between is dropped without LLM summarization (we can't call
 /// the LLM since the context is exhausted). Returns true if compression was performed.
+///
+/// NOTE: This is a lossy hard-drop. Callers MUST surface this to the user so
+/// they are aware context continuity has been interrupted.
 pub fn forceCompressHistory(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
@@ -249,6 +252,8 @@ pub fn forceCompressHistory(
 
     const keep_start = history.items.len - CONTEXT_RECOVERY_KEEP;
     const to_remove = keep_start - start;
+
+    log.warn("compaction: force-compressing history — dropping {} messages (context exhausted, LLM unavailable)", .{to_remove});
 
     // Free messages being removed
     for (history.items[start..keep_start]) |*msg| {
@@ -429,8 +434,11 @@ fn summarizeSlice(
         },
         model_name,
         0.2,
-    ) catch {
-        // Fallback: use a local truncation of the transcript
+    ) catch |err| {
+        // LLM summarization failed — fall back to a hard truncation of the raw
+        // transcript. Log this clearly: the caller will surface it to the user so
+        // they know context continuity may be degraded.
+        log.warn("compaction: LLM summarization failed ({}), falling back to transcript truncation — context continuity may be degraded", .{err});
         const max_len = @min(transcript.len, config.max_summary_chars);
         return try allocator.dupe(u8, transcript[0..max_len]);
     };

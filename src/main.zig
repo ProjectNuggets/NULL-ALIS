@@ -2651,6 +2651,18 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
     }
 }
 
+const StandaloneCompletionChannelDispatch = struct {
+    channel: yc.channels.Channel,
+
+    fn dispatch(ctx: ?*anyopaque, outbound: *const yc.bus.OutboundMessage) anyerror!void {
+        const self: *StandaloneCompletionChannelDispatch = @ptrCast(@alignCast(ctx.?));
+        if (!std.mem.eql(u8, self.channel.name(), outbound.channel)) {
+            return error.ChannelMismatch;
+        }
+        try self.channel.send(outbound.chat_id, outbound.content, outbound.media);
+    }
+};
+
 // ── Signal Channel ─────────────────────────────────────────────────
 
 fn hasReliabilityCredentialFallback(allocator: std.mem.Allocator, config: *const yc.config.Config) bool {
@@ -2984,6 +2996,9 @@ fn runMatrixChannel(
         std.process.exit(1);
     };
     defer runtime.deinit();
+
+    var completion_dispatch = StandaloneCompletionChannelDispatch{ .channel = mx.channel() };
+    runtime.attachCompletionOutboundDispatch(@ptrCast(&completion_dispatch), StandaloneCompletionChannelDispatch.dispatch);
 
     var loop_state = yc.channel_loop.MatrixLoopState.init();
     yc.channel_loop.runMatrixLoop(allocator, config, runtime, &loop_state, &mx);

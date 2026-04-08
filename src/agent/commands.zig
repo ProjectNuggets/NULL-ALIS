@@ -846,6 +846,11 @@ const SummaryOrigin = struct {
     account_id: ?[]const u8 = null,
 };
 
+const SummaryQuality = enum {
+    canonical,
+    fallback,
+};
+
 fn resolveSummaryOrigin(self: anytype, session_id: []const u8, key_hint: []const u8) SummaryOrigin {
     const derived = memory_mod.deriveMemoryProvenance(session_id, key_hint);
     const turn_ctx = message_tool.MessageTool.getTurnContext();
@@ -883,6 +888,7 @@ fn buildSummaryLatestContent(
     origin: SummaryOrigin,
     source_key: []const u8,
     at: []const u8,
+    quality: SummaryQuality,
     summary_body: []const u8,
 ) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -898,8 +904,49 @@ fn buildSummaryLatestContent(
     if (origin.account_id) |account_id| {
         try w.print("origin_account_id={s}\n", .{account_id});
     }
-    try w.print("source_key={s}\nat={s}\n{s}", .{ source_key, at, summary_body });
+    try w.print("source_key={s}\nat={s}\nquality_tier={s}\n{s}", .{
+        source_key,
+        at,
+        switch (quality) {
+            .canonical => "canonical",
+            .fallback => "fallback",
+        },
+        summary_body,
+    });
     return out.toOwnedSlice(allocator);
+}
+
+fn metadataValue(content: []const u8, key: []const u8) ?[]const u8 {
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    while (iter.next()) |line| {
+        if (line.len <= key.len or line[key.len] != '=') continue;
+        if (std.mem.eql(u8, line[0..key.len], key)) return line[key.len + 1 ..];
+    }
+    return null;
+}
+
+fn summaryLatestQuality(content: []const u8) SummaryQuality {
+    const tier = metadataValue(content, "quality_tier") orelse return .canonical;
+    if (std.mem.eql(u8, tier, "fallback")) return .fallback;
+    return .canonical;
+}
+
+fn shouldPromoteSummaryLatest(
+    allocator: std.mem.Allocator,
+    mem: memory_mod.Memory,
+    latest_key: []const u8,
+    candidate_quality: SummaryQuality,
+) bool {
+    // Freeze the current continuity contract: canonical summaries always win,
+    // fallback summaries only replace missing or fallback latest state.
+    const existing = mem.get(allocator, latest_key) catch return candidate_quality == .canonical;
+    if (existing == null) return true;
+
+    var latest = existing.?;
+    defer latest.deinit(allocator);
+
+    if (candidate_quality == .canonical) return true;
+    return summaryLatestQuality(latest.content) == .fallback;
 }
 
 fn buildContextAnchorContent(
@@ -969,11 +1016,12 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
 
     var parsed_summary: ?memory_mod.SummaryResult = null;
     defer if (parsed_summary) |*result| result.deinit(self.allocator);
+    var summary_quality: SummaryQuality = .fallback;
     const content = blk: {
         if (shouldUseDeterministicSessionSummary(reason)) {
             summary_text_owned = buildStructuredFallbackSummary(self, entries, checkpoint_content);
             if (summary_text_owned) |owned| {
-                log.info("memory.session_summary status=deterministic session={s} reason={s} entries={d}", .{
+                log.info("memory.timeline_summary status=deterministic session={s} reason={s} entries={d}", .{
                     session_id,
                     reason,
                     entries.len,
@@ -1007,7 +1055,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         ) catch {
             summary_text_owned = buildStructuredFallbackSummary(self, entries, checkpoint_content);
             if (summary_text_owned) |owned| {
-                log.warn("memory.session_summary fallback=structured reason=provider_error session={s} reason_tag={s}", .{
+                log.warn("memory.timeline_summary fallback=structured reason=provider_error session={s} reason_tag={s}", .{
                     session_id,
                     reason,
                 });
@@ -1034,7 +1082,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         parsed_summary = memory_mod.parseSummaryResponse(self.allocator, response.contentOrEmpty(), summarizer_cfg) catch {
             summary_text_owned = buildStructuredFallbackSummary(self, entries, checkpoint_content);
             if (summary_text_owned) |owned| {
-                log.warn("memory.session_summary fallback=structured reason=parse_error session={s} reason_tag={s}", .{
+                log.warn("memory.timeline_summary fallback=structured reason=parse_error session={s} reason_tag={s}", .{
                     session_id,
                     reason,
                 });
@@ -1042,22 +1090,13 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             }
             return false;
         };
+        summary_quality = .canonical;
         break :blk parsed_summary.?.summary;
     };
 
-    const summary_key = std.fmt.allocPrint(
-        self.allocator,
-        "session_summary/{s}/{d}",
-        .{ session_id, now_s },
-    ) catch return false;
-    defer self.allocator.free(summary_key);
-    const summary_origin = resolveSummaryOrigin(self, session_id, summary_key);
+    const summary_origin = resolveSummaryOrigin(self, session_id, session_id);
     const summary_content = appendOriginMetadata(self.allocator, summary_origin, content) catch return false;
     defer self.allocator.free(summary_content);
-
-    if (mem.store(summary_key, summary_content, .conversation, session_id)) |_| {
-        if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, summary_key, summary_content);
-    } else |_| {}
 
     const timeline_key = std.fmt.allocPrint(
         self.allocator,
@@ -1081,12 +1120,24 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         summary_origin,
         timeline_key,
         now_iso,
+        summary_quality,
         content,
     ) catch return true;
     defer self.allocator.free(latest_content);
-    if (mem.store(latest_key, latest_content, .core, null)) |_| {
-        if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, latest_key, latest_content);
-    } else |_| {}
+    if (shouldPromoteSummaryLatest(self.allocator, mem, latest_key, summary_quality)) {
+        if (mem.store(latest_key, latest_content, .core, null)) |_| {
+            if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, latest_key, latest_content);
+        } else |_| {}
+    } else {
+        log.info("memory.summary_latest promote=blocked session={s} reason={s} quality={s}", .{
+            session_id,
+            reason,
+            switch (summary_quality) {
+                .canonical => "canonical",
+                .fallback => "fallback",
+            },
+        });
+    }
 
     updateTimelineIndex(self.allocator, mem, rt, session_id, now_iso, focus, timeline_key, summary_origin);
 
@@ -1102,7 +1153,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                 if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, fact_key, fact.content);
             } else |_| {}
         }
-        log.info("memory.session_summary status=ok session={s} reason={s} entries={d} facts={d} next={s}", .{
+        log.info("memory.timeline_summary status=ok session={s} reason={s} entries={d} facts={d} next={s}", .{
             session_id,
             reason,
             entries.len,
@@ -1110,7 +1161,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             next,
         });
     } else {
-        log.info("memory.session_summary status=fallback session={s} reason={s} entries={d} next={s}", .{
+        log.info("memory.timeline_summary status=fallback session={s} reason={s} entries={d} next={s}", .{
             session_id,
             reason,
             entries.len,
@@ -1125,6 +1176,20 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
 }
 
 pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool {
+    const start_ms = std.time.milliTimestamp();
+    defer {
+        const duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - start_ms));
+        log.info("turn.stage stage=continuity_refresh duration_ms={d} reason={s}", .{
+            duration_ms,
+            reason,
+        });
+        const refresh_event = observability.ObserverEvent{ .turn_stage = .{
+            .stage = "continuity_refresh",
+            .duration_ms = duration_ms,
+        } };
+        self.observer.recordEvent(&refresh_event);
+    }
+
     const mem = self.mem orelse return false;
     const session_id = self.memory_session_id orelse return false;
     if (session_id.len == 0) return false;
@@ -2077,6 +2142,7 @@ fn handleApproveCommand(self: anytype, arg: []const u8) ![]const u8 {
 
 fn taskStatusLabel(status: subagent_mod.TaskStatus) []const u8 {
     return switch (status) {
+        .queued => "queued",
         .running => "running",
         .completed => "completed",
         .failed => "failed",
@@ -2099,8 +2165,30 @@ fn freeSubagentTaskState(manager: *subagent_mod.SubagentManager, state: *subagen
     if (state.result) |r| manager.allocator.free(r);
     if (state.error_msg) |e| manager.allocator.free(e);
     if (state.session_key) |sk| manager.allocator.free(sk);
+    if (state.runtime_session_key) |sk| manager.allocator.free(sk);
+    if (state.origin_channel) |channel| manager.allocator.free(channel);
+    if (state.origin_chat_id) |chat| manager.allocator.free(chat);
+    manager.allocator.free(state.task_summary);
+    manager.allocator.free(state.task_prompt);
     manager.allocator.free(state.label);
     manager.allocator.destroy(state);
+}
+
+fn taskOutcomeLabel(state: *const subagent_mod.TaskState) []const u8 {
+    if (state.error_msg != null) return "error";
+    if (state.result != null) return "result_ready";
+    return switch (state.status) {
+        .queued => "pending",
+        .running => "in_progress",
+        .completed => "completed",
+        .failed => "failed",
+    };
+}
+
+fn taskResultSnippet(state: *const subagent_mod.TaskState) []const u8 {
+    if (state.error_msg) |err_msg| return err_msg;
+    if (state.result) |result| return result;
+    return "";
 }
 
 fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
@@ -2117,6 +2205,7 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
     var running: u32 = 0;
     var completed: u32 = 0;
     var failed: u32 = 0;
+    var queued: u32 = 0;
     var visible_count: u32 = 0;
 
     var it = manager.tasks.iterator();
@@ -2126,14 +2215,24 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
         if (!taskBelongsToCurrentSession(self, state)) continue;
         visible_count += 1;
         switch (state.status) {
+            .queued => queued += 1,
             .running => running += 1,
             .completed => completed += 1,
             .failed => failed += 1,
         }
 
-        try w.print("#{d} {s} [{s}]", .{ task_id, state.label, taskStatusLabel(state.status) });
-        if (include_details and state.status == .failed and state.error_msg != null) {
-            try w.print(" error={s}", .{state.error_msg.?});
+        try w.print("#{d} {s} [{s}] task={s} outcome={s}", .{
+            task_id,
+            state.label,
+            taskStatusLabel(state.status),
+            state.task_summary,
+            taskOutcomeLabel(state),
+        });
+        if (include_details) {
+            const snippet = taskResultSnippet(state);
+            if (snippet.len > 0) {
+                try w.print(" detail={s}", .{snippet});
+            }
         }
         try w.writeAll("\n");
     }
@@ -2143,7 +2242,7 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
         return try out.toOwnedSlice(self.allocator);
     }
 
-    try w.print("Totals: running={d}, completed={d}, failed={d}", .{ running, completed, failed });
+    try w.print("Totals: queued={d}, running={d}, completed={d}, failed={d}", .{ queued, running, completed, failed });
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2159,7 +2258,8 @@ fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8) ![]cons
     const turn_ctx = message_tool.MessageTool.getTurnContext();
     const origin_channel = turn_ctx.channel orelse "agent";
     const origin_chat = turn_ctx.chat_id orelse self.memory_session_id orelse "agent";
-    const task_id = manager.spawn(trimmed_task, label, origin_channel, origin_chat) catch |err| {
+    const request_session_key = self.memory_session_id orelse origin_chat;
+    const task_id = manager.spawn(trimmed_task, label, request_session_key, origin_channel, origin_chat) catch |err| {
         return switch (err) {
             error.TooManyConcurrentSubagents => try self.allocator.dupe(u8, "Too many concurrent subagents. Wait for a task to finish."),
             else => try std.fmt.allocPrint(self.allocator, "Failed to spawn subagent: {s}", .{@errorName(err)}),
@@ -2168,14 +2268,18 @@ fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8) ![]cons
 
     return try std.fmt.allocPrint(
         self.allocator,
-        "Spawned subagent task #{d} ({s}).",
-        .{ task_id, label },
+        "Spawned subagent task #{d} ({s}) state=queued task={s}.",
+        .{ task_id, label, trimmed_task },
     );
 }
 
 test "spawnSubagentTask routes to current turn channel and chat" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
     var cfg = config_module.Config{
-        .workspace_dir = "/tmp/yc",
+        .workspace_dir = workspace,
         .config_path = "/tmp/yc/config.json",
         .allocator = std.testing.allocator,
     };
@@ -2210,12 +2314,16 @@ test "spawnSubagentTask routes to current turn channel and chat" {
     const state = manager.tasks.get(1) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("telegram", state.origin_channel.?);
     try std.testing.expectEqualStrings("tg-chat-123", state.origin_chat_id.?);
-    try std.testing.expectEqualStrings("tg-chat-123", state.session_key.?);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:1:main", state.session_key.?);
 }
 
 test "spawnSubagentTask falls back to agent channel and current session key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
     var cfg = config_module.Config{
-        .workspace_dir = "/tmp/yc",
+        .workspace_dir = workspace,
         .config_path = "/tmp/yc/config.json",
         .allocator = std.testing.allocator,
     };
@@ -2247,6 +2355,79 @@ test "spawnSubagentTask falls back to agent channel and current session key" {
     try std.testing.expectEqualStrings("agent", state.origin_channel.?);
     try std.testing.expectEqualStrings("agent:zaki-bot:user:88:main", state.origin_chat_id.?);
     try std.testing.expectEqualStrings("agent:zaki-bot:user:88:main", state.session_key.?);
+}
+
+test "formatSubagentList shows task summary and outcome" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var cfg = config_module.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    const state = try std.testing.allocator.create(subagent_mod.TaskState);
+    state.* = .{
+        .status = .completed,
+        .label = try std.testing.allocator.dupe(u8, "subagent"),
+        .task_summary = try std.testing.allocator.dupe(u8, "inspect routing"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "inspect routing"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:1:main"),
+        .result = try std.testing.allocator.dupe(u8, "routing ok"),
+        .started_at = std.time.milliTimestamp(),
+        .completed_at = std.time.milliTimestamp(),
+    };
+    try manager.tasks.put(std.testing.allocator, 7, state);
+
+    var spawn_tool = spawn_tool_mod.SpawnTool{ .manager = &manager };
+    const tools = [_]Tool{spawn_tool.tool()};
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        memory_session_id: ?[]const u8,
+        tools: []const Tool,
+    }{
+        .allocator = std.testing.allocator,
+        .memory_session_id = "agent:zaki-bot:user:1:main",
+        .tools = &tools,
+    };
+
+    const text = try formatSubagentList(&dummy, true);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "task=inspect routing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "outcome=result_ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "detail=routing ok") != null);
+}
+
+test "freeSubagentTaskState frees task prompt and runtime session key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var cfg = config_module.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    const state = try std.testing.allocator.create(subagent_mod.TaskState);
+    state.* = .{
+        .status = .completed,
+        .label = try std.testing.allocator.dupe(u8, "cleanup"),
+        .task_summary = try std.testing.allocator.dupe(u8, "cleanup summary"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "cleanup prompt"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:1:main"),
+        .runtime_session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:1:task:7"),
+        .started_at = std.time.milliTimestamp(),
+        .completed_at = std.time.milliTimestamp(),
+    };
+
+    freeSubagentTaskState(&manager, state);
 }
 
 fn handleAgentsCommand(self: anytype) ![]const u8 {
@@ -2385,28 +2566,35 @@ fn handleSubagentsCommand(self: anytype, arg: []const u8) ![]const u8 {
         if (state.status == .running) {
             return try std.fmt.allocPrint(
                 self.allocator,
-                "Task #{d}: {s} [{s}]",
-                .{ task_id, state.label, taskStatusLabel(state.status) },
+                "Task #{d}: {s} [{s}]\nTask: {s}\nOutcome: {s}",
+                .{ task_id, state.label, taskStatusLabel(state.status), state.task_summary, taskOutcomeLabel(state) },
+            );
+        }
+        if (state.status == .queued) {
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Task #{d}: {s} [{s}]\nTask: {s}\nOutcome: {s}",
+                .{ task_id, state.label, taskStatusLabel(state.status), state.task_summary, taskOutcomeLabel(state) },
             );
         }
         if (state.error_msg) |err_msg| {
             return try std.fmt.allocPrint(
                 self.allocator,
-                "Task #{d}: {s} [{s}]\nError: {s}",
-                .{ task_id, state.label, taskStatusLabel(state.status), err_msg },
+                "Task #{d}: {s} [{s}]\nTask: {s}\nOutcome: {s}\nError: {s}",
+                .{ task_id, state.label, taskStatusLabel(state.status), state.task_summary, taskOutcomeLabel(state), err_msg },
             );
         }
         if (state.result) |result| {
             return try std.fmt.allocPrint(
                 self.allocator,
-                "Task #{d}: {s} [{s}]\nResult:\n{s}",
-                .{ task_id, state.label, taskStatusLabel(state.status), result },
+                "Task #{d}: {s} [{s}]\nTask: {s}\nOutcome: {s}\nResult:\n{s}",
+                .{ task_id, state.label, taskStatusLabel(state.status), state.task_summary, taskOutcomeLabel(state), result },
             );
         }
         return try std.fmt.allocPrint(
             self.allocator,
-            "Task #{d}: {s} [{s}]",
-            .{ task_id, state.label, taskStatusLabel(state.status) },
+            "Task #{d}: {s} [{s}]\nTask: {s}\nOutcome: {s}",
+            .{ task_id, state.label, taskStatusLabel(state.status), state.task_summary, taskOutcomeLabel(state) },
         );
     }
     if (std.ascii.eqlIgnoreCase(action, "kill")) {
@@ -2471,6 +2659,7 @@ fn handlePollCommand(self: anytype) ![]const u8 {
         var running: u32 = 0;
         var completed: u32 = 0;
         var failed: u32 = 0;
+        var queued: u32 = 0;
         var visible: u32 = 0;
 
         var it = manager.tasks.iterator();
@@ -2479,6 +2668,7 @@ fn handlePollCommand(self: anytype) ![]const u8 {
             if (!taskBelongsToCurrentSession(self, state)) continue;
             visible += 1;
             switch (state.status) {
+                .queued => queued += 1,
                 .running => running += 1,
                 .completed => completed += 1,
                 .failed => failed += 1,
@@ -2487,8 +2677,8 @@ fn handlePollCommand(self: anytype) ![]const u8 {
         if (visible > 0) {
             wrote_any = true;
             try w.print(
-                "Subagent tasks: running={d}, completed={d}, failed={d}\n",
-                .{ running, completed, failed },
+                "Subagent tasks: queued={d}, running={d}, completed={d}, failed={d}\n",
+                .{ queued, running, completed, failed },
             );
         }
     }
