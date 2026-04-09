@@ -1,0 +1,30 @@
+{
+  "version": "1.0.0",
+  "project_name": "nullalis-sota",
+  "milestone": "v1.0-sota",
+  "execution": {
+    "mode": "interactive",
+    "granularity": "standard"
+  },
+  "models": {
+    "profile": "quality"
+  },
+  "workflow": {
+    "research": true,
+    "plan_check": true,
+    "verifier": true,
+    "auto_advance": false,
+    "discuss_mode": "assumptions"
+  },
+  "parallelization": {
+    "enabled": true
+  },
+  "git": {
+    "branching": "phase",
+    "branch_template": "feat/sota-phase-{phase}"
+  },
+  "build": {
+    "test_command": "zig build test --summary all",
+    "release_command": "zig build -Doptimize=ReleaseSmall"
+  }
+}
