@@ -1,7 +1,8 @@
 # Agent Lifecycle Specification
 
 > Task and session lifecycle contract for the nullalis agent runtime.
-> Baseline: 2026-04-09 (Phase 00-02).
+> Applies to: all deployment targets (hosted, desktop, extension, embedded).
+> Baseline: 2026-04-09 (Phase 00-02). Revised 2026-04-09.
 > Supersedes: frozen continuity contract (2026-04-08) — memory lifecycle
 > content moved to Section 10.
 
@@ -11,8 +12,8 @@ Defined in `src/subagent.zig` `TaskStatus` enum:
 
 | State | Ordinal | Description | Terminal |
 |---|---|---|---|
-| `queued` | 0 | Task created, waiting for thread slot | No |
-| `running` | 1 | Thread spawned, agent loop executing | No |
+| `queued` | 0 | Task created, waiting for worker thread to mark it running | No |
+| `running` | 1 | Worker thread called `markTaskRunning`, agent loop executing | No |
 | `completed` | 2 | Agent loop finished successfully | Yes |
 | `failed` | 3 | Agent loop errored or process restarted | Yes |
 
@@ -35,7 +36,7 @@ Defined in `src/subagent.zig` `TaskState` struct:
 | `task_summary` | `[]const u8` | Short summary of the task |
 | `task_prompt` | `[]const u8` | Full prompt sent to the subagent |
 | `session_key` | `?[]const u8` | Requester's session key (for result routing) |
-| `runtime_session_key` | `?[]const u8` | Derived runtime session for the subagent (e.g., `agent:zaki-bot:user:42:task:7`) |
+| `runtime_session_key` | `?[]const u8` | Derived runtime session for the subagent (canonical: `agent:zaki-bot:user:42:task:7`, fallback: `subagent:<id>`) |
 | `origin_channel` | `?[]const u8` | Channel that originated the task |
 | `origin_chat_id` | `?[]const u8` | Chat ID in the originating channel |
 | `result` | `?[]const u8` | Task result text (set on completion) |
@@ -105,7 +106,7 @@ When the event bus is not wired (e.g., subagent isolation), the result is stored
 
 | Transition | Trigger | Code Location |
 |---|---|---|
-| `queued -> running` | `std.Thread.spawn` succeeds | `SubagentManager.spawn()` |
+| `queued -> running` | Worker thread calls `markTaskRunning()` | `subagentThreadFn` (line 618) |
 | `running -> completed` | Agent loop returns result | `subagentThreadFn` -> `completeTask` |
 | `running -> failed` | Agent loop returns error | `subagentThreadFn` -> `completeTask` (error path) |
 | `queued -> failed` | Thread spawn fails (OOM, too many threads) | `SubagentManager.spawn()` error path |
@@ -137,18 +138,18 @@ A **task** is the unit of work. A **subagent** is the execution context:
 - Subagents do **not** have the event bus wired, so they cannot emit proactive messages directly.
 - Results are routed back to the caller via the parent's event bus.
 
-Session key derivation:
+Session key derivation (`deriveTaskRuntimeSessionKey`):
 - Canonical requester (e.g., `agent:zaki-bot:user:42:main`) -> runtime key: `agent:zaki-bot:user:42:task:<id>`
-- Non-canonical requester -> runtime key: `<session_key>:task:<id>`
+- Non-canonical requester (no parseable user ID) -> runtime key: `subagent:<id>`
 
 ## 7. Relationship: Tasks and Cron Jobs
 
-- Cron jobs use session keys with the `cron:<id>` lane pattern.
+- Cron jobs use session keys with the `cron:<id>` lane pattern (e.g., `agent:zaki-bot:user:42:cron:morning`).
 - Cron-triggered tasks follow the same lifecycle as user-triggered tasks.
-- The cron scheduler invokes the agent via the same gateway `/api/v1/chat/stream` path.
-- Cron tasks are subject to the same concurrency limits as user tasks.
+- Cron execution is **daemon/runtime-driven** via `CronScheduler.setAgentRunner` — it does **not** go through the gateway `/api/v1/chat/stream` path. The gateway only exposes CRUD endpoints for cron job management.
+- Cron results are delivered to channels via the outbound bus.
 
-Source: `src/gateway.zig` cron endpoints at `/api/v1/users/{user_id}/cron`.
+Source: `src/cron.zig` `CronScheduler`, `src/gateway.zig` cron CRUD at `/api/v1/users/{user_id}/cron`.
 
 ## 8. Task Persistence
 
