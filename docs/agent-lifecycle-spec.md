@@ -1,360 +1,214 @@
-# Agent Lifecycle Spec
+# Agent Lifecycle Specification
+
+> Task and session lifecycle contract for the nullalis agent runtime.
+> Baseline: 2026-04-09 (Phase 00-02).
+> Supersedes: frozen continuity contract (2026-04-08) — memory lifecycle
+> content moved to Section 10.
+
+## 1. Task States
+
+Defined in `src/subagent.zig` `TaskStatus` enum:
+
+| State | Ordinal | Description | Terminal |
+|---|---|---|---|
+| `queued` | 0 | Task created, waiting for thread slot | No |
+| `running` | 1 | Thread spawned, agent loop executing | No |
+| `completed` | 2 | Agent loop finished successfully | Yes |
+| `failed` | 3 | Agent loop errored or process restarted | Yes |
+
+### Planned States (SOTA)
+
+| State | Description | Sprint |
+|---|---|---|
+| `timed_out` | Task exceeded configured timeout | 2B |
+| `cancelled` | Operator cancelled via `/kill` or API | 2B |
+| `lost` | Process crashed, recovered from ledger | 2B |
+
+## 2. Task Record Fields
+
+Defined in `src/subagent.zig` `TaskState` struct:
+
+| Field | Type | Description |
+|---|---|---|
+| `status` | `TaskStatus` | Current lifecycle state |
+| `label` | `[]const u8` | Human-readable task label (e.g., "summarize this") |
+| `task_summary` | `[]const u8` | Short summary of the task |
+| `task_prompt` | `[]const u8` | Full prompt sent to the subagent |
+| `session_key` | `?[]const u8` | Requester's session key (for result routing) |
+| `runtime_session_key` | `?[]const u8` | Derived runtime session for the subagent (e.g., `agent:zaki-bot:user:42:task:7`) |
+| `origin_channel` | `?[]const u8` | Channel that originated the task |
+| `origin_chat_id` | `?[]const u8` | Chat ID in the originating channel |
+| `result` | `?[]const u8` | Task result text (set on completion) |
+| `error_msg` | `?[]const u8` | Error message (set on failure) |
+| `started_at` | `i64` | Millisecond timestamp when task was created |
+| `completed_at` | `?i64` | Millisecond timestamp when task completed/failed |
+| `thread` | `?std.Thread` | OS thread handle (null after join) |
+
+### Planned Fields (SOTA)
+
+| Field | Type | Sprint |
+|---|---|---|
+| `timeout_at` | `?i64` | Timeout deadline (2B) |
+| `progress_pct` | `?u8` | Progress percentage 0-100 (2B) |
+| `parent_task_id` | `?u64` | For nested subagent chains (5A) |
+| `cost_tokens` | `?u64` | Token cost tracking (4B) |
+
+## 3. Delivery Modes
+
+How task results reach the requester:
+
+| Mode | Description | Current |
+|---|---|---|
+| **Direct (to channel)** | Result routed as `InboundMessage` via event bus to the originating channel and chat | Yes |
+| **Session-queued** | Result stored in task state, polled via `/subagents` or `/agents` command | Yes |
+| **SSE event** | `subagent_completion` SSE event pushed to connected stream clients | Yes |
+| **Replay** | Completed task results replayed on session reconnect | Planned (2B) |
+
+### Direct Delivery Flow
+
+```
+SubagentManager.completeTask()
+  -> state.status = .completed
+  -> state.result = agent_output
+  -> event_bus.publish(InboundMessage{
+      channel: origin_channel,
+      chat_id: origin_chat_id,
+      session_key: session_key,
+      content: "completed: {label}\n{result}"
+    })
+```
+
+Source: `src/subagent.zig` `completeTask` method.
+
+### Fallback (No Event Bus)
+
+When the event bus is not wired (e.g., subagent isolation), the result is stored locally in `TaskState.result` and can be retrieved via `getTaskResult(task_id)`.
+
+## 4. Lifecycle Transitions
+
+```
+                    +-------------+
+                    |   queued    |
+                    +------+------+
+                           | thread spawned
+                    +------v------+
+                    |   running   |
+                    +------+------+
+                     +-----+-----+
+              success|           |error
+            +--------v---+  +----v------+
+            | completed  |  |  failed   |
+            +------------+  +-----------+
+```
 
-Status: frozen continuity contract
-Date: 2026-04-08
-Scope: nullalis continuity artifacts and normal prompt-loading behavior
+### Triggers
 
-## Goal
+| Transition | Trigger | Code Location |
+|---|---|---|
+| `queued -> running` | `std.Thread.spawn` succeeds | `SubagentManager.spawn()` |
+| `running -> completed` | Agent loop returns result | `subagentThreadFn` -> `completeTask` |
+| `running -> failed` | Agent loop returns error | `subagentThreadFn` -> `completeTask` (error path) |
+| `queued -> failed` | Thread spawn fails (OOM, too many threads) | `SubagentManager.spawn()` error path |
+| *(recovery)* `running -> failed` | Process restarts, in-flight task found in ledger | `recoverFromLedger` |
 
-Freeze the current continuity contract so lifecycle complexity does not expand without explicit evidence.
+### Planned Transitions (SOTA)
 
-This document records the behavior that is now considered intentional:
-- `summary_latest/<session>` is the canonical continuity object
-- `timeline_summary/<session>/<timestamp>` is the append-only historical record
-- `session_summary/...` is compatibility-only for audit/debug access and is not part of normal prompt loading
-- normal lifecycle writes should not duplicate rich continuity artifacts beyond those roles
+| Transition | Trigger | Sprint |
+|---|---|---|
+| `running -> timed_out` | Wall-clock exceeds `timeout_at` | 2B |
+| `running -> cancelled` | Operator sends `/kill <task_id>` | 2B |
+| `running -> lost` | Process crash detected on recovery | 2B |
 
-## Memory Layers
+## 5. Concurrency Control
 
-### Hot Memory
+- **Max concurrent**: `SubagentConfig.max_concurrent` (default: **4**)
+- **Max iterations per subagent**: `SubagentConfig.max_iterations` (default: **15**)
+- **Enforcement**: `spawn()` returns `error.TooManyConcurrentSubagents` when limit reached
+- **Thread stack**: 512 KB per subagent thread
+- **Running count**: `getRunningCount()` tracks live threads via mutex-protected task map
 
-Definition:
-- current in-RAM session cache
-- recent transcript tail still carried directly in the agent history
+## 6. Relationship: Tasks and Subagents
 
-Purpose:
-- primary continuity source during active conversation
-- lowest-latency context source
+A **task** is the unit of work. A **subagent** is the execution context:
 
-Contains:
-- recent user turns
-- recent assistant turns
-- current session-local working state
+- Each task spawns exactly one subagent (1:1).
+- The subagent runs a full `ChannelRuntime` agent loop in an isolated session.
+- Subagents have a **restricted tool profile**: `spawn`, `delegate`, and `message` tools are excluded to prevent recursive spawning.
+- Subagents do **not** have the event bus wired, so they cannot emit proactive messages directly.
+- Results are routed back to the caller via the parent's event bus.
 
-Must not contain:
-- long historical transcript once compaction has run
-- duplicated warm or cold artifacts
+Session key derivation:
+- Canonical requester (e.g., `agent:zaki-bot:user:42:main`) -> runtime key: `agent:zaki-bot:user:42:task:<id>`
+- Non-canonical requester -> runtime key: `<session_key>:task:<id>`
 
-### Warm Memory
+## 7. Relationship: Tasks and Cron Jobs
 
-Definition:
-- small continuity layer used to resume or bridge a session
+- Cron jobs use session keys with the `cron:<id>` lane pattern.
+- Cron-triggered tasks follow the same lifecycle as user-triggered tasks.
+- The cron scheduler invokes the agent via the same gateway `/api/v1/chat/stream` path.
+- Cron tasks are subject to the same concurrency limits as user tasks.
 
-Purpose:
-- preserve the meaning of older context after compaction
-- allow session restart without replaying the whole transcript
+Source: `src/gateway.zig` cron endpoints at `/api/v1/users/{user_id}/cron`.
 
-Contains:
-- `summary_latest/<session>`
-- bounded related `timeline_summary/<session>/<timestamp>` fallback
-- compact anchor/index metadata
-- selected nearby semantic hits
+## 8. Task Persistence
 
-Must not contain:
-- raw checkpoints as normal prompt content
-- duplicated full summary copies
-- verbose bookkeeping blobs
+- **Ledger file**: `subagent_tasks.jsonl` (constant: `TASK_LEDGER_FILE_NAME`)
+- **Recovery**: On startup, `recoverFromLedger` scans for in-flight tasks and marks them as failed with reason `"process_restarted_before_completion"`.
+- **Format**: One JSON line per task state change (append-only).
 
-### Cold Memory
+## 9. Source References
 
-Definition:
-- durable facts and broader semantic recall
+- Task types: `src/subagent.zig` lines 24-53
+- SubagentManager: `src/subagent.zig` line 69+
+- Thread spawn: `src/subagent.zig` `spawn()` method
+- Completion routing: `src/subagent.zig` `completeTask()` method
+- Recovery: `src/subagent.zig` `recoverFromLedger()`
+- Commands: `src/agent/commands.zig` `/subagents`, `/agents`, `/kill`, `/tell`
+- Characterization tests: `src/subagent.zig` baseline tests
 
-Purpose:
-- support on-demand retrieval outside the immediate session working set
+## 10. Memory Lifecycle (Frozen Contract)
 
-Contains:
-- `durable_fact/...`
-- curated long-lived memory
-- global semantic recall results
+> Preserved from the frozen continuity contract (2026-04-08).
+> This section documents the memory/continuity lifecycle, which is
+> separate from the task lifecycle above.
 
-Loaded:
-- on demand
-- or in a small bounded way when obviously relevant
+### Memory Layers
 
-## Artifact Contract
+**Hot Memory**: Current in-RAM session cache and recent transcript tail. Primary continuity source during active conversation.
 
-### `summary_latest/<session>`
+**Warm Memory**: Small continuity layer for session resume/bridging. Contains `summary_latest/<session>`, bounded `timeline_summary` fallback, compact anchor metadata.
 
-Role:
-- canonical current continuity object for a session
+**Cold Memory**: Durable facts and broader semantic recall. Contains `durable_fact/...`, loaded on demand.
 
-Should be:
-- compact
-- high signal
-- safe to inject every turn
+### Canonical Artifacts
 
-### `timeline_summary/<session>/<timestamp>`
+| Artifact | Role |
+|---|---|
+| `summary_latest/<session>` | Canonical current continuity object |
+| `timeline_summary/<session>/<ts>` | Append-only historical continuity record |
+| `durable_fact/...` | Cross-session long-lived facts |
+| `context_anchor_current` | Routing/recency pointer only |
+| `session_checkpoint_*` | Audit/debug/recovery artifact |
+| `session_summary/...` | Compatibility-only, not in normal prompt path |
 
-Role:
-- append-only historical continuity record
+### Stage Contract
 
-Should be:
-- generated when compaction or session finalization produces a quality summary
-- available for bounded fallback and audit
+- **turn_start**: Assemble prompt from hot cache + warm continuity + relevant cold recall. No writes.
+- **turn_end**: Persist transcript, update hot cache, mark continuity freshness. No prompt injection.
+- **compaction**: Reduce hot cache, produce quality warm summary. Write `timeline_summary`, `summary_latest`, optionally `durable_fact`.
+- **idle_prepare**: Ensure continuity is fresh before session teardown.
+- **shutdown_finalize**: Finalize only what is missing, free memory.
 
-### `durable_fact/...`
+### Continuity Refresh Rules
 
-Role:
-- cross-session, long-lived facts
+Should happen: after compaction, after materially different turns with stale summary, during idle preparation.
 
-Should be:
-- sparse
-- high confidence
-- injected only when relevant
+Should NOT happen: on every turn, during shutdown as first-time generation, on unrelated user requests.
 
-### `context_anchor_current`
+### Code References
 
-Role:
-- routing and recency pointer only
-
-Should contain only:
-- session id
-- source summary key
-- timestamp
-- channel/lane metadata
-
-Should not be treated as normal prompt memory.
-
-### `session_checkpoint_*`
-
-Role:
-- audit/debug/recovery artifact
-
-Should contain:
-- recent snippets
-- reason
-- counts
-
-Should not be injected into normal prompts except as explicit fallback/debug behavior.
-
-### `session_summary/...`
-
-Role:
-- audit-only compatibility artifact
-
-Reason:
-- retained only so historical data remains readable and protected
-- not written by the normal lifecycle path
-- not injected into normal prompts
-
-## Stage Contract
-
-## `turn_start`
-
-Inputs:
-- active session key
-- current user message
-- hot session cache if still resident
-- warm continuity objects for the session
-- relevant cold recall if needed
-
-Outputs:
-- assembled prompt context for this turn
-
-Allowed writes:
-- none required
-
-Allowed prompt injections:
-- hot session cache tail
-- `summary_latest/<session>`
-- bounded related `timeline_summary/...`
-- relevant `durable_fact/...`
-
-Forbidden behaviors:
-- generating rich lifecycle summaries
-- request-path session teardown
-- request-path tenant runtime pruning that blocks the turn
-- injecting raw checkpoints as standard context
-
-## `turn_end`
-
-Inputs:
-- completed assistant reply
-- updated hot session history
-
-Outputs:
-- persisted transcript
-- updated hot cache
-- "continuity dirty" marker if needed
-
-Allowed writes:
-- transcript/session-store persistence
-- lightweight state needed to mark continuity freshness or staleness
-
-Allowed prompt injections:
-- none; this is a post-response stage
-
-Forbidden behaviors:
-- expensive provider-backed shutdown summary generation
-- broad session teardown
-
-## `compaction`
-
-Trigger:
-- hot session cache approaches context/token limit
-
-Inputs:
-- active session history
-- token budget pressure
-
-Outputs:
-- reduced hot cache
-- recent tail preserved
-- quality warm continuity summary
-
-Allowed writes:
-- `timeline_summary/<session>/<timestamp>`
-- `summary_latest/<session>`
-- `durable_fact/...` if extraction quality is high
-- compact `context_anchor_current`
-- optional `session_checkpoint_*` for audit/debug
-
-Allowed prompt injections on later turns:
-- `summary_latest/<session>`
-- bounded related summaries/facts
-
-Forbidden behaviors:
-- leaving old raw hot context fully resident after successful compaction
-- writing low-signal summary placeholders over a better latest summary
-- duplicating multiple rich summary artifacts for the same event unless justified
-
-## `idle_prepare`
-
-Trigger:
-- session has been inactive for the idle preparation window
-
-Purpose:
-- ensure continuity is fresh before session teardown
-
-Inputs:
-- current hot session cache
-- current warm continuity freshness
-
-Outputs:
-- fresh continuity state
-- session ready for cheap teardown
-
-Allowed writes:
-- missing or stale `summary_latest/<session>`
-- matching `timeline_summary/...`
-- compact anchor update
-- optional checkpoint if summary refresh fails
-
-Forbidden behaviors:
-- blocking a future user request with this work
-- rebuilding the whole runtime inline on another user's turn
-
-## `shutdown_finalize`
-
-Trigger:
-- session eviction
-- runtime teardown
-- process shutdown
-
-Purpose:
-- finalize only what is still missing
-
-Inputs:
-- hot session cache
-- continuity freshness state
-
-Outputs:
-- safe handoff to warm continuity
-- freed session/runtime memory
-
-Allowed writes:
-- compact anchor update
-- optional checkpoint if no fresh summary exists
-- final summary only if absolutely necessary and not on a user-critical path
-
-Forbidden behaviors:
-- default provider-backed summary generation on the next request path
-- heavy teardown work that blocks the next session startup
-
-## Trigger Rules
-
-### When continuity refresh should happen
-
-Continuity refresh should happen:
-1. after compaction
-2. after a turn if the session became materially different and no fresh summary exists
-3. during idle preparation before teardown
-
-Continuity refresh should not happen:
-1. on every turn by default
-2. as the first time continuity is produced during shutdown
-3. on the next unrelated user request
-
-## Frozen Contract
-
-### Normal writes
-
-The current normal lifecycle may write:
-- `session_checkpoint_*` as the readable audit/debug checkpoint
-- `timeline_summary/<session>/<timestamp>` as append-only history
-- `summary_latest/<session>` as the canonical continuity object
-- `durable_fact/...` when extracted from a parsed canonical summary
-- `context_anchor_current` as compact recency/routing metadata
-
-The current normal lifecycle must not write:
-- `session_summary/...`
-
-### Normal prompt loading
-
-The normal prompt path may inject:
-- hot session tail
-- `summary_latest/<session>`
-- bounded related `timeline_summary/...`
-- relevant `durable_fact/...`
-
-The normal prompt path must not inject:
-- `session_summary/...`
-- `session_checkpoint_*`
-- rich `context_anchor_current`
-
-### Canonical overwrite rule
-
-`summary_latest/<session>` uses a simple frozen quality gate:
-- canonical summaries may replace existing latest state
-- fallback summaries may only replace missing or fallback latest state
-- legacy latest entries without `quality_tier=` are treated as canonical
-
-This is intentionally a small deterministic rule, not a ranking system.
-
-## Code Truth References
-
-- compaction-triggered continuity refresh:
-  - `src/agent/root.zig`
-  - `refreshDurableContinuityAfterCompaction`
-
-- summary seed when no latest exists:
-  - `src/agent/root.zig`
-  - `ensureDurableContinuitySeed`
-
-- lifecycle summary behavior:
-  - `src/agent/commands.zig`
-  - `shouldUseDeterministicSessionSummary`
-  - `persistSessionSemanticSummary`
-  - `persistSessionCheckpointDetailed`
-
-- shutdown flush:
-  - `src/session.zig`
-  - `SessionManager.deinit`
-  - `flushSessionsForShutdown`
-
-- runtime pruning on request path:
-  - `src/gateway.zig`
-  - `pruneTenantRuntimeCache`
-  - `getTenantRuntime`
-
-## Intentionally Left Alone
-
-This frozen contract does not change or refine:
-- anchor redesign
-- richer summary scoring or ranking
-- new memory artifact types
-- migration or deletion of historical `session_summary/...` data
-- broader gateway or idle-preparation redesign
-
-Any future expansion beyond this contract should be evidence-driven and explicit.
+- Compaction continuity: `src/agent/root.zig` `refreshDurableContinuityAfterCompaction`
+- Summary seed: `src/agent/root.zig` `ensureDurableContinuitySeed`
+- Lifecycle summary: `src/agent/commands.zig` `persistSessionSemanticSummary`, `persistSessionCheckpointDetailed`
+- Shutdown flush: `src/session.zig` `SessionManager.deinit`, `flushSessionsForShutdown`
+- Runtime pruning: `src/gateway.zig` `pruneTenantRuntimeCache`, `getTenantRuntime`

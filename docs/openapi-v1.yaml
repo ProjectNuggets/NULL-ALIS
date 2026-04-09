@@ -12,6 +12,12 @@ info:
     - `/api/v1/chat/stream` requires an explicit `session_key` by default.
     - `/webhook` auth is pairing-token based (Bearer), depending on pairing guard state.
     - Channel webhooks are unauthenticated at the internal-token layer; each route enforces its channel-specific verification/signature rules when configured.
+
+    SOTA contract status (2026-04-09):
+    - All existing endpoints below are STABLE and must not break.
+    - TODO: Planned endpoint additions are documented at the end of the paths section.
+    - TODO: SSE event extensions are documented in docs/online-agent-contract.md.
+    - TODO: Task lifecycle extensions are documented in docs/agent-lifecycle-spec.md.
 servers:
   - url: http://127.0.0.1:3000
     description: Local gateway
@@ -24,6 +30,7 @@ tags:
   - name: webhook
 
 paths:
+  # ── Stable endpoints (do not break) ───────────────────────────────
   /health:
     get:
       tags: [ops]
@@ -1250,6 +1257,53 @@ paths:
                 additionalProperties: true
         "502":
           description: Telegram API rejected disconnect operation
+
+  # ── TODO: Planned endpoint additions (SOTA program) ──────────────
+  #
+  # The following endpoints are planned but not yet implemented.
+  # They are documented here so the API surface is visible to frontend
+  # and integration developers before implementation begins.
+  #
+  # TODO [Sprint 2A]: POST /api/v1/chat/stream — extend SSE events
+  #   - Add tool_start, tool_result events to the SSE stream
+  #   - See docs/online-agent-contract.md for event schemas
+  #
+  # TODO [Sprint 2B]: GET /api/v1/users/{user_id}/tasks
+  #   - List subagent tasks for a user (with status filter)
+  #   - Response: array of TaskRecord objects
+  #
+  # TODO [Sprint 2B]: GET /api/v1/users/{user_id}/tasks/{task_id}
+  #   - Get single task details including result
+  #   - Response: TaskRecord with full result
+  #
+  # TODO [Sprint 2B]: POST /api/v1/users/{user_id}/tasks/{task_id}/stop
+  #   - Cancel a running subagent task
+  #   - Response: updated TaskRecord with status=cancelled
+  #
+  # TODO [Sprint 3A]: POST /api/v1/users/{user_id}/approvals/{tool_id}
+  #   - Approve or deny a pending tool execution
+  #   - Request: { approved: bool, reason?: string }
+  #
+  # TODO [Sprint 4A]: POST /api/v1/users/{user_id}/sessions/{session_key}/compact
+  #   - Trigger manual context compaction via API
+  #   - Response: compaction result with token counts
+  #
+  # TODO [Sprint 4A]: GET /api/v1/users/{user_id}/sessions/{session_key}/context
+  #   - Get context window status (tokens used/max, history length)
+  #   - Response: ContextSnapshot object
+  #
+  # TODO [Sprint 4A]: POST /api/v1/users/{user_id}/sessions/{session_key}/resume
+  #   - Resume a session from warm continuity
+  #   - Response: session state with continuity info
+  #
+  # TODO [Sprint 4A]: POST /api/v1/users/{user_id}/sessions/{session_key}/export
+  #   - Export session transcript
+  #   - Response: structured transcript with metadata
+  #
+  # TODO [Sprint 4B]: GET /api/v1/users/{user_id}/usage
+  #   - Get token usage and cost summary
+  #   - Response: UsageSummary with per-model breakdown
+  #
 
 components:
   parameters:
