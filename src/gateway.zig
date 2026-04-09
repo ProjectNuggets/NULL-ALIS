@@ -17137,3 +17137,119 @@ test "telegramReplyContainsMediaMarkers detects audio marker" {
     try std.testing.expect(telegramReplyContainsMediaMarkers("[AUDIO:/tmp/nullalis_tts_1.mp3]\nHello"));
     try std.testing.expect(!telegramReplyContainsMediaMarkers("Plain text reply"));
 }
+
+// ── Baseline characterization tests (Phase 00-01) ───────────────
+
+test "baseline: MAX_BODY_SIZE is 65536" {
+    try std.testing.expectEqual(@as(usize, 65_536), MAX_BODY_SIZE);
+}
+
+test "baseline: RATE_LIMIT_WINDOW_SECS is 60" {
+    try std.testing.expectEqual(@as(u64, 60), RATE_LIMIT_WINDOW_SECS);
+}
+
+test "baseline: RATE_LIMITER_SWEEP_INTERVAL_SECS is 300" {
+    try std.testing.expectEqual(@as(u64, 300), RATE_LIMITER_SWEEP_INTERVAL_SECS);
+}
+
+test "baseline: REQUEST_TIMEOUT_SECS is 30" {
+    try std.testing.expectEqual(@as(u64, 30), REQUEST_TIMEOUT_SECS);
+}
+
+test "baseline: SSE_TOKEN_CHUNK_SIZE is 96" {
+    try std.testing.expectEqual(@as(usize, 96), SSE_TOKEN_CHUNK_SIZE);
+}
+
+test "baseline: sseStatusFrame emits event:status with content" {
+    const frame = try sseStatusFrame(std.testing.allocator, "thinking");
+    defer std.testing.allocator.free(frame);
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: status\ndata: "));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"statusResponse\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"thinking\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, frame, "\n\n"));
+}
+
+test "baseline: sseReadyFrame emits event:ready with session key" {
+    const frame = try sseReadyFrame(std.testing.allocator, "agent:zaki-bot:user:1:main");
+    defer std.testing.allocator.free(frame);
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: ready\ndata: "));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "agent:zaki-bot:user:1:main") != null);
+}
+
+test "baseline: sseDoneFrame is always terminal with type:done" {
+    const frame_full = try sseDoneFrame(std.testing.allocator, "sess-1", 42);
+    defer std.testing.allocator.free(frame_full);
+    try std.testing.expect(std.mem.startsWith(u8, frame_full, "event: done\ndata: "));
+    try std.testing.expect(std.mem.indexOf(u8, frame_full, "\"type\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame_full, "\"session_id\":\"sess-1\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, frame_full, "\n\n"));
+
+    // Without optional fields
+    const frame_minimal = try sseDoneFrame(std.testing.allocator, null, null);
+    defer std.testing.allocator.free(frame_minimal);
+    try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "\"type\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "session_id") == null);
+}
+
+test "baseline: sseErrorFrame emits event:error with code and message" {
+    const frame = try sseErrorFrame(std.testing.allocator, "rate_limited", "Too many requests");
+    defer std.testing.allocator.free(frame);
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: error\ndata: "));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"rate_limited\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"Too many requests\"") != null);
+}
+
+test "baseline: sseSubagentCompletionFrame emits event:subagent_completion" {
+    const frame = try sseSubagentCompletionFrame(std.testing.allocator, "evt-1", "session:task:7", "task result here");
+    defer std.testing.allocator.free(frame);
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: subagent_completion\ndata: "));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"subagent_completion\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"evt-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"session:task:7\"") != null);
+}
+
+test "baseline: sseChatPayload emits reply_start then token(s) then done" {
+    const payload = try sseChatPayload(std.testing.allocator, "Hello world", "sess-42");
+    defer std.testing.allocator.free(payload);
+    // Must start with reply_start event
+    try std.testing.expect(std.mem.startsWith(u8, payload, "event: reply_start\n"));
+    // Must contain at least one token event
+    try std.testing.expect(std.mem.indexOf(u8, payload, "event: token\n") != null);
+    // Must end with done event
+    try std.testing.expect(std.mem.indexOf(u8, payload, "event: done\n") != null);
+    // reply_start must appear before done
+    const reply_pos = std.mem.indexOf(u8, payload, "event: reply_start\n").?;
+    const done_pos = std.mem.indexOf(u8, payload, "event: done\n").?;
+    try std.testing.expect(reply_pos < done_pos);
+}
+
+test "baseline: SlidingWindowRateLimiter tracks requests within window" {
+    var limiter = SlidingWindowRateLimiter{
+        .limit_per_window = 3,
+        .window_ns = @as(i128, RATE_LIMIT_WINDOW_SECS) * 1_000_000_000,
+        .entries = .{},
+        .last_sweep = std.time.nanoTimestamp(),
+    };
+    defer limiter.deinit(std.testing.allocator);
+
+    // First 3 requests should be allowed
+    try std.testing.expect(limiter.allow(std.testing.allocator, "test-ip"));
+    try std.testing.expect(limiter.allow(std.testing.allocator, "test-ip"));
+    try std.testing.expect(limiter.allow(std.testing.allocator, "test-ip"));
+    // 4th should be denied
+    try std.testing.expect(!limiter.allow(std.testing.allocator, "test-ip"));
+    // Different key should still be allowed
+    try std.testing.expect(limiter.allow(std.testing.allocator, "other-ip"));
+}
+
+test "baseline: IdempotencyStore deduplicates keys" {
+    var store = IdempotencyStore.init(300);
+    defer store.deinit(std.testing.allocator);
+    // First insert returns true (new)
+    try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-1"));
+    // Duplicate returns false
+    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-1"));
+    // Different key returns true
+    try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-2"));
+}

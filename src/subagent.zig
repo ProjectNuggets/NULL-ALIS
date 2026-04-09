@@ -1434,6 +1434,80 @@ test "SubagentManager spawn e2e completes and publishes bus message" {
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "completed: summarize this") != null);
 }
 
+// ── Baseline characterization tests (Phase 00-01) ───────────────
+
+test "baseline: SubagentConfig defaults max_iterations to 15" {
+    const cfg = SubagentConfig{};
+    try std.testing.expectEqual(@as(u32, 15), cfg.max_iterations);
+}
+
+test "baseline: SubagentConfig defaults max_concurrent to 4" {
+    const cfg = SubagentConfig{};
+    try std.testing.expectEqual(@as(u32, 4), cfg.max_concurrent);
+}
+
+test "baseline: TaskStatus has exactly 4 states" {
+    // Characterize the complete set of task states: queued, running, completed, failed
+    const info = @typeInfo(TaskStatus);
+    try std.testing.expectEqual(@as(usize, 4), info.@"enum".fields.len);
+    // Verify each state exists and has expected ordinal
+    try std.testing.expectEqual(@as(u2, 0), @intFromEnum(TaskStatus.queued));
+    try std.testing.expectEqual(@as(u2, 1), @intFromEnum(TaskStatus.running));
+    try std.testing.expectEqual(@as(u2, 2), @intFromEnum(TaskStatus.completed));
+    try std.testing.expectEqual(@as(u2, 3), @intFromEnum(TaskStatus.failed));
+}
+
+test "baseline: TaskState tracks required lifecycle fields" {
+    // Use @hasField instead of runtime iteration (comptime-safe in Zig 0.15).
+    try std.testing.expect(@hasField(TaskState, "status"));
+    try std.testing.expect(@hasField(TaskState, "label"));
+    try std.testing.expect(@hasField(TaskState, "session_key"));
+    try std.testing.expect(@hasField(TaskState, "runtime_session_key"));
+    try std.testing.expect(@hasField(TaskState, "result"));
+    try std.testing.expect(@hasField(TaskState, "started_at"));
+    try std.testing.expect(@hasField(TaskState, "completed_at"));
+}
+
+test "baseline: SubagentManager init respects custom config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{
+        .max_concurrent = 8,
+        .max_iterations = 30,
+    });
+    defer mgr.deinit();
+    try std.testing.expectEqual(@as(u32, 8), mgr.config.max_concurrent);
+    try std.testing.expectEqual(@as(u32, 30), mgr.config.max_iterations);
+    try std.testing.expectEqual(@as(u32, 0), mgr.getRunningCount());
+}
+
+test "baseline: SubagentManager getTaskStatus returns null for unknown task" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+    try std.testing.expect(mgr.getTaskStatus(99999) == null);
+    try std.testing.expect(mgr.getTaskResult(99999) == null);
+}
+
+test "baseline: TASK_LEDGER_FILE_NAME is subagent_tasks.jsonl" {
+    try std.testing.expectEqualStrings("subagent_tasks.jsonl", TASK_LEDGER_FILE_NAME);
+}
+
 test "SubagentManager spawn stress enforces live concurrency limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

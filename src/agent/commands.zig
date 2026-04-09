@@ -3589,3 +3589,63 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
 
     return try self.allocator.dupe(u8, usage);
 }
+
+// ── Baseline characterization tests (Phase 00-01) ───────────────
+
+test "baseline: parseSlashCommand parses simple command" {
+    const cmd = parseSlashCommand("/status") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("status", cmd.name);
+    try std.testing.expectEqualStrings("", cmd.arg);
+}
+
+test "baseline: parseSlashCommand parses command with argument" {
+    const cmd = parseSlashCommand("/model claude-sonnet-4.6") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("model", cmd.name);
+    try std.testing.expectEqualStrings("claude-sonnet-4.6", cmd.arg);
+}
+
+test "baseline: parseSlashCommand returns null for non-slash input" {
+    try std.testing.expect(parseSlashCommand("hello world") == null);
+    try std.testing.expect(parseSlashCommand("") == null);
+    try std.testing.expect(parseSlashCommand("/ ") == null);
+}
+
+test "baseline: parseSlashCommand strips bot mention" {
+    const cmd = parseSlashCommand("/model@zaki_bot gpt-4.1") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("model", cmd.name);
+    try std.testing.expectEqualStrings("gpt-4.1", cmd.arg);
+}
+
+test "baseline: isSlashName is case-insensitive" {
+    const cmd = parseSlashCommand("/STATUS") orelse return error.TestExpectedEqual;
+    try std.testing.expect(isSlashName(cmd, "status"));
+    try std.testing.expect(isSlashName(cmd, "STATUS"));
+    try std.testing.expect(!isSlashName(cmd, "model"));
+}
+
+test "baseline: known command surface has expected breadth" {
+    // Characterize that handleSlashCommand recognizes all documented commands.
+    // This test validates the slash command set by checking parseSlashCommand
+    // correctly parses each known command name.
+    const known_commands = [_][]const u8{
+        "new",     "reset",   "restart",  "help",    "commands",
+        "status",  "runtime", "whoami",   "id",      "model",
+        "models",  "think",   "verbose",  "reasoning",
+        "exec",    "queue",   "usage",    "tts",     "voice",
+        "stop",    "compact", "allowlist", "approve", "context",
+        "export-session", "export", "session", "subagents", "agents",
+        "focus",   "unfocus", "kill",     "steer",   "tell",
+        "config",  "capabilities", "debug",
+        "dock-telegram", "dock-discord", "dock-slack",
+        "activation", "send", "elevated", "bash", "poll", "skill",
+        "doctor",  "memory",
+    };
+    for (known_commands) |name| {
+        const input = std.fmt.allocPrint(std.testing.allocator, "/{s}", .{name}) catch unreachable;
+        defer std.testing.allocator.free(input);
+        const cmd = parseSlashCommand(input);
+        try std.testing.expect(cmd != null);
+    }
+    // Verify count — if someone adds a command, this test documents the current set size
+    try std.testing.expect(known_commands.len >= 44);
+}

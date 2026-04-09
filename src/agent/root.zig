@@ -6709,3 +6709,58 @@ test "tts_prepare_stage_emitted_when_mode_matches" {
     try std.testing.expectEqualStrings("stage check", response);
     try std.testing.expect(stage_observer.tts_stage_count > 0);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Baseline characterization tests (Phase 0 — SOTA program safety net)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "baseline: DEFAULT_MAX_TOOL_ITERATIONS is 25" {
+    try std.testing.expectEqual(@as(u32, 25), DEFAULT_MAX_TOOL_ITERATIONS);
+}
+
+test "baseline: DEFAULT_MAX_HISTORY is 50" {
+    try std.testing.expectEqual(@as(u32, 50), DEFAULT_MAX_HISTORY);
+}
+
+test "baseline: Agent struct has required execution control fields" {
+    // Verify the Agent struct contains the fields that the execution-mode
+    // and approval-modes sprints will extend. If these fields are renamed
+    // or removed, the SOTA program needs to know immediately.
+    // Use @hasField instead of runtime iteration (comptime-safe in Zig 0.15).
+    try std.testing.expect(@hasField(Agent, "max_tool_iterations"));
+    try std.testing.expect(@hasField(Agent, "max_history_messages"));
+    try std.testing.expect(@hasField(Agent, "parallel_tools"));
+    try std.testing.expect(@hasField(Agent, "model_name"));
+    try std.testing.expect(@hasField(Agent, "observer"));
+}
+
+test "baseline: context_tokens resolves known model windows" {
+    // Snapshot key model context windows so any model table change is visible.
+    const ct = @import("context_tokens.zig");
+    try std.testing.expectEqual(@as(?u64, 200_000), ct.lookupContextTokens("claude-sonnet-4.6"));
+    try std.testing.expectEqual(@as(?u64, 128_000), ct.lookupContextTokens("openai/gpt-4.1-mini"));
+}
+
+test "baseline: Agent deinit on minimal instance does not leak" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "baseline-test",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = DEFAULT_MAX_TOOL_ITERATIONS,
+        .max_history_messages = DEFAULT_MAX_HISTORY,
+        .auto_save = false,
+    };
+    defer agent.deinit();
+
+    // Verify defaults are applied correctly.
+    try std.testing.expectEqual(@as(u32, 25), agent.max_tool_iterations);
+    try std.testing.expectEqual(@as(u32, 50), agent.max_history_messages);
+}
