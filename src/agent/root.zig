@@ -1430,7 +1430,7 @@ pub const Agent = struct {
             var saw_stream_first_token = false;
             turn_llm_calls += 1;
 
-            // Call provider: streaming (no retries, no native tools) or blocking with retry
+            // Call provider: streaming or blocking. Reliable wrappers may retry/fallback internally.
             var response: ChatResponse = undefined;
             if (is_streaming) {
                 var stream_timing_ctx = StreamTimingContext{
@@ -3607,17 +3607,11 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
 
     const session_entries = try mem.list(allocator, .conversation, "agent:zaki-bot:user:1:main");
     defer memory_mod.freeEntries(allocator, session_entries);
-    var found_session_summary = false;
     for (session_entries) |entry| {
-        if (!std.mem.startsWith(u8, entry.key, "session_summary/agent:zaki-bot:user:1:main/")) continue;
-        found_session_summary = true;
-        try std.testing.expect(std.mem.indexOf(u8, entry.content, "focus:") != null);
-        try std.testing.expect(std.mem.indexOf(u8, entry.content, "decisions:") != null);
-        try std.testing.expect(std.mem.indexOf(u8, entry.content, "open_loops:") != null);
-        try std.testing.expect(std.mem.indexOf(u8, entry.content, "next:") != null);
-        break;
+        if (std.mem.startsWith(u8, entry.key, "session_summary/agent:zaki-bot:user:1:main/")) {
+            return error.TestUnexpectedResult;
+        }
     }
-    try std.testing.expect(found_session_summary);
 
     var found_timeline_summary = false;
     for (daily_entries) |entry| {
@@ -3965,6 +3959,107 @@ test "persistSessionCheckpoint summary_seed auto uses deterministic summary with
     defer anchor.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=summary_seed:auto") != null);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
+}
+
+test "persistSessionCheckpoint blocks fallback overwrite of existing canonical summary_latest" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.provider = .{ .ptr = @ptrCast(&test_failing_summary_provider_state), .vtable = &test_failing_summary_provider_vtable };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:main";
+
+    const existing_latest =
+        "type=summary_latest\n" ++
+        "session=agent:zaki-bot:user:1:main\n" ++
+        "channel=app\n" ++
+        "lane=main\n" ++
+        "origin_channel=app\n" ++
+        "origin_lane=main\n" ++
+        "source_key=timeline_summary/agent:zaki-bot:user:1:main/111\n" ++
+        "at=2026-04-08T10:00:00Z\n" ++
+        "focus: preserved canonical continuity\n" ++
+        "decisions:\n- keep trusted latest\n" ++
+        "open_loops:\n- none\n" ++
+        "next:\n- stay canonical\n";
+    try mem.store("summary_latest/agent:zaki-bot:user:1:main", existing_latest, .core, null);
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "seed deterministic continuity"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "I will seed deterministic continuity."),
+    });
+
+    agent.persistSessionCheckpoint("summary_seed:auto");
+
+    const latest = (try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:main")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expectEqualStrings(existing_latest, latest.content);
+
+    const daily_entries = try mem.list(allocator, .daily, null);
+    defer memory_mod.freeEntries(allocator, daily_entries);
+    var found_timeline_summary = false;
+    for (daily_entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "timeline_summary/agent:zaki-bot:user:1:main/")) continue;
+        found_timeline_summary = true;
+        break;
+    }
+    try std.testing.expect(found_timeline_summary);
+}
+
+test "persistSessionCheckpoint upgrades fallback summary_latest to canonical" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:main";
+
+    const existing_latest =
+        "type=summary_latest\n" ++
+        "session=agent:zaki-bot:user:1:main\n" ++
+        "channel=app\n" ++
+        "lane=main\n" ++
+        "origin_channel=app\n" ++
+        "origin_lane=main\n" ++
+        "source_key=timeline_summary/agent:zaki-bot:user:1:main/111\n" ++
+        "at=2026-04-08T10:00:00Z\n" ++
+        "quality_tier=fallback\n" ++
+        "focus: stale fallback continuity\n" ++
+        "decisions:\n- none\n" ++
+        "open_loops:\n- none\n" ++
+        "next:\n- none\n";
+    try mem.store("summary_latest/agent:zaki-bot:user:1:main", existing_latest, .core, null);
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "refresh canonical continuity"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "I will refresh canonical continuity."),
+    });
+
+    agent.persistSessionCheckpoint("new");
+
+    const latest = (try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:main")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "quality_tier=canonical") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "focus: test summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "stale fallback continuity") == null);
 }
 
 test "slash /reset clears history and switches model" {

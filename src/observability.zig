@@ -173,6 +173,7 @@ pub const VerboseObserver = struct {
         if (std.mem.eql(u8, stage, "turn_start")) return "Gathering context";
         if (std.mem.eql(u8, stage, "memory_enrich")) return "Retrieving memory";
         if (std.mem.eql(u8, stage, "turn_compaction") or std.mem.eql(u8, stage, "compact_trim")) return "Trimming context";
+        if (std.mem.eql(u8, stage, "continuity_refresh")) return "Refreshing continuity";
         if (std.mem.eql(u8, stage, "build_provider_messages")) return "Preparing model request";
         if (std.mem.eql(u8, stage, "response_cache_hit")) return "Using cached response";
         if (std.mem.eql(u8, stage, "parse_provider_response")) return "Processing model response";

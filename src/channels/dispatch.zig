@@ -240,96 +240,120 @@ pub fn runOutboundDispatcherWithTenantContext(
     stats: *DispatchStats,
     tenant_ctx: ?*const TenantDispatchContext,
 ) void {
-    const DeliverySignal = struct {
-        fn publish(
-            alloc: Allocator,
-            eb: *bus.Bus,
-            msg: *const bus.OutboundMessage,
-            action: []const u8,
-            reason: []const u8,
-            ts_s: i64,
-        ) void {
-            if (msg.source == null) return;
-            const outcome = bus.makeDeliveryOutcome(
-                alloc,
-                msg.source,
-                msg.user_id,
-                msg.channel,
-                msg.chat_id,
-                action,
-                reason,
-                ts_s,
-            ) catch return;
-            eb.publishDeliveryOutcome(outcome) catch {
-                outcome.deinit(alloc);
-            };
-        }
-    };
-
     while (event_bus.consumeOutbound()) |msg| {
         defer msg.deinit(allocator);
+        dispatchOutboundMessage(allocator, event_bus, registry, stats, tenant_ctx, &msg);
+    }
+}
 
-        const source = msg.source orelse "";
-        const proactive = ops_guard.isProactiveSource(msg.source);
-        if (proactive) {
-            const decision = ops_guard.allowProactive(
-                source,
-                msg.user_id,
-                msg.channel,
-                msg.chat_id,
-                msg.content,
-                msg.dedupe_key,
-                std.time.timestamp(),
-            );
-            switch (decision) {
-                .allow => {},
-                .blocked_rate => {
-                    DeliverySignal.publish(allocator, event_bus, &msg, "blocked_rate", "rate_limit", std.time.timestamp());
-                    continue;
-                },
-                .blocked_dedupe => {
-                    DeliverySignal.publish(allocator, event_bus, &msg, "blocked_dedupe", "dedupe_window", std.time.timestamp());
-                    continue;
-                },
-            }
+fn publishDeliverySignal(
+    alloc: Allocator,
+    event_bus: ?*bus.Bus,
+    msg: *const bus.OutboundMessage,
+    action: []const u8,
+    reason: []const u8,
+    ts_s: i64,
+) void {
+    const eb = event_bus orelse return;
+    if (msg.source == null) return;
+    const outcome = bus.makeDeliveryOutcome(
+        alloc,
+        msg.source,
+        msg.user_id,
+        msg.channel,
+        msg.chat_id,
+        action,
+        reason,
+        ts_s,
+    ) catch return;
+    eb.publishDeliveryOutcome(outcome) catch {
+        outcome.deinit(alloc);
+    };
+}
+
+fn isVirtualOutboundChannel(channel: []const u8) bool {
+    return std.mem.eql(u8, channel, "zaki_app");
+}
+
+pub fn dispatchOutboundMessage(
+    allocator: Allocator,
+    event_bus: ?*bus.Bus,
+    registry: *const ChannelRegistry,
+    stats: ?*DispatchStats,
+    tenant_ctx: ?*const TenantDispatchContext,
+    msg: *const bus.OutboundMessage,
+) void {
+    const source = msg.source orelse "";
+    const proactive = ops_guard.isProactiveSource(msg.source);
+    if (proactive) {
+        const decision = ops_guard.allowProactive(
+            source,
+            msg.user_id,
+            msg.channel,
+            msg.chat_id,
+            msg.content,
+            msg.dedupe_key,
+            std.time.timestamp(),
+        );
+        switch (decision) {
+            .allow => {},
+            .blocked_rate => {
+                publishDeliverySignal(allocator, event_bus, msg, "blocked_rate", "rate_limit", std.time.timestamp());
+                return;
+            },
+            .blocked_dedupe => {
+                publishDeliverySignal(allocator, event_bus, msg, "blocked_dedupe", "dedupe_window", std.time.timestamp());
+                return;
+            },
         }
+    }
 
-        const channel_opt = if (msg.account_id) |aid|
-            registry.findByNameAccount(msg.channel, aid)
-        else
-            registry.findByName(msg.channel);
+    if (isVirtualOutboundChannel(msg.channel)) {
+        if (stats) |value| _ = value.dispatched.fetchAdd(1, .monotonic);
+        publishDeliverySignal(allocator, event_bus, msg, "sent", "virtual_channel", std.time.timestamp());
+        if (proactive) {
+            ops_guard.recordProactiveSent(source, msg.user_id, msg.channel, msg.chat_id, std.time.timestamp());
+        }
+        return;
+    }
 
-        if (channel_opt) |channel| {
-            channel.send(msg.chat_id, msg.content, msg.media) catch {
-                _ = stats.errors.fetchAdd(1, .monotonic);
-                DeliverySignal.publish(allocator, event_bus, &msg, "send_error", "channel_send_failed", std.time.timestamp());
-                if (proactive) {
-                    ops_guard.recordProactiveSendError(source, msg.user_id, msg.channel, msg.chat_id, "channel_send_failed", std.time.timestamp());
-                }
-                continue;
-            };
-            _ = stats.dispatched.fetchAdd(1, .monotonic);
-            DeliverySignal.publish(allocator, event_bus, &msg, "sent", "sent", std.time.timestamp());
+    const channel_opt = if (msg.account_id) |aid|
+        registry.findByNameAccount(msg.channel, aid)
+    else
+        registry.findByName(msg.channel);
+
+    if (channel_opt) |channel| {
+        channel.send(msg.chat_id, msg.content, msg.media) catch {
+            if (stats) |value| _ = value.errors.fetchAdd(1, .monotonic);
+            publishDeliverySignal(allocator, event_bus, msg, "send_error", "channel_send_failed", std.time.timestamp());
+            if (proactive) {
+                ops_guard.recordProactiveSendError(source, msg.user_id, msg.channel, msg.chat_id, "channel_send_failed", std.time.timestamp());
+            }
+            return;
+        };
+        if (stats) |value| _ = value.dispatched.fetchAdd(1, .monotonic);
+        publishDeliverySignal(allocator, event_bus, msg, "sent", "sent", std.time.timestamp());
+        if (proactive) {
+            ops_guard.recordProactiveSent(source, msg.user_id, msg.channel, msg.chat_id, std.time.timestamp());
+        }
+        return;
+    }
+
+    if (tenant_ctx) |ctx| {
+        if (tryTenantTelegramFallbackSend(allocator, ctx, msg)) {
+            if (stats) |value| _ = value.dispatched.fetchAdd(1, .monotonic);
+            publishDeliverySignal(allocator, event_bus, msg, "sent", "tenant_fallback", std.time.timestamp());
             if (proactive) {
                 ops_guard.recordProactiveSent(source, msg.user_id, msg.channel, msg.chat_id, std.time.timestamp());
             }
-        } else {
-            if (tenant_ctx) |ctx| {
-                if (tryTenantTelegramFallbackSend(allocator, ctx, &msg)) {
-                    _ = stats.dispatched.fetchAdd(1, .monotonic);
-                    DeliverySignal.publish(allocator, event_bus, &msg, "sent", "tenant_fallback", std.time.timestamp());
-                    if (proactive) {
-                        ops_guard.recordProactiveSent(source, msg.user_id, msg.channel, msg.chat_id, std.time.timestamp());
-                    }
-                    continue;
-                }
-            }
-            _ = stats.channel_not_found.fetchAdd(1, .monotonic);
-            DeliverySignal.publish(allocator, event_bus, &msg, "channel_not_found", "channel_not_found", std.time.timestamp());
-            if (proactive) {
-                ops_guard.recordProactiveSendError(source, msg.user_id, msg.channel, msg.chat_id, "channel_not_found", std.time.timestamp());
-            }
+            return;
         }
+    }
+
+    if (stats) |value| _ = value.channel_not_found.fetchAdd(1, .monotonic);
+    publishDeliverySignal(allocator, event_bus, msg, "channel_not_found", "channel_not_found", std.time.timestamp());
+    if (proactive) {
+        ops_guard.recordProactiveSendError(source, msg.user_id, msg.channel, msg.chat_id, "channel_not_found", std.time.timestamp());
     }
 }
 
@@ -653,6 +677,40 @@ test "dispatcher increments channel_not_found for unknown channel" {
 
     try std.testing.expectEqual(@as(u64, 0), stats.getDispatched());
     try std.testing.expectEqual(@as(u64, 1), stats.getChannelNotFound());
+}
+
+test "dispatcher treats zaki_app as virtual outbound channel" {
+    const allocator = std.testing.allocator;
+
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutboundAnnotated(
+        allocator,
+        "zaki_app",
+        "agent:zaki-bot:user:1:main",
+        "subagent done",
+        "subagent",
+        "1",
+        null,
+    );
+
+    dispatchOutboundMessage(allocator, &event_bus, &reg, &stats, null, &msg);
+    defer msg.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
+    try std.testing.expectEqual(@as(u64, 0), stats.getChannelNotFound());
+
+    var outcome = event_bus.consumeDeliveryOutcome() orelse return error.TestUnexpectedResult;
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqualStrings("sent", outcome.action);
+    try std.testing.expectEqualStrings("virtual_channel", outcome.reason);
+    try std.testing.expectEqualStrings("zaki_app", outcome.channel);
 }
 
 test "dispatcher increments errors on channel.send failure" {

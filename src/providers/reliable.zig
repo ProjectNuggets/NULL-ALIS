@@ -1,9 +1,13 @@
 const std = @import("std");
 const root = @import("root.zig");
+const log = std.log.scoped(.provider_reliable);
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
+const StreamCallback = root.StreamCallback;
+const StreamChatResult = root.StreamChatResult;
+const StreamChunk = root.StreamChunk;
 
 /// Check if an error message indicates a non-retryable client error (4xx except 429/408).
 pub fn isNonRetryable(err_msg: []const u8) bool {
@@ -310,17 +314,33 @@ pub const ReliableProvider = struct {
         return error.AllProvidersFailed;
     }
 
+    const StreamRelayContext = struct {
+        outer_callback: StreamCallback,
+        outer_ctx: *anyopaque,
+        saw_first_token: bool = false,
+
+        fn onChunk(ctx: *anyopaque, chunk: StreamChunk) void {
+            const self: *StreamRelayContext = @ptrCast(@alignCast(ctx));
+            if (!chunk.is_final and (chunk.delta.len > 0 or chunk.token_count > 0)) {
+                self.saw_first_token = true;
+            }
+            self.outer_callback(self.outer_ctx, chunk);
+        }
+    };
+
     // ── Provider vtable implementation ──
 
     const vtable_impl = Provider.VTable{
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supports_streaming = supportsStreamingImpl,
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
         .warmup = warmupImpl,
+        .stream_chat = streamChatImpl,
     };
 
     /// Create a Provider interface from this ReliableProvider.
@@ -384,6 +404,72 @@ pub const ReliableProvider = struct {
                 self.storeErrorName(err);
                 const err_slice = self.lastErrorSlice();
 
+                if (isNonRetryable(err_slice)) break;
+                if (isTimeout(err_slice) and self.extras.len > 0) break;
+
+                if (isRateLimited(err_slice)) {
+                    if (self.extras.len > 0) break;
+                    _ = self.rotateKey();
+                }
+
+                if (attempt < self.max_retries) {
+                    const wait = self.computeBackoff(backoff_ms, err_slice);
+                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    backoff_ms = @min(backoff_ms *| 2, 10_000);
+                }
+            }
+        }
+        return null;
+    }
+
+    fn tryStreamProvider(
+        self: *ReliableProvider,
+        prov: Provider,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        current_model: []const u8,
+        callback: StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!?StreamChatResult {
+        if (!prov.supportsStreaming()) return null;
+
+        var backoff_ms = self.base_backoff_ms;
+        var attempt: u32 = 0;
+        while (attempt <= self.max_retries) : (attempt += 1) {
+            log.info("stream.attempt provider={s} model={s} attempt={d}", .{
+                prov.getName(),
+                current_model,
+                attempt,
+            });
+
+            var relay_ctx = StreamRelayContext{
+                .outer_callback = callback,
+                .outer_ctx = callback_ctx,
+            };
+            var stream_request = request;
+            stream_request.model = current_model;
+
+            if (prov.streamChat(
+                allocator,
+                stream_request,
+                current_model,
+                request.temperature,
+                StreamRelayContext.onChunk,
+                @ptrCast(&relay_ctx),
+            )) |result| {
+                return result;
+            } else |err| {
+                self.storeErrorName(err);
+                const err_slice = self.lastErrorSlice();
+                log.warn("stream.attempt failed provider={s} model={s} attempt={d} emitted_first_token={} error={s}", .{
+                    prov.getName(),
+                    current_model,
+                    attempt,
+                    relay_ctx.saw_first_token,
+                    err_slice,
+                });
+
+                if (relay_ctx.saw_first_token) return err;
                 if (isNonRetryable(err_slice)) break;
                 if (isTimeout(err_slice) and self.extras.len > 0) break;
 
@@ -494,6 +580,15 @@ pub const ReliableProvider = struct {
         return false;
     }
 
+    fn supportsStreamingImpl(ptr: *anyopaque) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        if (self.inner.supportsStreaming()) return true;
+        for (self.extras) |entry| {
+            if (entry.provider.supportsStreaming()) return true;
+        }
+        return false;
+    }
+
     fn supportsVisionImpl(ptr: *anyopaque) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         if (self.inner.supportsVision()) return true;
@@ -515,6 +610,50 @@ pub const ReliableProvider = struct {
     fn getNameImpl(ptr: *anyopaque) []const u8 {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         return self.inner.getName();
+    }
+
+    fn streamChatImpl(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+        temperature: f64,
+        callback: StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!StreamChatResult {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        _ = temperature;
+
+        const models = try self.modelChain(allocator, model);
+        defer allocator.free(models);
+
+        for (models) |current_model| {
+            if (try self.tryStreamProvider(
+                self.inner,
+                allocator,
+                request,
+                current_model,
+                callback,
+                callback_ctx,
+            )) |result| {
+                return result;
+            }
+
+            for (self.extras) |entry| {
+                if (try self.tryStreamProvider(
+                    entry.provider,
+                    allocator,
+                    request,
+                    current_model,
+                    callback,
+                    callback_ctx,
+                )) |result| {
+                    return result;
+                }
+            }
+        }
+
+        return self.finalFailureError();
     }
 
     fn deinitImpl(ptr: *anyopaque) void {
@@ -855,6 +994,170 @@ const ModelAwareMock = struct {
     fn modelDeinit(_: *anyopaque) void {}
 };
 
+const StreamingMockProvider = struct {
+    name: []const u8 = "StreamingMock",
+    chat_count: u32 = 0,
+    stream_count: u32 = 0,
+    fail_stream_until: u32 = 0,
+    fail_error: anyerror = error.Timeout,
+    emit_partial_before_error: bool = false,
+    supports_tools: bool = false,
+    supports_vision: bool = true,
+    supports_streaming: bool = true,
+    response: []const u8 = "streamed response",
+    models_seen_buf: [16][]const u8 = undefined,
+    models_seen_len: usize = 0,
+    fail_models_buf: [8][]const u8 = undefined,
+    fail_models_len: usize = 0,
+
+    const vtable_stream = Provider.VTable{
+        .chatWithSystem = streamMockChatWithSystem,
+        .chat = streamMockChat,
+        .supportsNativeTools = streamMockSupportsNativeTools,
+        .supports_streaming = streamMockSupportsStreaming,
+        .supports_vision = streamMockSupportsVision,
+        .getName = streamMockGetName,
+        .deinit = streamMockDeinit,
+        .stream_chat = streamMockStreamChat,
+    };
+
+    fn toProvider(self: *StreamingMockProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_stream };
+    }
+
+    fn initWithFailModels(name: []const u8, fail_models: []const []const u8, response: []const u8) StreamingMockProvider {
+        var mock = StreamingMockProvider{
+            .name = name,
+            .response = response,
+        };
+        const copy_len = @min(fail_models.len, mock.fail_models_buf.len);
+        for (fail_models[0..copy_len], 0..) |fail_model, i| {
+            mock.fail_models_buf[i] = fail_model;
+        }
+        mock.fail_models_len = copy_len;
+        return mock;
+    }
+
+    fn failsModel(self: *const StreamingMockProvider, model: []const u8) bool {
+        for (self.fail_models_buf[0..self.fail_models_len]) |fail_model| {
+            if (std.mem.eql(u8, fail_model, model)) return true;
+        }
+        return false;
+    }
+
+    fn recordModel(self: *StreamingMockProvider, model: []const u8) void {
+        if (self.models_seen_len < self.models_seen_buf.len) {
+            self.models_seen_buf[self.models_seen_len] = model;
+            self.models_seen_len += 1;
+        }
+    }
+
+    fn modelsSeen(self: *const StreamingMockProvider) []const []const u8 {
+        return self.models_seen_buf[0..self.models_seen_len];
+    }
+
+    fn streamMockChatWithSystem(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        model: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *StreamingMockProvider = @ptrCast(@alignCast(ptr));
+        self.chat_count += 1;
+        self.recordModel(model);
+        return allocator.dupe(u8, self.response);
+    }
+
+    fn streamMockChat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ChatRequest,
+        model: []const u8,
+        _: f64,
+    ) anyerror!ChatResponse {
+        const self: *StreamingMockProvider = @ptrCast(@alignCast(ptr));
+        self.chat_count += 1;
+        self.recordModel(model);
+        return ChatResponse{ .content = try allocator.dupe(u8, self.response) };
+    }
+
+    fn streamMockSupportsNativeTools(ptr: *anyopaque) bool {
+        const self: *StreamingMockProvider = @ptrCast(@alignCast(ptr));
+        return self.supports_tools;
+    }
+
+    fn streamMockSupportsStreaming(ptr: *anyopaque) bool {
+        const self: *StreamingMockProvider = @ptrCast(@alignCast(ptr));
+        return self.supports_streaming;
+    }
+
+    fn streamMockSupportsVision(ptr: *anyopaque) bool {
+        const self: *StreamingMockProvider = @ptrCast(@alignCast(ptr));
+        return self.supports_vision;
+    }
+
+    fn streamMockGetName(ptr: *anyopaque) []const u8 {
+        const self: *StreamingMockProvider = @ptrCast(@alignCast(ptr));
+        return self.name;
+    }
+
+    fn streamMockDeinit(_: *anyopaque) void {}
+
+    fn streamMockStreamChat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ChatRequest,
+        model: []const u8,
+        _: f64,
+        callback: StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!StreamChatResult {
+        const self: *StreamingMockProvider = @ptrCast(@alignCast(ptr));
+        self.stream_count += 1;
+        self.recordModel(model);
+
+        if (self.stream_count <= self.fail_stream_until or self.failsModel(model)) {
+            if (self.emit_partial_before_error) {
+                callback(callback_ctx, StreamChunk.textDelta("partial"));
+            }
+            return self.fail_error;
+        }
+
+        callback(callback_ctx, StreamChunk.textDelta(self.response));
+        callback(callback_ctx, StreamChunk.finalChunk());
+        return .{
+            .content = try allocator.dupe(u8, self.response),
+            .model = model,
+        };
+    }
+};
+
+const StreamCollector = struct {
+    text: [256]u8 = undefined,
+    text_len: usize = 0,
+    non_final_chunks: u32 = 0,
+    final_chunks: u32 = 0,
+
+    fn onChunk(ctx: *anyopaque, chunk: StreamChunk) void {
+        const self: *StreamCollector = @ptrCast(@alignCast(ctx));
+        if (chunk.is_final) {
+            self.final_chunks += 1;
+            return;
+        }
+        self.non_final_chunks += 1;
+        const remaining = self.text.len - self.text_len;
+        const copy_len = @min(remaining, chunk.delta.len);
+        @memcpy(self.text[self.text_len .. self.text_len + copy_len], chunk.delta[0..copy_len]);
+        self.text_len += copy_len;
+    }
+
+    fn textSlice(self: *const StreamCollector) []const u8 {
+        return self.text[0..self.text_len];
+    }
+};
+
 test "ReliableProvider vtable succeeds without retry" {
     var mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
     var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 3, 50);
@@ -922,6 +1225,111 @@ test "ReliableProvider vtable delegates supportsNativeTools" {
     var mock_no = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
     var reliable_no = ReliableProvider.initWithProvider(mock_no.toProvider(), 0, 50);
     try std.testing.expect(reliable_no.provider().supportsNativeTools() == false);
+}
+
+test "ReliableProvider supportsStreaming when wrapped provider streams" {
+    var streamer = StreamingMockProvider{};
+    var reliable = ReliableProvider.initWithProvider(streamer.toProvider(), 0, 50);
+    try std.testing.expect(reliable.provider().supportsStreaming());
+}
+
+test "ReliableProvider streamChat succeeds on primary provider" {
+    var primary = StreamingMockProvider{ .name = "primary", .response = "primary stream" };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50);
+    const prov = reliable.provider();
+
+    var collector = StreamCollector{};
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs, .model = "model" };
+    const result = try prov.streamChat(std.testing.allocator, request, "model", 0.7, StreamCollector.onChunk, @ptrCast(&collector));
+    defer if (result.content) |content| std.testing.allocator.free(content);
+
+    try std.testing.expectEqualStrings("primary stream", collector.textSlice());
+    try std.testing.expectEqualStrings("primary stream", result.content.?);
+    try std.testing.expectEqual(@as(u32, 1), collector.non_final_chunks);
+    try std.testing.expectEqual(@as(u32, 1), collector.final_chunks);
+    try std.testing.expectEqual(@as(u32, 1), primary.stream_count);
+}
+
+test "ReliableProvider streamChat falls back to extra provider before first token" {
+    var primary = StreamingMockProvider{
+        .name = "primary",
+        .fail_stream_until = 10,
+        .fail_error = error.Timeout,
+    };
+    var fallback = StreamingMockProvider{ .name = "fallback", .response = "fallback stream" };
+    const extras = [_]ProviderEntry{
+        .{ .name = "fallback", .provider = fallback.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 2, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    var collector = StreamCollector{};
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs, .model = "model" };
+    const result = try prov.streamChat(std.testing.allocator, request, "model", 0.7, StreamCollector.onChunk, @ptrCast(&collector));
+    defer if (result.content) |content| std.testing.allocator.free(content);
+
+    try std.testing.expectEqualStrings("fallback stream", collector.textSlice());
+    try std.testing.expectEqual(@as(u32, 1), primary.stream_count);
+    try std.testing.expectEqual(@as(u32, 1), fallback.stream_count);
+}
+
+test "ReliableProvider streamChat falls back to model alternative before first token" {
+    var primary = StreamingMockProvider.initWithFailModels(
+        "primary",
+        &.{"moonshotai/Kimi-K2.5"},
+        "model fallback stream",
+    );
+    const model_fallbacks = [_]ModelFallbackEntry{
+        .{ .model = "moonshotai/Kimi-K2.5", .fallbacks = &.{"moonshotai/kimi-k2.5"} },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withModelFallbacks(&model_fallbacks);
+    const prov = reliable.provider();
+
+    var collector = StreamCollector{};
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs, .model = "moonshotai/Kimi-K2.5" };
+    const result = try prov.streamChat(
+        std.testing.allocator,
+        request,
+        "moonshotai/Kimi-K2.5",
+        0.7,
+        StreamCollector.onChunk,
+        @ptrCast(&collector),
+    );
+    defer if (result.content) |content| std.testing.allocator.free(content);
+
+    try std.testing.expectEqualStrings("model fallback stream", collector.textSlice());
+    try std.testing.expectEqual(@as(u32, 2), primary.stream_count);
+    const models_seen = primary.modelsSeen();
+    try std.testing.expectEqual(@as(usize, 2), models_seen.len);
+    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.5", models_seen[0]);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k2.5", models_seen[1]);
+}
+
+test "ReliableProvider streamChat does not fallback after first token" {
+    var primary = StreamingMockProvider{
+        .name = "primary",
+        .fail_stream_until = 10,
+        .fail_error = error.Timeout,
+        .emit_partial_before_error = true,
+    };
+    var fallback = StreamingMockProvider{ .name = "fallback", .response = "fallback stream" };
+    const extras = [_]ProviderEntry{
+        .{ .name = "fallback", .provider = fallback.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 1, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    var collector = StreamCollector{};
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs, .model = "model" };
+    const result = prov.streamChat(std.testing.allocator, request, "model", 0.7, StreamCollector.onChunk, @ptrCast(&collector));
+
+    try std.testing.expectError(error.Timeout, result);
+    try std.testing.expectEqualStrings("partial", collector.textSlice());
+    try std.testing.expectEqual(@as(u32, 0), fallback.stream_count);
 }
 
 test "ReliableProvider supportsVision checks full provider chain" {

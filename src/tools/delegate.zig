@@ -133,7 +133,13 @@ pub const DelegateTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
-            return ToolResult{ .success = true, .output = response };
+            const wrapped = std.fmt.allocPrint(
+                allocator,
+                "delegate agent={s} status=completed\nresult:\n{s}",
+                .{ trimmed_agent, response },
+            ) catch return ToolResult{ .success = true, .output = response };
+            allocator.free(response);
+            return ToolResult{ .success = true, .output = wrapped };
         }
 
         const msg = std.fmt.allocPrint(

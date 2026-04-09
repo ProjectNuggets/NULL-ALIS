@@ -23,6 +23,19 @@ pub const c = @cImport({
 pub const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 const BUSY_TIMEOUT_MS: c_int = 5000;
 
+fn randomHexId(allocator: std.mem.Allocator, bytes_len: usize) ![]u8 {
+    const raw = try allocator.alloc(u8, bytes_len);
+    defer allocator.free(raw);
+    std.crypto.random.bytes(raw);
+    const out = try allocator.alloc(u8, bytes_len * 2);
+    const alphabet = "0123456789abcdef";
+    for (raw, 0..) |byte, idx| {
+        out[idx * 2] = alphabet[byte >> 4];
+        out[idx * 2 + 1] = alphabet[byte & 0x0f];
+    }
+    return out;
+}
+
 pub const SqliteMemory = struct {
     db: ?*c.sqlite3,
     allocator: std.mem.Allocator,
@@ -134,6 +147,15 @@ pub const SqliteMemory = struct {
             \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
             \\  session_id TEXT NOT NULL,
             \\  role TEXT NOT NULL,
+            \\  content TEXT NOT NULL,
+            \\  created_at TEXT DEFAULT (datetime('now'))
+            \\);
+            \\CREATE TABLE IF NOT EXISTS completion_events (
+            \\  id TEXT PRIMARY KEY,
+            \\  session_id TEXT NOT NULL,
+            \\  channel TEXT,
+            \\  account_id TEXT,
+            \\  chat_id TEXT,
             \\  content TEXT NOT NULL,
             \\  created_at TEXT DEFAULT (datetime('now'))
             \\);
@@ -527,6 +549,103 @@ pub const SqliteMemory = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
     }
 
+    pub fn saveCompletionEvent(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        session_id: []const u8,
+        channel: ?[]const u8,
+        account_id: ?[]const u8,
+        chat_id: ?[]const u8,
+        content: []const u8,
+    ) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql =
+            "INSERT INTO completion_events (id, session_id, channel, account_id, chat_id, content) VALUES (?, ?, ?, ?, ?, ?)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const event_id = try randomHexId(allocator, 16);
+        errdefer allocator.free(event_id);
+
+        _ = c.sqlite3_bind_text(stmt, 1, event_id.ptr, @intCast(event_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        if (channel) |value| {
+            _ = c.sqlite3_bind_text(stmt, 3, value.ptr, @intCast(value.len), SQLITE_STATIC);
+        }
+        if (account_id) |value| {
+            _ = c.sqlite3_bind_text(stmt, 4, value.ptr, @intCast(value.len), SQLITE_STATIC);
+        }
+        if (chat_id) |value| {
+            _ = c.sqlite3_bind_text(stmt, 5, value.ptr, @intCast(value.len), SQLITE_STATIC);
+        }
+        _ = c.sqlite3_bind_text(stmt, 6, content.ptr, @intCast(content.len), SQLITE_STATIC);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+        return event_id;
+    }
+
+    pub fn loadCompletionEvents(self: *Self, allocator: std.mem.Allocator, session_id: []const u8) ![]root.CompletionEvent {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql =
+            "SELECT id, session_id, channel, account_id, chat_id, content FROM completion_events WHERE session_id = ? ORDER BY created_at ASC, id ASC";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+
+        var list: std.ArrayListUnmanaged(root.CompletionEvent) = .empty;
+        errdefer root.freeCompletionEvents(allocator, list.items);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id_ptr = c.sqlite3_column_text(stmt, 0);
+            const id_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+            const session_ptr = c.sqlite3_column_text(stmt, 1);
+            const session_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const channel_ptr = c.sqlite3_column_text(stmt, 2);
+            const channel_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+            const account_ptr = c.sqlite3_column_text(stmt, 3);
+            const account_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+            const chat_ptr = c.sqlite3_column_text(stmt, 4);
+            const chat_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+            const content_ptr = c.sqlite3_column_text(stmt, 5);
+            const content_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 5));
+
+            if (id_ptr == null or session_ptr == null or content_ptr == null) continue;
+
+            try list.append(allocator, .{
+                .id = try allocator.dupe(u8, id_ptr[0..id_len]),
+                .session_id = try allocator.dupe(u8, session_ptr[0..session_len]),
+                .channel = if (channel_ptr != null) try allocator.dupe(u8, channel_ptr[0..channel_len]) else null,
+                .account_id = if (account_ptr != null) try allocator.dupe(u8, account_ptr[0..account_len]) else null,
+                .chat_id = if (chat_ptr != null) try allocator.dupe(u8, chat_ptr[0..chat_len]) else null,
+                .content = try allocator.dupe(u8, content_ptr[0..content_len]),
+            });
+        }
+
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn deleteCompletionEvent(self: *Self, event_id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql = "DELETE FROM completion_events WHERE id = ?";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, event_id.ptr, @intCast(event_id.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+    }
+
     // ── SessionStore vtable ────────────────────────────────────────
 
     fn implSessionSaveMessage(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8) anyerror!void {
@@ -549,11 +668,29 @@ pub const SqliteMemory = struct {
         return self_.clearAutoSaved(session_id);
     }
 
+    fn implSessionSaveCompletionEvent(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8, content: []const u8) anyerror![]u8 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.saveCompletionEvent(allocator, session_id, channel, account_id, chat_id, content);
+    }
+
+    fn implSessionLoadCompletionEvents(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]root.CompletionEvent {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.loadCompletionEvents(allocator, session_id);
+    }
+
+    fn implSessionDeleteCompletionEvent(ptr: *anyopaque, event_id: []const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.deleteCompletionEvent(event_id);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
         .clearMessages = &implSessionClearMessages,
         .clearAutoSaved = &implSessionClearAutoSaved,
+        .saveCompletionEvent = &implSessionSaveCompletionEvent,
+        .loadCompletionEvents = &implSessionLoadCompletionEvents,
+        .deleteCompletionEvent = &implSessionDeleteCompletionEvent,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {

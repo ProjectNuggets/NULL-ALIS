@@ -517,12 +517,22 @@ const MockSessionStore = struct {
     }
     fn implClearMessages(_: *anyopaque, _: []const u8) anyerror!void {}
     fn implClearAutoSaved(_: *anyopaque, _: ?[]const u8) anyerror!void {}
+    fn implSaveCompletionEvent(_: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, _: ?[]const u8, _: ?[]const u8, _: ?[]const u8, _: []const u8) anyerror![]u8 {
+        return allocator.dupe(u8, session_id);
+    }
+    fn implLoadCompletionEvents(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]root.CompletionEvent {
+        return allocator.alloc(root.CompletionEvent, 0);
+    }
+    fn implDeleteCompletionEvent(_: *anyopaque, _: []const u8) anyerror!void {}
 
     const vtable = root.SessionStore.VTable{
         .saveMessage = &implSaveMessage,
         .loadMessages = &implLoadMessages,
         .clearMessages = &implClearMessages,
         .clearAutoSaved = &implClearAutoSaved,
+        .saveCompletionEvent = &implSaveCompletionEvent,
+        .loadCompletionEvents = &implLoadCompletionEvents,
+        .deleteCompletionEvent = &implDeleteCompletionEvent,
     };
 
     fn store(self: *MockSessionStore) root.SessionStore {

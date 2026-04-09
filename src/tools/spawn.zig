@@ -43,11 +43,16 @@ pub const SpawnTool = struct {
         const manager = self.manager orelse
             return ToolResult.fail("Spawn tool not connected to SubagentManager");
 
+        const runtime_turn = root.getTurnContext();
         const turn = message_tool.MessageTool.getTurnContext();
+        const request_session_key = runtime_turn.session_key orelse
+            self.default_chat_id orelse
+            turn.chat_id orelse
+            "agent";
         const channel = turn.channel orelse self.default_channel orelse "system";
         const chat_id = turn.chat_id orelse self.default_chat_id orelse "agent";
 
-        const task_id = manager.spawn(trimmed_task, label, channel, chat_id) catch |err| {
+        const task_id = manager.spawn(trimmed_task, label, request_session_key, channel, chat_id) catch |err| {
             return switch (err) {
                 error.TooManyConcurrentSubagents => ToolResult.fail("Too many concurrent subagents. Wait for some to complete."),
                 else => ToolResult.fail("Failed to spawn subagent"),
@@ -56,7 +61,7 @@ pub const SpawnTool = struct {
 
         const msg = std.fmt.allocPrint(
             allocator,
-            "Subagent '{s}' spawned with task_id={d}. Results will be delivered as system messages.",
+            "Subagent '{s}' spawned with task_id={d} state=queued. Results will be delivered as system messages.",
             .{ label, task_id },
         ) catch return ToolResult.ok("Subagent spawned");
 
@@ -126,9 +131,13 @@ test "spawn empty JSON rejected" {
     try std.testing.expect(!result.success);
 }
 
-test "spawn uses current turn context over tool defaults" {
+test "spawn uses runtime turn session key over chat and tool defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
     var cfg = config_mod.Config{
-        .workspace_dir = "/tmp/yc",
+        .workspace_dir = workspace,
         .config_path = "/tmp/yc/config.json",
         .allocator = std.testing.allocator,
     };
@@ -142,6 +151,11 @@ test "spawn uses current turn context over tool defaults" {
     };
     const t = st.tool();
 
+    root.setTurnContext(.{
+        .origin = .user,
+        .session_key = "agent:zaki-bot:user:7:main",
+    });
+    defer root.clearTurnContext();
     message_tool.MessageTool.setTurnContext(.{
         .channel = "telegram",
         .chat_id = "chat-42",
@@ -160,12 +174,17 @@ test "spawn uses current turn context over tool defaults" {
     const state = manager.tasks.get(1) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("telegram", state.origin_channel.?);
     try std.testing.expectEqualStrings("chat-42", state.origin_chat_id.?);
-    try std.testing.expectEqualStrings("chat-42", state.session_key.?);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:7:main", state.session_key.?);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:7:task:1", state.runtime_session_key.?);
 }
 
 test "spawn falls back to tool defaults when turn context is absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
     var cfg = config_mod.Config{
-        .workspace_dir = "/tmp/yc",
+        .workspace_dir = workspace,
         .config_path = "/tmp/yc/config.json",
         .allocator = std.testing.allocator,
     };
@@ -179,6 +198,7 @@ test "spawn falls back to tool defaults when turn context is absent" {
     };
     const t = st.tool();
 
+    root.clearTurnContext();
     message_tool.MessageTool.clearTurnContext();
 
     const parsed = try root.parseTestArgs("{\"task\": \"fallback routing\"}");

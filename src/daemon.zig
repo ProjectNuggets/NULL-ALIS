@@ -454,12 +454,32 @@ fn mapHeartbeatOutcomeState(action: []const u8, reason: []const u8) HeartbeatOut
     return .{ .status = "send_failed", .reason = if (reason.len > 0) reason else "delivery_error" };
 }
 
-fn deliveryOutcomeThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
+fn completionEventIdFromSource(source: []const u8) ?[]const u8 {
+    const prefix = "subagent_completion:";
+    if (!std.mem.startsWith(u8, source, prefix)) return null;
+    const event_id = source[prefix.len..];
+    if (event_id.len == 0) return null;
+    return event_id;
+}
+
+fn deliveryOutcomeThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus, state_mgr_opt: ?*zaki_state.Manager) void {
     _ = state;
     while (event_bus.consumeDeliveryOutcome()) |outcome| {
         defer outcome.deinit(allocator);
-        if (!config.tenant.enabled) continue;
         const source = outcome.source orelse continue;
+
+        if (std.mem.eql(u8, outcome.action, "sent")) {
+            if (completionEventIdFromSource(source)) |event_id| {
+                const user_id = outcome.user_id orelse continue;
+                const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch continue;
+                if (state_mgr_opt) |mgr| {
+                    mgr.deleteCompletionEvent(numeric_user_id, event_id) catch {};
+                }
+                continue;
+            }
+        }
+
+        if (!config.tenant.enabled) continue;
         if (!std.mem.eql(u8, source, "heartbeat")) continue;
         const user_id = outcome.user_id orelse continue;
         const user_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tenant.data_root, user_id }) catch continue;
@@ -2025,10 +2045,26 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Event bus (created before gateway+scheduler so all threads can publish)
     var event_bus = bus_mod.Bus.init();
+    var delivery_state_mgr: ?*zaki_state.Manager = null;
+    defer if (delivery_state_mgr) |mgr| {
+        mgr.deinit();
+        allocator.destroy(mgr);
+    };
+    if (config.tenant.enabled and std.mem.eql(u8, config.state.backend, "postgres")) {
+        const mgr = allocator.create(zaki_state.Manager) catch null;
+        if (mgr) |state_mgr| {
+            if (zaki_state.Manager.init(allocator, config.state)) |initialized| {
+                state_mgr.* = initialized;
+                delivery_state_mgr = state_mgr;
+            } else |_| {
+                allocator.destroy(state_mgr);
+            }
+        }
+    }
 
     var delivery_outcome_thread: ?std.Thread = null;
     state.markRunning("delivery_outcome");
-    if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, deliveryOutcomeThread, .{ allocator, config, &state, &event_bus })) |thread| {
+    if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, deliveryOutcomeThread, .{ allocator, config, &state, &event_bus, delivery_state_mgr })) |thread| {
         delivery_outcome_thread = thread;
     } else |err| {
         state.markError("delivery_outcome", @errorName(err));
@@ -3405,6 +3441,7 @@ test "deliveryOutcomeThread writes heartbeat runtime terminal state" {
         &cfg,
         &state,
         &event_bus,
+        null,
     });
 
     const outcome = try bus_mod.makeDeliveryOutcome(

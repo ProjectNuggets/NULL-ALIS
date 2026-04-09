@@ -1297,8 +1297,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (sc.get("enabled")) |v| if (v == .bool) {
                         self.memory.semantic_cache.enabled = v.bool;
                     };
-                    if (sc.get("similarity_threshold")) |v| if (v == .float) {
-                        self.memory.semantic_cache.similarity_threshold = @floatCast(v.float);
+                    if (sc.get("similarity_threshold")) |v| switch (v) {
+                        .float => self.memory.semantic_cache.similarity_threshold = @floatCast(v.float),
+                        .integer => self.memory.semantic_cache.similarity_threshold = @floatFromInt(v.integer),
+                        else => {},
                     };
                     if (sc.get("ttl_minutes")) |v| if (v == .integer) {
                         self.memory.semantic_cache.ttl_minutes = @intCast(v.integer);

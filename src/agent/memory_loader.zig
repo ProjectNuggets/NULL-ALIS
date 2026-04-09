@@ -176,7 +176,9 @@ fn isDurableFactKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "durable_fact/");
 }
 
-fn isSessionSummaryKey(key: []const u8) bool {
+// Legacy compatibility artifact: retained for audit/debug access only and
+// intentionally excluded from normal continuity injection.
+fn isSessionSummaryAuditKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "session_summary/");
 }
 
@@ -301,7 +303,7 @@ fn shouldSkipGenericEntry(
     if (summary_latest_key) |latest_key| {
         if (std.mem.eql(u8, key, latest_key)) return true;
     }
-    if (isSessionSummaryKey(key)) return true;
+    if (isSessionSummaryAuditKey(key)) return true;
     if (has_priority_context and isSessionCheckpointKey(key)) return true;
     if (current_timeline_prefix) |prefix| {
         if (std.mem.startsWith(u8, key, prefix)) return true;
@@ -886,6 +888,55 @@ test "loadContext skips checkpoint style entries when summary context exists" {
 
     try std.testing.expect(std.mem.indexOf(u8, context, "summary_latest/agent:zaki-bot:user:1:main") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "session_checkpoint_1774400000") == null);
+}
+
+test "loadContext ignores session_summary artifacts on the normal prompt path" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "session_summary/agent:zaki-bot:user:1:main/1774400000",
+        "origin_channel=app\norigin_lane=main\n\nfocus: audit-only recap\ndecisions:\n- keep canonical latest separate\nopen_loops:\n- none\nnext:\n- continue\n",
+        .conversation,
+        "agent:zaki-bot:user:1:main",
+    );
+
+    const context = try loadContext(allocator, mem, "recap", "agent:zaki-bot:user:1:main");
+    defer allocator.free(context);
+
+    try std.testing.expectEqualStrings("", context);
+}
+
+test "loadContext prefers canonical continuity and ignores session_summary compatibility artifacts" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:zaki-bot:user:1:main",
+        "type=summary_latest\nsession=agent:zaki-bot:user:1:main\nfocus: canonical continuity\ndecisions:\n- trust summary_latest\nopen_loops:\n- none\nnext:\n- continue\n",
+        .core,
+        null,
+    );
+    try mem.store(
+        "session_summary/agent:zaki-bot:user:1:main/1774400000",
+        "origin_channel=app\norigin_lane=main\n\nfocus: stale compatibility recap\ndecisions:\n- should stay out of prompt loading\nopen_loops:\n- none\nnext:\n- none\n",
+        .conversation,
+        "agent:zaki-bot:user:1:main",
+    );
+
+    const context = try loadContext(allocator, mem, "continuity", "agent:zaki-bot:user:1:main");
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "summary_latest/agent:zaki-bot:user:1:main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "canonical continuity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "session_summary/agent:zaki-bot:user:1:main/1774400000") == null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "stale compatibility recap") == null);
 }
 
 test "truncateUtf8 does not split multi-byte sequences" {

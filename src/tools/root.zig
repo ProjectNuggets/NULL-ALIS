@@ -271,6 +271,7 @@ pub fn allTools(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
     opts: struct {
+        tool_profile: ToolProfile = .main,
         config: ?*const @import("../config.zig").Config = null,
         http_enabled: bool = false,
         browser_enabled: bool = false,
@@ -375,14 +376,16 @@ pub fn allTools(
     try list.append(allocator, mft.tool());
 
     // Delegate and schedule tools
-    const dlt = try allocator.create(delegate.DelegateTool);
-    dlt.* = .{
-        .agents = opts.agents orelse &.{},
-        .config_ref = opts.config,
-        .fallback_api_key = opts.fallback_api_key,
-        .depth = opts.delegate_depth,
-    };
-    try list.append(allocator, dlt.tool());
+    if (opts.tool_profile == .main) {
+        const dlt = try allocator.create(delegate.DelegateTool);
+        dlt.* = .{
+            .agents = opts.agents orelse &.{},
+            .config_ref = opts.config,
+            .fallback_api_key = opts.fallback_api_key,
+            .depth = opts.delegate_depth,
+        };
+        try list.append(allocator, dlt.tool());
+    }
 
     const scht = try allocator.create(schedule.ScheduleTool);
     scht.* = .{ .config = opts.config };
@@ -431,14 +434,16 @@ pub fn allTools(
     try list.append(allocator, skrt.tool());
 
     // Spawn tool (async subagent)
-    const sp = try allocator.create(spawn.SpawnTool);
-    sp.* = .{ .manager = opts.subagent_manager };
-    try list.append(allocator, sp.tool());
+    if (opts.tool_profile == .main) {
+        const sp = try allocator.create(spawn.SpawnTool);
+        sp.* = .{ .manager = opts.subagent_manager };
+        try list.append(allocator, sp.tool());
+    }
 
-    if (opts.event_bus) |event_bus| {
+    if (opts.tool_profile == .main and opts.event_bus != null) {
         const mt = try allocator.create(message.MessageTool);
         mt.* = .{
-            .event_bus = event_bus,
+            .event_bus = opts.event_bus.?,
             .outbound_allocator = allocator,
         };
         try list.append(allocator, mt.tool());
@@ -517,6 +522,10 @@ pub fn allTools(
 }
 
 pub const MessageTurnContext = message.MessageTool.TurnContext;
+pub const ToolProfile = enum {
+    main,
+    subagent,
+};
 pub const TurnOrigin = enum {
     user,
     heartbeat,
@@ -1325,6 +1334,71 @@ test "all tools includes message when event bus is available" {
             break;
         }
     }
+    try std.testing.expect(found_message);
+}
+
+test "all tools excludes spawn delegate and message in subagent profile" {
+    const Config = @import("../config.zig").Config;
+    const subagent_mod = @import("../subagent.zig");
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
+        .tool_profile = .subagent,
+        .subagent_manager = &manager,
+        .event_bus = &event_bus,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    for (tools) |t| {
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "spawn"));
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "delegate"));
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "message"));
+    }
+}
+
+test "all tools keeps spawn delegate and message in main profile" {
+    const Config = @import("../config.zig").Config;
+    const subagent_mod = @import("../subagent.zig");
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
+        .tool_profile = .main,
+        .subagent_manager = &manager,
+        .event_bus = &event_bus,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var found_spawn = false;
+    var found_delegate = false;
+    var found_message = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "spawn")) found_spawn = true;
+        if (std.mem.eql(u8, t.name(), "delegate")) found_delegate = true;
+        if (std.mem.eql(u8, t.name(), "message")) found_message = true;
+    }
+
+    try std.testing.expect(found_spawn);
+    try std.testing.expect(found_delegate);
     try std.testing.expect(found_message);
 }
 

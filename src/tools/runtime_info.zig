@@ -1,6 +1,7 @@
 const std = @import("std");
 const channel_catalog = @import("../channel_catalog.zig");
 const config_mod = @import("../config.zig");
+const runtime_truth = @import("../diagnostics/runtime_truth.zig");
 const inbound_canonicalizer = @import("../inbound_canonicalizer.zig");
 const json_util = @import("../json_util.zig");
 const multimodal = @import("../multimodal.zig");
@@ -9,6 +10,7 @@ const tool_dispatcher = @import("../tool_dispatcher.zig");
 const process_util = @import("process_util.zig");
 const voice = @import("../voice.zig");
 const lane_metrics = @import("../lane_metrics.zig");
+const zaki_session = @import("../zaki_session.zig");
 const root = @import("root.zig");
 
 const Tool = root.Tool;
@@ -40,14 +42,23 @@ const ConnectedAccountsStatus = struct {
     google_calendar_connected: bool = false,
 };
 
+fn sessionLaneLabel(session_key: ?[]const u8) []const u8 {
+    const key = session_key orelse return "none";
+    if (std.mem.indexOf(u8, key, ":task:") != null or std.mem.startsWith(u8, key, "task:")) return "task";
+    if (std.mem.indexOf(u8, key, ":cron:") != null or std.mem.startsWith(u8, key, "cron:")) return "cron";
+    if (std.mem.indexOf(u8, key, ":thread:") != null or std.mem.startsWith(u8, key, "thread:")) return "thread";
+    if (std.mem.endsWith(u8, key, ":main") or std.mem.eql(u8, key, "main")) return "main";
+    return "custom";
+}
+
 pub const RuntimeInfoTool = struct {
     config: *const config_mod.Config,
     runtime_tools: ?[]const Tool = null,
 
     pub const tool_name = "runtime_info";
-    pub const tool_description = "Inspect runtime, session, integrations, scheduler, heartbeat, and ops state as structured JSON. Use it to verify status before claiming it.";
+    pub const tool_description = "Inspect runtime, session, integrations, scheduler, heartbeat, execution truth, and ops state as structured JSON. Use it to verify status before claiming it.";
     pub const tool_params =
-        \\{"type":"object","properties":{"section":{"type":"string","enum":["summary","session","integrations","scheduler","heartbeat","ops"],"description":"Runtime section to inspect"},"user_id":{"type":"string","description":"Optional tenant user id override for reporting"},"verbose":{"type":"boolean","description":"Include larger summaries where available"}}}
+        \\{"type":"object","properties":{"section":{"type":"string","enum":["summary","session","integrations","scheduler","heartbeat","execution_truth","ops"],"description":"Runtime section to inspect"},"user_id":{"type":"string","description":"Optional tenant user id override for reporting"},"verbose":{"type":"boolean","description":"Include larger summaries where available"}}}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -74,10 +85,12 @@ pub const RuntimeInfoTool = struct {
             try self.buildSchedulerJson(allocator, user_id_override)
         else if (std.mem.eql(u8, section, "heartbeat"))
             try self.buildHeartbeatJson(allocator, user_id_override)
+        else if (std.mem.eql(u8, section, "execution_truth"))
+            try self.buildExecutionTruthJson(allocator, user_id_override)
         else if (std.mem.eql(u8, section, "ops"))
             try self.buildOpsJson(allocator)
         else
-            return ToolResult.fail("Unknown section. Use summary, session, integrations, scheduler, heartbeat, or ops.");
+            return ToolResult.fail("Unknown section. Use summary, session, integrations, scheduler, heartbeat, execution_truth, or ops.");
 
         return ToolResult{ .success = true, .output = output };
     }
@@ -194,6 +207,14 @@ pub const RuntimeInfoTool = struct {
         try json_util.appendJsonKey(&buf, allocator, "tenant_enabled");
         try buf.appendSlice(allocator, if (self.config.tenant.enabled) "true" else "false");
         try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "telegram_dm_same_user_main");
+        try buf.appendSlice(allocator, "true");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "telegram_group_session_policy", "thread");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "session_idle_evict_on_request_path");
+        try buf.appendSlice(allocator, "false");
+        try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "configured_channels");
         try appendStringArray(&buf, allocator, configured_channels.items);
         try buf.appendSlice(allocator, ",");
@@ -239,6 +260,16 @@ pub const RuntimeInfoTool = struct {
         _ = self;
         const tenant_ctx = root.getTenantContext();
         const turn_ctx = root.getTurnContext();
+        const session_key = turn_ctx.session_key;
+        const canonical_user_id = if (session_key) |value| zaki_session.parseUserIdFromSessionKey(value) else null;
+        const lane = sessionLaneLabel(session_key);
+        const same_user_truth = if (tenant_ctx.user_id) |tenant_user_id|
+            if (canonical_user_id) |resolved_user_id|
+                std.mem.eql(u8, tenant_user_id, resolved_user_id)
+            else
+                false
+        else
+            canonical_user_id != null;
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(allocator);
@@ -246,8 +277,17 @@ pub const RuntimeInfoTool = struct {
         try json_util.appendJsonKeyValue(&buf, allocator, "turn_origin", turn_ctx.origin.toSlice());
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKey(&buf, allocator, "session_key");
-        if (turn_ctx.session_key) |session_key| {
-            try json_util.appendJsonString(&buf, allocator, session_key);
+        if (session_key) |resolved_session_key| {
+            try json_util.appendJsonString(&buf, allocator, resolved_session_key);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "session_lane", lane);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "canonical_user_id");
+        if (canonical_user_id) |resolved_user_id| {
+            try json_util.appendJsonString(&buf, allocator, resolved_user_id);
         } else {
             try buf.appendSlice(allocator, "null");
         }
@@ -260,6 +300,9 @@ pub const RuntimeInfoTool = struct {
         }
         try buf.appendSlice(allocator, ",");
         try appendOptionalInt(&buf, allocator, "tenant_numeric_user_id", tenant_ctx.numeric_user_id);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "same_user_truth");
+        try buf.appendSlice(allocator, if (same_user_truth) "true" else "false");
         try buf.appendSlice(allocator, "}");
         return try buf.toOwnedSlice(allocator);
     }
@@ -513,6 +556,78 @@ pub const RuntimeInfoTool = struct {
         } else {
             try buf.appendSlice(allocator, "null");
         }
+        try buf.appendSlice(allocator, "}");
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn buildExecutionTruthJson(self: *RuntimeInfoTool, allocator: std.mem.Allocator, user_id_override: ?[]const u8) ![]u8 {
+        const tenant_ctx = root.getTenantContext();
+        const turn_ctx = root.getTurnContext();
+        const scoped_user_id = resolveScopedUserId(tenant_ctx, user_id_override);
+        var snapshot = try runtime_truth.collectRuntimeSnapshot(allocator, self.config, scoped_user_id);
+        defer snapshot.deinit(allocator);
+        var task_focus = try runtime_truth.collectExecutionTaskFocus(
+            allocator,
+            self.config,
+            tenant_ctx.state_mgr,
+            resolveScopedNumericUserId(tenant_ctx, user_id_override),
+            scoped_user_id,
+            turn_ctx.session_key,
+        );
+        defer task_focus.deinit(allocator);
+        const surfaced_session_key = task_focus.task_session_key orelse turn_ctx.session_key;
+        const task_snapshot_ptr: ?*const @import("../zaki_state.zig").TaskSnapshot = if (task_focus.task_snapshot) |*value| value else null;
+        var truth = try runtime_truth.deriveExecutionTruth(
+            allocator,
+            &snapshot,
+            task_snapshot_ptr,
+            surfaced_session_key,
+            scoped_user_id,
+        );
+        defer truth.deinit(allocator);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKeyValue(&buf, allocator, "task", truth.task);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "task_key");
+        if (truth.task_key) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "current_session_key");
+        if (turn_ctx.session_key) |value| {
+            try json_util.appendJsonString(&buf, allocator, value);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "selection_rule", task_focus.selection_rule);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "owner", truth.owner);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "owner_source", truth.owner_source);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "status", truth.status);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "result", truth.result);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "failure", truth.failure);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "degraded");
+        try buf.appendSlice(allocator, if (truth.degraded) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "degraded_reason", truth.degraded_reason);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "fallback_active");
+        try buf.appendSlice(allocator, if (truth.fallback_active) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "fallback_reason", truth.fallback_reason);
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "fallback_chain", truth.fallback_chain);
         try buf.appendSlice(allocator, "}");
         return try buf.toOwnedSlice(allocator);
     }
@@ -1265,8 +1380,10 @@ fn readTelegramState(
         }
     }
 
-    const user_root = deriveUserRoot(config.workspace_dir);
-    const path = try std.fmt.allocPrint(allocator, "{s}/channel_state.json", .{user_root});
+    const user_root = try resolveScopedUserRoot(allocator, config, tenant_ctx, user_id_override);
+    defer if (user_root) |value| allocator.free(value);
+    const root_path = user_root orelse return .{ .data_source = "file_fallback" };
+    const path = try std.fmt.allocPrint(allocator, "{s}/channel_state.json", .{root_path});
     defer allocator.free(path);
 
     const file = std.fs.openFileAbsolute(path, .{}) catch return .{ .data_source = "file_fallback" };
@@ -1379,6 +1496,42 @@ test "runtime info summary includes state backend keys" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"ownership_lease\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"parallel_tools_rollout_percent\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"entity_scope_source\":\"config_default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"telegram_dm_same_user_main\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"telegram_group_session_policy\":\"thread\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"session_idle_evict_on_request_path\":false") != null);
+}
+
+test "runtime info session surfaces canonical same-user lane truth" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+
+    root.setTurnContext(.{
+        .origin = .user,
+        .session_key = "agent:zaki-bot:user:7:main",
+        .provider = "openrouter",
+        .model = "moonshotai/kimi-k2.5",
+    });
+    defer root.clearTurnContext();
+    root.setTenantContext(.{
+        .user_id = "7",
+        .numeric_user_id = 7,
+    });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"section\":\"session\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"session_lane\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"canonical_user_id\":\"7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"same_user_truth\":true") != null);
 }
 
 test "runtime info parseToolkitAvailability supports object items" {
@@ -1540,6 +1693,42 @@ test "runtime info telegram snapshot treats invalid override as context missing 
     try std.testing.expectEqualStrings("context_missing", snapshot.data_source);
 }
 
+test "runtime info telegram snapshot reads fallback file from scoped tenant root override" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const users_root = try std.fs.path.join(std.testing.allocator, &.{ base, "users" });
+    defer std.testing.allocator.free(users_root);
+    try std.fs.makeDirAbsolute(users_root);
+
+    const user_root = try std.fs.path.join(std.testing.allocator, &.{ users_root, "7" });
+    defer std.testing.allocator.free(user_root);
+    try std.fs.makeDirAbsolute(user_root);
+
+    const channel_state_path = try std.fs.path.join(std.testing.allocator, &.{ user_root, "channel_state.json" });
+    defer std.testing.allocator.free(channel_state_path);
+    try writeTestFile(channel_state_path, "{\"telegram\":{\"connected\":true,\"account_id\":\"main\",\"chat_id\":1110331014}}\n");
+
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.data_root = users_root;
+
+    const snapshot = try readTelegramState(std.testing.allocator, &cfg, .{}, "7");
+    var snapshot_mut = snapshot;
+    defer snapshot_mut.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("file_fallback", snapshot.data_source);
+    try std.testing.expectEqual(@as(?bool, true), snapshot.state.connected);
+    try std.testing.expectEqualStrings("main", snapshot.state.account_id.?);
+    try std.testing.expectEqual(@as(?i64, 1110331014), snapshot.state.chat_id);
+}
+
 test "runtime info heartbeat reads effective tenant heartbeat file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1634,6 +1823,193 @@ test "runtime info summary aligns scheduler backend and data source for override
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"scheduler_backend\":\"context_missing\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"data_source\":\"context_missing\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"context_incomplete\":true") != null);
+}
+
+test "runtime info execution truth surfaces compact founder-readable status" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullalis/workspace",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = true;
+    cfg.state.backend = "postgres";
+    cfg.reliability.fallback_providers = &.{"anthropic"};
+
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    root.setTurnContext(.{
+        .origin = .user,
+        .session_key = "agent:test:user:1:task:ship",
+        .provider = "openrouter",
+        .model = "moonshotai/kimi-k2.5",
+    });
+    defer root.clearTurnContext();
+    root.setTenantContext(.{ .user_id = "1", .expect_postgres_state = true });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"section\":\"execution_truth\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"task\":\"task\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"task_key\":\"agent:test:user:1:task:ship\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"owner\":\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"status\":\"degraded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"degraded\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"fallback_active\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"fallback_reason\":\"local_fallback\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"fallback_chain\":\"anthropic\"") != null);
+}
+
+test "runtime info execution truth surfaces recovered failed task from durable ledger" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const state_dir = try std.fs.path.join(std.testing.allocator, &.{ workspace, "state" });
+    defer std.testing.allocator.free(state_dir);
+    try std.fs.makeDirAbsolute(state_dir);
+    const ledger_path = try std.fs.path.join(std.testing.allocator, &.{ state_dir, "subagent_tasks.jsonl" });
+    defer std.testing.allocator.free(ledger_path);
+    try writeTestFile(
+        ledger_path,
+        "{\"id\":7,\"status\":\"failed\",\"label\":\"recover\",\"task_summary\":\"recover\",\"task_prompt\":\"recover prompt\",\"session_key\":\"agent:zaki-bot:user:1:main\",\"origin_channel\":\"agent\",\"origin_chat_id\":\"session:recover\",\"result\":null,\"error\":\"process_restarted_before_completion\",\"started_at\":42,\"completed_at\":84}\n",
+    );
+
+    var cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.reliability.fallback_providers = &.{"anthropic"};
+
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    root.setTurnContext(.{
+        .origin = .user,
+        .session_key = "agent:zaki-bot:user:1:task:7",
+        .provider = "openrouter",
+        .model = "moonshotai/kimi-k2.5",
+    });
+    defer root.clearTurnContext();
+    root.setTenantContext(.{ .user_id = "1" });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"section\":\"execution_truth\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"task\":\"task\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"status\":\"attention\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"result\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"failure\":\"process_restarted_before_completion\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"degraded\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"degraded_reason\":\"\"") != null);
+}
+
+test "runtime info execution truth from main surfaces active background task truth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const state_dir = try std.fs.path.join(std.testing.allocator, &.{ workspace, "state" });
+    defer std.testing.allocator.free(state_dir);
+    try std.fs.makeDirAbsolute(state_dir);
+    const ledger_path = try std.fs.path.join(std.testing.allocator, &.{ state_dir, "subagent_tasks.jsonl" });
+    defer std.testing.allocator.free(ledger_path);
+    try writeTestFile(
+        ledger_path,
+        "{\"id\":7,\"status\":\"failed\",\"label\":\"recover\",\"task_summary\":\"recover\",\"task_prompt\":\"recover prompt\",\"request_session_key\":\"agent:zaki-bot:user:1:main\",\"runtime_session_key\":\"agent:zaki-bot:user:1:task:7\",\"error\":\"process_restarted_before_completion\",\"started_at\":42,\"completed_at\":84}\n" ++
+            "{\"id\":8,\"status\":\"running\",\"label\":\"ship\",\"task_summary\":\"ship\",\"task_prompt\":\"ship prompt\",\"request_session_key\":\"agent:zaki-bot:user:1:main\",\"runtime_session_key\":\"agent:zaki-bot:user:1:task:8\",\"started_at\":100}\n",
+    );
+
+    var cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.reliability.fallback_providers = &.{"anthropic"};
+
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    root.setTurnContext(.{
+        .origin = .user,
+        .session_key = "agent:zaki-bot:user:1:main",
+        .provider = "openrouter",
+        .model = "moonshotai/kimi-k2.5",
+    });
+    defer root.clearTurnContext();
+    root.setTenantContext(.{ .user_id = "1" });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"section\":\"execution_truth\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"task\":\"task\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"task_key\":\"agent:zaki-bot:user:1:task:8\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"current_session_key\":\"agent:zaki-bot:user:1:main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"selection_rule\":\"main_active_task\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"result\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"status\":\"active\"") != null);
+}
+
+test "runtime info execution truth from main falls back to attention task when no active task exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const state_dir = try std.fs.path.join(std.testing.allocator, &.{ workspace, "state" });
+    defer std.testing.allocator.free(state_dir);
+    try std.fs.makeDirAbsolute(state_dir);
+    const ledger_path = try std.fs.path.join(std.testing.allocator, &.{ state_dir, "subagent_tasks.jsonl" });
+    defer std.testing.allocator.free(ledger_path);
+    try writeTestFile(
+        ledger_path,
+        "{\"id\":7,\"status\":\"failed\",\"label\":\"recover\",\"task_summary\":\"recover\",\"task_prompt\":\"recover prompt\",\"request_session_key\":\"agent:zaki-bot:user:1:main\",\"runtime_session_key\":\"agent:zaki-bot:user:1:task:7\",\"error\":\"process_restarted_before_completion\",\"started_at\":42,\"completed_at\":84}\n" ++
+            "{\"id\":8,\"status\":\"completed\",\"label\":\"done\",\"task_summary\":\"done\",\"task_prompt\":\"done prompt\",\"request_session_key\":\"agent:zaki-bot:user:1:main\",\"runtime_session_key\":\"agent:zaki-bot:user:1:task:8\",\"result\":\"completed\",\"started_at\":21,\"completed_at\":40}\n",
+    );
+
+    var cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.reliability.fallback_providers = &.{"anthropic"};
+
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    root.setTurnContext(.{
+        .origin = .user,
+        .session_key = "agent:zaki-bot:user:1:main",
+        .provider = "openrouter",
+        .model = "moonshotai/kimi-k2.5",
+    });
+    defer root.clearTurnContext();
+    root.setTenantContext(.{ .user_id = "1" });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"section\":\"execution_truth\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"task_key\":\"agent:zaki-bot:user:1:task:7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"current_session_key\":\"agent:zaki-bot:user:1:main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"selection_rule\":\"main_attention_task\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"failure\":\"process_restarted_before_completion\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"status\":\"attention\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"degraded\":false") != null);
 }
 
 test "runtime info parseTelegramStateJson supports top-level postgres shape" {
