@@ -2,16 +2,26 @@
 
 ## Current Phase
 Phase 1.5: Prompt Architecture and Liveness — IN PROGRESS
-Plan 02 (Liveness narration engine) — COMPLETE
+Plan 03 (Task decomposition) — COMPLETE
 
 ## Current Plan
-Phase 1.5, Plan 02 complete. Ready for Plan 03 (Task decomposition).
+Phase 1.5, Plan 03 complete. Ready for Plan 04 (Learning loop).
 
 ## Phase 0 Results
 - 00-01: 26 characterization tests added (e0ce57d), 5045/5076 pass, 0 fail
 - 00-02: 3 documentation artifacts created (60471d9), no runtime changes
 
 ## Decisions Log
+
+### 2026-04-10: Phase 1.5 Plan 03 complete — Task decomposition runtime
+- TaskPlan/TaskStep types with step state machine (pending/running/done/failed) in task_planner.zig (REQ-020)
+- parseTaskPlan: bounded XML scan (same pattern as dispatcher.zig), null-safe, never panics (T-1.5-05)
+- extractTextAndPlan: zero-allocation splitter separating response text from <task_plan> block
+- emitStepEvent: narration_frame plan_step events via Observer vtable (wires into Plan 02 narration bus)
+- buildTaskDecompositionSection: system prompt instructions with <task_plan> XML format and 4 rules
+- Section inserted between turn classification and safety in buildSystemPrompt
+- 14 new tests; 5123/5154 pass total; ReleaseSmall build confirmed
+- Commits: f03e10a (task_planner.zig), 41e68bf (prompt.zig + root.zig wiring)
 
 ### 2026-04-10: Phase 1.5 Plan 02 complete — Liveness narration engine
 - NarrationObserver wraps any Observer, translates tool_call_start and turn_stage events into NarrationFrame structs (REQ-019)
@@ -71,6 +81,6 @@ None currently.
 - M1 (Kernel UX) complete and merged to main
 - M2 (Context Introspection) complete and merged to main
 - Build commands: `zig build test --summary all`, `zig build -Doptimize=ReleaseSmall`
-- 189,005 lines across 188 .zig files (+ narration.zig added in 01.5-02)
-- 1,500+ inline tests (5109/5140 passing after 01.5-02)
-- Last session stopped at: Completed 01.5-02-PLAN.md (2026-04-10T11:09:00Z)
+- 189,005 lines across 188 .zig files (+ narration.zig in 01.5-02, task_planner.zig in 01.5-03)
+- 1,500+ inline tests (5123/5154 passing after 01.5-03)
+- Last session stopped at: Completed 01.5-03-PLAN.md (2026-04-10T11:16:29Z)
