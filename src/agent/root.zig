@@ -45,6 +45,7 @@ pub const context_tokens = @import("context_tokens.zig");
 pub const context_report = @import("context_report.zig");
 pub const max_tokens_resolver = @import("max_tokens.zig");
 pub const prompt = @import("prompt.zig");
+pub const narration = @import("narration.zig");
 pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
@@ -1354,6 +1355,8 @@ pub const Agent = struct {
         self.current_turn_enriched_user = enriched;
         errdefer self.clearCurrentTurnProviderOverride();
 
+        // NOTE: Narration frames flow only through the Observer event bus.
+        // They must NEVER be appended to self.history — see narration.zig.
         const raw_user_history = try self.allocator.dupe(u8, user_message);
         var raw_user_history_appended = false;
         errdefer if (!raw_user_history_appended) self.allocator.free(raw_user_history);
@@ -2757,6 +2760,13 @@ test "prompt module reexport" {
     _ = prompt.TurnClass;
     _ = prompt.PersonaSection;
     _ = prompt.NarrationPolicy;
+}
+
+test "narration module reexport" {
+    _ = narration.NarrationObserver;
+    _ = narration.NarrationFrame;
+    _ = narration.NarrationCallback;
+    _ = narration.FrameType;
 }
 
 test "memory_loader module reexport" {
