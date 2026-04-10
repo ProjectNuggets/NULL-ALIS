@@ -37,18 +37,15 @@ Plans:
 - [ ] 02-05-PLAN.md — Task tools: task_list, task_get, task_stop LLM-callable tools
 - [ ] 02-06-PLAN.md — Cost and usage runtime: UsageRuntime, per-turn recording, session aggregation
 
-### Phase 02.1: Streaming, Voice, and Channel Polish (INSERTED)
+### Phase 02.1: Live Agent Narration Stream (INSERTED)
 
-**Goal:** Progressive streaming with live SSE delivery, voice-first agent mode across channels, operator channel health dashboard, and structured security audit command — making ZAKI narrate itself like Claude Code
-**Requirements:** [REQ-023, REQ-024, REQ-025, REQ-026]
+**Goal:** [Urgent work - to be planned]
+**Requirements**: TBD
 **Depends on:** Phase 2
-**Plans:** 4/4 plans complete
+**Plans:** 0 plans
 
 Plans:
-- [x] 02.1-01-PLAN.md — Progressive streaming: PacedFrameSink decorator, delivery mode resolution, live SSE path in gateway
-- [x] 02.1-02-PLAN.md — Health + security core modules: channel_health.zig aggregation, security_review.zig checks and scoring
-- [x] 02.1-03-PLAN.md — Voice-first mode: VoiceMode module, voice narration types, cross-channel audio capability
-- [x] 02.1-04-PLAN.md — Wire commands + endpoints: /health, /security-review, /voice slash commands, gateway API endpoints
+- [ ] TBD (run /gsd-plan-phase 02.1 to break down)
 
 ### Phase 3: Canonical Session and Context Runtime
 - [ ] 03-01: Session identity refactor (src/session/)
