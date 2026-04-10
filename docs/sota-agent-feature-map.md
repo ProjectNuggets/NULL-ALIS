@@ -84,29 +84,50 @@ This plan is grounded in the local repos, not marketing copy.
 
 ### Nullalis is strongest at
 
-- small-footprint Zig runtime
-- clear vtable extension boundaries
-- strong tenant/runtime contract
-- stable SSE chat delivery
+- small-footprint Zig runtime (single binary, runs on RPi to cloud)
+- clear vtable extension boundaries (`src/tools/root.zig`, `src/memory/root.zig`)
+- strong tenant/runtime contract (`src/gateway.zig`, `src/tenant_lock.zig`)
+- stable SSE chat delivery (`src/gateway.zig`)
+- 19 channel implementations — widest channel coverage of any agent runtime (`src/channels/`)
+- 10+ memory storage backends with 9-stage retrieval pipeline (`src/memory/`)
+- vector embedding plane with circuit breakers and durable outbox (`src/memory/vector/`)
+- semantic response cache (`src/memory/lifecycle/semantic_cache.zig`)
+- hardware/IoT tools — I2C, SPI, serial, MaixCam, firmware flashing (`src/tools/i2c.zig`, `src/tools/spi.zig`, `src/hardware.zig`)
+- voice/STT/TTS pipeline already shipping for Telegram (`src/voice.zig`)
+- browser automation and screenshot tools (`src/tools/browser.zig`, `src/tools/screenshot.zig`)
+- image processing tool (`src/tools/image.zig`)
+- rollout/canary system with shadow mode (`src/memory/lifecycle/rollout.zig`)
+- distributed system patterns: circuit breakers, outbox, tenant leases, supervised restart with backoff
+- SkillForge auto-discovery from GitHub/ClaHub/HuggingFace (`src/skillforge.zig`)
+- Litestream S3 WAL replication per user (`deploy/k8s/zaki-bot/`)
+- OpenClaw migration path built (`src/migration.zig`)
+- Prometheus metrics endpoint with ServiceMonitor + PrometheusRule (`/metrics`)
+- security: 5 sandbox backends, encrypted secrets, audit logging (`src/security/`)
 - durable memory and diagnostics foundations
-- security and multitenant posture
 
 ## Competitive Feature Matrix
 
 | Area | Claude Code | OpenClaw | Nullalis Today | Nullalis Target |
 |---|---|---|---|---|
-| Core interaction | terminal-native REPL with rich slash commands and execution loop | online gateway plus CLI, chat, web, apps, nodes | online SSE chat plus CLI and channel paths | online-first agent with coding-grade execution UX |
+| Core interaction | terminal-native REPL with rich slash commands and execution loop | online gateway plus CLI, chat, web, apps, nodes | online SSE chat plus CLI and 19 channel paths | online-first agent with coding-grade execution UX |
 | Session model | conversation/session management, resume, export, compact | gateway-owned routing, DM scopes, daily and idle reset, agent bindings | persistent `main/thread/task/cron` lanes and tenant session keys | one canonical session and lane contract with user-visible controls |
-| Tool system | explicit tool registry, permissions, concurrency, presets | shared core tools plus channel-owned actions | broad tool registry and tool profiles | explicit tool metadata, approval classes, safe presets |
-| Plan and approval | plan mode, ask-once, per-tool approvals, rules | strong safety defaults on channel ingress and device trust | policy and sandbox exist, but approval UX is thin | first-class execute/plan/review/approve modes |
-| Background tasks | dedicated task tools and task records | durable task ledger with notify policies and audit | subagent lifecycle exists, durability improving | task system as a first-class online feature |
-| Multi-agent | agent tool, team tools, send-message tools | isolated multi-agent routing and background child sessions | spawn/delegate/subagent exist | named teams, inspectable delegation, task-backed coordination |
-| Context and compaction | mature context management in query engine | pluggable context engine lifecycle | strong memory stack, trim-first hot-path compaction | explicit context engine contract and better compaction policy |
-| Transcript hygiene and provenance | mature session/runtime artifacts | strong session repair and inter-session provenance semantics | partial continuity and identity truth, but limited transcript hygiene | transcript repair, provenance tagging, and pruning become explicit runtime systems |
-| Extensibility | plugins, skills, MCP client and server | plugins by capability, channels/providers/services, context engine plugins | skills and MCP client exist, connectors are partial | skills + MCP + connectors under one capability graph |
-| Online control plane | bridge and remote session handoff, but CLI-first | gateway as product control plane | SSE API, diagnostics, tenant runtime | online operator surface with run events, approvals, tasks, resume |
-| Channel and app UX | not core product focus | flagship product strength | Telegram and app path exist, more channels exist in code | stable online app/chat experience first, channel parity second |
-| Status and review | `/doctor`, `/status`, `/review`, `/security-review`, `/usage` | `doctor`, `status`, `tasks audit`, routing diagnostics | `doctor`, `status`, runtime truth, partial slash commands | operator-grade review, debug, audit, task visibility, and usage truth |
+| Tool system | explicit tool registry, permissions, concurrency, presets (40+ tools) | shared core tools plus channel-owned actions (40+ tools) | 42 tool implementations with vtable dispatch and tool profiles | explicit tool metadata, approval classes, safe presets |
+| Plan and approval | plan mode, ask-once, per-tool approvals, wildcard rules | strong safety defaults on channel ingress and device trust | policy and 5 sandbox backends exist, but approval UX is thin | first-class execute/plan/review/approve modes |
+| Background tasks | dedicated task tools and task records | durable task ledger with notify policies and audit (SQLite) | subagent lifecycle exists, durability improving | task system as a first-class online feature |
+| Multi-agent | agent tool, team tools (TeamCreate/Delete), send-message | isolated multi-agent routing and background child sessions | spawn/delegate/subagent exist | named teams, inspectable delegation, task-backed coordination |
+| Context and compaction | mature context management in QueryEngine, query snipping | pluggable context engine lifecycle with plugin hooks | strong memory stack, auto-compaction on token pressure, continuity pipeline | explicit context engine contract and better compaction policy |
+| Memory | CLAUDE.md files (project/user/team), extracted memories | QMD/Honcho, session JSONL, search-optimized indexing | **10+ backends, 9-stage retrieval, vector plane with circuit breakers, semantic cache** | scoped durable state plus working state with selective recall |
+| Transcript hygiene and provenance | mature session/runtime artifacts | strong session repair and inter-session provenance semantics | partial continuity and identity truth, limited transcript hygiene | transcript repair, provenance tagging, and pruning become explicit runtime systems |
+| Extensibility | plugins, skills, MCP client and server, bundled plugins | plugins by capability, channels/providers/services, context engine plugins, ClawHub | skills, MCP client, SkillForge auto-discovery, connectors partial | skills + MCP + connectors under one capability graph |
+| Online control plane | bridge and remote session handoff, but CLI-first | gateway as product control plane with WebChat and Control UI | SSE API, diagnostics, tenant runtime, Prometheus metrics | online operator surface with run events, approvals, tasks, resume |
+| Channel and app UX | not core product focus | 23+ channels, flagship product strength | **19 channels: Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Mattermost, IRC, iMessage, Email, Lark, DingTalk, Line, OneBot, QQ + more** | stable online app/chat experience first, channel parity second |
+| Voice and multimodal | voice mode (STT streaming), feature flagged | TTS (ElevenLabs/MS/system), STT, media understanding | **STT via Groq Whisper for Telegram, TTS callback, image processing tool** | voice-first mode, cross-channel audio |
+| Hardware and IoT | not applicable | node commands (camera, screen, location, system.run) | **I2C, SPI, serial, MaixCam vision, firmware flashing, hardware_info** | unique edge/embedded differentiator |
+| Status and review | `/doctor`, `/status`, `/review`, `/security-review`, `/usage`, `/cost` | `doctor`, `status`, `tasks audit`, `security audit` (50+ checks) | `doctor`, `status`, runtime truth, partial slash commands | operator-grade review, debug, audit, task visibility, and usage truth |
+| IDE integration | VS Code, JetBrains bridge, Chrome extension, web bridge | macOS menu bar, iOS/Android nodes, WebChat | CLI and API only | IDE bridge and editor attachment (P2) |
+| Streaming UX | React+Ink terminal, rich streaming, thinking replay | block streaming with human delay, per-channel modes, embedded chunker | SSE progress events, reasoning summaries, typing indicators | run-event grammar with tool visibility and approval prompts |
+| Cost and usage | per-turn token/cost tracking, `/cost`, `/usage` commands | usage tracking modes (off/tokens/full) | partial usage reporting | per-turn cost, retry-aware, task cost, operator surfaces |
+| Security audit | permissions command, tool approval rules | `security audit` with 50+ checks, auto-fix, threat model | policy, audit logging, sandbox detection | structured audit, security review command |
 
 ## Nullalis Target Spec
 
@@ -165,24 +186,6 @@ If a proposed change does not move Nullalis toward that parity bar, it is not pa
 - context-engine plugins
 - app handoff between surfaces
 - richer voice and multimodal execution parity
-
-## Closing Remaining Gaps
-
-This section is additive gap-closure scope. It is intentionally separate from
-the original target spec so the final SOTA bar is explicit.
-
-- Coding workflow artifacts must be first-class: changed files, diff summary, commands run, tests run, test results, review state, and patch outcome.
-- Patch safety must be a runtime contract: risky paths, dirty worktree policy, rollback/retry checkpoints, and partial-success handling.
-- Nullalis needs a host/runtime capability contract, not just online APIs: hosted, CLI, desktop, VS extension, and edge/device runtimes must share one agent model with graceful degradation.
-- Retry, recovery, failover, interruption, and resumed-run behavior must appear as structured run artifacts rather than hidden implementation details.
-- Steering semantics must be explicit and separate from stop, cancel, and abort semantics.
-- Approval must be modeled as a full state machine, not just a yes/no gate.
-- Prompt scaffold, policy set, persona source, and model/profile choice must be captured as provenance for every run.
-- Memory needs an explicit write, correction, and repair policy so durable behavior improves without silent drift.
-- Multi-agent work needs an explicit coordination contract for ownership, write-scope isolation, merge/conflict handling, and accountability.
-- Cross-surface handoff must preserve continuity and provenance across app, API, CLI, extension, and later edge/device surfaces.
-- Background work needs an explicit notification policy.
-- SOTA claims require a final parity eval pack that exercises real coding workflows, interruption, approval loops, reconnect/resume, degraded hosts, and multi-agent coordination.
 
 ## What Not To Import Blindly
 
@@ -511,80 +514,6 @@ Nullalis already has tools, sandboxing, and policy, but not a fully explicit exe
 - keep `Tool` vtable stable; layer metadata beside it instead of mutating every call site first
 - move approval decisions out of prompt-only behavior into structured policy
 - make slash commands and SSE clients use the same approval engine
-
-### F1.5A. Liveness Narration — "Feels Alive"
-
-**Borrow from**
-
-- Claude Code real-time status narration: always showing what tool is running, why, and what it's waiting on
-- Claude Code task decomposition: breaking complex work into visible sub-steps
-
-**Why it matters**
-
-This is the single biggest UX gap between nullalis and Claude Code. An agent that goes silent during work feels broken. An agent that narrates feels alive and trustworthy. This is the difference between a tool and a digital twin.
-
-**Current Nullalis owners**
-
-- `src/agent/prompt.zig` — system prompt has one line about "send short progress updates"
-- `src/observability.zig` — observer emits `tool_call_start`, `tool_call`, `turn_stage` internally
-- `src/gateway.zig` — SSE `progress` events exist but only carry generic "thinking" labels
-
-**Add**
-
-- `src/agent/narration.zig` — narration engine that converts observer events into user-facing status
-- `src/agent/task_planner.zig` — task decomposition: detect complex requests, emit step plan, track per-step progress
-
-**Target behavior**
-
-- agent always states what it's about to do before doing it ("Using web_search to find..."), names the tool, explains why, reports the result
-- complex requests trigger visible plan: "I'll do this in 3 steps: 1. Look up... 2. Compare... 3. Write..."
-- each step emits progress events and completion markers
-- narration verbosity is configurable: quiet / normal / verbose (via `/verbose`)
-- background/subagent work suppresses narration to avoid noise
-- typing indicators on channels reflect real activity
-
-**Implementation notes**
-
-- wire observer events to a narration layer that produces user-facing text
-- narration output feeds SSE `progress` events (existing transport) and channel typing indicators
-- prompt instructions teach the model when to decompose vs when to just execute
-- plan revision: if a step fails, agent re-emits revised plan
-
-### F1.5B. Prompt Architecture And Persona
-
-**Borrow from**
-
-- Claude Code structured prompt assembly with tool-specific contributions
-- OpenClaw rich system prompt tied to channel, runtime, and subagent context
-
-**Why it matters**
-
-The system prompt is the agent's soul. A monolithic prompt builder limits composability and makes mode-specific behavior fragile. A configurable persona is required for the digital-twin feel.
-
-**Current Nullalis owners**
-
-- `src/agent/prompt.zig` — monolithic `buildSystemPrompt` with inline section strings
-
-**Add**
-
-- `src/agent/prompt_sections.zig` — composable named sections
-- `src/agent/learning.zig` — correction detector, preference extractor, durable behavioral facts
-
-**Target behavior**
-
-- prompt is assembled from composable sections: identity, persona, turn_classification, narration_rules, tool_policy, safety, workspace, memory, datetime, runtime
-- persona reads from workspace `SOUL.md` with runtime defaults and per-config overrides
-- persona dimensions: warmth, proactivity, verbosity, formality
-- agent detects corrections ("no, I meant...", "don't do that", "always use...") and stores as durable behavioral preferences
-- behavioral preferences are injected into future prompts automatically
-- lighter subagent prompt variant excludes persona/narration sections
-
-**Implementation notes**
-
-- keep `buildSystemPrompt` as the assembly entry point, refactor internals to section registry
-- learning loop writes to memory with `behavioral_preference/` key prefix
-- newer corrections supersede older ones on the same topic
-- persona default: "attentive digital twin" — warm, moderately proactive, concise, informal
 
 ### F2. Structured Run Events For Online UX
 
@@ -1044,10 +973,8 @@ As Nullalis becomes more agentic online, operators need a clean reason for every
 This is the safest order for implementation.
 
 1. `F1` execution modes and tool metadata
-2. `F1.5A` liveness narration and task decomposition
-3. `F1.5B` prompt architecture and persona
-4. `F2` structured run events
-5. `F3` durable task ledger
+2. `F2` structured run events
+3. `F3` durable task ledger
 4. `F4` canonical session identity and lane contract
 5. `F5` context-engine extraction
 6. `F8` online operator API contract
@@ -1079,10 +1006,6 @@ This is a structural advantage over both reference products when executed correc
 
 Nullalis reaches the intended product shape when all of these are true:
 
-- the agent feels alive: always narrating what it's doing, which tool it picked, why, and what it's waiting on
-- complex requests are decomposed into visible sub-steps with per-step status
-- the agent learns from corrections and applies them in future turns without being told twice
-- the persona feels like a digital twin, not a generic chatbot
 - an online user can see what the agent is doing, not just the final answer
 - approvals are explicit and explainable
 - background work is durable, inspectable, and stoppable
@@ -1093,12 +1016,235 @@ Nullalis reaches the intended product shape when all of these are true:
 - the agent core itself is no longer meaningfully behind either reference runtime on loop quality, prompting, compaction, reflection, and task/session semantics
 - abort, provenance, failover, channel action ownership, and usage truth are no longer hidden gaps versus the reference products
 
+## Features Missing From Original Plan (Added After Deep Repo + Reference Scan)
+
+### F16. Edge/Offline Deployment Mode
+
+**Why it matters**
+
+Nullalis already runs as a single Zig binary with Ollama for local LLM + local embeddings + SQLite storage. No other agent runtime in this class can run fully offline on a Raspberry Pi. This is a genuine differentiator.
+
+**Current Nullalis owners**
+
+- `src/providers/ollama.zig`
+- `src/memory/engines/sqlite.zig`
+- `src/memory/vector/embeddings_ollama.zig`
+- `build.zig` (engine feature flags)
+
+**Target behavior**
+
+- explicit `edge` deployment profile that strips cloud dependencies
+- local-first memory, provider, and embedding defaults
+- zero external network requirement when configured for edge
+
+### F17. Channel Breadth as Product Surface
+
+**Why it matters**
+
+19 channels is the widest coverage of any agent runtime. Neither Claude Code nor OpenClaw matches this. The roadmap treats channels as infrastructure but should treat them as a product feature.
+
+**Current Nullalis owners**
+
+- `src/channels/` (19 implementations)
+- `src/channels/dispatch.zig` (routing, supervised restart, outcome publishing)
+- `src/inbound_canonicalizer.zig` (cross-channel identity resolution with TTL cache)
+
+**Missing**
+
+- channel-specific capability discovery (what actions work where)
+- cross-channel session continuity (start in Telegram, continue in web)
+- channel health dashboard for operators
+- per-channel streaming modes (OpenClaw has off/partial/block/progress)
+
+### F18. Voice-First Agent Mode
+
+**Why it matters**
+
+STT+TTS pipeline already works for Telegram. Foundation exists but voice is not yet a first-class execution mode.
+
+**Current Nullalis owners**
+
+- `src/voice.zig` (Groq Whisper STT, TTS callback)
+- `src/channels/telegram.zig` (audio message handling)
+
+**Target behavior**
+
+- voice mode as explicit execution mode (not just transcribe→text→synthesize)
+- voice across channels (Discord voice, WhatsApp audio, etc.)
+- streaming TTS for long responses
+
+### F19. Semantic Cache as Cost Control
+
+**Why it matters**
+
+Already built (`src/memory/lifecycle/semantic_cache.zig`) but not exposed as operator feature.
+
+**Target behavior**
+
+- operator-visible cache hit rate, cost savings, cache policies
+- wired into usage/cost runtime (F14) as "avoided cost"
+- configurable per-user or per-deployment
+
+### F20. Memory Migration and Portability
+
+**Why it matters**
+
+OpenClaw migration exists (`src/migration.zig`). Memory export/import should be a user-facing feature.
+
+**Target behavior**
+
+- brain portability: export/import memory to new deployment
+- snapshot export with provenance metadata (aligns with `plan.md` Track D)
+- import from external sources (other assistants, note apps)
+
+### F21. IDE Bridge and Editor Integration
+
+**Borrow from**
+
+- Claude Code: VS Code/JetBrains bridge, Chrome extension, web bridge, teleport between devices
+- OpenClaw: macOS menu bar, WebChat, Control UI dashboard
+
+**Why it matters**
+
+Both reference products invest heavily in being where the user works. Nullalis is API-only today.
+
+**Target behavior (P2, not blocking SOTA core)**
+
+- VS Code extension that connects to nullalis gateway
+- web dashboard for operator controls (session, tasks, approvals)
+- later: Chrome extension, mobile companion
+
+### F22. Progressive Streaming with Human Pacing
+
+**Borrow from**
+
+- OpenClaw: block streaming with `humanDelay` (800-2500ms), `EmbeddedBlockChunker`, per-channel streaming modes
+- Claude Code: React+Ink streaming with thinking replay
+
+**Why it matters**
+
+Current SSE streaming works but lacks the polished feel of either reference product.
+
+**Current Nullalis owners**
+
+- `src/gateway.zig` (SSE handler)
+- `src/channels/telegram.zig` (100ms chunk delays already exist)
+
+**Target behavior**
+
+- configurable per-channel streaming modes (off/partial/block/progress)
+- human-like pacing for messaging channels
+- code-fence safety in chunk breaks
+
+### F23. Security Audit Command
+
+**Borrow from**
+
+- OpenClaw: `security audit` with 50+ check IDs, `--deep`, `--fix`, `--json` modes
+- Claude Code: `/security-review` command
+
+**Why it matters**
+
+As Nullalis becomes more agentic, a structured security self-check is essential.
+
+**Current Nullalis owners**
+
+- `src/security/policy.zig`
+- `src/security/audit.zig`
+- `src/doctor.zig`
+
+**Target behavior**
+
+- `/security-audit` command checking: tool blast radius, exec approval drift, network exposure, sandbox config, policy drift
+- auto-fixable items
+- JSON output for CI integration
+
+### F24. Presence and Typing System
+
+**Borrow from**
+
+- OpenClaw: presence subscription over WebSocket, online/offline status, typing indicators
+
+**Current Nullalis owners**
+
+- `src/channels/telegram.zig` (typing indicators exist)
+- `src/channels/discord.zig` (typing state exists)
+
+**Target behavior**
+
+- cross-channel presence aggregation
+- typing indicators for all channels that support it
+- presence API for app clients
+
+### F25. Decision Journal
+
+**From plan.md suggested features**
+
+**Why it matters**
+
+The agent keeps structured decision records — what was decided, why, which memories were used, what changed. Improves trust and explainability.
+
+**Target behavior**
+
+- structured decision records stored in memory system
+- accessible via operator commands
+- feeds into audit and trust graph
+
+### F26. Simulation Mode
+
+**From plan.md suggested features**
+
+**Why it matters**
+
+Before action, user can ask "simulate what you'd do this week." Builds trust before autonomy is increased.
+
+**Target behavior**
+
+- dry-run execution mode that shows planned actions without executing
+- cost estimation for planned work
+- approval checkpoint before transition to real execution
+
+## Claude Code Features Not Yet In Plan
+
+These exist in Claude Code but are not yet addressed in the nullalis roadmap:
+
+1. **Worktree isolation** — git worktree per agent/session (`EnterWorktreeTool`). Useful for parallel coding tasks.
+2. **Multi-pass execution** — `/passes` for iterative refinement loops.
+3. **Notebook editing** — Jupyter notebook cell editing tool.
+4. **REPL tool** — run code in Python/Node REPL.
+5. **Session teleport** — transfer session to another device (`/teleport`).
+6. **Auto-dream** — background ideation during idle time.
+7. **Hooks system** — pre/post tool execution hooks for user customization.
+8. **Query snipping** — compress context while preserving semantics.
+9. **Feature flag infrastructure** — GrowthBook-based A/B testing and dead-code elimination.
+10. **Direct connect / server mode** — persistent Claude Code instances.
+11. **Plugin auto-update** — skill and plugin version management.
+12. **MCP server mode** — expose nullalis tools to other agents (not just client).
+13. **Team memory sync** — shared team knowledge base.
+
+## OpenClaw Features Not Yet In Plan
+
+These exist in OpenClaw but are not yet addressed in the nullalis roadmap:
+
+1. **ACP (Agent Client Protocol)** — external harness support for Codex, Claude Code, Cursor, Copilot. Lets nullalis delegate to other agent runtimes.
+2. **Canvas / A2UI** — agent-driven visual workspace with push/reset/eval/snapshot.
+3. **Node/device commands** — camera, screen record, location, system.run, system.notify on mobile nodes.
+4. **WebChat** — built-in static chat UI over WebSocket.
+5. **Control UI** — web dashboard for status/config/tools/sessions.
+6. **DM pairing model** — short pairing codes for new DM access (simpler than current approach).
+7. **Block streaming with EmbeddedBlockChunker** — sophisticated chunking with code-fence safety.
+8. **Standing orders** — persistent recurring instructions.
+9. **Message debouncing/coalescing** — rapid message merge for better UX.
+10. **Context engine plugins** — pluggable context assembly strategies.
+11. **Threat model documentation** — formal threat model atlas.
+12. **Bonjour/mDNS discovery** — local device discovery for nodes.
+
 ## Decision Rule
 
 When choosing between a Claude Code behavior and an OpenClaw behavior:
 
 - prefer Claude Code for execution UX, tool ergonomics, and operator workflows
 - prefer OpenClaw for session ownership, online control plane, task durability, and routing
-- prefer Nullalis for runtime contracts, tenant posture, and implementation architecture
+- prefer Nullalis for runtime contracts, tenant posture, implementation architecture, channel breadth, memory sophistication, and edge deployment
 
 That is the synthesis path that can make Nullalis state-of-the-art without turning it into a clone.

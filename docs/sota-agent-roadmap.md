@@ -1,8 +1,10 @@
 # SOTA Agent Roadmap
 
-Status: active planning
-Date: 2026-04-08
+Status: active planning — source of truth for execution
+Date: 2026-04-09 (updated)
 Primary input: `docs/sota-agent-feature-map.md`
+Long-term vision: `/Users/nova/Downloads/plan.md` (Tracks A-G)
+Scope: This roadmap covers the agent-core SOTA program (plan.md Phase 1: Trustworthy Digital Twin Core + execution parity with Claude Code and OpenClaw). Tracks B-G (network, marketplace, inheritance, certificates, agent-as-API) are future phases after this program completes.
 
 ## Goal
 
@@ -43,41 +45,16 @@ It is designed to be:
 
 ## Program Structure
 
-The program is split into 8 phases.
+The program is split into 6 phases.
 
 1. Phase 0: Baseline and safety net
 2. Phase 1: Agent execution contract
-3. Phase 1.5: Prompt architecture and liveness ("feels alive")
-4. Phase 2: Online runtime visibility and tasks
-5. Phase 3: Canonical session and context runtime
-6. Phase 4: Operator parity and platform capability graph
-7. Phase 5: Multi-agent teams and parity closeout
-8. Phase 6: Closing remaining gaps
+3. Phase 2: Online runtime visibility and tasks
+4. Phase 3: Canonical session and context runtime
+5. Phase 4: Operator parity and platform capability graph
+6. Phase 5: Multi-agent teams and parity closeout
 
 Each phase is made of sprint-sized branches.
-
-## Phase 6: Closing Remaining Gaps
-
-Purpose:
-- isolate the remaining gap-closure work from the original plan
-- make the final SOTA completion bar auditable
-- prevent important parity items from staying implicit
-
-This final phase is additive. It does not replace earlier phases.
-
-Required closure areas:
-- coding workflow artifacts and patch outcome ledger
-- patch safety, rollback, and dirty-worktree contract
-- host/runtime capability and degraded-mode contract across hosted, CLI, desktop, VS extension, and edge/device targets
-- retry, recovery, failover, and interruption provenance
-- steering semantics distinct from stop/cancel/abort
-- approval state-machine semantics and replay behavior
-- prompt, policy, and model-selection provenance
-- memory write, correction, and repair policy
-- multi-agent ownership, write-scope, and merge/conflict contract
-- cross-surface session handoff and continuity
-- notification policy for background and task work
-- final SOTA parity eval pack covering real coding workflows
 
 ## Phase 0: Baseline And Safety Net
 
@@ -296,160 +273,6 @@ Depends on:
 
 Parallel-safe:
 - no
-
-## Phase 1.5: Prompt Architecture And Liveness
-
-Purpose:
-- make the agent feel alive — always showing what it's doing, thinking, and planning
-- give the agent the ability to decompose complex tasks into visible sub-steps
-- build a structured prompt scaffold that makes persona, narration, and tool-use policy composable
-- close the biggest gap vs Claude Code: the agent should never go silent during work
-
-### Sprint 1.5A
-
-Branch:
-- `refactor/prompt-scaffold-v1`
-
-Goal:
-- refactor the monolithic prompt builder into a composable scaffold with named sections
-
-Primary files:
-- `src/agent/prompt.zig`
-- `src/agent/root.zig`
-
-Add:
-- `src/agent/prompt_sections.zig`
-
-Deliverables:
-- composable prompt sections: identity, persona, turn_classification, narration_rules, tool_policy, safety, workspace, memory, datetime, runtime
-- section registry so channels/modes can include/exclude sections
-- persona section reads from workspace `SOUL.md` with runtime defaults
-- turn classification instruction: agent classifies each turn as chat/execute/wake/repair/operator before responding
-- narration rules: "always state what you are about to do before doing it, name the tool, explain why, report the result"
-
-Depends on:
-- Phase 1 complete (execution modes inform prompt shaping)
-
-Parallel-safe:
-- no
-
-### Sprint 1.5B
-
-Branch:
-- `feat/liveness-narration-v1`
-
-Goal:
-- agent emits real-time user-facing narration during execution (Claude Code parity)
-
-Primary files:
-- `src/agent/root.zig`
-- `src/observability.zig`
-- `src/gateway.zig`
-- `src/agent/prompt.zig`
-
-Add:
-- `src/agent/narration.zig`
-
-Deliverables:
-- narration engine that converts observer events into user-facing progress text:
-  - tool_call_start -> "Using {tool_name} to {reason}..."
-  - tool_call complete -> "Got result from {tool_name} ({duration}ms)"
-  - llm_request -> "Thinking..."
-  - turn_stage -> "Working on step {n}: {label}"
-- narration output wired to SSE `progress` events and channel typing indicators
-- configurable narration verbosity (quiet / normal / verbose) via `/verbose` command
-- narration suppression for background/subagent work
-
-Depends on:
-- `refactor/prompt-scaffold-v1`
-
-Parallel-safe:
-- no
-
-### Sprint 1.5C
-
-Branch:
-- `feat/task-decomposition-v1`
-
-Goal:
-- agent breaks complex requests into visible sub-steps before execution
-
-Primary files:
-- `src/agent/root.zig`
-- `src/agent/prompt.zig`
-
-Add:
-- `src/agent/task_planner.zig`
-
-Deliverables:
-- complexity detector: agent identifies multi-step requests and triggers decomposition
-- plan emission: agent shows numbered plan to user before executing ("I'll do this in 3 steps: 1... 2... 3...")
-- per-step status: each step emits progress events and completion markers
-- plan revision: if a step fails or changes scope, agent re-emits revised plan
-- prompt instructions that teach the agent when to decompose vs. when to just execute
-- step results accumulate into final synthesized response
-
-Depends on:
-- `refactor/prompt-scaffold-v1`
-- `feat/liveness-narration-v1`
-
-Parallel-safe:
-- no
-
-### Sprint 1.5D
-
-Branch:
-- `feat/learning-loop-v1`
-
-Goal:
-- agent detects corrections and preferences, stores them durably, applies in future turns
-
-Primary files:
-- `src/agent/root.zig`
-- `src/agent/prompt.zig`
-- `src/memory/root.zig`
-
-Add:
-- `src/agent/learning.zig`
-
-Deliverables:
-- correction detector: recognizes "no, I meant...", "don't do that", "always use..." patterns
-- preference extractor: derives behavioral rules from corrections
-- durable storage: writes behavioral facts to memory with `behavioral_preference/` key prefix
-- prompt injection: loads relevant behavioral preferences into system prompt for future turns
-- decay/override: newer corrections supersede older ones on the same topic
-
-Depends on:
-- `refactor/prompt-scaffold-v1`
-
-Parallel-safe:
-- yes, can run with `feat/task-decomposition-v1` if shared edits to `src/agent/root.zig` are small
-
-### Sprint 1.5E
-
-Branch:
-- `feat/persona-calibration-v1`
-
-Goal:
-- configurable personality depth and digital-twin warmth
-
-Primary files:
-- `src/agent/prompt.zig`
-- `src/agent/root.zig`
-- `src/config.zig`
-
-Deliverables:
-- persona resolver: reads `SOUL.md` from workspace, merges with config-level persona settings
-- persona dimensions: warmth (clinical <-> warm), proactivity (reactive <-> anticipatory), verbosity (terse <-> detailed), formality (casual <-> formal)
-- runtime persona override via `/config persona <dimension> <value>`
-- persona affects: greeting style, narration tone, proactive suggestion frequency, error message phrasing
-- default persona: "attentive digital twin" — warm, moderately proactive, concise, informal
-
-Depends on:
-- `refactor/prompt-scaffold-v1`
-
-Parallel-safe:
-- yes, can run with `feat/learning-loop-v1`
 
 ## Phase 2: Online Runtime Visibility And Tasks
 
@@ -1139,29 +962,24 @@ Strict order:
 4. `feat/approval-modes-v1`
 5. `feat/agent-reflection-policy-v1`
 6. `feat/abort-and-interrupt-v1`
-7. `refactor/prompt-scaffold-v1`
-8. `feat/liveness-narration-v1`
-9. `feat/task-decomposition-v1`
-10. `feat/learning-loop-v1`
-11. `feat/persona-calibration-v1`
-12. `feat/run-events-core-v1`
-13. `feat/task-ledger-core-v1`
-14. `feat/task-delivery-v1`
-15. `feat/cost-and-usage-runtime-v1`
-16. `refactor/session-identity-v1`
-17. `feat/transcript-hygiene-and-provenance-v1`
-18. `refactor/context-engine-contract-v1`
-19. `feat/session-controls-v1`
-20. `feat/context-report-v1`
-21. `feat/operator-workflows-v1`
-22. `feat/online-agent-api-v1`
-23. `feat/connectors-core-v1`
-24. `feat/connector-auth-bindings-v1`
-25. `feat/auth-profile-failover-v1`
-26. `feat/channel-action-adapters-v1`
-27. `feat/team-registry-v1`
-28. `feat/delegation-visibility-v1`
-29. `ops/sota-parity-evals-v1`
+7. `feat/run-events-core-v1`
+8. `feat/task-ledger-core-v1`
+9. `feat/task-delivery-v1`
+10. `feat/cost-and-usage-runtime-v1`
+11. `refactor/session-identity-v1`
+12. `feat/transcript-hygiene-and-provenance-v1`
+13. `refactor/context-engine-contract-v1`
+14. `feat/session-controls-v1`
+15. `feat/context-report-v1`
+16. `feat/operator-workflows-v1`
+17. `feat/online-agent-api-v1`
+18. `feat/connectors-core-v1`
+19. `feat/connector-auth-bindings-v1`
+20. `feat/auth-profile-failover-v1`
+21. `feat/channel-action-adapters-v1`
+22. `feat/team-registry-v1`
+23. `feat/delegation-visibility-v1`
+24. `ops/sota-parity-evals-v1`
 
 Optional overlap:
 
@@ -1169,27 +987,284 @@ Optional overlap:
 - task tools and SSE can overlap after core event types land
 - operator workflows, API formalization, and connectors can overlap once session/context/runtime truth is stable
 
+## Phase 6: Streaming, Voice, and Channel Product Polish
+
+Purpose:
+- turn existing channel and voice infrastructure into product-grade features
+- close streaming UX gap vs OpenClaw
+
+### Sprint 6A
+
+Branch:
+- `feat/progressive-streaming-v1`
+
+Goal:
+- implement per-channel streaming modes and human pacing
+
+Primary files:
+- `src/gateway.zig`
+- `src/channels/telegram.zig`
+- `src/channels/discord.zig`
+- `src/channels/slack.zig`
+
+Add:
+- `src/channels/stream_chunker.zig`
+
+Deliverables:
+- streaming modes: off, partial, block, progress (per channel config)
+- code-fence-safe chunk breaks
+- configurable human delay for messaging channels
+- message coalescing for rapid inbound
+
+Depends on:
+- `feat/run-events-core-v1`
+
+Parallel-safe:
+- yes, can run with Phase 4/5 sprints if gateway edits are coordinated
+
+Frontend:
+- streaming indicator in app chat
+- partial message rendering during block mode
+
+### Sprint 6B
+
+Branch:
+- `feat/voice-mode-v1`
+
+Goal:
+- promote voice from Telegram-only STT to first-class execution mode
+
+Primary files:
+- `src/voice.zig`
+- `src/channels/telegram.zig`
+- `src/channels/discord.zig`
+- `src/agent/root.zig`
+
+Add:
+- `src/voice/stt_providers.zig`
+- `src/voice/tts_providers.zig`
+
+Deliverables:
+- voice mode as explicit execution mode hint
+- streaming TTS for long responses
+- cross-channel audio handling (Discord, WhatsApp)
+- voice-optimized prompt variant
+
+Depends on:
+- Phase 1 complete
+
+Parallel-safe:
+- yes, isolated write set
+
+Frontend:
+- voice input toggle in app
+- audio playback for TTS responses
+
+### Sprint 6C
+
+Branch:
+- `feat/channel-health-dashboard-v1`
+
+Goal:
+- make channel breadth visible and manageable
+
+Primary files:
+- `src/channels/dispatch.zig`
+- `src/status.zig`
+- `src/doctor.zig`
+- `src/agent/commands.zig`
+
+Deliverables:
+- `/channels` operator command showing per-channel health, connection state, message counts
+- channel capability discovery (what actions work where)
+- per-channel metrics in Prometheus
+
+Depends on:
+- Phase 2 complete
+
+Parallel-safe:
+- yes
+
+Frontend:
+- channel status panel in settings/admin UI
+
+### Sprint 6D
+
+Branch:
+- `feat/security-audit-command-v1`
+
+Goal:
+- structured security self-check (parity with OpenClaw's 50+ check audit)
+
+Primary files:
+- `src/security/audit.zig`
+- `src/security/policy.zig`
+- `src/agent/commands.zig`
+- `src/doctor.zig`
+
+Add:
+- `src/security/audit_checks.zig`
+
+Deliverables:
+- `/security-audit` command with check IDs
+- categories: tool blast radius, exec approval drift, network exposure, sandbox config, policy drift
+- `--json` output for CI
+- auto-fixable items where safe
+
+Depends on:
+- `feat/approval-modes-v1`
+
+Parallel-safe:
+- yes
+
+Frontend:
+- security status indicator in admin panel
+
+## UX/UI Requirements Per Sprint
+
+Each sprint that adds user-visible capability needs corresponding frontend work. This matrix defines the minimum frontend deliverable per sprint.
+
+### Phase 0
+| Sprint | Backend Feature | Frontend Requirement |
+|---|---|---|
+| 0A | Baseline evals | None (infra only) |
+| 0B | Online agent contract doc | None (docs only) |
+
+### Phase 1
+| Sprint | Backend Feature | Frontend Requirement |
+|---|---|---|
+| 1A | Tool metadata | None (internal metadata) |
+| 1B | Execution modes | Mode indicator in chat header (plan/execute/review/background) |
+| 1C | Approval modes | Approval prompt card in chat stream, approval history panel |
+| 1D | Reflection policy | None (internal behavior) |
+| 1E | Abort and interrupt | Cancel/stop button in chat UI, interrupt confirmation |
+
+### Phase 2
+| Sprint | Backend Feature | Frontend Requirement |
+|---|---|---|
+| 2A | Run events core | None (internal event types) |
+| 2B | SSE run events | Tool execution cards, progress indicators, reasoning summary collapse |
+| 2C | Task ledger core | None (internal store) |
+| 2D | Task delivery | Task notification toast, missed-update indicator |
+| 2E | Task tools | Task board panel (list, status, stop), task detail view |
+| 2F | Cost and usage | Usage panel with per-turn cost, session total, cost chart |
+
+### Phase 3
+| Sprint | Backend Feature | Frontend Requirement |
+|---|---|---|
+| 3A | Session identity | Session picker/switcher, lane indicator |
+| 3B | Session controls | Resume/compact/reset/export buttons in session menu |
+| 3C | Context engine | None (internal contract) |
+| 3D | Context report | Context inspector panel (hot/warm/cold buckets, token budget) |
+| 3E | Transcript hygiene | None (internal behavior) |
+
+### Phase 4
+| Sprint | Backend Feature | Frontend Requirement |
+|---|---|---|
+| 4A | Operator workflows | Slash command palette, /review and /security-review panels |
+| 4B | Online agent API | API playground / webhook configuration panel |
+| 4C | Connectors core | Connector/integration management panel |
+| 4D | Connector auth | OAuth flow UI for connector setup |
+| 4E | Auth profile failover | Provider status panel showing active/cooldown/failed profiles |
+| 4F | Channel action adapters | Channel-specific action buttons in chat (react, thread, poll) |
+
+### Phase 5
+| Sprint | Backend Feature | Frontend Requirement |
+|---|---|---|
+| 5A | Team registry | Agent/team panel showing named specialists |
+| 5B | Delegation visibility | Delegation graph view, parent/child task linkage |
+| 5C | Parity evals | None (eval/report only) |
+
+### Phase 6
+| Sprint | Backend Feature | Frontend Requirement |
+|---|---|---|
+| 6A | Progressive streaming | Streaming indicator, partial message rendering |
+| 6B | Voice mode | Voice input toggle, audio playback |
+| 6C | Channel health | Channel status panel |
+| 6D | Security audit | Security status indicator |
+
+## Agent-Per-Sprint Execution Guide
+
+Each sprint is owned by one agent. This section defines how to brief each agent.
+
+### Context Packet (Every Agent Reads)
+
+1. `README.md`
+2. `docs/sota-agent-feature-map.md`
+3. `docs/sota-agent-roadmap.md` (this file)
+4. Sprint-specific files listed in the sprint's “Primary files” section
+5. `docs/openapi-v1.yaml` (if touching API surface)
+
+### Agent Execution Rules
+
+1. Read the context packet before writing any code.
+2. Stay within the sprint's declared write set.
+3. Do not silently broaden policy, permissions, or API behavior.
+4. Add tests for new behavior and regression cases.
+5. Do not edit shared-core files (`src/gateway.zig`, `src/agent/root.zig`, `src/agent/commands.zig`, `src/tools/root.zig`, `src/session.zig`, `src/subagent.zig`) unless the sprint explicitly lists them.
+6. If the sprint depends on another sprint, verify the dependency is merged before starting.
+7. Run validation before declaring done:
+   - `zig build test --summary all`
+   - `zig build -Doptimize=ReleaseSmall`
+8. Include evidence in PR description.
+
+### Serialization Rules
+
+Sprints that touch shared-core files MUST run serially. The dependency graph above enforces this. The parallel packs define safe overlap windows.
+
+If an agent needs to touch a shared-core file not in its declared write set, it must:
+1. Stop and report the dependency.
+2. Wait for coordinator approval.
+3. Minimize the edit to the smallest possible change.
+
+### Gateway Decomposition (Optional Pre-Work)
+
+Before starting Phase 2 sprints that touch `src/gateway.zig` (15,599 lines), consider extracting:
+1. `src/gateway/rate_limiter.zig` — SlidingWindowRateLimiter (self-contained)
+2. `src/gateway/idempotency.zig` — IdempotencyStore (self-contained)
+3. `src/gateway/tenant.zig` — tenant management functions
+4. `src/gateway/broker_proxy.zig` — broker proxy logic
+5. `src/gateway/webhook_handlers.zig` — per-channel webhook handling
+
+This would reduce core gateway to ~4,000-5,000 lines and lower merge conflict risk for parallel sprints.
+
 ## Definition Of Done For The Program
 
 The roadmap is complete when all of these are true:
 
 1. the agent loop is mode-aware and policy-aware
 2. tool approvals and failure reasons are structured and explainable
-3. the agent feels alive — always narrating what it's doing, which tool it picked, why, and what it's waiting on
-4. complex requests are decomposed into visible sub-steps with per-step status
-5. the agent learns from corrections and applies behavioral preferences in future turns
-6. persona is configurable and defaults to an attentive digital-twin voice
-7. online clients receive a rich run-event stream
-8. detached work is durable, inspectable, and stoppable
-9. session identity and lane policy are canonical
-10. transcript hygiene and provenance are explicit and reliable
-11. context assembly is explicit and inspectable
-12. operator workflows reach practical parity with Claude Code and OpenClaw
-13. connectors, skills, and MCP form one coherent capability graph
-14. auth failover and usage truth are operator-visible runtime systems
-15. channel message actions are owned by channel adapters, not smeared across core logic
-16. multi-agent work is visible and task-backed
-17. parity evals say Nullalis is at least on par with both reference products
+3. online clients receive a rich run-event stream
+4. detached work is durable, inspectable, and stoppable
+5. session identity and lane policy are canonical
+6. transcript hygiene and provenance are explicit and reliable
+7. context assembly is explicit and inspectable
+8. operator workflows reach practical parity with Claude Code and OpenClaw
+9. connectors, skills, and MCP form one coherent capability graph
+10. auth failover and usage truth are operator-visible runtime systems
+11. channel message actions are owned by channel adapters, not smeared across core logic
+12. multi-agent work is visible and task-backed
+13. streaming UX is per-channel configurable and human-paced
+14. voice mode works across supported channels
+15. security audit is structured and repeatable
+16. parity evals say Nullalis is at least on par with both reference products
+17. frontend has matching UI for every user-visible backend feature
+
+## Alignment With Long-Term Vision (plan.md)
+
+This roadmap executes plan.md Phase 1 (Trustworthy Digital Twin Core) plus execution-parity features.
+
+After this program completes, the following plan.md tracks become unblocked:
+
+| Track | Depends On | Status |
+|---|---|---|
+| Track A: Digital Twin Core | This roadmap | **Active — this program** |
+| Track B: Agent Network Effect | Phase 1 complete, trust graph, cross-agent APIs | Future |
+| Track C: Persona Marketplace | Phase 1 complete, persona package schema | Future |
+| Track D: Memory Inheritance | Phase 1 complete, memory export/import (F20) | Future — F20 seeds this |
+| Track E: Universal Remote | Connectors (Phase 4), approval modes (Phase 1) | Partially covered |
+| Track F: Agent Certificates | Eval harness (Phase 0), benchmark pipeline | Future |
+| Track G: Agent-as-API | Online API (Phase 4), session controls (Phase 3) | Partially covered |
 
 ## Immediate Next Branch
 
