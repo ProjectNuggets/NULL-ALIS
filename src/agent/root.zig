@@ -48,6 +48,8 @@ pub const prompt = @import("prompt.zig");
 pub const narration = @import("narration.zig");
 pub const task_planner = @import("task_planner.zig");
 pub const learning = @import("learning.zig");
+pub const run_event_types = @import("run_event_types.zig");
+const usage_runtime_mod = @import("../usage_runtime.zig");
 pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
@@ -365,6 +367,9 @@ pub const Agent = struct {
 
     /// Total tokens used across all turns.
     total_tokens: u64 = 0,
+
+    /// Optional usage runtime for structured per-turn accounting.
+    usage_rt: ?*usage_runtime_mod.UsageRuntime = null,
 
     /// Whether the system prompt has been injected.
     has_system_prompt: bool = false,
@@ -1743,6 +1748,17 @@ pub const Agent = struct {
             // Track tokens
             self.total_tokens += response.usage.total_tokens;
             self.last_turn_usage = response.usage;
+            if (self.usage_rt) |urt| {
+                const input: u64 = @intCast(response.usage.prompt_tokens);
+                const output: u64 = @intCast(response.usage.completion_tokens);
+                urt.recordTurn(
+                    self.default_provider,
+                    input,
+                    output,
+                    0.0, // Cost calculation deferred to provider-specific pricing
+                    0, // Duration refined when timing context available
+                );
+            }
 
             const response_text = response.contentOrEmpty();
             const use_native = response.hasToolCalls();
@@ -2826,6 +2842,18 @@ test "learning module reexport" {
     _ = learning.detectLearningSignals;
 }
 
+test "run_event_types reexport" {
+    _ = run_event_types.RunEventType;
+    _ = run_event_types.RunEvent;
+    _ = run_event_types.toSseFrame;
+}
+
+test "usage_runtime import" {
+    _ = usage_runtime_mod.UsageRuntime;
+    _ = usage_runtime_mod.TurnUsage;
+    _ = usage_runtime_mod.UsageReport;
+}
+
 test {
     _ = dispatcher;
     _ = compaction;
@@ -2834,6 +2862,7 @@ test {
     _ = memory_loader;
     _ = task_planner;
     _ = learning;
+    _ = run_event_types;
 }
 
 // ── Additional agent tests ──────────────────────────────────────

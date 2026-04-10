@@ -32,6 +32,11 @@ pub const ObserverEvent = union(enum) {
         step_index: ?u32 = null,
         step_total: ?u32 = null,
     },
+    task_update: struct {
+        task_id: []const u8,
+        status: []const u8,
+        description: ?[]const u8 = null,
+    },
 };
 
 /// Numeric metrics.
@@ -153,6 +158,7 @@ pub const LogObserver = struct {
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
             .err => |e| std.log.info("error component={s} message={s}", .{ e.component, e.message }),
             .narration_frame => |e| std.log.info("narration type={s} message={s}", .{ @tagName(e.frame_type), e.message }),
+            .task_update => |e| std.log.info("task.update task_id={s} status={s}", .{ e.task_id, e.status }),
         }
     }
 
@@ -347,6 +353,7 @@ pub const FileObserver = struct {
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
             .err => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"error\",\"component\":\"{s}\",\"message\":\"{s}\"}}", .{ e.component, e.message }) catch return,
             .narration_frame => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"narration_frame\",\"type\":\"{s}\",\"message\":\"{s}\"}}", .{ @tagName(e.frame_type), e.message }) catch return,
+            .task_update => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"task_update\",\"task_id\":\"{s}\",\"status\":\"{s}\"}}", .{ e.task_id, e.status }) catch return,
         };
         self.appendToFile(line);
     }
@@ -600,6 +607,12 @@ pub const OtelObserver = struct {
                 self.addSpan("narration.frame", now, now, &.{
                     .{ .key = "type", .value = @tagName(e.frame_type) },
                     .{ .key = "message", .value = e.message },
+                });
+            },
+            .task_update => |e| {
+                self.addSpan("task.update", now, now, &.{
+                    .{ .key = "task_id", .value = e.task_id },
+                    .{ .key = "status", .value = e.status },
                 });
             },
         }

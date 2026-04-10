@@ -92,6 +92,9 @@ pub const file_append = @import("file_append.zig");
 pub const spawn = @import("spawn.zig");
 pub const i2c = @import("i2c.zig");
 pub const spi = @import("spi.zig");
+pub const task_list = @import("task_list.zig");
+pub const task_get = @import("task_get.zig");
+pub const task_stop = @import("task_stop.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
 
