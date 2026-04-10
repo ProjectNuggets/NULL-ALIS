@@ -15,11 +15,15 @@
 - [ ] 01-05: Abort and interrupt (src/agent/abort.zig)
 
 ### Phase 1.5: Prompt Architecture and Liveness
-- [ ] 1.5-01: Prompt scaffold refactor — structured prompt builder with persona, turn classification, narration rules, and tool-use policy as composable sections (src/agent/prompt.zig)
-- [ ] 1.5-02: Liveness narration engine — agent emits real-time "thinking out loud" status: what it's doing, what tool it picked, why, what it's waiting on. Wire observer events to user-facing progress frames (src/agent/narration.zig)
-- [ ] 1.5-03: Task decomposition — agent breaks complex requests into explicit sub-steps before execution, shows plan to user, executes step-by-step with per-step status. Prompt instructions + runtime scaffolding (src/agent/task_planner.zig)
-- [ ] 1.5-04: Learning loop — agent notices corrections/preferences, stores them as durable behavioral facts, applies them in future turns. Distinct from raw memory recall (src/agent/learning.zig)
-- [ ] 1.5-05: Persona calibration — configurable personality depth, proactive insight style, digital-twin warmth vs. tool-agent crispness (workspace SOUL.md + runtime persona resolver)
+**Goal:** Add "feels alive" layer — composable prompt scaffold, real-time liveness narration, task decomposition, learning loop, and persona calibration
+**Plans:** 5 plans
+
+Plans:
+- [ ] 01.5-01-PLAN.md — Prompt scaffold refactor: composable section builders, PromptSections struct, TurnClass enum
+- [ ] 01.5-02-PLAN.md — Liveness narration engine: NarrationObserver, narration_frame events, semantic labels
+- [ ] 01.5-03-PLAN.md — Task decomposition: TaskPlan XML parser, step state machine, prompt instructions
+- [ ] 01.5-04-PLAN.md — Learning loop: correction/preference detection, durable_fact storage, /learn command
+- [ ] 01.5-05-PLAN.md — Persona calibration: SOUL.md front-matter parsing, PersonaProfile, /persona command
 
 ### Phase 2: Online Runtime Visibility and Tasks
 - [ ] 02-01: Run events core (src/agent/run_event_types.zig)
