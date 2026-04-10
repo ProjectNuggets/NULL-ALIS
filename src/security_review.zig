@@ -8,6 +8,7 @@
 const std = @import("std");
 const config_types = @import("config_types.zig");
 const doctor = @import("doctor.zig");
+const json_util = @import("json_util.zig");
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -286,28 +287,41 @@ fn severityString(s: doctor.Severity) []const u8 {
 /// Serialize a SecurityReport to JSON.
 /// Output: {"score":N,"grade":"X","checks":[...],"summary":{"ok":N,"warn":N,"err":N}}
 /// Caller owns the returned memory.
+/// All string values are JSON-escaped via json_util to prevent injection.
 pub fn formatReviewJson(allocator: std.mem.Allocator, report: SecurityReport) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
 
-    try w.print("{{\"score\":{d},\"grade\":\"{s}\",\"checks\":[", .{ report.score, report.grade });
+    {
+        var tmp: [32]u8 = undefined;
+        const n = std.fmt.bufPrint(&tmp, "{{\"score\":{d},\"grade\":", .{report.score}) catch unreachable;
+        try buf.appendSlice(allocator, n);
+    }
+    try json_util.appendJsonString(&buf, allocator, report.grade);
+    try buf.appendSlice(allocator, ",\"checks\":[");
 
     for (report.checks, 0..) |check, i| {
-        if (i > 0) try w.writeByte(',');
-        try w.print("{{\"name\":\"{s}\",\"category\":\"{s}\",\"severity\":\"{s}\",\"message\":\"{s}\"}}", .{
-            check.name,
-            check.category,
-            severityString(check.severity),
-            check.message,
-        });
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"name\":");
+        try json_util.appendJsonString(&buf, allocator, check.name);
+        try buf.appendSlice(allocator, ",\"category\":");
+        try json_util.appendJsonString(&buf, allocator, check.category);
+        try buf.appendSlice(allocator, ",\"severity\":");
+        try json_util.appendJsonString(&buf, allocator, severityString(check.severity));
+        try buf.appendSlice(allocator, ",\"message\":");
+        try json_util.appendJsonString(&buf, allocator, check.message);
+        try buf.append(allocator, '}');
     }
 
-    try w.print("],\"summary\":{{\"ok\":{d},\"warn\":{d},\"err\":{d}}}}}", .{
-        report.summary.ok_count,
-        report.summary.warn_count,
-        report.summary.err_count,
-    });
+    {
+        var tmp: [64]u8 = undefined;
+        const n = std.fmt.bufPrint(&tmp, "],\"summary\":{{\"ok\":{d},\"warn\":{d},\"err\":{d}}}}}", .{
+            report.summary.ok_count,
+            report.summary.warn_count,
+            report.summary.err_count,
+        }) catch unreachable;
+        try buf.appendSlice(allocator, n);
+    }
 
     return try allocator.dupe(u8, buf.items);
 }

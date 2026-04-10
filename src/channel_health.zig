@@ -8,6 +8,7 @@ const std = @import("std");
 const health = @import("health.zig");
 const channel_manager = @import("channel_manager.zig");
 const dispatch = @import("channels/dispatch.zig");
+const json_util = @import("json_util.zig");
 
 /// Overall health status derived from channel states.
 pub const OverallStatus = enum {
@@ -101,33 +102,45 @@ fn stateString(s: dispatch.SupervisedChannel.State) []const u8 {
 /// Serialize channel health entries to JSON.
 /// Output shape: {"status":"...","uptime_seconds":N,"channels":[...]}
 /// Caller owns the returned memory.
+/// All string values are JSON-escaped via json_util to prevent injection.
 pub fn formatHealthJson(allocator: std.mem.Allocator, entries: []const ChannelHealthEntry, uptime_seconds: i64) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
 
     const status = OverallStatus.fromChannels(entries);
-    try w.print("{{\"status\":\"{s}\",\"uptime_seconds\":{d},\"channels\":[", .{ status.toSlice(), uptime_seconds });
-
-    for (entries, 0..) |entry, i| {
-        if (i > 0) try w.writeByte(',');
-        try w.print("{{\"name\":\"{s}\",\"listener_type\":\"{s}\",\"state\":\"{s}\",\"failure_count\":{d},\"backoff_ms\":{d}", .{
-            entry.name,
-            entry.listener_type,
-            stateString(entry.state),
-            entry.failure_count,
-            entry.backoff_ms,
-        });
-        if (entry.last_error) |err_msg| {
-            try w.print(",\"last_error\":\"{s}\"", .{err_msg});
-        }
-        if (entry.component_status) |cs| {
-            try w.print(",\"component_status\":\"{s}\"", .{cs});
-        }
-        try w.writeByte('}');
+    try buf.appendSlice(allocator, "{\"status\":");
+    try json_util.appendJsonString(&buf, allocator, status.toSlice());
+    {
+        var tmp: [64]u8 = undefined;
+        const n = std.fmt.bufPrint(&tmp, ",\"uptime_seconds\":{d},\"channels\":[", .{uptime_seconds}) catch unreachable;
+        try buf.appendSlice(allocator, n);
     }
 
-    try w.writeAll("]}");
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"name\":");
+        try json_util.appendJsonString(&buf, allocator, entry.name);
+        try buf.appendSlice(allocator, ",\"listener_type\":");
+        try json_util.appendJsonString(&buf, allocator, entry.listener_type);
+        try buf.appendSlice(allocator, ",\"state\":");
+        try json_util.appendJsonString(&buf, allocator, stateString(entry.state));
+        {
+            var tmp: [64]u8 = undefined;
+            const n = std.fmt.bufPrint(&tmp, ",\"failure_count\":{d},\"backoff_ms\":{d}", .{ entry.failure_count, entry.backoff_ms }) catch unreachable;
+            try buf.appendSlice(allocator, n);
+        }
+        if (entry.last_error) |err_msg| {
+            try buf.appendSlice(allocator, ",\"last_error\":");
+            try json_util.appendJsonString(&buf, allocator, err_msg);
+        }
+        if (entry.component_status) |cs| {
+            try buf.appendSlice(allocator, ",\"component_status\":");
+            try json_util.appendJsonString(&buf, allocator, cs);
+        }
+        try buf.append(allocator, '}');
+    }
+
+    try buf.appendSlice(allocator, "]}");
     return try allocator.dupe(u8, buf.items);
 }
 
