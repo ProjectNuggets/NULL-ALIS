@@ -1,5 +1,15 @@
 const std = @import("std");
 
+/// Semantic frame types for user-facing narration events.
+pub const NarrationFrameType = enum {
+    thinking,
+    tool_start,
+    tool_done,
+    waiting,
+    plan_step,
+    error_recovery,
+};
+
 /// Events the observer can record.
 pub const ObserverEvent = union(enum) {
     agent_start: struct { provider: []const u8, model: []const u8 },
@@ -15,6 +25,13 @@ pub const ObserverEvent = union(enum) {
     channel_message: struct { channel: []const u8, direction: []const u8 },
     heartbeat_tick: void,
     err: struct { component: []const u8, message: []const u8 },
+    narration_frame: struct {
+        message: []const u8,
+        frame_type: NarrationFrameType,
+        tool_name: ?[]const u8 = null,
+        step_index: ?u32 = null,
+        step_total: ?u32 = null,
+    },
 };
 
 /// Numeric metrics.
@@ -135,6 +152,7 @@ pub const LogObserver = struct {
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
             .err => |e| std.log.info("error component={s} message={s}", .{ e.component, e.message }),
+            .narration_frame => |e| std.log.info("narration type={s} message={s}", .{ @tagName(e.frame_type), e.message }),
         }
     }
 
@@ -328,6 +346,7 @@ pub const FileObserver = struct {
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":\"{s}\",\"direction\":\"{s}\"}}", .{ e.channel, e.direction }) catch return,
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
             .err => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"error\",\"component\":\"{s}\",\"message\":\"{s}\"}}", .{ e.component, e.message }) catch return,
+            .narration_frame => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"narration_frame\",\"type\":\"{s}\",\"message\":\"{s}\"}}", .{ @tagName(e.frame_type), e.message }) catch return,
         };
         self.appendToFile(line);
     }
@@ -574,6 +593,12 @@ pub const OtelObserver = struct {
                 _ = self.errors_total.fetchAdd(1, .monotonic);
                 self.addSpan("error", now, now, &.{
                     .{ .key = "component", .value = e.component },
+                    .{ .key = "message", .value = e.message },
+                });
+            },
+            .narration_frame => |e| {
+                self.addSpan("narration.frame", now, now, &.{
+                    .{ .key = "type", .value = @tagName(e.frame_type) },
                     .{ .key = "message", .value = e.message },
                 });
             },
