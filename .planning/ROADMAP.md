@@ -42,13 +42,13 @@ Plans:
 **Goal:** Progressive streaming with live SSE delivery, voice-first agent mode across channels, operator channel health dashboard, and structured security audit command — making ZAKI narrate itself like Claude Code
 **Requirements:** [REQ-023, REQ-024, REQ-025, REQ-026]
 **Depends on:** Phase 2
-**Plans:** 4 plans
+**Plans:** 4/4 plans complete
 
 Plans:
-- [ ] 02.1-01-PLAN.md — Progressive streaming: PacedFrameSink decorator, delivery mode resolution, live SSE path in gateway
-- [ ] 02.1-02-PLAN.md — Health + security core modules: channel_health.zig aggregation, security_review.zig checks and scoring
-- [ ] 02.1-03-PLAN.md — Voice-first mode: VoiceMode module, voice narration types, cross-channel audio capability
-- [ ] 02.1-04-PLAN.md — Wire commands + endpoints: /health, /security-review, /voice slash commands, gateway API endpoints
+- [x] 02.1-01-PLAN.md — Progressive streaming: PacedFrameSink decorator, delivery mode resolution, live SSE path in gateway
+- [x] 02.1-02-PLAN.md — Health + security core modules: channel_health.zig aggregation, security_review.zig checks and scoring
+- [x] 02.1-03-PLAN.md — Voice-first mode: VoiceMode module, voice narration types, cross-channel audio capability
+- [x] 02.1-04-PLAN.md — Wire commands + endpoints: /health, /security-review, /voice slash commands, gateway API endpoints
 
 ### Phase 3: Canonical Session and Context Runtime
 - [ ] 03-01: Session identity refactor (src/session/)
