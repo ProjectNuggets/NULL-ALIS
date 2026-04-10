@@ -56,12 +56,147 @@ pub const TurnClass = enum {
     }
 };
 
-/// Persona calibration for downstream REQ-022.
+// ═══════════════════════════════════════════════════════════════════════════
+// Persona Calibration (REQ-022)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Warmth dimension for persona calibration.
+pub const Warmth = enum { crisp, balanced, warm };
+
+/// Proactivity dimension for persona calibration.
+pub const Proactivity = enum { reactive, moderate, proactive };
+
+/// Persona calibration section — used in PromptSections.
 pub const PersonaSection = struct {
-    warmth: enum { crisp, balanced, warm } = .balanced,
-    proactivity: enum { reactive, moderate, proactive } = .moderate,
+    warmth: Warmth = .balanced,
+    proactivity: Proactivity = .moderate,
     voice_style: ?[]const u8 = null,
+    twin_mode: bool = false,
 };
+
+/// Parsed persona profile from SOUL.md front-matter.
+/// All fields default gracefully when absent or unrecognized.
+pub const PersonaProfile = struct {
+    warmth: Warmth = .balanced,
+    proactivity: Proactivity = .moderate,
+    voice: ?[]const u8 = null,
+    twin_mode: bool = false,
+};
+
+/// Parse SOUL.md content for YAML-like front-matter (delimited by triple-dash lines).
+/// Returns default PersonaProfile when no front-matter is present or content is empty.
+pub fn resolvePersona(content: []const u8) PersonaProfile {
+    var profile: PersonaProfile = .{};
+    if (content.len == 0) return profile;
+
+    // Find opening --- line
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    var first = lines.next() orelse return profile;
+    first = std.mem.trimRight(u8, first, "\r");
+    if (!std.mem.eql(u8, std.mem.trim(u8, first, " \t"), "---")) return profile;
+
+    // Scan key: value lines until closing ---
+    var in_front_matter = true;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.eql(u8, trimmed, "---")) {
+            in_front_matter = false;
+            break;
+        }
+        if (!in_front_matter) break;
+        const colon_idx = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const key = std.mem.trim(u8, trimmed[0..colon_idx], " \t");
+        const value = std.mem.trim(u8, trimmed[colon_idx + 1 ..], " \t");
+        if (value.len == 0) continue;
+
+        if (std.ascii.eqlIgnoreCase(key, "warmth")) {
+            if (std.ascii.eqlIgnoreCase(value, "crisp")) {
+                profile.warmth = .crisp;
+            } else if (std.ascii.eqlIgnoreCase(value, "warm")) {
+                profile.warmth = .warm;
+            } else if (std.ascii.eqlIgnoreCase(value, "balanced")) {
+                profile.warmth = .balanced;
+            }
+            // else: unknown value — keep default (.balanced)
+        } else if (std.ascii.eqlIgnoreCase(key, "proactivity")) {
+            if (std.ascii.eqlIgnoreCase(value, "reactive")) {
+                profile.proactivity = .reactive;
+            } else if (std.ascii.eqlIgnoreCase(value, "proactive")) {
+                profile.proactivity = .proactive;
+            } else if (std.ascii.eqlIgnoreCase(value, "moderate")) {
+                profile.proactivity = .moderate;
+            }
+            // else: unknown value — keep default (.moderate)
+        } else if (std.ascii.eqlIgnoreCase(key, "voice")) {
+            profile.voice = value;
+        } else if (std.ascii.eqlIgnoreCase(key, "twin_mode")) {
+            profile.twin_mode = std.ascii.eqlIgnoreCase(value, "true");
+        }
+        // Unknown keys are silently ignored (T-1.5-11 graceful default)
+    }
+    return profile;
+}
+
+/// Read SOUL.md from workspace_dir and resolve persona front-matter.
+/// Returns null when file is absent or unreadable.
+/// Caller does NOT need to free PersonaProfile — no allocation is done.
+pub fn resolvePersonaFromFile(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+) ?PersonaProfile {
+    const path = std.fs.path.join(allocator, &.{ workspace_dir, "SOUL.md" }) catch return null;
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+
+    // Bounded read: BOOTSTRAP_MAX_CHARS matches workspacePromptFingerprint bound (T-1.5-11)
+    const content = file.readToEndAlloc(allocator, BOOTSTRAP_MAX_CHARS + 1024) catch return null;
+    defer allocator.free(content);
+
+    return resolvePersona(content);
+}
+
+/// Emit persona calibration instructions based on resolved PersonaSection.
+fn buildPersonaSection(w: anytype, persona: PersonaSection) !void {
+    try w.writeAll("## Persona Calibration\n\n");
+
+    // Warmth instructions
+    switch (persona.warmth) {
+        .crisp => try w.writeAll("Tone: Be direct and tool-like. Minimize conversational filler. Lead with results.\n"),
+        .balanced => try w.writeAll("Tone: Balance warmth and directness. Be approachable but efficient.\n"),
+        .warm => try w.writeAll("Tone: Adopt a warm, personable tone. Acknowledge the person, not just the task.\n"),
+    }
+
+    // Proactivity instructions
+    switch (persona.proactivity) {
+        .reactive => try w.writeAll("Initiative: Respond to requests only. Do not volunteer information or suggestions unprompted.\n"),
+        .moderate => try w.writeAll("Initiative: Offer relevant context or next steps when clearly useful, but don't over-explain.\n"),
+        .proactive => try w.writeAll("Initiative: Proactively surface relevant context, risks, and next steps. Anticipate needs.\n"),
+    }
+
+    // Voice style instructions
+    if (persona.voice_style) |voice| {
+        if (std.ascii.eqlIgnoreCase(voice, "verbose")) {
+            try w.writeAll("Voice: Provide detailed, thorough responses. Explain reasoning and context.\n");
+        } else if (std.ascii.eqlIgnoreCase(voice, "concise")) {
+            try w.writeAll("Voice: Keep responses tight. Skip pleasantries. Use bullets over paragraphs when possible.\n");
+        } else if (std.ascii.eqlIgnoreCase(voice, "formal")) {
+            try w.writeAll("Voice: Use professional, formal language. Avoid contractions and slang.\n");
+        } else if (std.ascii.eqlIgnoreCase(voice, "casual")) {
+            try w.writeAll("Voice: Use casual, conversational language. Contractions and plain speech are fine.\n");
+        }
+        // Unknown voice styles are silently ignored
+    }
+
+    // Twin mode instruction
+    if (persona.twin_mode) {
+        try w.writeAll("Digital twin mode: You represent the user's persistent digital twin. Maintain continuity of their preferences, history, and goals across sessions. Act as an extension of the user's intent.\n");
+    }
+
+    try w.writeAll("\n");
+}
 
 /// Narration emission policy for downstream REQ-019.
 pub const NarrationPolicy = struct {
@@ -175,9 +310,10 @@ pub fn buildSystemPrompt(
         try w.writeAll(section);
     }
 
-    // Persona section — placeholder insertion point for REQ-022
-    // (emits nothing when null — downstream sprint will populate)
-    _ = ctx.sections.persona;
+    // Persona section — injected before turn classification and safety (T-1.5-10)
+    if (ctx.sections.persona) |persona| {
+        try buildPersonaSection(w, persona);
+    }
 
     // Turn classification section
     try buildTurnClassificationSection(w);
@@ -1207,4 +1343,145 @@ test "buildSystemPrompt turn classification section appears before safety" {
     const tc_pos = std.mem.indexOf(u8, prompt, "## Turn Classification") orelse return error.SectionNotFound;
     const safety_pos = std.mem.indexOf(u8, prompt, "## Safety") orelse return error.SectionNotFound;
     try std.testing.expect(tc_pos < safety_pos);
+}
+
+// ─── Persona calibration tests (REQ-022) ────────────────────────────────────
+
+test "resolvePersona with all fields returns correct PersonaProfile" {
+    const content =
+        \\---
+        \\warmth: warm
+        \\proactivity: proactive
+        \\voice: verbose
+        \\twin_mode: true
+        \\---
+        \\Body text here.
+    ;
+    const profile = resolvePersona(content);
+    try std.testing.expectEqual(Warmth.warm, profile.warmth);
+    try std.testing.expectEqual(Proactivity.proactive, profile.proactivity);
+    try std.testing.expectEqualStrings("verbose", profile.voice.?);
+    try std.testing.expect(profile.twin_mode);
+}
+
+test "resolvePersona with only warmth=crisp returns correct warmth with defaults" {
+    const content =
+        \\---
+        \\warmth: crisp
+        \\---
+    ;
+    const profile = resolvePersona(content);
+    try std.testing.expectEqual(Warmth.crisp, profile.warmth);
+    try std.testing.expectEqual(Proactivity.moderate, profile.proactivity);
+    try std.testing.expect(profile.voice == null);
+    try std.testing.expect(!profile.twin_mode);
+}
+
+test "resolvePersona with invalid warmth value defaults to balanced" {
+    const content =
+        \\---
+        \\warmth: INVALID
+        \\proactivity: moderate
+        \\---
+    ;
+    const profile = resolvePersona(content);
+    try std.testing.expectEqual(Warmth.balanced, profile.warmth);
+    try std.testing.expectEqual(Proactivity.moderate, profile.proactivity);
+}
+
+test "resolvePersona with no front-matter returns default PersonaProfile" {
+    const content = "Just some regular SOUL.md content without front-matter.";
+    const profile = resolvePersona(content);
+    try std.testing.expectEqual(Warmth.balanced, profile.warmth);
+    try std.testing.expectEqual(Proactivity.moderate, profile.proactivity);
+    try std.testing.expect(profile.voice == null);
+    try std.testing.expect(!profile.twin_mode);
+}
+
+test "resolvePersona with empty string returns default PersonaProfile" {
+    const profile = resolvePersona("");
+    try std.testing.expectEqual(Warmth.balanced, profile.warmth);
+    try std.testing.expectEqual(Proactivity.moderate, profile.proactivity);
+    try std.testing.expect(profile.voice == null);
+    try std.testing.expect(!profile.twin_mode);
+}
+
+test "buildPersonaSection with warmth=warm emits warm tone instruction" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildPersonaSection(w, .{ .warmth = .warm });
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Persona Calibration") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "warm, personable tone") != null);
+}
+
+test "buildPersonaSection with warmth=crisp emits direct tone instruction" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildPersonaSection(w, .{ .warmth = .crisp });
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "Be direct and tool-like") != null);
+}
+
+test "buildPersonaSection with twin_mode=true emits digital twin instruction" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildPersonaSection(w, .{ .twin_mode = true });
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "digital twin") != null);
+}
+
+test "buildPersonaSection with default PersonaSection emits balanced defaults" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildPersonaSection(w, .{});
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Persona Calibration") != null);
+    // balanced tone
+    try std.testing.expect(std.mem.indexOf(u8, output, "Balance warmth and directness") != null);
+    // No twin mode
+    try std.testing.expect(std.mem.indexOf(u8, output, "digital twin") == null);
+}
+
+test "buildSystemPrompt with persona section places persona before safety" {
+    const allocator = std.testing.allocator;
+    const p = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .sections = .{ .persona = .{ .warmth = .warm, .twin_mode = true } },
+    });
+    defer allocator.free(p);
+
+    const persona_pos = std.mem.indexOf(u8, p, "## Persona Calibration") orelse return error.PersonaSectionMissing;
+    const safety_pos = std.mem.indexOf(u8, p, "## Safety") orelse return error.SafetySectionMissing;
+    try std.testing.expect(persona_pos < safety_pos);
+    try std.testing.expect(std.mem.indexOf(u8, p, "warm, personable tone") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "digital twin") != null);
+}
+
+test "buildSystemPrompt safety characterization unaffected by twin_mode persona" {
+    // T-1.5-10: persona cannot override safety rules
+    const allocator = std.testing.allocator;
+    const p = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .sections = .{ .persona = .{ .warmth = .warm, .twin_mode = true } },
+    });
+    defer allocator.free(p);
+
+    // Safety rules must still be present
+    try std.testing.expect(std.mem.indexOf(u8, p, "Do not exfiltrate private data.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "Do not run destructive commands without asking.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "Do not bypass oversight or approval mechanisms.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "Prefer `trash` over `rm`.") != null);
 }
