@@ -19,6 +19,9 @@ const context_report = @import("context_report.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const util = @import("../util.zig");
+const channel_health = @import("../channel_health.zig");
+const security_review = @import("../security_review.zig");
+const health_mod = @import("../health.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = struct {
@@ -3343,6 +3346,9 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
             \\  /learn [list|forget <key>] — inspect and remove learned behavioral facts
             \\  /persona — show current persona profile from SOUL.md
+            \\  /health — channel health dashboard
+            \\  /security-review — structured security audit with score
+            \\  /voice [on|off] — toggle voice-first mode
             \\  exit, quit
         );
     }
@@ -3379,7 +3385,8 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "queue")) return try handleQueueCommand(self, cmd.arg);
     if (isSlashName(cmd, "mode")) return try handleModeCommand(self, cmd.arg);
     if (isSlashName(cmd, "usage")) return try handleUsageCommand(self, cmd.arg);
-    if (isSlashName(cmd, "tts") or isSlashName(cmd, "voice")) return try handleTtsCommand(self, cmd.arg);
+    if (isSlashName(cmd, "tts")) return try handleTtsCommand(self, cmd.arg);
+    if (isSlashName(cmd, "voice")) return try handleVoiceCommand(self, cmd.arg);
     if (isSlashName(cmd, "stop")) return try handleStopCommand(self);
     if (isSlashName(cmd, "compact")) {
         if (try self.manualCompactHistory()) {
@@ -3431,8 +3438,89 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "memory")) return try handleMemoryCommand(self, cmd.arg);
     if (isSlashName(cmd, "learn")) return try handleLearnCommand(self, cmd.arg);
     if (isSlashName(cmd, "persona")) return try handlePersonaCommand(self, cmd.arg);
+    if (isSlashName(cmd, "health")) return try handleHealthCommand(self);
+    if (isSlashName(cmd, "security-review") or isSlashName(cmd, "security_review")) return try handleSecurityReviewCommand(self);
 
     return null;
+}
+
+fn handleHealthCommand(self: anytype) ![]const u8 {
+    // Use the global health snapshot for component-level health.
+    // Per-channel detail (via ChannelManager) is available at /api/v1/channels/health.
+    const snap = health_mod.snapshot();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(self.allocator);
+    const w = buf.writer(self.allocator);
+
+    try w.print("System Health (uptime: {d}s)\n\n", .{snap.uptime_seconds});
+
+    var component_count: usize = 0;
+    var it = snap.components.iterator();
+    while (it.next()) |entry| {
+        try w.print("  {s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.status });
+        component_count += 1;
+    }
+
+    if (component_count == 0) {
+        try w.writeAll("  (no components registered)\n");
+    }
+
+    try w.writeAll("\nFor per-channel detail, use GET /api/v1/channels/health\n");
+    return try buf.toOwnedSlice(self.allocator);
+}
+
+fn handleSecurityReviewCommand(self: anytype) ![]const u8 {
+    // Extract security parameters from the agent's policy when available.
+    const workspace_only = if (@hasField(@TypeOf(self.*), "policy"))
+        (if (self.policy) |p| p.workspace_only else true)
+    else
+        true;
+    const max_actions = if (@hasField(@TypeOf(self.*), "policy"))
+        (if (self.policy) |p| p.max_actions_per_hour else @as(u32, 100))
+    else
+        @as(u32, 100);
+
+    const report = try security_review.runAllChecks(
+        self.allocator,
+        .{}, // SecurityConfig defaults — full config available via API endpoint
+        workspace_only,
+        max_actions,
+        true, // pairing_enabled — conservative default
+    );
+    defer self.allocator.free(report.checks);
+
+    return try security_review.formatReviewText(self.allocator, report);
+}
+
+fn handleVoiceCommand(self: anytype, arg: []const u8) ![]const u8 {
+    if (arg.len == 0) {
+        // Show current voice mode state
+        const voice_active = self.tts_mode != .off;
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Voice mode: {s}\nTTS mode: {s}\nAudio: {s}",
+            .{
+                if (voice_active) "active" else "inactive",
+                self.tts_mode.toSlice(),
+                if (self.tts_audio) "on" else "off",
+            },
+        );
+    }
+
+    if (std.ascii.eqlIgnoreCase(arg, "on")) {
+        self.tts_mode = .always;
+        self.tts_audio = true;
+        return try self.allocator.dupe(u8, "Voice mode enabled (TTS: always, audio: on)");
+    }
+
+    if (std.ascii.eqlIgnoreCase(arg, "off")) {
+        self.tts_mode = .off;
+        self.tts_audio = false;
+        return try self.allocator.dupe(u8, "Voice mode disabled");
+    }
+
+    return try self.allocator.dupe(u8, "Usage: /voice [on|off]");
 }
 
 fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -3784,6 +3872,7 @@ test "baseline: known command surface has expected breadth" {
         "capabilities", "debug",     "dock-telegram", "dock-discord", "dock-slack",
         "activation",   "send",      "elevated",      "bash",         "poll",
         "skill",        "doctor",    "memory",        "learn",        "persona",
+        "health",       "security-review", "security_review",
     };
     for (known_commands) |name| {
         const input = std.fmt.allocPrint(std.testing.allocator, "/{s}", .{name}) catch unreachable;
@@ -3792,5 +3881,24 @@ test "baseline: known command surface has expected breadth" {
         try std.testing.expect(cmd != null);
     }
     // Verify count — if someone adds a command, this test documents the current set size
-    try std.testing.expect(known_commands.len >= 46);
+    try std.testing.expect(known_commands.len >= 48);
+}
+
+test "handleSlashCommand recognizes /health" {
+    const cmd = parseSlashCommand("/health");
+    try std.testing.expect(cmd != null);
+    try std.testing.expectEqualStrings("health", cmd.?.name);
+}
+
+test "handleSlashCommand recognizes /security-review" {
+    const cmd = parseSlashCommand("/security-review");
+    try std.testing.expect(cmd != null);
+    try std.testing.expectEqualStrings("security-review", cmd.?.name);
+}
+
+test "handleSlashCommand recognizes /voice on" {
+    const cmd = parseSlashCommand("/voice on");
+    try std.testing.expect(cmd != null);
+    try std.testing.expectEqualStrings("voice", cmd.?.name);
+    try std.testing.expectEqualStrings("on", std.mem.trim(u8, cmd.?.arg, " \t"));
 }
