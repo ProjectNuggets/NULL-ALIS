@@ -8455,14 +8455,21 @@ const LiveSseCtx = struct {
     sendFrameFn: *const fn (ptr: *anyopaque, frame: []const u8) anyerror!void,
     allocator: std.mem.Allocator,
     seq: *usize,
+    /// Set to true on send failure (e.g. client disconnect). Once set,
+    /// subsequent tokens are skipped to avoid wasting compute.
+    client_gone: *bool,
 };
 
 fn liveStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     if (chunk.delta.len == 0) return; // skip empty/final-only chunks
     const ctx: *LiveSseCtx = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.client_gone.*) return; // client disconnected — skip remaining tokens
     const frame = sseTokenFrame(ctx.allocator, chunk.delta, ctx.seq.*) catch return;
     defer ctx.allocator.free(frame);
-    ctx.sendFrameFn(ctx.stream_ptr, frame) catch return;
+    ctx.sendFrameFn(ctx.stream_ptr, frame) catch {
+        ctx.client_gone.* = true;
+        return;
+    };
     ctx.seq.* += 1;
 }
 
@@ -8641,11 +8648,13 @@ fn handleApiChatStreamSseConnection(
     // Set up live stream context for stream_callback (tokens piped directly to SSE)
     var live_seq: usize = 0;
     const SseStreamType = LockedSseStream(@TypeOf(stream));
+    var live_client_gone: bool = false;
     var live_ctx = LiveSseCtx{
         .stream_ptr = @ptrCast(&sse_stream),
         .sendFrameFn = SseStreamType.sendFrameErased,
         .allocator = req_allocator,
         .seq = &live_seq,
+        .client_gone = &live_client_gone,
     };
 
     const ReplyOutcome = union(enum) {
