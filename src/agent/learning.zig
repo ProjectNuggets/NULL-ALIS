@@ -99,12 +99,6 @@ pub fn detectLearningSignals(allocator: std.mem.Allocator, user_message: []const
                 break;
             }
         }
-        // "i meant" also triggers implicit_correction when not yet detected
-        // as explicit_correction (the explicit list uses "i meant" as well,
-        // but that branch already fired above if matched).
-        if (std.mem.indexOf(u8, lower, "i meant") != null and !found.contains(.implicit_correction)) {
-            found.insert(.implicit_correction);
-        }
     }
 
     var result = std.ArrayListUnmanaged(LearningSignal){};

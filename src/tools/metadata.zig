@@ -20,6 +20,11 @@ pub const ToolFlags = packed struct {
     background_safe: bool = false,
     operator_only: bool = false,
     concurrency_safe: bool = false,
+
+    /// Validate that flags are not contradictory.
+    pub fn validate(self: ToolFlags) error{ContradictoryFlags}!void {
+        if (self.read_only and self.mutating) return error.ContradictoryFlags;
+    }
 };
 
 /// Risk classification for approval policy integration.

@@ -978,15 +978,23 @@ pub const Agent = struct {
         }
         // Execution mode gate: block tools not allowed in current mode
         if (self.execution_mode != .execute) {
+            // TODO(phase-4+): wire comptime tool registry here instead of empty slice
             const meta = tool_metadata.lookupMetadata(call.name, &.{}) orelse
                 tool_metadata.ToolMetadata.conservative(call.name);
             if (!self.execution_mode.allowsTool(meta)) {
-                return .{ .blocked = .{
-                    .name = call.name,
-                    .output = "blocked",
-                    .success = false,
-                    .tool_call_id = call.tool_call_id,
-                } };
+                return .{
+                    .blocked = .{
+                        .name = call.name,
+                        .output = switch (self.execution_mode) {
+                            .plan => "Tool blocked: not allowed in plan mode (read-only tools only)",
+                            .review => "Tool blocked: not allowed in review mode (read-only tools only)",
+                            .background => "Tool blocked: not allowed in background mode (background-safe tools only)",
+                            .execute => unreachable, // execute allows all tools
+                        },
+                        .success = false,
+                        .tool_call_id = call.tool_call_id,
+                    },
+                };
             }
         }
         return .allowed;
@@ -1234,6 +1242,7 @@ pub const Agent = struct {
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         const turn_start_ms = std.time.milliTimestamp();
+        self.cancellation_token.reset(); // Clear stale cancellation from previous turn
         commands.refreshSubagentToolContext(self);
         var turn_llm_calls: u32 = 0;
         var turn_retry_attempts: u32 = 0;
@@ -1403,11 +1412,31 @@ pub const Agent = struct {
                 const fact_content = learning.extractFactFromMessage(self.allocator, user_message, signals) catch null;
                 defer if (fact_content) |fc| self.allocator.free(fc);
                 if (fact_content) |fc| {
-                    const key = learning.factKey(self.allocator, fc) catch null;
-                    if (key) |k| {
-                        defer self.allocator.free(k);
-                        _ = mem.store(k, fc, .core, self.memory_session_id) catch {};
-                        log.info("learning.signal_detected signals={d} key={s}", .{ signals.len, k });
+                    // T-1.5-08: enforce MAX_FACTS_PER_SESSION before storing
+                    const at_limit = blk: {
+                        const entries = mem.list(self.allocator, null, self.memory_session_id) catch break :blk false;
+                        defer if (entries.len > 0) {
+                            for (entries) |e| {
+                                self.allocator.free(e.key);
+                                self.allocator.free(e.content);
+                            }
+                            self.allocator.free(entries);
+                        };
+                        var fact_count: usize = 0;
+                        for (entries) |e| {
+                            if (std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) fact_count += 1;
+                        }
+                        break :blk fact_count >= learning.MAX_FACTS_PER_SESSION;
+                    };
+                    if (at_limit) {
+                        log.warn("learning.max_facts_reached session={?s}", .{self.memory_session_id});
+                    } else {
+                        const key = learning.factKey(self.allocator, fc) catch null;
+                        if (key) |k| {
+                            defer self.allocator.free(k);
+                            _ = mem.store(k, fc, .core, self.memory_session_id) catch {};
+                            log.info("learning.signal_detected signals={d} key={s}", .{ signals.len, k });
+                        }
                     }
                 }
             }

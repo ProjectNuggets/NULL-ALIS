@@ -280,7 +280,9 @@ pub const SecurityPolicy = struct {
     /// Resolve approval policy for a tool based on its metadata and current autonomy level.
     /// Returns the ApprovalPolicy that should govern this tool's execution.
     pub fn resolveApproval(self: *const SecurityPolicy, tool_name: []const u8) approval_modes_mod.ApprovalPolicy {
-        const meta = tool_metadata_mod.ToolMetadata.conservative(tool_name);
+        // TODO(phase-4+): wire comptime tool registry here instead of empty slice
+        const meta = tool_metadata_mod.lookupMetadata(tool_name, &.{}) orelse
+            tool_metadata_mod.ToolMetadata.conservative(tool_name);
         return approval_modes_mod.ApprovalPolicy.forTool(meta, self.autonomy);
     }
 };

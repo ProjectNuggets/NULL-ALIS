@@ -85,9 +85,12 @@ pub const NarrationObserver = struct {
     }
 
     fn emitFrame(self: *NarrationObserver, frame: NarrationFrame) void {
-        // Deliver via callback if one is registered.
+        // Deliver via callback if one is registered and has a valid context.
         if (self.callback) |cb| {
-            cb(self.callback_ctx orelse @ptrCast(&self.inner), frame);
+            if (self.callback_ctx) |ctx| {
+                cb(ctx, frame);
+            }
+            // Skip callback if no context — avoid passing pointer to unrelated data.
         }
         // Also emit as an observer event so downstream consumers (SSE, channels) receive it.
         const narration_event = ObserverEvent{ .narration_frame = .{

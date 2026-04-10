@@ -3577,8 +3577,17 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
         // Accept either the full key or the 16-char hex suffix
         const full_key = if (std.mem.startsWith(u8, raw_key, "durable_fact/behavior/"))
             try self.allocator.dupe(u8, raw_key)
-        else
-            try std.fmt.allocPrint(self.allocator, "durable_fact/behavior/{s}", .{raw_key});
+        else blk: {
+            if (raw_key.len != 16) {
+                return try self.allocator.dupe(u8, "Key must be the full durable_fact/behavior/... key or a 16-char hex suffix. Use /learn list to see keys.");
+            }
+            for (raw_key) |c| {
+                if (!std.ascii.isHex(c)) {
+                    return try self.allocator.dupe(u8, "Key suffix must be hexadecimal. Use /learn list to see keys.");
+                }
+            }
+            break :blk try std.fmt.allocPrint(self.allocator, "durable_fact/behavior/{s}", .{raw_key});
+        };
         defer self.allocator.free(full_key);
 
         const removed = mem_rt.memory.forget(full_key) catch |err| {
@@ -3614,6 +3623,7 @@ fn handlePersonaCommand(self: anytype, _arg: []const u8) ![]const u8 {
     }
 
     const profile = profile_opt.?;
+    defer if (profile.voice) |v| self.allocator.free(v);
     const warmth_str: []const u8 = switch (profile.warmth) {
         .crisp => "crisp",
         .balanced => "balanced",
