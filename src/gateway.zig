@@ -9204,13 +9204,38 @@ fn handleApiRoute(
         if (!std.mem.eql(u8, method, "GET")) {
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         }
-        // Construct a temporary ChannelManager to aggregate health.
-        // In production, channels are registered on the global registry;
-        // the manager collects configured entries from config.
         const snap = health.snapshot();
+        // Build real channel health entries from config when available.
+        // A temporary ChannelManager + ChannelRegistry are constructed so
+        // collectConfiguredChannels populates the entry list that
+        // aggregateChannelHealth reads (supervision state, failure counts).
+        if (config_opt) |cfg| {
+            var registry = channel_dispatch.ChannelRegistry.init(req_allocator);
+            defer registry.deinit();
+            const mgr = channel_manager.ChannelManager.init(req_allocator, cfg, &registry) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_manager_init_failed\"}" };
+            };
+            defer mgr.deinit();
+            mgr.collectConfiguredChannels() catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_collect_failed\"}" };
+            };
+            const entries = channel_health_mod.aggregateChannelHealth(req_allocator, mgr) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_aggregate_failed\"}" };
+            };
+            defer req_allocator.free(entries);
+            const json = channel_health_mod.formatHealthJson(
+                req_allocator,
+                entries,
+                @intCast(snap.uptime_seconds),
+            ) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_format_failed\"}" };
+            };
+            return .{ .body = json };
+        }
+        // No config available — return empty channels with uptime only.
         const json = channel_health_mod.formatHealthJson(
             req_allocator,
-            &.{}, // no per-channel entries without a live ChannelManager
+            &.{},
             @intCast(snap.uptime_seconds),
         ) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_format_failed\"}" };
