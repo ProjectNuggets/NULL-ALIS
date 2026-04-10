@@ -3445,9 +3445,10 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
 }
 
 fn handleHealthCommand(self: anytype) ![]const u8 {
-    // Use the global health snapshot for component-level health.
+    // Use snapshotComponents for a mutex-safe copy of the registry.
     // Per-channel detail (via ChannelManager) is available at /api/v1/channels/health.
-    const snap = health_mod.snapshot();
+    const snap = try health_mod.snapshotComponents(self.allocator);
+    defer self.allocator.free(snap.entries);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(self.allocator);
@@ -3455,15 +3456,12 @@ fn handleHealthCommand(self: anytype) ![]const u8 {
 
     try w.print("System Health (uptime: {d}s)\n\n", .{snap.uptime_seconds});
 
-    var component_count: usize = 0;
-    var it = snap.components.iterator();
-    while (it.next()) |entry| {
-        try w.print("  {s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.status });
-        component_count += 1;
-    }
-
-    if (component_count == 0) {
+    if (snap.entries.len == 0) {
         try w.writeAll("  (no components registered)\n");
+    } else {
+        for (snap.entries) |entry| {
+            try w.print("  {s}: {s}\n", .{ entry.name, entry.health.status });
+        }
     }
 
     try w.writeAll("\nFor per-channel detail, use GET /api/v1/channels/health\n");

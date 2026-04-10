@@ -124,6 +124,37 @@ pub fn snapshot() HealthSnapshot {
     };
 }
 
+/// A single named component entry, safe to use after the registry mutex is released.
+pub const ComponentEntry = struct {
+    name: []const u8,
+    health: ComponentHealth,
+};
+
+/// Return a heap-allocated copy of all registered components.
+/// Safe to iterate without holding the registry mutex.
+/// Caller owns the returned slice and must free it with the same allocator.
+pub fn snapshotComponents(allocator: std.mem.Allocator) !struct { entries: []ComponentEntry, uptime_seconds: u64 } {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    ensureInit();
+
+    const now = std.time.timestamp();
+    const uptime: u64 = if (now > registry_start_time) @intCast(now - registry_start_time) else 0;
+
+    const count = registry_components.count();
+    const entries = try allocator.alloc(ComponentEntry, count);
+    var i: usize = 0;
+    var iter = registry_components.iterator();
+    while (iter.next()) |entry| {
+        entries[i] = .{
+            .name = entry.key_ptr.*,
+            .health = entry.value_ptr.*,
+        };
+        i += 1;
+    }
+    return .{ .entries = entries, .uptime_seconds = uptime };
+}
+
 /// Get a specific component's health.
 pub fn getComponentHealth(component: []const u8) ?ComponentHealth {
     registry_mutex.lock();
