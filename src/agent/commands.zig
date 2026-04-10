@@ -3643,17 +3643,16 @@ test "baseline: known command surface has expected breadth" {
     // This test validates the slash command set by checking parseSlashCommand
     // correctly parses each known command name.
     const known_commands = [_][]const u8{
-        "new",     "reset",   "restart",  "help",    "commands",
-        "status",  "runtime", "whoami",   "id",      "model",
-        "models",  "think",   "verbose",  "reasoning",
-        "exec",    "queue",   "usage",    "tts",     "voice",
-        "stop",    "compact", "allowlist", "approve", "context",
-        "export-session", "export", "session", "subagents", "agents",
-        "focus",   "unfocus", "kill",     "steer",   "tell",
-        "config",  "capabilities", "debug",
-        "dock-telegram", "dock-discord", "dock-slack",
-        "activation", "send", "elevated", "bash", "poll", "skill",
-        "doctor",  "memory",
+        "new",          "reset",     "restart",       "help",         "commands",
+        "status",       "runtime",   "whoami",        "id",           "model",
+        "models",       "think",     "verbose",       "reasoning",    "exec",
+        "queue",        "usage",     "tts",           "voice",        "stop",
+        "compact",      "allowlist", "approve",       "context",      "export-session",
+        "export",       "session",   "subagents",     "agents",       "focus",
+        "unfocus",      "kill",      "steer",         "tell",         "config",
+        "capabilities", "debug",     "dock-telegram", "dock-discord", "dock-slack",
+        "activation",   "send",      "elevated",      "bash",         "poll",
+        "skill",        "doctor",    "memory",
     };
     for (known_commands) |name| {
         const input = std.fmt.allocPrint(std.testing.allocator, "/{s}", .{name}) catch unreachable;

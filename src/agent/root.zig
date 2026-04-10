@@ -32,8 +32,11 @@ const hooks_mod = @import("../hooks.zig");
 const execution_mode_mod = @import("execution_mode.zig");
 const ExecutionMode = execution_mode_mod.ExecutionMode;
 const tool_metadata = @import("../tools/metadata.zig");
+const abort_mod = @import("abort.zig");
+const CancellationToken = abort_mod.CancellationToken;
 
 const cache = memory_mod.cache;
+pub const abort = @import("abort.zig");
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
 pub const context_builder = @import("context_builder.zig");
@@ -304,6 +307,7 @@ pub const Agent = struct {
     reasoning_mode: ReasoningMode = .off,
     usage_mode: UsageMode = .off,
     execution_mode: ExecutionMode = .execute,
+    cancellation_token: CancellationToken = .{},
     exec_host: ExecHost = .gateway,
     exec_security: ExecSecurity = .allowlist,
     exec_ask: ExecAsk = .on_miss,
@@ -1474,6 +1478,16 @@ pub const Agent = struct {
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
+
+            // ── Cooperative cancellation check ──────────────────────────
+            if (self.cancellation_token.isCancelled()) {
+                log.warn("Turn cancelled at iteration {d}", .{iteration});
+                const cancel_event = ObserverEvent{ .turn_cancelled = .{ .reason = "user_request", .iteration = iteration } };
+                self.observer.recordEvent(&cancel_event);
+                const complete_event = ObserverEvent{ .turn_complete = {} };
+                self.observer.recordEvent(&complete_event);
+                return try self.allocator.dupe(u8, "[Cancelled]");
+            }
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
             const build_messages_start_ms = std.time.milliTimestamp();
@@ -6803,6 +6817,7 @@ test "baseline: Agent struct has required execution control fields" {
     try std.testing.expect(@hasField(Agent, "parallel_tools"));
     try std.testing.expect(@hasField(Agent, "model_name"));
     try std.testing.expect(@hasField(Agent, "observer"));
+    try std.testing.expect(@hasField(Agent, "cancellation_token"));
 }
 
 test "baseline: context_tokens resolves known model windows" {

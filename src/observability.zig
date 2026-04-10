@@ -9,6 +9,7 @@ pub const ObserverEvent = union(enum) {
     tool_call_start: struct { tool: []const u8 },
     tool_call: struct { tool: []const u8, duration_ms: u64, success: bool },
     tool_iterations_exhausted: struct { iterations: u32 },
+    turn_cancelled: struct { reason: []const u8, iteration: u32 },
     turn_stage: struct { stage: []const u8, iteration: ?u32 = null, duration_ms: ?u64 = null, count: ?u32 = null },
     turn_complete: void,
     channel_message: struct { channel: []const u8, direction: []const u8 },
@@ -106,6 +107,7 @@ pub const LogObserver = struct {
             .tool_call_start => |e| std.log.info("tool.start tool={s}", .{e.tool}),
             .tool_call => |e| std.log.info("tool.call tool={s} duration_ms={d} success={}", .{ e.tool, e.duration_ms, e.success }),
             .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
+            .turn_cancelled => |e| std.log.info("turn.cancelled reason={s} iteration={d}", .{ e.reason, e.iteration }),
             .turn_stage => |e| {
                 if (e.iteration) |iteration| {
                     if (e.duration_ms) |duration_ms| {
@@ -320,6 +322,7 @@ pub const FileObserver = struct {
             .tool_call_start => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call_start\",\"tool\":\"{s}\"}}", .{e.tool}) catch return,
             .tool_call => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call\",\"tool\":\"{s}\",\"duration_ms\":{d},\"success\":{}}}", .{ e.tool, e.duration_ms, e.success }) catch return,
             .tool_iterations_exhausted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_iterations_exhausted\",\"iterations\":{d}}}", .{e.iterations}) catch return,
+            .turn_cancelled => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_cancelled\",\"reason\":\"{s}\",\"iteration\":{d}}}", .{ e.reason, e.iteration }) catch return,
             .turn_stage => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_stage\",\"stage\":\"{s}\"}}", .{e.stage}) catch return,
             .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":\"{s}\",\"direction\":\"{s}\"}}", .{ e.channel, e.direction }) catch return,
@@ -540,6 +543,14 @@ pub const OtelObserver = struct {
                 const iter_str = std.fmt.bufPrint(&iter_buf, "{d}", .{e.iterations}) catch "0";
                 self.addSpan("tool.iterations_exhausted", now, now, &.{
                     .{ .key = "iterations", .value = iter_str },
+                });
+            },
+            .turn_cancelled => |e| {
+                var iter_buf: [20]u8 = undefined;
+                const iter_str = std.fmt.bufPrint(&iter_buf, "{d}", .{e.iteration}) catch "0";
+                self.addSpan("turn.cancelled", now, now, &.{
+                    .{ .key = "reason", .value = e.reason },
+                    .{ .key = "iteration", .value = iter_str },
                 });
             },
             .turn_stage => |e| {
