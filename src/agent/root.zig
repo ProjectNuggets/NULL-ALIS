@@ -353,6 +353,10 @@ pub const Agent = struct {
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
 
+    /// Security configuration for sandbox, audit, and resource checks.
+    /// Used by /security-review slash command to report actual runtime config.
+    security_config: config_types.SecurityConfig = .{},
+
     /// Lifecycle hooks — config-driven shell commands on agent events.
     hooks: []const hooks_mod.Hook = &.{},
 
@@ -491,6 +495,7 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .security_config = cfg.security,
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,

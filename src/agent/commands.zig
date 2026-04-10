@@ -3481,9 +3481,14 @@ fn handleSecurityReviewCommand(self: anytype) ![]const u8 {
     else
         @as(u32, 100);
 
+    const sec_cfg: config_types.SecurityConfig = if (@hasField(@TypeOf(self.*), "security_config"))
+        self.security_config
+    else
+        .{};
+
     const report = try security_review.runAllChecks(
         self.allocator,
-        .{}, // SecurityConfig defaults — full config available via API endpoint
+        sec_cfg,
         workspace_only,
         max_actions,
         true, // pairing_enabled — conservative default
