@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const learning = @import("learning.zig");
 const providers = @import("../providers/root.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
@@ -3326,6 +3327,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             \\  /activation, /send, /elevated, /bash, /poll, /skill
             \\  /doctor — memory subsystem diagnostics
             \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
+            \\  /learn [list|forget <key>] — inspect and remove learned behavioral facts
             \\  exit, quit
         );
     }
@@ -3412,8 +3414,76 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "skill")) return try handleSkillCommand(self, cmd.arg);
     if (isSlashName(cmd, "doctor")) return try handleDoctorCommand(self);
     if (isSlashName(cmd, "memory")) return try handleMemoryCommand(self, cmd.arg);
+    if (isSlashName(cmd, "learn")) return try handleLearnCommand(self, cmd.arg);
 
     return null;
+}
+
+fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
+    const parsed = splitFirstToken(arg);
+    const sub = parsed.head;
+    const rest = parsed.tail;
+
+    const mem_rt = memoryRuntimePtr(self) orelse {
+        return try self.allocator.dupe(u8, "Memory not available.");
+    };
+
+    // /learn  or  /learn list  — show all behavioral facts
+    if (sub.len == 0 or std.mem.eql(u8, sub, "list")) {
+        const entries = mem_rt.memory.list(self.allocator, null, self.memory_session_id) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
+        };
+        defer memory_mod.freeEntries(self.allocator, entries);
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const w = out.writer(self.allocator);
+
+        var count: usize = 0;
+        for (entries) |e| {
+            if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) continue;
+            count += 1;
+        }
+
+        if (count == 0) {
+            return try self.allocator.dupe(u8, "No learned behavioral facts found.");
+        }
+
+        try w.print("Learned behavioral facts ({d}):\n", .{count});
+        var idx: usize = 0;
+        for (entries) |e| {
+            if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) continue;
+            idx += 1;
+            const preview_len = @min(@as(usize, 200), e.content.len);
+            try w.print("  {d}. {s}\n     key: {s}\n", .{ idx, e.content[0..preview_len], e.key });
+        }
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    // /learn forget <key>  — remove a specific learned fact by key suffix or full key
+    if (std.mem.eql(u8, sub, "forget")) {
+        const raw_key = std.mem.trim(u8, rest, " \t");
+        if (raw_key.len == 0) {
+            return try self.allocator.dupe(u8, "Usage: /learn forget <key>");
+        }
+
+        // Accept either the full key or the 16-char hex suffix
+        const full_key = if (std.mem.startsWith(u8, raw_key, "durable_fact/behavior/"))
+            try self.allocator.dupe(u8, raw_key)
+        else
+            try std.fmt.allocPrint(self.allocator, "durable_fact/behavior/{s}", .{raw_key});
+        defer self.allocator.free(full_key);
+
+        const removed = mem_rt.memory.forget(full_key) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Forget failed: {s}", .{@errorName(err)});
+        };
+        if (removed) {
+            return try std.fmt.allocPrint(self.allocator, "Removed learned fact: {s}", .{full_key});
+        }
+        return try std.fmt.allocPrint(self.allocator, "No learned fact found with key: {s}", .{full_key});
+    }
+
+    return try self.allocator.dupe(u8, "Usage: /learn [list|forget <key>]");
 }
 
 fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -3652,7 +3722,7 @@ test "baseline: known command surface has expected breadth" {
         "unfocus",      "kill",      "steer",         "tell",         "config",
         "capabilities", "debug",     "dock-telegram", "dock-discord", "dock-slack",
         "activation",   "send",      "elevated",      "bash",         "poll",
-        "skill",        "doctor",    "memory",
+        "skill",        "doctor",    "memory",        "learn",
     };
     for (known_commands) |name| {
         const input = std.fmt.allocPrint(std.testing.allocator, "/{s}", .{name}) catch unreachable;
@@ -3661,5 +3731,5 @@ test "baseline: known command surface has expected breadth" {
         try std.testing.expect(cmd != null);
     }
     // Verify count — if someone adds a command, this test documents the current set size
-    try std.testing.expect(known_commands.len >= 44);
+    try std.testing.expect(known_commands.len >= 45);
 }

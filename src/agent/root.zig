@@ -47,6 +47,7 @@ pub const max_tokens_resolver = @import("max_tokens.zig");
 pub const prompt = @import("prompt.zig");
 pub const narration = @import("narration.zig");
 pub const task_planner = @import("task_planner.zig");
+pub const learning = @import("learning.zig");
 pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
@@ -2781,6 +2782,12 @@ test "task_planner module reexport" {
     _ = task_planner.parseTaskPlan;
 }
 
+test "learning module reexport" {
+    _ = learning.LearningSignal;
+    _ = learning.LearnedFact;
+    _ = learning.detectLearningSignals;
+}
+
 test {
     _ = dispatcher;
     _ = compaction;
@@ -2788,6 +2795,7 @@ test {
     _ = prompt;
     _ = memory_loader;
     _ = task_planner;
+    _ = learning;
 }
 
 // ── Additional agent tests ──────────────────────────────────────
