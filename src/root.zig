@@ -93,6 +93,7 @@ pub const channel_identity_backfill = @import("channel_identity_backfill.zig");
 
 // Phase 02.1: Streaming, Voice & Channel Polish
 pub const channel_health = @import("channel_health.zig");
+pub const security_review = @import("security_review.zig");
 
 test {
     // Run tests from all imported modules
