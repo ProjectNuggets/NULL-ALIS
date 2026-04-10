@@ -54,7 +54,7 @@ pub const ChannelHealthEntry = struct {
 /// Caller owns the returned slice.
 pub fn aggregateChannelHealth(allocator: std.mem.Allocator, mgr: *const channel_manager.ChannelManager) ![]ChannelHealthEntry {
     const items = mgr.entries.items;
-    if (items.len == 0) return &.{};
+    if (items.len == 0) return try allocator.alloc(ChannelHealthEntry, 0);
 
     const entries = try allocator.alloc(ChannelHealthEntry, items.len);
     for (items, 0..) |entry, i| {
