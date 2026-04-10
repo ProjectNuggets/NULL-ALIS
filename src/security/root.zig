@@ -8,6 +8,7 @@
 //! - Sandbox: vtable interface for OS-level isolation backends
 //! - RateTracker: sliding-window rate limiting (used by SecurityPolicy)
 
+pub const approval_modes = @import("approval_modes.zig");
 pub const audit = @import("audit.zig");
 pub const policy = @import("policy.zig");
 pub const pairing = @import("pairing.zig");

@@ -1,5 +1,7 @@
 const std = @import("std");
 pub const RateTracker = @import("tracker.zig").RateTracker;
+const approval_modes_mod = @import("approval_modes.zig");
+const tool_metadata_mod = @import("../tools/metadata.zig");
 
 /// How much autonomy the agent has
 pub const AutonomyLevel = enum {
@@ -274,6 +276,13 @@ pub const SecurityPolicy = struct {
         }
         return false;
     }
+
+    /// Resolve approval policy for a tool based on its metadata and current autonomy level.
+    /// Returns the ApprovalPolicy that should govern this tool's execution.
+    pub fn resolveApproval(self: *const SecurityPolicy, tool_name: []const u8) approval_modes_mod.ApprovalPolicy {
+        const meta = tool_metadata_mod.ToolMetadata.conservative(tool_name);
+        return approval_modes_mod.ApprovalPolicy.forTool(meta, self.autonomy);
+    }
 };
 
 /// Maximum command/path length for security analysis.
@@ -493,6 +502,18 @@ fn lowerBuf(s: []const u8) LowerResult {
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
+
+test "resolveApproval returns confirm_once for supervised+conservative" {
+    const pol = SecurityPolicy{ .autonomy = .supervised };
+    const result = pol.resolveApproval("some_tool");
+    try std.testing.expectEqual(approval_modes_mod.ApprovalPolicy.confirm_once, result);
+}
+
+test "resolveApproval returns auto_approve for full autonomy" {
+    const pol = SecurityPolicy{ .autonomy = .full };
+    const result = pol.resolveApproval("some_tool");
+    try std.testing.expectEqual(approval_modes_mod.ApprovalPolicy.auto_approve, result);
+}
 
 test "autonomy default is supervised" {
     try std.testing.expectEqual(AutonomyLevel.supervised, AutonomyLevel.default());

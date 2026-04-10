@@ -1624,6 +1624,19 @@ fn handleThinkCommand(self: anytype, arg: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(self.allocator, "Thinking set to: {s}", .{self.reasoning_effort orelse "off"});
 }
 
+fn handleModeCommand(self: anytype, arg: []const u8) ![]const u8 {
+    const execution_mode_mod = @import("execution_mode.zig");
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    if (trimmed.len == 0) {
+        return try std.fmt.allocPrint(self.allocator, "Current execution mode: {s}", .{self.execution_mode.toSlice()});
+    }
+    if (execution_mode_mod.ExecutionMode.fromString(trimmed)) |mode| {
+        self.execution_mode = mode;
+        return try std.fmt.allocPrint(self.allocator, "Switched to {s} mode", .{mode.toSlice()});
+    }
+    return try self.allocator.dupe(u8, "Unknown mode. Options: plan, execute, review, background");
+}
+
 fn handleVerboseCommand(self: anytype, arg: []const u8) ![]const u8 {
     const level = firstToken(arg);
     if (level.len == 0 or std.ascii.eqlIgnoreCase(level, "status")) {
@@ -3300,6 +3313,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             \\  /new, /reset [model], /restart [model]
             \\  /help, /commands, /status, /runtime, /whoami, /id
             \\  /model, /models, /model <name>
+            \\  /mode [plan|execute|review|background]
             \\  /think, /verbose, /reasoning
             \\  /exec, /queue, /usage, /tts, /voice
             \\  /stop, /compact
@@ -3346,6 +3360,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "reasoning") or isSlashName(cmd, "reason")) return try handleReasoningCommand(self, cmd.arg);
     if (isSlashName(cmd, "exec")) return try handleExecCommand(self, cmd.arg);
     if (isSlashName(cmd, "queue")) return try handleQueueCommand(self, cmd.arg);
+    if (isSlashName(cmd, "mode")) return try handleModeCommand(self, cmd.arg);
     if (isSlashName(cmd, "usage")) return try handleUsageCommand(self, cmd.arg);
     if (isSlashName(cmd, "tts") or isSlashName(cmd, "voice")) return try handleTtsCommand(self, cmd.arg);
     if (isSlashName(cmd, "stop")) return try handleStopCommand(self);
