@@ -44,6 +44,7 @@ pub const bootstrap = @import("bootstrap/root.zig");
 
 // Phase 3: Networking
 pub const gateway = @import("gateway.zig");
+pub const gateway_run_events = @import("gateway_run_events.zig");
 pub const controller = @import("controller.zig");
 pub const cell_spec = @import("cell_spec.zig");
 pub const cell_k8s_api = @import("cell_k8s_api.zig");
@@ -55,8 +56,10 @@ pub const cron = @import("cron.zig");
 pub const health = @import("health.zig");
 pub const skills = @import("skills.zig");
 pub const tools = @import("tools/root.zig");
+pub const tasks = @import("tasks/root.zig");
 pub const identity = @import("identity.zig");
 pub const cost = @import("cost.zig");
+pub const usage_runtime = @import("usage_runtime.zig");
 pub const observability = @import("observability.zig");
 pub const heartbeat = @import("heartbeat.zig");
 pub const runtime = @import("runtime.zig");

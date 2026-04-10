@@ -92,6 +92,9 @@ pub const file_append = @import("file_append.zig");
 pub const spawn = @import("spawn.zig");
 pub const i2c = @import("i2c.zig");
 pub const spi = @import("spi.zig");
+pub const task_list = @import("task_list.zig");
+pub const task_get = @import("task_get.zig");
+pub const task_stop = @import("task_stop.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
 
@@ -290,6 +293,7 @@ pub fn allTools(
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        task_delivery: ?*@import("../tasks/root.zig").TaskDelivery = null,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -508,6 +512,21 @@ pub fn allTools(
         const spit = try allocator.create(spi.SpiTool);
         spit.* = .{};
         try list.append(allocator, spit.tool());
+    }
+
+    // Task management tools (Phase 2: REQ-006)
+    if (opts.task_delivery) |delivery| {
+        const tlt = try allocator.create(task_list.TaskListTool);
+        tlt.* = .{ .delivery = delivery };
+        try list.append(allocator, tlt.tool());
+
+        const tgt = try allocator.create(task_get.TaskGetTool);
+        tgt.* = .{ .delivery = delivery };
+        try list.append(allocator, tgt.tool());
+
+        const tst = try allocator.create(task_stop.TaskStopTool);
+        tst.* = .{ .delivery = delivery };
+        try list.append(allocator, tst.tool());
     }
 
     // MCP tools (pre-initialized externally)

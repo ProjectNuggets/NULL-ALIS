@@ -1774,6 +1774,19 @@ fn handleQueueCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handleUsageCommand(self: anytype, arg: []const u8) ![]const u8 {
     const mode = firstToken(arg);
     if (mode.len == 0 or std.ascii.eqlIgnoreCase(mode, "status")) {
+        // Use structured UsageRuntime report when available
+        if (self.usage_rt) |urt| {
+            const rpt = urt.report(self.allocator) catch
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "Usage: {s}\nSession total: {d} tokens",
+                    .{ self.usage_mode.toSlice(), self.total_tokens },
+                );
+            defer rpt.deinit();
+            const text = rpt.formatText(self.allocator) catch
+                return try self.allocator.dupe(u8, "[usage report format error]");
+            return text;
+        }
         return try std.fmt.allocPrint(
             self.allocator,
             "Usage: {s}\nLast turn: prompt={d} completion={d} total={d}\nSession total: {d}",

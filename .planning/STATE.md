@@ -1,17 +1,28 @@
 # State — SOTA Agent Program
 
 ## Current Phase
-Phase 1.5: Prompt Architecture and Liveness — COMPLETE
-Plan 05 (Persona calibration) — COMPLETE
+Phase 2: Online Runtime Visibility and Tasks — COMPLETE
+Plan 06 (UsageRuntime) — COMPLETE
 
 ## Current Plan
-Phase 1.5 complete. All 5 plans (01–05) done. Ready for Phase 2.
+Phase 2 complete. All 6 plans (01–06) done across 3 waves. Ready for Phase 3.
 
 ## Phase 0 Results
 - 00-01: 26 characterization tests added (e0ce57d), 5045/5076 pass, 0 fail
 - 00-02: 3 documentation artifacts created (60471d9), no runtime changes
 
 ## Decisions Log
+
+### 2026-04-10: Phase 2 complete — Online Runtime Visibility and Tasks
+- 02-01: RunEventType enum (8 variants), RunEvent tagged union, toSseFrame SSE serializer (REQ-004)
+- 02-02: RunEventObserver with FrameSink, translates 6 ObserverEvent types to RunEvent SSE frames
+- 02-03: TaskLedger with 7-state machine (queued/running/succeeded/failed/timed_out/cancelled/lost), sweepLost, MAX_TASKS=256 (REQ-005)
+- 02-04: TaskDelivery wraps Ledger+Observer, emits task_update ObserverEvent on every state transition; detail truncated to 256 chars (T-02-09)
+- 02-05: task_list, task_get, task_stop tools with Tool vtable (REQ-006)
+- 02-06: UsageRuntime per-turn recording, session aggregation, ring buffer (MAX_TURNS_TRACKED=1024), /usage wired (REQ-015)
+- New ObserverEvent variant: task_update (task_id, status, description) — switch arms in Log/File/Otel observers
+- gateway_run_events.zig placed as sibling to gateway.zig (Zig prevents gateway.zig + gateway/ coexistence)
+- 69 new tests; 5232/5263 total pass; ReleaseSmall build confirmed
 
 ### 2026-04-10: Phase 1.5 Plan 05 complete — Persona calibration
 - Warmth/Proactivity named enums + PersonaProfile struct in prompt.zig (REQ-022)
