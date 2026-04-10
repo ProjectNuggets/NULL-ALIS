@@ -54,6 +54,9 @@ const channel_dispatch = @import("channels/dispatch.zig");
 const bus_mod = @import("bus.zig");
 const tasks_mod = @import("tasks/root.zig");
 const usage_runtime_mod = @import("usage_runtime.zig");
+const gateway_run_events = @import("gateway_run_events.zig");
+const channel_health_mod = @import("channel_health.zig");
+const security_review_mod = @import("security_review.zig");
 const log = std.log.scoped(.gateway);
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
@@ -8004,6 +8007,12 @@ fn LockedSseStream(comptime StreamType: type) type {
         fn markClosed(self: *Self) void {
             _ = self.closed.swap(true, .acq_rel);
         }
+
+        /// Type-erased sendFrame for use with LiveSseCtx function pointer.
+        fn sendFrameErased(ptr: *anyopaque, frame: []const u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.sendFrame(frame);
+        }
     };
 }
 
@@ -8435,6 +8444,56 @@ fn handleApiChatEventsSseConnection(
     return true;
 }
 
+// ── Live SSE Streaming Context ──────────────────────────────────────
+//
+// Used when delivery_mode is "live": the agent's stream_callback pipes
+// token chunks directly to the SSE client via sseTokenFrame + LockedSseStream.
+// The seq counter is shared by pointer so it increments across callbacks.
+
+const LiveSseCtx = struct {
+    stream_ptr: *anyopaque,
+    sendFrameFn: *const fn (ptr: *anyopaque, frame: []const u8) anyerror!void,
+    allocator: std.mem.Allocator,
+    seq: *usize,
+    /// Set to true on send failure (e.g. client disconnect). Once set,
+    /// subsequent tokens are skipped to avoid wasting compute.
+    client_gone: *bool,
+    /// Paced sink for inter-chunk delays (human-pacing). When non-null,
+    /// liveStreamCallback writes through this instead of sendFrameFn directly.
+    paced_sink: ?*gateway_run_events.PacedFrameSink = null,
+
+    /// FrameSink-compatible write that delegates to the error-returning
+    /// sendFrameFn, setting client_gone on failure. Used as the inner
+    /// sink for PacedFrameSink so pacing delays apply before each send.
+    fn sinkWrite(ptr: *anyopaque, frame: []const u8) void {
+        const self: *LiveSseCtx = @ptrCast(@alignCast(ptr));
+        self.sendFrameFn(self.stream_ptr, frame) catch {
+            self.client_gone.* = true;
+        };
+    }
+
+    fn frameSink(self: *LiveSseCtx) gateway_run_events.FrameSink {
+        return .{ .ptr = @ptrCast(self), .writeFn = sinkWrite };
+    }
+};
+
+fn liveStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
+    if (chunk.delta.len == 0) return; // skip empty/final-only chunks
+    const ctx: *LiveSseCtx = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.client_gone.*) return; // client disconnected — skip remaining tokens
+    const frame = sseTokenFrame(ctx.allocator, chunk.delta, ctx.seq.*) catch return;
+    defer ctx.allocator.free(frame);
+    if (ctx.paced_sink) |paced| {
+        paced.sink().write(frame);
+    } else {
+        ctx.sendFrameFn(ctx.stream_ptr, frame) catch {
+            ctx.client_gone.* = true;
+            return;
+        };
+    }
+    ctx.seq.* += 1;
+}
+
 fn handleApiChatStreamSseConnection(
     root_allocator: std.mem.Allocator,
     req_allocator: std.mem.Allocator,
@@ -8592,6 +8651,39 @@ fn handleApiChatStreamSseConnection(
     };
 
     const chat_start_ms = std.time.milliTimestamp();
+
+    // ── Delivery mode resolution (D-02, D-04) ──────────────────────
+    const channel_name = "zaki_app"; // gateway SSE endpoint is always web client
+    const delivery_mode = gateway_run_events.resolveDeliveryMode(channel_name);
+    const is_live = std.mem.eql(u8, delivery_mode, "live");
+
+    // In live mode, send reply_start BEFORE agent processing so the client
+    // knows to expect progressive token delivery.
+    if (is_live) {
+        const live_reply_start = sseReplyStartFrame(req_allocator, "final_reply", "live", true) catch null;
+        defer if (live_reply_start) |frame| req_allocator.free(frame);
+        const live_rs_frame: []const u8 = if (live_reply_start) |frame| frame else "event: reply_start\ndata: {\"type\":\"reply_start\",\"stream_kind\":\"final_reply\",\"delivery_mode\":\"live\",\"live\":true}\n\n";
+        sse_stream.sendFrame(live_rs_frame) catch return true;
+    }
+
+    // Set up live stream context for stream_callback (tokens piped directly to SSE)
+    // PacedFrameSink wraps the SSE send with inter-chunk delays for human-pacing (D-03).
+    var live_seq: usize = 0;
+    const SseStreamType = LockedSseStream(@TypeOf(stream));
+    var live_client_gone: bool = false;
+    var live_ctx = LiveSseCtx{
+        .stream_ptr = @ptrCast(&sse_stream),
+        .sendFrameFn = SseStreamType.sendFrameErased,
+        .allocator = req_allocator,
+        .seq = &live_seq,
+        .client_gone = &live_client_gone,
+    };
+    const pacing_delay = gateway_run_events.resolvePacingDelay(channel_name);
+    var paced_sink = gateway_run_events.PacedFrameSink.init(live_ctx.frameSink(), pacing_delay);
+    if (is_live and pacing_delay > 0) {
+        live_ctx.paced_sink = &paced_sink;
+    }
+
     const ReplyOutcome = union(enum) {
         ok: []const u8,
         err: struct { code: []const u8, msg: []const u8 },
@@ -8610,6 +8702,8 @@ fn handleApiChatStreamSseConnection(
                     break :blk .{ .err = .{ .code = "tenant_runtime_failed", .msg = "tenant runtime init failed" } };
                 }
             };
+            // Tenant runtime path: stream_callback not wired yet (tenant API does not
+            // accept it). Falls back to buffered_replay post-hoc chunking even in live mode.
             break :blk .{ .ok = tenant_runtime.processMessage(
                 session_key,
                 message,
@@ -8638,6 +8732,8 @@ fn handleApiChatStreamSseConnection(
                     .is_dm = true,
                 },
                 .progress_observer = progress_observer,
+                .stream_callback = if (is_live) liveStreamCallback else null,
+                .stream_ctx = if (is_live) @ptrCast(&live_ctx) else null,
             }) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
@@ -8665,25 +8761,42 @@ fn handleApiChatStreamSseConnection(
         reply
     else
         "received";
-    const reply_start_fallback = "event: reply_start\ndata: {\"type\":\"reply_start\",\"stream_kind\":\"final_reply\",\"delivery_mode\":\"buffered_replay\",\"live\":false}\n\n";
-    const reply_start_owned = sseReplyStartFrame(req_allocator, "final_reply", "buffered_replay", false) catch null;
-    defer if (reply_start_owned) |frame| req_allocator.free(frame);
-    const reply_start_frame: []const u8 = if (reply_start_owned) |frame| frame else reply_start_fallback;
-    sse_stream.sendFrame(reply_start_frame) catch return true;
 
-    var start: usize = 0;
-    var seq: usize = 0;
-    while (start < payload_text.len) : (start += SSE_TOKEN_CHUNK_SIZE) {
-        const end = @min(start + SSE_TOKEN_CHUNK_SIZE, payload_text.len);
-        const token_owned = sseTokenFrame(req_allocator, payload_text[start..end], seq) catch {
-            sendLockedSseErrorFrames(&sse_stream, req_allocator, "stream_encode_failed", "failed to encode token frame");
-            return true;
-        };
-        defer req_allocator.free(token_owned);
-        sse_stream.sendFrame(token_owned) catch return true;
-        seq += 1;
+    // Determine if live streaming actually delivered tokens. If the provider
+    // does not support streaming, live_seq stays 0 and we must fall back to
+    // post-hoc chunking so the reply text still reaches the client.
+    const live_streamed = is_live and live_seq > 0;
+
+    if (!live_streamed) {
+        // ── Buffered replay / fallback path ────────────────────────
+        // Used when: (a) delivery_mode is buffered_replay, or (b) live mode
+        // but the provider didn't actually stream (non-streaming provider).
+        if (!is_live) {
+            // Only send reply_start in buffered mode (live already sent it above)
+            const reply_start_fallback = "event: reply_start\ndata: {\"type\":\"reply_start\",\"stream_kind\":\"final_reply\",\"delivery_mode\":\"buffered_replay\",\"live\":false}\n\n";
+            const reply_start_owned = sseReplyStartFrame(req_allocator, "final_reply", "buffered_replay", false) catch null;
+            defer if (reply_start_owned) |frame| req_allocator.free(frame);
+            const reply_start_frame: []const u8 = if (reply_start_owned) |frame| frame else reply_start_fallback;
+            sse_stream.sendFrame(reply_start_frame) catch return true;
+        }
+
+        var start: usize = 0;
+        var seq: usize = 0;
+        while (start < payload_text.len) : (start += SSE_TOKEN_CHUNK_SIZE) {
+            const end = @min(start + SSE_TOKEN_CHUNK_SIZE, payload_text.len);
+            const token_owned = sseTokenFrame(req_allocator, payload_text[start..end], seq) catch {
+                sendLockedSseErrorFrames(&sse_stream, req_allocator, "stream_encode_failed", "failed to encode token frame");
+                return true;
+            };
+            defer req_allocator.free(token_owned);
+            sse_stream.sendFrame(token_owned) catch return true;
+            seq += 1;
+        }
     }
+    // Live mode with streaming provider: tokens already delivered via
+    // liveStreamCallback during agent processing. No post-hoc chunking needed.
 
+    // Always send done frame regardless of delivery mode.
     const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
     const done_owned = sseDoneFrame(req_allocator, session_key, std.time.milliTimestamp()) catch null;
     defer if (done_owned) |frame| req_allocator.free(frame);
@@ -9084,6 +9197,77 @@ fn handleApiRoute(
         scaffoldUserWorkspace(req_allocator, &user_ctx);
         prep_guard.release();
         return .{ .body = "{\"status\":\"provisioned\"}" };
+    }
+
+    // ── Channel Health endpoint (D-10) ───────────────────────────────
+    if (std.mem.eql(u8, base_path, "/api/v1/channels/health")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        }
+        const snap = health.snapshot();
+        // Build real channel health entries from config when available.
+        // A temporary ChannelManager + ChannelRegistry are constructed so
+        // collectConfiguredChannels populates the entry list that
+        // aggregateChannelHealth reads (supervision state, failure counts).
+        if (config_opt) |cfg| {
+            var registry = channel_dispatch.ChannelRegistry.init(req_allocator);
+            defer registry.deinit();
+            const mgr = channel_manager.ChannelManager.init(req_allocator, cfg, &registry) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_manager_init_failed\"}" };
+            };
+            defer mgr.deinit();
+            mgr.collectConfiguredChannels() catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_collect_failed\"}" };
+            };
+            const entries = channel_health_mod.aggregateChannelHealth(req_allocator, mgr) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_aggregate_failed\"}" };
+            };
+            defer req_allocator.free(entries);
+            const json = channel_health_mod.formatHealthJson(
+                req_allocator,
+                entries,
+                @intCast(snap.uptime_seconds),
+            ) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_format_failed\"}" };
+            };
+            return .{ .body = json };
+        }
+        // No config available — return empty channels with uptime only.
+        const json = channel_health_mod.formatHealthJson(
+            req_allocator,
+            &.{},
+            @intCast(snap.uptime_seconds),
+        ) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_format_failed\"}" };
+        };
+        return .{ .body = json };
+    }
+
+    // ── Security Review endpoint (D-12) ──────────────────────────────
+    if (std.mem.eql(u8, base_path, "/api/v1/security/review")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        }
+        const sec_cfg: config_types.SecurityConfig = if (config_opt) |cfg| cfg.security else .{};
+        const workspace_only: bool = if (config_opt) |cfg| cfg.autonomy.workspace_only else true;
+        const max_actions: u32 = if (config_opt) |cfg| cfg.autonomy.max_actions_per_hour else 100;
+        const pairing_enabled: bool = state.pairing_guard != null;
+
+        const report = security_review_mod.runAllChecks(
+            req_allocator,
+            sec_cfg,
+            workspace_only,
+            max_actions,
+            pairing_enabled,
+        ) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"security_review_failed\"}" };
+        };
+        defer req_allocator.free(report.checks);
+
+        const json = security_review_mod.formatReviewJson(req_allocator, report) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"review_format_failed\"}" };
+        };
+        return .{ .body = json };
     }
 
     const parsed = parseUserPath(base_path) orelse

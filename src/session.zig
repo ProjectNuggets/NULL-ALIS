@@ -101,6 +101,8 @@ pub const SessionManager = struct {
         message_turn_context: ?tools_mod.MessageTurnContext = null,
         turn_origin: tools_mod.TurnOrigin = .user,
         progress_observer: ?Observer = null,
+        stream_callback: ?providers.StreamCallback = null,
+        stream_ctx: ?*anyopaque = null,
     };
 
     pub const OriginSnapshot = struct {
@@ -582,6 +584,18 @@ pub const SessionManager = struct {
         defer if (progress_attached) {
             session.agent.observer = base_observer;
             session.turn_observer_multi.observers = &.{};
+        };
+
+        // Wire stream callback for live SSE delivery (T-02.1-04: scoped to single turn)
+        var stream_attached = false;
+        if (options.stream_callback) |cb| {
+            session.agent.stream_callback = cb;
+            session.agent.stream_ctx = options.stream_ctx;
+            stream_attached = true;
+        }
+        defer if (stream_attached) {
+            session.agent.stream_callback = null;
+            session.agent.stream_ctx = null;
         };
 
         if (lock_wait_ms > 0) {

@@ -93,8 +93,10 @@ pub const TaskPlan = struct {
 
 /// Result of splitting response text from its embedded <task_plan> block.
 pub const ExtractResult = struct {
-    /// Text outside the <task_plan> block (before + after), trimmed.
+    /// Text before the <task_plan> block, trimmed.
     text: []const u8,
+    /// Text after the </task_plan> closing tag, trimmed. Empty if none.
+    text_after: []const u8 = "",
     /// Raw content inside <task_plan>...</task_plan>, or null if no block found.
     plan_xml: ?[]const u8,
 };
@@ -156,17 +158,7 @@ pub fn extractTextAndPlan(response: []const u8) ExtractResult {
         const after_close = abs_close + close_tag.len;
         const text_after = std.mem.trim(u8, response[after_close..], " \t\r\n");
 
-        // Combine before + after as the text portion (separated by newline when both non-empty).
-        // Since we return slices into `response` we can only return one slice. We choose the
-        // longer of the two unless before is empty, in which case we return after (and vice-versa).
-        // Both-non-empty case: caller can reconstruct from offsets; we return `text_before` as
-        // the canonical text slice for now (common: plan appears at start of response).
-        const text: []const u8 = if (text_before.len > 0)
-            text_before
-        else
-            text_after;
-
-        return .{ .text = text, .plan_xml = plan_xml };
+        return .{ .text = text_before, .text_after = text_after, .plan_xml = plan_xml };
     } else {
         // Unclosed tag — no plan_xml
         return .{ .text = std.mem.trim(u8, response[0..open_pos], " \t\r\n"), .plan_xml = null };
@@ -404,6 +396,8 @@ test "extractTextAndPlan splits text from task_plan block" {
     // Text portion should not contain the task_plan tags
     try std.testing.expect(std.mem.indexOf(u8, result.text, "<task_plan>") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "</task_plan>") == null);
+    // text_after captures content after the closing tag
+    try std.testing.expectEqualStrings("And now I will execute.", result.text_after);
 }
 
 test "extractTextAndPlan with no task_plan returns full text and null plan_xml" {

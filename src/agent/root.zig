@@ -22,6 +22,7 @@ const capabilities_mod = @import("../capabilities.zig");
 const multimodal = @import("../multimodal.zig");
 const platform = @import("../platform.zig");
 const voice_mod = @import("../voice.zig");
+const voice_mode = @import("../voice_mode.zig");
 const observability = @import("../observability.zig");
 const tool_dispatcher = @import("../tool_dispatcher.zig");
 const Observer = observability.Observer;
@@ -352,6 +353,10 @@ pub const Agent = struct {
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
 
+    /// Security configuration for sandbox, audit, and resource checks.
+    /// Used by /security-review slash command to report actual runtime config.
+    security_config: config_types.SecurityConfig = .{},
+
     /// Lifecycle hooks — config-driven shell commands on agent events.
     hooks: []const hooks_mod.Hook = &.{},
 
@@ -490,6 +495,7 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .security_config = cfg.security,
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -673,7 +679,7 @@ pub const Agent = struct {
 
     fn ttsAudioChannelSupported(message_ctx: tools_mod.MessageTurnContext) bool {
         const channel = message_ctx.channel orelse return false;
-        return std.ascii.eqlIgnoreCase(channel, "telegram");
+        return voice_mode.channelSupportsAudio(channel);
     }
 
     fn ttsTrimUtf8Boundary(text: []const u8, max_chars: usize) []const u8 {
@@ -972,15 +978,23 @@ pub const Agent = struct {
         }
         // Execution mode gate: block tools not allowed in current mode
         if (self.execution_mode != .execute) {
+            // TODO(phase-4+): wire comptime tool registry here instead of empty slice
             const meta = tool_metadata.lookupMetadata(call.name, &.{}) orelse
                 tool_metadata.ToolMetadata.conservative(call.name);
             if (!self.execution_mode.allowsTool(meta)) {
-                return .{ .blocked = .{
-                    .name = call.name,
-                    .output = "blocked",
-                    .success = false,
-                    .tool_call_id = call.tool_call_id,
-                } };
+                return .{
+                    .blocked = .{
+                        .name = call.name,
+                        .output = switch (self.execution_mode) {
+                            .plan => "Tool blocked: not allowed in plan mode (read-only tools only)",
+                            .review => "Tool blocked: not allowed in review mode (read-only tools only)",
+                            .background => "Tool blocked: not allowed in background mode (background-safe tools only)",
+                            .execute => unreachable, // execute allows all tools
+                        },
+                        .success = false,
+                        .tool_call_id = call.tool_call_id,
+                    },
+                };
             }
         }
         return .allowed;
@@ -1228,6 +1242,7 @@ pub const Agent = struct {
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         const turn_start_ms = std.time.milliTimestamp();
+        self.cancellation_token.reset(); // Clear stale cancellation from previous turn
         commands.refreshSubagentToolContext(self);
         var turn_llm_calls: u32 = 0;
         var turn_retry_attempts: u32 = 0;
@@ -1397,11 +1412,31 @@ pub const Agent = struct {
                 const fact_content = learning.extractFactFromMessage(self.allocator, user_message, signals) catch null;
                 defer if (fact_content) |fc| self.allocator.free(fc);
                 if (fact_content) |fc| {
-                    const key = learning.factKey(self.allocator, fc) catch null;
-                    if (key) |k| {
-                        defer self.allocator.free(k);
-                        _ = mem.store(k, fc, .core, self.memory_session_id) catch {};
-                        log.info("learning.signal_detected signals={d} key={s}", .{ signals.len, k });
+                    // T-1.5-08: enforce MAX_FACTS_PER_SESSION before storing
+                    const at_limit = blk: {
+                        const entries = mem.list(self.allocator, null, self.memory_session_id) catch break :blk false;
+                        defer if (entries.len > 0) {
+                            for (entries) |e| {
+                                self.allocator.free(e.key);
+                                self.allocator.free(e.content);
+                            }
+                            self.allocator.free(entries);
+                        };
+                        var fact_count: usize = 0;
+                        for (entries) |e| {
+                            if (std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) fact_count += 1;
+                        }
+                        break :blk fact_count >= learning.MAX_FACTS_PER_SESSION;
+                    };
+                    if (at_limit) {
+                        log.warn("learning.max_facts_reached session={?s}", .{self.memory_session_id});
+                    } else {
+                        const key = learning.factKey(self.allocator, fc) catch null;
+                        if (key) |k| {
+                            defer self.allocator.free(k);
+                            _ = mem.store(k, fc, .core, self.memory_session_id) catch {};
+                            log.info("learning.signal_detected signals={d} key={s}", .{ signals.len, k });
+                        }
                     }
                 }
             }
@@ -6946,4 +6981,17 @@ test "baseline: Agent deinit on minimal instance does not leak" {
     // Verify defaults are applied correctly.
     try std.testing.expectEqual(@as(u32, 25), agent.max_tool_iterations);
     try std.testing.expectEqual(@as(u32, 50), agent.max_history_messages);
+}
+
+test "ttsAudioChannelSupported returns true for discord via voice_mode" {
+    // Proves the hardcoded telegram-only check has been replaced with
+    // voice_mode.channelSupportsAudio which supports multiple channels.
+    try std.testing.expect(voice_mode.channelSupportsAudio("discord"));
+    try std.testing.expect(voice_mode.channelSupportsAudio("telegram"));
+    try std.testing.expect(voice_mode.channelSupportsAudio("whatsapp"));
+}
+
+test "ttsAudioChannelSupported returns false for cli via voice_mode" {
+    try std.testing.expect(!voice_mode.channelSupportsAudio("cli"));
+    try std.testing.expect(!voice_mode.channelSupportsAudio("unknown"));
 }

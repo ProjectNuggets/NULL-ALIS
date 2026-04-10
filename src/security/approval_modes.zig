@@ -35,8 +35,8 @@ pub const ApprovalPolicy = enum {
             .full => .auto_approve,
             .read_only => .deny,
             .supervised => {
-                if (meta.flags.read_only) return .auto_approve;
                 if (meta.flags.operator_only) return .deny;
+                if (meta.flags.read_only) return .auto_approve;
                 if (meta.flags.mutating) return .confirm_once;
                 return .auto_approve;
             },
