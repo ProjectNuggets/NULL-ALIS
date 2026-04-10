@@ -26,12 +26,16 @@ Plans:
 - [ ] 01.5-05-PLAN.md — Persona calibration: SOUL.md front-matter parsing, PersonaProfile, /persona command
 
 ### Phase 2: Online Runtime Visibility and Tasks
-- [ ] 02-01: Run events core (src/agent/run_event_types.zig)
-- [ ] 02-02: SSE run events (src/gateway/run_events.zig)
-- [ ] 02-03: Task ledger core (src/tasks/)
-- [ ] 02-04: Task delivery (src/tasks/delivery.zig)
-- [ ] 02-05: Task tools (src/tools/task_list.zig, task_get.zig, task_stop.zig)
-- [ ] 02-06: Cost and usage runtime (src/usage_runtime.zig)
+**Goal:** Structured run-event stream for online clients, durable task ledger with lifecycle management, task tools for LLM inspection/control, and per-turn cost/token accounting
+**Plans:** 6 plans
+
+Plans:
+- [ ] 02-01-PLAN.md — Run event types: RunEventType enum (8 variants), RunEvent tagged union, toSseFrame serializer
+- [ ] 02-02-PLAN.md — SSE run events: RunEventObserver wrapping Observer for SSE delivery, gateway wiring
+- [ ] 02-03-PLAN.md — Task ledger core: TaskStatus (7 states), TaskEntry, TaskLedger with state machine
+- [ ] 02-04-PLAN.md — Task delivery: TaskDelivery bridging ledger transitions to observer events
+- [ ] 02-05-PLAN.md — Task tools: task_list, task_get, task_stop LLM-callable tools
+- [ ] 02-06-PLAN.md — Cost and usage runtime: UsageRuntime, per-turn recording, session aggregation
 
 ### Phase 3: Canonical Session and Context Runtime
 - [ ] 03-01: Session identity refactor (src/session/)
