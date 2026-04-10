@@ -2,16 +2,24 @@
 
 ## Current Phase
 Phase 1.5: Prompt Architecture and Liveness — IN PROGRESS
-Plan 01 (Composable prompt scaffold) — COMPLETE
+Plan 02 (Liveness narration engine) — COMPLETE
 
 ## Current Plan
-Phase 1.5, Plan 01 complete. Ready for Plan 02 (Liveness narration engine).
+Phase 1.5, Plan 02 complete. Ready for Plan 03 (Task decomposition).
 
 ## Phase 0 Results
 - 00-01: 26 characterization tests added (e0ce57d), 5045/5076 pass, 0 fail
 - 00-02: 3 documentation artifacts created (60471d9), no runtime changes
 
 ## Decisions Log
+
+### 2026-04-10: Phase 1.5 Plan 02 complete — Liveness narration engine
+- NarrationObserver wraps any Observer, translates tool_call_start and turn_stage events into NarrationFrame structs (REQ-019)
+- narration_frame variant added to ObserverEvent; NarrationFrameType enum in observability.zig (avoids circular import)
+- 12 stage label mappings matching VerboseObserver; dual delivery: callback + event bus
+- Safety comment at self.history.append enforces T-1.5-03: narration frames never enter LLM history
+- 9 new tests; 5109/5140 pass total; ReleaseSmall build confirmed
+- Commits: 568e5a0 (observability + narration.zig), fa8244c (root.zig wiring)
 
 ### 2026-04-10: Phase 1.5 Plan 01 complete — Composable prompt scaffold
 - buildSystemPrompt decomposed into 5 independent section builders
@@ -63,5 +71,6 @@ None currently.
 - M1 (Kernel UX) complete and merged to main
 - M2 (Context Introspection) complete and merged to main
 - Build commands: `zig build test --summary all`, `zig build -Doptimize=ReleaseSmall`
-- 189,005 lines across 188 .zig files
-- 1,500+ inline tests
+- 189,005 lines across 188 .zig files (+ narration.zig added in 01.5-02)
+- 1,500+ inline tests (5109/5140 passing after 01.5-02)
+- Last session stopped at: Completed 01.5-02-PLAN.md (2026-04-10T11:09:00Z)
