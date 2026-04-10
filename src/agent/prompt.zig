@@ -26,6 +26,67 @@ pub const ConversationContext = struct {
     idle_gap_secs: ?u64 = null,
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Composable Prompt Section Types
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Turn class — classifies the incoming turn before tool selection.
+pub const TurnClass = enum {
+    chat,
+    execute,
+    wake,
+    repair,
+    operator,
+
+    pub fn toSlice(self: TurnClass) []const u8 {
+        return switch (self) {
+            .chat => "chat",
+            .execute => "execute",
+            .wake => "wake",
+            .repair => "repair",
+            .operator => "operator",
+        };
+    }
+
+    pub fn fromString(s: []const u8) ?TurnClass {
+        inline for (std.meta.fields(TurnClass)) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
+/// Persona calibration for downstream REQ-022.
+pub const PersonaSection = struct {
+    warmth: enum { crisp, balanced, warm } = .balanced,
+    proactivity: enum { reactive, moderate, proactive } = .moderate,
+    voice_style: ?[]const u8 = null,
+};
+
+/// Narration emission policy for downstream REQ-019.
+pub const NarrationPolicy = struct {
+    emit_tool_start: bool = true,
+    emit_tool_result: bool = false,
+    emit_waiting: bool = true,
+    emit_plan_step: bool = true,
+};
+
+/// Tool-use policy for downstream REQ-020 / REQ-021.
+pub const ToolUsePolicy = struct {
+    max_iterations: u32 = 25,
+    requires_approval: bool = false,
+    execution_mode: []const u8 = "execute",
+};
+
+/// Composable prompt sections — extension points for downstream sprints.
+/// All fields default to null (zero-init) for backward compatibility.
+pub const PromptSections = struct {
+    persona: ?PersonaSection = null,
+    narration: ?NarrationPolicy = null,
+    tool_use: ?ToolUsePolicy = null,
+    learned_facts: ?[]const u8 = null,
+};
+
 /// Context passed to prompt sections during construction.
 pub const PromptContext = struct {
     workspace_dir: []const u8,
@@ -33,6 +94,7 @@ pub const PromptContext = struct {
     tools: []const Tool,
     capabilities_section: ?[]const u8 = null,
     conversation_context: ?ConversationContext = null,
+    sections: PromptSections = .{},
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -107,50 +169,106 @@ pub fn buildSystemPrompt(
     try appendChannelAttachmentsSection(w);
 
     // Conversation context section (Signal-specific for now)
-    if (ctx.conversation_context) |cc| {
-        try w.writeAll("## Conversation Context\n\n");
-        if (cc.channel) |ch| {
-            try std.fmt.format(w, "- Active channel (authoritative): {s}\n", .{ch});
-        }
-        if (cc.is_group) |ig| {
-            if (ig) {
-                if (cc.group_id) |gid| {
-                    try std.fmt.format(w, "- Chat type: group\n", .{});
-                    try std.fmt.format(w, "- Group ID: {s}\n", .{gid});
-                } else {
-                    try std.fmt.format(w, "- Chat type: group\n", .{});
-                }
-            } else {
-                try std.fmt.format(w, "- Chat type: direct message\n", .{});
-            }
-        }
-        if (cc.sender_number) |num| {
-            try std.fmt.format(w, "- Sender phone: {s}\n", .{num});
-        }
-        if (cc.sender_uuid) |uuid| {
-            try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
-        }
-        if (cc.last_interaction_unix_s) |timestamp| {
-            try w.writeAll("- Last interaction in this session: ");
-            try appendUtcTimestampLine(w, timestamp);
-        }
-        if (cc.idle_gap_secs) |idle_gap_secs| {
-            try w.writeAll("- Idle gap before this turn: ");
-            try appendHumanizedIdleGap(w, idle_gap_secs);
-            try w.writeByte('\n');
-        }
-        try w.writeAll("- IMPORTANT: Use this context as the source of truth for this turn. Do not claim a different channel.\n");
-        try w.writeAll("\n");
-    }
+    try buildConversationContextSection(w, ctx.conversation_context);
 
     if (ctx.capabilities_section) |section| {
         try w.writeAll(section);
     }
 
+    // Persona section — placeholder insertion point for REQ-022
+    // (emits nothing when null — downstream sprint will populate)
+    _ = ctx.sections.persona;
+
+    // Turn classification section
+    try buildTurnClassificationSection(w);
+
     // Safety section
+    try buildSafetySection(w);
+
+    // Narration section — placeholder insertion point for REQ-019
+    // (emits nothing when null — downstream sprint will populate)
+    _ = ctx.sections.narration;
+
+    // Learned facts section — placeholder insertion point for REQ-021
+    // (emits nothing when null — downstream sprint will populate)
+    _ = ctx.sections.learned_facts;
+
+    // Tool use policy — placeholder insertion point for REQ-020
+    // (emits nothing when null — downstream sprint will populate)
+    _ = ctx.sections.tool_use;
+
+    // Skills section
+    try appendSkillsSection(allocator, w, ctx.workspace_dir);
+
+    // Workspace section
+    try buildWorkspaceSection(w, ctx.workspace_dir);
+
+    // DateTime section
+    try appendDateTimeSection(allocator, w, ctx.workspace_dir);
+
+    // Runtime section
+    try buildRuntimeSection(w, ctx.model_name);
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Emit conversation context (Signal-specific for now).
+/// Produces no output when cc is null.
+fn buildConversationContextSection(w: anytype, cc_opt: ?ConversationContext) !void {
+    const cc = cc_opt orelse return;
+    try w.writeAll("## Conversation Context\n\n");
+    if (cc.channel) |ch| {
+        try std.fmt.format(w, "- Active channel (authoritative): {s}\n", .{ch});
+    }
+    if (cc.is_group) |ig| {
+        if (ig) {
+            if (cc.group_id) |gid| {
+                try std.fmt.format(w, "- Chat type: group\n", .{});
+                try std.fmt.format(w, "- Group ID: {s}\n", .{gid});
+            } else {
+                try std.fmt.format(w, "- Chat type: group\n", .{});
+            }
+        } else {
+            try std.fmt.format(w, "- Chat type: direct message\n", .{});
+        }
+    }
+    if (cc.sender_number) |num| {
+        try std.fmt.format(w, "- Sender phone: {s}\n", .{num});
+    }
+    if (cc.sender_uuid) |uuid| {
+        try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
+    }
+    if (cc.last_interaction_unix_s) |timestamp| {
+        try w.writeAll("- Last interaction in this session: ");
+        try appendUtcTimestampLine(w, timestamp);
+    }
+    if (cc.idle_gap_secs) |idle_gap_secs| {
+        try w.writeAll("- Idle gap before this turn: ");
+        try appendHumanizedIdleGap(w, idle_gap_secs);
+        try w.writeByte('\n');
+    }
+    try w.writeAll("- IMPORTANT: Use this context as the source of truth for this turn. Do not claim a different channel.\n");
+    try w.writeAll("\n");
+}
+
+/// Emit turn classification instructions.
+/// Extracted from the monolithic safety section so downstream sprints can inject
+/// per-class guidance (narration, approval, repair strategies).
+fn buildTurnClassificationSection(w: anytype) !void {
+    try w.writeAll("## Turn Classification\n\n");
+    try w.writeAll("Classify every incoming turn before choosing tools or reply style:\n");
+    try w.writeAll("- `chat` — conversational exchange, no tool use needed\n");
+    try w.writeAll("- `execute` — user wants something done, use tools as needed\n");
+    try w.writeAll("- `wake` — proactive/scheduled turn, check automations and heartbeat\n");
+    try w.writeAll("- `repair` — error recovery, be cautious and diagnostic\n");
+    try w.writeAll("- `operator` — administrative command, follow operator protocols\n");
+    try w.writeAll("\n");
+}
+
+/// Emit safety rules. Turn classification has been extracted into buildTurnClassificationSection.
+fn buildSafetySection(w: anytype) !void {
     try w.writeAll("## Safety\n\n");
     try w.writeAll("- Precedence: verified runtime state, tool results, and direct observations override workspace docs, memory, and inference.\n\n");
-    try w.writeAll("- First classify the turn as `chat`, `execute`, `wake`, `repair`, or `operator`, then choose tools and reply style accordingly.\n\n");
     try w.writeAll("- Preferred tool paths: `schedule` for user time/date/recurrence work; `cron_*` for raw scheduler inspection; `runtime_info` for runtime/session/scheduler truth; `http_request` for known external APIs; `web_search`/`web_fetch` for open-web research; `spawn` for async-now work; `delegate` for specialist subtasks; `message` for explicit outbound sends; `shell` only when no more specific tool is better and policy allows.\n\n");
     try w.writeAll("- On longer work, send short progress updates instead of going silent. Before risky multi-step changes, briefly state the plan. Default to concise, result-first replies and prefer artifacts or links over pasted output.\n\n");
     try w.writeAll("- Do not exfiltrate private data.\n");
@@ -168,23 +286,19 @@ pub fn buildSystemPrompt(
     try w.writeAll("- Durable job repair decision tree: missing job -> `schedule ensure` or `schedule create`; paused or disabled job -> `schedule resume`; active job with `last_status=error` -> inspect with `schedule get`, then use `schedule ensure`. Never use `resume` to repair an active errored job.\n\n");
     try w.writeAll("- Only wake turns may use `schedule ensure`, and only for canonical jobs declared in `AUTOMATIONS.json`. `HEARTBEAT.md` is wake policy only; it is not schedule truth.\n\n");
     try w.writeAll("- Scheduler state is execution truth for jobs. If a job exists in `schedule`, it is valid and should run even if not declared in `AUTOMATIONS.json`. `AUTOMATIONS.json` is only for durable restore/repair, and scheduler-only jobs are not drift by themselves.\n\n");
+}
 
-    // Skills section
-    try appendSkillsSection(allocator, w, ctx.workspace_dir);
+/// Emit the workspace section.
+fn buildWorkspaceSection(w: anytype, workspace_dir: []const u8) !void {
+    try std.fmt.format(w, "## Workspace\n\nWorking directory: `{s}`\n\n", .{workspace_dir});
+}
 
-    // Workspace section
-    try std.fmt.format(w, "## Workspace\n\nWorking directory: `{s}`\n\n", .{ctx.workspace_dir});
-
-    // DateTime section
-    try appendDateTimeSection(allocator, w, ctx.workspace_dir);
-
-    // Runtime section
+/// Emit the runtime section.
+fn buildRuntimeSection(w: anytype, model_name: []const u8) !void {
     try std.fmt.format(w, "## Runtime\n\nOS: {s} | Model: {s}\n\n", .{
         @tagName(builtin.os.tag),
-        ctx.model_name,
+        model_name,
     });
-
-    return try buf.toOwnedSlice(allocator);
 }
 
 fn buildIdentitySection(
@@ -540,13 +654,19 @@ test "buildSystemPrompt includes core sections" {
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Project Context") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Turn Classification") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Safety") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Precedence: verified runtime state") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "`chat`, `execute`, `wake`, `repair`, or `operator`") != null);
+    // Turn classification now lives in its own section
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "`chat`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "`execute`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "`wake`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "`repair`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "`operator`") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Preferred tool paths") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent timing, scheduler, or delivery status claims") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Cold memory is tool-only by default") != null);
@@ -918,4 +1038,148 @@ test "buildSystemPrompt datetime appears before runtime" {
     const dt_pos = std.mem.indexOf(u8, prompt, "## Current Date & Time") orelse return error.SectionNotFound;
     const rt_pos = std.mem.indexOf(u8, prompt, "## Runtime") orelse return error.SectionNotFound;
     try std.testing.expect(dt_pos < rt_pos);
+}
+
+// ─── New section-builder tests (REQ-018) ────────────────────────────────────
+
+test "TurnClass toSlice roundtrip" {
+    const cases = [_]struct { tc: TurnClass, s: []const u8 }{
+        .{ .tc = .chat, .s = "chat" },
+        .{ .tc = .execute, .s = "execute" },
+        .{ .tc = .wake, .s = "wake" },
+        .{ .tc = .repair, .s = "repair" },
+        .{ .tc = .operator, .s = "operator" },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqualStrings(c.s, c.tc.toSlice());
+        const parsed = TurnClass.fromString(c.s) orelse return error.TestUnexpectedNull;
+        try std.testing.expectEqual(c.tc, parsed);
+    }
+}
+
+test "TurnClass fromString returns null for unknown" {
+    try std.testing.expect(TurnClass.fromString("") == null);
+    try std.testing.expect(TurnClass.fromString("CHAT") == null);
+    try std.testing.expect(TurnClass.fromString("unknown") == null);
+}
+
+test "PromptSections zero-init has all null fields" {
+    const s: PromptSections = .{};
+    try std.testing.expect(s.persona == null);
+    try std.testing.expect(s.narration == null);
+    try std.testing.expect(s.tool_use == null);
+    try std.testing.expect(s.learned_facts == null);
+}
+
+test "PersonaSection zero-init has default values" {
+    const p: PersonaSection = .{};
+    try std.testing.expectEqual(@as(@TypeOf(p.warmth), .balanced), p.warmth);
+    try std.testing.expectEqual(@as(@TypeOf(p.proactivity), .moderate), p.proactivity);
+    try std.testing.expect(p.voice_style == null);
+}
+
+test "NarrationPolicy zero-init has default values" {
+    const n: NarrationPolicy = .{};
+    try std.testing.expect(n.emit_tool_start == true);
+    try std.testing.expect(n.emit_tool_result == false);
+    try std.testing.expect(n.emit_waiting == true);
+    try std.testing.expect(n.emit_plan_step == true);
+}
+
+test "ToolUsePolicy zero-init has default values" {
+    const t: ToolUsePolicy = .{};
+    try std.testing.expectEqual(@as(u32, 25), t.max_iterations);
+    try std.testing.expect(t.requires_approval == false);
+    try std.testing.expectEqualStrings("execute", t.execution_mode);
+}
+
+test "buildTurnClassificationSection contains expected header and classes" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildTurnClassificationSection(w);
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Turn Classification") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "`chat`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "`execute`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "`wake`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "`repair`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "`operator`") != null);
+}
+
+test "buildSafetySection does not contain turn classification text" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildSafetySection(w);
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Safety") != null);
+    // "First classify the turn" line was moved to buildTurnClassificationSection
+    try std.testing.expect(std.mem.indexOf(u8, output, "First classify the turn") == null);
+    // Core safety content remains
+    try std.testing.expect(std.mem.indexOf(u8, output, "Precedence: verified runtime state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Preferred tool paths") != null);
+}
+
+test "buildConversationContextSection with null produces empty output" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildConversationContextSection(w, null);
+
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+}
+
+test "buildConversationContextSection emits channel and sender info" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildConversationContextSection(w, .{
+        .channel = "signal",
+        .sender_number = "+15551234567",
+        .is_group = false,
+    });
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Conversation Context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "signal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "+15551234567") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "direct message") != null);
+}
+
+test "buildSystemPrompt backward compatible with default PromptSections" {
+    const allocator = std.testing.allocator;
+    // Calling with explicit zero-init sections should produce same structure as no sections field
+    const prompt_default = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "compat-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt_default);
+
+    const prompt_explicit = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "compat-model",
+        .tools = &.{},
+        .sections = .{},
+    });
+    defer allocator.free(prompt_explicit);
+
+    try std.testing.expectEqualStrings(prompt_default, prompt_explicit);
+}
+
+test "buildSystemPrompt turn classification section appears before safety" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+
+    const tc_pos = std.mem.indexOf(u8, prompt, "## Turn Classification") orelse return error.SectionNotFound;
+    const safety_pos = std.mem.indexOf(u8, prompt, "## Safety") orelse return error.SectionNotFound;
+    try std.testing.expect(tc_pos < safety_pos);
 }
