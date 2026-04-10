@@ -33,21 +33,37 @@ pub const FrameSink = struct {
 /// delay, enabling human-pacing for progressive SSE token streaming.
 /// The delay is applied at the delivery layer (not in the LLM provider
 /// callback), per D-03. Thread.sleep is bounded (T-02.1-02).
+/// Decorator that wraps any FrameSink with a configurable inter-chunk
+/// delay, enabling human-pacing for progressive SSE token streaming.
+/// Uses timestamp-based gating: only sleeps if the elapsed time since
+/// the last write is less than the configured delay, so fast tokens
+/// don't accumulate artificial latency (T-02.1-02: bounded delay).
 pub const PacedFrameSink = struct {
     inner: FrameSink,
     delay_ns: u64,
+    last_write_ns: i128,
 
     pub fn init(inner: FrameSink, delay_ms: u32) PacedFrameSink {
         return .{
             .inner = inner,
             .delay_ns = @as(u64, delay_ms) * std.time.ns_per_ms,
+            .last_write_ns = 0,
         };
     }
 
     fn pacedWrite(ptr: *anyopaque, frame: []const u8) void {
         const self: *PacedFrameSink = @ptrCast(@alignCast(ptr));
         if (self.delay_ns > 0) {
-            std.Thread.sleep(self.delay_ns);
+            const now = std.time.nanoTimestamp();
+            if (self.last_write_ns > 0) {
+                const elapsed = now - self.last_write_ns;
+                const delay_i128: i128 = @intCast(self.delay_ns);
+                if (elapsed < delay_i128) {
+                    const remaining: u64 = @intCast(delay_i128 - elapsed);
+                    std.Thread.sleep(remaining);
+                }
+            }
+            self.last_write_ns = std.time.nanoTimestamp();
         }
         self.inner.write(frame);
     }
@@ -69,10 +85,11 @@ pub fn resolveDeliveryMode(channel: []const u8) []const u8 {
 }
 
 /// Resolve inter-chunk pacing delay (ms) for a given channel.
-/// Web SSE (zaki_app) gets 30ms for human-readable progressive feel.
+/// Web SSE (zaki_app) gets 10ms for human-readable progressive feel
+/// without excessive latency on long responses (500 tokens * 10ms = 5s).
 /// CLI gets 0ms (immediate dump). Non-live channels return 0 (unused).
 pub fn resolvePacingDelay(channel: []const u8) u32 {
-    if (std.ascii.eqlIgnoreCase(channel, "zaki_app")) return 30;
+    if (std.ascii.eqlIgnoreCase(channel, "zaki_app")) return 10;
     if (std.ascii.eqlIgnoreCase(channel, "cli")) return 0;
     return 0; // non-live channels don't need pacing
 }
@@ -409,8 +426,8 @@ test "resolveDeliveryMode unknown_channel returns buffered_replay" {
 
 // ── resolvePacingDelay Tests ────────────────────────────────────────
 
-test "resolvePacingDelay zaki_app returns 30" {
-    try std.testing.expectEqual(@as(u32, 30), resolvePacingDelay("zaki_app"));
+test "resolvePacingDelay zaki_app returns 10" {
+    try std.testing.expectEqual(@as(u32, 10), resolvePacingDelay("zaki_app"));
 }
 
 test "resolvePacingDelay cli returns 0" {
