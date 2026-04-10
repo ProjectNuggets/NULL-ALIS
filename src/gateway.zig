@@ -55,6 +55,8 @@ const bus_mod = @import("bus.zig");
 const tasks_mod = @import("tasks/root.zig");
 const usage_runtime_mod = @import("usage_runtime.zig");
 const gateway_run_events = @import("gateway_run_events.zig");
+const channel_health_mod = @import("channel_health.zig");
+const security_review_mod = @import("security_review.zig");
 const log = std.log.scoped(.gateway);
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
@@ -9159,6 +9161,52 @@ fn handleApiRoute(
         scaffoldUserWorkspace(req_allocator, &user_ctx);
         prep_guard.release();
         return .{ .body = "{\"status\":\"provisioned\"}" };
+    }
+
+    // ── Channel Health endpoint (D-10) ───────────────────────────────
+    if (std.mem.eql(u8, base_path, "/api/v1/channels/health")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        }
+        // Construct a temporary ChannelManager to aggregate health.
+        // In production, channels are registered on the global registry;
+        // the manager collects configured entries from config.
+        const snap = health.snapshot();
+        const json = channel_health_mod.formatHealthJson(
+            req_allocator,
+            &.{}, // no per-channel entries without a live ChannelManager
+            @intCast(snap.uptime_seconds),
+        ) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_format_failed\"}" };
+        };
+        return .{ .body = json };
+    }
+
+    // ── Security Review endpoint (D-12) ──────────────────────────────
+    if (std.mem.eql(u8, base_path, "/api/v1/security/review")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        }
+        const sec_cfg: config_types.SecurityConfig = if (config_opt) |cfg| cfg.security else .{};
+        const workspace_only: bool = if (config_opt) |cfg| cfg.autonomy.workspace_only else true;
+        const max_actions: u32 = if (config_opt) |cfg| cfg.autonomy.max_actions_per_hour else 100;
+        const pairing_enabled: bool = state.pairing_guard != null;
+
+        const report = security_review_mod.runAllChecks(
+            req_allocator,
+            sec_cfg,
+            workspace_only,
+            max_actions,
+            pairing_enabled,
+        ) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"security_review_failed\"}" };
+        };
+        defer req_allocator.free(report.checks);
+
+        const json = security_review_mod.formatReviewJson(req_allocator, report) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"review_format_failed\"}" };
+        };
+        return .{ .body = json };
     }
 
     const parsed = parseUserPath(base_path) orelse
