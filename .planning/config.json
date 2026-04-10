@@ -14,7 +14,8 @@
     "plan_check": true,
     "verifier": true,
     "auto_advance": false,
-    "discuss_mode": "assumptions"
+    "discuss_mode": "assumptions",
+    "_auto_chain_active": false
   },
   "parallelization": {
     "enabled": true
