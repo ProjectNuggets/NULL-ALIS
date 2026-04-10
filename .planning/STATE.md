@@ -1,17 +1,24 @@
 # State — SOTA Agent Program
 
 ## Current Phase
-Phase 0: Baseline and Safety Net — COMPLETE
-Next: Phase 1 (Agent Execution Contract) then Phase 1.5 (Prompt Architecture and Liveness)
+Phase 1.5: Prompt Architecture and Liveness — IN PROGRESS
+Plan 01 (Composable prompt scaffold) — COMPLETE
 
 ## Current Plan
-Phase 0 complete. Ready for Phase 1.
+Phase 1.5, Plan 01 complete. Ready for Plan 02 (Liveness narration engine).
 
 ## Phase 0 Results
 - 00-01: 26 characterization tests added (e0ce57d), 5045/5076 pass, 0 fail
 - 00-02: 3 documentation artifacts created (60471d9), no runtime changes
 
 ## Decisions Log
+
+### 2026-04-10: Phase 1.5 Plan 01 complete — Composable prompt scaffold
+- buildSystemPrompt decomposed into 5 independent section builders
+- PromptSections struct with optional persona/narration/tool_use/learned_facts (REQ-018)
+- TurnClass enum (chat/execute/wake/repair/operator) extracted from safety section
+- 12 new inline tests; all 5131 tests pass; ReleaseSmall build confirmed
+- Commits: 91f5d07 (prompt.zig), 8cf63d5 (root.zig)
 
 ### 2026-04-10: Phase 1.5 added — Prompt Architecture and Liveness
 - Agent review flagged "feels alive" as the biggest gap vs Claude Code

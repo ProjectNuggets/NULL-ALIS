@@ -19,7 +19,7 @@
 **Plans:** 5 plans
 
 Plans:
-- [ ] 01.5-01-PLAN.md — Prompt scaffold refactor: composable section builders, PromptSections struct, TurnClass enum
+- [x] 01.5-01-PLAN.md — Prompt scaffold refactor: composable section builders, PromptSections struct, TurnClass enum
 - [ ] 01.5-02-PLAN.md — Liveness narration engine: NarrationObserver, narration_frame events, semantic labels
 - [ ] 01.5-03-PLAN.md — Task decomposition: TaskPlan XML parser, step state machine, prompt instructions
 - [ ] 01.5-04-PLAN.md — Learning loop: correction/preference detection, durable_fact storage, /learn command
