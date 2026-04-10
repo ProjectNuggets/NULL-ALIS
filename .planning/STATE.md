@@ -2,6 +2,7 @@
 
 ## Current Phase
 Phase 0: Baseline and Safety Net — COMPLETE
+Next: Phase 1 (Agent Execution Contract) then Phase 1.5 (Prompt Architecture and Liveness)
 
 ## Current Plan
 Phase 0 complete. Ready for Phase 1.
@@ -12,10 +13,24 @@ Phase 0 complete. Ready for Phase 1.
 
 ## Decisions Log
 
+### 2026-04-10: Phase 1.5 added — Prompt Architecture and Liveness
+- Agent review flagged "feels alive" as the biggest gap vs Claude Code
+- Added Phase 1.5 between Phase 1 and Phase 2 with 5 sprints:
+  - 1.5A: Prompt scaffold refactor (composable sections)
+  - 1.5B: Liveness narration engine (real-time user-facing status)
+  - 1.5C: Task decomposition (visible sub-steps for complex requests)
+  - 1.5D: Learning loop (correction detection, preference storage)
+  - 1.5E: Persona calibration (SOUL.md, warmth/proactivity dimensions)
+- Docs tightened per code review: transport-agnostic contracts, token has no type field,
+  queued->running is markTaskRunning not Thread.spawn, session fallback is subagent:<id>,
+  cron is daemon-driven not gateway chat-stream
+- Requirements expanded: REQ-018 through REQ-022 cover P0.5 "feels alive" tier
+- Program now 8 phases, 33 sprints, 29 branches in dependency graph
+
 ### 2026-04-09: Program bootstrap
 - Competitive analysis complete (Claude Code + OpenClaw + nullalis)
-- Feature map updated with 26 features (F1-F26)
-- Roadmap has 28 sprints across 7 phases (0-6)
+- Feature map updated with F1-F15 plus F1.5A-F1.5B
+- Roadmap has 33 sprints across 8 phases (0, 1, 1.5, 2-6)
 - GSD execution harness adopted for context-isolated sprint execution
 - Gateway decomposition recommended before Phase 2 (optional)
 - 14 of 28 sprints need frontend UI work

@@ -43,16 +43,41 @@ It is designed to be:
 
 ## Program Structure
 
-The program is split into 6 phases.
+The program is split into 8 phases.
 
 1. Phase 0: Baseline and safety net
 2. Phase 1: Agent execution contract
-3. Phase 2: Online runtime visibility and tasks
-4. Phase 3: Canonical session and context runtime
-5. Phase 4: Operator parity and platform capability graph
-6. Phase 5: Multi-agent teams and parity closeout
+3. Phase 1.5: Prompt architecture and liveness ("feels alive")
+4. Phase 2: Online runtime visibility and tasks
+5. Phase 3: Canonical session and context runtime
+6. Phase 4: Operator parity and platform capability graph
+7. Phase 5: Multi-agent teams and parity closeout
+8. Phase 6: Closing remaining gaps
 
 Each phase is made of sprint-sized branches.
+
+## Phase 6: Closing Remaining Gaps
+
+Purpose:
+- isolate the remaining gap-closure work from the original plan
+- make the final SOTA completion bar auditable
+- prevent important parity items from staying implicit
+
+This final phase is additive. It does not replace earlier phases.
+
+Required closure areas:
+- coding workflow artifacts and patch outcome ledger
+- patch safety, rollback, and dirty-worktree contract
+- host/runtime capability and degraded-mode contract across hosted, CLI, desktop, VS extension, and edge/device targets
+- retry, recovery, failover, and interruption provenance
+- steering semantics distinct from stop/cancel/abort
+- approval state-machine semantics and replay behavior
+- prompt, policy, and model-selection provenance
+- memory write, correction, and repair policy
+- multi-agent ownership, write-scope, and merge/conflict contract
+- cross-surface session handoff and continuity
+- notification policy for background and task work
+- final SOTA parity eval pack covering real coding workflows
 
 ## Phase 0: Baseline And Safety Net
 
@@ -271,6 +296,160 @@ Depends on:
 
 Parallel-safe:
 - no
+
+## Phase 1.5: Prompt Architecture And Liveness
+
+Purpose:
+- make the agent feel alive — always showing what it's doing, thinking, and planning
+- give the agent the ability to decompose complex tasks into visible sub-steps
+- build a structured prompt scaffold that makes persona, narration, and tool-use policy composable
+- close the biggest gap vs Claude Code: the agent should never go silent during work
+
+### Sprint 1.5A
+
+Branch:
+- `refactor/prompt-scaffold-v1`
+
+Goal:
+- refactor the monolithic prompt builder into a composable scaffold with named sections
+
+Primary files:
+- `src/agent/prompt.zig`
+- `src/agent/root.zig`
+
+Add:
+- `src/agent/prompt_sections.zig`
+
+Deliverables:
+- composable prompt sections: identity, persona, turn_classification, narration_rules, tool_policy, safety, workspace, memory, datetime, runtime
+- section registry so channels/modes can include/exclude sections
+- persona section reads from workspace `SOUL.md` with runtime defaults
+- turn classification instruction: agent classifies each turn as chat/execute/wake/repair/operator before responding
+- narration rules: "always state what you are about to do before doing it, name the tool, explain why, report the result"
+
+Depends on:
+- Phase 1 complete (execution modes inform prompt shaping)
+
+Parallel-safe:
+- no
+
+### Sprint 1.5B
+
+Branch:
+- `feat/liveness-narration-v1`
+
+Goal:
+- agent emits real-time user-facing narration during execution (Claude Code parity)
+
+Primary files:
+- `src/agent/root.zig`
+- `src/observability.zig`
+- `src/gateway.zig`
+- `src/agent/prompt.zig`
+
+Add:
+- `src/agent/narration.zig`
+
+Deliverables:
+- narration engine that converts observer events into user-facing progress text:
+  - tool_call_start -> "Using {tool_name} to {reason}..."
+  - tool_call complete -> "Got result from {tool_name} ({duration}ms)"
+  - llm_request -> "Thinking..."
+  - turn_stage -> "Working on step {n}: {label}"
+- narration output wired to SSE `progress` events and channel typing indicators
+- configurable narration verbosity (quiet / normal / verbose) via `/verbose` command
+- narration suppression for background/subagent work
+
+Depends on:
+- `refactor/prompt-scaffold-v1`
+
+Parallel-safe:
+- no
+
+### Sprint 1.5C
+
+Branch:
+- `feat/task-decomposition-v1`
+
+Goal:
+- agent breaks complex requests into visible sub-steps before execution
+
+Primary files:
+- `src/agent/root.zig`
+- `src/agent/prompt.zig`
+
+Add:
+- `src/agent/task_planner.zig`
+
+Deliverables:
+- complexity detector: agent identifies multi-step requests and triggers decomposition
+- plan emission: agent shows numbered plan to user before executing ("I'll do this in 3 steps: 1... 2... 3...")
+- per-step status: each step emits progress events and completion markers
+- plan revision: if a step fails or changes scope, agent re-emits revised plan
+- prompt instructions that teach the agent when to decompose vs. when to just execute
+- step results accumulate into final synthesized response
+
+Depends on:
+- `refactor/prompt-scaffold-v1`
+- `feat/liveness-narration-v1`
+
+Parallel-safe:
+- no
+
+### Sprint 1.5D
+
+Branch:
+- `feat/learning-loop-v1`
+
+Goal:
+- agent detects corrections and preferences, stores them durably, applies in future turns
+
+Primary files:
+- `src/agent/root.zig`
+- `src/agent/prompt.zig`
+- `src/memory/root.zig`
+
+Add:
+- `src/agent/learning.zig`
+
+Deliverables:
+- correction detector: recognizes "no, I meant...", "don't do that", "always use..." patterns
+- preference extractor: derives behavioral rules from corrections
+- durable storage: writes behavioral facts to memory with `behavioral_preference/` key prefix
+- prompt injection: loads relevant behavioral preferences into system prompt for future turns
+- decay/override: newer corrections supersede older ones on the same topic
+
+Depends on:
+- `refactor/prompt-scaffold-v1`
+
+Parallel-safe:
+- yes, can run with `feat/task-decomposition-v1` if shared edits to `src/agent/root.zig` are small
+
+### Sprint 1.5E
+
+Branch:
+- `feat/persona-calibration-v1`
+
+Goal:
+- configurable personality depth and digital-twin warmth
+
+Primary files:
+- `src/agent/prompt.zig`
+- `src/agent/root.zig`
+- `src/config.zig`
+
+Deliverables:
+- persona resolver: reads `SOUL.md` from workspace, merges with config-level persona settings
+- persona dimensions: warmth (clinical <-> warm), proactivity (reactive <-> anticipatory), verbosity (terse <-> detailed), formality (casual <-> formal)
+- runtime persona override via `/config persona <dimension> <value>`
+- persona affects: greeting style, narration tone, proactive suggestion frequency, error message phrasing
+- default persona: "attentive digital twin" — warm, moderately proactive, concise, informal
+
+Depends on:
+- `refactor/prompt-scaffold-v1`
+
+Parallel-safe:
+- yes, can run with `feat/learning-loop-v1`
 
 ## Phase 2: Online Runtime Visibility And Tasks
 
@@ -960,24 +1139,29 @@ Strict order:
 4. `feat/approval-modes-v1`
 5. `feat/agent-reflection-policy-v1`
 6. `feat/abort-and-interrupt-v1`
-7. `feat/run-events-core-v1`
-8. `feat/task-ledger-core-v1`
-9. `feat/task-delivery-v1`
-10. `feat/cost-and-usage-runtime-v1`
-11. `refactor/session-identity-v1`
-12. `feat/transcript-hygiene-and-provenance-v1`
-13. `refactor/context-engine-contract-v1`
-14. `feat/session-controls-v1`
-15. `feat/context-report-v1`
-16. `feat/operator-workflows-v1`
-17. `feat/online-agent-api-v1`
-18. `feat/connectors-core-v1`
-19. `feat/connector-auth-bindings-v1`
-20. `feat/auth-profile-failover-v1`
-21. `feat/channel-action-adapters-v1`
-22. `feat/team-registry-v1`
-23. `feat/delegation-visibility-v1`
-24. `ops/sota-parity-evals-v1`
+7. `refactor/prompt-scaffold-v1`
+8. `feat/liveness-narration-v1`
+9. `feat/task-decomposition-v1`
+10. `feat/learning-loop-v1`
+11. `feat/persona-calibration-v1`
+12. `feat/run-events-core-v1`
+13. `feat/task-ledger-core-v1`
+14. `feat/task-delivery-v1`
+15. `feat/cost-and-usage-runtime-v1`
+16. `refactor/session-identity-v1`
+17. `feat/transcript-hygiene-and-provenance-v1`
+18. `refactor/context-engine-contract-v1`
+19. `feat/session-controls-v1`
+20. `feat/context-report-v1`
+21. `feat/operator-workflows-v1`
+22. `feat/online-agent-api-v1`
+23. `feat/connectors-core-v1`
+24. `feat/connector-auth-bindings-v1`
+25. `feat/auth-profile-failover-v1`
+26. `feat/channel-action-adapters-v1`
+27. `feat/team-registry-v1`
+28. `feat/delegation-visibility-v1`
+29. `ops/sota-parity-evals-v1`
 
 Optional overlap:
 
@@ -991,17 +1175,21 @@ The roadmap is complete when all of these are true:
 
 1. the agent loop is mode-aware and policy-aware
 2. tool approvals and failure reasons are structured and explainable
-3. online clients receive a rich run-event stream
-4. detached work is durable, inspectable, and stoppable
-5. session identity and lane policy are canonical
-6. transcript hygiene and provenance are explicit and reliable
-7. context assembly is explicit and inspectable
-8. operator workflows reach practical parity with Claude Code and OpenClaw
-9. connectors, skills, and MCP form one coherent capability graph
-10. auth failover and usage truth are operator-visible runtime systems
-11. channel message actions are owned by channel adapters, not smeared across core logic
-12. multi-agent work is visible and task-backed
-13. parity evals say Nullalis is at least on par with both reference products
+3. the agent feels alive — always narrating what it's doing, which tool it picked, why, and what it's waiting on
+4. complex requests are decomposed into visible sub-steps with per-step status
+5. the agent learns from corrections and applies behavioral preferences in future turns
+6. persona is configurable and defaults to an attentive digital-twin voice
+7. online clients receive a rich run-event stream
+8. detached work is durable, inspectable, and stoppable
+9. session identity and lane policy are canonical
+10. transcript hygiene and provenance are explicit and reliable
+11. context assembly is explicit and inspectable
+12. operator workflows reach practical parity with Claude Code and OpenClaw
+13. connectors, skills, and MCP form one coherent capability graph
+14. auth failover and usage truth are operator-visible runtime systems
+15. channel message actions are owned by channel adapters, not smeared across core logic
+16. multi-agent work is visible and task-backed
+17. parity evals say Nullalis is at least on par with both reference products
 
 ## Immediate Next Branch
 

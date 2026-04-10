@@ -14,6 +14,13 @@
 - [ ] 01-04: Agent reflection policy
 - [ ] 01-05: Abort and interrupt (src/agent/abort.zig)
 
+### Phase 1.5: Prompt Architecture and Liveness
+- [ ] 1.5-01: Prompt scaffold refactor — structured prompt builder with persona, turn classification, narration rules, and tool-use policy as composable sections (src/agent/prompt.zig)
+- [ ] 1.5-02: Liveness narration engine — agent emits real-time "thinking out loud" status: what it's doing, what tool it picked, why, what it's waiting on. Wire observer events to user-facing progress frames (src/agent/narration.zig)
+- [ ] 1.5-03: Task decomposition — agent breaks complex requests into explicit sub-steps before execution, shows plan to user, executes step-by-step with per-step status. Prompt instructions + runtime scaffolding (src/agent/task_planner.zig)
+- [ ] 1.5-04: Learning loop — agent notices corrections/preferences, stores them as durable behavioral facts, applies them in future turns. Distinct from raw memory recall (src/agent/learning.zig)
+- [ ] 1.5-05: Persona calibration — configurable personality depth, proactive insight style, digital-twin warmth vs. tool-agent crispness (workspace SOUL.md + runtime persona resolver)
+
 ### Phase 2: Online Runtime Visibility and Tasks
 - [ ] 02-01: Run events core (src/agent/run_event_types.zig)
 - [ ] 02-02: SSE run events (src/gateway/run_events.zig)
@@ -47,3 +54,17 @@
 - [ ] 06-02: Voice-first agent mode
 - [ ] 06-03: Channel health dashboard
 - [ ] 06-04: Security audit command
+
+### Phase 7: Closing Remaining Gaps
+- [ ] 07-01: Coding workflow artifacts and patch outcome ledger
+- [ ] 07-02: Patch safety and rollback contract
+- [ ] 07-03: Host/runtime capability and degraded-mode contract
+- [ ] 07-04: Retry, recovery, and failover provenance
+- [ ] 07-05: Steering semantics across API, CLI, app, and tasks
+- [ ] 07-06: Approval state machine and replay semantics
+- [ ] 07-07: Prompt, policy, and model provenance
+- [ ] 07-08: Memory write/repair policy
+- [ ] 07-09: Multi-agent coordination contract
+- [ ] 07-10: Cross-surface session handoff
+- [ ] 07-11: Notification policy for background and task work
+- [ ] 07-12: Final SOTA parity eval pack

@@ -166,6 +166,24 @@ If a proposed change does not move Nullalis toward that parity bar, it is not pa
 - app handoff between surfaces
 - richer voice and multimodal execution parity
 
+## Closing Remaining Gaps
+
+This section is additive gap-closure scope. It is intentionally separate from
+the original target spec so the final SOTA bar is explicit.
+
+- Coding workflow artifacts must be first-class: changed files, diff summary, commands run, tests run, test results, review state, and patch outcome.
+- Patch safety must be a runtime contract: risky paths, dirty worktree policy, rollback/retry checkpoints, and partial-success handling.
+- Nullalis needs a host/runtime capability contract, not just online APIs: hosted, CLI, desktop, VS extension, and edge/device runtimes must share one agent model with graceful degradation.
+- Retry, recovery, failover, interruption, and resumed-run behavior must appear as structured run artifacts rather than hidden implementation details.
+- Steering semantics must be explicit and separate from stop, cancel, and abort semantics.
+- Approval must be modeled as a full state machine, not just a yes/no gate.
+- Prompt scaffold, policy set, persona source, and model/profile choice must be captured as provenance for every run.
+- Memory needs an explicit write, correction, and repair policy so durable behavior improves without silent drift.
+- Multi-agent work needs an explicit coordination contract for ownership, write-scope isolation, merge/conflict handling, and accountability.
+- Cross-surface handoff must preserve continuity and provenance across app, API, CLI, extension, and later edge/device surfaces.
+- Background work needs an explicit notification policy.
+- SOTA claims require a final parity eval pack that exercises real coding workflows, interruption, approval loops, reconnect/resume, degraded hosts, and multi-agent coordination.
+
 ## What Not To Import Blindly
 
 - Do not import Claude Code's terminal UI architecture.
@@ -493,6 +511,80 @@ Nullalis already has tools, sandboxing, and policy, but not a fully explicit exe
 - keep `Tool` vtable stable; layer metadata beside it instead of mutating every call site first
 - move approval decisions out of prompt-only behavior into structured policy
 - make slash commands and SSE clients use the same approval engine
+
+### F1.5A. Liveness Narration — "Feels Alive"
+
+**Borrow from**
+
+- Claude Code real-time status narration: always showing what tool is running, why, and what it's waiting on
+- Claude Code task decomposition: breaking complex work into visible sub-steps
+
+**Why it matters**
+
+This is the single biggest UX gap between nullalis and Claude Code. An agent that goes silent during work feels broken. An agent that narrates feels alive and trustworthy. This is the difference between a tool and a digital twin.
+
+**Current Nullalis owners**
+
+- `src/agent/prompt.zig` — system prompt has one line about "send short progress updates"
+- `src/observability.zig` — observer emits `tool_call_start`, `tool_call`, `turn_stage` internally
+- `src/gateway.zig` — SSE `progress` events exist but only carry generic "thinking" labels
+
+**Add**
+
+- `src/agent/narration.zig` — narration engine that converts observer events into user-facing status
+- `src/agent/task_planner.zig` — task decomposition: detect complex requests, emit step plan, track per-step progress
+
+**Target behavior**
+
+- agent always states what it's about to do before doing it ("Using web_search to find..."), names the tool, explains why, reports the result
+- complex requests trigger visible plan: "I'll do this in 3 steps: 1. Look up... 2. Compare... 3. Write..."
+- each step emits progress events and completion markers
+- narration verbosity is configurable: quiet / normal / verbose (via `/verbose`)
+- background/subagent work suppresses narration to avoid noise
+- typing indicators on channels reflect real activity
+
+**Implementation notes**
+
+- wire observer events to a narration layer that produces user-facing text
+- narration output feeds SSE `progress` events (existing transport) and channel typing indicators
+- prompt instructions teach the model when to decompose vs when to just execute
+- plan revision: if a step fails, agent re-emits revised plan
+
+### F1.5B. Prompt Architecture And Persona
+
+**Borrow from**
+
+- Claude Code structured prompt assembly with tool-specific contributions
+- OpenClaw rich system prompt tied to channel, runtime, and subagent context
+
+**Why it matters**
+
+The system prompt is the agent's soul. A monolithic prompt builder limits composability and makes mode-specific behavior fragile. A configurable persona is required for the digital-twin feel.
+
+**Current Nullalis owners**
+
+- `src/agent/prompt.zig` — monolithic `buildSystemPrompt` with inline section strings
+
+**Add**
+
+- `src/agent/prompt_sections.zig` — composable named sections
+- `src/agent/learning.zig` — correction detector, preference extractor, durable behavioral facts
+
+**Target behavior**
+
+- prompt is assembled from composable sections: identity, persona, turn_classification, narration_rules, tool_policy, safety, workspace, memory, datetime, runtime
+- persona reads from workspace `SOUL.md` with runtime defaults and per-config overrides
+- persona dimensions: warmth, proactivity, verbosity, formality
+- agent detects corrections ("no, I meant...", "don't do that", "always use...") and stores as durable behavioral preferences
+- behavioral preferences are injected into future prompts automatically
+- lighter subagent prompt variant excludes persona/narration sections
+
+**Implementation notes**
+
+- keep `buildSystemPrompt` as the assembly entry point, refactor internals to section registry
+- learning loop writes to memory with `behavioral_preference/` key prefix
+- newer corrections supersede older ones on the same topic
+- persona default: "attentive digital twin" — warm, moderately proactive, concise, informal
 
 ### F2. Structured Run Events For Online UX
 
@@ -952,8 +1044,10 @@ As Nullalis becomes more agentic online, operators need a clean reason for every
 This is the safest order for implementation.
 
 1. `F1` execution modes and tool metadata
-2. `F2` structured run events
-3. `F3` durable task ledger
+2. `F1.5A` liveness narration and task decomposition
+3. `F1.5B` prompt architecture and persona
+4. `F2` structured run events
+5. `F3` durable task ledger
 4. `F4` canonical session identity and lane contract
 5. `F5` context-engine extraction
 6. `F8` online operator API contract
@@ -985,6 +1079,10 @@ This is a structural advantage over both reference products when executed correc
 
 Nullalis reaches the intended product shape when all of these are true:
 
+- the agent feels alive: always narrating what it's doing, which tool it picked, why, and what it's waiting on
+- complex requests are decomposed into visible sub-steps with per-step status
+- the agent learns from corrections and applies them in future turns without being told twice
+- the persona feels like a digital twin, not a generic chatbot
 - an online user can see what the agent is doing, not just the final answer
 - approvals are explicit and explainable
 - background work is durable, inspectable, and stoppable
