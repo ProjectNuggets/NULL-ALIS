@@ -1,17 +1,27 @@
 # State — SOTA Agent Program
 
 ## Current Phase
-Phase 1.5: Prompt Architecture and Liveness — IN PROGRESS
-Plan 04 (Learning loop) — COMPLETE
+Phase 1.5: Prompt Architecture and Liveness — COMPLETE
+Plan 05 (Persona calibration) — COMPLETE
 
 ## Current Plan
-Phase 1.5, Plan 04 complete. Ready for Plan 05 (Persona calibration).
+Phase 1.5 complete. All 5 plans (01–05) done. Ready for Phase 2.
 
 ## Phase 0 Results
 - 00-01: 26 characterization tests added (e0ce57d), 5045/5076 pass, 0 fail
 - 00-02: 3 documentation artifacts created (60471d9), no runtime changes
 
 ## Decisions Log
+
+### 2026-04-10: Phase 1.5 Plan 05 complete — Persona calibration
+- Warmth/Proactivity named enums + PersonaProfile struct in prompt.zig (REQ-022)
+- resolvePersona: O(n) YAML-like front-matter scan, graceful defaults, no allocation
+- resolvePersonaFromFile: bounded SOUL.md read (BOOTSTRAP_MAX_CHARS = 20,000)
+- buildPersonaSection: ## Persona Calibration header with warmth/proactivity/voice/twin_mode instructions
+- Persona section injected before turn classification and safety (T-1.5-10)
+- /persona slash command: displays current profile from SOUL.md
+- 11 new tests (prompt.zig inline); 5154/5185 total pass; ReleaseSmall build confirmed
+- Commits: af072e2 (prompt.zig), fb4eff5 (commands.zig + root.zig wiring)
 
 ### 2026-04-10: Phase 1.5 Plan 04 complete — Learning loop
 - LearningSignal enum + LearnedFact struct in learning.zig (REQ-021)
@@ -93,5 +103,5 @@ None currently.
 - M2 (Context Introspection) complete and merged to main
 - Build commands: `zig build test --summary all`, `zig build -Doptimize=ReleaseSmall`
 - 189,005 lines across 188 .zig files (+ narration.zig in 01.5-02, task_planner.zig in 01.5-03, learning.zig in 01.5-04)
-- 1,500+ inline tests (5143/5174 passing after 01.5-04)
-- Last session stopped at: Completed 01.5-04-PLAN.md (2026-04-10T11:23:29Z)
+- 1,500+ inline tests (5154/5185 passing after 01.5-05)
+- Last session stopped at: Completed 01.5-05-PLAN.md (2026-04-10T11:32:37Z)
