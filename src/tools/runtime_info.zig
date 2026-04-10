@@ -1289,8 +1289,9 @@ fn readEffectiveHeartbeatConfig(
     tenant_ctx: root.ToolTenantContext,
     user_id_override: ?[]const u8,
 ) !EffectiveHeartbeatConfig {
+    const scoped_user_id = resolveScopedUserId(tenant_ctx, user_id_override);
     const defaults = EffectiveHeartbeatConfig{
-        .enabled = config.heartbeat.enabled,
+        .enabled = if (config.tenant.enabled and scoped_user_id != null) false else config.heartbeat.enabled,
         .interval_minutes = @max(@as(u32, 1), config.heartbeat.interval_minutes),
         .data_source = "config",
     };
@@ -1775,6 +1776,49 @@ test "runtime info heartbeat reads effective tenant heartbeat file" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"enabled\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"interval_minutes\":5") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"data_source\":\"file\"") != null);
+}
+
+test "runtime info heartbeat defaults tenant users to disabled without explicit state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const users_root = try std.fs.path.join(std.testing.allocator, &.{ base, "users" });
+    defer std.testing.allocator.free(users_root);
+    try std.fs.makeDirAbsolute(users_root);
+
+    const user_root = try std.fs.path.join(std.testing.allocator, &.{ users_root, "1" });
+    defer std.testing.allocator.free(user_root);
+    try std.fs.makeDirAbsolute(user_root);
+
+    const workspace = try std.fs.path.join(std.testing.allocator, &.{ user_root, "workspace" });
+    defer std.testing.allocator.free(workspace);
+    try std.fs.makeDirAbsolute(workspace);
+
+    var cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.tenant.enabled = true;
+    cfg.tenant.data_root = users_root;
+    cfg.heartbeat.enabled = true;
+    cfg.heartbeat.interval_minutes = 60;
+
+    var tool_impl = RuntimeInfoTool{ .config = &cfg };
+    const t = tool_impl.tool();
+    root.setTenantContext(.{ .user_id = "1", .numeric_user_id = 1 });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"section\":\"heartbeat\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"interval_minutes\":60") != null);
 }
 
 test "runtime info scheduler reports context missing for tenant postgres scope without state manager" {

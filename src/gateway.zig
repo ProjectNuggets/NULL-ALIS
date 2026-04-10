@@ -3107,10 +3107,70 @@ fn telegramAllowlistIsLegacyWildcard(values: []const []const u8) bool {
     return std.mem.eql(u8, std.mem.trim(u8, values[0], " \t\r\n"), "*");
 }
 
-fn parseHeartbeatStateSummary(content: []const u8) HeartbeatStateSummary {
-    return .{
-        .enabled = jsonBoolField(content, "enabled") orelse false,
-    };
+fn parseHeartbeatStateSummary(allocator: std.mem.Allocator, content: []const u8) HeartbeatStateSummary {
+    if (jsonBoolField(content, "enabled")) |enabled| {
+        return .{ .enabled = enabled };
+    }
+
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed.len == 0) return .{};
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+
+    if (parsed.value.object.get("heartbeat")) |heartbeat| {
+        if (heartbeat == .object) {
+            if (heartbeat.object.get("enabled")) |enabled| {
+                if (enabled == .bool) return .{ .enabled = enabled.bool };
+            }
+        }
+    }
+
+    return .{};
+}
+
+fn canonicalHeartbeatEnabledJson(allocator: std.mem.Allocator, enabled: bool) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"enabled\":{s}}}", .{
+        if (enabled) "true" else "false",
+    });
+}
+
+fn writeUserConfigJson(
+    state: *GatewayState,
+    user_ctx: *const UserContext,
+    scoped_user_id: []const u8,
+    content: []const u8,
+) !void {
+    if (state.zaki_state) |mgr| {
+        const user_id = try parseNumericUserId(scoped_user_id);
+        try mgr.putConfigJson(user_id, content);
+        writeFile(user_ctx.config_path, content) catch |err| {
+            log.warn("tenant settings mirror write failed path={s}: {}", .{ user_ctx.config_path, err });
+        };
+        return;
+    }
+    try writeFile(user_ctx.config_path, content);
+}
+
+fn writeHeartbeatEnabledForUser(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    user_ctx: *const UserContext,
+    scoped_user_id: []const u8,
+    enabled: bool,
+) ![]u8 {
+    const canonical_body = try canonicalHeartbeatEnabledJson(allocator, enabled);
+    errdefer allocator.free(canonical_body);
+
+    if (state.zaki_state) |mgr| {
+        const user_id = try parseNumericUserId(scoped_user_id);
+        try mgr.putHeartbeatJson(user_id, canonical_body);
+    } else {
+        try writeFile(user_ctx.heartbeat_path, canonical_body);
+    }
+
+    return canonical_body;
 }
 
 fn telegramWebhookMatchesUser(webhook_url: []const u8, user_id: []const u8) bool {
@@ -3212,11 +3272,11 @@ fn loadNormalizedHeartbeatEnabled(
         const user_id = parseNumericUserId(user_id_raw) catch return false;
         const content = mgr.getHeartbeatJson(allocator, user_id) catch return false;
         defer allocator.free(content);
-        return parseHeartbeatStateSummary(content).enabled;
+        return parseHeartbeatStateSummary(allocator, content).enabled;
     }
     const content = readFileOrDefault(allocator, heartbeat_path, "{}\n") catch return false;
     defer allocator.free(content);
-    return parseHeartbeatStateSummary(content).enabled;
+    return parseHeartbeatStateSummary(allocator, content).enabled;
 }
 
 fn loadHeartbeatRuntimeSummary(
@@ -9219,19 +9279,9 @@ fn handleApiRoute(
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"merge failed\"}" };
             };
             defer req_allocator.free(merged);
-            if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                mgr.putConfigJson(user_id, merged) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-                };
-                writeFile(user_ctx.config_path, merged) catch |err| {
-                    log.warn("tenant settings mirror write failed path={s}: {}", .{ user_ctx.config_path, err });
-                };
-            } else {
-                writeFile(user_ctx.config_path, merged) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-                };
-            }
+            writeUserConfigJson(state, &user_ctx, scoped_user_id, merged) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+            };
             removeTenantRuntime(state, scoped_user_id);
             const response = user_settings.renderSettingsJson(req_allocator, updated_settings) catch "{\"status\":\"updated\"}";
             return .{ .body = response };
@@ -9242,24 +9292,10 @@ fn handleApiRoute(
 
     if (std.mem.eql(u8, parsed.subpath, "heartbeat")) {
         if (std.mem.eql(u8, method, "GET")) {
-            if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                const content = mgr.getHeartbeatJson(req_allocator, user_id) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
-                };
-                defer req_allocator.free(content);
-                const canonical_body = std.fmt.allocPrint(req_allocator, "{{\"enabled\":{s}}}", .{
-                    if (parseHeartbeatStateSummary(content).enabled) "true" else "false",
-                }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
-                return .{ .body = canonical_body };
-            }
-            const content = readFileOrDefault(req_allocator, user_ctx.heartbeat_path, "{}\n") catch {
-                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
+            const enabled = loadNormalizedHeartbeatEnabled(req_allocator, state, scoped_user_id, user_ctx.heartbeat_path);
+            const canonical_body = canonicalHeartbeatEnabledJson(req_allocator, enabled) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
             };
-            defer req_allocator.free(content);
-            const canonical_body = std.fmt.allocPrint(req_allocator, "{{\"enabled\":{s}}}", .{
-                if (parseHeartbeatStateSummary(content).enabled) "true" else "false",
-            }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
             return .{ .body = canonical_body };
         }
         if (std.mem.eql(u8, method, "PUT")) {
@@ -9268,19 +9304,10 @@ fn handleApiRoute(
                 .status = "400 Bad Request",
                 .body = "{\"error\":\"missing enabled\"}",
             };
-            const canonical_body = std.fmt.allocPrint(req_allocator, "{{\"enabled\":{s}}}", .{
-                if (enabled) "true" else "false",
-            }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
-            if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                mgr.putHeartbeatJson(user_id, canonical_body) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-                };
-            } else {
-                writeFile(user_ctx.heartbeat_path, canonical_body) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-                };
-            }
+            const canonical_body = writeHeartbeatEnabledForUser(req_allocator, state, &user_ctx, scoped_user_id, enabled) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
+            };
+            removeTenantRuntime(state, scoped_user_id);
             return .{ .body = canonical_body };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
@@ -12868,6 +12895,58 @@ test "handleApiRoute GET settings returns defaults when no profile exists" {
     try std.testing.expectEqual(@as(i64, 30), parsed.value.object.get("session_timeout_minutes").?.integer);
 }
 
+test "handleApiRoute GET settings ignores heartbeat state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const user_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_dir);
+    try std.fs.makeDirAbsolute(user_dir);
+
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{user_dir});
+    defer std.testing.allocator.free(config_path);
+    try writeFile(config_path, "{\"product_settings\":{\"assistant_mode\":\"balanced\",\"group_activation\":\"mention\",\"proactive_updates\":true,\"voice_replies\":false,\"session_timeout_minutes\":30}}\n");
+
+    const heartbeat_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{user_dir});
+    defer std.testing.allocator.free(heartbeat_path);
+    try writeFile(heartbeat_path, "{\"enabled\":false}\n");
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/settings HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "GET",
+        "/api/v1/users/1/settings",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(true, parsed.value.object.get("proactive_updates").?.bool);
+}
+
 test "handleApiRoute PATCH settings writes canonical tenant preferences and preserves unknown keys" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12881,6 +12960,9 @@ test "handleApiRoute PATCH settings writes canonical tenant preferences and pres
     const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{user_dir});
     defer std.testing.allocator.free(config_path);
     try writeFile(config_path, "{\"foo\":\"bar\",\"agent\":{\"max_tool_iterations\":9}}\n");
+    const heartbeat_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{user_dir});
+    defer std.testing.allocator.free(heartbeat_path);
+    try writeFile(heartbeat_path, "{\"enabled\":true}\n");
 
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
@@ -12935,9 +13017,28 @@ test "handleApiRoute PATCH settings writes canonical tenant preferences and pres
     try std.testing.expectEqualStrings("bar", parsed.value.object.get("foo").?.string);
     const product = parsed.value.object.get("product_settings").?.object;
     try std.testing.expectEqualStrings("deep", product.get("assistant_mode").?.string);
+    try std.testing.expectEqual(false, product.get("proactive_updates").?.bool);
     try std.testing.expect(parsed.value.object.get("agent") == null);
     try std.testing.expect(parsed.value.object.get("memory") == null);
     try std.testing.expect(parsed.value.object.get("session") == null);
+
+    const heartbeat_get_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/heartbeat HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const heartbeat_get_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        heartbeat_get_request,
+        "GET",
+        "/api/v1/users/1/heartbeat",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", heartbeat_get_response.status);
+    try std.testing.expectEqualStrings("{\"enabled\":true}", heartbeat_get_response.body);
 }
 
 test "handleApiRoute PATCH config rejects raw config writes" {
@@ -13070,6 +13171,13 @@ test "handleApiRoute PUT heartbeat stores canonical enabled-only payload" {
     const internal_tokens = [_][]const u8{"test-internal-token"};
     state.internal_service_tokens = &internal_tokens;
 
+    const user_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_dir);
+    try std.fs.makeDirAbsolute(user_dir);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{user_dir});
+    defer std.testing.allocator.free(config_path);
+    try writeFile(config_path, "{\"product_settings\":{\"assistant_mode\":\"balanced\",\"group_activation\":\"mention\",\"proactive_updates\":false,\"voice_replies\":false,\"session_timeout_minutes\":30}}\n");
+
     var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer req_arena.deinit();
     const req_allocator = req_arena.allocator();
@@ -13111,6 +13219,26 @@ test "handleApiRoute PUT heartbeat stores canonical enabled-only payload" {
     );
     try std.testing.expectEqualStrings("200 OK", get_response.status);
     try std.testing.expectEqualStrings("{\"enabled\":true}", get_response.body);
+
+    const settings_request = try std.fmt.allocPrint(
+        req_allocator,
+        "GET /api/v1/users/1/settings HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\n\r\n",
+        .{},
+    );
+    const settings_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        settings_request,
+        "GET",
+        "/api/v1/users/1/settings",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", settings_response.status);
+    const settings_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, settings_response.body, .{});
+    defer settings_parsed.deinit();
+    try std.testing.expectEqual(false, settings_parsed.value.object.get("proactive_updates").?.bool);
 }
 
 test "handleApiRoute GET heartbeat normalizes legacy stored payload" {
@@ -13125,7 +13253,7 @@ test "handleApiRoute GET heartbeat normalizes legacy stored payload" {
     try std.fs.makeDirAbsolute(user_dir);
     const heartbeat_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat.json", .{user_dir});
     defer std.testing.allocator.free(heartbeat_path);
-    try writeFile(heartbeat_path, "{\"enabled\":true,\"intervalSec\":3600}\n");
+    try writeFile(heartbeat_path, "{\"heartbeat\":{\"enabled\":true},\"intervalSec\":3600}\n");
 
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();

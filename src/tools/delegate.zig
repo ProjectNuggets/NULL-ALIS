@@ -6,6 +6,10 @@ const JsonObjectMap = root.JsonObjectMap;
 const config_mod = @import("../config.zig");
 const NamedAgentConfig = config_mod.NamedAgentConfig;
 const runtime_bundle = @import("../providers/runtime_bundle.zig");
+const provider_types = @import("../providers/root.zig");
+
+/// Default timeout for delegate LLM calls (seconds).
+const DEFAULT_DELEGATE_TIMEOUT_SECS: u32 = 120;
 
 /// Delegate tool — delegates a subtask to a named sub-agent with a different
 /// provider/model configuration. Executes a single-turn chatWithSystem call
@@ -118,11 +122,20 @@ pub const DelegateTool = struct {
             };
             defer bundle.deinit();
 
-            const response = bundle.provider().chatWithSystem(
+            const model = derived_cfg.default_model orelse ac.model;
+            const messages = &[_]provider_types.ChatMessage{
+                .{ .role = .system, .content = sys_prompt },
+                .{ .role = .user, .content = full_prompt },
+            };
+            const chat_response = bundle.provider().chat(
                 allocator,
-                sys_prompt,
-                full_prompt,
-                derived_cfg.default_model orelse ac.model,
+                .{
+                    .messages = messages,
+                    .model = model,
+                    .temperature = derived_cfg.default_temperature,
+                    .timeout_secs = DEFAULT_DELEGATE_TIMEOUT_SECS,
+                },
+                model,
                 derived_cfg.default_temperature,
             ) catch |err| {
                 const msg = std.fmt.allocPrint(
@@ -132,13 +145,13 @@ pub const DelegateTool = struct {
                 ) catch return ToolResult.fail("Delegation failed");
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
+            const response = chat_response.contentOrEmpty();
 
             const wrapped = std.fmt.allocPrint(
                 allocator,
                 "delegate agent={s} status=completed\nresult:\n{s}",
                 .{ trimmed_agent, response },
-            ) catch return ToolResult{ .success = true, .output = response };
-            allocator.free(response);
+            ) catch return ToolResult{ .success = true, .output = try allocator.dupe(u8, response) };
             return ToolResult{ .success = true, .output = wrapped };
         }
 

@@ -28,6 +28,7 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const RateTracker = @import("../security/policy.zig").RateTracker;
+const hooks_mod = @import("../hooks.zig");
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -338,6 +339,9 @@ pub const Agent = struct {
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
 
+    /// Lifecycle hooks — config-driven shell commands on agent events.
+    hooks: []const hooks_mod.Hook = &.{},
+
     /// Optional streaming callback. When set, turn() uses streamChat() for streaming providers.
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
@@ -558,8 +562,14 @@ pub const Agent = struct {
     }
 
     /// Force-compress history for context exhaustion recovery.
+    /// Archives dropped messages to memory (when available) before deleting them.
     pub fn forceCompressHistory(self: *Agent) bool {
-        return compaction.forceCompressHistory(self.allocator, &self.history);
+        return compaction.forceCompressHistoryWithArchive(
+            self.allocator,
+            &self.history,
+            self.mem,
+            self.memory_session_id,
+        );
     }
 
     fn appendUniqueString(
@@ -936,6 +946,12 @@ pub const Agent = struct {
             const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
             self.observer.recordEvent(&tool_start_event);
 
+            hooks_mod.runHooks(self.allocator, self.hooks, .tool_start, .{
+                .tool_name = call.name,
+                .session_key = self.memory_session_id,
+                .workspace_dir = self.workspace_dir,
+            });
+
             const tool_timer = std.time.milliTimestamp();
             const result = self.executeTool(tool_allocator, call);
             const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
@@ -946,6 +962,13 @@ pub const Agent = struct {
                 .success = result.success,
             } };
             self.observer.recordEvent(&tool_event);
+
+            hooks_mod.runHooks(self.allocator, self.hooks, .tool_end, .{
+                .tool_name = call.name,
+                .tool_success = result.success,
+                .session_key = self.memory_session_id,
+                .workspace_dir = self.workspace_dir,
+            });
 
             try results_buf.append(self.allocator, result);
         }
@@ -1180,6 +1203,12 @@ pub const Agent = struct {
             .stage = "turn_start",
         } };
         self.observer.recordEvent(&turn_start_event);
+
+        // Fire turn_start hooks
+        hooks_mod.runHooks(self.allocator, self.hooks, .turn_start, .{
+            .session_key = self.memory_session_id,
+            .workspace_dir = self.workspace_dir,
+        });
 
         // Inject system prompt on first turn (or when tracked workspace files changed).
         const prompt_refresh_plan = context_builder.buildPromptRefreshPlan(self);
@@ -1447,7 +1476,7 @@ pub const Agent = struct {
                         .model = self.model_name,
                         .temperature = self.temperature,
                         .max_tokens = self.max_tokens,
-                        .tools = null,
+                        .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
@@ -1478,7 +1507,7 @@ pub const Agent = struct {
                 }
                 response = ChatResponse{
                     .content = stream_result.content,
-                    .tool_calls = &.{},
+                    .tool_calls = stream_result.tool_calls,
                     .usage = stream_result.usage,
                     .model = stream_result.model,
                 };
@@ -1889,6 +1918,12 @@ pub const Agent = struct {
 
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
+
+                // Fire turn_end hooks
+                hooks_mod.runHooks(self.allocator, self.hooks, .turn_end, .{
+                    .session_key = self.memory_session_id,
+                    .workspace_dir = self.workspace_dir,
+                });
 
                 // Free provider response fields (content, tool_calls, model)
                 // All borrows have been duped into final_text and history at this point.

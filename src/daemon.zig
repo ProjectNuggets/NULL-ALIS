@@ -741,7 +741,7 @@ fn runTenantHeartbeatForUser(
     var hb_cfg = loadUserHeartbeatConfig(
         allocator,
         user_root,
-        config.heartbeat.enabled,
+        false,
         config.heartbeat.interval_minutes,
         state_json,
     );
@@ -3228,6 +3228,51 @@ test "loadUserHeartbeatConfig supports intervalSec compatibility key" {
     try std.testing.expect(cfg.enabled);
     try std.testing.expectEqual(@as(u32, 5), cfg.interval_minutes);
     try std.testing.expectEqualStrings("legacy seconds key", cfg.prompt);
+}
+
+test "runTenantHeartbeatForUser requires explicit tenant heartbeat enablement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    const user_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{root});
+    defer std.testing.allocator.free(user_root);
+    try std.fs.makeDirAbsolute(user_root);
+
+    const workspace = try std.fmt.allocPrint(std.testing.allocator, "{s}/workspace", .{user_root});
+    defer std.testing.allocator.free(workspace);
+    try std.fs.makeDirAbsolute(workspace);
+
+    var cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.heartbeat.enabled = true;
+    cfg.heartbeat.interval_minutes = 30;
+    cfg.tenant.enabled = true;
+    cfg.tenant.data_root = root;
+
+    var event_bus = bus_mod.Bus.init();
+
+    runTenantHeartbeatForUser(
+        std.testing.allocator,
+        &cfg,
+        &event_bus,
+        "1",
+        1,
+        user_root,
+        workspace,
+        false,
+        "heartbeat.interval_due",
+        null,
+    );
+
+    const runtime_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/heartbeat_runtime.json", .{user_root});
+    defer std.testing.allocator.free(runtime_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(runtime_path, .{}));
 }
 
 test "isHeartbeatContentEffectivelyEmpty handles comments and placeholders" {

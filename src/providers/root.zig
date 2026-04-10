@@ -238,6 +238,10 @@ pub const StreamCallback = *const fn (ctx: *anyopaque, chunk: StreamChunk) void;
 /// Result of a streaming chat call (accumulated after stream completes).
 pub const StreamChatResult = struct {
     content: ?[]const u8 = null,
+    /// Structured tool calls accumulated during streaming (provider-native format).
+    /// Populated by providers that support streaming tool calls (e.g. Anthropic, OpenAI).
+    /// When empty, the agent loop falls back to XML text parsing.
+    tool_calls: []const ToolCall = &.{},
     usage: TokenUsage = .{},
     model: []const u8 = "",
 };
