@@ -52,6 +52,8 @@ const channels = @import("channels/root.zig");
 const channel_manager = @import("channel_manager.zig");
 const channel_dispatch = @import("channels/dispatch.zig");
 const bus_mod = @import("bus.zig");
+const tasks_mod = @import("tasks/root.zig");
+const usage_runtime_mod = @import("usage_runtime.zig");
 const log = std.log.scoped(.gateway);
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
@@ -1043,6 +1045,9 @@ const TenantRuntime = struct {
     completion_router: ?*SubagentCompletionRouter,
     sec_tracker: ?security.RateTracker,
     sec_policy: ?security.SecurityPolicy,
+    task_ledger: *tasks_mod.TaskLedger,
+    task_delivery: *tasks_mod.TaskDelivery,
+    usage_rt: *usage_runtime_mod.UsageRuntime,
     log_obs: *observability.LogObserver,
     metrics_obs: LifecycleMetricsObserver,
     observer_slots: [2]Observer,
@@ -1106,6 +1111,9 @@ const TenantRuntime = struct {
             .completion_router = null,
             .sec_tracker = null,
             .sec_policy = null,
+            .task_ledger = undefined,
+            .task_delivery = undefined,
+            .usage_rt = undefined,
             .log_obs = undefined,
             .metrics_obs = .{ .metrics = lifecycle_metrics },
             .observer_slots = undefined,
@@ -1266,6 +1274,34 @@ const TenantRuntime = struct {
         runtime.completion_router = if (runtime.subagent_manager != null) allocator.create(SubagentCompletionRouter) catch null else null;
         errdefer if (runtime.completion_router) |router| allocator.destroy(router);
 
+        // Build observer chain first — needed by task delivery
+        const log_obs = try allocator.create(observability.LogObserver);
+        errdefer allocator.destroy(log_obs);
+        log_obs.* = .{};
+        runtime.log_obs = log_obs;
+        runtime.observer_slots = .{
+            runtime.log_obs.observer(),
+            runtime.metrics_obs.observer(),
+        };
+        runtime.observer_multi = .{ .observers = runtime.observer_slots[0..] };
+
+        // Task ledger + delivery (Phase 2: REQ-005, REQ-006)
+        const task_ledger = try allocator.create(tasks_mod.TaskLedger);
+        errdefer allocator.destroy(task_ledger);
+        task_ledger.* = tasks_mod.TaskLedger.init(allocator);
+        runtime.task_ledger = task_ledger;
+
+        const task_delivery = try allocator.create(tasks_mod.TaskDelivery);
+        errdefer allocator.destroy(task_delivery);
+        task_delivery.* = .{ .ledger = task_ledger, .observer = runtime.observer_multi.observer() };
+        runtime.task_delivery = task_delivery;
+
+        // Usage runtime (Phase 2: REQ-015)
+        const usage_rt = try allocator.create(usage_runtime_mod.UsageRuntime);
+        errdefer allocator.destroy(usage_rt);
+        usage_rt.* = usage_runtime_mod.UsageRuntime.init(allocator);
+        runtime.usage_rt = usage_rt;
+
         runtime.tools = tools_mod.allTools(allocator, runtime.config.workspace_dir, .{
             .config = &runtime.config,
             .http_enabled = runtime.config.http_request.enabled,
@@ -1281,18 +1317,9 @@ const TenantRuntime = struct {
             .allowed_paths = runtime.config.autonomy.allowed_paths,
             .policy = if (runtime.sec_policy) |*policy| policy else null,
             .subagent_manager = runtime.subagent_manager,
+            .task_delivery = runtime.task_delivery,
         }) catch &.{};
         errdefer if (runtime.tools.len > 0) tools_mod.deinitTools(allocator, runtime.tools);
-
-        const log_obs = try allocator.create(observability.LogObserver);
-        errdefer allocator.destroy(log_obs);
-        log_obs.* = .{};
-        runtime.log_obs = log_obs;
-        runtime.observer_slots = .{
-            runtime.log_obs.observer(),
-            runtime.metrics_obs.observer(),
-        };
-        runtime.observer_multi = .{ .observers = runtime.observer_slots[0..] };
 
         const mem_opt: ?memory_mod.Memory = if (runtime.mem_rt) |rt| rt.memory else null;
         runtime.session_mgr = session_mod.SessionManager.init(
@@ -1310,6 +1337,8 @@ const TenantRuntime = struct {
         if (runtime.sec_policy) |*policy| {
             runtime.session_mgr.policy = policy;
         }
+
+        runtime.session_mgr.usage_rt = runtime.usage_rt;
 
         if (runtime.mem_rt) |*rt| {
             runtime.session_mgr.mem_rt = rt;
@@ -1401,6 +1430,11 @@ const TenantRuntime = struct {
         }
         if (self.mem_rt) |*rt| rt.deinit();
         if (self.sec_tracker) |*tracker| tracker.deinit();
+        self.usage_rt.deinit();
+        self.allocator.destroy(self.usage_rt);
+        self.task_ledger.deinit();
+        self.allocator.destroy(self.task_delivery);
+        self.allocator.destroy(self.task_ledger);
         self.provider_bundle.deinit();
         self.allocator.destroy(self.log_obs);
         self.allocator.free(self.workspace_path);
@@ -7540,6 +7574,11 @@ fn SseProgressObserver(comptime StreamType: type) type {
                 .tool_iterations_exhausted => self.emit("finalize", "error", "Tool iteration limit reached", null, null, null),
                 .turn_stage => |e| self.emitStage(e.stage, e.iteration, e.duration_ms, e.count),
                 .turn_complete => self.emit("finalize", "done", "Response ready", null, null, null),
+                .task_update => |e| {
+                    var label_buf: [192]u8 = undefined;
+                    const label = std.fmt.bufPrint(&label_buf, "Task {s}: {s}", .{ e.task_id, e.status }) catch "Task update";
+                    self.emit("task", "update", label, null, null, null);
+                },
                 else => {},
             }
         }
@@ -7778,6 +7817,11 @@ const BufferedSseProgressObserver = struct {
             .tool_iterations_exhausted => self.emit("finalize", "error", "Tool iteration limit reached", null, null, null),
             .turn_stage => |e| self.emitStage(e.stage, e.iteration, e.duration_ms, e.count),
             .turn_complete => self.emit("finalize", "done", "Response ready", null, null, null),
+            .task_update => |e| {
+                var label_buf: [192]u8 = undefined;
+                const label = std.fmt.bufPrint(&label_buf, "Task {s}: {s}", .{ e.task_id, e.status }) catch "Task update";
+                self.emit("task", "update", label, null, null, null);
+            },
             else => {},
         }
     }
@@ -11860,6 +11904,9 @@ pub fn runWithRole(
     var completion_router_opt: ?*SubagentCompletionRouter = null;
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
+    var standalone_task_ledger: ?tasks_mod.TaskLedger = null;
+    var standalone_task_delivery: ?tasks_mod.TaskDelivery = null;
+    var standalone_usage_rt: ?usage_runtime_mod.UsageRuntime = null;
     var log_obs_gateway = observability.LogObserver{};
     var metrics_obs_gateway = LifecycleMetricsObserver{ .metrics = &state.lifecycle_metrics };
     var gateway_observer_slots: [2]Observer = undefined;
@@ -12000,6 +12047,22 @@ pub fn runWithRole(
                     completion_router_opt = allocator.create(SubagentCompletionRouter) catch null;
                 }
 
+                // Task ledger + delivery + usage runtime (Phase 2)
+                standalone_task_ledger = tasks_mod.TaskLedger.init(allocator);
+                standalone_usage_rt = usage_runtime_mod.UsageRuntime.init(allocator);
+
+                const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
+                gateway_observer_slots = .{
+                    log_obs_gateway.observer(),
+                    metrics_obs_gateway.observer(),
+                };
+                gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
+
+                standalone_task_delivery = .{
+                    .ledger = &(standalone_task_ledger.?),
+                    .observer = gateway_observer_multi.observer(),
+                };
+
                 // Tools.
                 tools_slice = tools_mod.allTools(allocator, cfg.workspace_dir, .{
                     .config = cfg,
@@ -12015,17 +12078,15 @@ pub fn runWithRole(
                     .allowed_paths = cfg.autonomy.allowed_paths,
                     .policy = if (sec_policy_opt) |*policy| policy else null,
                     .subagent_manager = subagent_manager_opt,
+                    .task_delivery = if (standalone_task_delivery) |*d| d else null,
                 }) catch &.{};
 
-                const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
-                gateway_observer_slots = .{
-                    log_obs_gateway.observer(),
-                    metrics_obs_gateway.observer(),
-                };
-                gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
                 var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, gateway_observer_multi.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
+                }
+                if (standalone_usage_rt) |*urt| {
+                    sm.usage_rt = urt;
                 }
                 if (mem_rt) |*rt| {
                     sm.mem_rt = rt;
@@ -12063,6 +12124,8 @@ pub fn runWithRole(
     defer if (completion_router_opt) |router| allocator.destroy(router);
     defer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
     defer if (session_mgr_opt) |*sm| sm.deinit();
+    defer if (standalone_task_ledger) |*ledger| ledger.deinit();
+    defer if (standalone_usage_rt) |*urt| urt.deinit();
     defer if (sec_tracker_opt) |*tracker| tracker.deinit();
 
     // Resolve the listen address

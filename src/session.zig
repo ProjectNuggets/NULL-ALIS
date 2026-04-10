@@ -90,6 +90,7 @@ pub const SessionManager = struct {
     session_store: ?memory_mod.SessionStore = null,
     response_cache: ?*memory_mod.cache.ResponseCache = null,
     mem_rt: ?*memory_mod.MemoryRuntime = null,
+    usage_rt: ?*@import("usage_runtime.zig").UsageRuntime = null,
     observer: Observer,
     policy: ?*const SecurityPolicy = null,
 
@@ -248,6 +249,7 @@ pub const SessionManager = struct {
         agent.session_store = self.session_store;
         agent.response_cache = self.response_cache;
         agent.mem_rt = self.mem_rt;
+        agent.usage_rt = self.usage_rt;
         agent.memory_session_id = memory_session_id;
         return agent;
     }
