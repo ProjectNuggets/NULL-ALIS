@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const learning = @import("learning.zig");
+const prompt_mod = @import("prompt.zig");
 const providers = @import("../providers/root.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
@@ -3328,6 +3329,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             \\  /doctor — memory subsystem diagnostics
             \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
             \\  /learn [list|forget <key>] — inspect and remove learned behavioral facts
+            \\  /persona — show current persona profile from SOUL.md
             \\  exit, quit
         );
     }
@@ -3415,6 +3417,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "doctor")) return try handleDoctorCommand(self);
     if (isSlashName(cmd, "memory")) return try handleMemoryCommand(self, cmd.arg);
     if (isSlashName(cmd, "learn")) return try handleLearnCommand(self, cmd.arg);
+    if (isSlashName(cmd, "persona")) return try handlePersonaCommand(self, cmd.arg);
 
     return null;
 }
@@ -3484,6 +3487,51 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     return try self.allocator.dupe(u8, "Usage: /learn [list|forget <key>]");
+}
+
+fn handlePersonaCommand(self: anytype, _arg: []const u8) ![]const u8 {
+    _ = _arg;
+
+    const workspace_dir = if (@hasField(@TypeOf(self.*), "workspace_dir"))
+        self.workspace_dir
+    else
+        return try self.allocator.dupe(u8, "Workspace directory not available.");
+
+    const profile_opt = prompt_mod.resolvePersonaFromFile(self.allocator, workspace_dir);
+    if (profile_opt == null) {
+        return try self.allocator.dupe(
+            u8,
+            "No SOUL.md found or no persona front-matter defined. Using defaults.\n" ++
+                "  Warmth:     balanced\n" ++
+                "  Proactivity: moderate\n" ++
+                "  Voice:      (none)\n" ++
+                "  Twin mode:  false",
+        );
+    }
+
+    const profile = profile_opt.?;
+    const warmth_str: []const u8 = switch (profile.warmth) {
+        .crisp => "crisp",
+        .balanced => "balanced",
+        .warm => "warm",
+    };
+    const proactivity_str: []const u8 = switch (profile.proactivity) {
+        .reactive => "reactive",
+        .moderate => "moderate",
+        .proactive => "proactive",
+    };
+    const voice_str = profile.voice orelse "(none)";
+    const twin_str: []const u8 = if (profile.twin_mode) "true" else "false";
+
+    return try std.fmt.allocPrint(
+        self.allocator,
+        "Current persona profile (from SOUL.md):\n" ++
+            "  Warmth:     {s}\n" ++
+            "  Proactivity: {s}\n" ++
+            "  Voice:      {s}\n" ++
+            "  Twin mode:  {s}",
+        .{ warmth_str, proactivity_str, voice_str, twin_str },
+    );
 }
 
 fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -3722,7 +3770,7 @@ test "baseline: known command surface has expected breadth" {
         "unfocus",      "kill",      "steer",         "tell",         "config",
         "capabilities", "debug",     "dock-telegram", "dock-discord", "dock-slack",
         "activation",   "send",      "elevated",      "bash",         "poll",
-        "skill",        "doctor",    "memory",        "learn",
+        "skill",        "doctor",    "memory",        "learn",        "persona",
     };
     for (known_commands) |name| {
         const input = std.fmt.allocPrint(std.testing.allocator, "/{s}", .{name}) catch unreachable;
@@ -3731,5 +3779,5 @@ test "baseline: known command surface has expected breadth" {
         try std.testing.expect(cmd != null);
     }
     // Verify count — if someone adds a command, this test documents the current set size
-    try std.testing.expect(known_commands.len >= 45);
+    try std.testing.expect(known_commands.len >= 46);
 }

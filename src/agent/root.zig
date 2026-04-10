@@ -1270,12 +1270,22 @@ pub const Agent = struct {
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
+            // Resolve persona from SOUL.md front-matter (REQ-022). Falls back to defaults when absent.
+            const persona_profile_opt = prompt.resolvePersonaFromFile(self.allocator, self.workspace_dir);
+            const persona_section: ?prompt.PersonaSection = if (persona_profile_opt) |p| .{
+                .warmth = p.warmth,
+                .proactivity = p.proactivity,
+                .voice_style = p.voice,
+                .twin_mode = p.twin_mode,
+            } else null;
+
             const system_prompt = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
                 .model_name = self.model_name,
                 .tools = self.tools,
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
+                .sections = .{ .persona = persona_section },
             });
             defer self.allocator.free(system_prompt);
 
@@ -2761,6 +2771,11 @@ test "prompt module reexport" {
     _ = prompt.PromptSections;
     _ = prompt.TurnClass;
     _ = prompt.PersonaSection;
+    _ = prompt.PersonaProfile;
+    _ = prompt.Warmth;
+    _ = prompt.Proactivity;
+    _ = prompt.resolvePersona;
+    _ = prompt.resolvePersonaFromFile;
     _ = prompt.NarrationPolicy;
 }
 
