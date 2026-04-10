@@ -313,3 +313,56 @@ test "stageLabel returns human-readable labels" {
     try std.testing.expectEqualStrings("Preparing reply", stageLabel("compose_final_reply"));
     try std.testing.expectEqualStrings("unknown_stage", stageLabel("unknown_stage"));
 }
+
+// ── PacedFrameSink Tests ────────────────────────────────────────────
+
+test "PacedFrameSink.init creates instance with inner sink, delay_ms=30" {
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    var paced = PacedFrameSink.init(test_sink.sink(), 30);
+    try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), paced.delay_ns);
+}
+
+test "PacedFrameSink.sink returns valid FrameSink that delegates write to inner" {
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    var paced = PacedFrameSink.init(test_sink.sink(), 0);
+    const sink = paced.sink();
+    sink.write("hello from paced");
+    try std.testing.expectEqual(@as(usize, 1), test_sink.frames.items.len);
+    try std.testing.expectEqualStrings("hello from paced", test_sink.lastFrame().?);
+}
+
+// ── resolveDeliveryMode Tests ───────────────────────────────────────
+
+test "resolveDeliveryMode zaki_app returns live" {
+    try std.testing.expectEqualStrings("live", resolveDeliveryMode("zaki_app"));
+}
+
+test "resolveDeliveryMode cli returns live" {
+    try std.testing.expectEqualStrings("live", resolveDeliveryMode("cli"));
+}
+
+test "resolveDeliveryMode telegram returns buffered_replay" {
+    try std.testing.expectEqualStrings("buffered_replay", resolveDeliveryMode("telegram"));
+}
+
+test "resolveDeliveryMode discord returns buffered_replay" {
+    try std.testing.expectEqualStrings("buffered_replay", resolveDeliveryMode("discord"));
+}
+
+test "resolveDeliveryMode unknown_channel returns buffered_replay" {
+    try std.testing.expectEqualStrings("buffered_replay", resolveDeliveryMode("unknown_channel"));
+}
+
+// ── resolvePacingDelay Tests ────────────────────────────────────────
+
+test "resolvePacingDelay zaki_app returns 30" {
+    try std.testing.expectEqual(@as(u32, 30), resolvePacingDelay("zaki_app"));
+}
+
+test "resolvePacingDelay cli returns 0" {
+    try std.testing.expectEqual(@as(u32, 0), resolvePacingDelay("cli"));
+}
