@@ -2,16 +2,27 @@
 
 ## Current Phase
 Phase 1.5: Prompt Architecture and Liveness — IN PROGRESS
-Plan 03 (Task decomposition) — COMPLETE
+Plan 04 (Learning loop) — COMPLETE
 
 ## Current Plan
-Phase 1.5, Plan 03 complete. Ready for Plan 04 (Learning loop).
+Phase 1.5, Plan 04 complete. Ready for Plan 05 (Persona calibration).
 
 ## Phase 0 Results
 - 00-01: 26 characterization tests added (e0ce57d), 5045/5076 pass, 0 fail
 - 00-02: 3 documentation artifacts created (60471d9), no runtime changes
 
 ## Decisions Log
+
+### 2026-04-10: Phase 1.5 Plan 04 complete — Learning loop
+- LearningSignal enum + LearnedFact struct in learning.zig (REQ-021)
+- detectLearningSignals: case-insensitive heuristic matching, std.EnumSet deduplication
+- factKey: FNV-1a 64-bit hash → durable_fact/behavior/{x:0>16} deterministic key
+- extractFactFromMessage: copy for explicit signals; null for implicit-only
+- MAX_FACTS_PER_SESSION = 100 (T-1.5-08 DoS mitigation)
+- /learn slash command: list filters durable_fact/behavior/ prefix; forget removes by key
+- learning module re-exported from agent/root.zig
+- 20 new tests (19 inline + 1 reexport); 5143/5174 pass total; ReleaseSmall build confirmed
+- Commits: 747ffaa (learning.zig), 38eda4d (commands.zig + root.zig wiring)
 
 ### 2026-04-10: Phase 1.5 Plan 03 complete — Task decomposition runtime
 - TaskPlan/TaskStep types with step state machine (pending/running/done/failed) in task_planner.zig (REQ-020)
@@ -81,6 +92,6 @@ None currently.
 - M1 (Kernel UX) complete and merged to main
 - M2 (Context Introspection) complete and merged to main
 - Build commands: `zig build test --summary all`, `zig build -Doptimize=ReleaseSmall`
-- 189,005 lines across 188 .zig files (+ narration.zig in 01.5-02, task_planner.zig in 01.5-03)
-- 1,500+ inline tests (5123/5154 passing after 01.5-03)
-- Last session stopped at: Completed 01.5-03-PLAN.md (2026-04-10T11:16:29Z)
+- 189,005 lines across 188 .zig files (+ narration.zig in 01.5-02, task_planner.zig in 01.5-03, learning.zig in 01.5-04)
+- 1,500+ inline tests (5143/5174 passing after 01.5-04)
+- Last session stopped at: Completed 01.5-04-PLAN.md (2026-04-10T11:23:29Z)
