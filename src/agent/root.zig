@@ -29,6 +29,9 @@ const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const RateTracker = @import("../security/policy.zig").RateTracker;
 const hooks_mod = @import("../hooks.zig");
+const execution_mode_mod = @import("execution_mode.zig");
+const ExecutionMode = execution_mode_mod.ExecutionMode;
+const tool_metadata = @import("../tools/metadata.zig");
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -300,6 +303,7 @@ pub const Agent = struct {
     verbose_level: VerboseLevel = .off,
     reasoning_mode: ReasoningMode = .off,
     usage_mode: UsageMode = .off,
+    execution_mode: ExecutionMode = .execute,
     exec_host: ExecHost = .gateway,
     exec_security: ExecSecurity = .allowlist,
     exec_ask: ExecAsk = .on_miss,
@@ -794,6 +798,27 @@ pub const Agent = struct {
         return commands.execBlockMessage(self, args);
     }
 
+    const reflection_prompt_execute =
+        "Reflect on the tool results above and decide your next steps. " ++
+        "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
+        "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up. " ++
+        "If a tool reports queued/async delivery, state it as queued (not confirmed delivered) unless a later tool confirms delivery.";
+    const reflection_prompt_plan =
+        "You are in plan mode. Analyze the read-only tool results above and provide a structured plan. Do not attempt to use mutating tools.";
+    const reflection_prompt_review =
+        "You are in review mode. Analyze the read-only tool results above and provide a structured review with findings and recommendations.";
+    const reflection_prompt_background =
+        "Process the tool results. Do not attempt user interaction tools.";
+
+    fn getReflectionPrompt(mode: ExecutionMode) []const u8 {
+        return switch (mode) {
+            .plan => reflection_prompt_plan,
+            .execute => reflection_prompt_execute,
+            .review => reflection_prompt_review,
+            .background => reflection_prompt_background,
+        };
+    }
+
     const PolicyPreflightResult = union(enum) {
         allowed,
         blocked: ToolExecutionResult,
@@ -928,6 +953,19 @@ pub const Agent = struct {
                 return .{ .blocked = .{
                     .name = call.name,
                     .output = "Action budget exhausted",
+                    .success = false,
+                    .tool_call_id = call.tool_call_id,
+                } };
+            }
+        }
+        // Execution mode gate: block tools not allowed in current mode
+        if (self.execution_mode != .execute) {
+            const meta = tool_metadata.lookupMetadata(call.name, &.{}) orelse
+                tool_metadata.ToolMetadata.conservative(call.name);
+            if (!self.execution_mode.allowsTool(meta)) {
+                return .{ .blocked = .{
+                    .name = call.name,
+                    .output = "blocked",
                     .success = false,
                     .tool_call_id = call.tool_call_id,
                 } };
@@ -2059,13 +2097,11 @@ pub const Agent = struct {
             const reflect_start_ms = std.time.milliTimestamp();
             const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
             const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
+            const reflection_prompt = getReflectionPrompt(self.execution_mode);
             const with_reflection = try std.fmt.allocPrint(
                 arena,
-                "{s}\n\nReflect on the tool results above and decide your next steps. " ++
-                    "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
-                    "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up. " ++
-                    "If a tool reports queued/async delivery, state it as queued (not confirmed delivered) unless a later tool confirms delivery.",
-                .{scrubbed_results},
+                "{s}\n\n{s}",
+                .{ scrubbed_results, reflection_prompt },
             );
             try self.history.append(self.allocator, .{
                 .role = .user,

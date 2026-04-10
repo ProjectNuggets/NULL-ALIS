@@ -53,6 +53,7 @@ pub fn parseTestArgs(json_str: []const u8) !std.json.Parsed(JsonValue) {
 }
 
 // Sub-modules
+pub const metadata = @import("metadata.zig");
 pub const shell = @import("shell.zig");
 pub const file_read = @import("file_read.zig");
 pub const file_write = @import("file_write.zig");
