@@ -1272,6 +1272,9 @@ pub const Agent = struct {
 
             // Resolve persona from SOUL.md front-matter (REQ-022). Falls back to defaults when absent.
             const persona_profile_opt = prompt.resolvePersonaFromFile(self.allocator, self.workspace_dir);
+            defer if (persona_profile_opt) |p| {
+                if (p.voice) |v| self.allocator.free(v);
+            };
             const persona_section: ?prompt.PersonaSection = if (persona_profile_opt) |p| .{
                 .warmth = p.warmth,
                 .proactivity = p.proactivity,
@@ -1378,6 +1381,26 @@ pub const Agent = struct {
         });
         raw_user_history_appended = true;
         self.current_turn_raw_user = raw_user_history;
+
+        // ── Learning signal detection (REQ-021) ─────────────────────
+        // Scan user message for corrections/preferences. If found, extract
+        // a behavioral fact and store it as a durable_fact/behavior/ key.
+        if (self.mem) |mem| {
+            const signals = learning.detectLearningSignals(self.allocator, user_message) catch &.{};
+            defer if (signals.len > 0) self.allocator.free(signals);
+            if (signals.len > 0) {
+                const fact_content = learning.extractFactFromMessage(self.allocator, user_message, signals) catch null;
+                defer if (fact_content) |fc| self.allocator.free(fc);
+                if (fact_content) |fc| {
+                    const key = learning.factKey(self.allocator, fc) catch null;
+                    if (key) |k| {
+                        defer self.allocator.free(k);
+                        _ = mem.store(k, fc, .core, self.memory_session_id) catch {};
+                        log.info("learning.signal_detected signals={d} key={s}", .{ signals.len, k });
+                    }
+                }
+            }
+        }
 
         if (self.compact_context_enabled) {
             self.last_turn_compacted = false;

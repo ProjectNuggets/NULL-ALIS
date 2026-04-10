@@ -140,7 +140,7 @@ pub fn resolvePersona(content: []const u8) PersonaProfile {
 
 /// Read SOUL.md from workspace_dir and resolve persona front-matter.
 /// Returns null when file is absent or unreadable.
-/// Caller does NOT need to free PersonaProfile — no allocation is done.
+/// Caller must free PersonaProfile.voice with the same allocator if non-null.
 pub fn resolvePersonaFromFile(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
@@ -155,7 +155,12 @@ pub fn resolvePersonaFromFile(
     const content = file.readToEndAlloc(allocator, BOOTSTRAP_MAX_CHARS + 1024) catch return null;
     defer allocator.free(content);
 
-    return resolvePersona(content);
+    var profile = resolvePersona(content);
+    // Dupe voice string — content is freed by defer, so the slice would dangle.
+    if (profile.voice) |v| {
+        profile.voice = allocator.dupe(u8, v) catch null;
+    }
+    return profile;
 }
 
 /// Emit persona calibration instructions based on resolved PersonaSection.
