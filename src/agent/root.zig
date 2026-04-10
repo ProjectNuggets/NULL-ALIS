@@ -46,6 +46,7 @@ pub const context_report = @import("context_report.zig");
 pub const max_tokens_resolver = @import("max_tokens.zig");
 pub const prompt = @import("prompt.zig");
 pub const narration = @import("narration.zig");
+pub const task_planner = @import("task_planner.zig");
 pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
@@ -2774,12 +2775,19 @@ test "memory_loader module reexport" {
     _ = memory_loader.enrichMessage;
 }
 
+test "task_planner module reexport" {
+    _ = task_planner.TaskPlan;
+    _ = task_planner.TaskStep;
+    _ = task_planner.parseTaskPlan;
+}
+
 test {
     _ = dispatcher;
     _ = compaction;
     _ = cli;
     _ = prompt;
     _ = memory_loader;
+    _ = task_planner;
 }
 
 // ── Additional agent tests ──────────────────────────────────────

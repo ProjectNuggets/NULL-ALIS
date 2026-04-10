@@ -182,6 +182,9 @@ pub fn buildSystemPrompt(
     // Turn classification section
     try buildTurnClassificationSection(w);
 
+    // Task decomposition section
+    try buildTaskDecompositionSection(w);
+
     // Safety section
     try buildSafetySection(w);
 
@@ -263,6 +266,28 @@ fn buildTurnClassificationSection(w: anytype) !void {
     try w.writeAll("- `repair` — error recovery, be cautious and diagnostic\n");
     try w.writeAll("- `operator` — administrative command, follow operator protocols\n");
     try w.writeAll("\n");
+}
+
+/// Emit task decomposition instructions.
+/// Tells the model when to emit <task_plan> XML and how to structure it.
+/// Only emitted when a request has 3 or more distinct steps.
+fn buildTaskDecompositionSection(w: anytype) !void {
+    try w.writeAll("## Task Decomposition\n\n");
+    try w.writeAll("When a user request involves 3 or more distinct steps, decompose it into a structured plan before executing.\n\n");
+    try w.writeAll("Emit a `<task_plan>` block in your response:\n");
+    try w.writeAll("```\n");
+    try w.writeAll("<task_plan>\n");
+    try w.writeAll("<summary>Brief description of the overall task</summary>\n");
+    try w.writeAll("<step>First concrete action</step>\n");
+    try w.writeAll("<step>Second concrete action</step>\n");
+    try w.writeAll("<step>Third concrete action</step>\n");
+    try w.writeAll("</task_plan>\n");
+    try w.writeAll("```\n\n");
+    try w.writeAll("Rules:\n");
+    try w.writeAll("- Only decompose when the request genuinely has multiple distinct steps.\n");
+    try w.writeAll("- Simple questions or single-tool operations do not need a plan.\n");
+    try w.writeAll("- After emitting the plan, execute step 1 immediately in the same turn.\n");
+    try w.writeAll("- Do not re-emit the plan on subsequent iterations — execute the next pending step.\n\n");
 }
 
 /// Emit safety rules. Turn classification has been extracted into buildTurnClassificationSection.
