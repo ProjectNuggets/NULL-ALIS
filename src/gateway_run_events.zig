@@ -27,6 +27,56 @@ pub const FrameSink = struct {
     }
 };
 
+// ── PacedFrameSink ──────────────────────────────────────────────────
+
+/// Decorator that wraps any FrameSink with a configurable inter-chunk
+/// delay, enabling human-pacing for progressive SSE token streaming.
+/// The delay is applied at the delivery layer (not in the LLM provider
+/// callback), per D-03. Thread.sleep is bounded (T-02.1-02).
+pub const PacedFrameSink = struct {
+    inner: FrameSink,
+    delay_ns: u64,
+
+    pub fn init(inner: FrameSink, delay_ms: u32) PacedFrameSink {
+        return .{
+            .inner = inner,
+            .delay_ns = @as(u64, delay_ms) * std.time.ns_per_ms,
+        };
+    }
+
+    fn pacedWrite(ptr: *anyopaque, frame: []const u8) void {
+        const self: *PacedFrameSink = @ptrCast(@alignCast(ptr));
+        if (self.delay_ns > 0) {
+            std.Thread.sleep(self.delay_ns);
+        }
+        self.inner.write(frame);
+    }
+
+    pub fn sink(self: *PacedFrameSink) FrameSink {
+        return .{ .ptr = @ptrCast(self), .writeFn = pacedWrite };
+    }
+};
+
+// ── Delivery Mode Resolution ────────────────────────────────────────
+
+/// Resolve delivery mode for a given channel name.
+/// Live channels (zaki_app, cli) receive token-by-token streaming.
+/// All other channels use buffered_replay (post-hoc chunking).
+pub fn resolveDeliveryMode(channel: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(channel, "zaki_app")) return "live";
+    if (std.ascii.eqlIgnoreCase(channel, "cli")) return "live";
+    return "buffered_replay";
+}
+
+/// Resolve inter-chunk pacing delay (ms) for a given channel.
+/// Web SSE (zaki_app) gets 30ms for human-readable progressive feel.
+/// CLI gets 0ms (immediate dump). Non-live channels return 0 (unused).
+pub fn resolvePacingDelay(channel: []const u8) u32 {
+    if (std.ascii.eqlIgnoreCase(channel, "zaki_app")) return 30;
+    if (std.ascii.eqlIgnoreCase(channel, "cli")) return 0;
+    return 0; // non-live channels don't need pacing
+}
+
 // ── RunEventObserver ─────────────────────────────────────────────────
 
 pub const RunEventObserver = struct {
@@ -312,4 +362,57 @@ test "stageLabel returns human-readable labels" {
     try std.testing.expectEqualStrings("Running tools", stageLabel("dispatch_tools"));
     try std.testing.expectEqualStrings("Preparing reply", stageLabel("compose_final_reply"));
     try std.testing.expectEqualStrings("unknown_stage", stageLabel("unknown_stage"));
+}
+
+// ── PacedFrameSink Tests ────────────────────────────────────────────
+
+test "PacedFrameSink.init creates instance with inner sink, delay_ms=30" {
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    const paced = PacedFrameSink.init(test_sink.sink(), 30);
+    try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), paced.delay_ns);
+}
+
+test "PacedFrameSink.sink returns valid FrameSink that delegates write to inner" {
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    var paced = PacedFrameSink.init(test_sink.sink(), 0);
+    const sink = paced.sink();
+    sink.write("hello from paced");
+    try std.testing.expectEqual(@as(usize, 1), test_sink.frames.items.len);
+    try std.testing.expectEqualStrings("hello from paced", test_sink.lastFrame().?);
+}
+
+// ── resolveDeliveryMode Tests ───────────────────────────────────────
+
+test "resolveDeliveryMode zaki_app returns live" {
+    try std.testing.expectEqualStrings("live", resolveDeliveryMode("zaki_app"));
+}
+
+test "resolveDeliveryMode cli returns live" {
+    try std.testing.expectEqualStrings("live", resolveDeliveryMode("cli"));
+}
+
+test "resolveDeliveryMode telegram returns buffered_replay" {
+    try std.testing.expectEqualStrings("buffered_replay", resolveDeliveryMode("telegram"));
+}
+
+test "resolveDeliveryMode discord returns buffered_replay" {
+    try std.testing.expectEqualStrings("buffered_replay", resolveDeliveryMode("discord"));
+}
+
+test "resolveDeliveryMode unknown_channel returns buffered_replay" {
+    try std.testing.expectEqualStrings("buffered_replay", resolveDeliveryMode("unknown_channel"));
+}
+
+// ── resolvePacingDelay Tests ────────────────────────────────────────
+
+test "resolvePacingDelay zaki_app returns 30" {
+    try std.testing.expectEqual(@as(u32, 30), resolvePacingDelay("zaki_app"));
+}
+
+test "resolvePacingDelay cli returns 0" {
+    try std.testing.expectEqual(@as(u32, 0), resolvePacingDelay("cli"));
 }
