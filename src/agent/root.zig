@@ -2753,6 +2753,10 @@ test "cli module reexport" {
 test "prompt module reexport" {
     _ = prompt.buildSystemPrompt;
     _ = prompt.PromptContext;
+    _ = prompt.PromptSections;
+    _ = prompt.TurnClass;
+    _ = prompt.PersonaSection;
+    _ = prompt.NarrationPolicy;
 }
 
 test "memory_loader module reexport" {
