@@ -8458,6 +8458,23 @@ const LiveSseCtx = struct {
     /// Set to true on send failure (e.g. client disconnect). Once set,
     /// subsequent tokens are skipped to avoid wasting compute.
     client_gone: *bool,
+    /// Paced sink for inter-chunk delays (human-pacing). When non-null,
+    /// liveStreamCallback writes through this instead of sendFrameFn directly.
+    paced_sink: ?*gateway_run_events.PacedFrameSink = null,
+
+    /// FrameSink-compatible write that delegates to the error-returning
+    /// sendFrameFn, setting client_gone on failure. Used as the inner
+    /// sink for PacedFrameSink so pacing delays apply before each send.
+    fn sinkWrite(ptr: *anyopaque, frame: []const u8) void {
+        const self: *LiveSseCtx = @ptrCast(@alignCast(ptr));
+        self.sendFrameFn(self.stream_ptr, frame) catch {
+            self.client_gone.* = true;
+        };
+    }
+
+    fn frameSink(self: *LiveSseCtx) gateway_run_events.FrameSink {
+        return .{ .ptr = @ptrCast(self), .writeFn = sinkWrite };
+    }
 };
 
 fn liveStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
@@ -8466,10 +8483,14 @@ fn liveStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     if (ctx.client_gone.*) return; // client disconnected — skip remaining tokens
     const frame = sseTokenFrame(ctx.allocator, chunk.delta, ctx.seq.*) catch return;
     defer ctx.allocator.free(frame);
-    ctx.sendFrameFn(ctx.stream_ptr, frame) catch {
-        ctx.client_gone.* = true;
-        return;
-    };
+    if (ctx.paced_sink) |paced| {
+        paced.sink().write(frame);
+    } else {
+        ctx.sendFrameFn(ctx.stream_ptr, frame) catch {
+            ctx.client_gone.* = true;
+            return;
+        };
+    }
     ctx.seq.* += 1;
 }
 
@@ -8646,6 +8667,7 @@ fn handleApiChatStreamSseConnection(
     }
 
     // Set up live stream context for stream_callback (tokens piped directly to SSE)
+    // PacedFrameSink wraps the SSE send with inter-chunk delays for human-pacing (D-03).
     var live_seq: usize = 0;
     const SseStreamType = LockedSseStream(@TypeOf(stream));
     var live_client_gone: bool = false;
@@ -8656,6 +8678,11 @@ fn handleApiChatStreamSseConnection(
         .seq = &live_seq,
         .client_gone = &live_client_gone,
     };
+    const pacing_delay = gateway_run_events.resolvePacingDelay(channel_name);
+    var paced_sink = gateway_run_events.PacedFrameSink.init(live_ctx.frameSink(), pacing_delay);
+    if (is_live and pacing_delay > 0) {
+        live_ctx.paced_sink = &paced_sink;
+    }
 
     const ReplyOutcome = union(enum) {
         ok: []const u8,
