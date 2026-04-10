@@ -22,6 +22,7 @@ const capabilities_mod = @import("../capabilities.zig");
 const multimodal = @import("../multimodal.zig");
 const platform = @import("../platform.zig");
 const voice_mod = @import("../voice.zig");
+const voice_mode = @import("../voice_mode.zig");
 const observability = @import("../observability.zig");
 const tool_dispatcher = @import("../tool_dispatcher.zig");
 const Observer = observability.Observer;
@@ -673,7 +674,7 @@ pub const Agent = struct {
 
     fn ttsAudioChannelSupported(message_ctx: tools_mod.MessageTurnContext) bool {
         const channel = message_ctx.channel orelse return false;
-        return std.ascii.eqlIgnoreCase(channel, "telegram");
+        return voice_mode.channelSupportsAudio(channel);
     }
 
     fn ttsTrimUtf8Boundary(text: []const u8, max_chars: usize) []const u8 {
@@ -6946,4 +6947,17 @@ test "baseline: Agent deinit on minimal instance does not leak" {
     // Verify defaults are applied correctly.
     try std.testing.expectEqual(@as(u32, 25), agent.max_tool_iterations);
     try std.testing.expectEqual(@as(u32, 50), agent.max_history_messages);
+}
+
+test "ttsAudioChannelSupported returns true for discord via voice_mode" {
+    // Proves the hardcoded telegram-only check has been replaced with
+    // voice_mode.channelSupportsAudio which supports multiple channels.
+    try std.testing.expect(voice_mode.channelSupportsAudio("discord"));
+    try std.testing.expect(voice_mode.channelSupportsAudio("telegram"));
+    try std.testing.expect(voice_mode.channelSupportsAudio("whatsapp"));
+}
+
+test "ttsAudioChannelSupported returns false for cli via voice_mode" {
+    try std.testing.expect(!voice_mode.channelSupportsAudio("cli"));
+    try std.testing.expect(!voice_mode.channelSupportsAudio("unknown"));
 }

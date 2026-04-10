@@ -130,6 +130,8 @@ pub const NarrationObserver = struct {
         if (std.mem.eql(u8, stage, "llm_first_token")) return "Model responding";
         if (std.mem.eql(u8, stage, "llm_first_token_upper_bound")) return "Waiting for model";
         if (std.mem.eql(u8, stage, "post_reply_compaction")) return "Compacting context";
+        if (std.mem.eql(u8, stage, "voice_listening")) return "Listening...";
+        if (std.mem.eql(u8, stage, "voice_speaking")) return "Speaking...";
         return null;
     }
 
@@ -138,6 +140,8 @@ pub const NarrationObserver = struct {
         if (std.mem.eql(u8, stage, "dispatch_tools")) return .tool_start;
         if (std.mem.eql(u8, stage, "llm_first_token_upper_bound")) return .waiting;
         if (std.mem.eql(u8, stage, "llm_first_token")) return .waiting;
+        if (std.mem.eql(u8, stage, "voice_listening")) return .listening;
+        if (std.mem.eql(u8, stage, "voice_speaking")) return .speaking;
         return .thinking;
     }
 };
@@ -220,4 +224,20 @@ test "NarrationFrame struct zero-init" {
     try std.testing.expect(frame.tool_name == null);
     try std.testing.expect(frame.step_index == null);
     try std.testing.expect(frame.step_total == null);
+}
+
+test "turnStageToNarration handles voice_listening" {
+    try std.testing.expectEqualStrings("Listening...", NarrationObserver.turnStageToNarration("voice_listening").?);
+}
+
+test "turnStageToNarration handles voice_speaking" {
+    try std.testing.expectEqualStrings("Speaking...", NarrationObserver.turnStageToNarration("voice_speaking").?);
+}
+
+test "turnStageToFrameType maps voice_listening to listening" {
+    try std.testing.expectEqual(FrameType.listening, NarrationObserver.turnStageToFrameType("voice_listening"));
+}
+
+test "turnStageToFrameType maps voice_speaking to speaking" {
+    try std.testing.expectEqual(FrameType.speaking, NarrationObserver.turnStageToFrameType("voice_speaking"));
 }

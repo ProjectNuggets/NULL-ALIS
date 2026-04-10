@@ -8,6 +8,8 @@ pub const NarrationFrameType = enum {
     waiting,
     plan_step,
     error_recovery,
+    listening, // voice STT active
+    speaking, // voice TTS active
 };
 
 /// Events the observer can record.
