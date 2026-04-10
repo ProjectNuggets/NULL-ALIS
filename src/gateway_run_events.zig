@@ -27,6 +27,56 @@ pub const FrameSink = struct {
     }
 };
 
+// ── PacedFrameSink ──────────────────────────────────────────────────
+
+/// Decorator that wraps any FrameSink with a configurable inter-chunk
+/// delay, enabling human-pacing for progressive SSE token streaming.
+/// The delay is applied at the delivery layer (not in the LLM provider
+/// callback), per D-03. Thread.sleep is bounded (T-02.1-02).
+pub const PacedFrameSink = struct {
+    inner: FrameSink,
+    delay_ns: u64,
+
+    pub fn init(inner: FrameSink, delay_ms: u32) PacedFrameSink {
+        return .{
+            .inner = inner,
+            .delay_ns = @as(u64, delay_ms) * std.time.ns_per_ms,
+        };
+    }
+
+    fn pacedWrite(ptr: *anyopaque, frame: []const u8) void {
+        const self: *PacedFrameSink = @ptrCast(@alignCast(ptr));
+        if (self.delay_ns > 0) {
+            std.Thread.sleep(self.delay_ns);
+        }
+        self.inner.write(frame);
+    }
+
+    pub fn sink(self: *PacedFrameSink) FrameSink {
+        return .{ .ptr = @ptrCast(self), .writeFn = pacedWrite };
+    }
+};
+
+// ── Delivery Mode Resolution ────────────────────────────────────────
+
+/// Resolve delivery mode for a given channel name.
+/// Live channels (zaki_app, cli) receive token-by-token streaming.
+/// All other channels use buffered_replay (post-hoc chunking).
+pub fn resolveDeliveryMode(channel: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(channel, "zaki_app")) return "live";
+    if (std.ascii.eqlIgnoreCase(channel, "cli")) return "live";
+    return "buffered_replay";
+}
+
+/// Resolve inter-chunk pacing delay (ms) for a given channel.
+/// Web SSE (zaki_app) gets 30ms for human-readable progressive feel.
+/// CLI gets 0ms (immediate dump). Non-live channels return 0 (unused).
+pub fn resolvePacingDelay(channel: []const u8) u32 {
+    if (std.ascii.eqlIgnoreCase(channel, "zaki_app")) return 30;
+    if (std.ascii.eqlIgnoreCase(channel, "cli")) return 0;
+    return 0; // non-live channels don't need pacing
+}
+
 // ── RunEventObserver ─────────────────────────────────────────────────
 
 pub const RunEventObserver = struct {
@@ -320,7 +370,7 @@ test "PacedFrameSink.init creates instance with inner sink, delay_ms=30" {
     const allocator = std.testing.allocator;
     var test_sink = TestFrameSink.init(allocator);
     defer test_sink.deinit();
-    var paced = PacedFrameSink.init(test_sink.sink(), 30);
+    const paced = PacedFrameSink.init(test_sink.sink(), 30);
     try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), paced.delay_ns);
 }
 
