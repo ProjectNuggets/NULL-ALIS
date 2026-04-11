@@ -7277,7 +7277,7 @@ fn ownershipLockConflictSseRouteResponse(allocator: std.mem.Allocator, conflict:
 }
 
 const SSE_TOKEN_CHUNK_SIZE: usize = 96;
-const SSE_KEEPALIVE_FRAME: []const u8 = "event: progress\ndata: {\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Still working on the reply\"}\n\n";
+const SSE_KEEPALIVE_FRAME: []const u8 = "event: progress\ndata: {\"type\":\"progress\",\"phase\":\"thinking\",\"state\":\"update\",\"label\":\"Still working on the reply\",\"heartbeat\":true}\n\n";
 const SSE_KEEPALIVE_INTERVAL_MS: u64 = if (builtin.is_test) 25 else 10_000;
 const SSE_KEEPALIVE_POLL_MS: u64 = if (builtin.is_test) 5 else 250;
 
@@ -7321,6 +7321,9 @@ fn sseProgressFrame(
     }
     if (duration_ms) |value| {
         try w.print(",\"duration_ms\":{d}", .{value});
+    }
+    if (std.mem.eql(u8, label, "Still working on the reply")) {
+        try w.writeAll(",\"heartbeat\":true");
     }
     try w.writeAll("}\n\n");
     return buf.toOwnedSlice(allocator);
@@ -17298,6 +17301,21 @@ test "sseProgressFrame emits progress payload with optional fields" {
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool\":\"schedule\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"iteration\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"duration_ms\":123") != null);
+}
+
+test "sseProgressFrame marks keepalive progress as heartbeat" {
+    const frame = try sseProgressFrame(
+        std.testing.allocator,
+        "thinking",
+        "update",
+        "Still working on the reply",
+        null,
+        null,
+        null,
+    );
+    defer std.testing.allocator.free(frame);
+
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"heartbeat\":true") != null);
 }
 
 test "sseReasoningSummaryFrame emits reasoning summary payload with optional fields" {

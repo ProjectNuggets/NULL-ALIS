@@ -1006,8 +1006,21 @@ pub const Agent = struct {
         parsed_calls: []const ParsedToolCall,
         results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
     ) !void {
-        for (parsed_calls) |call| {
-            const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
+        for (parsed_calls, 0..) |call, i| {
+            var tool_use_id_buf: [96]u8 = undefined;
+            const tool_use_id = toolUseIdForCall(call, i, &tool_use_id_buf);
+            const command = toolCommandFromCall(call);
+            const file_hint = toolFileFromCall(call);
+            var files_buf: [1][]const u8 = undefined;
+            const files = filesFromHint(file_hint, &files_buf);
+            const tool_start_event = ObserverEvent{ .tool_call_start = .{
+                .tool = call.name,
+                .tool_use_id = tool_use_id,
+                .input_preview = call.arguments_json,
+                .command = command,
+                .files = files,
+                .activity_label = toolActivityLabel(call.name),
+            } };
             self.observer.recordEvent(&tool_start_event);
 
             hooks_mod.runHooks(self.allocator, self.hooks, .tool_start, .{
@@ -1024,6 +1037,12 @@ pub const Agent = struct {
                 .tool = call.name,
                 .duration_ms = tool_duration,
                 .success = result.success,
+                .tool_use_id = tool_use_id,
+                .output_preview = result.output,
+                .output_truncated = result.output.len > 256,
+                .result_summary = if (result.success) "completed" else "failed",
+                .command = command,
+                .files = files,
             } };
             self.observer.recordEvent(&tool_event);
 
@@ -1036,6 +1055,87 @@ pub const Agent = struct {
 
             try results_buf.append(self.allocator, result);
         }
+    }
+
+    fn toolUseIdForCall(call: ParsedToolCall, index: usize, buf: *[96]u8) ?[]const u8 {
+        if (call.tool_call_id) |id| return id;
+        return std.fmt.bufPrint(buf, "local-{d}-{s}", .{ index, call.name }) catch null;
+    }
+
+    fn toolActivityLabel(tool_name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, tool_name, "bash") or std.mem.eql(u8, tool_name, "shell")) return "Running command";
+        if (std.mem.eql(u8, tool_name, "powershell")) return "Running PowerShell command";
+        if (std.mem.eql(u8, tool_name, "file_read") or std.mem.eql(u8, tool_name, "read")) return "Reading file";
+        if (std.mem.eql(u8, tool_name, "file_write") or std.mem.eql(u8, tool_name, "write_file")) return "Writing file";
+        if (std.mem.eql(u8, tool_name, "file_edit") or std.mem.eql(u8, tool_name, "edit")) return "Editing file";
+        if (std.mem.eql(u8, tool_name, "grep") or std.mem.eql(u8, tool_name, "search")) return "Searching files";
+        if (std.mem.eql(u8, tool_name, "glob") or std.mem.eql(u8, tool_name, "list")) return "Listing files";
+        return null;
+    }
+
+    fn toolCommandFromCall(call: ParsedToolCall) ?[]const u8 {
+        if (std.mem.eql(u8, call.name, "bash") or std.mem.eql(u8, call.name, "shell") or std.mem.eql(u8, call.name, "powershell")) {
+            return extractJsonStringField(call.arguments_json, "command");
+        }
+        return null;
+    }
+
+    fn toolFileFromCall(call: ParsedToolCall) ?[]const u8 {
+        if (extractJsonStringField(call.arguments_json, "file_path")) |file_path| return file_path;
+        if (extractJsonStringField(call.arguments_json, "path")) |path| return path;
+        if (extractJsonStringField(call.arguments_json, "filename")) |filename| return filename;
+        return null;
+    }
+
+    fn filesFromHint(file_hint: ?[]const u8, files_buf: *[1][]const u8) ?[]const []const u8 {
+        if (file_hint) |file| {
+            files_buf[0] = file;
+            return files_buf[0..1];
+        }
+        return null;
+    }
+
+    fn skipJsonWhitespace(json: []const u8, start: usize) usize {
+        var i = start;
+        while (i < json.len and (json[i] == ' ' or json[i] == '\n' or json[i] == '\r' or json[i] == '\t')) : (i += 1) {}
+        return i;
+    }
+
+    fn extractJsonStringField(json: []const u8, key: []const u8) ?[]const u8 {
+        var search_from: usize = 0;
+        while (std.mem.indexOfPos(u8, json, search_from, key)) |key_start| {
+            const key_end = key_start + key.len;
+            if (key_start == 0 or key_end >= json.len or json[key_start - 1] != '"' or json[key_end] != '"') {
+                search_from = key_end;
+                continue;
+            }
+            var i = skipJsonWhitespace(json, key_end + 1);
+            if (i >= json.len or json[i] != ':') {
+                search_from = key_end;
+                continue;
+            }
+            i = skipJsonWhitespace(json, i + 1);
+            if (i >= json.len or json[i] != '"') {
+                search_from = key_end;
+                continue;
+            }
+            const value_start = i + 1;
+            i = value_start;
+            var escaped = false;
+            while (i < json.len) : (i += 1) {
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (json[i] == '\\') {
+                    escaped = true;
+                    continue;
+                }
+                if (json[i] == '"') return json[value_start..i];
+            }
+            return null;
+        }
+        return null;
     }
 
     fn executeToolCallsParallel(
@@ -1081,7 +1181,20 @@ pub const Agent = struct {
         var force_serial_tail = false;
 
         for (parsed_calls, 0..) |call, i| {
-            const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
+            var tool_use_id_buf: [96]u8 = undefined;
+            const tool_use_id = toolUseIdForCall(call, i, &tool_use_id_buf);
+            const command = toolCommandFromCall(call);
+            const file_hint = toolFileFromCall(call);
+            var files_buf: [1][]const u8 = undefined;
+            const files = filesFromHint(file_hint, &files_buf);
+            const tool_start_event = ObserverEvent{ .tool_call_start = .{
+                .tool = call.name,
+                .tool_use_id = tool_use_id,
+                .input_preview = call.arguments_json,
+                .command = command,
+                .files = files,
+                .activity_label = toolActivityLabel(call.name),
+            } };
             self.observer.recordEvent(&tool_start_event);
 
             switch (self.preflightToolPolicy(call)) {
@@ -1130,10 +1243,22 @@ pub const Agent = struct {
 
         for (parsed_calls, 0..) |call, i| {
             const result = ordered_results[i];
+            var tool_use_id_buf: [96]u8 = undefined;
+            const tool_use_id = toolUseIdForCall(call, i, &tool_use_id_buf);
+            const command = toolCommandFromCall(call);
+            const file_hint = toolFileFromCall(call);
+            var files_buf: [1][]const u8 = undefined;
+            const files = filesFromHint(file_hint, &files_buf);
             const tool_event = ObserverEvent{ .tool_call = .{
                 .tool = call.name,
                 .duration_ms = ordered_durations[i],
                 .success = result.success,
+                .tool_use_id = tool_use_id,
+                .output_preview = result.output,
+                .output_truncated = result.output.len > 256,
+                .result_summary = if (result.success) "completed" else "failed",
+                .command = command,
+                .files = files,
             } };
             self.observer.recordEvent(&tool_event);
             try results_buf.append(self.allocator, result);

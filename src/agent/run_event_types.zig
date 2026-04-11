@@ -51,17 +51,34 @@ pub const ProgressPayload = struct {
     tool: ?[]const u8 = null,
     iteration: ?u32 = null,
     duration_ms: ?u64 = null,
+    tool_use_id: ?[]const u8 = null,
+    task_id: ?[]const u8 = null,
+    group_id: ?[]const u8 = null,
+    heartbeat: bool = false,
+    command: ?[]const u8 = null,
+    files: ?[]const []const u8 = null,
 };
 
 pub const ToolStartPayload = struct {
     tool: []const u8,
+    tool_use_id: ?[]const u8 = null,
+    input_preview: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    files: ?[]const []const u8 = null,
+    activity_label: ?[]const u8 = null,
 };
 
 pub const ToolResultPayload = struct {
     tool: []const u8,
     success: bool,
     duration_ms: u64,
+    tool_use_id: ?[]const u8 = null,
     output_preview: ?[]const u8 = null,
+    output_truncated: bool = false,
+    result_summary: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    files: ?[]const []const u8 = null,
+    exit_code: ?i32 = null,
 };
 
 pub const ApprovalRequiredPayload = struct {
@@ -158,12 +175,26 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             if (p.duration_ms) |dur| {
                 try w.print(",\"duration_ms\":{d}", .{dur});
             }
+            try writeOptionalStringField(w, "tool_use_id", p.tool_use_id);
+            try writeOptionalStringField(w, "task_id", p.task_id);
+            try writeOptionalStringField(w, "group_id", p.group_id);
+            if (p.heartbeat) {
+                try w.writeAll(",\"heartbeat\":true");
+            }
+            try writeOptionalStringField(w, "command", p.command);
+            try writeOptionalStringArrayField(w, "files", p.files);
             try w.writeAll("}");
         },
         .tool_start => |p| {
             try w.writeAll("{\"type\":\"tool_start\",\"tool\":\"");
             try jsonEscapeInto(w, p.tool);
-            try w.writeAll("\"}");
+            try w.writeAll("\"");
+            try writeOptionalStringField(w, "tool_use_id", p.tool_use_id);
+            try writeOptionalStringField(w, "input_preview", p.input_preview);
+            try writeOptionalStringField(w, "command", p.command);
+            try writeOptionalStringArrayField(w, "files", p.files);
+            try writeOptionalStringField(w, "activity_label", p.activity_label);
+            try w.writeAll("}");
         },
         .tool_result => |p| {
             try w.writeAll("{\"type\":\"tool_result\",\"tool\":\"");
@@ -172,11 +203,21 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
                 if (p.success) "true" else "false",
                 p.duration_ms,
             });
+            try writeOptionalStringField(w, "tool_use_id", p.tool_use_id);
             if (p.output_preview) |preview| {
                 const truncated = if (preview.len > MAX_PREVIEW_LEN) preview[0..MAX_PREVIEW_LEN] else preview;
                 try w.writeAll(",\"output_preview\":\"");
                 try jsonEscapeInto(w, truncated);
                 try w.writeAll("\"");
+                if (p.output_truncated or preview.len > MAX_PREVIEW_LEN) {
+                    try w.writeAll(",\"output_truncated\":true");
+                }
+            }
+            try writeOptionalStringField(w, "result_summary", p.result_summary);
+            try writeOptionalStringField(w, "command", p.command);
+            try writeOptionalStringArrayField(w, "files", p.files);
+            if (p.exit_code) |code| {
+                try w.print(",\"exit_code\":{d}", .{code});
             }
             try w.writeAll("}");
         },
@@ -252,6 +293,31 @@ fn jsonEscapeInto(writer: anytype, input: []const u8) !void {
     }
 }
 
+fn writeOptionalStringField(writer: anytype, field_name: []const u8, value: ?[]const u8) !void {
+    if (value) |text| {
+        try writer.writeAll(",\"");
+        try writer.writeAll(field_name);
+        try writer.writeAll("\":\"");
+        try jsonEscapeInto(writer, text);
+        try writer.writeAll("\"");
+    }
+}
+
+fn writeOptionalStringArrayField(writer: anytype, field_name: []const u8, value: ?[]const []const u8) !void {
+    if (value) |items| {
+        try writer.writeAll(",\"");
+        try writer.writeAll(field_name);
+        try writer.writeAll("\":[");
+        for (items, 0..) |item, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("\"");
+            try jsonEscapeInto(writer, item);
+            try writer.writeAll("\"");
+        }
+        try writer.writeAll("]");
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 test "RunEventType has exactly 8 variants" {
@@ -291,6 +357,25 @@ test "RunEvent.tool_start payload contains tool name" {
     try std.testing.expectEqualStrings("bash", event.tool_start.tool);
 }
 
+test "toSseFrame for tool_start includes safe action metadata" {
+    const allocator = std.testing.allocator;
+    const files = [_][]const u8{"src/main.zig"};
+    const frame = try toSseFrame(allocator, RunEvent{ .tool_start = .{
+        .tool = "bash",
+        .tool_use_id = "call_1",
+        .input_preview = "{\"command\":\"zig build test\"}",
+        .command = "zig build test",
+        .files = files[0..],
+        .activity_label = "Running command",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: tool_start\n"));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_use_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"command\":\"zig build test\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"files\":[\"src/main.zig\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"activity_label\":\"Running command\"") != null);
+}
+
 test "RunEvent.tool_result payload has tool, success, duration_ms" {
     const event = RunEvent{ .tool_result = .{
         .tool = "file_read",
@@ -300,6 +385,28 @@ test "RunEvent.tool_result payload has tool, success, duration_ms" {
     try std.testing.expectEqualStrings("file_read", event.tool_result.tool);
     try std.testing.expect(event.tool_result.success);
     try std.testing.expectEqual(@as(u64, 42), event.tool_result.duration_ms);
+}
+
+test "toSseFrame for tool_result includes matching action evidence" {
+    const allocator = std.testing.allocator;
+    const files = [_][]const u8{"src/main.zig"};
+    const frame = try toSseFrame(allocator, RunEvent{ .tool_result = .{
+        .tool = "bash",
+        .success = true,
+        .duration_ms = 42,
+        .tool_use_id = "call_1",
+        .output_preview = "$ zig build test\nok",
+        .result_summary = "completed",
+        .command = "zig build test",
+        .files = files[0..],
+        .exit_code = 0,
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: tool_result\n"));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_use_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"output_preview\":\"$ zig build test\\nok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"result_summary\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"exit_code\":0") != null);
 }
 
 test "RunEvent.task_update payload has task_id, status, description" {
@@ -347,6 +454,24 @@ test "toSseFrame for progress matches gateway format" {
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool\":\"bash\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"iteration\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"duration_ms\":150") != null);
+}
+
+test "toSseFrame for progress includes heartbeat and group metadata" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .progress = .{
+        .phase = "thinking",
+        .state = "update",
+        .label = "Still working on the reply",
+        .tool_use_id = "call_1",
+        .task_id = "task_1",
+        .group_id = "group_1",
+        .heartbeat = true,
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_use_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"task_id\":\"task_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"group_id\":\"group_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"heartbeat\":true") != null);
 }
 
 test "toSseFrame for done event" {

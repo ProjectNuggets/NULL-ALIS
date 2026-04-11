@@ -122,11 +122,25 @@ pub const RunEventObserver = struct {
 
         // Translate applicable events to RunEvent SSE frames
         const run_event: ?RunEvent = switch (event.*) {
-            .tool_call_start => |e| RunEvent{ .tool_start = .{ .tool = e.tool } },
+            .tool_call_start => |e| RunEvent{ .tool_start = .{
+                .tool = e.tool,
+                .tool_use_id = e.tool_use_id,
+                .input_preview = e.input_preview,
+                .command = e.command,
+                .files = e.files,
+                .activity_label = e.activity_label,
+            } },
             .tool_call => |e| RunEvent{ .tool_result = .{
                 .tool = e.tool,
                 .success = e.success,
                 .duration_ms = e.duration_ms,
+                .tool_use_id = e.tool_use_id,
+                .output_preview = e.output_preview,
+                .output_truncated = e.output_truncated,
+                .result_summary = e.result_summary,
+                .command = e.command,
+                .files = e.files,
+                .exit_code = e.exit_code,
             } },
             .turn_stage => |e| RunEvent{ .progress = .{
                 .phase = e.stage,
@@ -134,6 +148,12 @@ pub const RunEventObserver = struct {
                 .label = stageLabel(e.stage),
                 .iteration = e.iteration,
                 .duration_ms = e.duration_ms,
+                .tool_use_id = e.tool_use_id,
+                .task_id = e.task_id,
+                .group_id = e.group_id,
+                .heartbeat = e.heartbeat,
+                .command = e.command,
+                .files = e.files,
             } },
             .narration_frame => |e| RunEvent{ .progress = .{
                 .phase = @tagName(e.frame_type),
