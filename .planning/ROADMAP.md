@@ -51,11 +51,16 @@ Plans:
 - [x] 02.1-04-PLAN.md — Wire commands + endpoints: /health, /security-review, /voice slash commands, gateway API endpoints
 
 ### Phase 3: Canonical Session and Context Runtime
-- [ ] 03-01: Session identity refactor (src/session/)
-- [ ] 03-02: Session controls (resume, compact, reset, export)
-- [ ] 03-03: Context engine contract (src/agent/context_engine.zig)
-- [ ] 03-04: Context report
-- [ ] 03-05: Transcript hygiene and provenance
+**Goal:** Canonical session identity with typed lane routing, session lifecycle controls (resume/reset), context engine with explicit 4-phase lifecycle, and transcript hygiene with provenance tagging
+**Requirements:** [REQ-007, REQ-008, REQ-009, REQ-017]
+**Depends on:** Phase 2
+**Plans:** 4 plans
+
+Plans:
+- [ ] 03-01-PLAN.md — Session identity: SessionIdentity struct, SessionLane enum, parseSessionKey/formatSessionKey, session module barrel
+- [ ] 03-02-PLAN.md — Session controls: /reset and /resume commands, per-user session limit, listUserSessions
+- [ ] 03-03-PLAN.md — Context engine: ContextEngine with ingest/assemble/compact/afterTurn lifecycle, TurnContextResult
+- [ ] 03-04-PLAN.md — Transcript hygiene: ProvenanceTag, stripInternalMarkers, sanitizeForExport, clean export formatting
 
 ### Phase 4: Operator Parity and Platform Capability Graph
 - [ ] 04-01: Operator workflows (/review, /security-review, /tasks, /permissions)
