@@ -70,10 +70,10 @@
 **Goal:** Multi-session identity, session controls, context engine, transcript provenance
 **Requirements:** REQ-007, REQ-008, REQ-009, REQ-017
 **Depends on:** Phase 02.1
-- [ ] 03-01: Session identity refactor — thread:{uuid} replaces :main, session metadata
-- [ ] 03-02: Session controls — resume, compact, reset, export
-- [ ] 03-03: Context engine contract (src/agent/context_engine.zig)
-- [ ] 03-04: Context report — user-visible context transparency
+- [x] 03-01: Session identity refactor — thread:{uuid} replaces :main, session metadata
+- [x] 03-02: Session controls — resume, compact, reset, export
+- [x] 03-03: Context engine contract (src/agent/context_engine.zig)
+- [x] 03-04: Context report — user-visible context transparency
 - [ ] 03-05: Transcript hygiene and provenance tagging
 - [ ] 03-06: **UI activation** — multi-thread sidebar, session controls, context panels
 
