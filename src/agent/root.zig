@@ -984,6 +984,7 @@ pub const Agent = struct {
         // Execution mode gate: block tools not allowed in current mode
         if (self.execution_mode != .execute) {
             // TODO(phase-4+): wire comptime tool registry here instead of empty slice
+            // CR IN-03: known limitation — all non-hardcoded tools use conservative fallback in plan/review mode
             const meta = tool_metadata.lookupMetadata(call.name, &.{}) orelse
                 tool_metadata.ToolMetadata.conservative(call.name);
             if (!self.execution_mode.allowsTool(meta)) {

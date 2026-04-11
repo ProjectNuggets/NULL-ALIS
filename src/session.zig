@@ -730,41 +730,68 @@ pub const SessionManager = struct {
     }
 
     /// Evict sessions idle longer than max_idle_secs. Returns number evicted.
+    /// CR WR-03: Three-phase eviction to avoid holding manager mutex during blocking I/O.
+    /// Phase 1: collect candidates (manager mutex held, fast).
+    /// Phase 2: checkpoint each candidate (no manager mutex, may do LLM calls).
+    /// Phase 3: remove from map (manager mutex held, fast).
     pub fn evictIdle(self: *SessionManager, max_idle_secs: u64) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         const now = std.time.timestamp();
-        var evicted: usize = 0;
 
-        // Collect keys to remove (can't modify map while iterating)
-        var to_remove: std.ArrayListUnmanaged([]const u8) = .{};
-        defer to_remove.deinit(self.allocator);
+        // Phase 1: Collect candidate sessions while holding manager mutex (fast scan only).
+        var candidates: std.ArrayListUnmanaged(*Session) = .{};
+        defer candidates.deinit(self.allocator);
 
-        var it = self.sessions.iterator();
-        while (it.next()) |entry| {
-            const session = entry.value_ptr.*;
-            if (session.active_refs != 0) continue;
-            if (!session.mutex.tryLock()) continue;
-            defer session.mutex.unlock();
-            const idle_secs: u64 = @intCast(@max(0, now - session.last_active));
-            if (idle_secs > max_idle_secs or sessionIsTtlExpired(session, now)) {
-                syncSessionOriginToAgent(session);
-                if (sessionIsTtlExpired(session, now)) {
-                    session.agent.persistSessionCheckpoint("ttl_evict");
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            var it = self.sessions.iterator();
+            while (it.next()) |entry| {
+                const session = entry.value_ptr.*;
+                if (session.active_refs != 0) continue;
+                if (!session.mutex.tryLock()) continue;
+                // Check idle/TTL while holding session mutex
+                const idle_secs: u64 = @intCast(@max(0, now - session.last_active));
+                if (idle_secs > max_idle_secs or sessionIsTtlExpired(session, now)) {
+                    // Keep session mutex locked — we'll checkpoint in Phase 2
+                    candidates.append(self.allocator, session) catch {
+                        session.mutex.unlock();
+                        continue;
+                    };
                 } else {
-                    session.agent.persistSessionCheckpoint("idle_evict");
+                    session.mutex.unlock();
                 }
-                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 
-        for (to_remove.items) |key| {
-            if (self.sessions.fetchRemove(key)) |kv| {
-                const session = kv.value;
-                session.deinit(self.allocator);
-                self.allocator.destroy(session);
-                evicted += 1;
+        // Phase 2: Checkpoint each candidate (no manager mutex held — safe for blocking I/O).
+        var to_remove: std.ArrayListUnmanaged([]const u8) = .{};
+        defer to_remove.deinit(self.allocator);
+
+        for (candidates.items) |session| {
+            defer session.mutex.unlock();
+            syncSessionOriginToAgent(session);
+            if (sessionIsTtlExpired(session, now)) {
+                session.agent.persistSessionCheckpoint("ttl_evict");
+            } else {
+                session.agent.persistSessionCheckpoint("idle_evict");
+            }
+            to_remove.append(self.allocator, session.session_key) catch continue;
+        }
+
+        // Phase 3: Remove from map (manager mutex held, fast).
+        var evicted: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            for (to_remove.items) |key| {
+                if (self.sessions.fetchRemove(key)) |kv| {
+                    const session = kv.value;
+                    session.deinit(self.allocator);
+                    self.allocator.destroy(session);
+                    evicted += 1;
+                }
             }
         }
 

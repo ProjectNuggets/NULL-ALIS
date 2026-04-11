@@ -17,6 +17,7 @@ const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
 const context_report = @import("context_report.zig");
 const context_tokens = @import("context_tokens.zig");
+const execution_mode_mod = @import("execution_mode.zig"); // CR IN-02: moved from handleModeCommand body to module scope
 const max_tokens_resolver = @import("max_tokens.zig");
 const transcript = @import("transcript.zig");
 const util = @import("../util.zig");
@@ -1266,7 +1267,9 @@ fn clearSessionState(self: anytype, reason: []const u8) void {
     clearPendingExecCommand(self);
 
     if (self.session_store) |store| {
-        store.clearAutoSaved(self.memory_session_id) catch {};
+        if (self.memory_session_id) |sid| { // CR-04: guard optional before passing to clearAutoSaved
+            store.clearAutoSaved(sid) catch {};
+        }
     }
 }
 
@@ -1576,7 +1579,7 @@ fn executeRuntimeInfoSection(self: anytype, runtime_tool: Tool, section: []const
     if (!result.success) {
         return try self.allocator.dupe(u8, result.error_msg orelse "Runtime info unavailable");
     }
-    return @constCast(result.output);
+    return try self.allocator.dupe(u8, result.output); // CR-02: dupe instead of constCast for ownership safety
 }
 
 fn jsonObjectFieldString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1631,7 +1634,6 @@ fn handleThinkCommand(self: anytype, arg: []const u8) ![]const u8 {
 }
 
 fn handleModeCommand(self: anytype, arg: []const u8) ![]const u8 {
-    const execution_mode_mod = @import("execution_mode.zig");
     const trimmed = std.mem.trim(u8, arg, " \t");
     if (trimmed.len == 0) {
         return try std.fmt.allocPrint(self.allocator, "Current execution mode: {s}", .{self.execution_mode.toSlice()});
@@ -2202,6 +2204,7 @@ fn handleApproveCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     const command_to_run = pending_command;
+    const exec_id_snapshot = self.pending_exec_id; // CR-01: capture before defer clears it
     defer clearPendingExecCommand(self);
 
     if (decision == .allow_always) {
@@ -2213,7 +2216,7 @@ fn handleApproveCommand(self: anytype, arg: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(
         self.allocator,
         "Approved exec (id={d}).\n{s}",
-        .{ self.pending_exec_id, output },
+        .{ exec_id_snapshot, output },
     );
 }
 
@@ -2937,14 +2940,14 @@ fn formatConfigMutationResponse(
 
     return try std.fmt.allocPrint(
         allocator,
-        "Config {s} ({s}):\\n" ++
-            "  action: {s}\\n" ++
-            "  path: {s}\\n" ++
-            "  old: {s}\\n" ++
-            "  new: {s}\\n" ++
-            "  requires_restart: {s}\\n" ++
-            "  hot_applied: {s}\\n" ++
-            "  backup: {s}\\n",
+        "Config {s} ({s}):\n" ++
+            "  action: {s}\n" ++
+            "  path: {s}\n" ++
+            "  old: {s}\n" ++
+            "  new: {s}\n" ++
+            "  requires_restart: {s}\n" ++
+            "  hot_applied: {s}\n" ++
+            "  backup: {s}\n",
         .{
             action_name,
             mode,
