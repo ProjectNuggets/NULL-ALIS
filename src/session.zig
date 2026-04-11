@@ -34,6 +34,9 @@ const SESSION_LOCK_WAIT_STAGE = "session_lock_wait";
 const SESSION_LOCK_WAIT_WARN_MS: u64 = 50;
 const SESSION_IDLE_CONTEXT_THRESHOLD_SECS: u64 = 5 * 60;
 
+/// Maximum concurrent sessions per user (DoS mitigation T-03-04).
+const MAX_SESSIONS_PER_USER: usize = 50;
+
 const DEFAULT_QUEUE_DROP_MESSAGE = "Queue policy dropped this queued turn.";
 const QUEUE_NEWEST_DROP_MESSAGE = "Queue overflow: dropped newest queued turn.";
 const QUEUE_SUMMARIZE_DROP_MESSAGE = "Queue overflow: dropped and coalesced queued turns. Please resend your latest request.";
@@ -179,6 +182,22 @@ pub const SessionManager = struct {
         if (self.sessions.get(session_key)) |session| {
             if (retain_ref) session.active_refs += 1;
             return session;
+        }
+
+        // Per-user session count limit (DoS mitigation T-03-04)
+        const zaki_session = @import("zaki_session.zig");
+        const session_identity = @import("session/identity.zig");
+        if (zaki_session.parseUserIdFromSessionKey(session_key)) |uid| {
+            var user_count: usize = 0;
+            var key_it = self.sessions.keyIterator();
+            while (key_it.next()) |existing_key| {
+                if (session_identity.isOwnedBy(existing_key.*, uid)) {
+                    user_count += 1;
+                }
+            }
+            if (user_count >= MAX_SESSIONS_PER_USER) {
+                return error.SessionLimitExceeded;
+            }
         }
 
         // Create new session
@@ -750,6 +769,56 @@ pub const SessionManager = struct {
         }
 
         return evicted;
+    }
+
+    /// Snapshot of a session for listing/API purposes (no mutex held on return).
+    pub const SessionInfo = struct {
+        session_key: []const u8,
+        created_at: i64,
+        last_active: i64,
+        turn_count: u64,
+    };
+
+    /// Count sessions belonging to `user_id`. Thread-safe.
+    pub fn countUserSessions(self: *SessionManager, user_id: []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session_identity = @import("session/identity.zig");
+        var count: usize = 0;
+        var it = self.sessions.keyIterator();
+        while (it.next()) |key_ptr| {
+            if (session_identity.isOwnedBy(key_ptr.*, user_id)) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Return a heap-allocated slice of SessionInfo for sessions owned by
+    /// `user_id`. Caller must free with `allocator.free(result)`. Thread-safe.
+    /// Only returns sessions matching the requesting user_id (T-03-07).
+    pub fn listUserSessions(
+        self: *SessionManager,
+        allocator: std.mem.Allocator,
+        user_id: []const u8,
+    ) ![]SessionInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session_identity = @import("session/identity.zig");
+        var result: std.ArrayListUnmanaged(SessionInfo) = .empty;
+        errdefer result.deinit(allocator);
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            if (session_identity.isOwnedBy(entry.key_ptr.*, user_id)) {
+                try result.append(allocator, .{
+                    .session_key = entry.key_ptr.*,
+                    .created_at = entry.value_ptr.*.created_at,
+                    .last_active = entry.value_ptr.*.last_active,
+                    .turn_count = entry.value_ptr.*.turn_count,
+                });
+            }
+        }
+        return try result.toOwnedSlice(allocator);
     }
 };
 
@@ -2425,4 +2494,93 @@ test "session initial state includes last_consolidated" {
     try testing.expectEqual(@as(u64, 0), s.turn_count);
     try testing.expect(s.created_at > 0);
     try testing.expect(s.last_active > 0);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Per-user session limit and listing tests (T-03-04, T-03-07)
+// ---------------------------------------------------------------------------
+
+test "MAX_SESSIONS_PER_USER is 50" {
+    try testing.expectEqual(@as(usize, 50), MAX_SESSIONS_PER_USER);
+}
+
+test "SessionInfo struct has expected fields" {
+    const info = SessionManager.SessionInfo{
+        .session_key = "agent:zaki-bot:user:1:main",
+        .created_at = 1000,
+        .last_active = 2000,
+        .turn_count = 5,
+    };
+    try testing.expectEqualStrings("agent:zaki-bot:user:1:main", info.session_key);
+    try testing.expectEqual(@as(i64, 1000), info.created_at);
+    try testing.expectEqual(@as(i64, 2000), info.last_active);
+    try testing.expectEqual(@as(u64, 5), info.turn_count);
+}
+
+test "countUserSessions returns 0 for empty manager" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const count = sm.countUserSessions("99");
+    try testing.expectEqual(@as(usize, 0), count);
+}
+
+test "countUserSessions counts only sessions for matching user" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("agent:zaki-bot:user:42:main");
+    _ = try sm.getOrCreate("agent:zaki-bot:user:42:thread:t1");
+    _ = try sm.getOrCreate("agent:zaki-bot:user:99:main");
+
+    try testing.expectEqual(@as(usize, 2), sm.countUserSessions("42"));
+    try testing.expectEqual(@as(usize, 1), sm.countUserSessions("99"));
+    try testing.expectEqual(@as(usize, 0), sm.countUserSessions("0"));
+}
+
+test "listUserSessions returns only sessions for requesting user" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("agent:zaki-bot:user:7:main");
+    _ = try sm.getOrCreate("agent:zaki-bot:user:7:thread:c1");
+    _ = try sm.getOrCreate("agent:zaki-bot:user:8:main");
+
+    const infos = try sm.listUserSessions(testing.allocator, "7");
+    defer testing.allocator.free(infos);
+
+    try testing.expectEqual(@as(usize, 2), infos.len);
+    // All returned keys must belong to user 7
+    for (infos) |info| {
+        try testing.expect(std.mem.startsWith(u8, info.session_key, "agent:zaki-bot:user:7:"));
+    }
+}
+
+test "getOrCreate enforces MAX_SESSIONS_PER_USER per user" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    // Create MAX_SESSIONS_PER_USER sessions for user "limit-user" using thread keys
+    var key_buf: [128]u8 = undefined;
+    var i: usize = 0;
+    while (i < MAX_SESSIONS_PER_USER) : (i += 1) {
+        const key = std.fmt.bufPrint(&key_buf, "agent:zaki-bot:user:limit-user:thread:t{d}", .{i}) catch unreachable;
+        _ = try sm.getOrCreate(key);
+    }
+
+    // The next session for the same user must fail with SessionLimitExceeded
+    const overflow_key = "agent:zaki-bot:user:limit-user:thread:overflow";
+    const result = sm.getOrCreate(overflow_key);
+    try testing.expectError(error.SessionLimitExceeded, result);
+
+    // Other users are unaffected
+    _ = try sm.getOrCreate("agent:zaki-bot:user:other-user:main");
 }

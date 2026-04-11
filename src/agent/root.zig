@@ -4408,7 +4408,9 @@ test "persistSessionCheckpoint upgrades fallback summary_latest to canonical" {
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "stale fallback continuity") == null);
 }
 
-test "slash /reset clears history and switches model" {
+test "slash /reset checkpoints and clears history" {
+    // /reset now calls handleResetCommand: checkpoint + clear + reset counters.
+    // It no longer accepts a model argument (use /model for that).
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
@@ -4418,13 +4420,11 @@ test "slash /reset clears history and switches model" {
         .content = try allocator.dupe(u8, "hello"),
     });
 
-    const response = (try agent.handleSlashCommand("/reset gpt-4o-mini")).?;
+    const response = (try agent.handleSlashCommand("/reset")).?;
     defer allocator.free(response);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "Session cleared.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "gpt-4o-mini") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Session reset") != null);
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
-    try std.testing.expectEqualStrings("gpt-4o-mini", agent.model_name);
 }
 
 test "slash /help returns help text" {

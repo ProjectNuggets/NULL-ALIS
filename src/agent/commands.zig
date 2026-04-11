@@ -1979,6 +1979,50 @@ fn handleSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
     return try self.allocator.dupe(u8, "Unknown /session command. Use: /session ttl <duration|off>");
 }
 
+fn handleResetCommand(self: anytype, arg: []const u8) ![]const u8 {
+    _ = arg; // reserved for future flags like --no-checkpoint
+    // Step 1: persist checkpoint before clearing (T-03-06: no data loss on reset)
+    persistSessionCheckpoint(self, "reset:manual");
+    // Step 2: clear history
+    self.clearHistory();
+    // Step 3: reset runtime command state
+    resetRuntimeCommandState(self);
+    // Step 4: reset token and compaction counters on Agent
+    self.total_tokens = 0;
+    self.last_turn_compacted = false;
+    return try self.allocator.dupe(u8, "Session reset. Checkpoint saved, history cleared.");
+}
+
+fn handleResumeCommand(self: anytype, arg: []const u8) ![]const u8 {
+    const session_identity = @import("../session/identity.zig");
+    const target_key = std.mem.trim(u8, firstToken(arg), " \t");
+    if (target_key.len == 0) {
+        return try self.allocator.dupe(u8, "Usage: /resume <session_key>");
+    }
+    if (target_key.len > 255) {
+        return try self.allocator.dupe(u8, "Error: session key too long (max 255 chars).");
+    }
+    // Validate ownership: target session key must belong to the current user (T-03-05)
+    const zaki_session = @import("../zaki_session.zig");
+    const current_user_id = zaki_session.parseUserIdFromSessionKey(self.memory_session_id orelse "") orelse {
+        return try self.allocator.dupe(u8, "Error: cannot determine current user for ownership check.");
+    };
+    if (!session_identity.isOwnedBy(target_key, current_user_id)) {
+        return try self.allocator.dupe(u8, "Error: session key does not belong to current user.");
+    }
+    // Validate the key parses correctly
+    _ = session_identity.parseSessionKey(target_key) catch {
+        return try self.allocator.dupe(u8, "Error: invalid session key format.");
+    };
+    // Note: Agent does not own memory_session_id (managed by SessionManager).
+    // Instruct the caller to reconnect with the target session key.
+    return try std.fmt.allocPrint(
+        self.allocator,
+        "To resume session {s}, reconnect with session_key={s} in your next API request.",
+        .{ target_key, target_key },
+    );
+}
+
 fn handleFocusCommand(self: anytype, arg: []const u8) ![]const u8 {
     const target = std.mem.trim(u8, arg, " \t");
     if (target.len == 0) {
@@ -3305,9 +3349,11 @@ fn handleDoctorCommand(self: anytype) ![]const u8 {
 pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
 
-    if (isSlashName(cmd, "new") or isSlashName(cmd, "reset")) {
-        const checkpoint_reason: []const u8 = if (isSlashName(cmd, "reset")) "reset" else "new";
-        clearSessionState(self, checkpoint_reason);
+    if (isSlashName(cmd, "reset")) return try handleResetCommand(self, cmd.arg);
+    if (isSlashName(cmd, "resume")) return try handleResumeCommand(self, cmd.arg);
+
+    if (isSlashName(cmd, "new")) {
+        clearSessionState(self, "new");
         if (cmd.arg.len > 0) {
             try setModelName(self, cmd.arg);
             return try std.fmt.allocPrint(self.allocator, "Session cleared. Switched to model: {s}", .{cmd.arg});
@@ -3328,7 +3374,9 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "help") or isSlashName(cmd, "commands")) {
         return try self.allocator.dupe(u8,
             \\Available commands:
-            \\  /new, /reset [model], /restart [model]
+            \\  /new [model], /restart [model]
+            \\  /reset                     — Checkpoint + clear history (fresh start)
+            \\  /resume <session_key>      — Switch to a named session (reconnect with key)
             \\  /help, /commands, /status, /runtime, /whoami, /id
             \\  /model, /models, /model <name>
             \\  /mode [plan|execute|review|background]
@@ -3875,17 +3923,17 @@ test "baseline: known command surface has expected breadth" {
     // This test validates the slash command set by checking parseSlashCommand
     // correctly parses each known command name.
     const known_commands = [_][]const u8{
-        "new",          "reset",           "restart",         "help",         "commands",
-        "status",       "runtime",         "whoami",          "id",           "model",
-        "models",       "think",           "verbose",         "reasoning",    "exec",
-        "queue",        "usage",           "tts",             "voice",        "stop",
-        "compact",      "allowlist",       "approve",         "context",      "export-session",
-        "export",       "session",         "subagents",       "agents",       "focus",
-        "unfocus",      "kill",            "steer",           "tell",         "config",
-        "capabilities", "debug",           "dock-telegram",   "dock-discord", "dock-slack",
-        "activation",   "send",            "elevated",        "bash",         "poll",
-        "skill",        "doctor",          "memory",          "learn",        "persona",
-        "health",       "security-review", "security_review",
+        "new",          "reset",           "resume",          "restart",      "help",
+        "commands",     "status",          "runtime",         "whoami",       "id",
+        "model",        "models",          "think",           "verbose",      "reasoning",
+        "exec",         "queue",           "usage",           "tts",          "voice",
+        "stop",         "compact",         "allowlist",       "approve",      "context",
+        "export-session", "export",        "session",         "subagents",    "agents",
+        "focus",        "unfocus",         "kill",            "steer",        "tell",
+        "config",       "capabilities",    "debug",           "dock-telegram","dock-discord",
+        "dock-slack",   "activation",      "send",            "elevated",     "bash",
+        "poll",         "skill",           "doctor",          "memory",       "learn",
+        "persona",      "health",          "security-review", "security_review",
     };
     for (known_commands) |name| {
         const input = std.fmt.allocPrint(std.testing.allocator, "/{s}", .{name}) catch unreachable;
