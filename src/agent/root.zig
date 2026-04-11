@@ -44,6 +44,7 @@ pub const context_builder = @import("context_builder.zig");
 pub const context_cache = @import("context_cache.zig");
 pub const context_tokens = @import("context_tokens.zig");
 pub const context_report = @import("context_report.zig");
+pub const context_engine = @import("context_engine.zig");
 pub const max_tokens_resolver = @import("max_tokens.zig");
 pub const prompt = @import("prompt.zig");
 pub const narration = @import("narration.zig");
@@ -397,6 +398,9 @@ pub const Agent = struct {
     /// True when force-compression (hard-drop, no LLM summary) was used. Distinguished
     /// from graceful LLM compaction so we can show a stronger user-facing notice.
     context_force_compressed: bool = false,
+
+    /// Per-turn context lifecycle engine — stateless between turns.
+    context_engine_state: context_engine.ContextEngine = .{},
 
     /// Compact explanation of what context was assembled on the last completed turn.
     last_turn_context: context_builder.LastTurnContext = .{},
