@@ -18,6 +18,7 @@ const config_mutator = @import("../config_mutator.zig");
 const context_report = @import("context_report.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
+const transcript = @import("transcript.zig");
 const util = @import("../util.zig");
 const channel_health = @import("../channel_health.zig");
 const security_review = @import("../security_review.zig");
@@ -1951,7 +1952,8 @@ fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
             .assistant => "assistant",
             .tool => "tool",
         };
-        try w.print("## {s}\n\n{s}\n\n", .{ role, entry.content });
+        // Use transcript hygiene for clean export (strips [Memory context], [Queue notice])
+        transcript.formatExportEntry(w, role, entry.content, null) catch {};
     }
     try w.flush();
 

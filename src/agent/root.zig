@@ -53,6 +53,7 @@ pub const learning = @import("learning.zig");
 pub const run_event_types = @import("run_event_types.zig");
 const usage_runtime_mod = @import("../usage_runtime.zig");
 pub const memory_loader = @import("memory_loader.zig");
+pub const transcript = @import("transcript.zig");
 pub const commands = @import("commands.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
@@ -3027,6 +3028,7 @@ test {
     _ = task_planner;
     _ = learning;
     _ = run_event_types;
+    _ = transcript;
 }
 
 // ── Additional agent tests ──────────────────────────────────────
