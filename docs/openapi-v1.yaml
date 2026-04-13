@@ -1280,25 +1280,41 @@ paths:
   #   - Cancel a running subagent task
   #   - Response: updated TaskRecord with status=cancelled
   #
-  # TODO [Sprint 3A]: POST /api/v1/users/{user_id}/approvals/{tool_id}
-  #   - Approve or deny a pending tool execution
-  #   - Request: { approved: bool, reason?: string }
+  # ── Phase 3.5 Session CRUD (implemented) ──────────────────────────
   #
-  # TODO [Sprint 4A]: POST /api/v1/users/{user_id}/sessions/{session_key}/compact
-  #   - Trigger manual context compaction via API
-  #   - Response: compaction result with token counts
+  # GET  /api/v1/users/{user_id}/sessions
+  #   - List sessions owned by user
+  #   - Response: { sessions: [{ session_key, created_at, last_active, turn_count }] }
   #
-  # TODO [Sprint 4A]: GET /api/v1/users/{user_id}/sessions/{session_key}/context
-  #   - Get context window status (tokens used/max, history length)
-  #   - Response: ContextSnapshot object
+  # GET  /api/v1/users/{user_id}/sessions/{session_key}
+  #   - Get session info including history length
+  #   - Response: { session_key, created_at, last_active, turn_count, history_len }
   #
-  # TODO [Sprint 4A]: POST /api/v1/users/{user_id}/sessions/{session_key}/resume
-  #   - Resume a session from warm continuity
-  #   - Response: session state with continuity info
+  # DELETE /api/v1/users/{user_id}/sessions/{session_key}
+  #   - Destroy a session
+  #   - Response: { status: "deleted" }
   #
-  # TODO [Sprint 4A]: POST /api/v1/users/{user_id}/sessions/{session_key}/export
-  #   - Export session transcript
-  #   - Response: structured transcript with metadata
+  # POST /api/v1/users/{user_id}/sessions/{session_key}/compact
+  #   - Trigger manual context compaction
+  #   - Response: { status: "compacted" }
+  #
+  # GET  /api/v1/users/{user_id}/sessions/{session_key}/context
+  #   - Context window status (tokens used/max, history length)
+  #   - Response: { history_len, tokens_used, max_history, token_limit }
+  #
+  # GET|POST /api/v1/users/{user_id}/sessions/{session_key}/export
+  #   - Export session transcript as JSON
+  #   - Response: { session_key, messages: [{ role, content }] }
+  #
+  # GET  /api/v1/users/{user_id}/sessions/{session_key}/history
+  #   - Alias for export (BFF compatibility)
+  #
+  # POST /api/v1/users/{user_id}/sessions/{session_key}/approve
+  #   - Approve or deny a pending exec command
+  #   - Request: { approved: bool }
+  #   - Response: { status: "approved"|"denied", message: "..." }
+  #
+  # ── Remaining TODOs ────────────────────────────────────────────────
   #
   # TODO [Sprint 4B]: GET /api/v1/users/{user_id}/usage
   #   - Get token usage and cost summary

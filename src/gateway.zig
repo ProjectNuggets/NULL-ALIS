@@ -8643,8 +8643,6 @@ fn handleApiChatStreamSseConnection(
     const status_frame: []const u8 = if (status_owned) |frame| frame else status_fallback;
     sse_stream.sendFrame(status_frame) catch return true;
 
-    var progress_observer_impl = SseProgressObserver(@TypeOf(sse_stream)).init(req_allocator, &sse_stream);
-    const progress_observer = progress_observer_impl.observer();
     var keepalive = SseKeepalive(@TypeOf(sse_stream)).init(&sse_stream);
     const keepalive_thread: ?std.Thread = std.Thread.spawn(.{}, SseKeepalive(@TypeOf(sse_stream)).run, .{&keepalive}) catch null;
     var keepalive_joined = false;
@@ -8686,6 +8684,13 @@ fn handleApiChatStreamSseConnection(
     if (is_live and pacing_delay > 0) {
         live_ctx.paced_sink = &paced_sink;
     }
+    var noop_progress_observer = observability.NoopObserver{};
+    var run_event_observer_impl = gateway_run_events.RunEventObserver{
+        .inner = noop_progress_observer.observer(),
+        .sink = live_ctx.frameSink(),
+        .allocator = req_allocator,
+    };
+    const progress_observer = run_event_observer_impl.observer();
 
     const ReplyOutcome = union(enum) {
         ok: []const u8,
@@ -8920,6 +8925,336 @@ fn telegramApiCall(
         .max_response_bytes = 1024 * 1024,
     });
     return response.body;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Session CRUD Handlers (Phase 3.5 — Activation)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn handleSessionList(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    session_mgr_opt: ?*session_mod.SessionManager,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    const mgr = session_mgr_opt orelse return .{ .body = "{\"sessions\":[]}" };
+    const sessions = mgr.listUserSessions(allocator, user_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"session_list_failed\"}" };
+    };
+    defer allocator.free(sessions);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"sessions\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    for (sessions, 0..) |info, i| {
+        if (i > 0) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.writeAll("{\"session_key\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        jsonEscapeInto(w, info.session_key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.print("\",\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d}}}", .{
+            info.created_at,
+            info.last_active,
+            info.turn_count,
+        }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    }
+    w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch "{\"sessions\":[]}" };
+}
+
+fn handleSessionAction(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    rest: []const u8,
+    session_mgr_opt: ?*session_mod.SessionManager,
+    raw_request: []const u8,
+) RouteResponse {
+    // Parse: {session_key} or {session_key}/{action}
+    // Session keys use colons not slashes, so last slash separates key from action.
+    var session_key: []const u8 = rest;
+    var action: ?[]const u8 = null;
+    if (std.mem.lastIndexOfScalar(u8, rest, '/')) |slash| {
+        const tail = rest[slash + 1 ..];
+        // Only treat as action if it's a known action keyword
+        if (isSessionAction(tail)) {
+            session_key = rest[0..slash];
+            action = tail;
+        }
+    }
+
+    if (session_key.len == 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing session_key\"}" };
+    }
+
+    // Ownership check: session must belong to this user
+    const session_identity = @import("session/identity.zig");
+    if (!session_identity.isOwnedBy(session_key, user_id)) {
+        return .{ .status = "403 Forbidden", .body = "{\"error\":\"session_not_owned\"}" };
+    }
+
+    const mgr = session_mgr_opt orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"no_session_manager\"}" };
+
+    if (action == null) {
+        // GET /sessions/{key} — session info
+        if (std.mem.eql(u8, method, "GET")) {
+            return handleSessionGet(allocator, mgr, session_key);
+        }
+        // DELETE /sessions/{key} — destroy session
+        if (std.mem.eql(u8, method, "DELETE")) {
+            return handleSessionDelete(allocator, mgr, session_key);
+        }
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+
+    const act = action.?;
+
+    if (std.mem.eql(u8, act, "compact")) {
+        if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        return handleSessionCompact(allocator, mgr, session_key);
+    }
+    if (std.mem.eql(u8, act, "context")) {
+        if (!std.mem.eql(u8, method, "GET")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        return handleSessionContext(allocator, mgr, session_key);
+    }
+    if (std.mem.eql(u8, act, "export")) {
+        if (!std.mem.eql(u8, method, "POST") and !std.mem.eql(u8, method, "GET")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        return handleSessionExport(allocator, mgr, session_key);
+    }
+    if (std.mem.eql(u8, act, "history")) {
+        if (!std.mem.eql(u8, method, "GET")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        return handleSessionHistory(allocator, mgr, session_key);
+    }
+    if (std.mem.eql(u8, act, "approve")) {
+        if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        return handleSessionApprove(allocator, mgr, session_key, raw_request);
+    }
+
+    return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_session_action\"}" };
+}
+
+fn isSessionAction(s: []const u8) bool {
+    const actions = [_][]const u8{ "compact", "context", "export", "history", "approve" };
+    for (actions) |a| {
+        if (std.mem.eql(u8, s, a)) return true;
+    }
+    return false;
+}
+
+fn handleSessionGet(
+    allocator: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+) RouteResponse {
+    mgr.mutex.lock();
+    defer mgr.mutex.unlock();
+    const session = mgr.sessions.get(session_key) orelse {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"session_key\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    jsonEscapeInto(w, session_key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.print("\",\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d},\"history_len\":{d}}}", .{
+        session.created_at,
+        session.last_active,
+        session.turn_count,
+        session.agent.historyLen(),
+    }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch "{\"error\":\"response_build_failed\"}" };
+}
+
+fn handleSessionDelete(
+    _: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+) RouteResponse {
+    mgr.mutex.lock();
+    defer mgr.mutex.unlock();
+    const kv = mgr.sessions.fetchRemove(session_key) orelse {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    };
+    const session = kv.value;
+    session.deinit(mgr.allocator);
+    mgr.allocator.destroy(session);
+    return .{ .body = "{\"status\":\"deleted\"}" };
+}
+
+fn handleSessionCompact(
+    allocator: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+) RouteResponse {
+    // Phase 1: Lookup under manager mutex (fast)
+    mgr.mutex.lock();
+    const session = mgr.sessions.get(session_key) orelse {
+        mgr.mutex.unlock();
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    };
+    mgr.mutex.unlock();
+    // Phase 2: Lock session, run real compaction (may call LLM for summary)
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    const compacted = session.agent.manualCompactHistory() catch {
+        // Compaction failed (e.g. provider unavailable) — checkpoint instead
+        session.agent.persistSessionCheckpoint("api_compact_fallback");
+        return .{ .body = "{\"status\":\"checkpoint_only\",\"compacted\":false}" };
+    };
+    if (compacted) {
+        session.agent.persistSessionCheckpoint("api_compact");
+    }
+    _ = allocator;
+    return .{ .body = if (compacted) "{\"status\":\"compacted\",\"compacted\":true}" else "{\"status\":\"no_change\",\"compacted\":false}" };
+}
+
+fn handleSessionContext(
+    allocator: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+) RouteResponse {
+    mgr.mutex.lock();
+    const session = mgr.sessions.get(session_key) orelse {
+        mgr.mutex.unlock();
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    };
+    // Hold session mutex while reading agent state to prevent races with active turns
+    session.mutex.lock();
+    mgr.mutex.unlock();
+    defer session.mutex.unlock();
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    const agent = &session.agent;
+    w.print("{{\"history_len\":{d},\"tokens_used\":{d},\"max_history\":{d},\"token_limit\":{d}}}", .{
+        agent.historyLen(),
+        agent.tokensUsed(),
+        agent.max_history_messages,
+        agent.token_limit,
+    }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch "{\"error\":\"response_build_failed\"}" };
+}
+
+fn handleSessionExport(
+    allocator: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+) RouteResponse {
+    mgr.mutex.lock();
+    const session = mgr.sessions.get(session_key) orelse {
+        mgr.mutex.unlock();
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    };
+    // Hold session mutex while reading history to prevent races with active turns
+    session.mutex.lock();
+    mgr.mutex.unlock();
+    defer session.mutex.unlock();
+
+    const history = session.agent.getHistory(allocator) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"history_read_failed\"}" };
+    };
+    defer allocator.free(history);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"session_key\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    jsonEscapeInto(w, session_key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll("\",\"messages\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    for (history, 0..) |entry, i| {
+        if (i > 0) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.writeAll("{\"role\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.writeAll(entry.role) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.writeAll("\",\"content\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        jsonEscapeInto(w, entry.content) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    }
+    w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch "{\"error\":\"response_build_failed\"}" };
+}
+
+fn handleSessionHistory(
+    allocator: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+) RouteResponse {
+    // Returns messages array only (no session_key wrapper) — BFF compatibility.
+    mgr.mutex.lock();
+    const session = mgr.sessions.get(session_key) orelse {
+        mgr.mutex.unlock();
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    };
+    // Hold session mutex while reading history to prevent races with active turns
+    session.mutex.lock();
+    mgr.mutex.unlock();
+    defer session.mutex.unlock();
+
+    const history = session.agent.getHistory(allocator) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"history_read_failed\"}" };
+    };
+    defer allocator.free(history);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"messages\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    for (history, 0..) |entry, i| {
+        if (i > 0) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.writeAll("{\"role\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.writeAll(entry.role) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.writeAll("\",\"content\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        jsonEscapeInto(w, entry.content) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    }
+    w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch "{\"error\":\"response_build_failed\"}" };
+}
+
+fn handleSessionApprove(
+    allocator: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+    raw_request: []const u8,
+) RouteResponse {
+    const body = extractBody(raw_request) orelse return .{
+        .status = "400 Bad Request",
+        .body = "{\"error\":\"missing body\"}",
+    };
+    const approved = jsonBoolField(body, "approved") orelse return .{
+        .status = "400 Bad Request",
+        .body = "{\"error\":\"missing approved field\"}",
+    };
+
+    // Guard: session must already exist — never auto-create for approval.
+    // processMessage would call getOrCreate, which could mint a new session.
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        if (mgr.sessions.get(session_key) == null) {
+            return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+        }
+    }
+
+    // Route the decision through the existing slash command handler.
+    // This keeps approval logic in one place (commands.zig).
+    const command = if (approved) "/approve allow-once" else "/approve deny";
+    const result = mgr.processMessage(session_key, command, null) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"approval_failed\"}" };
+    };
+    defer allocator.free(result);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"status\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll(if (approved) "approved" else "denied") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll("\",\"message\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    jsonEscapeInto(w, result) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch "{\"status\":\"processed\"}" };
 }
 
 fn handleApiRoute(
@@ -10006,6 +10341,15 @@ fn handleApiRoute(
             };
         }
         return .{ .body = "{\"status\":\"disconnected\",\"channel\":\"telegram\"}" };
+    }
+
+    // ── Session CRUD endpoints (Phase 3.5) ──────────────────────────────
+    if (std.mem.eql(u8, parsed.subpath, "sessions")) {
+        return handleSessionList(req_allocator, method, scoped_user_id, session_mgr_opt);
+    }
+    if (std.mem.startsWith(u8, parsed.subpath, "sessions/")) {
+        const rest = parsed.subpath["sessions/".len..];
+        return handleSessionAction(req_allocator, method, scoped_user_id, rest, session_mgr_opt, raw_request);
     }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"not found\"}" };
@@ -17645,4 +17989,67 @@ test "baseline: IdempotencyStore deduplicates keys" {
     try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-1"));
     // Different key returns true
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-2"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Session CRUD Tests (Phase 3.5)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "isSessionAction recognises known actions" {
+    try std.testing.expect(isSessionAction("compact"));
+    try std.testing.expect(isSessionAction("context"));
+    try std.testing.expect(isSessionAction("export"));
+    try std.testing.expect(isSessionAction("history"));
+    try std.testing.expect(isSessionAction("approve"));
+    try std.testing.expect(!isSessionAction("unknown"));
+    try std.testing.expect(!isSessionAction(""));
+    try std.testing.expect(!isSessionAction("sessions"));
+}
+
+test "handleSessionList returns empty array when no session manager" {
+    const resp = handleSessionList(std.testing.allocator, "GET", "1", null);
+    try std.testing.expectEqualStrings("{\"sessions\":[]}", resp.body);
+}
+
+test "handleSessionList rejects non-GET methods" {
+    const resp = handleSessionList(std.testing.allocator, "POST", "1", null);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleSessionAction rejects empty session key" {
+    const resp = handleSessionAction(std.testing.allocator, "GET", "1", "", null, "");
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "handleSessionAction rejects cross-user session key" {
+    const resp = handleSessionAction(
+        std.testing.allocator,
+        "GET",
+        "1",
+        "agent:zaki-bot:user:999:main",
+        null,
+        "",
+    );
+    try std.testing.expectEqualStrings("403 Forbidden", resp.status);
+}
+
+test "handleSessionApprove rejects missing body" {
+    // Approval body validation doesn't need a real session — uses extractBody directly
+    const resp = handleSessionApprove(
+        std.testing.allocator,
+        undefined,
+        "agent:zaki-bot:user:1:main",
+        "POST /approve HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "handleSessionApprove rejects missing approved field" {
+    const body = "{}";
+    const req = std.fmt.comptimePrint(
+        "POST /approve HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    const resp = handleSessionApprove(std.testing.allocator, undefined, "agent:zaki-bot:user:1:main", req);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
 }

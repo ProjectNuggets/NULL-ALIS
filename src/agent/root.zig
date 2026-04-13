@@ -1009,12 +1009,13 @@ pub const Agent = struct {
     fn executeToolCallsSerial(
         self: *Agent,
         tool_allocator: std.mem.Allocator,
+        iteration: u32,
         parsed_calls: []const ParsedToolCall,
         results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
     ) !void {
         for (parsed_calls, 0..) |call, i| {
             var tool_use_id_buf: [96]u8 = undefined;
-            const tool_use_id = toolUseIdForCall(call, i, &tool_use_id_buf);
+            const tool_use_id = toolUseIdForCall(call, iteration, i, &tool_use_id_buf);
             const command = toolCommandFromCall(call);
             const file_hint = toolFileFromCall(call);
             var files_buf: [1][]const u8 = undefined;
@@ -1063,9 +1064,9 @@ pub const Agent = struct {
         }
     }
 
-    fn toolUseIdForCall(call: ParsedToolCall, index: usize, buf: *[96]u8) ?[]const u8 {
+    fn toolUseIdForCall(call: ParsedToolCall, iteration: u32, index: usize, buf: *[96]u8) ?[]const u8 {
         if (call.tool_call_id) |id| return id;
-        return std.fmt.bufPrint(buf, "local-{d}-{s}", .{ index, call.name }) catch null;
+        return std.fmt.bufPrint(buf, "local-{d}-{d}-{s}", .{ iteration, index, call.name }) catch null;
     }
 
     fn toolActivityLabel(tool_name: []const u8) ?[]const u8 {
@@ -1147,6 +1148,7 @@ pub const Agent = struct {
     fn executeToolCallsParallel(
         self: *Agent,
         tool_allocator: std.mem.Allocator,
+        iteration: u32,
         parsed_calls: []const ParsedToolCall,
         results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
     ) !void {
@@ -1188,7 +1190,7 @@ pub const Agent = struct {
 
         for (parsed_calls, 0..) |call, i| {
             var tool_use_id_buf: [96]u8 = undefined;
-            const tool_use_id = toolUseIdForCall(call, i, &tool_use_id_buf);
+            const tool_use_id = toolUseIdForCall(call, iteration, i, &tool_use_id_buf);
             const command = toolCommandFromCall(call);
             const file_hint = toolFileFromCall(call);
             var files_buf: [1][]const u8 = undefined;
@@ -1250,7 +1252,7 @@ pub const Agent = struct {
         for (parsed_calls, 0..) |call, i| {
             const result = ordered_results[i];
             var tool_use_id_buf: [96]u8 = undefined;
-            const tool_use_id = toolUseIdForCall(call, i, &tool_use_id_buf);
+            const tool_use_id = toolUseIdForCall(call, iteration, i, &tool_use_id_buf);
             const command = toolCommandFromCall(call);
             const file_hint = toolFileFromCall(call);
             var files_buf: [1][]const u8 = undefined;
@@ -2315,9 +2317,9 @@ pub const Agent = struct {
             const dispatch_start_ms = std.time.milliTimestamp();
             const used_parallel_dispatch = self.shouldParallelDispatch(parsed_calls);
             if (used_parallel_dispatch) {
-                try self.executeToolCallsParallel(arena, parsed_calls, &results_buf);
+                try self.executeToolCallsParallel(arena, iteration, parsed_calls, &results_buf);
             } else {
-                try self.executeToolCallsSerial(arena, parsed_calls, &results_buf);
+                try self.executeToolCallsSerial(arena, iteration, parsed_calls, &results_buf);
             }
             const dispatch_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - dispatch_start_ms));
             log.info("turn.stage stage=dispatch_tools iteration={d} duration_ms={d} mode={s} calls={d}", .{
@@ -2748,11 +2750,15 @@ pub const Agent = struct {
         }
     }
 
+    pub const HistoryPair = struct {
+        role: []const u8,
+        content: []const u8,
+    };
+
     /// Get history entries as role-string + content pairs (for persistence).
     /// Caller owns the returned slice but NOT the inner strings (borrows from history).
-    pub fn getHistory(self: *const Agent, allocator: std.mem.Allocator) ![]struct { role: []const u8, content: []const u8 } {
-        const Pair = struct { role: []const u8, content: []const u8 };
-        const result = try allocator.alloc(Pair, self.history.items.len);
+    pub fn getHistory(self: *const Agent, allocator: std.mem.Allocator) ![]HistoryPair {
+        const result = try allocator.alloc(HistoryPair, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
             result[i] = .{
                 .role = switch (msg.role) {

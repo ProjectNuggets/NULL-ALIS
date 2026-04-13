@@ -100,6 +100,10 @@ pub const RunEventObserver = struct {
     inner: Observer,
     sink: FrameSink,
     allocator: std.mem.Allocator,
+    last_reasoning_emit_ms: i64 = 0,
+    last_reasoning_hash: u64 = 0,
+
+    const REASONING_DEDUPE_WINDOW_MS: i64 = 450;
 
     const vtable = Observer.VTable{
         .record_event = recordEvent,
@@ -120,63 +124,145 @@ pub const RunEventObserver = struct {
         // Always forward to inner observer first
         self.inner.recordEvent(event);
 
-        // Translate applicable events to RunEvent SSE frames
-        const run_event: ?RunEvent = switch (event.*) {
-            .tool_call_start => |e| RunEvent{ .tool_start = .{
-                .tool = e.tool,
-                .tool_use_id = e.tool_use_id,
-                .input_preview = e.input_preview,
-                .command = e.command,
-                .files = e.files,
-                .activity_label = e.activity_label,
-            } },
-            .tool_call => |e| RunEvent{ .tool_result = .{
-                .tool = e.tool,
-                .success = e.success,
-                .duration_ms = e.duration_ms,
-                .tool_use_id = e.tool_use_id,
-                .output_preview = e.output_preview,
-                .output_truncated = e.output_truncated,
-                .result_summary = e.result_summary,
-                .command = e.command,
-                .files = e.files,
-                .exit_code = e.exit_code,
-            } },
-            .turn_stage => |e| RunEvent{ .progress = .{
-                .phase = e.stage,
-                .state = "update",
-                .label = stageLabel(e.stage),
-                .iteration = e.iteration,
-                .duration_ms = e.duration_ms,
-                .tool_use_id = e.tool_use_id,
-                .task_id = e.task_id,
-                .group_id = e.group_id,
-                .heartbeat = e.heartbeat,
-                .command = e.command,
-                .files = e.files,
-            } },
-            .narration_frame => |e| RunEvent{ .progress = .{
-                .phase = @tagName(e.frame_type),
-                .state = "update",
-                .label = e.message,
-                .tool = e.tool_name,
-            } },
-            .agent_end => |e| RunEvent{ .done = .{
+        // Translate applicable events to RunEvent SSE frames.
+        switch (event.*) {
+            .llm_request => {
+                self.emit(.{ .progress = .{
+                    .phase = "thinking",
+                    .state = "start",
+                    .label = "Thinking",
+                } });
+                self.emitReasoningSummary("Thinking through the request", "thinking", null, null);
+            },
+            .llm_response => |e| {
+                self.emit(.{ .progress = .{
+                    .phase = if (e.success) "compose" else "finalize",
+                    .state = if (e.success) "update" else "error",
+                    .label = if (e.success) "Model response received" else "Model request failed",
+                    .duration_ms = e.duration_ms,
+                } });
+            },
+            .tool_call_start => |e| {
+                self.emit(.{ .tool_start = .{
+                    .tool = e.tool,
+                    .tool_use_id = e.tool_use_id,
+                    .input_preview = e.input_preview,
+                    .command = e.command,
+                    .files = e.files,
+                    .activity_label = e.activity_label,
+                } });
+                var summary_buf: [196]u8 = undefined;
+                const summary = std.fmt.bufPrint(&summary_buf, "Using {s} to verify the answer", .{e.tool}) catch "Using a tool to verify the answer";
+                self.emitReasoningSummary(summary, "tool", e.tool, null);
+            },
+            .tool_call => |e| {
+                self.emit(.{ .tool_result = .{
+                    .tool = e.tool,
+                    .success = e.success,
+                    .duration_ms = e.duration_ms,
+                    .tool_use_id = e.tool_use_id,
+                    .output_preview = e.output_preview,
+                    .output_truncated = e.output_truncated,
+                    .result_summary = e.result_summary,
+                    .command = e.command,
+                    .files = e.files,
+                    .exit_code = e.exit_code,
+                } });
+            },
+            .turn_stage => |e| {
+                self.emit(.{ .progress = .{
+                    .phase = e.stage,
+                    .state = "update",
+                    .label = stageLabel(e.stage),
+                    .iteration = e.iteration,
+                    .duration_ms = e.duration_ms,
+                    .tool_use_id = e.tool_use_id,
+                    .task_id = e.task_id,
+                    .group_id = e.group_id,
+                    .heartbeat = e.heartbeat,
+                    .command = e.command,
+                    .files = e.files,
+                } });
+                if (reasoningSummaryForStage(e.stage)) |summary| {
+                    self.emitReasoningSummary(summary, reasoningPhaseForStage(e.stage), null, e.iteration);
+                }
+            },
+            .narration_frame => |e| {
+                self.emit(.{ .progress = .{
+                    .phase = @tagName(e.frame_type),
+                    .state = "update",
+                    .label = e.message,
+                    .tool = e.tool_name,
+                } });
+            },
+            .agent_end => |e| self.emit(.{ .done = .{
                 .usage_tokens = e.tokens_used,
-            } },
-            .task_update => |e| RunEvent{ .task_update = .{
+            } }),
+            .task_update => |e| self.emit(.{ .task_update = .{
                 .task_id = e.task_id,
                 .status = e.status,
                 .description = e.description,
-            } },
-            else => null,
-        };
-
-        if (run_event) |evt| {
-            const frame = toSseFrame(self.allocator, evt) catch return;
-            defer self.allocator.free(frame);
-            self.sink.write(frame);
+            } }),
+            .turn_complete => self.emit(.{ .progress = .{
+                .phase = "finalize",
+                .state = "done",
+                .label = "Response ready",
+            } }),
+            .tool_iterations_exhausted => self.emit(.{ .progress = .{
+                .phase = "finalize",
+                .state = "error",
+                .label = "Tool iteration limit reached",
+            } }),
+            else => {},
         }
+    }
+
+    fn emit(self: *RunEventObserver, evt: RunEvent) void {
+        const frame = toSseFrame(self.allocator, evt) catch return;
+        defer self.allocator.free(frame);
+        self.sink.write(frame);
+    }
+
+    fn shouldSuppressReasoningSummary(
+        self: *RunEventObserver,
+        summary: []const u8,
+        phase: ?[]const u8,
+        tool: ?[]const u8,
+        iteration: ?u32,
+    ) bool {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(summary);
+        if (phase) |phase_name| hasher.update(phase_name);
+        if (tool) |tool_name| hasher.update(tool_name);
+        if (iteration) |value| {
+            var iter_buf: [16]u8 = undefined;
+            const iter_text = std.fmt.bufPrint(&iter_buf, "{d}", .{value}) catch "";
+            hasher.update(iter_text);
+        }
+        const hash = hasher.final();
+        const now_ms = std.time.milliTimestamp();
+        if (self.last_reasoning_hash == hash and now_ms - self.last_reasoning_emit_ms < REASONING_DEDUPE_WINDOW_MS) {
+            return true;
+        }
+        self.last_reasoning_hash = hash;
+        self.last_reasoning_emit_ms = now_ms;
+        return false;
+    }
+
+    fn emitReasoningSummary(
+        self: *RunEventObserver,
+        summary: []const u8,
+        phase: ?[]const u8,
+        tool: ?[]const u8,
+        iteration: ?u32,
+    ) void {
+        if (self.shouldSuppressReasoningSummary(summary, phase, tool, iteration)) return;
+        self.emit(.{ .reasoning_summary = .{
+            .summary = summary,
+            .phase = phase,
+            .tool = tool,
+            .iteration = iteration,
+        } });
     }
 
     // ── Convenience emitters ─────────────────────────────────────────
@@ -240,6 +326,26 @@ fn stageLabel(stage: []const u8) []const u8 {
     return stage;
 }
 
+fn reasoningSummaryForStage(stage: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, stage, "turn_start")) return "Checking context and memory";
+    if (std.mem.eql(u8, stage, "memory_enrich")) return "Checking context and memory";
+    if (std.mem.eql(u8, stage, "build_provider_messages")) return "Preparing the model request";
+    if (std.mem.eql(u8, stage, "response_cache_hit")) return "Reusing a cached answer";
+    if (std.mem.eql(u8, stage, "dispatch_tools")) return "Running tools to verify the answer";
+    if (std.mem.eql(u8, stage, "tool_reflection")) return "Reviewing tool results";
+    if (std.mem.eql(u8, stage, "compose_final_reply")) return "Preparing the final answer";
+    if (std.mem.eql(u8, stage, "finalize_no_tools")) return "Finishing the response";
+    return null;
+}
+
+fn reasoningPhaseForStage(stage: []const u8) []const u8 {
+    if (std.mem.eql(u8, stage, "response_cache_hit")) return "compose";
+    if (std.mem.eql(u8, stage, "dispatch_tools")) return "tool";
+    if (std.mem.eql(u8, stage, "compose_final_reply")) return "compose";
+    if (std.mem.eql(u8, stage, "finalize_no_tools")) return "finalize";
+    return "thinking";
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 const TestFrameSink = struct {
@@ -270,6 +376,13 @@ const TestFrameSink = struct {
     fn lastFrame(self: *const TestFrameSink) ?[]const u8 {
         if (self.frames.items.len == 0) return null;
         return self.frames.items[self.frames.items.len - 1];
+    }
+
+    fn firstFrameWithPrefix(self: *const TestFrameSink, prefix: []const u8) ?[]const u8 {
+        for (self.frames.items) |frame| {
+            if (std.mem.startsWith(u8, frame, prefix)) return frame;
+        }
+        return null;
     }
 };
 
@@ -303,7 +416,7 @@ test "tool_call_start produces tool_start SSE frame" {
     const obs = reo.observer();
     const evt = ObserverEvent{ .tool_call_start = .{ .tool = "bash" } };
     obs.recordEvent(&evt);
-    const frame = test_sink.lastFrame().?;
+    const frame = test_sink.firstFrameWithPrefix("event: tool_start\n").?;
     try std.testing.expect(std.mem.startsWith(u8, frame, "event: tool_start\n"));
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool\":\"bash\"") != null);
 }
@@ -331,7 +444,7 @@ test "turn_stage produces progress SSE frame with label" {
     const obs = reo.observer();
     const evt = ObserverEvent{ .turn_stage = .{ .stage = "dispatch_tools" } };
     obs.recordEvent(&evt);
-    const frame = test_sink.lastFrame().?;
+    const frame = test_sink.firstFrameWithPrefix("event: progress\n").?;
     try std.testing.expect(std.mem.startsWith(u8, frame, "event: progress\n"));
     try std.testing.expect(std.mem.indexOf(u8, frame, "Running tools") != null);
 }

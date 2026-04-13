@@ -12,6 +12,7 @@ pub const RunEventType = enum {
     ready,
     reply_start,
     progress,
+    reasoning_summary,
     tool_start,
     tool_result,
     approval_required,
@@ -23,6 +24,7 @@ pub const RunEventType = enum {
             .ready => "ready",
             .reply_start => "reply_start",
             .progress => "progress",
+            .reasoning_summary => "reasoning_summary",
             .tool_start => "tool_start",
             .tool_result => "tool_result",
             .approval_required => "approval_required",
@@ -57,6 +59,13 @@ pub const ProgressPayload = struct {
     heartbeat: bool = false,
     command: ?[]const u8 = null,
     files: ?[]const []const u8 = null,
+};
+
+pub const ReasoningSummaryPayload = struct {
+    summary: []const u8,
+    phase: ?[]const u8 = null,
+    tool: ?[]const u8 = null,
+    iteration: ?u32 = null,
 };
 
 pub const ToolStartPayload = struct {
@@ -107,6 +116,7 @@ pub const RunEvent = union(enum) {
     ready: ReadyPayload,
     reply_start: ReplyStartPayload,
     progress: ProgressPayload,
+    reasoning_summary: ReasoningSummaryPayload,
     tool_start: ToolStartPayload,
     tool_result: ToolResultPayload,
     approval_required: ApprovalRequiredPayload,
@@ -119,6 +129,7 @@ pub fn eventType(event: RunEvent) RunEventType {
         .ready => .ready,
         .reply_start => .reply_start,
         .progress => .progress,
+        .reasoning_summary => .reasoning_summary,
         .tool_start => .tool_start,
         .tool_result => .tool_result,
         .approval_required => .approval_required,
@@ -183,6 +194,17 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             }
             try writeOptionalStringField(w, "command", p.command);
             try writeOptionalStringArrayField(w, "files", p.files);
+            try w.writeAll("}");
+        },
+        .reasoning_summary => |p| {
+            try w.writeAll("{\"type\":\"reasoning_summary\",\"summary\":\"");
+            try jsonEscapeInto(w, p.summary);
+            try w.writeAll("\"");
+            try writeOptionalStringField(w, "phase", p.phase);
+            try writeOptionalStringField(w, "tool", p.tool);
+            if (p.iteration) |iter| {
+                try w.print(",\"iteration\":{d}", .{iter});
+            }
             try w.writeAll("}");
         },
         .tool_start => |p| {
@@ -320,15 +342,16 @@ fn writeOptionalStringArrayField(writer: anytype, field_name: []const u8, value:
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-test "RunEventType has exactly 8 variants" {
+test "RunEventType has exactly 9 variants" {
     const fields = @typeInfo(RunEventType).@"enum".fields;
-    try std.testing.expectEqual(@as(usize, 8), fields.len);
+    try std.testing.expectEqual(@as(usize, 9), fields.len);
 }
 
 test "RunEventType.toSlice returns correct strings" {
     try std.testing.expectEqualStrings("ready", RunEventType.ready.toSlice());
     try std.testing.expectEqualStrings("reply_start", RunEventType.reply_start.toSlice());
     try std.testing.expectEqualStrings("progress", RunEventType.progress.toSlice());
+    try std.testing.expectEqualStrings("reasoning_summary", RunEventType.reasoning_summary.toSlice());
     try std.testing.expectEqualStrings("tool_start", RunEventType.tool_start.toSlice());
     try std.testing.expectEqualStrings("tool_result", RunEventType.tool_result.toSlice());
     try std.testing.expectEqualStrings("approval_required", RunEventType.approval_required.toSlice());
@@ -350,6 +373,22 @@ test "RunEvent.progress payload has phase, state, label" {
     try std.testing.expectEqualStrings("turn_start", event.progress.phase);
     try std.testing.expectEqualStrings("update", event.progress.state);
     try std.testing.expectEqualStrings("Gathering context", event.progress.label);
+}
+
+test "toSseFrame for reasoning_summary preserves safe narration" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .reasoning_summary = .{
+        .summary = "Checking context and memory",
+        .phase = "thinking",
+        .tool = null,
+        .iteration = 2,
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: reasoning_summary\n"));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"type\":\"reasoning_summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"summary\":\"Checking context and memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"phase\":\"thinking\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"iteration\":2") != null);
 }
 
 test "RunEvent.tool_start payload contains tool name" {
