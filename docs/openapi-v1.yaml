@@ -635,7 +635,10 @@ paths:
                 additionalProperties: true
     patch:
       tags: [user]
-      summary: Patch/replace user config JSON
+      summary: Patch/replace user config JSON (currently disabled)
+      description: >
+        Raw config writes are disabled in the current runtime. Use the
+        settings endpoint instead. Always returns 403.
       security:
         - InternalToken: []
       parameters:
@@ -648,21 +651,22 @@ paths:
               type: object
               additionalProperties: true
       responses:
-        "200":
-          description: Updated
+        "403":
+          description: Raw config writes disabled
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/StatusResponse"
-        "409":
-          description: Tenant ownership lock conflict
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OwnershipLockConflictResponse"
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: raw_config_writes_disabled
     put:
       tags: [user]
-      summary: Replace user config JSON
+      summary: Replace user config JSON (currently disabled)
+      description: >
+        Raw config writes are disabled in the current runtime. Use the
+        settings endpoint instead. Always returns 403.
       security:
         - InternalToken: []
       parameters:
@@ -675,18 +679,16 @@ paths:
               type: object
               additionalProperties: true
       responses:
-        "200":
-          description: Updated
+        "403":
+          description: Raw config writes disabled
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/StatusResponse"
-        "409":
-          description: Tenant ownership lock conflict
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OwnershipLockConflictResponse"
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: raw_config_writes_disabled
 
   /api/v1/users/{user_id}/settings:
     get:
@@ -1280,46 +1282,217 @@ paths:
   #   - Cancel a running subagent task
   #   - Response: updated TaskRecord with status=cancelled
   #
-  # ── Phase 3.5 Session CRUD (implemented) ──────────────────────────
-  #
-  # GET  /api/v1/users/{user_id}/sessions
-  #   - List sessions owned by user
-  #   - Response: { sessions: [{ session_key, created_at, last_active, turn_count }] }
-  #
-  # GET  /api/v1/users/{user_id}/sessions/{session_key}
-  #   - Get session info including history length
-  #   - Response: { session_key, created_at, last_active, turn_count, history_len }
-  #
-  # DELETE /api/v1/users/{user_id}/sessions/{session_key}
-  #   - Destroy a session
-  #   - Response: { status: "deleted" }
-  #
-  # POST /api/v1/users/{user_id}/sessions/{session_key}/compact
-  #   - Trigger manual context compaction
-  #   - Response: { status: "compacted" }
-  #
-  # GET  /api/v1/users/{user_id}/sessions/{session_key}/context
-  #   - Context window status (tokens used/max, history length)
-  #   - Response: { history_len, tokens_used, max_history, token_limit }
-  #
-  # GET|POST /api/v1/users/{user_id}/sessions/{session_key}/export
-  #   - Export session transcript as JSON
-  #   - Response: { session_key, messages: [{ role, content }] }
-  #
-  # GET  /api/v1/users/{user_id}/sessions/{session_key}/history
-  #   - Alias for export (BFF compatibility)
-  #
-  # POST /api/v1/users/{user_id}/sessions/{session_key}/approve
-  #   - Approve or deny a pending exec command
-  #   - Request: { approved: bool }
-  #   - Response: { status: "approved"|"denied", message: "..." }
-  #
   # ── Remaining TODOs ────────────────────────────────────────────────
   #
   # TODO [Sprint 4B]: GET /api/v1/users/{user_id}/usage
   #   - Get token usage and cost summary
   #   - Response: UsageSummary with per-model breakdown
   #
+
+  # ── Phase 3.5 Session CRUD (implemented) ──────────────────────────
+
+  /api/v1/users/{user_id}/sessions:
+    get:
+      summary: List sessions owned by user
+      operationId: listUserSessions
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      responses:
+        '200':
+          description: Session list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionListResponse'
+        '500':
+          description: Internal error
+
+  /api/v1/users/{user_id}/sessions/{session_key}:
+    get:
+      summary: Get session info including history length
+      operationId: getSession
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/SessionKeyPath'
+      responses:
+        '200':
+          description: Session info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionInfoResponse'
+        '403':
+          description: Session not owned by user
+        '404':
+          description: Session not found
+    delete:
+      summary: Destroy a session
+      operationId: deleteSession
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/SessionKeyPath'
+      responses:
+        '200':
+          description: Session deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: deleted
+        '403':
+          description: Session not owned by user
+        '404':
+          description: Session not found
+        '409':
+          description: Session in use (active turn or concurrent reader)
+
+  /api/v1/users/{user_id}/sessions/{session_key}/compact:
+    post:
+      summary: Trigger manual context compaction
+      operationId: compactSession
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/SessionKeyPath'
+      responses:
+        '200':
+          description: Compaction result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [compacted, no_change, checkpoint_only]
+                  compacted:
+                    type: boolean
+        '403':
+          description: Session not owned by user
+        '404':
+          description: Session not found
+
+  /api/v1/users/{user_id}/sessions/{session_key}/context:
+    get:
+      summary: Context window status (tokens used/max, history length)
+      operationId: getSessionContext
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/SessionKeyPath'
+      responses:
+        '200':
+          description: Context window snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionContextResponse'
+        '403':
+          description: Session not owned by user
+        '404':
+          description: Session not found
+
+  /api/v1/users/{user_id}/sessions/{session_key}/export:
+    get:
+      summary: Export session transcript as JSON
+      operationId: exportSession
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/SessionKeyPath'
+      responses:
+        '200':
+          description: Full transcript with session_key wrapper
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionExportResponse'
+        '403':
+          description: Session not owned by user
+        '404':
+          description: Session not found
+    post:
+      summary: Export session transcript as JSON (POST alias)
+      operationId: exportSessionPost
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/SessionKeyPath'
+      responses:
+        '200':
+          description: Full transcript with session_key wrapper
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionExportResponse'
+        '403':
+          description: Session not owned by user
+        '404':
+          description: Session not found
+
+  /api/v1/users/{user_id}/sessions/{session_key}/history:
+    get:
+      summary: Get message history (BFF compatibility, no session_key wrapper)
+      operationId: getSessionHistory
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/SessionKeyPath'
+      responses:
+        '200':
+          description: Messages array only
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionHistoryResponse'
+        '403':
+          description: Session not owned by user
+        '404':
+          description: Session not found
+
+  /api/v1/users/{user_id}/sessions/{session_key}/approve:
+    post:
+      summary: Approve or deny a pending exec command
+      operationId: approveSession
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/SessionKeyPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approved]
+              properties:
+                approved:
+                  type: boolean
+      responses:
+        '200':
+          description: Approval result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [approved, denied]
+                  message:
+                    type: string
+        '400':
+          description: Missing body or approved field
+        '403':
+          description: Session not owned by user
+        '404':
+          description: Session not found
 
 components:
   parameters:
@@ -1344,6 +1517,17 @@ components:
       schema:
         type: string
       description: Channel identity binding record id.
+    SessionKeyPath:
+      in: path
+      name: session_key
+      required: true
+      schema:
+        type: string
+      description: >
+        Canonical session key, e.g. `agent:zaki-bot:user:123:main`.
+        Keys use colons as delimiters. Pass the key as-is in the URL
+        path — the gateway matches on raw path segments without
+        URL-decoding.
 
   securitySchemes:
     InternalToken:
@@ -1357,6 +1541,85 @@ components:
       bearerFormat: opaque
 
   schemas:
+    # ── Session CRUD schemas (Phase 3.5) ────────────────────────────
+    SessionListResponse:
+      type: object
+      properties:
+        sessions:
+          type: array
+          items:
+            type: object
+            properties:
+              session_key:
+                type: string
+              created_at:
+                type: integer
+                format: int64
+                description: Unix timestamp (ms)
+              last_active:
+                type: integer
+                format: int64
+                description: Unix timestamp (ms)
+              turn_count:
+                type: integer
+                format: int64
+    SessionInfoResponse:
+      type: object
+      properties:
+        session_key:
+          type: string
+        created_at:
+          type: integer
+          format: int64
+        last_active:
+          type: integer
+          format: int64
+        turn_count:
+          type: integer
+          format: int64
+        history_len:
+          type: integer
+          format: int64
+    SessionContextResponse:
+      type: object
+      properties:
+        history_len:
+          type: integer
+          format: int64
+        tokens_used:
+          type: integer
+          format: int64
+        max_history:
+          type: integer
+          format: int64
+        token_limit:
+          type: integer
+          format: int64
+    SessionExportResponse:
+      type: object
+      properties:
+        session_key:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionMessage'
+    SessionHistoryResponse:
+      type: object
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionMessage'
+    SessionMessage:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          type: string
+
     StatusResponse:
       type: object
       properties:

@@ -2437,7 +2437,7 @@ pub fn parseQueryParam(target: []const u8, name: []const u8) ?[]const u8 {
 pub fn validateBearerToken(token: []const u8, paired_tokens: []const []const u8) bool {
     if (paired_tokens.len == 0) return true;
     for (paired_tokens) |pt| {
-        if (std.mem.eql(u8, token, pt)) return true;
+        if (constantTimeEqual(token, pt)) return true;
     }
     return false;
 }
@@ -2664,6 +2664,16 @@ fn firstConfiguredInternalServiceToken(internal_service_tokens: []const []const 
     return null;
 }
 
+/// Constant-time comparison to prevent timing side-channel attacks on token extraction.
+fn constantTimeEqual(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var result: u8 = 0;
+    for (a, b) |x, y| {
+        result |= x ^ y;
+    }
+    return result == 0;
+}
+
 fn validateInternalServiceTokenWithPolicy(
     raw: []const u8,
     internal_service_tokens: []const []const u8,
@@ -2674,7 +2684,7 @@ fn validateInternalServiceTokenWithPolicy(
     for (internal_service_tokens) |tok| {
         const expected = std.mem.trim(u8, tok, " \t\r\n");
         if (expected.len == 0) continue;
-        if (std.mem.eql(u8, expected, provided)) return true;
+        if (constantTimeEqual(expected, provided)) return true;
     }
     return false;
 }
@@ -8941,27 +8951,35 @@ fn handleSessionList(
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
     const mgr = session_mgr_opt orelse return .{ .body = "{\"sessions\":[]}" };
-    const sessions = mgr.listUserSessions(allocator, user_id) catch {
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"session_list_failed\"}" };
-    };
-    defer allocator.free(sessions);
+
+    // Build JSON while holding mgr.mutex so session_key pointers stay valid.
+    // listUserSessions returns borrowed keys that can dangle after concurrent delete.
+    const session_identity = @import("session/identity.zig");
+    mgr.mutex.lock();
+    defer mgr.mutex.unlock();
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
     w.writeAll("{\"sessions\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    for (sessions, 0..) |info, i| {
-        if (i > 0) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    var it = mgr.sessions.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        if (!session_identity.isOwnedBy(entry.key_ptr.*, user_id)) continue;
+        const session = entry.value_ptr.*;
+        if (!first) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        first = false;
         w.writeAll("{\"session_key\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        jsonEscapeInto(w, info.session_key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        jsonEscapeInto(w, entry.key_ptr.*) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
         w.print("\",\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d}}}", .{
-            info.created_at,
-            info.last_active,
-            info.turn_count,
+            session.created_at,
+            session.last_active,
+            session.turn_count,
         }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
     }
     w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch "{\"sessions\":[]}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
 fn handleSessionAction(
@@ -8987,6 +9005,17 @@ fn handleSessionAction(
 
     if (session_key.len == 0) {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing session_key\"}" };
+    }
+
+    // Input validation: cap length and reject control characters (CR/LF/null)
+    // to match chat stream path validation and prevent log injection.
+    if (session_key.len > 255) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"session_key too long\"}" };
+    }
+    for (session_key) |c| {
+        if (c < 0x20 or c == 0x7f) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid session_key\"}" };
+        }
     }
 
     // Ownership check: session must belong to this user
@@ -9048,11 +9077,16 @@ fn handleSessionGet(
     mgr: *session_mod.SessionManager,
     session_key: []const u8,
 ) RouteResponse {
+    // Lock escalation: mgr.mutex → session.mutex → release mgr.mutex
     mgr.mutex.lock();
-    defer mgr.mutex.unlock();
     const session = mgr.sessions.get(session_key) orelse {
+        mgr.mutex.unlock();
         return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
     };
+    session.mutex.lock();
+    mgr.mutex.unlock();
+    defer session.mutex.unlock();
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
@@ -9064,7 +9098,8 @@ fn handleSessionGet(
         session.turn_count,
         session.agent.historyLen(),
     }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
 fn handleSessionDelete(
@@ -9073,30 +9108,43 @@ fn handleSessionDelete(
     session_key: []const u8,
 ) RouteResponse {
     mgr.mutex.lock();
-    defer mgr.mutex.unlock();
-    const kv = mgr.sessions.fetchRemove(session_key) orelse {
+    const session = mgr.sessions.get(session_key) orelse {
+        mgr.mutex.unlock();
         return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
     };
-    const session = kv.value;
+    // Guard: refuse to delete a session with an active turn (active_refs > 0)
+    // or an active reader (session.mutex held). Prevents use-after-free.
+    if (session.active_refs > 0 or !session.mutex.tryLock()) {
+        mgr.mutex.unlock();
+        return .{ .status = "409 Conflict", .body = "{\"error\":\"session_in_use\"}" };
+    }
+    // Remove from map while holding both locks, then release mgr.mutex.
+    // Once removed, no other handler can find this session, so blocking I/O
+    // (checkpoint) won't stall other session operations.
+    _ = mgr.sessions.fetchRemove(session_key);
+    mgr.mutex.unlock();
+    // Checkpoint + cleanup with only session.mutex held (safe for blocking I/O).
+    session.agent.persistSessionCheckpoint("api_delete");
+    session.mutex.unlock();
     session.deinit(mgr.allocator);
     mgr.allocator.destroy(session);
     return .{ .body = "{\"status\":\"deleted\"}" };
 }
 
 fn handleSessionCompact(
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     mgr: *session_mod.SessionManager,
     session_key: []const u8,
 ) RouteResponse {
-    // Phase 1: Lookup under manager mutex (fast)
+    // Lock escalation: mgr.mutex → session.mutex → release mgr.mutex
+    // (prevents use-after-free if eviction runs between unlock and lock)
     mgr.mutex.lock();
     const session = mgr.sessions.get(session_key) orelse {
         mgr.mutex.unlock();
         return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
     };
-    mgr.mutex.unlock();
-    // Phase 2: Lock session, run real compaction (may call LLM for summary)
     session.mutex.lock();
+    mgr.mutex.unlock();
     defer session.mutex.unlock();
     const compacted = session.agent.manualCompactHistory() catch {
         // Compaction failed (e.g. provider unavailable) — checkpoint instead
@@ -9106,7 +9154,6 @@ fn handleSessionCompact(
     if (compacted) {
         session.agent.persistSessionCheckpoint("api_compact");
     }
-    _ = allocator;
     return .{ .body = if (compacted) "{\"status\":\"compacted\",\"compacted\":true}" else "{\"status\":\"no_change\",\"compacted\":false}" };
 }
 
@@ -9135,7 +9182,68 @@ fn handleSessionContext(
         agent.max_history_messages,
         agent.token_limit,
     }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+}
+
+/// Max messages serialized per export/history request to prevent OOM from huge sessions.
+const SESSION_EXPORT_MAX_MESSAGES: usize = 10_000;
+
+/// Shared helper: serialize history pairs as a JSON array of {role, content} objects.
+/// Caps output at SESSION_EXPORT_MAX_MESSAGES to prevent unbounded memory growth.
+fn writeHistoryMessagesJson(w: anytype, history: []const @import("agent/root.zig").Agent.HistoryPair) !void {
+    const capped = if (history.len > SESSION_EXPORT_MAX_MESSAGES) history[0..SESSION_EXPORT_MAX_MESSAGES] else history;
+    for (capped, 0..) |entry, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.writeAll("{\"role\":\"");
+        try w.writeAll(entry.role);
+        try w.writeAll("\",\"content\":\"");
+        try jsonEscapeInto(w, entry.content);
+        try w.writeAll("\"}");
+    }
+    if (history.len > SESSION_EXPORT_MAX_MESSAGES) {
+        try w.writeAll(",{\"role\":\"system\",\"content\":\"[truncated — ");
+        var trunc_buf: [64]u8 = undefined;
+        const trunc_msg = std.fmt.bufPrint(&trunc_buf, "{d} of {d} messages shown]\"}}",
+            .{ SESSION_EXPORT_MAX_MESSAGES, history.len }) catch "export truncated]\"}";
+        try w.writeAll(trunc_msg);
+    }
+}
+
+/// Serialize session history messages to a JSON array string while holding
+/// session.mutex. getHistory() returns borrowed content pointers that are
+/// only valid while the lock is held — we MUST serialize before releasing.
+fn buildSessionMessagesJson(
+    allocator: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+) struct { json: ?[]u8, err: ?RouteResponse } {
+    mgr.mutex.lock();
+    const session = mgr.sessions.get(session_key) orelse {
+        mgr.mutex.unlock();
+        return .{ .json = null, .err = .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" } };
+    };
+    session.mutex.lock();
+    mgr.mutex.unlock();
+    defer session.mutex.unlock();
+
+    const history = session.agent.getHistory(allocator) catch {
+        return .{ .json = null, .err = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"history_read_failed\"}" } };
+    };
+    defer allocator.free(history);
+
+    // Serialize while session.mutex is held — content pointers are valid here.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    const w = buf.writer(allocator);
+    writeHistoryMessagesJson(w, history) catch {
+        buf.deinit(allocator);
+        return .{ .json = null, .err = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+    };
+    const json = buf.toOwnedSlice(allocator) catch {
+        buf.deinit(allocator);
+        return .{ .json = null, .err = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+    };
+    return .{ .json = json, .err = null };
 }
 
 fn handleSessionExport(
@@ -9143,20 +9251,10 @@ fn handleSessionExport(
     mgr: *session_mod.SessionManager,
     session_key: []const u8,
 ) RouteResponse {
-    mgr.mutex.lock();
-    const session = mgr.sessions.get(session_key) orelse {
-        mgr.mutex.unlock();
-        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
-    };
-    // Hold session mutex while reading history to prevent races with active turns
-    session.mutex.lock();
-    mgr.mutex.unlock();
-    defer session.mutex.unlock();
-
-    const history = session.agent.getHistory(allocator) catch {
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"history_read_failed\"}" };
-    };
-    defer allocator.free(history);
+    const built = buildSessionMessagesJson(allocator, mgr, session_key);
+    if (built.err) |err_resp| return err_resp;
+    const messages_json = built.json.?;
+    defer allocator.free(messages_json);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
@@ -9164,16 +9262,10 @@ fn handleSessionExport(
     w.writeAll("{\"session_key\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
     jsonEscapeInto(w, session_key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
     w.writeAll("\",\"messages\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    for (history, 0..) |entry, i| {
-        if (i > 0) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        w.writeAll("{\"role\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        w.writeAll(entry.role) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        w.writeAll("\",\"content\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        jsonEscapeInto(w, entry.content) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        w.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    }
+    w.writeAll(messages_json) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
     w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
 fn handleSessionHistory(
@@ -9182,35 +9274,19 @@ fn handleSessionHistory(
     session_key: []const u8,
 ) RouteResponse {
     // Returns messages array only (no session_key wrapper) — BFF compatibility.
-    mgr.mutex.lock();
-    const session = mgr.sessions.get(session_key) orelse {
-        mgr.mutex.unlock();
-        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
-    };
-    // Hold session mutex while reading history to prevent races with active turns
-    session.mutex.lock();
-    mgr.mutex.unlock();
-    defer session.mutex.unlock();
-
-    const history = session.agent.getHistory(allocator) catch {
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"history_read_failed\"}" };
-    };
-    defer allocator.free(history);
+    const built = buildSessionMessagesJson(allocator, mgr, session_key);
+    if (built.err) |err_resp| return err_resp;
+    const messages_json = built.json.?;
+    defer allocator.free(messages_json);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
     w.writeAll("{\"messages\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    for (history, 0..) |entry, i| {
-        if (i > 0) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        w.writeAll("{\"role\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        w.writeAll(entry.role) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        w.writeAll("\",\"content\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        jsonEscapeInto(w, entry.content) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        w.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    }
+    w.writeAll(messages_json) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
     w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
 fn handleSessionApprove(
@@ -9228,22 +9304,33 @@ fn handleSessionApprove(
         .body = "{\"error\":\"missing approved field\"}",
     };
 
-    // Guard: session must already exist — never auto-create for approval.
-    // processMessage would call getOrCreate, which could mint a new session.
-    {
-        mgr.mutex.lock();
-        defer mgr.mutex.unlock();
-        if (mgr.sessions.get(session_key) == null) {
-            return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
-        }
-    }
+    // Pin session with active_refs to prevent eviction between check and processMessage.
+    // processMessage calls getOrCreate internally, which would silently mint a new
+    // session if the original was evicted — defeating the existence guard.
+    mgr.mutex.lock();
+    const session = mgr.sessions.get(session_key) orelse {
+        mgr.mutex.unlock();
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    };
+    session.active_refs += 1; // Pin — eviction skips active_refs > 0
+    mgr.mutex.unlock();
 
     // Route the decision through the existing slash command handler.
     // This keeps approval logic in one place (commands.zig).
     const command = if (approved) "/approve allow-once" else "/approve deny";
     const result = mgr.processMessage(session_key, command, null) catch {
+        // Unpin on error path
+        mgr.mutex.lock();
+        if (session.active_refs > 0) session.active_refs -= 1;
+        mgr.mutex.unlock();
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"approval_failed\"}" };
     };
+
+    // Unpin after successful processing
+    mgr.mutex.lock();
+    if (session.active_refs > 0) session.active_refs -= 1;
+    mgr.mutex.unlock();
+
     defer allocator.free(result);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -9254,7 +9341,8 @@ fn handleSessionApprove(
     w.writeAll("\",\"message\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
     jsonEscapeInto(w, result) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
     w.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch "{\"status\":\"processed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
 fn handleApiRoute(
@@ -18034,7 +18122,10 @@ test "handleSessionAction rejects cross-user session key" {
 }
 
 test "handleSessionApprove rejects missing body" {
-    // Approval body validation doesn't need a real session — uses extractBody directly
+    // Safety: mgr is undefined because extractBody returns null (empty body after
+    // headers) before the function ever dereferences mgr. This is intentional —
+    // it tests that input validation fires before any session access. If someone
+    // reorders the function to touch mgr first, this test will correctly fail.
     const resp = handleSessionApprove(
         std.testing.allocator,
         undefined,
@@ -18045,6 +18136,8 @@ test "handleSessionApprove rejects missing body" {
 }
 
 test "handleSessionApprove rejects missing approved field" {
+    // Safety: see "rejects missing body" test — jsonBoolField returns null before
+    // mgr is dereferenced, so undefined is safe here.
     const body = "{}";
     const req = std.fmt.comptimePrint(
         "POST /approve HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}",

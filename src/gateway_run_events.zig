@@ -1,12 +1,14 @@
 //! RunEventObserver — translates ObserverEvents into RunEvent SSE frames.
 //!
 //! Wraps an inner Observer, forwarding all events. For applicable events
-//! (tool_call_start, tool_call, turn_stage, narration_frame, agent_end,
-//! task_update), constructs a RunEvent, serializes it via toSseFrame,
-//! and writes through a FrameSink.
+//! (llm_request, llm_response, tool_call_start, tool_call, turn_stage,
+//! narration_frame, agent_end, task_update, turn_complete,
+//! tool_iterations_exhausted), constructs a RunEvent, serializes it via
+//! toSseFrame, and writes through a FrameSink.
 //!
-//! Security: Only translates the specified event types. llm_request/llm_response
-//! are NOT forwarded to SSE to prevent leaking provider API details (T-02-03).
+//! Security: llm_request/llm_response are translated to safe progress events
+//! (phase/state labels only) — no provider API details are exposed (T-02-03).
+//! reasoning_summary events emit human-readable narration with dedup.
 
 const std = @import("std");
 const observability = @import("observability.zig");
@@ -31,10 +33,6 @@ pub const FrameSink = struct {
 
 /// Decorator that wraps any FrameSink with a configurable inter-chunk
 /// delay, enabling human-pacing for progressive SSE token streaming.
-/// The delay is applied at the delivery layer (not in the LLM provider
-/// callback), per D-03. Thread.sleep is bounded (T-02.1-02).
-/// Decorator that wraps any FrameSink with a configurable inter-chunk
-/// delay, enabling human-pacing for progressive SSE token streaming.
 /// Uses timestamp-based gating: only sleeps if the elapsed time since
 /// the last write is less than the configured delay, so fast tokens
 /// don't accumulate artificial latency (T-02.1-02: bounded delay).
@@ -57,8 +55,9 @@ pub const PacedFrameSink = struct {
             const now = std.time.nanoTimestamp();
             if (self.last_write_ns > 0) {
                 const elapsed = now - self.last_write_ns;
+                // Guard: clock adjustments can produce negative elapsed — skip pacing.
                 const delay_i128: i128 = @intCast(self.delay_ns);
-                if (elapsed < delay_i128) {
+                if (elapsed >= 0 and elapsed < delay_i128) {
                     const remaining: u64 = @intCast(delay_i128 - elapsed);
                     std.Thread.sleep(remaining);
                 }
@@ -151,8 +150,13 @@ pub const RunEventObserver = struct {
                     .files = e.files,
                     .activity_label = e.activity_label,
                 } });
+                // Stack buffer for summary — safe because emitReasoningSummary→emit→toSseFrame
+                // copies the string synchronously before this frame returns.
                 var summary_buf: [196]u8 = undefined;
-                const summary = std.fmt.bufPrint(&summary_buf, "Using {s} to verify the answer", .{e.tool}) catch "Using a tool to verify the answer";
+                const summary = if (e.activity_label) |label|
+                    label
+                else
+                    std.fmt.bufPrint(&summary_buf, "Using {s}", .{e.tool}) catch "Using a tool";
                 self.emitReasoningSummary(summary, "tool", e.tool, null);
             },
             .tool_call => |e| {
@@ -314,8 +318,11 @@ fn stageLabel(stage: []const u8) []const u8 {
     if (std.mem.eql(u8, stage, "memory_enrich")) return "Retrieving memory";
     if (std.mem.eql(u8, stage, "turn_compaction") or
         std.mem.eql(u8, stage, "compact_trim")) return "Trimming context";
+    if (std.mem.eql(u8, stage, "turn_auto_compaction")) return "Auto-compacting context";
     if (std.mem.eql(u8, stage, "continuity_refresh")) return "Refreshing continuity";
     if (std.mem.eql(u8, stage, "build_provider_messages")) return "Preparing request";
+    if (std.mem.eql(u8, stage, "response_cache_hit")) return "Using cached response";
+    if (std.mem.eql(u8, stage, "parse_provider_response")) return "Processing response";
     if (std.mem.eql(u8, stage, "dispatch_tools")) return "Running tools";
     if (std.mem.eql(u8, stage, "tool_reflection")) return "Reflecting on results";
     if (std.mem.eql(u8, stage, "compose_final_reply")) return "Preparing reply";
@@ -323,6 +330,8 @@ fn stageLabel(stage: []const u8) []const u8 {
     if (std.mem.eql(u8, stage, "llm_first_token")) return "Model responding";
     if (std.mem.eql(u8, stage, "llm_first_token_upper_bound")) return "Waiting for model";
     if (std.mem.eql(u8, stage, "post_reply_compaction")) return "Compacting context";
+    if (std.mem.eql(u8, stage, "tts_prepare")) return "Preparing audio";
+    if (std.mem.eql(u8, stage, "history_maintenance_after_tools")) return "Updating history";
     return stage;
 }
 
@@ -331,18 +340,21 @@ fn reasoningSummaryForStage(stage: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, stage, "memory_enrich")) return "Checking context and memory";
     if (std.mem.eql(u8, stage, "build_provider_messages")) return "Preparing the model request";
     if (std.mem.eql(u8, stage, "response_cache_hit")) return "Reusing a cached answer";
-    if (std.mem.eql(u8, stage, "dispatch_tools")) return "Running tools to verify the answer";
+    if (std.mem.eql(u8, stage, "dispatch_tools")) return "Running tools";
     if (std.mem.eql(u8, stage, "tool_reflection")) return "Reviewing tool results";
     if (std.mem.eql(u8, stage, "compose_final_reply")) return "Preparing the final answer";
     if (std.mem.eql(u8, stage, "finalize_no_tools")) return "Finishing the response";
+    if (std.mem.eql(u8, stage, "post_reply_compaction")) return "Compacting context window";
     return null;
 }
 
 fn reasoningPhaseForStage(stage: []const u8) []const u8 {
     if (std.mem.eql(u8, stage, "response_cache_hit")) return "compose";
     if (std.mem.eql(u8, stage, "dispatch_tools")) return "tool";
+    if (std.mem.eql(u8, stage, "tool_reflection")) return "tool";
     if (std.mem.eql(u8, stage, "compose_final_reply")) return "compose";
     if (std.mem.eql(u8, stage, "finalize_no_tools")) return "finalize";
+    if (std.mem.eql(u8, stage, "post_reply_compaction")) return "finalize";
     return "thinking";
 }
 
@@ -512,6 +524,25 @@ test "stageLabel returns human-readable labels" {
     try std.testing.expectEqualStrings("Running tools", stageLabel("dispatch_tools"));
     try std.testing.expectEqualStrings("Preparing reply", stageLabel("compose_final_reply"));
     try std.testing.expectEqualStrings("unknown_stage", stageLabel("unknown_stage"));
+}
+
+test "shouldSuppressReasoningSummary deduplicates identical events within window" {
+    var noop = observability.NoopObserver{};
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    var reo = RunEventObserver{ .inner = noop.observer(), .sink = test_sink.sink(), .allocator = allocator };
+
+    // First emission should pass
+    try std.testing.expect(!reo.shouldSuppressReasoningSummary("Thinking", "thinking", null, null));
+    // Identical emission within window should be suppressed
+    try std.testing.expect(reo.shouldSuppressReasoningSummary("Thinking", "thinking", null, null));
+    // Different content should pass
+    try std.testing.expect(!reo.shouldSuppressReasoningSummary("Using bash", "tool", "bash", null));
+    // Same tool content should be suppressed
+    try std.testing.expect(reo.shouldSuppressReasoningSummary("Using bash", "tool", "bash", null));
+    // Same text but different iteration should pass
+    try std.testing.expect(!reo.shouldSuppressReasoningSummary("Using bash", "tool", "bash", 2));
 }
 
 // ── PacedFrameSink Tests ────────────────────────────────────────────

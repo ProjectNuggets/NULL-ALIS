@@ -1,8 +1,9 @@
 //! Structured run-event type system for online client consumption.
 //!
-//! Defines the 8 event kinds from REQ-004 (ready, reply_start, progress,
-//! tool_start, tool_result, approval_required, task_update, done) as a
-//! tagged union with per-event payloads and an SSE frame serializer.
+//! Defines the 9 event kinds from REQ-004 (ready, reply_start, progress,
+//! reasoning_summary, tool_start, tool_result, approval_required,
+//! task_update, done) as a tagged union with per-event payloads and an
+//! SSE frame serializer.
 
 const std = @import("std");
 
