@@ -154,6 +154,9 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn deleteSecret(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
+    pub fn listSecretKeys(_: *@This(), allocator: std.mem.Allocator, _: i64) ![][]const u8 {
+        return allocator.alloc([]const u8, 0);
+    }
     pub fn replaceJobsJson(_: *@This(), _: i64, _: []const u8, _: []const u8) !void {
         return error.PostgresNotEnabled;
     }
@@ -1128,6 +1131,32 @@ const ManagerImpl = struct {
         const affected = c.PQcmdTuples(result);
         if (affected == null) return false;
         return !std.mem.eql(u8, std.mem.span(affected), "0");
+    }
+
+    pub fn listSecretKeys(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![][]const u8 {
+        const q = try self.buildQuery(
+            "SELECT key FROM {schema}.user_secrets WHERE user_id = $1 ORDER BY key ASC",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const nrows: usize = @intCast(@max(0, c.PQntuples(result)));
+        if (nrows == 0) return allocator.alloc([]const u8, 0);
+        const keys = try allocator.alloc([]u8, nrows);
+        var initialized: usize = 0;
+        errdefer {
+            for (keys[0..initialized]) |k| allocator.free(k);
+            allocator.free(keys);
+        }
+        for (0..nrows) |i| {
+            keys[i] = try dupeResultValue(allocator, result, @intCast(i), 0);
+            initialized += 1;
+        }
+        return keys;
     }
 
     pub fn replaceJobsJson(self: *Self, user_id: i64, session_id: []const u8, json: []const u8) !void {

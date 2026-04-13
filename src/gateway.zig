@@ -10011,6 +10011,35 @@ fn handleApiRoute(
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
 
+    if (std.mem.eql(u8, parsed.subpath, "secrets")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        }
+        if (state.zaki_state) |mgr| {
+            const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+            const keys = mgr.listSecretKeys(req_allocator, user_id) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"list secrets failed\"}" };
+            };
+            defer {
+                for (keys) |k| req_allocator.free(k);
+                req_allocator.free(keys);
+            }
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            defer resp.deinit(req_allocator);
+            const w = resp.writer(req_allocator);
+            w.writeAll("{\"keys\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            for (keys, 0..) |key, idx| {
+                if (idx > 0) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            }
+            w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" } };
+        }
+        return .{ .body = "{\"keys\":[]}" };
+    }
+
     if (std.mem.startsWith(u8, parsed.subpath, "secrets/")) {
         const secret_key = parsed.subpath["secrets/".len..];
         const secret_path = resolveSecretPath(req_allocator, user_ctx.secrets_dir, secret_key) catch {
