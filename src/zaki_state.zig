@@ -1166,7 +1166,7 @@ const ManagerImpl = struct {
         defer c.PQclear(result);
         const nrows: usize = @intCast(@max(0, c.PQntuples(result)));
         if (nrows == 0) return allocator.alloc([]const u8, 0);
-        const keys = try allocator.alloc([]u8, nrows);
+        const keys = try allocator.alloc([]const u8, nrows);
         var initialized: usize = 0;
         errdefer {
             for (keys[0..initialized]) |k| allocator.free(k);
