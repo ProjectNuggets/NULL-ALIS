@@ -176,7 +176,7 @@ pub const ProductPresetsConfig = struct {
             // Token-based compaction handles context quality. This cap prevents
             // HTTP timeouts from 300+ message objects in a single API call.
             // Context is preserved via compaction summaries before trim.
-            .max_history_messages = 200,
+            .max_history_messages = 500,
             .queue_mode = "serial",
             .queue_cap = 8,
             .queue_drop = "summarize",
@@ -199,7 +199,7 @@ pub const ProductPresetsConfig = struct {
     balanced: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            .max_history_messages = 200,
+            .max_history_messages = 500,
             .queue_mode = "serial",
             .queue_cap = 12,
             .queue_drop = "summarize",
@@ -221,7 +221,7 @@ pub const ProductPresetsConfig = struct {
     deep: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            .max_history_messages = 200,
+            .max_history_messages = 500,
             .queue_mode = "serial",
             .queue_cap = 20,
             .queue_drop = "summarize",
