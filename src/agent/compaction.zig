@@ -136,47 +136,24 @@ pub fn autoCompactHistory(
 
     var compacted = false;
     const estimate_before = tokenEstimate(history.items);
-    const has_system = history.items.len > 0 and history.items[0].role == .system;
-    const non_system_count = history.items.len - @as(usize, if (has_system) 1 else 0);
 
-    // ── Message count trigger ──
-    // Many short messages can stay under the token threshold but create
-    // massive API payloads (300+ JSON objects → HTTP timeout). If message
-    // count exceeds 150, force the cheap pass regardless of token percentage.
-    // This consolidates old messages via placeholder substitution, reducing
-    // the payload to the API without losing context (summaries preserve it).
-    const message_count_pressure = non_system_count > 150;
-
-    // ── Pass A: Cheap dedup + placeholder substitution at 60% OR message count pressure ──
+    // ── Pass A: Cheap dedup + placeholder substitution at 60% ──
     const cheap_threshold = (config.token_limit * 60) / 100;
-    if (estimate_before > cheap_threshold or message_count_pressure) {
+    if (estimate_before > cheap_threshold) {
         const reduced = cheapCompactionPass(allocator, history, config.keep_recent);
         if (reduced) compacted = true;
     }
 
-    // If message count is still high after cheap pass, force LLM summarization
-    // to consolidate the message objects (not just the content).
-    const still_too_many = blk: {
-        const hs = history.items.len > 0 and history.items[0].role == .system;
-        const nsc = history.items.len - @as(usize, if (hs) 1 else 0);
-        break :blk nsc > 150;
-    };
-
-    // ── Pass B: Structured extraction at 75% OR still too many messages ──
+    // ── Pass B: Structured extraction at 75% ──
     const structured_threshold = (config.token_limit * 75) / 100;
-    if (tokenEstimate(history.items) > structured_threshold or still_too_many) {
+    if (tokenEstimate(history.items) > structured_threshold) {
         const extracted = structuredExtractionPass(allocator, history, provider, model_name, config) catch false;
         if (extracted) compacted = true;
     }
 
-    // ── Pass C: Full LLM summarization at 85% OR still too many after B ──
+    // ── Pass C: Full LLM summarization at 85% ──
     const llm_threshold = (config.token_limit * 85) / 100;
-    const final_count_check = blk: {
-        const hs2 = history.items.len > 0 and history.items[0].role == .system;
-        const nsc2 = history.items.len - @as(usize, if (hs2) 1 else 0);
-        break :blk nsc2 > 150;
-    };
-    if (tokenEstimate(history.items) > llm_threshold or final_count_check) {
+    if (tokenEstimate(history.items) > llm_threshold) {
         const summarized = try compactHistoryKeepingRecent(allocator, history, provider, model_name, config, config.keep_recent);
         if (summarized) compacted = true;
     }
