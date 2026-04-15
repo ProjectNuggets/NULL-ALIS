@@ -172,10 +172,10 @@ pub const ProductPresetsConfig = struct {
     fast: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            // max_history_messages: high safety valve — token-based three-pass
-            // compression (60%/85%) is the intelligent compaction mechanism.
-            // References (Claude Code, Cursor, Devin) don't use message count caps.
-            .max_history_messages = 500,
+            // Fast mode: lower message cap to prevent large payloads to smaller models.
+            // Gemma 4 31B on Together.ai can timeout on 300+ message payloads.
+            // Token-based compaction is the primary mechanism, this is the safety cap.
+            .max_history_messages = 100,
             .queue_mode = "serial",
             .queue_cap = 8,
             .queue_drop = "summarize",

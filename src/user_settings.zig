@@ -652,7 +652,7 @@ test "applySettingsToConfig enables fast summarizer without changing fast preset
     try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
     try std.testing.expectEqual(@as(u32, 8), cfg.agent.queue_cap);
     try std.testing.expectEqualStrings("summarize", cfg.agent.queue_drop);
-    try std.testing.expectEqual(@as(u32, 500), cfg.agent.max_history_messages);
+    try std.testing.expectEqual(@as(u32, 100), cfg.agent.max_history_messages);
     try std.testing.expect(cfg.memory.summarizer.enabled);
     try std.testing.expectEqual(@as(u32, 3000), cfg.memory.summarizer.window_size_tokens);
     try std.testing.expectEqual(@as(u32, 300), cfg.memory.summarizer.summary_max_tokens);
