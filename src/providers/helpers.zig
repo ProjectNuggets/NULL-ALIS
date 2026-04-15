@@ -18,7 +18,7 @@ fn resolveApiKeyFromCfg(cfg: anytype) ?[]const u8 {
 }
 
 fn timeout_ms_from_secs(timeout_secs: u64) u32 {
-    if (timeout_secs == 0) return 30_000;
+    if (timeout_secs == 0) return 300_000; // 5 min default
     const timeout_ms = timeout_secs * 1000;
     return @intCast(@min(timeout_ms, std.math.maxInt(u32)));
 }

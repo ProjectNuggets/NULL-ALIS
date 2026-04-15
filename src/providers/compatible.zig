@@ -1162,7 +1162,7 @@ test "supportsStreaming returns true for compatible" {
 }
 
 test "compatible requestTimeoutMs honors explicit timeout" {
-    try std.testing.expectEqual(@as(u32, 30_000), requestTimeoutMs(0));
+    try std.testing.expectEqual(@as(u32, 300_000), requestTimeoutMs(0));
     try std.testing.expectEqual(@as(u32, 120_000), requestTimeoutMs(120));
 }
 
@@ -1495,7 +1495,7 @@ test "merge_system_into_user streaming body also merges" {
     try std.testing.expect(std.mem.indexOf(u8, content, "[System: Be concise]") != null);
 }
 pub fn requestTimeoutMs(timeout_secs: u64) u32 {
-    if (timeout_secs == 0) return 30_000;
+    if (timeout_secs == 0) return 300_000; // 5 min default — 30s was too short for large payloads
     return @intCast(@min(timeout_secs * 1000, std.math.maxInt(u32)));
 }
 
