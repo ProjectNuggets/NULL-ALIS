@@ -22,14 +22,14 @@ const OwnedMessage = Agent.OwnedMessage;
 pub const DEFAULT_COMPACTION_KEEP_RECENT: u32 = 20;
 
 /// Default: max characters retained in stored compaction summary.
-pub const DEFAULT_COMPACTION_MAX_SUMMARY_CHARS: u32 = 2_000;
+pub const DEFAULT_COMPACTION_MAX_SUMMARY_CHARS: u32 = 16_000;
 /// Maximum characters appended from workspace critical rules.
 const MAX_WORKSPACE_CONTEXT_CHARS: usize = 2_000;
 /// Maximum AGENTS.md bytes read for critical rules extraction.
 const MAX_AGENTS_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default: max characters in source transcript passed to the summarizer.
-pub const DEFAULT_COMPACTION_MAX_SOURCE_CHARS: u32 = 12_000;
+pub const DEFAULT_COMPACTION_MAX_SOURCE_CHARS: u32 = 80_000;
 
 /// Default token limit for context window (used by token-based compaction trigger).
 pub const DEFAULT_TOKEN_LIMIT: u64 = config_types.DEFAULT_AGENT_TOKEN_LIMIT;
@@ -110,12 +110,124 @@ pub fn tokenEstimate(history: []const OwnedMessage) u64 {
     return (total_chars + 3) / 4;
 }
 
-/// Auto-compact history when it exceeds max_history_messages or when
-/// estimated token usage exceeds the dynamic reserve-aware token threshold.
-/// For large histories (>10 messages to summarize), uses multi-part strategy:
-/// splits into halves, summarizes each independently, then merges.
-/// Returns true if compaction was performed.
+/// Auto-compact history using a multi-pass strategy:
+///
+/// Pass A (60% of context): Cheap dedup + placeholder substitution.
+///   - Replace tool results older than `keep_recent` turns with short placeholders
+///   - Deduplicate consecutive identical tool outputs
+///   - Zero LLM cost — pure string operations
+///
+/// Pass C (85% of context): Full LLM summarization.
+///   - Summarize older messages via the provider (existing logic)
+///   - For large histories (>10 messages): splits into halves, summarizes each
+///
+/// Pass B (75%, structured extraction via cheap model) is planned but requires
+/// sidecar provider infrastructure — will be wired with narration sidecar.
+///
+/// Returns true if any compaction was performed.
 pub fn autoCompactHistory(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged(OwnedMessage),
+    provider: Provider,
+    model_name: []const u8,
+    config: CompactionConfig,
+) !bool {
+    if (config.token_limit == 0) return false;
+
+    var compacted = false;
+    const estimate_before = tokenEstimate(history.items);
+
+    // ── Pass A: Cheap dedup + placeholder substitution at 60% ──
+    const cheap_threshold = (config.token_limit * 60) / 100;
+    if (estimate_before > cheap_threshold) {
+        const reduced = cheapCompactionPass(allocator, history, config.keep_recent);
+        if (reduced) compacted = true;
+    }
+
+    // ── Pass B: Structured extraction at 75% ──
+    // Extracts key decisions, files modified, current state into structured bullets.
+    // Uses the same provider (sidecar if wired, else main model).
+    const structured_threshold = (config.token_limit * 75) / 100;
+    if (tokenEstimate(history.items) > structured_threshold) {
+        const extracted = structuredExtractionPass(allocator, history, provider, model_name, config) catch false;
+        if (extracted) compacted = true;
+    }
+
+    // ── Pass C: Full LLM summarization at 85% ──
+    // Only runs if Pass A+B didn't reduce tokens enough.
+    const llm_threshold = (config.token_limit * 85) / 100;
+    if (tokenEstimate(history.items) > llm_threshold) {
+        const summarized = try compactHistoryKeepingRecent(allocator, history, provider, model_name, config, config.keep_recent);
+        if (summarized) compacted = true;
+    }
+
+    return compacted;
+}
+
+/// Pass A: Cheap compaction — no LLM calls. Pure string operations.
+///
+/// 1. Replace old tool results (outside keep_recent window) with short placeholders.
+///    Format: "[tool_result truncated — see earlier context]"
+/// 2. Deduplicate consecutive tool results with identical content.
+///
+/// Returns true if any content was reduced.
+fn cheapCompactionPass(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged(OwnedMessage),
+    keep_recent: u32,
+) bool {
+    const has_system = history.items.len > 0 and history.items[0].role == .system;
+    const start: usize = if (has_system) 1 else 0;
+    const non_system_count = history.items.len - start;
+    if (non_system_count <= keep_recent) return false;
+
+    const protect_boundary = history.items.len - @min(non_system_count, keep_recent);
+    var reduced = false;
+
+    // Phase 1: Replace old tool results with placeholders
+    const placeholder = "[tool_result truncated — see earlier context]";
+    for (history.items[start..protect_boundary]) |*msg| {
+        if (msg.role != .tool) continue;
+        // Only replace if the content is significantly longer than the placeholder
+        if (msg.content.len <= placeholder.len + 20) continue;
+
+        const new_content = allocator.dupe(u8, placeholder) catch continue;
+        allocator.free(msg.content);
+        msg.content = new_content;
+        reduced = true;
+    }
+
+    // Phase 2: Deduplicate consecutive identical tool results in older messages.
+    // If two adjacent .tool messages have the same content, replace the earlier
+    // one with a short dedup marker.
+    if (protect_boundary > start + 1) {
+        const dedup_marker = "[duplicate tool_result removed]";
+        var i: usize = start;
+        while (i + 1 < protect_boundary) : (i += 1) {
+            if (history.items[i].role != .tool or history.items[i + 1].role != .tool) continue;
+            if (!std.mem.eql(u8, history.items[i].content, history.items[i + 1].content)) continue;
+            // Replace the earlier duplicate with a short marker
+            const marker = allocator.dupe(u8, dedup_marker) catch continue;
+            allocator.free(history.items[i].content);
+            history.items[i].content = marker;
+            reduced = true;
+        }
+    }
+
+    if (reduced) {
+        log.info("compaction: cheap pass reduced old tool outputs (placeholder substitution + dedup)", .{});
+    }
+    return reduced;
+}
+
+/// Pass B: Structured extraction — uses the sidecar/provider to extract key state
+/// from older messages into a compact structured summary. Cheaper than full
+/// summarization because the input is shorter (middle messages only, ~2k tokens)
+/// and the output is structured bullets (~500 tokens).
+///
+/// Replaces middle messages (between system and keep_recent boundary) with the
+/// structured extraction. Falls back to no-op if the LLM call fails.
+fn structuredExtractionPass(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
     provider: Provider,
@@ -124,20 +236,83 @@ pub fn autoCompactHistory(
 ) !bool {
     const has_system = history.items.len > 0 and history.items[0].role == .system;
     const start: usize = if (has_system) 1 else 0;
-    _ = history.items.len - start;
+    const non_system_count = history.items.len - start;
+    const keep_recent: usize = @min(non_system_count, config.keep_recent);
+    if (non_system_count <= keep_recent + 2) return false; // not enough to extract from
 
-    // Trigger when estimated tokens exceed the usable window after reserving
-    // reply/tool/safety headroom for the current model.
-    const budget_policy = buildTokenBudgetPolicy(config.token_limit, config.max_tokens);
-    const token_threshold = budget_policy.threshold;
-    const token_trigger = config.token_limit > 0 and tokenEstimate(history.items) > token_threshold;
+    const extract_end = start + (non_system_count - keep_recent);
 
-    // Automatic compaction is reserved for true context pressure only.
-    // Session-boundary continuity is handled by explicit checkpoint paths
-    // such as /new, reset, eviction, or the durable seed writer.
-    if (!token_trigger) return false;
+    // Build a compact transcript of the middle messages for extraction
+    const transcript = try buildCompactionTranscript(allocator, history.items, start, extract_end, 8_000);
+    defer allocator.free(transcript);
+    if (transcript.len < 100) return false; // too short to bother
 
-    return compactHistoryKeepingRecent(allocator, history, provider, model_name, config, config.keep_recent);
+    const extraction_system =
+        "You are a state extraction engine. Given a conversation transcript, extract: " ++
+        "(1) Key decisions made, (2) Files or resources modified, (3) Current task status, " ++
+        "(4) Unresolved items or open questions. Output as concise bullet points only. " ++
+        "No prose, no headers. Max 15 bullets.";
+    const extraction_user = std.fmt.allocPrint(
+        allocator,
+        "Extract key state from this conversation:\n\n{s}",
+        .{transcript},
+    ) catch return false;
+    defer allocator.free(extraction_user);
+
+    var messages: [2]providers.ChatMessage = .{
+        .{ .role = .system, .content = extraction_system },
+        .{ .role = .user, .content = extraction_user },
+    };
+
+    const resp = provider.chat(
+        allocator,
+        .{
+            .messages = &messages,
+            .model = model_name,
+            .temperature = 0.2,
+            .tools = null,
+            .timeout_secs = config.message_timeout_secs,
+        },
+        model_name,
+        0.2,
+    ) catch |err| {
+        log.warn("compaction: structured extraction failed ({}) — skipping pass B", .{err});
+        return false;
+    };
+    defer {
+        if (resp.content) |c| if (c.len > 0) allocator.free(c);
+        if (resp.model.len > 0) allocator.free(resp.model);
+        if (resp.reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
+    }
+
+    const extraction = resp.contentOrEmpty();
+    if (extraction.len < 20) return false; // extraction too short, skip
+
+    // Replace the middle messages with the structured extraction
+    const extraction_content = std.fmt.allocPrint(
+        allocator,
+        "[Structured context extraction]\n{s}",
+        .{extraction},
+    ) catch return false;
+
+    for (history.items[start..extract_end]) |*msg| {
+        msg.deinit(allocator);
+    }
+    history.items[start] = .{
+        .role = .assistant,
+        .content = extraction_content,
+    };
+    if (extract_end > start + 1) {
+        const src = history.items[extract_end..];
+        std.mem.copyForwards(OwnedMessage, history.items[start + 1 ..], src);
+        history.items.len -= (extract_end - start - 1);
+    }
+
+    log.info("compaction: structured extraction replaced {d} messages with {d}-char state summary", .{
+        extract_end - start,
+        extraction_content.len,
+    });
+    return true;
 }
 
 /// Manual compaction for explicit operator boundaries.
@@ -164,7 +339,34 @@ fn compactHistoryKeepingRecent(
     const start: usize = if (has_system) 1 else 0;
     const non_system_count = history.items.len - start;
 
-    const keep_recent: usize = @min(non_system_count, requested_keep_recent);
+    var keep_recent: usize = @min(non_system_count, requested_keep_recent);
+
+    // Tool-call pair hygiene: never split a tool_call from its tool_result.
+    // If the boundary lands on a .tool message (tool result), extend keep_recent
+    // backwards to also include the preceding assistant message (tool call instruction).
+    const boundary_idx = start + (non_system_count - keep_recent);
+    if (boundary_idx < history.items.len and boundary_idx > start) {
+        if (history.items[boundary_idx].role == .tool) {
+            // The first kept message is a tool result — orphaned without its call.
+            // Include the preceding assistant message too.
+            keep_recent += 1;
+        }
+    }
+    // Also check the last compacted message: if it's an assistant with a tool_call
+    // and the next (first kept) is a .tool, the pair is already preserved above.
+    // But if the last compacted message is .tool and the one before it is .assistant,
+    // we should keep both — walk back until we hit a non-tool message.
+    {
+        var adj_boundary = start + (non_system_count - keep_recent);
+        while (adj_boundary > start and adj_boundary < history.items.len and
+            history.items[adj_boundary].role == .tool)
+        {
+            keep_recent += 1;
+            adj_boundary -= 1;
+        }
+    }
+
+    keep_recent = @min(non_system_count, keep_recent);
     const compact_count = non_system_count - keep_recent;
     if (compact_count == 0) return false;
 
@@ -443,7 +645,7 @@ fn buildCompactionTranscript(
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, ": ");
         // Truncate very long messages in transcript
-        const content = if (msg.content.len > 500) msg.content[0..500] else msg.content;
+        const content = if (msg.content.len > 2000) msg.content[0..2000] else msg.content;
         try buf.appendSlice(allocator, content);
         try buf.append(allocator, '\n');
 
@@ -502,7 +704,8 @@ fn summarizeSlice(
         const max_len = @min(transcript.len, config.max_summary_chars);
         return try allocator.dupe(u8, transcript[0..max_len]);
     };
-    // Free response's heap-allocated fields after extracting what we need
+    // Free response's heap-allocated fields after extracting what we need.
+    // Includes tool_calls for defensive completeness (W1 fix).
     defer {
         if (summary_resp.content) |c| {
             if (c.len > 0) allocator.free(c);
@@ -511,6 +714,12 @@ fn summarizeSlice(
         if (summary_resp.reasoning_content) |rc| {
             if (rc.len > 0) allocator.free(rc);
         }
+        for (summary_resp.tool_calls) |tc| {
+            if (tc.id.len > 0) allocator.free(tc.id);
+            if (tc.name.len > 0) allocator.free(tc.name);
+            if (tc.arguments.len > 0) allocator.free(tc.arguments);
+        }
+        if (summary_resp.tool_calls.len > 0) allocator.free(summary_resp.tool_calls);
     }
 
     const raw_summary = summary_resp.contentOrEmpty();
@@ -1077,4 +1286,139 @@ test "buildCompactionTranscript excludes bootstrap system prompt when start skip
 
     try std.testing.expect(std.mem.indexOf(u8, transcript, "AGENTS.md bootstrap content") == null);
     try std.testing.expect(std.mem.indexOf(u8, transcript, "USER: user-message") != null);
+}
+
+test "tool-call pair hygiene: boundary never orphans tool result" {
+    // Verify that when keep_recent boundary lands on a .tool message,
+    // the boundary extends to include the preceding assistant tool_call.
+    const allocator = std.testing.allocator;
+    var history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
+    defer {
+        for (history.items) |*msg| msg.deinit(allocator);
+        history.deinit(allocator);
+    }
+
+    // Build history: [system, user1, asst1, user2, asst2(tool_call), tool_result, user3, asst3]
+    try history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u1") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a1") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u2") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "tool_call:read_file") });
+    try history.append(allocator, .{ .role = .tool, .content = try allocator.dupe(u8, "file contents here") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u3") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a3") });
+
+    // With keep_recent=3, naive boundary would be at index 5 (the .tool message).
+    // Pair hygiene should extend keep_recent to include the assistant at index 4.
+    // non_system_count = 7, keep_recent starts at 3, boundary = 1 + (7-3) = 5 → .tool
+    // After hygiene: keep_recent should be 4, boundary at index 4 → .assistant
+    const non_system = history.items.len - 1; // 7
+    _ = non_system;
+
+    // We can't call compactHistoryKeepingRecent directly since it needs a provider.
+    // Instead, verify the boundary logic inline:
+    const has_system = history.items[0].role == .system;
+    const start: usize = if (has_system) 1 else 0;
+    const non_system_count = history.items.len - start;
+    var keep_recent: usize = @min(non_system_count, 3);
+
+    // Replicate the pair hygiene logic
+    const boundary_idx = start + (non_system_count - keep_recent);
+    if (boundary_idx < history.items.len and boundary_idx > start) {
+        if (history.items[boundary_idx].role == .tool) {
+            keep_recent += 1;
+        }
+    }
+    {
+        var adj_boundary = start + (non_system_count - keep_recent);
+        while (adj_boundary > start and adj_boundary < history.items.len and
+            history.items[adj_boundary].role == .tool)
+        {
+            keep_recent += 1;
+            adj_boundary -= 1;
+        }
+    }
+    keep_recent = @min(non_system_count, keep_recent);
+
+    // Verify: keep_recent extended from 3 to 4 to include the assistant tool_call
+    try std.testing.expectEqual(@as(usize, 4), keep_recent);
+
+    // Verify the first kept message is the assistant (tool_call), not the .tool result
+    const final_boundary = start + (non_system_count - keep_recent);
+    try std.testing.expect(history.items[final_boundary].role == .assistant);
+    try std.testing.expectEqualStrings("tool_call:read_file", history.items[final_boundary].content);
+}
+
+test "cheapCompactionPass replaces old tool results with placeholders" {
+    const allocator = std.testing.allocator;
+    var history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
+    defer {
+        for (history.items) |*msg| msg.deinit(allocator);
+        history.deinit(allocator);
+    }
+
+    // Build history with a large tool result in the old section
+    try history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u1") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "let me read that") });
+    // Large tool result (200 chars) — should be replaced
+    const big_tool = try allocator.dupe(u8, "x" ** 200);
+    try history.append(allocator, .{ .role = .tool, .content = big_tool });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u2") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a2") });
+    // Recent messages (keep_recent=2 protects these)
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u3") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a3") });
+
+    const reduced = cheapCompactionPass(allocator, &history, 2);
+    try std.testing.expect(reduced);
+
+    // The old tool result (index 3) should now be a short placeholder
+    try std.testing.expect(history.items[3].role == .tool);
+    try std.testing.expect(history.items[3].content.len < 100);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[3].content, "truncated") != null);
+
+    // Recent messages should be untouched
+    try std.testing.expectEqualStrings("u3", history.items[6].content);
+    try std.testing.expectEqualStrings("a3", history.items[7].content);
+}
+
+test "cheapCompactionPass deduplicates consecutive identical tool results" {
+    const allocator = std.testing.allocator;
+    var history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
+    defer {
+        for (history.items) |*msg| msg.deinit(allocator);
+        history.deinit(allocator);
+    }
+
+    try history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
+    // Two consecutive tool results with identical (short) content
+    try history.append(allocator, .{ .role = .tool, .content = try allocator.dupe(u8, "same output") });
+    try history.append(allocator, .{ .role = .tool, .content = try allocator.dupe(u8, "same output") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "recent") });
+
+    const reduced = cheapCompactionPass(allocator, &history, 1);
+    try std.testing.expect(reduced);
+
+    // First tool result should be replaced with dedup marker
+    try std.testing.expect(std.mem.indexOf(u8, history.items[1].content, "duplicate") != null);
+    // Second tool result keeps original content
+    try std.testing.expectEqualStrings("same output", history.items[2].content);
+}
+
+test "cheapCompactionPass no-op when all messages are recent" {
+    const allocator = std.testing.allocator;
+    var history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
+    defer {
+        for (history.items) |*msg| msg.deinit(allocator);
+        history.deinit(allocator);
+    }
+
+    try history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u1") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a1") });
+
+    // keep_recent=10 covers everything
+    const reduced = cheapCompactionPass(allocator, &history, 10);
+    try std.testing.expect(!reduced);
 }

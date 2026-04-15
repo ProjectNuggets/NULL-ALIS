@@ -96,6 +96,9 @@ pub const SessionManager = struct {
     usage_rt: ?*@import("usage_runtime.zig").UsageRuntime = null,
     observer: Observer,
     policy: ?*const SecurityPolicy = null,
+    /// Sidecar provider for cheap auxiliary calls (narration, compaction).
+    sidecar_provider: ?Provider = null,
+    sidecar_model: []const u8 = "",
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -144,6 +147,19 @@ pub const SessionManager = struct {
             .mutex = .{},
             .sessions = .{},
         };
+    }
+
+    /// Check if any session has an active turn in progress.
+    /// Used by the maintenance loop to defer TenantRuntime destruction
+    /// until in-flight turns complete (prevents use-after-free).
+    pub fn hasActiveTurns(self: *SessionManager) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*.active_refs > 0) return true;
+        }
+        return false;
     }
 
     pub fn deinit(self: *SessionManager) void {
@@ -272,6 +288,10 @@ pub const SessionManager = struct {
         agent.mem_rt = self.mem_rt;
         agent.usage_rt = self.usage_rt;
         agent.memory_session_id = memory_session_id;
+        // Wire sidecar provider for narration/compaction if available
+        agent.sidecar_provider = self.sidecar_provider;
+        agent.sidecar_model = self.sidecar_model;
+        agent.narration_interval = self.config.sidecar.narration_interval;
         return agent;
     }
 
@@ -822,8 +842,10 @@ pub const SessionManager = struct {
     }
 
     /// Return a heap-allocated slice of SessionInfo for sessions owned by
-    /// `user_id`. Caller must free with `allocator.free(result)`. Thread-safe.
+    /// `user_id`. Caller owns all memory: free each `.session_key` then
+    /// `allocator.free(result)`. Thread-safe.
     /// Only returns sessions matching the requesting user_id (T-03-07).
+    /// WR-01 fix: session_key is duped so callers are safe after mutex release.
     pub fn listUserSessions(
         self: *SessionManager,
         allocator: std.mem.Allocator,
@@ -833,12 +855,16 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
         const session_identity = @import("session/identity.zig");
         var result: std.ArrayListUnmanaged(SessionInfo) = .empty;
-        errdefer result.deinit(allocator);
+        errdefer {
+            // Free any already-duped keys on error.
+            for (result.items) |info| allocator.free(info.session_key);
+            result.deinit(allocator);
+        }
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             if (session_identity.isOwnedBy(entry.key_ptr.*, user_id)) {
                 try result.append(allocator, .{
-                    .session_key = entry.key_ptr.*,
+                    .session_key = try allocator.dupe(u8, entry.key_ptr.*),
                     .created_at = entry.value_ptr.*.created_at,
                     .last_active = entry.value_ptr.*.last_active,
                     .turn_count = entry.value_ptr.*.turn_count,
@@ -2580,7 +2606,10 @@ test "listUserSessions returns only sessions for requesting user" {
     _ = try sm.getOrCreate("agent:zaki-bot:user:8:main");
 
     const infos = try sm.listUserSessions(testing.allocator, "7");
-    defer testing.allocator.free(infos);
+    defer {
+        for (infos) |info| testing.allocator.free(info.session_key);
+        testing.allocator.free(infos);
+    }
 
     try testing.expectEqual(@as(usize, 2), infos.len);
     // All returned keys must belong to user 7

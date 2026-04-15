@@ -2,6 +2,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
+const NNGTs_prefix_order = @import("NNGTs_prefix_order.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -157,6 +158,21 @@ pub const OpenRouterProvider = struct {
                     }
                 }
 
+                // Parse reasoning/thinking content (deepseek-r1, GLM, Kimi via OpenRouter)
+                var reasoning_content: ?[]const u8 = null;
+                if (msg_obj.get("reasoning_content")) |rc| {
+                    if (rc == .string and rc.string.len > 0) {
+                        reasoning_content = try allocator.dupe(u8, rc.string);
+                    }
+                }
+                if (reasoning_content == null) {
+                    if (choices.array.items[0].object.get("reasoning")) |rc| {
+                        if (rc == .string and rc.string.len > 0) {
+                            reasoning_content = try allocator.dupe(u8, rc.string);
+                        }
+                    }
+                }
+
                 const model_str = if (root_obj.get("model")) |m| (if (m == .string) try allocator.dupe(u8, m.string) else try allocator.dupe(u8, "")) else try allocator.dupe(u8, "");
 
                 return .{
@@ -164,6 +180,7 @@ pub const OpenRouterProvider = struct {
                     .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
                     .usage = usage,
                     .model = model_str,
+                    .reasoning_content = reasoning_content,
                 };
             }
         }
@@ -465,7 +482,7 @@ pub const OpenRouterProvider = struct {
         if (request.tools) |tools| {
             if (tools.len > 0) {
                 try buf.appendSlice(allocator, ",\"tools\":");
-                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try NNGTs_prefix_order.convertToolsSorted(&buf, allocator, tools);
                 try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
             }
         }
@@ -507,7 +524,7 @@ pub const OpenRouterProvider = struct {
         if (request.tools) |tools| {
             if (tools.len > 0) {
                 try buf.appendSlice(allocator, ",\"tools\":");
-                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try NNGTs_prefix_order.convertToolsSorted(&buf, allocator, tools);
                 try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
             }
         }

@@ -26,6 +26,12 @@ pub const RuntimeProviderBundle = struct {
     reliable_entries: ?[]reliable.ProviderEntry = null,
     model_fallbacks: ?[]reliable.ModelFallbackEntry = null,
 
+    /// Sidecar provider for cheap auxiliary LLM calls (narration, compaction).
+    /// Separate from the main provider — uses Groq Llama 8B by default (free tier).
+    sidecar_holder: ?*ProviderHolder = null,
+    sidecar_key: ?[]u8 = null,
+    sidecar_model: []const u8 = "",
+
     pub fn init(allocator: std.mem.Allocator, cfg: *const Config) !RuntimeProviderBundle {
         var bundle = RuntimeProviderBundle{ .allocator = allocator };
         errdefer bundle.deinit();
@@ -45,6 +51,31 @@ pub const RuntimeProviderBundle = struct {
             cfg.getProviderBaseUrl(cfg.default_provider),
             cfg.getProviderNativeTools(cfg.default_provider),
         );
+
+        // Build sidecar provider for cheap auxiliary calls (narration, compaction).
+        // Uses Together.ai Llama 8B by default. Falls back gracefully if no API key.
+        if (cfg.sidecar.enabled and cfg.sidecar.provider.len > 0) {
+            bundle.sidecar_model = cfg.sidecar.model;
+            bundle.sidecar_key = api_key.resolveApiKeyFromConfig(
+                allocator,
+                cfg.sidecar.provider,
+                cfg.providers,
+            ) catch null;
+            // Only build the sidecar if we got an API key (or provider doesn't need one)
+            if (bundle.sidecar_key != null or std.mem.eql(u8, cfg.sidecar.provider, "ollama")) {
+                const sidecar_holder = allocator.create(ProviderHolder) catch null;
+                if (sidecar_holder) |holder| {
+                    holder.* = ProviderHolder.fromConfig(
+                        allocator,
+                        cfg.sidecar.provider,
+                        bundle.sidecar_key,
+                        cfg.getProviderBaseUrl(cfg.sidecar.provider),
+                        cfg.getProviderNativeTools(cfg.sidecar.provider),
+                    );
+                    bundle.sidecar_holder = holder;
+                }
+            }
+        }
 
         const allows_key_rotation = factory.classifyProvider(cfg.default_provider) != .openai_codex_provider;
         var rotating_key_count: usize = 0;
@@ -168,6 +199,18 @@ pub const RuntimeProviderBundle = struct {
         return self.primary_key;
     }
 
+    /// Returns the sidecar provider (cheap model for narration, compaction, extraction).
+    /// Returns null if sidecar is not configured or API key is missing.
+    pub fn sidecarProvider(self: *const RuntimeProviderBundle) ?@TypeOf(self.primary_holder.?.provider()) {
+        if (self.sidecar_holder) |holder| return holder.provider();
+        return null;
+    }
+
+    /// Returns the sidecar model name (e.g., "meta-llama/Llama-3.1-8B-Instruct-Turbo").
+    pub fn sidecarModelName(self: *const RuntimeProviderBundle) []const u8 {
+        return self.sidecar_model;
+    }
+
     pub fn deinit(self: *RuntimeProviderBundle) void {
         const had_reliable = self.reliable_ptr != null;
 
@@ -212,6 +255,17 @@ pub const RuntimeProviderBundle = struct {
         if (self.primary_key) |key| {
             self.allocator.free(key);
             self.primary_key = null;
+        }
+
+        // Sidecar cleanup
+        if (self.sidecar_holder) |holder| {
+            holder.deinit();
+            self.allocator.destroy(holder);
+            self.sidecar_holder = null;
+        }
+        if (self.sidecar_key) |key| {
+            self.allocator.free(key);
+            self.sidecar_key = null;
         }
     }
 };

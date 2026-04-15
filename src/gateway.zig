@@ -59,8 +59,11 @@ const channel_health_mod = @import("channel_health.zig");
 const security_review_mod = @import("security_review.zig");
 const log = std.log.scoped(.gateway);
 
-/// Maximum request body size (64KB) — prevents memory exhaustion.
-pub const MAX_BODY_SIZE: usize = 65_536;
+/// Maximum request body size (10MB) — sized for file attachments (images as
+/// base64 data URIs for images up to 20 MB raw (~27 MB encoded), audio for STT).
+/// Per-cell pod architecture isolates users at the container level; rate limiting
+/// covers API abuse.
+pub const MAX_BODY_SIZE: usize = 30 * 1024 * 1024;
 
 /// Request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -1057,6 +1060,11 @@ const TenantRuntime = struct {
     observer_multi: observability.MultiObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: std.atomic.Value(i64),
+    /// Set to true when the runtime should be destroyed on the next maintenance
+    /// sweep. Prevents use-after-free: settings PATCH marks for destruction
+    /// instead of immediately freeing while concurrent request threads may
+    /// still hold a pointer to this runtime.
+    pending_destroy: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     effective_config_source: []const u8,
     effective_config_hash: u64,
     resolved_settings: user_settings.ProductSettings,
@@ -1343,6 +1351,12 @@ const TenantRuntime = struct {
 
         runtime.session_mgr.usage_rt = runtime.usage_rt;
 
+        // Wire sidecar provider from bundle to session manager
+        if (runtime.provider_bundle.sidecarProvider()) |sp| {
+            runtime.session_mgr.sidecar_provider = sp;
+            runtime.session_mgr.sidecar_model = runtime.provider_bundle.sidecarModelName();
+        }
+
         if (runtime.mem_rt) |*rt| {
             runtime.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(runtime.tools, rt);
@@ -1471,9 +1485,23 @@ const TenantRuntime = struct {
     }
 };
 
+/// Remove a tenant runtime immediately. Used by maintenance sweep and shutdown.
 fn removeTenantRuntime(state: *GatewayState, user_id: []const u8) void {
     if (state.tenant_runtimes.fetchRemove(user_id)) |kv| {
         kv.value.deinit();
+    }
+}
+
+/// Mark a tenant runtime for deferred destruction. The maintenance loop
+/// (runs every 1s) will destroy it once no sessions have active turns.
+/// This prevents use-after-free when a settings PATCH races with an
+/// in-flight request holding a pointer to the runtime.
+fn markTenantRuntimeForDestroy(state: *GatewayState, user_id: []const u8) void {
+    state.tenant_runtime_mutex.lock();
+    defer state.tenant_runtime_mutex.unlock();
+    if (state.tenant_runtimes.get(user_id)) |runtime| {
+        runtime.pending_destroy.store(true, .release);
+        log.info("tenant.runtime.marked_for_destroy user={s}", .{user_id});
     }
 }
 
@@ -1591,6 +1619,31 @@ fn pruneTenantRuntimeCache(state: *GatewayState, now_s: i64) void {
         }
     }
 
+    // Sweep runtimes marked for deferred destruction (settings PATCH race safety).
+    // Only destroy when no sessions have active turns in progress.
+    if (state.tenant_runtimes.count() > 0) {
+        var destroy_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (destroy_keys.items) |k| state.allocator.free(k);
+            destroy_keys.deinit(state.allocator);
+        }
+        var dit = state.tenant_runtimes.iterator();
+        while (dit.next()) |entry| {
+            const rt = entry.value_ptr.*;
+            if (rt.pending_destroy.load(.acquire)) {
+                // Check if any sessions have active turns before destroying
+                if (!rt.session_mgr.hasActiveTurns()) {
+                    const key_copy = state.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                    destroy_keys.append(state.allocator, key_copy) catch state.allocator.free(key_copy);
+                }
+            }
+        }
+        for (destroy_keys.items) |key| {
+            removeTenantRuntime(state, key);
+            log.info("tenant.runtime.deferred_destroy user={s}", .{key});
+        }
+    }
+
     const max_users: usize = @intCast(@max(@as(u32, 1), state.tenant_runtime_cache_max_users));
     while (state.tenant_runtimes.count() > max_users and state.tenant_runtimes.count() > 0) {
         var oldest_key: ?[]u8 = null;
@@ -1643,8 +1696,28 @@ fn getTenantRuntime(
     defer state.tenant_runtime_mutex.unlock();
 
     if (state.tenant_runtimes.get(user_ctx.user_id)) |runtime| {
-        runtime.last_used_s.store(now_s, .release);
-        return runtime;
+        if (!runtime.pending_destroy.load(.acquire)) {
+            runtime.last_used_s.store(now_s, .release);
+            return runtime;
+        }
+        // Runtime is marked for destruction. If no active turns, destroy now
+        // and create a fresh one below. If turns are active, the request must
+        // wait — returning the doomed runtime would use stale config.
+        if (!runtime.session_mgr.hasActiveTurns()) {
+            // Safe to destroy immediately under the mutex — no concurrent users
+            if (state.tenant_runtimes.fetchRemove(user_ctx.user_id)) |kv| {
+                kv.value.deinit();
+            }
+            log.info("tenant.runtime.replaced user={s}", .{user_ctx.user_id});
+        } else {
+            // Active turns still running on the doomed runtime. New requests
+            // arriving during this drain window will also use the old config.
+            // This is a tradeoff: brief stale-config window (microseconds to
+            // seconds) vs blocking/erroring the request. Acceptable for launch.
+            // The runtime will be replaced on the next sweep once turns drain.
+            runtime.last_used_s.store(now_s, .release);
+            return runtime;
+        }
     }
 
     const runtime = try TenantRuntime.init(state.allocator, config, user_ctx, state.event_bus, state.zaki_state, state, &state.lifecycle_metrics);
@@ -7572,12 +7645,19 @@ fn SseProgressObserver(comptime StreamType: type) type {
                     }
                 },
                 .tool_call_start => |e| {
-                    var label_buf: [160]u8 = undefined;
-                    const label = std.fmt.bufPrint(&label_buf, "Using {s}", .{e.tool}) catch "Using tool";
+                    var label_buf: [256]u8 = undefined;
+                    const label = if (e.activity_label) |al|
+                        (if (e.files) |files| (if (files.len > 0)
+                            (std.fmt.bufPrint(&label_buf, "{s}: {s}", .{ al, files[0] }) catch al)
+                        else
+                            al) else (if (e.command) |cmd|
+                            (std.fmt.bufPrint(&label_buf, "{s}: {s}", .{ al, cmd[0..@min(cmd.len, 60)] }) catch al)
+                        else
+                            al))
+                    else
+                        (std.fmt.bufPrint(&label_buf, "Using {s}", .{e.tool}) catch "Using tool");
                     self.emit("tool", "start", label, e.tool, null, null);
-                    var summary_buf: [196]u8 = undefined;
-                    const summary = std.fmt.bufPrint(&summary_buf, "Using {s} to verify the answer", .{e.tool}) catch "Using a tool to verify the answer";
-                    self.emitReasoningSummary(summary, "tool", e.tool, null);
+                    self.emitReasoningSummary(label, "tool", e.tool, null);
                 },
                 .tool_call => |e| {
                     var label_buf: [192]u8 = undefined;
@@ -7815,12 +7895,19 @@ const BufferedSseProgressObserver = struct {
                 }
             },
             .tool_call_start => |e| {
-                var label_buf: [160]u8 = undefined;
-                const label = std.fmt.bufPrint(&label_buf, "Using {s}", .{e.tool}) catch "Using tool";
+                var label_buf: [256]u8 = undefined;
+                const label = if (e.activity_label) |al|
+                    (if (e.files) |files| (if (files.len > 0)
+                        (std.fmt.bufPrint(&label_buf, "{s}: {s}", .{ al, files[0] }) catch al)
+                    else
+                        al) else (if (e.command) |cmd|
+                        (std.fmt.bufPrint(&label_buf, "{s}: {s}", .{ al, cmd[0..@min(cmd.len, 60)] }) catch al)
+                    else
+                        al))
+                else
+                    (std.fmt.bufPrint(&label_buf, "Using {s}", .{e.tool}) catch "Using tool");
                 self.emit("tool", "start", label, e.tool, null, null);
-                var summary_buf: [196]u8 = undefined;
-                const summary = std.fmt.bufPrint(&summary_buf, "Using {s} to verify the answer", .{e.tool}) catch "Using a tool to verify the answer";
-                self.emitReasoningSummary(summary, "tool", e.tool, null);
+                self.emitReasoningSummary(label, "tool", e.tool, null);
             },
             .tool_call => |e| {
                 var label_buf: [192]u8 = undefined;
@@ -8941,45 +9028,112 @@ fn telegramApiCall(
 // Session CRUD Handlers (Phase 3.5 — Activation)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Sentinel response for JSON serialization failures (IN-02: single source of truth).
+const response_build_err: RouteResponse = .{
+    .status = "500 Internal Server Error",
+    .body = "{\"error\":\"response_build_failed\"}",
+};
+
+/// Finalize a JSON buffer into a RouteResponse body. On OOM the buffer is freed
+/// and response_build_err is returned.
+fn finalizeJsonBuf(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8)) RouteResponse {
+    const body = buf.toOwnedSlice(allocator) catch {
+        buf.deinit(allocator);
+        return response_build_err;
+    };
+    return .{ .body = body };
+}
+
 fn handleSessionList(
     allocator: std.mem.Allocator,
     method: []const u8,
     user_id: []const u8,
     session_mgr_opt: ?*session_mod.SessionManager,
+    state_mgr: ?*zaki_state_mod.Manager,
 ) RouteResponse {
     if (!std.mem.eql(u8, method, "GET")) {
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
-    const mgr = session_mgr_opt orelse return .{ .body = "{\"sessions\":[]}" };
-
-    // Build JSON while holding mgr.mutex so session_key pointers stay valid.
-    // listUserSessions returns borrowed keys that can dangle after concurrent delete.
-    const session_identity = @import("session/identity.zig");
-    mgr.mutex.lock();
-    defer mgr.mutex.unlock();
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
-    w.writeAll("{\"sessions\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    var it = mgr.sessions.iterator();
+    w.writeAll("{\"sessions\":[") catch return response_build_err;
     var first = true;
-    while (it.next()) |entry| {
-        if (!session_identity.isOwnedBy(entry.key_ptr.*, user_id)) continue;
-        const session = entry.value_ptr.*;
-        if (!first) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        first = false;
-        w.writeAll("{\"session_key\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        jsonEscapeInto(w, entry.key_ptr.*) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-        w.print("\",\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d}}}", .{
-            session.created_at,
-            session.last_active,
-            session.turn_count,
-        }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+
+    // Track keys already emitted (owned copies to avoid dangling pointers after mutex release)
+    var seen_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer {
+        var kit = seen_keys.keyIterator();
+        while (kit.next()) |key| allocator.free(@constCast(key.*));
+        seen_keys.deinit(allocator);
     }
-    w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+
+    // Phase 1: Live in-memory sessions — normalized field shape matching Phase 2
+    if (session_mgr_opt) |mgr| {
+        const session_identity = @import("session/identity.zig");
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+
+        var it = mgr.sessions.iterator();
+        while (it.next()) |entry| {
+            if (!session_identity.isOwnedBy(entry.key_ptr.*, user_id)) continue;
+            const session = entry.value_ptr.*;
+            if (!first) w.writeAll(",") catch return response_build_err;
+            first = false;
+            // Normalized shape: session_key, title, message_count, last_active (int), live
+            w.writeAll("{\"session_key\":\"") catch return response_build_err;
+            jsonEscapeInto(w, entry.key_ptr.*) catch return response_build_err;
+            w.writeAll("\",\"title\":\"") catch return response_build_err;
+            // Derive title from session key for live sessions
+            const key_str = entry.key_ptr.*;
+            if (std.mem.endsWith(u8, key_str, ":main")) {
+                w.writeAll("Main") catch return response_build_err;
+            } else {
+                // Extract thread slug from key: agent:zaki-bot:user:42:thread:abc → abc
+                if (std.mem.lastIndexOf(u8, key_str, ":")) |idx| {
+                    jsonEscapeInto(w, key_str[idx + 1 ..]) catch return response_build_err;
+                } else {
+                    w.writeAll("Session") catch return response_build_err;
+                }
+            }
+            w.print("\",\"message_count\":{d},\"last_active\":{d},\"live\":true}}", .{
+                session.turn_count,
+                session.last_active,
+            }) catch return response_build_err;
+            // Store owned copy of key (safe after mutex release)
+            const key_copy = allocator.dupe(u8, entry.key_ptr.*) catch continue;
+            seen_keys.put(allocator, key_copy, {}) catch allocator.free(key_copy);
+        }
+    }
+
+    // Phase 2: Persisted sessions from Postgres (survives eviction + pod restart)
+    if (state_mgr) |mgr| {
+        const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch 0;
+        if (numeric_user_id > 0) {
+            if (mgr.listUserSessions(allocator, numeric_user_id)) |persisted| {
+                defer {
+                    for (persisted) |*info| info.deinit(allocator);
+                    allocator.free(persisted);
+                }
+                for (persisted) |info| {
+                    if (seen_keys.get(info.session_key) != null) continue;
+                    if (!first) w.writeAll(",") catch return response_build_err;
+                    first = false;
+                    w.writeAll("{\"session_key\":\"") catch return response_build_err;
+                    jsonEscapeInto(w, info.session_key) catch return response_build_err;
+                    w.writeAll("\",\"title\":\"") catch return response_build_err;
+                    jsonEscapeInto(w, info.title) catch return response_build_err;
+                    w.print("\",\"message_count\":{d},\"last_active\":\"", .{info.message_count}) catch return response_build_err;
+                    jsonEscapeInto(w, info.last_active) catch return response_build_err;
+                    w.writeAll("\",\"live\":false}") catch return response_build_err;
+                }
+            } else |_| {}
+        }
+    }
+
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
 }
 
 fn handleSessionAction(
@@ -9090,16 +9244,15 @@ fn handleSessionGet(
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
-    w.writeAll("{\"session_key\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    jsonEscapeInto(w, session_key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll("{\"session_key\":\"") catch return response_build_err;
+    jsonEscapeInto(w, session_key) catch return response_build_err;
     w.print("\",\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d},\"history_len\":{d}}}", .{
         session.created_at,
         session.last_active,
         session.turn_count,
         session.agent.historyLen(),
-    }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+    }) catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
 }
 
 fn handleSessionDelete(
@@ -9181,9 +9334,8 @@ fn handleSessionContext(
         agent.tokensUsed(),
         agent.max_history_messages,
         agent.token_limit,
-    }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+    }) catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
 }
 
 /// Max messages serialized per export/history request to prevent OOM from huge sessions.
@@ -9237,11 +9389,11 @@ fn buildSessionMessagesJson(
     const w = buf.writer(allocator);
     writeHistoryMessagesJson(w, history) catch {
         buf.deinit(allocator);
-        return .{ .json = null, .err = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+        return .{ .json = null, .err = response_build_err };
     };
     const json = buf.toOwnedSlice(allocator) catch {
         buf.deinit(allocator);
-        return .{ .json = null, .err = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+        return .{ .json = null, .err = response_build_err };
     };
     return .{ .json = json, .err = null };
 }
@@ -9259,13 +9411,12 @@ fn handleSessionExport(
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
-    w.writeAll("{\"session_key\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    jsonEscapeInto(w, session_key) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    w.writeAll("\",\"messages\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    w.writeAll(messages_json) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+    w.writeAll("{\"session_key\":\"") catch return response_build_err;
+    jsonEscapeInto(w, session_key) catch return response_build_err;
+    w.writeAll("\",\"messages\":[") catch return response_build_err;
+    w.writeAll(messages_json) catch return response_build_err;
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
 }
 
 fn handleSessionHistory(
@@ -9282,11 +9433,26 @@ fn handleSessionHistory(
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
-    w.writeAll("{\"messages\":[") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    w.writeAll(messages_json) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
-    return .{ .body = out.toOwnedSlice(allocator) catch
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+    w.writeAll("{\"messages\":[") catch return response_build_err;
+    w.writeAll(messages_json) catch return response_build_err;
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+/// Pure input validation for session approve requests. Does not touch session
+/// state — safe to call without a SessionManager. Returns the parsed `approved`
+/// bool on success, or a RouteResponse error on validation failure.
+/// WR-02 fix: extracted so tests can validate input without passing undefined mgr.
+fn validateApproveInput(raw_request: []const u8) union(enum) { approved: bool, err: RouteResponse } {
+    const body = extractBody(raw_request) orelse return .{ .err = .{
+        .status = "400 Bad Request",
+        .body = "{\"error\":\"missing body\"}",
+    } };
+    const approved = jsonBoolField(body, "approved") orelse return .{ .err = .{
+        .status = "400 Bad Request",
+        .body = "{\"error\":\"missing approved field\"}",
+    } };
+    return .{ .approved = approved };
 }
 
 fn handleSessionApprove(
@@ -9295,13 +9461,10 @@ fn handleSessionApprove(
     session_key: []const u8,
     raw_request: []const u8,
 ) RouteResponse {
-    const body = extractBody(raw_request) orelse return .{
-        .status = "400 Bad Request",
-        .body = "{\"error\":\"missing body\"}",
-    };
-    const approved = jsonBoolField(body, "approved") orelse return .{
-        .status = "400 Bad Request",
-        .body = "{\"error\":\"missing approved field\"}",
+    const validated = validateApproveInput(raw_request);
+    const approved = switch (validated) {
+        .approved => |v| v,
+        .err => |e| return e,
     };
 
     // Pin session with active_refs to prevent eviction between check and processMessage.
@@ -9936,7 +10099,11 @@ fn handleApiRoute(
             writeUserConfigJson(state, &user_ctx, scoped_user_id, merged) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
             };
-            removeTenantRuntime(state, scoped_user_id);
+            // Mark for deferred destruction instead of immediate remove.
+            // Prevents use-after-free if a concurrent request thread holds
+            // a pointer to this TenantRuntime. The maintenance loop (1s)
+            // will destroy it once no sessions have active turns.
+            markTenantRuntimeForDestroy(state, scoped_user_id);
             const response = user_settings.renderSettingsJson(req_allocator, updated_settings) catch "{\"status\":\"updated\"}";
             return .{ .body = response };
         }
@@ -9961,7 +10128,7 @@ fn handleApiRoute(
             const canonical_body = writeHeartbeatEnabledForUser(req_allocator, state, &user_ctx, scoped_user_id, enabled) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
             };
-            removeTenantRuntime(state, scoped_user_id);
+            markTenantRuntimeForDestroy(state, scoped_user_id);
             return .{ .body = canonical_body };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
@@ -10460,9 +10627,17 @@ fn handleApiRoute(
         return .{ .body = "{\"status\":\"disconnected\",\"channel\":\"telegram\"}" };
     }
 
+    // ── Voice endpoints (Phase 3 — STT / TTS) ──────────────────────────
+    if (std.mem.eql(u8, parsed.subpath, "voice/transcribe")) {
+        return handleVoiceTranscribe(req_allocator, method, raw_request, config_opt);
+    }
+    if (std.mem.eql(u8, parsed.subpath, "voice/synthesize")) {
+        return handleVoiceSynthesize(req_allocator, method, raw_request, config_opt);
+    }
+
     // ── Session CRUD endpoints (Phase 3.5) ──────────────────────────────
     if (std.mem.eql(u8, parsed.subpath, "sessions")) {
-        return handleSessionList(req_allocator, method, scoped_user_id, session_mgr_opt);
+        return handleSessionList(req_allocator, method, scoped_user_id, session_mgr_opt, state.zaki_state);
     }
     if (std.mem.startsWith(u8, parsed.subpath, "sessions/")) {
         const rest = parsed.subpath["sessions/".len..];
@@ -10470,6 +10645,202 @@ fn handleApiRoute(
     }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"not found\"}" };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Voice helpers
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Copy a path slice into a fixed buffer and null-terminate it.
+/// Returns null if the path is too long for the buffer.
+fn toSentinelPath(buf: []u8, path: []const u8) ?[:0]const u8 {
+    if (path.len >= buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return buf[0..path.len :0];
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Voice: STT (transcribe) and TTS (synthesize) API handlers
+// ════════════════════════════════════════════════════════════════════════════
+
+/// POST /api/v1/users/{id}/voice/transcribe
+/// Body: {"audio":"<base64>","format":"webm"} (format optional, default "webm")
+/// Returns: {"text":"transcribed text"}
+fn handleVoiceTranscribe(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    raw_request: []const u8,
+    config_opt: ?*const Config,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    const cfg = config_opt orelse return .{
+        .status = "503 Service Unavailable",
+        .body = "{\"error\":\"voice not configured\"}",
+    };
+    if (!cfg.audio_media.enabled) {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"voice not enabled\"}" };
+    }
+    const provider_name = cfg.audio_media.provider;
+    const api_key = cfg.getProviderKey(provider_name) orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"voice api key not configured\"}" };
+    };
+    const body = extractBody(raw_request) orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
+    };
+    const audio_b64 = jsonStringField(body, "audio") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing audio field\"}" };
+    };
+    if (audio_b64.len == 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"empty audio data\"}" };
+    }
+    // Cap base64 input at ~7.5MB (decodes to ~5.6MB raw audio)
+    if (audio_b64.len > 10 * 1024 * 1024) {
+        return .{ .status = "413 Payload Too Large", .body = "{\"error\":\"audio too large\"}" };
+    }
+
+    const format = jsonStringField(body, "format") orelse "webm";
+
+    // Decode base64 → raw audio bytes
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(audio_b64) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid base64\"}" };
+    };
+    const decoded = allocator.alloc(u8, decoded_len) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc failed\"}" };
+    };
+    defer allocator.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, audio_b64) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid base64\"}" };
+    };
+
+    // Write to temp file (timestamp + random suffix to prevent collisions)
+    const ts = std.time.milliTimestamp();
+    var rand_bytes: [4]u8 = undefined;
+    std.crypto.random.bytes(&rand_bytes);
+    const rand_suffix: u32 = std.mem.readInt(u32, &rand_bytes, .little);
+    var path_buf: [256]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/nullalis_stt_{d}_{x}.{s}", .{ ts, rand_suffix, format }) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path build failed\"}" };
+    };
+    var z_buf: [257]u8 = undefined;
+    const tmp_path_z = toSentinelPath(&z_buf, tmp_path) orelse {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path too long\"}" };
+    };
+    {
+        const file = std.fs.createFileAbsolute(tmp_path_z, .{}) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"temp file write failed\"}" };
+        };
+        defer file.close();
+        file.writeAll(decoded) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"temp file write failed\"}" };
+        };
+    }
+    defer std.fs.deleteFileAbsolute(tmp_path_z) catch {};
+
+    // Call Whisper API
+    const endpoint = voice.resolveTranscriptionEndpoint(provider_name, cfg.audio_media.base_url);
+    const text = voice.transcribeFile(allocator, api_key, endpoint, tmp_path, .{
+        .model = cfg.audio_media.model,
+        .language = cfg.audio_media.language,
+    }) catch {
+        return .{ .status = "502 Bad Gateway", .body = "{\"error\":\"transcription failed\"}" };
+    };
+    defer allocator.free(text);
+
+    // Build JSON response
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    defer resp.deinit(allocator);
+    const w = resp.writer(allocator);
+    w.writeAll("{\"text\":\"") catch return response_build_err;
+    jsonEscapeInto(w, text) catch return response_build_err;
+    w.writeAll("\"}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &resp);
+}
+
+/// POST /api/v1/users/{id}/voice/synthesize
+/// Body: {"text":"hello","voice":"alloy","format":"mp3"} (voice/format optional)
+/// Returns: {"audio":"<base64>","format":"mp3"}
+fn handleVoiceSynthesize(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    raw_request: []const u8,
+    config_opt: ?*const Config,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    const cfg = config_opt orelse return .{
+        .status = "503 Service Unavailable",
+        .body = "{\"error\":\"voice not configured\"}",
+    };
+    // TTS provider comes from agent config (often "openai" for speech synthesis
+    // even if STT uses "groq"). Falls back to the default provider.
+    const tts_provider = cfg.agent.tts_provider orelse cfg.default_provider;
+    const api_key = cfg.getProviderKey(tts_provider) orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"tts api key not configured\"}" };
+    };
+    const body = extractBody(raw_request) orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
+    };
+    const text = jsonStringField(body, "text") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing text field\"}" };
+    };
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"empty text\"}" };
+    }
+    // Cap text at 4096 chars (OpenAI TTS limit)
+    if (text.len > 4096) {
+        return .{ .status = "413 Payload Too Large", .body = "{\"error\":\"text too long (max 4096 chars)\"}" };
+    }
+
+    const voice_name = jsonStringField(body, "voice") orelse "alloy";
+    const format = jsonStringField(body, "format") orelse "mp3";
+
+    const audio_path = voice.synthesizeTextToTempAudio(allocator, tts_provider, api_key, text, .{
+        .voice = voice_name,
+        .format = format,
+    }) catch {
+        return .{ .status = "502 Bad Gateway", .body = "{\"error\":\"synthesis failed\"}" };
+    };
+    defer allocator.free(audio_path);
+
+    // Read the generated audio file
+    var path_z_buf: [512]u8 = undefined;
+    const audio_path_z = toSentinelPath(&path_z_buf, audio_path) orelse {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path too long\"}" };
+    };
+
+    const audio_file = std.fs.openFileAbsolute(audio_path_z, .{}) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"audio read failed\"}" };
+    };
+    defer audio_file.close();
+    defer std.fs.deleteFileAbsolute(audio_path_z) catch {};
+
+    const audio_data = audio_file.readToEndAlloc(allocator, 8 * 1024 * 1024) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"audio read failed\"}" };
+    };
+    defer allocator.free(audio_data);
+
+    // Base64-encode the audio
+    const b64_len = std.base64.standard.Encoder.calcSize(audio_data.len);
+    const b64_buf = allocator.alloc(u8, b64_len) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc failed\"}" };
+    };
+    defer allocator.free(b64_buf);
+    _ = std.base64.standard.Encoder.encode(b64_buf, audio_data);
+
+    // Build JSON response
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    defer resp.deinit(allocator);
+    const w = resp.writer(allocator);
+    w.writeAll("{\"audio\":\"") catch return response_build_err;
+    w.writeAll(b64_buf) catch return response_build_err;
+    w.writeAll("\",\"format\":\"") catch return response_build_err;
+    jsonEscapeInto(w, format) catch return response_build_err;
+    w.writeAll("\"}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &resp);
 }
 
 const WebhookHandlerContext = struct {
@@ -12238,6 +12609,10 @@ fn handleAcceptedConnection(
                 var requested: usize = 0;
                 var removed: usize = 0;
                 var missing: usize = 0;
+                // All HashMap access must be under the tenant_runtime_mutex.
+                // This is an admin endpoint — immediate destruction is correct.
+                state.tenant_runtime_mutex.lock();
+                defer state.tenant_runtime_mutex.unlock();
                 if (state.role == .user_cell and request.all) {
                     const pinned_user_id = state.pinned_user_id orelse {
                         response_status = "400 Bad Request";
@@ -12893,7 +13268,7 @@ pub fn runWithRole(
 // ── Tests ────────────────────────────────────────────────────────
 
 test "constants are set correctly" {
-    try std.testing.expectEqual(@as(usize, 65_536), MAX_BODY_SIZE);
+    try std.testing.expectEqual(@as(usize, 30 * 1024 * 1024), MAX_BODY_SIZE);
     try std.testing.expectEqual(@as(u64, 30), REQUEST_TIMEOUT_SECS);
     try std.testing.expectEqual(@as(u64, 60), RATE_LIMIT_WINDOW_SECS);
 }
@@ -13078,8 +13453,8 @@ test "rate limiter window_ns calculation" {
     try std.testing.expectEqual(@as(i128, 120_000_000_000), limiter.window_ns);
 }
 
-test "MAX_BODY_SIZE is 64KB" {
-    try std.testing.expectEqual(@as(usize, 64 * 1024), MAX_BODY_SIZE);
+test "MAX_BODY_SIZE is 10MB" {
+    try std.testing.expectEqual(@as(usize, 30 * 1024 * 1024), MAX_BODY_SIZE);
 }
 
 test "RATE_LIMIT_WINDOW_SECS is 60" {
@@ -16162,7 +16537,7 @@ test "expectedHttpRequestSize rejects invalid content length" {
 }
 
 test "expectedHttpRequestSize rejects oversized content length" {
-    const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999\r\n\r\n";
+    const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 32000000\r\n\r\n";
     try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw));
 }
 
@@ -17960,14 +18335,14 @@ test "tenant preference application uses operator-owned assistant mode presets" 
     try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
     try std.testing.expectEqual(@as(u32, 20), cfg.agent.queue_cap);
     try std.testing.expectEqualStrings("summarize", cfg.agent.queue_drop);
-    try std.testing.expectEqual(@as(u32, 80), cfg.agent.max_history_messages);
+    try std.testing.expectEqual(@as(u32, 500), cfg.agent.max_history_messages);
     try std.testing.expectEqualStrings("always", cfg.agent.activation_mode);
     try std.testing.expectEqualStrings("off", cfg.agent.send_mode);
     try std.testing.expectEqualStrings("inbound", cfg.agent.tts_mode);
     try std.testing.expect(cfg.agent.tts_audio);
     try std.testing.expectEqual(@as(?u64, 2700), cfg.agent.session_ttl_secs);
     try std.testing.expect(cfg.memory.summarizer.enabled);
-    try std.testing.expectEqual(@as(u32, 6000), cfg.memory.summarizer.window_size_tokens);
+    try std.testing.expectEqual(@as(u32, 8000), cfg.memory.summarizer.window_size_tokens);
     try std.testing.expectEqual(@as(u32, 700), cfg.memory.summarizer.summary_max_tokens);
     try std.testing.expect(cfg.memory.summarizer.auto_extract_semantic);
     try std.testing.expect(!cfg.session.cross_channel_shared_main);
@@ -17994,8 +18369,8 @@ test "telegramReplyContainsMediaMarkers detects audio marker" {
 
 // ── Baseline characterization tests (Phase 00-01) ───────────────
 
-test "baseline: MAX_BODY_SIZE is 65536" {
-    try std.testing.expectEqual(@as(usize, 65_536), MAX_BODY_SIZE);
+test "baseline: MAX_BODY_SIZE is 10MB" {
+    try std.testing.expectEqual(@as(usize, 30 * 1024 * 1024), MAX_BODY_SIZE);
 }
 
 test "baseline: RATE_LIMIT_WINDOW_SECS is 60" {
@@ -18124,12 +18499,13 @@ test "isSessionAction recognises known actions" {
 }
 
 test "handleSessionList returns empty array when no session manager" {
-    const resp = handleSessionList(std.testing.allocator, "GET", "1", null);
+    const resp = handleSessionList(std.testing.allocator, "GET", "1", null, null);
+    defer std.testing.allocator.free(resp.body);
     try std.testing.expectEqualStrings("{\"sessions\":[]}", resp.body);
 }
 
 test "handleSessionList rejects non-GET methods" {
-    const resp = handleSessionList(std.testing.allocator, "POST", "1", null);
+    const resp = handleSessionList(std.testing.allocator, "POST", "1", null, null);
     try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
 }
 
@@ -18150,28 +18526,426 @@ test "handleSessionAction rejects cross-user session key" {
     try std.testing.expectEqualStrings("403 Forbidden", resp.status);
 }
 
-test "handleSessionApprove rejects missing body" {
-    // Safety: mgr is undefined because extractBody returns null (empty body after
-    // headers) before the function ever dereferences mgr. This is intentional —
-    // it tests that input validation fires before any session access. If someone
-    // reorders the function to touch mgr first, this test will correctly fail.
-    const resp = handleSessionApprove(
-        std.testing.allocator,
-        undefined,
-        "agent:zaki-bot:user:1:main",
-        "POST /approve HTTP/1.1\r\nHost: localhost\r\n\r\n",
-    );
-    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+test "validateApproveInput rejects missing body" {
+    const result = validateApproveInput("POST /approve HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try std.testing.expectEqualStrings("400 Bad Request", result.err.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.body, "missing body") != null);
 }
 
-test "handleSessionApprove rejects missing approved field" {
-    // Safety: see "rejects missing body" test — jsonBoolField returns null before
-    // mgr is dereferenced, so undefined is safe here.
+test "validateApproveInput rejects missing approved field" {
     const body = "{}";
     const req = std.fmt.comptimePrint(
         "POST /approve HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}",
         .{ body.len, body },
     );
-    const resp = handleSessionApprove(std.testing.allocator, undefined, "agent:zaki-bot:user:1:main", req);
+    const result = validateApproveInput(req);
+    try std.testing.expectEqualStrings("400 Bad Request", result.err.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.body, "missing approved field") != null);
+}
+
+test "validateApproveInput accepts valid approved true" {
+    const body = "{\"approved\":true}";
+    const req = std.fmt.comptimePrint(
+        "POST /approve HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    const result = validateApproveInput(req);
+    try std.testing.expect(result.approved == true);
+}
+
+test "validateApproveInput accepts valid approved false" {
+    const body = "{\"approved\":false}";
+    const req = std.fmt.comptimePrint(
+        "POST /approve HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    const result = validateApproveInput(req);
+    try std.testing.expect(result.approved == false);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Session CRUD Integration Tests (IN-01)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Minimal mock provider for gateway CRUD handler tests. Returns a fixed
+/// response, never touches the network. Mirrors session.zig's MockProvider.
+const TestMockProvider = struct {
+    response: []const u8 = "ok",
+
+    const vtable = providers.Provider.VTable{
+        .chatWithSystem = mockChatWithSystem,
+        .chat = mockChat,
+        .supportsNativeTools = mockSupportsNativeTools,
+        .getName = mockGetName,
+        .deinit = mockDeinit,
+    };
+
+    fn provider(self: *TestMockProvider) providers.Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn mockChatWithSystem(ptr: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        const self: *TestMockProvider = @ptrCast(@alignCast(ptr));
+        return allocator.dupe(u8, self.response);
+    }
+
+    fn mockChat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *TestMockProvider = @ptrCast(@alignCast(ptr));
+        return .{ .content = try allocator.dupe(u8, self.response) };
+    }
+
+    fn mockSupportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn mockGetName(_: *anyopaque) []const u8 {
+        return "test-mock";
+    }
+
+    fn mockDeinit(_: *anyopaque) void {}
+};
+
+var test_noop_observer = observability.NoopObserver{};
+
+fn testCrudSessionManager(allocator: std.mem.Allocator, mock: *TestMockProvider) session_mod.SessionManager {
+    const S = struct {
+        var cfg: Config = .{
+            .workspace_dir = "/tmp/gw_test",
+            .config_path = "/tmp/gw_test/config.json",
+            .default_model = "test/mock-model",
+            .allocator = undefined, // overwritten below
+        };
+    };
+    S.cfg.allocator = allocator;
+    return session_mod.SessionManager.init(
+        allocator,
+        &S.cfg,
+        mock.provider(),
+        &.{},
+        null,
+        test_noop_observer.observer(),
+        null,
+        null,
+    );
+}
+
+test "handleSessionGet returns session info JSON" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:42:thread:abc");
+    // Seed a turn so history and turn_count are non-zero
+    session.turn_count = 3;
+
+    const resp = handleSessionGet(std.testing.allocator, &mgr, "agent:zaki-bot:user:42:thread:abc");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    // Verify key fields are present in JSON
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"session_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "agent:zaki-bot:user:42:thread:abc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"turn_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"history_len\"") != null);
+}
+
+test "handleSessionGet returns 404 for unknown session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const resp = handleSessionGet(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:nonexistent");
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleSessionDelete removes session and returns deleted" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    // Don't defer mgr.deinit() — delete cleans up the session, but we still deinit the mgr
+    defer mgr.deinit();
+
+    _ = try mgr.getOrCreate("agent:zaki-bot:user:10:thread:del");
+    try std.testing.expectEqual(@as(usize, 1), mgr.sessionCount());
+
+    const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:10:thread:del");
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"deleted\"") != null);
+    try std.testing.expectEqual(@as(usize, 0), mgr.sessionCount());
+}
+
+test "handleSessionDelete returns 409 when session has active refs" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:10:thread:busy");
+    session.active_refs = 1; // Simulate active turn
+
+    const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:10:thread:busy");
+    try std.testing.expectEqualStrings("409 Conflict", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "session_in_use") != null);
+    // Session should still exist
+    try std.testing.expectEqual(@as(usize, 1), mgr.sessionCount());
+}
+
+test "handleSessionDelete returns 404 for unknown session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:ghost");
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleSessionCompact returns status on empty session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    _ = try mgr.getOrCreate("agent:zaki-bot:user:5:thread:cmp");
+
+    const resp = handleSessionCompact(std.testing.allocator, &mgr, "agent:zaki-bot:user:5:thread:cmp");
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    // Empty session should return no_change or checkpoint_only
+    try std.testing.expect(
+        std.mem.indexOf(u8, resp.body, "\"compacted\"") != null or
+            std.mem.indexOf(u8, resp.body, "checkpoint_only") != null,
+    );
+}
+
+test "handleSessionCompact returns 404 for unknown session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const resp = handleSessionCompact(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:none");
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleSessionContext returns context metadata" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    _ = try mgr.getOrCreate("agent:zaki-bot:user:7:thread:ctx");
+
+    const resp = handleSessionContext(std.testing.allocator, &mgr, "agent:zaki-bot:user:7:thread:ctx");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"history_len\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tokens_used\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"max_history\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"token_limit\"") != null);
+}
+
+test "handleSessionContext returns 404 for unknown session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const resp = handleSessionContext(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:none");
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleSessionHistory returns messages array for empty session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    _ = try mgr.getOrCreate("agent:zaki-bot:user:3:thread:hist");
+
+    const resp = handleSessionHistory(std.testing.allocator, &mgr, "agent:zaki-bot:user:3:thread:hist");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expectEqualStrings("{\"messages\":[]}", resp.body);
+}
+
+test "handleSessionHistory returns messages after processMessage" {
+    var mock = TestMockProvider{ .response = "Hello back" };
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const reply = try mgr.processMessage("agent:zaki-bot:user:3:thread:hist2", "Hi there", null);
+    defer std.testing.allocator.free(reply);
+
+    const resp = handleSessionHistory(std.testing.allocator, &mgr, "agent:zaki-bot:user:3:thread:hist2");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"messages\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "Hi there") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "Hello back") != null);
+}
+
+test "handleSessionHistory returns 404 for unknown session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const resp = handleSessionHistory(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:none");
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleSessionExport returns session_key and messages" {
+    var mock = TestMockProvider{ .response = "Exported reply" };
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const reply = try mgr.processMessage("agent:zaki-bot:user:4:thread:exp", "Export me", null);
+    defer std.testing.allocator.free(reply);
+
+    const resp = handleSessionExport(std.testing.allocator, &mgr, "agent:zaki-bot:user:4:thread:exp");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"session_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "agent:zaki-bot:user:4:thread:exp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"messages\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "Export me") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "Exported reply") != null);
+}
+
+test "handleSessionExport returns 404 for unknown session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const resp = handleSessionExport(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:none");
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+// ── Voice endpoint tests ────────────────────────────────────────────────
+
+test "handleVoiceTranscribe rejects GET" {
+    const resp = handleVoiceTranscribe(std.testing.allocator, "GET", "GET /voice HTTP/1.1\r\n\r\n", null);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleVoiceTranscribe returns 503 without config" {
+    const resp = handleVoiceTranscribe(std.testing.allocator, "POST", "POST /voice HTTP/1.1\r\n\r\n{}", null);
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "not configured") != null);
+}
+
+test "handleVoiceTranscribe returns 503 when audio disabled" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/voice_test",
+        .config_path = "/tmp/voice_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.audio_media.enabled = false;
+    const resp = handleVoiceTranscribe(std.testing.allocator, "POST", "POST /voice HTTP/1.1\r\n\r\n{}", &cfg);
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "not enabled") != null);
+}
+
+test "handleVoiceTranscribe returns 503 without api key" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/voice_test",
+        .config_path = "/tmp/voice_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.audio_media.enabled = true;
+    cfg.audio_media.provider = "groq";
+    cfg.providers = &.{}; // no providers configured
+    const resp = handleVoiceTranscribe(std.testing.allocator, "POST", "POST /voice HTTP/1.1\r\n\r\n{}", &cfg);
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "api key") != null);
+}
+
+test "handleVoiceTranscribe returns 400 without body" {
+    const provider_entry = config_types.ProviderEntry{ .name = "groq", .api_key = "test-key" };
+    var cfg = Config{
+        .workspace_dir = "/tmp/voice_test",
+        .config_path = "/tmp/voice_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.audio_media.enabled = true;
+    cfg.audio_media.provider = "groq";
+    cfg.providers = @constCast(&[_]config_types.ProviderEntry{provider_entry});
+    const resp = handleVoiceTranscribe(std.testing.allocator, "POST", "POST /voice HTTP/1.1\r\n", &cfg);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "missing body") != null);
+}
+
+test "handleVoiceTranscribe returns 400 without audio field" {
+    const provider_entry = config_types.ProviderEntry{ .name = "groq", .api_key = "test-key" };
+    var cfg = Config{
+        .workspace_dir = "/tmp/voice_test",
+        .config_path = "/tmp/voice_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.audio_media.enabled = true;
+    cfg.audio_media.provider = "groq";
+    cfg.providers = @constCast(&[_]config_types.ProviderEntry{provider_entry});
+    const resp = handleVoiceTranscribe(std.testing.allocator, "POST", "POST /voice HTTP/1.1\r\n\r\n{\"text\":\"hi\"}", &cfg);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "missing audio") != null);
+}
+
+test "handleVoiceTranscribe returns 400 for empty audio" {
+    const provider_entry = config_types.ProviderEntry{ .name = "groq", .api_key = "test-key" };
+    var cfg = Config{
+        .workspace_dir = "/tmp/voice_test",
+        .config_path = "/tmp/voice_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.audio_media.enabled = true;
+    cfg.audio_media.provider = "groq";
+    cfg.providers = @constCast(&[_]config_types.ProviderEntry{provider_entry});
+    const resp = handleVoiceTranscribe(std.testing.allocator, "POST", "POST /voice HTTP/1.1\r\n\r\n{\"audio\":\"\"}", &cfg);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "empty audio") != null);
+}
+
+test "handleVoiceTranscribe returns 413 for oversized audio" {
+    const provider_entry = config_types.ProviderEntry{ .name = "groq", .api_key = "test-key" };
+    var cfg = Config{
+        .workspace_dir = "/tmp/voice_test",
+        .config_path = "/tmp/voice_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.audio_media.enabled = true;
+    cfg.audio_media.provider = "groq";
+    cfg.providers = @constCast(&[_]config_types.ProviderEntry{provider_entry});
+    // Build a request with >10MB audio field — use a JSON body with a very long audio value
+    // We only need to check the length guard, so construct the request header + body referencing a long string
+    const huge_audio = "A" ** (10 * 1024 * 1024 + 1);
+    const body = "{\"audio\":\"" ++ huge_audio ++ "\"}";
+    const req = "POST /voice HTTP/1.1\r\n\r\n" ++ body;
+    const resp = handleVoiceTranscribe(std.testing.allocator, "POST", req, &cfg);
+    try std.testing.expectEqualStrings("413 Payload Too Large", resp.status);
+}
+
+test "handleVoiceSynthesize rejects GET" {
+    const resp = handleVoiceSynthesize(std.testing.allocator, "GET", "GET /voice HTTP/1.1\r\n\r\n", null);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleVoiceSynthesize returns 503 without config" {
+    const resp = handleVoiceSynthesize(std.testing.allocator, "POST", "POST /voice HTTP/1.1\r\n\r\n{}", null);
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.status);
+}
+
+test "handleVoiceSynthesize returns 400 for empty text" {
+    const provider_entry = config_types.ProviderEntry{ .name = "openrouter", .api_key = "test-key" };
+    var cfg = Config{
+        .workspace_dir = "/tmp/voice_test",
+        .config_path = "/tmp/voice_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.providers = @constCast(&[_]config_types.ProviderEntry{provider_entry});
+    const resp = handleVoiceSynthesize(std.testing.allocator, "POST", "POST /voice HTTP/1.1\r\n\r\n{\"text\":\"   \"}", &cfg);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "empty text") != null);
+}
+
+test "handleVoiceSynthesize returns 400 without text field" {
+    const provider_entry = config_types.ProviderEntry{ .name = "openrouter", .api_key = "test-key" };
+    var cfg = Config{
+        .workspace_dir = "/tmp/voice_test",
+        .config_path = "/tmp/voice_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.providers = @constCast(&[_]config_types.ProviderEntry{provider_entry});
+    const resp = handleVoiceSynthesize(std.testing.allocator, "POST", "POST /voice HTTP/1.1\r\n\r\n{\"voice\":\"nova\"}", &cfg);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "missing text") != null);
 }

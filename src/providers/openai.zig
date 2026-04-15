@@ -2,6 +2,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
+const NNGTs_prefix_order = @import("NNGTs_prefix_order.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -311,7 +312,7 @@ pub const OpenAiProvider = struct {
         if (request.tools) |tools| {
             if (tools.len > 0) {
                 try buf.appendSlice(allocator, ",\"tools\":");
-                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try NNGTs_prefix_order.convertToolsSorted(&buf, allocator, tools);
                 try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
             }
         }
@@ -353,7 +354,7 @@ pub const OpenAiProvider = struct {
         if (request.tools) |tools| {
             if (tools.len > 0) {
                 try buf.appendSlice(allocator, ",\"tools\":");
-                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try NNGTs_prefix_order.convertToolsSorted(&buf, allocator, tools);
                 try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
             }
         }

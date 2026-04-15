@@ -57,17 +57,25 @@ pub const NarrationObserver = struct {
         self.inner.recordEvent(event);
 
         // Generate narration frames for specific events.
+        // Use activity_label, command, and files from tool events for specific
+        // narration instead of generic "Using tool" / "Tool completed".
         switch (event.*) {
             .tool_call_start => |e| {
+                // Priority: activity_label > "Running: {command}" > "Using {tool}"
+                const message = e.activity_label orelse
+                    if (e.command != null) "Running command" else "Using tool";
                 self.emitFrame(.{
-                    .message = "Using tool",
+                    .message = message,
                     .frame_type = .tool_start,
                     .tool_name = e.tool,
                 });
             },
             .tool_call => |e| {
+                // Use result_summary if available, otherwise generic success/fail
+                const message = e.result_summary orelse
+                    if (e.success) "Tool completed" else "Tool failed";
                 self.emitFrame(.{
-                    .message = if (e.success) "Tool completed" else "Tool failed",
+                    .message = message,
                     .frame_type = if (e.success) .tool_done else .error_recovery,
                     .tool_name = e.tool,
                 });

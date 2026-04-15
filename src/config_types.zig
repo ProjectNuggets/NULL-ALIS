@@ -144,6 +144,16 @@ pub const AssistantModePresetAgentConfig = struct {
     queue_cap: u32,
     queue_drop: []const u8,
     queue_debounce_ms: u32 = 0,
+    /// Temperature override for this mode. null = use Config.default_temperature.
+    temperature: ?f64 = null,
+    /// Max tool iterations per turn. 0 = use AgentConfig.max_tool_iterations default.
+    max_tool_iterations: u32 = 0,
+    /// Max response tokens per turn. 0 = use resolved model default.
+    max_response_tokens: u32 = 0,
+    /// Model override for this mode. Empty string = use Config.default_model.
+    model: []const u8 = "",
+    /// Provider override for this mode. Empty string = use Config.default_provider.
+    provider: []const u8 = "",
 };
 
 pub const AssistantModePresetSummarizerConfig = struct {
@@ -162,11 +172,21 @@ pub const ProductPresetsConfig = struct {
     fast: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            .max_history_messages = 40,
-            .queue_mode = "latest",
+            // max_history_messages: high safety valve — token-based three-pass
+            // compression (60%/85%) is the intelligent compaction mechanism.
+            // References (Claude Code, Cursor, Devin) don't use message count caps.
+            .max_history_messages = 500,
+            .queue_mode = "serial",
             .queue_cap = 8,
-            .queue_drop = "newest",
+            .queue_drop = "summarize",
             .queue_debounce_ms = 0,
+            .temperature = 0.5,
+            .max_tool_iterations = 8,
+            // Gemma 4 31B: fast, cheap, good tool calling.
+            // Together primary (has Gemma 4 with function calling).
+            // Groq fallback when they add Gemma 4 support.
+            .model = "google/gemma-4-31b-it",
+            .provider = "together",
         },
         .summarizer = .{
             .enabled = true,
@@ -178,15 +198,21 @@ pub const ProductPresetsConfig = struct {
     balanced: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            .max_history_messages = 50,
+            .max_history_messages = 500,
             .queue_mode = "serial",
             .queue_cap = 12,
             .queue_drop = "summarize",
             .queue_debounce_ms = 0,
+            .temperature = 0.7,
+            .max_tool_iterations = 25,
+            // Kimi K2.5: top open-weight intelligence, strong multi-tool.
+            // Together primary (org-prefixed ID), OpenRouter fallback.
+            .model = "moonshotai/Kimi-K2.5",
+            .provider = "together",
         },
         .summarizer = .{
             .enabled = true,
-            .window_size_tokens = 4000,
+            .window_size_tokens = 5000,
             .summary_max_tokens = 500,
             .auto_extract_semantic = true,
         },
@@ -194,19 +220,42 @@ pub const ProductPresetsConfig = struct {
     deep: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            .max_history_messages = 80,
+            .max_history_messages = 500,
             .queue_mode = "serial",
             .queue_cap = 20,
             .queue_drop = "summarize",
             .queue_debounce_ms = 0,
+            .temperature = 0.8,
+            .max_tool_iterations = 50,
+            // GLM 5.1: SOTA SWE-Bench Pro (58.4), 202K context, 65K output,
+            // built for 8-hour autonomous execution loops.
+            // Together primary. MiniMax M2.7 on Together as model fallback
+            // ($0.30/$1.20 — strong agent capabilities at lower cost).
+            .model = "zai-org/GLM-5.1",
+            .provider = "together",
         },
         .summarizer = .{
             .enabled = true,
-            .window_size_tokens = 6000,
+            .window_size_tokens = 8000,
             .summary_max_tokens = 700,
             .auto_extract_semantic = true,
         },
     },
+};
+
+pub const SidecarConfig = struct {
+    /// Enable the sidecar provider for auxiliary LLM calls (narration, compaction).
+    enabled: bool = true,
+    /// Provider for sidecar calls. Groq primary (free tier, 14,400 req/day, ~100ms latency).
+    /// If Groq is unavailable or rate-limited, sidecar calls degrade gracefully
+    /// (narration skipped, compaction falls back to main model).
+    /// Override to "together" for paid fallback ($0.18/M tokens).
+    provider: []const u8 = "groq",
+    /// Model for sidecar calls. Cheap and fast — used for narration, structured
+    /// extraction, and compaction summarization. Not user-facing.
+    model: []const u8 = "llama-3.1-8b-instant",
+    /// Interval: emit thinking narration every N tool iterations during multi-step tasks.
+    narration_interval: u32 = 3,
 };
 
 pub const AgentConfig = struct {

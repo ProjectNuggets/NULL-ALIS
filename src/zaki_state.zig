@@ -13,6 +13,23 @@ const config_types = @import("config_types.zig");
 const memory_root = @import("memory/root.zig");
 const cron_mod = @import("cron.zig");
 const security_secrets = @import("security/secrets.zig");
+
+/// Session metadata returned by listUserSessions. Defined at module level
+/// so both the mock and real Postgres implementations can use it.
+pub const SessionInfo = struct {
+    session_key: []const u8,
+    kind: []const u8,
+    title: []const u8,
+    message_count: u32,
+    last_active: []const u8,
+
+    pub fn deinit(self: *const SessionInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_key);
+        allocator.free(self.kind);
+        allocator.free(self.title);
+        allocator.free(self.last_active);
+    }
+};
 const pg_helpers = @import("memory/engines/postgres.zig");
 const zaki_session = @import("zaki_session.zig");
 const log = std.log.scoped(.zaki_state);
@@ -156,6 +173,9 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     }
     pub fn listSecretKeys(_: *@This(), allocator: std.mem.Allocator, _: i64) ![][]const u8 {
         return allocator.alloc([]const u8, 0);
+    }
+    pub fn listUserSessions(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]SessionInfo {
+        return allocator.alloc(SessionInfo, 0);
     }
     pub fn replaceJobsJson(_: *@This(), _: i64, _: []const u8, _: []const u8) !void {
         return error.PostgresNotEnabled;
@@ -2331,6 +2351,58 @@ const ManagerImpl = struct {
         const lengths = [_]c_int{ @intCast(session_id.len), @intCast(user_s.len), @intCast(kind.len), @intCast(title.len) };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
+    }
+
+    /// List all session keys for a user from the persistent sessions table.
+    /// Returns sessions with metadata (key, kind, title, message count, last activity).
+    /// Used by the session panel to show both live and evicted sessions.
+    pub fn listUserSessions(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]SessionInfo {
+        const q = try self.buildQuery(
+            "SELECT s.session_key, s.kind, s.title, " ++
+                "COALESCE((SELECT COUNT(*) FROM {schema}.messages m WHERE m.user_id = s.user_id AND m.session_id = s.session_key), 0) AS message_count, " ++
+                "COALESCE((SELECT MAX(created_at) FROM {schema}.messages m WHERE m.user_id = s.user_id AND m.session_id = s.session_key), s.created_at) AS last_active " ++
+                "FROM {schema}.sessions s WHERE s.user_id = $1 ORDER BY last_active DESC",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const rows: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc(SessionInfo, rows);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*info| info.deinit(allocator);
+            allocator.free(out);
+        }
+
+        for (0..rows) |i| {
+            const row: c_int = @intCast(i);
+            const count_str = try dupeResultValue(allocator, result, row, 3);
+            defer allocator.free(count_str);
+
+            // Allocate each field individually with errdefer cleanup
+            const sk = try dupeResultValue(allocator, result, row, 0);
+            errdefer allocator.free(sk);
+            const kd = try dupeResultValue(allocator, result, row, 1);
+            errdefer allocator.free(kd);
+            const tt = try dupeResultValue(allocator, result, row, 2);
+            errdefer allocator.free(tt);
+            const la = try dupeResultValue(allocator, result, row, 4);
+
+            out[i] = .{
+                .session_key = sk,
+                .kind = kd,
+                .title = tt,
+                .message_count = std.fmt.parseInt(u32, count_str, 10) catch 0,
+                .last_active = la,
+            };
+            initialized += 1;
+        }
+        return out;
     }
 
     fn decodeTaskSnapshotRow(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int) !TaskSnapshot {

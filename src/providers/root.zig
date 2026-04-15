@@ -244,6 +244,9 @@ pub const StreamChatResult = struct {
     tool_calls: []const ToolCall = &.{},
     usage: TokenUsage = .{},
     model: []const u8 = "",
+    /// Reasoning/thinking content accumulated during streaming.
+    /// Populated by providers that stream thinking blocks (Claude, GLM, Kimi).
+    reasoning_content: ?[]const u8 = null,
 };
 
 /// Tool specification for function-calling APIs.

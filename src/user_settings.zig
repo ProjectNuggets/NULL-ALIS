@@ -349,6 +349,34 @@ pub fn applySettingsToConfig(cfg: *Config, settings: ProductSettings) void {
     cfg.agent.queue_drop = preset.agent.queue_drop;
     cfg.agent.queue_debounce_ms = preset.agent.queue_debounce_ms;
 
+    // Mode-specific quality/cost differentiation
+    if (preset.agent.temperature) |temp| {
+        cfg.default_temperature = temp;
+    }
+    if (preset.agent.max_tool_iterations > 0) {
+        cfg.agent.max_tool_iterations = preset.agent.max_tool_iterations;
+    }
+    // Per-mode model/provider selection — the core of mode differentiation.
+    // Fast=Gemma/Together, Balanced=K2.5/Together, Deep=GLM/OpenRouter.
+    // Empty string = keep the current config default (operator override).
+    //
+    // IMPORTANT: When the provider changes, the RuntimeProviderBundle MUST be
+    // rebuilt. The provider bundle is an HTTP client pointed at a specific API
+    // endpoint — changing cfg.default_provider without rebuilding the bundle
+    // sends the wrong model to the wrong provider (silent failure).
+    // Currently safe: applySettingsToConfig runs before bundle init at boot.
+    // If hot-reload is added later, bundle rebuild must follow config update.
+    if (preset.agent.model.len > 0) {
+        cfg.default_model = preset.agent.model;
+    }
+    if (preset.agent.provider.len > 0) {
+        cfg.default_provider = preset.agent.provider;
+    }
+    // Note: max_response_tokens intentionally NOT applied from presets.
+    // Hard API caps truncate mid-response during agentic tasks (file writes, code gen).
+    // References (Claude Code, Cursor, Devin) use no per-mode response caps.
+    // Verbosity is controlled via persona voice_style (concise/verbose) instead.
+
     cfg.memory.summarizer.enabled = preset.summarizer.enabled;
     cfg.memory.summarizer.window_size_tokens = preset.summarizer.window_size_tokens;
     cfg.memory.summarizer.summary_max_tokens = preset.summarizer.summary_max_tokens;
@@ -621,13 +649,50 @@ test "applySettingsToConfig enables fast summarizer without changing fast preset
         .session_timeout_minutes = 30,
     });
 
-    try std.testing.expectEqualStrings("latest", cfg.agent.queue_mode);
+    try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
     try std.testing.expectEqual(@as(u32, 8), cfg.agent.queue_cap);
-    try std.testing.expectEqualStrings("newest", cfg.agent.queue_drop);
-    try std.testing.expectEqual(@as(u32, 40), cfg.agent.max_history_messages);
+    try std.testing.expectEqualStrings("summarize", cfg.agent.queue_drop);
+    try std.testing.expectEqual(@as(u32, 500), cfg.agent.max_history_messages);
     try std.testing.expect(cfg.memory.summarizer.enabled);
     try std.testing.expectEqual(@as(u32, 3000), cfg.memory.summarizer.window_size_tokens);
     try std.testing.expectEqual(@as(u32, 300), cfg.memory.summarizer.summary_max_tokens);
+
+    // Mode-specific quality fields
+    try std.testing.expectEqual(@as(f64, 0.5), cfg.default_temperature);
+    try std.testing.expectEqual(@as(u32, 8), cfg.agent.max_tool_iterations);
+    // max_response_tokens not applied — no hard cap on response length
+    try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
+    // Per-mode model/provider selection
+    try std.testing.expectEqualStrings("google/gemma-4-31b-it", cfg.default_model.?);
+    try std.testing.expectEqualStrings("together", cfg.default_provider);
+}
+
+test "applySettingsToConfig deep mode applies high-quality settings" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+
+    applySettingsToConfig(&cfg, .{
+        .assistant_mode = .deep,
+        .group_activation = .always,
+        .proactive_updates = false,
+        .voice_replies = true,
+        .session_timeout_minutes = 60,
+    });
+
+    try std.testing.expectEqual(@as(f64, 0.8), cfg.default_temperature);
+    try std.testing.expectEqual(@as(u32, 50), cfg.agent.max_tool_iterations);
+    // max_response_tokens not applied — no hard cap
+    try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
+    try std.testing.expectEqual(@as(u32, 500), cfg.agent.max_history_messages);
+    try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
+    try std.testing.expectEqual(@as(u32, 8000), cfg.memory.summarizer.window_size_tokens);
+    // Per-mode model/provider selection
+    try std.testing.expectEqualStrings("zai-org/GLM-5.1", cfg.default_model.?);
+    try std.testing.expectEqualStrings("together", cfg.default_provider);
 }
 
 test "resolveSettingsFromConfigJson clamps huge canonical timeout" {

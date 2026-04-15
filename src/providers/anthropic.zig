@@ -3,6 +3,7 @@ const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
+const NNGTs_cache = @import("NNGTs_cache.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -64,6 +65,7 @@ pub const AnthropicProvider = struct {
     }
 
     /// Build a simple chat request JSON body.
+    /// Uses cacheable system prompt format and proper JSON escaping.
     pub fn buildSimpleRequestBody(
         allocator: std.mem.Allocator,
         system_prompt: ?[]const u8,
@@ -71,15 +73,30 @@ pub const AnthropicProvider = struct {
         model: []const u8,
         temperature: f64,
     ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"model\":");
+        try root.appendJsonString(&buf, allocator, model);
+        try buf.appendSlice(allocator, ",\"max_tokens\":");
+        var max_buf: [16]u8 = undefined;
+        const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{DEFAULT_MAX_TOKENS}) catch return error.AnthropicApiError;
+        try buf.appendSlice(allocator, max_str);
+
         if (system_prompt) |sys| {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","max_tokens":{d},"system":"{s}","messages":[{{"role":"user","content":"{s}"}}],"temperature":{d:.2}}}
-            , .{ model, DEFAULT_MAX_TOKENS, sys, message, temperature });
-        } else {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","max_tokens":{d},"messages":[{{"role":"user","content":"{s}"}}],"temperature":{d:.2}}}
-            , .{ model, DEFAULT_MAX_TOKENS, message, temperature });
+            try buf.appendSlice(allocator, ",\"system\":");
+            try NNGTs_cache.serializeSystemCacheable(&buf, allocator, sys);
         }
+
+        try buf.appendSlice(allocator, ",\"messages\":[{\"role\":\"user\",\"content\":");
+        try root.appendJsonString(&buf, allocator, message);
+        try buf.appendSlice(allocator, "}],\"temperature\":");
+        var temp_buf: [16]u8 = undefined;
+        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.AnthropicApiError;
+        try buf.appendSlice(allocator, temp_str);
+        try buf.append(allocator, '}');
+
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Build the authorization header value based on credential type.
@@ -140,6 +157,9 @@ pub const AnthropicProvider = struct {
         var text_parts: std.ArrayListUnmanaged(u8) = .empty;
         defer text_parts.deinit(allocator);
 
+        var thinking_parts: std.ArrayListUnmanaged(u8) = .empty;
+        defer thinking_parts.deinit(allocator);
+
         var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
 
         if (root_obj.get("content")) |content_arr| {
@@ -147,7 +167,17 @@ pub const AnthropicProvider = struct {
                 const obj = block.object;
                 const kind = if (obj.get("type")) |t| (if (t == .string) t.string else "") else "";
 
-                if (std.mem.eql(u8, kind, "text")) {
+                if (std.mem.eql(u8, kind, "thinking")) {
+                    // Claude extended thinking block
+                    if (obj.get("thinking")) |thinking| {
+                        if (thinking == .string and thinking.string.len > 0) {
+                            if (thinking_parts.items.len > 0) {
+                                try thinking_parts.append(allocator, '\n');
+                            }
+                            try thinking_parts.appendSlice(allocator, thinking.string);
+                        }
+                    }
+                } else if (std.mem.eql(u8, kind, "text")) {
                     if (obj.get("text")) |text| {
                         if (text == .string) {
                             const trimmed = std.mem.trim(u8, text.string, " \t\r\n");
@@ -200,6 +230,7 @@ pub const AnthropicProvider = struct {
             .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
             .usage = usage,
             .model = try allocator.dupe(u8, model_str),
+            .reasoning_content = if (thinking_parts.items.len > 0) try thinking_parts.toOwnedSlice(allocator) else null,
         };
     }
 
@@ -446,7 +477,7 @@ fn buildChatRequestBody(
 
     if (system_prompt) |sys| {
         try buf.appendSlice(allocator, ",\"system\":");
-        try root.appendJsonString(&buf, allocator, sys);
+        try NNGTs_cache.serializeSystemCacheable(&buf, allocator, sys);
     }
 
     try buf.appendSlice(allocator, ",\"messages\":[");
@@ -513,7 +544,7 @@ fn buildStreamingChatRequestBody(
 
     if (system_prompt) |sys| {
         try buf.appendSlice(allocator, ",\"system\":");
-        try root.appendJsonString(&buf, allocator, sys);
+        try NNGTs_cache.serializeSystemCacheable(&buf, allocator, sys);
     }
 
     try buf.appendSlice(allocator, ",\"messages\":[");

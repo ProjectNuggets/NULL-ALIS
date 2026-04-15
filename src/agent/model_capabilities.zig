@@ -59,6 +59,14 @@ const MODEL_TABLE = [_]ModelEntry{
     .{ .key = "deepseek-v3.2", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     .{ .key = "deepseek-chat", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     .{ .key = "deepseek-reasoner", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
+    // Zhipu / GLM
+    .{ .key = "glm-5.1", .caps = .{ .context_window = 202_000, .max_output = 65_536 } },
+    .{ .key = "glm-5.1-air", .caps = .{ .context_window = 202_000, .max_output = 32_768 } },
+    // Google Gemma
+    .{ .key = "gemma-4-26b-a4b-it", .caps = .{ .context_window = 256_000, .max_output = 8_192 } },
+    .{ .key = "gemma-4-31b-it", .caps = .{ .context_window = 256_000, .max_output = 8_192 } },
+    .{ .key = "gemma-4-e2b-it", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
+    .{ .key = "gemma-4-e4b-it", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     // Meta LLaMA / Mixtral
     .{ .key = "llama-4-70b-instruct", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     .{ .key = "llama-3.3-70b-versatile", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
