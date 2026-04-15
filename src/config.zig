@@ -1481,16 +1481,17 @@ test "save roundtrip preserves extended config sections" {
     cfg.scheduler.max_concurrent = 2;
 
     cfg.agent.compact_context = true;
-    cfg.agent.max_tool_iterations = 7;
-    cfg.agent.max_history_messages = 21;
+    // max_tool_iterations: NOT set here — mode presets handle this (8/25/500).
+    // max_history_messages: NOT set here — mode presets set 500.
     cfg.agent.parallel_tools = true;
-    cfg.agent.parallel_tools_rollout_percent = 35;
+    cfg.agent.parallel_tools_rollout_percent = 100;
     cfg.agent.tool_dispatcher = "parallel";
     cfg.agent.session_idle_timeout_secs = 90;
-    cfg.agent.compaction_keep_recent = 12;
-    cfg.agent.compaction_max_summary_chars = 3000;
-    cfg.agent.compaction_max_source_chars = 9000;
-    cfg.agent.message_timeout_secs = 60;
+    // Phase 3.9 compaction budgets — profile must not override these.
+    cfg.agent.compaction_keep_recent = 20;
+    cfg.agent.compaction_max_summary_chars = 16_000;
+    cfg.agent.compaction_max_source_chars = 80_000;
+    cfg.agent.message_timeout_secs = 300;
 
     cfg.memory.search.provider = "openai";
     cfg.memory.search.model = "text-embedding-3-small";
@@ -1601,7 +1602,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("docker", loaded.runtime.kind);
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expect(loaded.agent.parallel_tools);
-    try std.testing.expectEqual(@as(u8, 35), loaded.agent.parallel_tools_rollout_percent);
+    try std.testing.expectEqual(@as(u8, 100), loaded.agent.parallel_tools_rollout_percent);
 
     try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
     try std.testing.expect(loaded.memory.response_cache.enabled);
