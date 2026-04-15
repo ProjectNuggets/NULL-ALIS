@@ -684,7 +684,7 @@ test "applySettingsToConfig deep mode applies high-quality settings" {
     });
 
     try std.testing.expectEqual(@as(f64, 0.8), cfg.default_temperature);
-    try std.testing.expectEqual(@as(u32, 50), cfg.agent.max_tool_iterations);
+    try std.testing.expectEqual(@as(u32, 500), cfg.agent.max_tool_iterations);
     // max_response_tokens not applied — no hard cap
     try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
     try std.testing.expectEqual(@as(u32, 500), cfg.agent.max_history_messages);

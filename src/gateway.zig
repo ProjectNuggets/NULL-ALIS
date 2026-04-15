@@ -10636,12 +10636,22 @@ fn handleApiRoute(
     }
 
     // ── Session CRUD endpoints (Phase 3.5) ──────────────────────────────
+    // In tenant mode, the per-worker session_mgr_opt is null. Resolve the
+    // tenant runtime's session manager via the user ID lookup instead.
+    const effective_session_mgr: ?*session_mod.SessionManager = session_mgr_opt orelse blk: {
+        state.tenant_runtime_mutex.lock();
+        defer state.tenant_runtime_mutex.unlock();
+        if (state.tenant_runtimes.get(scoped_user_id)) |runtime| {
+            break :blk &runtime.session_mgr;
+        }
+        break :blk null;
+    };
     if (std.mem.eql(u8, parsed.subpath, "sessions")) {
-        return handleSessionList(req_allocator, method, scoped_user_id, session_mgr_opt, state.zaki_state);
+        return handleSessionList(req_allocator, method, scoped_user_id, effective_session_mgr, state.zaki_state);
     }
     if (std.mem.startsWith(u8, parsed.subpath, "sessions/")) {
         const rest = parsed.subpath["sessions/".len..];
-        return handleSessionAction(req_allocator, method, scoped_user_id, rest, session_mgr_opt, raw_request);
+        return handleSessionAction(req_allocator, method, scoped_user_id, rest, effective_session_mgr, raw_request);
     }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"not found\"}" };

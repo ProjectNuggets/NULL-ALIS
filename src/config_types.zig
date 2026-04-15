@@ -226,7 +226,11 @@ pub const ProductPresetsConfig = struct {
             .queue_drop = "summarize",
             .queue_debounce_ms = 0,
             .temperature = 0.8,
-            .max_tool_iterations = 50,
+            // Effectively uncapped: deep mode runs until the model decides to stop
+            // or context is exhausted. Matches Claude Code behavior. Three-pass
+            // compression handles the context window. 500 is a safety valve, not
+            // a practical limit — most tasks complete in 10-30 iterations.
+            .max_tool_iterations = 500,
             // GLM 5.1: SOTA SWE-Bench Pro (58.4), 202K context, 65K output,
             // built for 8-hour autonomous execution loops.
             // Together primary. MiniMax M2.7 on Together as model fallback
