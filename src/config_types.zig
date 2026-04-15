@@ -172,10 +172,11 @@ pub const ProductPresetsConfig = struct {
     fast: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            // Fast mode: lower message cap to prevent large payloads to smaller models.
-            // Gemma 4 31B on Together.ai can timeout on 300+ message payloads.
-            // Token-based compaction is the primary mechanism, this is the safety cap.
-            .max_history_messages = 100,
+            // max_history_messages: safety valve for API payload size.
+            // Token-based compaction handles context quality. This cap prevents
+            // HTTP timeouts from 300+ message objects in a single API call.
+            // Context is preserved via compaction summaries before trim.
+            .max_history_messages = 200,
             .queue_mode = "serial",
             .queue_cap = 8,
             .queue_drop = "summarize",
@@ -198,7 +199,7 @@ pub const ProductPresetsConfig = struct {
     balanced: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            .max_history_messages = 500,
+            .max_history_messages = 200,
             .queue_mode = "serial",
             .queue_cap = 12,
             .queue_drop = "summarize",
@@ -220,7 +221,7 @@ pub const ProductPresetsConfig = struct {
     deep: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            .max_history_messages = 500,
+            .max_history_messages = 200,
             .queue_mode = "serial",
             .queue_cap = 20,
             .queue_drop = "summarize",
