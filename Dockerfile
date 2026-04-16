@@ -56,7 +56,13 @@ FROM alpine:3.23 AS release-base
 
 LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
 
-RUN apk add --no-cache ca-certificates curl tzdata postgresql-libs
+RUN apk add --no-cache \
+      ca-certificates \
+      curl \
+      tzdata \
+      postgresql-libs \
+      poppler-utils \
+      pandoc
 
 COPY --from=builder /app/zig-out/bin/nullalis /usr/local/bin/nullalis
 COPY --from=config /nullclaw-data /nullclaw-data

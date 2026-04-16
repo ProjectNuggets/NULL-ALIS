@@ -10672,6 +10672,15 @@ fn handleApiRoute(
         return handleVoiceSynthesize(req_allocator, method, raw_request, config_opt);
     }
 
+    // ── Attachments (Phase 3.9 — user file uploads) ─────────────────────
+    // POST /api/v1/users/{id}/attachments
+    // Body: {"filename":"<safe name>","content_b64":"<base64>"}
+    // Writes to {workspace_path}/attachments/<safe_name>. Agent reads via
+    // the file_read tool with path "attachments/<safe_name>".
+    if (std.mem.eql(u8, parsed.subpath, "attachments")) {
+        return handleAttachmentUpload(req_allocator, method, raw_request, &user_ctx);
+    }
+
     // ── Session CRUD endpoints (Phase 3.5) ──────────────────────────────
     // In tenant mode, the per-worker session_mgr_opt is null. Resolve the
     // tenant runtime's session manager via the user ID lookup instead.
@@ -10804,6 +10813,114 @@ fn handleVoiceTranscribe(
     jsonEscapeInto(w, text) catch return response_build_err;
     w.writeAll("\"}") catch return response_build_err;
     return finalizeJsonBuf(allocator, &resp);
+}
+
+/// Validate an attachment filename. Returns true if safe.
+/// Allows: A-Z, a-z, 0-9, dot, dash, underscore, space. Max 200 chars.
+/// Rejects: slashes, backslashes, null bytes, leading dot, empty.
+fn isSafeAttachmentFilename(name: []const u8) bool {
+    if (name.len == 0 or name.len > 200) return false;
+    if (name[0] == '.') return false; // no hidden files, no .env
+    for (name) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or
+            (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or
+            c == '.' or c == '-' or c == '_' or c == ' ';
+        if (!ok) return false;
+    }
+    // No consecutive dots (prevents ".." traversal via URL decode quirks)
+    var i: usize = 1;
+    while (i < name.len) : (i += 1) {
+        if (name[i] == '.' and name[i - 1] == '.') return false;
+    }
+    return true;
+}
+
+/// POST /api/v1/users/{id}/attachments
+/// Body: {"filename":"AddGrowth.pdf","content_b64":"<base64>"}
+/// Writes decoded bytes to {workspace_path}/attachments/{filename}.
+/// Returns: {"path":"attachments/<filename>","bytes":<n>}
+///
+/// Security:
+/// - Filename must match isSafeAttachmentFilename (no /, no .., no hidden).
+/// - Max decoded size: 20 MB (matches multimodal cap).
+/// - Written under the user's own workspace directory (per-user isolation
+///   already enforced by UserContext selection above this call).
+fn handleAttachmentUpload(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    raw_request: []const u8,
+    user_ctx: *const UserContext,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    const body = extractBody(raw_request) orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
+    };
+    const filename = jsonStringField(body, "filename") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing filename\"}" };
+    };
+    if (!isSafeAttachmentFilename(filename)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"unsafe filename\"}" };
+    }
+    const content_b64 = jsonStringField(body, "content_b64") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing content_b64\"}" };
+    };
+    // Cap base64 input at ~27MB (decodes to ~20MB raw). Matches MAX_BODY_SIZE minus headroom.
+    if (content_b64.len > 27 * 1024 * 1024) {
+        return .{ .status = "413 Payload Too Large", .body = "{\"error\":\"attachment too large\"}" };
+    }
+
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(content_b64) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid base64\"}" };
+    };
+    if (decoded_len > 20 * 1024 * 1024) {
+        return .{ .status = "413 Payload Too Large", .body = "{\"error\":\"decoded size exceeds 20MB\"}" };
+    }
+    const decoded = allocator.alloc(u8, decoded_len) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc failed\"}" };
+    };
+    defer allocator.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, content_b64) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid base64\"}" };
+    };
+
+    // Ensure {workspace}/attachments directory exists.
+    const dir_path = std.fmt.allocPrint(allocator, "{s}/attachments", .{user_ctx.workspace_path}) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path build failed\"}" };
+    };
+    defer allocator.free(dir_path);
+    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"attachments dir create failed\"}" };
+        },
+    };
+
+    // Write file to {workspace}/attachments/{filename}.
+    const file_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, filename }) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path build failed\"}" };
+    };
+    defer allocator.free(file_path);
+
+    {
+        const file = std.fs.createFileAbsolute(file_path, .{ .truncate = true }) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"attachment write failed\"}" };
+        };
+        defer file.close();
+        file.writeAll(decoded) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"attachment write failed\"}" };
+        };
+    }
+
+    // Build response — return relative path the agent uses with file_read.
+    const resp = std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"attachments/{s}\",\"bytes\":{d}}}",
+        .{ filename, decoded_len },
+    ) catch "{\"error\":\"response build failed\"}";
+    return .{ .body = resp };
 }
 
 /// POST /api/v1/users/{id}/voice/synthesize
