@@ -1466,6 +1466,8 @@ const TenantRuntime = struct {
         conversation_context: ?agent_prompt.ConversationContext,
         message_turn_context: ?tools_mod.MessageTurnContext,
         progress_observer: ?Observer,
+        stream_callback: ?providers.StreamCallback,
+        stream_ctx: ?*anyopaque,
     ) ![]const u8 {
         self.last_used_s.store(std.time.timestamp(), .release);
         const numeric_user_id = std.fmt.parseInt(i64, self.user_id, 10) catch null;
@@ -1480,6 +1482,8 @@ const TenantRuntime = struct {
         const response = try self.session_mgr.processMessageWithContext(session_key, message, conversation_context, .{
             .message_turn_context = message_turn_context,
             .progress_observer = progress_observer,
+            .stream_callback = stream_callback,
+            .stream_ctx = stream_ctx,
         });
         return response;
     }
@@ -8807,8 +8811,7 @@ fn handleApiChatStreamSseConnection(
                     break :blk .{ .err = .{ .code = "tenant_runtime_failed", .msg = "tenant runtime init failed" } };
                 }
             };
-            // Tenant runtime path: stream_callback not wired yet (tenant API does not
-            // accept it). Falls back to buffered_replay post-hoc chunking even in live mode.
+            // Tenant runtime path: stream tokens directly to SSE for live delivery.
             break :blk .{ .ok = tenant_runtime.processMessage(
                 session_key,
                 message,
@@ -8823,6 +8826,8 @@ fn handleApiChatStreamSseConnection(
                     .is_dm = true,
                 },
                 progress_observer,
+                if (is_live) liveStreamCallback else null,
+                if (is_live) @ptrCast(&live_ctx) else null,
             ) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
@@ -9661,6 +9666,8 @@ fn handleApiRoute(
                         .is_dm = true,
                     },
                     progress_observer,
+                    null, // No streaming for this SSE endpoint variant
+                    null,
                 ) catch {
                     _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                     const err_sse = sseErrorEvent(req_allocator, "chat_failed", "chat failed") catch "event: error\ndata: {\"type\":\"error\",\"code\":\"chat_failed\",\"message\":\"chat failed\"}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
@@ -11340,6 +11347,8 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                         .is_group = is_group,
                         .is_dm = !is_group,
                     },
+                    null,
+                    null, // Telegram: no streaming (buffered reply)
                     null,
                 ) catch |err| blk: {
                     const agent_turn_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - agent_turn_start_ms));
