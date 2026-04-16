@@ -183,10 +183,10 @@ pub const ProductPresetsConfig = struct {
             .queue_debounce_ms = 0,
             .temperature = 0.5,
             .max_tool_iterations = 8,
-            // Gemma 4 31B: fast, cheap, good tool calling.
-            // Together primary (has Gemma 4 with function calling).
-            // Groq fallback when they add Gemma 4 support.
-            .model = "google/gemma-4-31b-it",
+            // Gemma 4 E4B: 4B effective params, fast inference, tool calling.
+            // Optimized for speed — sub-second TTFT on Together serverless.
+            // The 31B dense model was too slow on serverless (no prefix caching).
+            .model = "google/gemma-4-e4b-it",
             .provider = "together",
         },
         .summarizer = .{
