@@ -285,6 +285,13 @@ pub const AgentConfig = struct {
     compaction_keep_recent: u32 = 20,
     compaction_max_summary_chars: u32 = 16_000,
     compaction_max_source_chars: u32 = 80_000,
+    /// Sliding-window trigger: keep only the last N user turns verbatim. Older
+    /// turns are collapsed into one summary block placed after the system
+    /// message. This is the primary compaction trigger in stateless-provider
+    /// deployments (Together, Groq) where prefill cost scales with payload size.
+    /// Per-mode defaults are set in config.zig (fast=12, balanced=20, deep=30).
+    /// 0 disables turn-window compaction (falls back to token-based triggers).
+    history_window_turns: u32 = 20,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
     message_timeout_secs: u64 = 300,
     session_ttl_secs: ?u64 = null,

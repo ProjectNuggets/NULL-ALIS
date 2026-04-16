@@ -825,6 +825,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("compaction_max_source_chars")) |v| {
                 if (v == .integer) self.agent.compaction_max_source_chars = @intCast(v.integer);
             }
+            if (ag.object.get("history_window_turns")) |v| {
+                if (v == .integer and v.integer >= 0) self.agent.history_window_turns = @intCast(v.integer);
+            }
             if (ag.object.get("token_limit")) |v| {
                 if (v == .integer and v.integer >= 0) {
                     self.agent.token_limit = @intCast(v.integer);

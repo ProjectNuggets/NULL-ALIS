@@ -60,6 +60,15 @@ pub const CompactionConfig = struct {
     max_tokens: u32 = 0,
     message_timeout_secs: u64 = 0,
     max_history_messages: u32 = 50,
+    /// Sliding-window trigger: keep only the last N user turns verbatim. A "turn"
+    /// starts at a user role message and includes all following assistant/tool
+    /// messages up to the next user message. 0 disables turn-based compaction
+    /// (falls back to token-based triggers only).
+    ///
+    /// This is the PRIMARY trigger in stateless-provider deployments (Together
+    /// serverless, Groq) where every turn re-prefills the full message array.
+    /// Turn-count compaction bounds per-turn latency deterministically.
+    history_window_turns: u32 = 0,
     workspace_dir: ?[]const u8 = null,
 };
 
@@ -159,6 +168,134 @@ pub fn autoCompactHistory(
     }
 
     return compacted;
+}
+
+/// Count the number of user turns present in history. A "turn" begins at a
+/// message with role=.user. System messages and anything before the first user
+/// message are ignored for turn counting.
+pub fn countTurns(history: []const OwnedMessage) usize {
+    var count: usize = 0;
+    for (history) |*msg| {
+        if (msg.role == .user) count += 1;
+    }
+    return count;
+}
+
+/// Find the message index where the (turn_index)-th user turn starts.
+/// turn_index is 0-based. Returns null if not found.
+pub fn indexOfUserTurn(history: []const OwnedMessage, turn_index: usize) ?usize {
+    var seen: usize = 0;
+    for (history, 0..) |*msg, i| {
+        if (msg.role != .user) continue;
+        if (seen == turn_index) return i;
+        seen += 1;
+    }
+    return null;
+}
+
+/// Sliding-window compaction: keep the last `window_turns` user turns (and all
+/// assistant/tool messages belonging to each turn) verbatim. Everything older
+/// is collapsed into a single summary block prepended to the windowed history
+/// (after the system message, if any).
+///
+/// Tool-call pair hygiene is preserved automatically because turn boundaries
+/// always land on user messages — assistant + tool pairs inside a turn are never
+/// split.
+///
+/// Returns true if compaction was performed.
+pub fn compactByTurnWindow(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged(OwnedMessage),
+    provider: Provider,
+    model_name: []const u8,
+    config: CompactionConfig,
+) !bool {
+    const window = config.history_window_turns;
+    if (window == 0) return false;
+
+    const total_turns = countTurns(history.items);
+    if (total_turns <= window) return false;
+
+    const overflow_turns = total_turns - window;
+    // Boundary = index of the first user message we want to KEEP = the (overflow_turns)-th turn
+    const keep_start = indexOfUserTurn(history.items, overflow_turns) orelse return false;
+
+    const has_system = history.items.len > 0 and history.items[0].role == .system;
+    const start: usize = if (has_system) 1 else 0;
+    if (keep_start <= start) return false;
+
+    // Build a summary of history.items[start..keep_start] using the existing
+    // summarization helper. If the overflow is large, split in halves to stay
+    // within max_source_chars.
+    const summary = if ((keep_start - start) > 10) blk: {
+        const mid = start + (keep_start - start) / 2;
+        const summary_a = summarizeSlice(allocator, provider, model_name, history.items, start, mid, config) catch |err| {
+            log.warn("compaction.window: summarize_a failed ({}) — skipping window pass", .{err});
+            return false;
+        };
+        defer allocator.free(summary_a);
+        const summary_b = summarizeSlice(allocator, provider, model_name, history.items, mid, keep_start, config) catch |err| {
+            log.warn("compaction.window: summarize_b failed ({}) — skipping window pass", .{err});
+            return false;
+        };
+        defer allocator.free(summary_b);
+        const merged = try std.fmt.allocPrint(
+            allocator,
+            "Earlier context:\n{s}\n\nMore recent context:\n{s}",
+            .{ summary_a, summary_b },
+        );
+        if (merged.len > config.max_summary_chars) {
+            const truncated = try allocator.dupe(u8, merged[0..config.max_summary_chars]);
+            allocator.free(merged);
+            break :blk truncated;
+        }
+        break :blk merged;
+    } else summarizeSlice(allocator, provider, model_name, history.items, start, keep_start, config) catch |err| {
+        log.warn("compaction.window: summarize failed ({}) — skipping window pass", .{err});
+        return false;
+    };
+    defer allocator.free(summary);
+
+    const workspace_context = try readWorkspaceContextForSummary(allocator, config.workspace_dir);
+    defer allocator.free(workspace_context);
+
+    const summary_with_context = if (workspace_context.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ summary, workspace_context })
+    else
+        try allocator.dupe(u8, summary);
+    defer allocator.free(summary_with_context);
+
+    const summary_content = try std.fmt.allocPrint(
+        allocator,
+        "[Compaction summary — {d} earlier turns collapsed]\n{s}",
+        .{ overflow_turns, summary_with_context },
+    );
+
+    // Free the messages being compacted
+    for (history.items[start..keep_start]) |*msg| {
+        msg.deinit(allocator);
+    }
+
+    // Replace the first compacted slot with the summary (role=.assistant is
+    // what all providers accept; .user would also work, but assistant is
+    // closer to semantic truth: the runtime is providing meta-context).
+    history.items[start] = .{
+        .role = .assistant,
+        .content = summary_content,
+    };
+
+    // Shift remaining messages left
+    if (keep_start > start + 1) {
+        const src = history.items[keep_start..];
+        std.mem.copyForwards(OwnedMessage, history.items[start + 1 ..], src);
+        history.items.len -= (keep_start - start - 1);
+    }
+
+    log.info("compaction.window: collapsed {d} overflow turns into summary; kept {d} recent turns", .{
+        overflow_turns,
+        window,
+    });
+    return true;
 }
 
 /// Pass A: Cheap compaction — no LLM calls. Pure string operations.
@@ -1007,6 +1144,72 @@ test "autoCompactHistory no-op below token threshold" {
 
 test "DEFAULT_TOKEN_LIMIT constant" {
     try std.testing.expectEqual(config_types.DEFAULT_AGENT_TOKEN_LIMIT, DEFAULT_TOKEN_LIMIT);
+}
+
+test "countTurns counts only user role messages" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
+    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u1") });
+    try agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a1") });
+    try agent.history.append(allocator, .{ .role = .tool, .content = try allocator.dupe(u8, "t1") });
+    try agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a2") });
+    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u2") });
+    try agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a3") });
+
+    try std.testing.expectEqual(@as(usize, 2), countTurns(agent.history.items));
+}
+
+test "indexOfUserTurn returns correct message index" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
+    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u1") });
+    try agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a1") });
+    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u2") });
+    try agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a2") });
+    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u3") });
+
+    try std.testing.expectEqual(@as(?usize, 1), indexOfUserTurn(agent.history.items, 0));
+    try std.testing.expectEqual(@as(?usize, 3), indexOfUserTurn(agent.history.items, 1));
+    try std.testing.expectEqual(@as(?usize, 5), indexOfUserTurn(agent.history.items, 2));
+    try std.testing.expectEqual(@as(?usize, null), indexOfUserTurn(agent.history.items, 3));
+}
+
+test "compactByTurnWindow no-op when window disabled" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u1") });
+    try agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a1") });
+
+    const result = try compactByTurnWindow(allocator, &agent.history, agent.provider, agent.model_name, .{
+        .history_window_turns = 0,
+    });
+    try std.testing.expect(!result);
+    try std.testing.expectEqual(@as(usize, 2), agent.history.items.len);
+}
+
+test "compactByTurnWindow no-op when turns <= window" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u1") });
+    try agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a1") });
+    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u2") });
+    try agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a2") });
+
+    const result = try compactByTurnWindow(allocator, &agent.history, agent.provider, agent.model_name, .{
+        .history_window_turns = 5,
+    });
+    try std.testing.expect(!result);
+    try std.testing.expectEqual(@as(usize, 4), agent.history.items.len);
 }
 
 test "forceCompressHistory keeps system + last 4 messages" {

@@ -67,7 +67,7 @@ fn markImageMarkersIgnored(count: usize) void {
 
 pub const MultimodalConfig = struct {
     max_images: u32 = 4,
-    max_image_size_bytes: u64 = 5_242_880, // 5 MB
+    max_image_size_bytes: u64 = 20_971_520, // 20 MB
     /// Allow passing remote image URLs (`https://...`) through to providers.
     /// Disabled by default for secure-by-default behavior.
     allow_remote_fetch: bool = false,
@@ -690,7 +690,7 @@ test "isUrl relative path" {
 test "MultimodalConfig defaults" {
     const cfg = MultimodalConfig{};
     try std.testing.expectEqual(@as(u32, 4), cfg.max_images);
-    try std.testing.expectEqual(@as(u64, 5_242_880), cfg.max_image_size_bytes);
+    try std.testing.expectEqual(@as(u64, 20_971_520), cfg.max_image_size_bytes);
 }
 
 test "prepareMessagesForProvider no markers passes through" {

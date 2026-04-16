@@ -307,6 +307,8 @@ pub const Agent = struct {
     allowed_paths: []const []const u8 = &.{},
     max_tool_iterations: u32,
     max_history_messages: u32,
+    /// Sliding-window compaction trigger. See CompactionConfig.history_window_turns.
+    history_window_turns: u32 = 0,
     parallel_tools: bool = false,
     parallel_tools_rollout_percent: u8 = 100,
     tool_dispatcher_mode: ToolDispatcherMode = .auto,
@@ -481,6 +483,7 @@ pub const Agent = struct {
             .allowed_paths = cfg.autonomy.allowed_paths,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
+            .history_window_turns = cfg.agent.history_window_turns,
             .parallel_tools = cfg.agent.parallel_tools,
             .parallel_tools_rollout_percent = cfg.agent.parallel_tools_rollout_percent,
             .tool_dispatcher_mode = tool_dispatcher.parseMode(cfg.agent.tool_dispatcher).mode,
@@ -572,12 +575,16 @@ pub const Agent = struct {
     }
 
     /// Auto-compact history when it exceeds thresholds.
+    /// Primary trigger: sliding-window (turn-count) — keeps last N user turns
+    /// verbatim, collapses older into one summary block. Deterministic latency
+    /// bound for stateless providers (Together/Groq) without prefix caching.
+    /// Fallback: token-based triggers (60%/75%/85%) if window is 0.
     /// Uses sidecar provider for LLM summarization if available (cost savings:
     /// Groq Llama 8B instead of Sonnet/GLM/K2.5). Falls back to main provider.
     pub fn autoCompactHistory(self: *Agent) !bool {
         const compact_provider = if (self.sidecar_provider) |sp| sp else self.provider;
         const compact_model = if (self.sidecar_provider != null) self.sidecar_model else self.model_name;
-        return compaction.autoCompactHistory(self.allocator, &self.history, compact_provider, compact_model, .{
+        const cfg = compaction.CompactionConfig{
             .keep_recent = self.compaction_keep_recent,
             .max_summary_chars = self.compaction_max_summary_chars,
             .max_source_chars = self.compaction_max_source_chars,
@@ -585,8 +592,20 @@ pub const Agent = struct {
             .max_tokens = self.max_tokens,
             .message_timeout_secs = self.message_timeout_secs,
             .max_history_messages = self.max_history_messages,
+            .history_window_turns = self.history_window_turns,
             .workspace_dir = self.workspace_dir,
-        });
+        };
+
+        // Primary: turn-based sliding window. When this fires, it supersedes
+        // token-based passes for this invocation (the window already bounds payload).
+        if (self.history_window_turns > 0) {
+            const windowed = try compaction.compactByTurnWindow(self.allocator, &self.history, compact_provider, compact_model, cfg);
+            if (windowed) return true;
+        }
+
+        // Fallback / complementary: token-based passes (handles runaway tool outputs
+        // even when turn count is within window).
+        return compaction.autoCompactHistory(self.allocator, &self.history, compact_provider, compact_model, cfg);
     }
 
     /// Manual compaction for explicit operator boundaries.
@@ -601,6 +620,7 @@ pub const Agent = struct {
             .max_tokens = self.max_tokens,
             .message_timeout_secs = self.message_timeout_secs,
             .max_history_messages = self.max_history_messages,
+            .history_window_turns = self.history_window_turns,
             .workspace_dir = self.workspace_dir,
         });
     }
