@@ -183,14 +183,13 @@ pub const ProductPresetsConfig = struct {
             .queue_debounce_ms = 0,
             .temperature = 0.5,
             .max_tool_iterations = 8,
-            // Llama 3.3 70B on Groq: production-quality chat model served on
-            // Groq's LPU hardware (~600ms TTFT despite being 70B dense).
-            // Groq has AUTOMATIC prefix caching on serverless (free), so
-            // repeated turns with stable prefix get massive speedup.
-            // Quality tier: Meta's latest open-weight, battle-tested, strong
-            // tool calling. Free tier: 14,400 req/day (shared with sidecar).
-            .model = "llama-3.3-70b-versatile",
-            .provider = "groq",
+            // Kimi K2.5 on Together for both fast and balanced modes.
+            // Differentiation comes from agent loop parameters:
+            // Fast:     temp 0.5, 8 iterations,  queue_cap 8,  history 500
+            // Balanced: temp 0.7, 25 iterations, queue_cap 12, history 500
+            // Deep uses GLM 5.1 for maximum depth on complex tasks.
+            .model = "moonshotai/Kimi-K2.5",
+            .provider = "together",
         },
         .summarizer = .{
             .enabled = true,
