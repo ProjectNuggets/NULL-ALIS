@@ -9429,19 +9429,49 @@ fn handleSessionHistory(
     mgr: *session_mod.SessionManager,
     session_key: []const u8,
 ) RouteResponse {
-    // Returns messages array only (no session_key wrapper) — BFF compatibility.
+    // Try in-memory first (live session with full history)
     const built = buildSessionMessagesJson(allocator, mgr, session_key);
-    if (built.err) |err_resp| return err_resp;
-    const messages_json = built.json.?;
-    defer allocator.free(messages_json);
+    if (built.json) |messages_json| {
+        defer allocator.free(messages_json);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(allocator);
+        const w = out.writer(allocator);
+        w.writeAll("{\"messages\":[") catch return response_build_err;
+        w.writeAll(messages_json) catch return response_build_err;
+        w.writeAll("]}") catch return response_build_err;
+        return finalizeJsonBuf(allocator, &out);
+    }
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(allocator);
-    const w = out.writer(allocator);
-    w.writeAll("{\"messages\":[") catch return response_build_err;
-    w.writeAll(messages_json) catch return response_build_err;
-    w.writeAll("]}") catch return response_build_err;
-    return finalizeJsonBuf(allocator, &out);
+    // Fallback: load from persistent session store (evicted/restored sessions)
+    if (mgr.session_store) |store| {
+        const entries = store.loadMessages(allocator, session_key) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"history_load_failed\"}" };
+        };
+        defer {
+            for (entries) |entry| {
+                allocator.free(entry.role);
+                allocator.free(entry.content);
+            }
+            allocator.free(entries);
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(allocator);
+        const w = out.writer(allocator);
+        w.writeAll("{\"messages\":[") catch return response_build_err;
+        for (entries, 0..) |entry, i| {
+            if (i > 0) w.writeAll(",") catch return response_build_err;
+            w.writeAll("{\"role\":\"") catch return response_build_err;
+            jsonEscapeInto(w, entry.role) catch return response_build_err;
+            w.writeAll("\",\"content\":\"") catch return response_build_err;
+            jsonEscapeInto(w, entry.content) catch return response_build_err;
+            w.writeAll("\"}") catch return response_build_err;
+        }
+        w.writeAll("]}") catch return response_build_err;
+        return finalizeJsonBuf(allocator, &out);
+    }
+
+    return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
 }
 
 /// Pure input validation for session approve requests. Does not touch session
