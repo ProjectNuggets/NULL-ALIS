@@ -14,6 +14,14 @@ const MemoryEntry = root.MemoryEntry;
 const LAST_HYGIENE_KEY = "last_hygiene_at";
 const TOMBSTONES_FILENAME = "TOMBSTONES.md";
 
+/// Max size for a single memory markdown file on read. Grew from 1 MB to 16 MB
+/// after production logs showed `error.FileTooBig` on MEMORY.md for active
+/// sessions with many curated entries + context anchors. Postgres is
+/// authoritative; the markdown mirror only degrades if this cap is too low.
+/// 16 MB is a practical ceiling — a single markdown at that size is a
+/// pathological state that a future sweeper should compact.
+const MARKDOWN_FILE_READ_CAP: usize = 16 * 1024 * 1024;
+
 pub const MarkdownMemory = struct {
     workspace_dir: []const u8,
     allocator: std.mem.Allocator,
@@ -165,7 +173,7 @@ pub const MarkdownMemory = struct {
     fn replaceCoreEntryAtomic(path: []const u8, key: []const u8, content: []const u8, allocator: std.mem.Allocator) !void {
         try ensureDir(path);
 
-        const existing = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+        const existing = std.fs.cwd().readFileAlloc(allocator, path, MARKDOWN_FILE_READ_CAP) catch |err| switch (err) {
             error.FileNotFound => try allocator.dupe(u8, ""),
             else => return err,
         };
@@ -206,7 +214,7 @@ pub const MarkdownMemory = struct {
     fn removeStructuredEntryAtomic(path: []const u8, key: []const u8, allocator: std.mem.Allocator) !void {
         try ensureDir(path);
 
-        const existing = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+        const existing = std.fs.cwd().readFileAlloc(allocator, path, MARKDOWN_FILE_READ_CAP) catch |err| switch (err) {
             error.FileNotFound => try allocator.dupe(u8, ""),
             else => return err,
         };
@@ -274,7 +282,7 @@ pub const MarkdownMemory = struct {
         const path = try self.tombstonePath(allocator);
         defer allocator.free(path);
 
-        const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+        const content = std.fs.cwd().readFileAlloc(allocator, path, MARKDOWN_FILE_READ_CAP) catch |err| switch (err) {
             error.FileNotFound => return result.toOwnedSlice(allocator),
             else => return err,
         };
@@ -462,7 +470,7 @@ pub const MarkdownMemory = struct {
 
         const cp = try self.corePath(parse_allocator);
         defer parse_allocator.free(cp);
-        if (std.fs.cwd().readFileAlloc(parse_allocator, cp, 1024 * 1024)) |content| {
+        if (std.fs.cwd().readFileAlloc(parse_allocator, cp, MARKDOWN_FILE_READ_CAP)) |content| {
             const entries = try parseEntries(content, "MEMORY", .core, parse_allocator);
             for (entries) |entry| {
                 const cloned = try cloneEntry(allocator, entry);
@@ -496,7 +504,7 @@ pub const MarkdownMemory = struct {
             for (filenames.items) |entry_name| {
                 const fpath = try std.fmt.allocPrint(parse_allocator, "{s}/{s}", .{ md, entry_name });
                 defer parse_allocator.free(fpath);
-                if (std.fs.cwd().readFileAlloc(parse_allocator, fpath, 1024 * 1024)) |content| {
+                if (std.fs.cwd().readFileAlloc(parse_allocator, fpath, MARKDOWN_FILE_READ_CAP)) |content| {
                     const fname = entry_name[0 .. entry_name.len - 3];
                     const entries = try parseEntries(content, fname, .daily, parse_allocator);
                     for (entries) |parsed| {
@@ -508,7 +516,7 @@ pub const MarkdownMemory = struct {
 
             const tombstone_path = try std.fmt.allocPrint(parse_allocator, "{s}/{s}", .{ md, TOMBSTONES_FILENAME });
             defer parse_allocator.free(tombstone_path);
-            if (std.fs.cwd().readFileAlloc(parse_allocator, tombstone_path, 1024 * 1024)) |content| {
+            if (std.fs.cwd().readFileAlloc(parse_allocator, tombstone_path, MARKDOWN_FILE_READ_CAP)) |content| {
                 const entries = try parseEntries(content, "TOMBSTONES", .daily, parse_allocator);
                 for (entries) |parsed| {
                     const cloned = try cloneEntry(allocator, parsed);

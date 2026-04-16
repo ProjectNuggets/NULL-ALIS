@@ -1041,23 +1041,34 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         const prompt = memory_mod.buildSummarizationPrompt(self.allocator, entries, entries.len) catch return false;
         defer self.allocator.free(prompt);
 
-        const summary_system = "Summarize the ended session into a compact continuity object. Preserve focus, decisions, open loops, next steps, and long-lived facts. Follow the required plain-text structure exactly.";
+        const summary_system = "Summarize the ended session into a compact continuity object. " ++
+            "Output plain text only. No markdown formatting — no bold, no headers (#), no asterisks. " ++
+            "Use exactly these section labels with colons on their own lines: focus:, decisions:, open_loops:, next:. " ++
+            "Preserve focus, decisions, open loops, next steps, and long-lived facts.";
         var summary_messages: [2]providers.ChatMessage = .{
             .{ .role = .system, .content = summary_system },
             .{ .role = .user, .content = prompt },
         };
         const timeout_secs = lifecycleSummaryTimeoutSecs(self);
 
-        var response = self.provider.chat(
+        // Use the sidecar (cheap, fast — Groq Llama 8B) when available. Main
+        // LLM (Kimi K2.5 / GLM) often wraps summaries in markdown headers
+        // like "**focus:**" which trip the strict parser. Sidecar small
+        // models follow plain-text format reliably and are 10-20x cheaper.
+        const use_sidecar = self.sidecar_provider != null and self.sidecar_model.len > 0;
+        const summary_provider = if (use_sidecar) self.sidecar_provider.? else self.provider;
+        const summary_model = if (use_sidecar) self.sidecar_model else self.model_name;
+
+        var response = summary_provider.chat(
             self.allocator,
             .{
                 .messages = summary_messages[0..],
-                .model = self.model_name,
+                .model = summary_model,
                 .temperature = 0.2,
                 .tools = null,
                 .timeout_secs = timeout_secs,
             },
-            self.model_name,
+            summary_model,
             0.2,
         ) catch {
             summary_text_owned = buildStructuredFallbackSummary(self, entries, checkpoint_content);

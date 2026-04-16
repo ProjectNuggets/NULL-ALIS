@@ -203,6 +203,19 @@ pub fn indexOfUserTurn(history: []const OwnedMessage, turn_index: usize) ?usize 
 /// split.
 ///
 /// Returns true if compaction was performed.
+/// Marker prefix used to identify a previously-generated compaction summary
+/// in history. When we re-enter compactByTurnWindow, if history.items[start]
+/// begins with this marker, it means the cached summary is still present and
+/// we can amortize the sidecar LLM cost across multiple subsequent turns.
+const COMPACTION_SUMMARY_PREFIX: []const u8 = "[Compaction summary";
+
+/// Re-compaction threshold: how many NEW overflow messages must accumulate
+/// past the cached summary before we pay the sidecar LLM cost again. Five
+/// messages ≈ 2-3 conversational turns (a turn often has user + assistant
+/// + one tool_call + tool_result = 4 messages). This amortizes the ~12s
+/// summarization cost across 4-5 turns instead of paying it every turn.
+const COMPACTION_RECOMPUTE_MSG_THRESHOLD: usize = 5;
+
 pub fn compactByTurnWindow(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
@@ -223,6 +236,35 @@ pub fn compactByTurnWindow(
     const has_system = history.items.len > 0 and history.items[0].role == .system;
     const start: usize = if (has_system) 1 else 0;
     if (keep_start <= start) return false;
+
+    // ── Cache check ──────────────────────────────────────────────────
+    // If history.items[start] is already a compaction summary from a
+    // previous invocation, we only re-summarize when enough new overflow
+    // has accumulated to justify the sidecar LLM cost. Otherwise we leave
+    // history untouched — the existing summary continues to cover the
+    // older context and the small amount of new overflow gets sent
+    // verbatim on this turn (acceptable: it's a handful of messages).
+    //
+    // This amortizes the 12s compaction cost from every-turn to every
+    // 4-5 turns in steady state.
+    const existing_summary_present = history.items[start].role == .assistant and
+        std.mem.startsWith(u8, history.items[start].content, COMPACTION_SUMMARY_PREFIX);
+
+    if (existing_summary_present) {
+        // Messages past the cached summary that would be newly rolled in.
+        const new_overflow_msgs = if (keep_start > start + 1) keep_start - start - 1 else 0;
+        if (new_overflow_msgs < COMPACTION_RECOMPUTE_MSG_THRESHOLD) {
+            log.info(
+                "compaction.window: cache hit — {d} new overflow msgs below threshold {d}, skipping re-summarization",
+                .{ new_overflow_msgs, COMPACTION_RECOMPUTE_MSG_THRESHOLD },
+            );
+            return false;
+        }
+        log.info(
+            "compaction.window: cache miss — {d} new overflow msgs at/over threshold {d}, re-summarizing",
+            .{ new_overflow_msgs, COMPACTION_RECOMPUTE_MSG_THRESHOLD },
+        );
+    }
 
     // Build a summary of history.items[start..keep_start] using the existing
     // summarization helper. If the overflow is large, split in halves to stay

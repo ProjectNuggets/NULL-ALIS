@@ -182,11 +182,17 @@ pub const ProductPresetsConfig = struct {
             .queue_drop = "summarize",
             .queue_debounce_ms = 0,
             .temperature = 0.5,
-            .max_tool_iterations = 8,
+            // Raised 8→20 after field testing showed 8 truncated real tasks
+            // mid-flow (e.g. "read PDF + check memory + compare + summarize"
+            // is 5-7 tool calls; with overhead, 8 was a hard stop for users).
+            // Adaptive exit (repeated-call detector) prevents runaways, so a
+            // higher cap is safe. Still "fast" perceptually — most single-step
+            // queries finish in 1-3 iterations.
+            .max_tool_iterations = 20,
             // Kimi K2.5 on Together for both fast and balanced modes.
             // Differentiation comes from agent loop parameters:
-            // Fast:     temp 0.5, 8 iterations,  queue_cap 8,  history 500
-            // Balanced: temp 0.7, 25 iterations, queue_cap 12, history 500
+            // Fast:     temp 0.5, 20 iterations,  queue_cap 8,  history 500
+            // Balanced: temp 0.7, 35 iterations, queue_cap 12, history 500
             // Deep uses GLM 5.1 for maximum depth on complex tasks.
             .model = "moonshotai/Kimi-K2.5",
             .provider = "together",
@@ -207,7 +213,11 @@ pub const ProductPresetsConfig = struct {
             .queue_drop = "summarize",
             .queue_debounce_ms = 0,
             .temperature = 0.7,
-            .max_tool_iterations = 25,
+            // Raised 25→35 to match SOTA ranges (Claude Code ~50, OpenHands 30).
+            // Balanced users tackle multi-step research/execution tasks; the
+            // extra headroom covers real workflows without changing perceived
+            // pace (first-token latency is unchanged).
+            .max_tool_iterations = 35,
             // Kimi K2.5: top open-weight intelligence, strong multi-tool.
             // Together primary (org-prefixed ID), OpenRouter fallback.
             .model = "moonshotai/Kimi-K2.5",
@@ -229,11 +239,13 @@ pub const ProductPresetsConfig = struct {
             .queue_drop = "summarize",
             .queue_debounce_ms = 0,
             .temperature = 0.8,
-            // Effectively uncapped: deep mode runs until the model decides to stop
-            // or context is exhausted. Matches Claude Code behavior. Three-pass
-            // compression handles the context window. 500 is a safety valve, not
-            // a practical limit — most tasks complete in 10-30 iterations.
-            .max_tool_iterations = 500,
+            // 100 is a real safety valve — previously 500 was effectively
+            // unbounded and masked loop bugs. Deep tasks legitimately need
+            // 30-60 iterations for SWE-Bench-style work; 100 leaves headroom
+            // without letting a pathological loop consume unlimited tokens.
+            // Adaptive exits (repeated-call + no-progress) handle premature
+            // termination for stuck agents, keeping the cap purely a guardrail.
+            .max_tool_iterations = 100,
             // GLM 5.1: SOTA SWE-Bench Pro (58.4), 202K context, 65K output,
             // built for 8-hour autonomous execution loops.
             // Together primary. MiniMax M2.7 on Together as model fallback

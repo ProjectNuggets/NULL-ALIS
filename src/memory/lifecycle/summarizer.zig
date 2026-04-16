@@ -218,9 +218,45 @@ pub fn parseSummaryResponse(
     };
 }
 
+/// Check if `section` label appears in `summary` at the start of a logical
+/// line, tolerating common LLM formatting decorations:
+///   - leading whitespace / bullet chars / hashes
+///   - surrounding markdown emphasis (**focus:** or __focus:__)
+///   - case-insensitive match
+/// This keeps the parser strict about WHICH sections must appear while
+/// accepting how the model decorates them.
+fn hasSectionMarker(summary: []const u8, section: []const u8) bool {
+    var iter = std.mem.splitScalar(u8, summary, '\n');
+    while (iter.next()) |raw_line| {
+        // Strip leading whitespace, bullets, hashes
+        var line = raw_line;
+        while (line.len > 0 and (line[0] == ' ' or line[0] == '\t' or
+            line[0] == '-' or line[0] == '*' or line[0] == '#' or line[0] == '>'))
+        {
+            line = line[1..];
+        }
+        // Strip opening markdown emphasis: **, __
+        if (line.len >= 2 and (std.mem.startsWith(u8, line, "**") or std.mem.startsWith(u8, line, "__"))) {
+            line = line[2..];
+        }
+        if (line.len == 0) continue;
+        if (line.len < section.len) continue;
+        // Case-insensitive startsWith
+        var matches = true;
+        for (section, 0..) |c, i| {
+            if (std.ascii.toLower(line[i]) != std.ascii.toLower(c)) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return true;
+    }
+    return false;
+}
+
 fn hasRequiredStructuredSections(summary: []const u8) bool {
     for (required_summary_sections) |section| {
-        if (std.mem.indexOf(u8, summary, section) == null) return false;
+        if (!hasSectionMarker(summary, section)) return false;
     }
     return true;
 }

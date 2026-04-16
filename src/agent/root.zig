@@ -1423,6 +1423,17 @@ pub const Agent = struct {
         var turn_first_token_ms: ?u64 = null;
         var turn_first_token_upper_bound_ms: ?u64 = null;
 
+        // ── Adaptive exit: repeated-call detector ─────────────────────────
+        // Tracks the FNV-1a hash of the last 3 tool call sets (name+args). If
+        // the same hash appears 3 times in a row within a single turn, the
+        // agent is stuck in a loop — terminate early with a synthesis prompt
+        // instead of burning through max_tool_iterations. Hash of 0 is sentinel
+        // for "slot unused". ring buffer indexed by `recent_call_idx % 3`.
+        const LOOP_WINDOW: usize = 3;
+        var recent_call_hashes: [LOOP_WINDOW]u64 = .{ 0, 0, 0 };
+        var recent_call_idx: usize = 0;
+        var loop_detected: bool = false;
+
         // Handle slash commands before sending to LLM (saves tokens)
         if (try self.handleSlashCommand(user_message)) |response| {
             return response;
@@ -1736,6 +1747,16 @@ pub const Agent = struct {
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
+
+            // ── Adaptive exit: loop detected last iteration ──────────────
+            // If repeated-call detector flagged a loop in the previous
+            // iteration, drop out of the tool loop now and let the exhaustion
+            // path produce a summary. This fires before LLM/tool work, so we
+            // don't pay another iteration's cost for a known-stuck agent.
+            if (loop_detected) {
+                log.warn("agent.loop_exit iteration={d} — breaking to summary fallback", .{iteration});
+                break;
+            }
 
             // ── Cooperative cancellation check ──────────────────────────
             if (self.cancellation_token.isCancelled()) {
@@ -2423,6 +2444,36 @@ pub const Agent = struct {
                 .role = .assistant,
                 .content = assistant_content,
             });
+
+            // ── Adaptive exit: repeated-call detector ─────────────────────
+            // Hash this iteration's tool call set. If the same hash has
+            // appeared in every slot of the ring buffer (LOOP_WINDOW
+            // consecutive iterations), we're looping — set loop_detected so
+            // the outer loop can exit cleanly after this iteration completes.
+            var h = std.hash.Fnv1a_64.init();
+            for (parsed_calls) |call| {
+                h.update(call.name);
+                h.update("\x00");
+                h.update(call.arguments_json);
+                h.update("\x01");
+            }
+            const call_set_hash = h.final();
+            recent_call_hashes[recent_call_idx % LOOP_WINDOW] = call_set_hash;
+            recent_call_idx += 1;
+            if (recent_call_idx >= LOOP_WINDOW) {
+                var all_same = true;
+                for (recent_call_hashes) |hv| {
+                    if (hv != call_set_hash) { all_same = false; break; }
+                }
+                if (all_same) {
+                    loop_detected = true;
+                    log.warn("agent.loop_detected iteration={d} hash={x} — same tool_call set repeated {d}x, will exit after this iteration", .{
+                        iteration,
+                        call_set_hash,
+                        LOOP_WINDOW,
+                    });
+                }
+            }
 
             // Execute tool calls (serial by default, optional parallel dispatcher)
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
