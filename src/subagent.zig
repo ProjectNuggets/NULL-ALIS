@@ -1060,9 +1060,7 @@ test "SubagentManager completeTask routes via bus" {
     mgr.completeTask(1, "result text", null);
 
     // Check bus received the message — verify depth increased
-    try std.testing.expect(bus.inboundDepth() > 0);
-
-    var msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    var msg = try waitForInboundMessage(&bus, 50);
     defer msg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("telegram", msg.channel);
     try std.testing.expectEqualStrings("12345", msg.chat_id);
@@ -1343,6 +1341,15 @@ fn waitForTaskTerminal(mgr: *SubagentManager, task_id: u64, timeout_ms: u64) !vo
     return error.TestTimeout;
 }
 
+fn waitForInboundMessage(bus: *bus_mod.Bus, timeout_ms: u64) !bus_mod.InboundMessage {
+    const start = std.time.milliTimestamp();
+    while (std.time.milliTimestamp() - start < timeout_ms) {
+        if (bus.consumeInbound()) |msg| return msg;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.TestTimeout;
+}
+
 fn waitForActiveRunnerCount(runner: *BlockingCompletionRunner, expected_active: usize, timeout_ms: u64) !void {
     const start = std.time.milliTimestamp();
     while (std.time.milliTimestamp() - start < timeout_ms) {
@@ -1424,9 +1431,7 @@ test "SubagentManager spawn e2e completes and publishes bus message" {
 
     try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(task_id).?);
     try std.testing.expectEqualStrings("completed: summarize this", mgr.getTaskResult(task_id).?);
-    try std.testing.expect(bus.inboundDepth() > 0);
-
-    var msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    var msg = try waitForInboundMessage(&bus, 250);
     defer msg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("agent", msg.channel);
     try std.testing.expectEqualStrings("session:e2e", msg.chat_id);
