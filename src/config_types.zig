@@ -183,10 +183,12 @@ pub const ProductPresetsConfig = struct {
             .queue_debounce_ms = 0,
             .temperature = 0.5,
             .max_tool_iterations = 8,
-            // Gemma 4 E4B: 4B effective params, fast inference, tool calling.
-            // Optimized for speed — sub-second TTFT on Together serverless.
-            // The 31B dense model was too slow on serverless (no prefix caching).
-            .model = "google/gemma-4-e4b-it",
+            // Gemma 4 31B on Together. Together serverless has no prefix caching
+            // (dedicated endpoints only), so every turn recomputes the prefix.
+            // Mitigations: streaming (perceived TTFT), compaction (context growth),
+            // eventual migration to Gemma 4 26B A4B (MoE) when Together adds it,
+            // or dedicated endpoint when traffic justifies it.
+            .model = "google/gemma-4-31b-it",
             .provider = "together",
         },
         .summarizer = .{
