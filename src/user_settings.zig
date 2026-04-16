@@ -663,8 +663,8 @@ test "applySettingsToConfig enables fast summarizer without changing fast preset
     // max_response_tokens not applied — no hard cap on response length
     try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
     // Per-mode model/provider selection
-    try std.testing.expectEqualStrings("google/gemma-4-31b-it", cfg.default_model.?);
-    try std.testing.expectEqualStrings("together", cfg.default_provider);
+    try std.testing.expectEqualStrings("llama-3.3-70b-versatile", cfg.default_model.?);
+    try std.testing.expectEqualStrings("groq", cfg.default_provider);
 }
 
 test "applySettingsToConfig deep mode applies high-quality settings" {

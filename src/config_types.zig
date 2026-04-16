@@ -183,13 +183,14 @@ pub const ProductPresetsConfig = struct {
             .queue_debounce_ms = 0,
             .temperature = 0.5,
             .max_tool_iterations = 8,
-            // Gemma 4 31B on Together. Together serverless has no prefix caching
-            // (dedicated endpoints only), so every turn recomputes the prefix.
-            // Mitigations: streaming (perceived TTFT), compaction (context growth),
-            // eventual migration to Gemma 4 26B A4B (MoE) when Together adds it,
-            // or dedicated endpoint when traffic justifies it.
-            .model = "google/gemma-4-31b-it",
-            .provider = "together",
+            // Llama 3.3 70B on Groq: production-quality chat model served on
+            // Groq's LPU hardware (~600ms TTFT despite being 70B dense).
+            // Groq has AUTOMATIC prefix caching on serverless (free), so
+            // repeated turns with stable prefix get massive speedup.
+            // Quality tier: Meta's latest open-weight, battle-tested, strong
+            // tool calling. Free tier: 14,400 req/day (shared with sidecar).
+            .model = "llama-3.3-70b-versatile",
+            .provider = "groq",
         },
         .summarizer = .{
             .enabled = true,
