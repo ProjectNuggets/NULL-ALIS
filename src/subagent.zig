@@ -14,6 +14,8 @@ const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const channel_loop = @import("channel_loop.zig");
 const json_util = @import("json_util.zig");
+const observability = @import("observability.zig");
+const tasks_mod = @import("tasks/root.zig");
 const zaki_session = @import("zaki_session.zig");
 const zaki_state = @import("zaki_state.zig");
 
@@ -28,6 +30,10 @@ pub const TaskStatus = enum {
     running,
     completed,
     failed,
+    /// Task was cancelled before it started running (WP2.4). Live
+    /// interruption of a running subagent is not supported — cancellation
+    /// applies to queued tasks only. See SubagentManager.cancelQueued.
+    cancelled,
 };
 
 pub const TaskState = struct {
@@ -79,6 +85,25 @@ pub const SubagentManager = struct {
         content: []const u8,
     ) anyerror!void;
 
+    /// Outcome of an atomic queued-only cancel attempt against the
+    /// subagent-owned task map (WP2.4). See cancelQueued. Semantics mirror
+    /// TaskDelivery.CancelOutcome so callers can translate easily when
+    /// both ledgers are wired.
+    pub const CancelOutcome = enum {
+        /// Task was queued and has been transitioned to cancelled. The
+        /// spawned thread will observe the cancelled status on its next
+        /// markTaskRunning attempt and exit before executing any work.
+        cancelled,
+        /// Task exists but is already running. Live interruption is not
+        /// supported — the task is left untouched.
+        running,
+        /// Task exists but is already in a terminal state (completed,
+        /// failed, cancelled).
+        terminal,
+        /// No task with the given id is tracked by this manager.
+        not_found,
+    };
+
     allocator: Allocator,
     tasks: std.AutoHashMapUnmanaged(u64, *TaskState),
     next_id: u64,
@@ -95,6 +120,12 @@ pub const SubagentManager = struct {
     completion_runner_ctx: ?*anyopaque = null,
     completion_delivery: ?CompletionDeliveryFn = null,
     completion_delivery_ctx: ?*anyopaque = null,
+
+    /// Optional bridge (WP2.1): when attached, subagent lifecycle transitions
+    /// are mirrored into the canonical TaskLedger via TaskDelivery so clients
+    /// observing task_update events see real subagent state. Null keeps
+    /// detached behavior unchanged.
+    task_delivery: ?*tasks_mod.TaskDelivery = null,
 
     pub fn init(
         allocator: Allocator,
@@ -167,6 +198,20 @@ pub const SubagentManager = struct {
         defer self.mutex.unlock();
         self.completion_delivery_ctx = ctx;
         self.completion_delivery = delivery;
+    }
+
+    /// Attach a canonical TaskDelivery so subagent lifecycle transitions
+    /// mirror into the TaskLedger. Detached (null) behavior is unchanged.
+    pub fn attachTaskDelivery(self: *SubagentManager, delivery: *tasks_mod.TaskDelivery) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.task_delivery = delivery;
+    }
+
+    fn formatCanonicalTaskId(buf: *[tasks_mod.ledger.TASK_ID_LEN]u8, task_id: u64) ?[]const u8 {
+        const formatted = std.fmt.bufPrint(buf, "task_{x:0>11}", .{task_id}) catch return null;
+        if (formatted.len != tasks_mod.ledger.TASK_ID_LEN) return null;
+        return formatted;
     }
 
     /// Spawn a background subagent. Returns task_id immediately.
@@ -264,6 +309,16 @@ pub const SubagentManager = struct {
             self.allocator.destroy(ctx);
             return err;
         };
+
+        // Mirror the new task into the canonical ledger (WP2.1). The thread
+        // will block on markTaskRunning until we release the mutex, so the
+        // queued → running transition order is preserved.
+        if (self.task_delivery) |td| {
+            const owner = state.session_key orelse "subagent";
+            _ = td.createTaskWithNumericId(state.task_summary, owner, task_id) catch |err| {
+                log.warn("subagent: failed to mirror task #{d} to delivery: {}", .{ task_id, err });
+            };
+        }
 
         return task_id;
     }
@@ -547,6 +602,25 @@ pub const SubagentManager = struct {
                 origin_channel = state.origin_channel orelse "system";
                 origin_chat_id = state.origin_chat_id orelse "agent";
                 request_session_key = state.session_key orelse origin_chat_id;
+
+                // Mirror terminal transition into the canonical ledger
+                // (WP2.1). Result/error strings are owned by the subagent
+                // state; we pass null here to avoid cross-owning a pointer
+                // into the ledger, which does not manage string lifetimes.
+                if (self.task_delivery) |td| {
+                    var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+                    if (formatCanonicalTaskId(&id_buf, task_id)) |id_slice| {
+                        if (state.status == .failed) {
+                            td.markFailed(id_slice, null) catch |err| {
+                                log.warn("subagent: failed to mirror failed status for task #{d}: {}", .{ task_id, err });
+                            };
+                        } else {
+                            td.markSucceeded(id_slice, null) catch |err| {
+                                log.warn("subagent: failed to mirror succeeded status for task #{d}: {}", .{ task_id, err });
+                            };
+                        }
+                    }
+                }
             }
         }
 
@@ -604,15 +678,77 @@ pub const SubagentManager = struct {
         }
     }
 
-    fn markTaskRunning(self: *SubagentManager, task_id: u64) void {
+    /// Transition a queued task to running. Returns true if the
+    /// transition happened. Returns false when the task is missing, has
+    /// already been started, or was cancelled before the spawned thread
+    /// got a chance to enter its run body (WP2.4). The thread path uses
+    /// the return value to honor pre-execution cancellation without
+    /// racing with cancelQueued.
+    fn markTaskRunning(self: *SubagentManager, task_id: u64) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.tasks.get(task_id)) |state| {
             if (state.status == .queued) {
                 state.status = .running;
                 self.persistTaskSnapshotLocked(task_id, state);
+                if (self.task_delivery) |td| {
+                    var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+                    if (formatCanonicalTaskId(&id_buf, task_id)) |id_slice| {
+                        td.markRunning(id_slice) catch |err| {
+                            log.warn("subagent: failed to mirror running status for task #{d}: {}", .{ task_id, err });
+                        };
+                    }
+                }
+                return true;
             }
         }
+        return false;
+    }
+
+    /// Cancel a queued subagent task atomically (WP2.4). This is the only
+    /// cancellation path supported in v0.1 — running tasks cannot be
+    /// interrupted because the subagent thread owns the `ChannelRuntime`
+    /// lifecycle and there is no cooperative interrupt point. Terminal
+    /// tasks are not mutated. See CancelOutcome for the full result
+    /// semantics.
+    ///
+    /// Concurrency: the manager mutex is held just long enough to flip
+    /// the local status and persist the snapshot. The canonical ledger
+    /// mirror happens outside the manager mutex via TaskDelivery's own
+    /// lock — matching the lock order established elsewhere in this file
+    /// (manager.mutex → td.mutex is always released-then-reacquired to
+    /// keep the surface symmetric).
+    pub fn cancelQueued(self: *SubagentManager, task_id: u64) CancelOutcome {
+        var delivery_ref: ?*tasks_mod.TaskDelivery = null;
+        const outcome = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const state = self.tasks.get(task_id) orelse break :blk CancelOutcome.not_found;
+            switch (state.status) {
+                .queued => {
+                    state.status = .cancelled;
+                    state.completed_at = std.time.milliTimestamp();
+                    self.persistTaskSnapshotLocked(task_id, state);
+                    delivery_ref = self.task_delivery;
+                    break :blk CancelOutcome.cancelled;
+                },
+                .running => break :blk CancelOutcome.running,
+                .completed, .failed, .cancelled => break :blk CancelOutcome.terminal,
+            }
+        };
+        if (outcome == .cancelled) {
+            if (delivery_ref) |td| {
+                var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+                if (formatCanonicalTaskId(&id_buf, task_id)) |id_slice| {
+                    // cancelQueued on the canonical ledger is idempotent
+                    // and returns a parallel outcome; we rely on the
+                    // subagent-side decision as the source of truth and
+                    // simply propagate the state.
+                    _ = td.cancelQueued(id_slice);
+                }
+            }
+        }
+        return outcome;
     }
 };
 
@@ -628,7 +764,12 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         ctx.manager.allocator.destroy(ctx);
     }
 
-    ctx.manager.markTaskRunning(ctx.task_id);
+    // WP2.4: honor pre-execution cancellation. If the task was cancelled
+    // between spawn() and the thread's entry here, markTaskRunning will
+    // decline the queued→running transition. In that case we must not
+    // execute the injected runner or the full ChannelRuntime — just let
+    // the thread exit so the cancelled state is observable by callers.
+    if (!ctx.manager.markTaskRunning(ctx.task_id)) return;
 
     // Test path: injected runner bypasses the full runtime (used in unit tests).
     if (ctx.manager.completion_runner) |runner| {
@@ -727,19 +868,21 @@ fn freeTaskState(allocator: Allocator, state: *TaskState) void {
     allocator.destroy(state);
 }
 
-fn taskStatusText(status: TaskStatus) []const u8 {
+pub fn taskStatusText(status: TaskStatus) []const u8 {
     return switch (status) {
         .queued => "queued",
         .running => "running",
         .completed => "completed",
         .failed => "failed",
+        .cancelled => "cancelled",
     };
 }
 
-fn parseTaskStatus(raw: []const u8) TaskStatus {
+pub fn parseTaskStatus(raw: []const u8) TaskStatus {
     if (std.mem.eql(u8, raw, "queued")) return .queued;
     if (std.mem.eql(u8, raw, "running")) return .running;
     if (std.mem.eql(u8, raw, "completed")) return .completed;
+    if (std.mem.eql(u8, raw, "cancelled")) return .cancelled;
     return .failed;
 }
 
@@ -1002,7 +1145,7 @@ test "SubagentManager completeTask updates state" {
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
-    mgr.markTaskRunning(1);
+    _ = mgr.markTaskRunning(1);
     try std.testing.expectEqual(TaskStatus.running, mgr.getTaskStatus(1).?);
     mgr.completeTask(1, "done!", null);
 
@@ -1033,7 +1176,7 @@ test "SubagentManager completeTask with error" {
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
-    mgr.markTaskRunning(1);
+    _ = mgr.markTaskRunning(1);
     mgr.completeTask(1, null, "timeout");
 
     try std.testing.expectEqual(TaskStatus.failed, mgr.getTaskStatus(1).?);
@@ -1069,7 +1212,7 @@ test "SubagentManager completeTask routes via bus" {
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
-    mgr.markTaskRunning(1);
+    _ = mgr.markTaskRunning(1);
     mgr.completeTask(1, "result text", null);
 
     // Check bus received the message — verify depth increased
@@ -1110,7 +1253,7 @@ test "SubagentManager completeTask falls back to local completion delivery witho
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
-    mgr.markTaskRunning(1);
+    _ = mgr.markTaskRunning(1);
     mgr.completeTask(1, "result text", null);
 
     try std.testing.expect(recorder.session_key != null);
@@ -1162,7 +1305,7 @@ test "SubagentManager completeTask prefers completion_delivery over bus when bot
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
-    mgr.markTaskRunning(1);
+    _ = mgr.markTaskRunning(1);
     mgr.completeTask(1, "tenant result payload", null);
 
     // completion_delivery recorder must have received the content.
@@ -1407,7 +1550,7 @@ fn waitForTaskTerminal(mgr: *SubagentManager, task_id: u64, timeout_ms: u64) !vo
     const start = std.time.milliTimestamp();
     while (std.time.milliTimestamp() - start < timeout_ms) {
         const status = mgr.getTaskStatus(task_id) orelse return error.TestUnexpectedResult;
-        if (status == .completed or status == .failed) return;
+        if (status == .completed or status == .failed or status == .cancelled) return;
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
     return error.TestTimeout;
@@ -1437,6 +1580,10 @@ fn waitForActiveRunnerCount(runner: *BlockingCompletionRunner, expected_active: 
 fn immediateCompletionRunner(_: ?*anyopaque, allocator: Allocator, system_prompt: []const u8, task: []const u8) ![]const u8 {
     try std.testing.expect(system_prompt.len > 0);
     return std.fmt.allocPrint(allocator, "completed: {s}", .{task});
+}
+
+fn failingCompletionRunner(_: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8) ![]const u8 {
+    return error.SubagentRunnerFailure;
 }
 
 const BlockingCompletionRunner = struct {
@@ -1523,15 +1670,16 @@ test "baseline: SubagentConfig defaults max_concurrent to 4" {
     try std.testing.expectEqual(@as(u32, 4), cfg.max_concurrent);
 }
 
-test "baseline: TaskStatus has exactly 4 states" {
-    // Characterize the complete set of task states: queued, running, completed, failed
+test "baseline: TaskStatus has exactly 5 states" {
+    // Characterize the complete set of task states: queued, running, completed, failed, cancelled (WP2.4)
     const info = @typeInfo(TaskStatus);
-    try std.testing.expectEqual(@as(usize, 4), info.@"enum".fields.len);
+    try std.testing.expectEqual(@as(usize, 5), info.@"enum".fields.len);
     // Verify each state exists and has expected ordinal
-    try std.testing.expectEqual(@as(u2, 0), @intFromEnum(TaskStatus.queued));
-    try std.testing.expectEqual(@as(u2, 1), @intFromEnum(TaskStatus.running));
-    try std.testing.expectEqual(@as(u2, 2), @intFromEnum(TaskStatus.completed));
-    try std.testing.expectEqual(@as(u2, 3), @intFromEnum(TaskStatus.failed));
+    try std.testing.expectEqual(@as(u3, 0), @intFromEnum(TaskStatus.queued));
+    try std.testing.expectEqual(@as(u3, 1), @intFromEnum(TaskStatus.running));
+    try std.testing.expectEqual(@as(u3, 2), @intFromEnum(TaskStatus.completed));
+    try std.testing.expectEqual(@as(u3, 3), @intFromEnum(TaskStatus.failed));
+    try std.testing.expectEqual(@as(u3, 4), @intFromEnum(TaskStatus.cancelled));
 }
 
 test "baseline: TaskState tracks required lifecycle fields" {
@@ -1623,4 +1771,363 @@ test "SubagentManager spawn stress enforces live concurrency limit" {
 
     try std.testing.expectEqual(@as(u32, 0), mgr.getRunningCount());
     try std.testing.expectEqual(@as(usize, concurrency_cap), runner.peak_active);
+}
+
+// ── WP2.1: TaskDelivery bridge ─────────────────────────────────────
+
+test "SubagentManager attached TaskDelivery mirrors queued/running/succeeded" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var ledger_inst = tasks_mod.TaskLedger.init(std.testing.allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = tasks_mod.TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.completion_runner = immediateCompletionRunner;
+    mgr.attachTaskDelivery(&delivery);
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawn("bridge me", "bridge", "session:bridge", "agent", "session:bridge");
+    try waitForTaskTerminal(&mgr, task_id, 2_000);
+
+    var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+    const id_slice = try std.fmt.bufPrint(&id_buf, "task_{x:0>11}", .{task_id});
+    const entry = ledger_inst.getTask(id_slice) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(tasks_mod.TaskStatus.succeeded, entry.status);
+    try std.testing.expectEqualStrings("session:bridge", entry.owner_session);
+}
+
+test "SubagentManager attached TaskDelivery mirrors failed status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var ledger_inst = tasks_mod.TaskLedger.init(std.testing.allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = tasks_mod.TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.completion_runner = failingCompletionRunner;
+    mgr.attachTaskDelivery(&delivery);
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawn("fail me", "bridge", "session:bridge", "agent", "session:bridge");
+    try waitForTaskTerminal(&mgr, task_id, 2_000);
+
+    var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+    const id_slice = try std.fmt.bufPrint(&id_buf, "task_{x:0>11}", .{task_id});
+    const entry = ledger_inst.getTask(id_slice) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(tasks_mod.TaskStatus.failed, entry.status);
+}
+
+test "SubagentManager detached TaskDelivery leaves ledger untouched" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var ledger_inst = tasks_mod.TaskLedger.init(std.testing.allocator);
+    defer ledger_inst.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.completion_runner = immediateCompletionRunner;
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawn("no bridge", "solo", "session:solo", "agent", "session:solo");
+    try waitForTaskTerminal(&mgr, task_id, 2_000);
+
+    try std.testing.expectEqual(@as(usize, 0), ledger_inst.listTasks().len);
+    try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(task_id).?);
+}
+
+// ── WP2.4: honest queued-only cancellation ─────────────────────────
+
+test "taskStatusText round-trips cancelled" {
+    try std.testing.expectEqualStrings("cancelled", taskStatusText(TaskStatus.cancelled));
+    try std.testing.expectEqual(TaskStatus.cancelled, parseTaskStatus("cancelled"));
+}
+
+test "SubagentManager cancelQueued transitions queued task to cancelled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    // Use a blocking runner so the task stays queued/running long enough
+    // for us to observe state — but insert directly to avoid the thread.
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "cancel-me"),
+        .task_summary = try std.testing.allocator.dupe(u8, "cancel summary"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "cancel prompt"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+
+    try std.testing.expectEqual(SubagentManager.CancelOutcome.cancelled, mgr.cancelQueued(1));
+    try std.testing.expectEqual(TaskStatus.cancelled, mgr.getTaskStatus(1).?);
+}
+
+test "SubagentManager cancelQueued refuses running task" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .running,
+        .label = try std.testing.allocator.dupe(u8, "running"),
+        .task_summary = try std.testing.allocator.dupe(u8, "running summary"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "running prompt"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+
+    try std.testing.expectEqual(SubagentManager.CancelOutcome.running, mgr.cancelQueued(1));
+    try std.testing.expectEqual(TaskStatus.running, mgr.getTaskStatus(1).?);
+}
+
+test "SubagentManager cancelQueued refuses terminal task" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .completed,
+        .label = try std.testing.allocator.dupe(u8, "done"),
+        .task_summary = try std.testing.allocator.dupe(u8, "done summary"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "done prompt"),
+        .result = try std.testing.allocator.dupe(u8, "ok"),
+        .started_at = std.time.milliTimestamp(),
+        .completed_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+
+    try std.testing.expectEqual(SubagentManager.CancelOutcome.terminal, mgr.cancelQueued(1));
+    try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(1).?);
+}
+
+test "SubagentManager cancelQueued returns not_found for unknown id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    try std.testing.expectEqual(SubagentManager.CancelOutcome.not_found, mgr.cancelQueued(999));
+}
+
+test "SubagentManager cancelQueued mirrors canonical cancelled outcome" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var ledger_inst = tasks_mod.TaskLedger.init(std.testing.allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = tasks_mod.TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+
+    // Block the runner so the task stays queued until we cancel it.
+    var runner = BlockingCompletionRunner{};
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.completion_runner = BlockingCompletionRunner.run;
+    mgr.completion_runner_ctx = @ptrCast(&runner);
+    mgr.attachTaskDelivery(&delivery);
+    defer mgr.deinit();
+
+    // Insert a queued task directly — no thread spawned — so we can prove
+    // the mirror path without racing with markTaskRunning.
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "mirror-cancel"),
+        .task_summary = try std.testing.allocator.dupe(u8, "mirror cancel summary"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "mirror cancel prompt"),
+        .session_key = try std.testing.allocator.dupe(u8, "session:mirror"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 42, state);
+    _ = try delivery.createTaskWithNumericId(state.task_summary, state.session_key.?, 42);
+
+    try std.testing.expectEqual(SubagentManager.CancelOutcome.cancelled, mgr.cancelQueued(42));
+    try std.testing.expectEqual(TaskStatus.cancelled, mgr.getTaskStatus(42).?);
+
+    var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+    const id_slice = try std.fmt.bufPrint(&id_buf, "task_{x:0>11}", .{@as(u64, 42)});
+    const entry = ledger_inst.getTask(id_slice) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(tasks_mod.TaskStatus.cancelled, entry.status);
+}
+
+test "SubagentManager cancelled queued task does not execute completion_runner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    const TrackingRunner = struct {
+        var invocations: std.atomic.Value(u32) = .{ .raw = 0 };
+
+        fn reset() void {
+            invocations.store(0, .monotonic);
+        }
+
+        fn run(_: ?*anyopaque, allocator: Allocator, _: []const u8, task: []const u8) ![]const u8 {
+            _ = invocations.fetchAdd(1, .monotonic);
+            return std.fmt.allocPrint(allocator, "ran: {s}", .{task});
+        }
+    };
+    TrackingRunner.reset();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.completion_runner = TrackingRunner.run;
+    defer mgr.deinit();
+
+    // Hold the manager mutex so the just-spawned thread is blocked
+    // trying to enter markTaskRunning. While it waits, we flip the task
+    // to cancelled. When we release the mutex, the thread observes
+    // cancelled via markTaskRunning returning false and bails out.
+    mgr.mutex.lock();
+    const task_id = try spawnWhileLocked(&mgr, "cancel-before-run", "bg", "session:cbr", "agent", "session:cbr");
+    try std.testing.expect(mgr.tasks.get(task_id) != null);
+    // Directly flip the state — cancelQueued would try to take the
+    // mutex we already hold, deadlocking. The end result is the same
+    // transition cancelQueued would perform.
+    const state = mgr.tasks.get(task_id).?;
+    state.status = .cancelled;
+    state.completed_at = std.time.milliTimestamp();
+    mgr.mutex.unlock();
+
+    try waitForTaskTerminal(&mgr, task_id, 2_000);
+    try std.testing.expectEqual(TaskStatus.cancelled, mgr.getTaskStatus(task_id).?);
+    try std.testing.expectEqual(@as(u32, 0), TrackingRunner.invocations.load(.monotonic));
+}
+
+// Lock-aware variant of SubagentManager.spawn used only in the
+// cancel-before-run test: spawn acquires the manager mutex, which is
+// already held by the test. This helper is a thin duplicate that skips
+// the initial lock so the test can race cancellation against thread
+// startup without deadlocking.
+fn spawnWhileLocked(
+    mgr: *SubagentManager,
+    task: []const u8,
+    label: []const u8,
+    request_session_key: []const u8,
+    origin_channel: []const u8,
+    origin_chat_id: []const u8,
+) !u64 {
+    if (mgr.getRunningCountLocked() >= mgr.config.max_concurrent)
+        return error.TooManyConcurrentSubagents;
+
+    const task_id = mgr.next_id;
+    mgr.next_id += 1;
+
+    const state = try mgr.allocator.create(TaskState);
+    const state_label = try mgr.allocator.dupe(u8, label);
+    const state_task_summary = try summarizeTaskForDisplay(mgr.allocator, task);
+    const state_prompt = try mgr.allocator.dupe(u8, task);
+    const state_session = try mgr.allocator.dupe(u8, request_session_key);
+    var runtime_session_buf: [128]u8 = undefined;
+    const runtime_session_text = deriveTaskRuntimeSessionKey(&runtime_session_buf, request_session_key, task_id);
+    const state_runtime_session = try mgr.allocator.dupe(u8, runtime_session_text);
+    const state_channel = try mgr.allocator.dupe(u8, origin_channel);
+    const state_chat = try mgr.allocator.dupe(u8, origin_chat_id);
+    state.* = .{
+        .status = .queued,
+        .label = state_label,
+        .task_summary = state_task_summary,
+        .task_prompt = state_prompt,
+        .session_key = state_session,
+        .runtime_session_key = state_runtime_session,
+        .origin_channel = state_channel,
+        .origin_chat_id = state_chat,
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(mgr.allocator, task_id, state);
+
+    const task_copy = try mgr.allocator.dupe(u8, task);
+    const label_copy = try mgr.allocator.dupe(u8, label);
+    const request_session_copy = try mgr.allocator.dupe(u8, request_session_key);
+    const origin_channel_copy = try mgr.allocator.dupe(u8, origin_channel);
+    const origin_chat_copy = try mgr.allocator.dupe(u8, origin_chat_id);
+
+    const ctx = try mgr.allocator.create(ThreadContext);
+    ctx.* = .{
+        .manager = mgr,
+        .task_id = task_id,
+        .task = task_copy,
+        .label = label_copy,
+        .request_session_key = request_session_copy,
+        .origin_channel = origin_channel_copy,
+        .origin_chat_id = origin_chat_copy,
+    };
+
+    state.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, subagentThreadFn, .{ctx});
+    return task_id;
 }

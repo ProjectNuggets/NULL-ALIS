@@ -13,10 +13,18 @@ info:
     - `/webhook` auth is pairing-token based (Bearer), depending on pairing guard state.
     - Channel webhooks are unauthenticated at the internal-token layer; each route enforces its channel-specific verification/signature rules when configured.
 
-    SOTA contract status (2026-04-09):
+    SOTA contract status (2026-04-17):
     - All existing endpoints below are STABLE and must not break.
-    - TODO: Planned endpoint additions are documented at the end of the paths section.
-    - TODO: SSE event extensions are documented in docs/online-agent-contract.md.
+    - SSE event vocabulary (`progress`, `reasoning_summary`, `tool_start`, `tool_result`,
+      `approval_required`, `task_update`, `done`, etc.) is documented in
+      docs/online-agent-contract.md. That document is the authoritative
+      schema for frames emitted over `/api/v1/chat/stream`.
+    - Direct operator controls (execution mode, permissions posture,
+      usage/cost inspection) are exposed as chat slash commands in the
+      agent runtime (`/permissions`, `/mode`, `/plan`, `/review`,
+      `/execute`, `/approve`, `/usage`, `/cost`). REST parity is planned
+      but deferred — see the "Planned endpoint additions" block below
+      and docs/online-agent-contract.md §2a.
     - TODO: Task lifecycle extensions are documented in docs/agent-lifecycle-spec.md.
 servers:
   - url: http://127.0.0.1:3000
@@ -506,7 +514,15 @@ paths:
                   description: Required explicit lane key. In tenant mode it must belong to the authenticated user and use one of `main`, `thread:<id>`, `task:<id>`, or `cron:<id>`.
       responses:
         "200":
-          description: SSE stream (`status`, optional `progress`, `token`, `done`)
+          description: |
+            SSE stream of structured run events. Frames include (non-exhaustive):
+            `status`, `ready` (tenant mode), `reply_start`, `progress`,
+            `reasoning_summary`, `tool_start`, `tool_result`,
+            `approval_required`, `task_update`, `token`, `error`, and a
+            terminal `done`. See
+            [docs/online-agent-contract.md](./online-agent-contract.md) for
+            the full event schema, correlation ids (`run_id`,
+            `tool_use_id`), and ordering invariants.
           content:
             text/event-stream:
               schema:
@@ -1260,34 +1276,135 @@ paths:
         "502":
           description: Telegram API rejected disconnect operation
 
-  # ── TODO: Planned endpoint additions (SOTA program) ──────────────
+  # ── Planned endpoint additions (SOTA program) ──────────────────────
   #
-  # The following endpoints are planned but not yet implemented.
-  # They are documented here so the API surface is visible to frontend
-  # and integration developers before implementation begins.
+  # The entries below are DEFERRED. They are NOT implemented in v0.1
+  # and MUST NOT be called as if they were active. They are kept here
+  # only as a visible design surface for frontend/integration planning.
   #
-  # TODO [Sprint 2A]: POST /api/v1/chat/stream — extend SSE events
-  #   - Add tool_start, tool_result events to the SSE stream
-  #   - See docs/online-agent-contract.md for event schemas
+  # Direct operator controls (execution mode, permissions posture,
+  # usage/cost inspection) are currently exposed as **chat slash
+  # commands** in the agent runtime, not as REST endpoints. See
+  # docs/online-agent-contract.md §2a for the implemented slash-command
+  # surface (`/permissions`, `/mode`, `/plan`, `/review`, `/execute`,
+  # `/approve`, `/usage`, `/cost`). REST parity for these controls is
+  # planned but deferred beyond v0.1.
   #
-  # TODO [Sprint 2B]: GET /api/v1/users/{user_id}/tasks
-  #   - List subagent tasks for a user (with status filter)
-  #   - Response: array of TaskRecord objects
+  # SSE event vocabulary for POST /api/v1/chat/stream (tool_start,
+  # tool_result, approval_required, task_update, ...) IS implemented.
+  # See docs/online-agent-contract.md for the authoritative frame schema.
   #
-  # TODO [Sprint 2B]: GET /api/v1/users/{user_id}/tasks/{task_id}
-  #   - Get single task details including result
-  #   - Response: TaskRecord with full result
+  # GET /api/v1/users/{user_id}/tasks and GET /tasks/{task_id} are
+  # IMPLEMENTED as read-only snapshots of the canonical TaskLedger
+  # (WP2.2). See the operation entries below.
   #
-  # TODO [Sprint 2B]: POST /api/v1/users/{user_id}/tasks/{task_id}/stop
-  #   - Cancel a running subagent task
+  # Deferred [future]: POST /api/v1/users/{user_id}/tasks/{task_id}/stop
+  #   - Cancel a queued subagent task over REST
   #   - Response: updated TaskRecord with status=cancelled
+  #   - Task creation and cancellation currently flow through the agent
+  #     tool surface (`spawn` for creation, `task_stop` for cancellation)
+  #     and the operator command surface (`/subagents kill <id|all>`),
+  #     not REST.
+  #   - Cancellation is QUEUED-ONLY (WP2.4). A task that has already
+  #     transitioned to `running` cannot be interrupted in v0.1 — every
+  #     surface (`task_stop`, `/subagents kill`, and any future REST
+  #     endpoint) must report this honestly rather than pretending to
+  #     kill a running task. Live interruption is out of scope.
   #
-  # ── Remaining TODOs ────────────────────────────────────────────────
+  # ── Remaining deferred items ───────────────────────────────────────
   #
-  # TODO [Sprint 4B]: GET /api/v1/users/{user_id}/usage
-  #   - Get token usage and cost summary
-  #   - Response: UsageSummary with per-model breakdown
+  # GET /api/v1/users/{user_id}/usage is IMPLEMENTED in v0.1 as a
+  # read-only snapshot of UsageRuntime (WP2.3). See the operation entry
+  # below. The in-chat `/usage` and `/cost` slash commands remain the
+  # interactive surface; both report the same underlying state.
   #
+  # Still deferred:
+  #   - Persistent usage ledger (durable cross-session/cross-pod totals).
+  #   - Provider pricing tables and real cost_usd values from the agent
+  #     path (today the runtime records 0.0 per turn and cost_available
+  #     is `false` unless a non-zero cost has otherwise been recorded).
+  #   - Budget enforcement (hard/soft limits, alerts).
+  #   - The `cost_update` SSE event (see docs/online-agent-contract.md
+  #     §8 — still deferred).
+  #
+
+  # ── Task read-only query surface (WP2.2, implemented) ─────────────
+
+  /api/v1/users/{user_id}/tasks:
+    get:
+      summary: List spawned/detached tasks for a user
+      description: >
+        Returns a snapshot of the canonical task ledger for the given user.
+        If no tenant runtime has been materialized (no agent work has
+        happened for this user yet) the endpoint returns `{"tasks": []}`
+        rather than 404.
+      operationId: listUserTasks
+      tags: [Tasks]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      responses:
+        '200':
+          description: Task list snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskListResponse'
+        '405':
+          description: Method not allowed (only GET is supported)
+
+  /api/v1/users/{user_id}/tasks/{task_id}:
+    get:
+      summary: Get a single task by id
+      operationId: getUserTask
+      tags: [Tasks]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/TaskIdPath'
+      responses:
+        '200':
+          description: Task snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskRecord'
+        '400':
+          description: Malformed task_id
+        '404':
+          description: Task not found
+        '405':
+          description: Method not allowed (only GET is supported)
+
+  # ── Usage read-only summary surface (WP2.3, implemented) ──────────
+
+  /api/v1/users/{user_id}/usage:
+    get:
+      summary: Token usage and cost summary for a user
+      description: >
+        Returns a snapshot of the per-user UsageRuntime: session totals
+        (input, output, total tokens, cost in USD), turn count, and a
+        per-model breakdown. If no tenant runtime has been materialized
+        for this user yet (no agent work has happened), the endpoint
+        returns a zero summary rather than 404. The endpoint is strictly
+        read-only — it never instantiates a tenant runtime on demand.
+
+
+        Provider pricing is not wired in v0.1, so `session_cost_usd` is
+        typically 0 and `cost_available` is `false`. Persistent usage
+        ledgers, budget enforcement, and real pricing tables are
+        deferred beyond v0.1.
+      operationId: getUserUsage
+      tags: [Usage]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      responses:
+        '200':
+          description: Usage summary snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSummary'
+        '405':
+          description: Method not allowed (only GET is supported)
 
   # ── Phase 3.5 Session CRUD (implemented) ──────────────────────────
 
@@ -1458,7 +1575,13 @@ paths:
 
   /api/v1/users/{user_id}/sessions/{session_key}/approve:
     post:
-      summary: Approve or deny a pending exec command
+      summary: Approve or deny the session's pending tool approval
+      description: |
+        Resolves the single pending approval held by the session's agent
+        (see docs/online-agent-contract.md §2). `approved: true` is
+        translated to `/approve allow-once` and `approved: false` to
+        `/approve deny`. Generic persistent allow-always is not supported
+        in v1.
       operationId: approveSession
       tags: [Sessions]
       parameters:
@@ -1528,6 +1651,16 @@ components:
         Keys use colons as delimiters. Pass the key as-is in the URL
         path — the gateway matches on raw path segments without
         URL-decoding.
+    TaskIdPath:
+      in: path
+      name: task_id
+      required: true
+      schema:
+        type: string
+      description: >
+        Canonical task id (format `task_<11 hex digits>`, 16 chars).
+        The gateway rejects task_ids containing control characters,
+        `/`, or longer than 64 chars with 400 Bad Request.
 
   securitySchemes:
     InternalToken:
@@ -1580,6 +1713,112 @@ components:
         history_len:
           type: integer
           format: int64
+    # ── Task query schemas (WP2.2) ──────────────────────────────────
+    TaskRecord:
+      type: object
+      required: [task_id, description, status, owner_session, created_at_ms, updated_at_ms]
+      properties:
+        task_id:
+          type: string
+          description: Canonical task id, format `task_<11 hex digits>`.
+        description:
+          type: string
+          description: Human-readable task description.
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed, timed_out, cancelled, lost]
+        owner_session:
+          type: string
+          description: Session key that owns this task.
+        created_at_ms:
+          type: integer
+          format: int64
+          description: Unix timestamp (ms) when the task was created.
+        updated_at_ms:
+          type: integer
+          format: int64
+          description: Unix timestamp (ms) of the last state transition.
+        result_summary:
+          type: string
+          description: Present only on terminal success.
+        error_message:
+          type: string
+          description: Present only on terminal failure/timeout.
+    TaskListResponse:
+      type: object
+      required: [tasks]
+      properties:
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/TaskRecord'
+    UsageModelBreakdown:
+      type: object
+      required: [model, input_tokens, output_tokens, total_tokens, cost_usd, turn_count]
+      properties:
+        model:
+          type: string
+          description: Provider-reported model identifier.
+        input_tokens:
+          type: integer
+          format: int64
+        output_tokens:
+          type: integer
+          format: int64
+        total_tokens:
+          type: integer
+          format: int64
+        cost_usd:
+          type: number
+          format: double
+          description: >
+            USD cost accumulated across this model's turns. Today this is
+            0 unless a non-zero cost was explicitly recorded — provider
+            pricing tables are deferred beyond v0.1.
+        turn_count:
+          type: integer
+          format: int32
+    UsageSummary:
+      type: object
+      required:
+        - session_total_tokens
+        - session_input_tokens
+        - session_output_tokens
+        - session_cost_usd
+        - turn_count
+        - models
+        - cost_available
+      properties:
+        session_total_tokens:
+          type: integer
+          format: int64
+        session_input_tokens:
+          type: integer
+          format: int64
+        session_output_tokens:
+          type: integer
+          format: int64
+        session_cost_usd:
+          type: number
+          format: double
+          description: >
+            Accumulated USD cost across all recorded turns for this user.
+            0 unless non-zero costs have been recorded (pricing tables
+            are deferred).
+        turn_count:
+          type: integer
+          format: int32
+          description: Total number of turns recorded for this user.
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageModelBreakdown'
+        cost_available:
+          type: boolean
+          description: >
+            True when `session_cost_usd > 0`. Reflects whether any cost
+            has actually been attributed; in v0.1 this is typically
+            false because provider pricing is not wired.
     SessionContextResponse:
       type: object
       properties:

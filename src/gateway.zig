@@ -1362,6 +1362,7 @@ const TenantRuntime = struct {
             tools_mod.bindMemoryRuntime(runtime.tools, rt);
         }
         if (runtime.subagent_manager) |mgr| {
+            mgr.attachTaskDelivery(runtime.task_delivery);
             if (runtime.completion_router) |router| {
                 router.* = .{
                     .session_mgr = &runtime.session_mgr,
@@ -9049,6 +9050,164 @@ fn finalizeJsonBuf(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8
     return .{ .body = body };
 }
 
+// ── Task query endpoints (WP2.2) ──────────────────────────────────────
+// Read-only GET surface over the canonical TaskDelivery. Creation and
+// cancellation remain in-band via the agent tool surface (task_spawn /
+// task_stop); this HTTP surface exists so UI clients can poll task state
+// without driving a tool call.
+
+fn serializeTaskEntryJson(w: anytype, entry: *const tasks_mod.TaskEntry) !void {
+    try w.writeAll("{\"task_id\":\"");
+    try w.writeAll(&entry.task_id);
+    try w.writeAll("\",\"description\":\"");
+    try jsonEscapeInto(w, entry.description);
+    try w.writeAll("\",\"status\":\"");
+    try w.writeAll(entry.status.toSlice());
+    try w.writeAll("\",\"owner_session\":\"");
+    try jsonEscapeInto(w, entry.owner_session);
+    try w.print("\",\"created_at_ms\":{d},\"updated_at_ms\":{d}", .{
+        entry.created_at_ms,
+        entry.updated_at_ms,
+    });
+    if (entry.result_summary) |rs| {
+        try w.writeAll(",\"result_summary\":\"");
+        try jsonEscapeInto(w, rs);
+        try w.writeByte('"');
+    }
+    if (entry.error_message) |em| {
+        try w.writeAll(",\"error_message\":\"");
+        try jsonEscapeInto(w, em);
+        try w.writeByte('"');
+    }
+    try w.writeByte('}');
+}
+
+fn handleTaskList(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    delivery_opt: ?*tasks_mod.TaskDelivery,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+
+    // No delivery resolved (tenant runtime not yet materialized) → empty list.
+    const delivery = delivery_opt orelse return .{ .body = "{\"tasks\":[]}" };
+
+    const entries = delivery.listTasksSnapshot(allocator) catch return response_build_err;
+    defer allocator.free(entries);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"tasks\":[") catch return response_build_err;
+    var first = true;
+    for (entries) |*entry| {
+        if (!first) w.writeAll(",") catch return response_build_err;
+        first = false;
+        serializeTaskEntryJson(w, entry) catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn handleTaskGet(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    task_id: []const u8,
+    delivery_opt: ?*tasks_mod.TaskDelivery,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+
+    // Input validation: non-empty, bounded length, no control characters.
+    if (task_id.len == 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing task_id\"}" };
+    }
+    if (task_id.len > 64) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"task_id too long\"}" };
+    }
+    for (task_id) |c| {
+        if (c < 0x20 or c == 0x7f or c == '/') {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid task_id\"}" };
+        }
+    }
+
+    const delivery = delivery_opt orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"task_not_found\"}" };
+    const snap = delivery.getTaskSnapshot(task_id) orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"task_not_found\"}" };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    serializeTaskEntryJson(w, &snap) catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+// ── Usage read-only endpoint (WP2.3) ──────────────────────────────────
+// GET /api/v1/users/{user_id}/usage returns a snapshot of UsageRuntime
+// for the user. It is READ-ONLY: it never materializes a tenant runtime
+// to answer the read. When no runtime exists for the user we return a
+// zero summary. Provider pricing is not wired in v0.1 — cost_available
+// is reported as false unless a non-zero cost has been accumulated
+// (currently never from the agent path), matching the /cost slash
+// command semantics.
+
+fn serializeUsageReportJson(w: anytype, rpt: *const usage_runtime_mod.UsageReport) !void {
+    try w.print(
+        "{{\"session_total_tokens\":{d},\"session_input_tokens\":{d},\"session_output_tokens\":{d},\"session_cost_usd\":{d:.6},\"turn_count\":{d},\"models\":[",
+        .{
+            rpt.session_total_tokens,
+            rpt.session_input_tokens,
+            rpt.session_output_tokens,
+            rpt.session_cost_usd,
+            rpt.turn_count,
+        },
+    );
+    for (rpt.model_breakdown, 0..) |m, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"model\":\"");
+        try jsonEscapeInto(w, m.model);
+        try w.print(
+            "\",\"input_tokens\":{d},\"output_tokens\":{d},\"total_tokens\":{d},\"cost_usd\":{d:.6},\"turn_count\":{d}}}",
+            .{
+                m.input_tokens,
+                m.output_tokens,
+                m.total_tokens,
+                m.cost_usd,
+                m.turn_count,
+            },
+        );
+    }
+    try w.writeAll("],\"cost_available\":");
+    try w.writeAll(if (rpt.session_cost_usd > 0.0) "true" else "false");
+    try w.writeByte('}');
+}
+
+fn handleUserUsage(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    usage_rt_opt: ?*usage_runtime_mod.UsageRuntime,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+
+    // No tenant runtime materialized yet → zero summary (static body).
+    const usage_rt = usage_rt_opt orelse return .{
+        .body = "{\"session_total_tokens\":0,\"session_input_tokens\":0,\"session_output_tokens\":0,\"session_cost_usd\":0.000000,\"turn_count\":0,\"models\":[],\"cost_available\":false}",
+    };
+
+    const rpt = usage_rt.report(allocator) catch return response_build_err;
+    defer rpt.deinit();
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    serializeUsageReportJson(w, &rpt) catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
 fn handleSessionList(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -9361,8 +9520,7 @@ fn writeHistoryMessagesJson(w: anytype, history: []const @import("agent/root.zig
     if (history.len > SESSION_EXPORT_MAX_MESSAGES) {
         try w.writeAll(",{\"role\":\"system\",\"content\":\"[truncated — ");
         var trunc_buf: [64]u8 = undefined;
-        const trunc_msg = std.fmt.bufPrint(&trunc_buf, "{d} of {d} messages shown]\"}}",
-            .{ SESSION_EXPORT_MAX_MESSAGES, history.len }) catch "export truncated]\"}";
+        const trunc_msg = std.fmt.bufPrint(&trunc_buf, "{d} of {d} messages shown]\"}}", .{ SESSION_EXPORT_MAX_MESSAGES, history.len }) catch "export truncated]\"}";
         try w.writeAll(trunc_msg);
     }
 }
@@ -10698,6 +10856,42 @@ fn handleApiRoute(
     if (std.mem.startsWith(u8, parsed.subpath, "sessions/")) {
         const rest = parsed.subpath["sessions/".len..];
         return handleSessionAction(req_allocator, method, scoped_user_id, rest, effective_session_mgr, raw_request);
+    }
+
+    // ── Task query endpoints (WP2.2) ────────────────────────────────────
+    // Resolve the per-tenant TaskDelivery by looking up the tenant runtime.
+    // We do NOT materialize a runtime on demand — a GET that arrives before
+    // any agent work has happened for this user simply sees no tasks.
+    if (std.mem.eql(u8, parsed.subpath, "tasks") or std.mem.startsWith(u8, parsed.subpath, "tasks/")) {
+        const effective_task_delivery: ?*tasks_mod.TaskDelivery = blk: {
+            state.tenant_runtime_mutex.lock();
+            defer state.tenant_runtime_mutex.unlock();
+            if (state.tenant_runtimes.get(scoped_user_id)) |runtime| {
+                break :blk runtime.task_delivery;
+            }
+            break :blk null;
+        };
+        if (std.mem.eql(u8, parsed.subpath, "tasks")) {
+            return handleTaskList(req_allocator, method, effective_task_delivery);
+        }
+        const rest = parsed.subpath["tasks/".len..];
+        return handleTaskGet(req_allocator, method, rest, effective_task_delivery);
+    }
+
+    // ── Usage summary endpoint (WP2.3) ──────────────────────────────────
+    // Resolve the per-tenant UsageRuntime. Mirrors the task-read contract:
+    // we never create a tenant runtime on demand — a GET before the user
+    // has any agent activity returns a zero summary.
+    if (std.mem.eql(u8, parsed.subpath, "usage")) {
+        const effective_usage_rt: ?*usage_runtime_mod.UsageRuntime = blk: {
+            state.tenant_runtime_mutex.lock();
+            defer state.tenant_runtime_mutex.unlock();
+            if (state.tenant_runtimes.get(scoped_user_id)) |runtime| {
+                break :blk runtime.usage_rt;
+            }
+            break :blk null;
+        };
+        return handleUserUsage(req_allocator, method, effective_usage_rt);
     }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"not found\"}" };
@@ -13283,6 +13477,9 @@ pub fn runWithRole(
                 }
                 session_mgr_opt = sm;
                 if (subagent_manager_opt) |mgr| {
+                    if (standalone_task_delivery) |*td| {
+                        mgr.attachTaskDelivery(td);
+                    }
                     if (session_mgr_opt) |*session_mgr| {
                         if (completion_router_opt) |router| {
                             router.* = .{
@@ -18690,6 +18887,158 @@ test "handleSessionAction rejects cross-user session key" {
         "",
     );
     try std.testing.expectEqualStrings("403 Forbidden", resp.status);
+}
+
+// ── WP2.2 task query endpoint tests ──────────────────────────────────
+
+test "handleTaskList returns empty array when no delivery resolved" {
+    const resp = handleTaskList(std.testing.allocator, "GET", null);
+    // Static body when delivery is null; no free.
+    try std.testing.expectEqualStrings("{\"tasks\":[]}", resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+}
+
+test "handleTaskList rejects non-GET methods" {
+    const resp = handleTaskList(std.testing.allocator, "POST", null);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleTaskList returns tasks from delivery snapshot" {
+    const alloc = std.testing.allocator;
+    var ledger = tasks_mod.TaskLedger.init(alloc);
+    defer ledger.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = tasks_mod.TaskDelivery{ .ledger = &ledger, .observer = noop.observer() };
+    _ = try ledger.createTask("alpha task", "session-1");
+    _ = try ledger.createTask("beta task", "session-1");
+
+    const resp = handleTaskList(alloc, "GET", &delivery);
+    defer alloc.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tasks\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "alpha task") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "beta task") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"owner_session\":\"session-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"queued\"") != null);
+}
+
+test "handleTaskGet rejects non-GET methods" {
+    const resp = handleTaskGet(std.testing.allocator, "DELETE", "task_00000000001", null);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleTaskGet returns 400 for empty task_id" {
+    const resp = handleTaskGet(std.testing.allocator, "GET", "", null);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "handleTaskGet returns 400 for task_id with control chars" {
+    const resp = handleTaskGet(std.testing.allocator, "GET", "task_\x01bad", null);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "handleTaskGet returns 404 when delivery not resolved" {
+    const resp = handleTaskGet(std.testing.allocator, "GET", "task_00000000001", null);
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleTaskGet returns 404 when task not present" {
+    const alloc = std.testing.allocator;
+    var ledger = tasks_mod.TaskLedger.init(alloc);
+    defer ledger.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = tasks_mod.TaskDelivery{ .ledger = &ledger, .observer = noop.observer() };
+
+    const resp = handleTaskGet(alloc, "GET", "task_deadbeefbad", &delivery);
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleTaskGet returns snapshot JSON for existing task" {
+    const alloc = std.testing.allocator;
+    var ledger = tasks_mod.TaskLedger.init(alloc);
+    defer ledger.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = tasks_mod.TaskDelivery{ .ledger = &ledger, .observer = noop.observer() };
+    const entry = try ledger.createTask("some work", "session-7");
+    const id = entry.task_id;
+
+    const resp = handleTaskGet(alloc, "GET", &id, &delivery);
+    defer alloc.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "some work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"owner_session\":\"session-7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"queued\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, &id) != null);
+}
+
+// ── WP2.3 usage endpoint tests ───────────────────────────────────────
+
+test "handleUserUsage returns zero summary when no runtime resolved" {
+    const resp = handleUserUsage(std.testing.allocator, "GET", null);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    // Static body when runtime is null; no free.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"session_total_tokens\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"turn_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"models\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"cost_available\":false") != null);
+}
+
+test "handleUserUsage rejects non-GET methods" {
+    const resp = handleUserUsage(std.testing.allocator, "POST", null);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleUserUsage rejects DELETE" {
+    const resp = handleUserUsage(std.testing.allocator, "DELETE", null);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleUserUsage returns populated summary from UsageRuntime" {
+    const alloc = std.testing.allocator;
+    var urt = usage_runtime_mod.UsageRuntime.init(alloc);
+    defer urt.deinit();
+    urt.recordTurn("claude-3", 100, 50, 0.0, 120);
+    urt.recordTurn("gpt-4", 200, 80, 0.0, 160);
+    urt.recordTurn("claude-3", 10, 5, 0.0, 40);
+
+    const resp = handleUserUsage(alloc, "GET", &urt);
+    defer alloc.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"turn_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"session_total_tokens\":445") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"session_input_tokens\":310") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"session_output_tokens\":135") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"model\":\"claude-3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"model\":\"gpt-4\"") != null);
+    // No non-zero cost was recorded → cost_available is false.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"cost_available\":false") != null);
+}
+
+test "handleUserUsage escapes model names in JSON output" {
+    const alloc = std.testing.allocator;
+    var urt = usage_runtime_mod.UsageRuntime.init(alloc);
+    defer urt.deinit();
+    // Model name with a quote, backslash, and newline — must be escaped.
+    urt.recordTurn("evil\"model\\x\nname", 1, 1, 0.0, 1);
+
+    const resp = handleUserUsage(alloc, "GET", &urt);
+    defer alloc.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    // Raw unescaped quote must not appear in the model value.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "evil\\\"model\\\\x\\nname") != null);
+    // Raw newline must NOT be present anywhere in the JSON body.
+    try std.testing.expect(std.mem.indexOfScalar(u8, resp.body, '\n') == null);
+}
+
+test "handleUserUsage reports cost_available=true when cost accumulated" {
+    const alloc = std.testing.allocator;
+    var urt = usage_runtime_mod.UsageRuntime.init(alloc);
+    defer urt.deinit();
+    urt.recordTurn("claude-3", 100, 50, 0.001234, 100);
+
+    const resp = handleUserUsage(alloc, "GET", &urt);
+    defer alloc.free(resp.body);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"cost_available\":true") != null);
 }
 
 test "validateApproveInput rejects missing body" {

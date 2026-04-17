@@ -27,7 +27,11 @@ pub const TaskListTool = struct {
 
     pub fn execute(self: *TaskListTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const status_filter = if (root.getString(args, "status")) |s| TaskStatus.fromString(s) else null;
-        const entries = self.delivery.listTasks();
+        // WP2.1R: consume a snapshot instead of a borrowed ledger slice, so
+        // subagent lifecycle threads can append concurrently without
+        // racing the reader.
+        const entries = try self.delivery.listTasksSnapshot(allocator);
+        defer allocator.free(entries);
 
         var buf: std.ArrayListUnmanaged(u8) = .{};
         errdefer buf.deinit(allocator);

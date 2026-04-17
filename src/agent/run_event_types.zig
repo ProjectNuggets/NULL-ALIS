@@ -60,6 +60,7 @@ pub const ProgressPayload = struct {
     heartbeat: bool = false,
     command: ?[]const u8 = null,
     files: ?[]const []const u8 = null,
+    run_id: ?[]const u8 = null,
 };
 
 pub const ReasoningSummaryPayload = struct {
@@ -67,6 +68,7 @@ pub const ReasoningSummaryPayload = struct {
     phase: ?[]const u8 = null,
     tool: ?[]const u8 = null,
     iteration: ?u32 = null,
+    run_id: ?[]const u8 = null,
 };
 
 pub const ToolStartPayload = struct {
@@ -76,6 +78,7 @@ pub const ToolStartPayload = struct {
     command: ?[]const u8 = null,
     files: ?[]const []const u8 = null,
     activity_label: ?[]const u8 = null,
+    run_id: ?[]const u8 = null,
 };
 
 pub const ToolResultPayload = struct {
@@ -89,12 +92,14 @@ pub const ToolResultPayload = struct {
     command: ?[]const u8 = null,
     files: ?[]const []const u8 = null,
     exit_code: ?i32 = null,
+    run_id: ?[]const u8 = null,
 };
 
 pub const ApprovalRequiredPayload = struct {
     tool: []const u8,
     reason: []const u8,
     risk_level: []const u8,
+    run_id: ?[]const u8 = null,
 };
 
 pub const TaskUpdatePayload = struct {
@@ -102,6 +107,7 @@ pub const TaskUpdatePayload = struct {
     status: []const u8,
     description: ?[]const u8 = null,
     progress_pct: ?u8 = null,
+    run_id: ?[]const u8 = null,
 };
 
 pub const DonePayload = struct {
@@ -109,6 +115,7 @@ pub const DonePayload = struct {
     message_id: ?i64 = null,
     usage_tokens: ?u64 = null,
     cost_usd: ?f64 = null,
+    run_id: ?[]const u8 = null,
 };
 
 // ── RunEvent Tagged Union ────────────────────────────────────────────
@@ -195,6 +202,7 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             }
             try writeOptionalStringField(w, "command", p.command);
             try writeOptionalStringArrayField(w, "files", p.files);
+            try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
         .reasoning_summary => |p| {
@@ -206,6 +214,7 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             if (p.iteration) |iter| {
                 try w.print(",\"iteration\":{d}", .{iter});
             }
+            try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
         .tool_start => |p| {
@@ -217,6 +226,7 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             try writeOptionalStringField(w, "command", p.command);
             try writeOptionalStringArrayField(w, "files", p.files);
             try writeOptionalStringField(w, "activity_label", p.activity_label);
+            try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
         .tool_result => |p| {
@@ -242,6 +252,7 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             if (p.exit_code) |code| {
                 try w.print(",\"exit_code\":{d}", .{code});
             }
+            try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
         .approval_required => |p| {
@@ -251,7 +262,9 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             try jsonEscapeInto(w, p.reason);
             try w.writeAll("\",\"risk_level\":\"");
             try jsonEscapeInto(w, p.risk_level);
-            try w.writeAll("\"}");
+            try w.writeAll("\"");
+            try writeOptionalStringField(w, "run_id", p.run_id);
+            try w.writeAll("}");
         },
         .task_update => |p| {
             try w.writeAll("{\"type\":\"task_update\",\"task_id\":\"");
@@ -267,6 +280,7 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             if (p.progress_pct) |pct| {
                 try w.print(",\"progress_pct\":{d}", .{pct});
             }
+            try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
         .done => |p| {
@@ -285,6 +299,7 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             if (p.cost_usd) |cost| {
                 try w.print(",\"cost_usd\":{d:.6}", .{cost});
             }
+            try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
     }
@@ -590,6 +605,100 @@ test "toSseFrame for approval_required" {
     defer allocator.free(frame);
     try std.testing.expect(std.mem.startsWith(u8, frame, "event: approval_required\n"));
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"risk_level\":\"high\"") != null);
+}
+
+test "toSseFrame includes run_id when set on tool_start" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .tool_start = .{
+        .tool = "bash",
+        .tool_use_id = "call_1",
+        .run_id = "r-100-1",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_use_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\":\"r-100-1\"") != null);
+}
+
+test "toSseFrame omits run_id when null on tool_start" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .tool_start = .{
+        .tool = "bash",
+        .tool_use_id = "call_2",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\"") == null);
+}
+
+test "toSseFrame includes run_id when set on tool_result" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .tool_result = .{
+        .tool = "bash",
+        .success = true,
+        .duration_ms = 5,
+        .tool_use_id = "call_1",
+        .run_id = "r-100-1",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_use_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\":\"r-100-1\"") != null);
+}
+
+test "toSseFrame omits run_id when null on tool_result" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .tool_result = .{
+        .tool = "bash",
+        .success = true,
+        .duration_ms = 5,
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\"") == null);
+}
+
+test "toSseFrame includes run_id when set on approval_required" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .approval_required = .{
+        .tool = "bash",
+        .reason = "supervised_mutating_requires_approval",
+        .risk_level = "critical",
+        .run_id = "r-200-3",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"risk_level\":\"critical\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\":\"r-200-3\"") != null);
+}
+
+test "toSseFrame omits run_id when null on approval_required" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .approval_required = .{
+        .tool = "bash",
+        .reason = "x",
+        .risk_level = "low",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\"") == null);
+}
+
+test "toSseFrame includes run_id when set on progress" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .progress = .{
+        .phase = "thinking",
+        .state = "start",
+        .label = "Thinking",
+        .run_id = "r-300-9",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\":\"r-300-9\"") != null);
+}
+
+test "toSseFrame omits run_id when null on progress" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .progress = .{
+        .phase = "thinking",
+        .state = "start",
+        .label = "Thinking",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\"") == null);
 }
 
 test "toSseFrame for task_update with progress_pct" {

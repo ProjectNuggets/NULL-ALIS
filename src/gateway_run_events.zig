@@ -125,13 +125,14 @@ pub const RunEventObserver = struct {
 
         // Translate applicable events to RunEvent SSE frames.
         switch (event.*) {
-            .llm_request => {
+            .llm_request => |e| {
                 self.emit(.{ .progress = .{
                     .phase = "thinking",
                     .state = "start",
                     .label = "Thinking",
+                    .run_id = e.run_id,
                 } });
-                self.emitReasoningSummary("Thinking through the request", "thinking", null, null);
+                self.emitReasoningSummary("Thinking through the request", "thinking", null, null, e.run_id);
             },
             .llm_response => |e| {
                 self.emit(.{ .progress = .{
@@ -139,6 +140,7 @@ pub const RunEventObserver = struct {
                     .state = if (e.success) "update" else "error",
                     .label = if (e.success) "Model response received" else "Model request failed",
                     .duration_ms = e.duration_ms,
+                    .run_id = e.run_id,
                 } });
             },
             .tool_call_start => |e| {
@@ -149,6 +151,7 @@ pub const RunEventObserver = struct {
                     .command = e.command,
                     .files = e.files,
                     .activity_label = e.activity_label,
+                    .run_id = e.run_id,
                 } });
                 // Stack buffer for summary — safe because emitReasoningSummary→emit→toSseFrame
                 // copies the string synchronously before this frame returns.
@@ -157,7 +160,7 @@ pub const RunEventObserver = struct {
                     label
                 else
                     std.fmt.bufPrint(&summary_buf, "Using {s}", .{e.tool}) catch "Using a tool";
-                self.emitReasoningSummary(summary, "tool", e.tool, null);
+                self.emitReasoningSummary(summary, "tool", e.tool, null, e.run_id);
             },
             .tool_call => |e| {
                 self.emit(.{ .tool_result = .{
@@ -171,6 +174,7 @@ pub const RunEventObserver = struct {
                     .command = e.command,
                     .files = e.files,
                     .exit_code = e.exit_code,
+                    .run_id = e.run_id,
                 } });
             },
             .turn_stage => |e| {
@@ -186,9 +190,10 @@ pub const RunEventObserver = struct {
                     .heartbeat = e.heartbeat,
                     .command = e.command,
                     .files = e.files,
+                    .run_id = e.run_id,
                 } });
                 if (reasoningSummaryForStage(e.stage)) |summary| {
-                    self.emitReasoningSummary(summary, reasoningPhaseForStage(e.stage), null, e.iteration);
+                    self.emitReasoningSummary(summary, reasoningPhaseForStage(e.stage), null, e.iteration, e.run_id);
                 }
             },
             .narration_frame => |e| {
@@ -201,11 +206,19 @@ pub const RunEventObserver = struct {
             },
             .agent_end => |e| self.emit(.{ .done = .{
                 .usage_tokens = e.tokens_used,
+                .run_id = e.run_id,
             } }),
             .task_update => |e| self.emit(.{ .task_update = .{
                 .task_id = e.task_id,
                 .status = e.status,
                 .description = e.description,
+                .run_id = e.run_id,
+            } }),
+            .approval_required => |e| self.emit(.{ .approval_required = .{
+                .tool = e.tool,
+                .reason = e.reason,
+                .risk_level = e.risk_level,
+                .run_id = e.run_id,
             } }),
             .turn_complete => self.emit(.{ .progress = .{
                 .phase = "finalize",
@@ -259,6 +272,7 @@ pub const RunEventObserver = struct {
         phase: ?[]const u8,
         tool: ?[]const u8,
         iteration: ?u32,
+        run_id: ?[]const u8,
     ) void {
         if (self.shouldSuppressReasoningSummary(summary, phase, tool, iteration)) return;
         self.emit(.{ .reasoning_summary = .{
@@ -266,6 +280,7 @@ pub const RunEventObserver = struct {
             .phase = phase,
             .tool = tool,
             .iteration = iteration,
+            .run_id = run_id,
         } });
     }
 
@@ -524,6 +539,64 @@ test "stageLabel returns human-readable labels" {
     try std.testing.expectEqualStrings("Running tools", stageLabel("dispatch_tools"));
     try std.testing.expectEqualStrings("Preparing reply", stageLabel("compose_final_reply"));
     try std.testing.expectEqualStrings("unknown_stage", stageLabel("unknown_stage"));
+}
+
+test "tool_call_start with run_id forwards run_id into tool_start frame" {
+    var noop = observability.NoopObserver{};
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    var reo = RunEventObserver{ .inner = noop.observer(), .sink = test_sink.sink(), .allocator = allocator };
+    const obs = reo.observer();
+    const evt = ObserverEvent{ .tool_call_start = .{
+        .tool = "bash",
+        .tool_use_id = "call_1",
+        .run_id = "r-42-1",
+    } };
+    obs.recordEvent(&evt);
+    const frame = test_sink.firstFrameWithPrefix("event: tool_start\n").?;
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_use_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\":\"r-42-1\"") != null);
+}
+
+test "tool_call with run_id forwards run_id into tool_result frame" {
+    var noop = observability.NoopObserver{};
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    var reo = RunEventObserver{ .inner = noop.observer(), .sink = test_sink.sink(), .allocator = allocator };
+    const obs = reo.observer();
+    const evt = ObserverEvent{ .tool_call = .{
+        .tool = "bash",
+        .success = true,
+        .duration_ms = 7,
+        .tool_use_id = "call_1",
+        .run_id = "r-42-1",
+    } };
+    obs.recordEvent(&evt);
+    const frame = test_sink.lastFrame().?;
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: tool_result\n"));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_use_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\":\"r-42-1\"") != null);
+}
+
+test "approval_required with run_id forwards run_id into approval_required frame" {
+    var noop = observability.NoopObserver{};
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    var reo = RunEventObserver{ .inner = noop.observer(), .sink = test_sink.sink(), .allocator = allocator };
+    const obs = reo.observer();
+    const evt = ObserverEvent{ .approval_required = .{
+        .tool = "bash",
+        .reason = "supervised_mutating_requires_approval",
+        .risk_level = "critical",
+        .run_id = "r-77-2",
+    } };
+    obs.recordEvent(&evt);
+    const frame = test_sink.lastFrame().?;
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: approval_required\n"));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\":\"r-77-2\"") != null);
 }
 
 test "shouldSuppressReasoningSummary deduplicates identical events within window" {

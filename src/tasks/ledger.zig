@@ -99,18 +99,37 @@ pub const TaskLedger = struct {
     }
 
     pub fn deinit(self: *TaskLedger) void {
+        // WP2.1S: the ledger owns every string field on every TaskEntry, so
+        // we must release them before dropping the entries slab.
+        for (self.entries.items) |*entry| {
+            self.freeEntryStrings(entry);
+        }
         self.entries.deinit(self.allocator);
+    }
+
+    fn freeEntryStrings(self: *TaskLedger, entry: *TaskEntry) void {
+        self.allocator.free(entry.description);
+        self.allocator.free(entry.owner_session);
+        if (entry.result_summary) |rs| self.allocator.free(rs);
+        if (entry.error_message) |em| self.allocator.free(em);
     }
 
     pub fn createTask(self: *TaskLedger, description: []const u8, owner_session: []const u8) !*TaskEntry {
         if (self.entries.items.len >= MAX_TASKS) return error.LedgerFull;
 
+        // WP2.1S: duplicate before append so a failed append frees the dupes
+        // via errdefer — the entry never observes the borrowed inputs.
+        const desc_copy = try self.allocator.dupe(u8, description);
+        errdefer self.allocator.free(desc_copy);
+        const owner_copy = try self.allocator.dupe(u8, owner_session);
+        errdefer self.allocator.free(owner_copy);
+
         const now = std.time.milliTimestamp();
         try self.entries.append(self.allocator, .{
             .task_id = undefined,
-            .description = description,
+            .description = desc_copy,
             .status = .queued,
-            .owner_session = owner_session,
+            .owner_session = owner_copy,
             .created_at_ms = now,
             .updated_at_ms = now,
         });
@@ -120,6 +139,54 @@ pub const TaskLedger = struct {
         self.next_id += 1;
 
         return entry;
+    }
+
+    /// Create a canonical entry using a caller-supplied numeric id. Used by
+    /// the subagent bridge (WP2.1) to mirror SubagentManager's numeric task
+    /// ids into the canonical TaskLedger. Idempotent: if an entry with the
+    /// same id already exists, it is returned unchanged.
+    pub fn createTaskWithNumericId(
+        self: *TaskLedger,
+        description: []const u8,
+        owner_session: []const u8,
+        numeric_id: u64,
+    ) !*TaskEntry {
+        var id_buf: [TASK_ID_LEN]u8 = undefined;
+        const formatted = std.fmt.bufPrint(&id_buf, "task_{x:0>11}", .{numeric_id}) catch
+            return error.TaskIdOverflow;
+        if (formatted.len != TASK_ID_LEN) return error.TaskIdOverflow;
+
+        if (self.findIndex(formatted)) |idx| {
+            // Idempotent: no new allocation; existing owned strings stay put.
+            return &self.entries.items[idx];
+        }
+
+        if (self.entries.items.len >= MAX_TASKS) return error.LedgerFull;
+
+        // WP2.1S: duplicate inputs before append so SubagentManager can free
+        // its TaskState strings independently without dangling the ledger.
+        const desc_copy = try self.allocator.dupe(u8, description);
+        errdefer self.allocator.free(desc_copy);
+        const owner_copy = try self.allocator.dupe(u8, owner_session);
+        errdefer self.allocator.free(owner_copy);
+
+        const now = std.time.milliTimestamp();
+        try self.entries.append(self.allocator, .{
+            .task_id = id_buf,
+            .description = desc_copy,
+            .status = .queued,
+            .owner_session = owner_copy,
+            .created_at_ms = now,
+            .updated_at_ms = now,
+        });
+
+        // Advance next_id past externally supplied ids so future auto-created
+        // tasks can't collide with bridged ids.
+        if (numeric_id >= self.next_id) {
+            self.next_id = numeric_id + 1;
+        }
+
+        return &self.entries.items[self.entries.items.len - 1];
     }
 
     fn findIndex(self: *const TaskLedger, task_id: []const u8) ?usize {
@@ -149,16 +216,24 @@ pub const TaskLedger = struct {
     pub fn markSucceeded(self: *TaskLedger, task_id: []const u8, result: ?[]const u8) !void {
         const entry = self.getTaskMut(task_id) orelse return error.TaskNotFound;
         try validateTransition(entry.status, .succeeded);
+        // WP2.1S: dupe-new before free-old so a failed allocation leaves the
+        // existing result_summary intact. The state machine prevents reaching
+        // markSucceeded twice in practice, but the defensive pattern keeps
+        // ownership invariants stable for any future internal call site.
+        const new_result: ?[]const u8 = if (result) |r| try self.allocator.dupe(u8, r) else null;
+        if (entry.result_summary) |old| self.allocator.free(old);
         entry.status = .succeeded;
-        entry.result_summary = result;
+        entry.result_summary = new_result;
         entry.updated_at_ms = std.time.milliTimestamp();
     }
 
     pub fn markFailed(self: *TaskLedger, task_id: []const u8, err_msg: ?[]const u8) !void {
         const entry = self.getTaskMut(task_id) orelse return error.TaskNotFound;
         try validateTransition(entry.status, .failed);
+        const new_err: ?[]const u8 = if (err_msg) |e| try self.allocator.dupe(u8, e) else null;
+        if (entry.error_message) |old| self.allocator.free(old);
         entry.status = .failed;
-        entry.error_message = err_msg;
+        entry.error_message = new_err;
         entry.updated_at_ms = std.time.milliTimestamp();
     }
 
@@ -401,6 +476,47 @@ test "TaskLedger.sweepLost marks stale running tasks" {
     try std.testing.expectEqual(TaskStatus.lost, updated.status);
 }
 
+test "TaskLedger.createTaskWithNumericId uses supplied id and advances next_id" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+
+    const entry = try ledger_inst.createTaskWithNumericId("bridged", "session-a", 42);
+    try std.testing.expectEqualStrings("task_0000000002a", &entry.task_id);
+    try std.testing.expectEqual(@as(u64, 43), ledger_inst.next_id);
+
+    const follow = try ledger_inst.createTask("auto", "session-a");
+    try std.testing.expectEqualStrings("task_0000000002b", &follow.task_id);
+}
+
+test "TaskLedger.createTaskWithNumericId is idempotent for duplicate ids" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+
+    const first = try ledger_inst.createTaskWithNumericId("bridged", "session-a", 7);
+    const first_id = first.task_id;
+    try ledger_inst.markRunning(&first_id);
+
+    const again = try ledger_inst.createTaskWithNumericId("bridged", "session-a", 7);
+    try std.testing.expectEqualStrings(&first_id, &again.task_id);
+    try std.testing.expectEqual(TaskStatus.running, again.status);
+    try std.testing.expectEqual(@as(usize, 1), ledger_inst.entries.items.len);
+}
+
+test "TaskLedger.createTaskWithNumericId does not regress next_id for smaller numbers" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+
+    _ = try ledger_inst.createTask("auto", "session-a");
+    _ = try ledger_inst.createTask("auto", "session-a");
+    try std.testing.expectEqual(@as(u64, 3), ledger_inst.next_id);
+
+    _ = try ledger_inst.createTaskWithNumericId("bridged", "session-a", 1);
+    try std.testing.expectEqual(@as(u64, 3), ledger_inst.next_id);
+}
+
 test "TaskLedger enforces MAX_TASKS" {
     const allocator = std.testing.allocator;
     var ledger_inst = TaskLedger.init(allocator);
@@ -411,4 +527,135 @@ test "TaskLedger enforces MAX_TASKS" {
         _ = try ledger_inst.createTask("fill", "s1");
     }
     try std.testing.expectError(error.LedgerFull, ledger_inst.createTask("overflow", "s1"));
+}
+
+// ── WP2.1S: ledger-owned string fields ──────────────────────────────
+
+test "TaskLedger.createTask owns description and owner_session" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+
+    var desc_buf = [_]u8{ 'a', 'b', 'c' };
+    var owner_buf = [_]u8{ 's', '1' };
+    const entry = try ledger_inst.createTask(&desc_buf, &owner_buf);
+    const id = entry.task_id;
+
+    // Mutate the caller's buffers: the ledger must be unaffected because it
+    // duplicated the inputs on insert.
+    @memset(&desc_buf, 'X');
+    @memset(&owner_buf, 'Z');
+
+    const after = ledger_inst.getTask(&id).?;
+    try std.testing.expectEqualStrings("abc", after.description);
+    try std.testing.expectEqualStrings("s1", after.owner_session);
+}
+
+test "TaskLedger.createTaskWithNumericId owns description and owner_session" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+
+    var desc_buf = [_]u8{ 'h', 'e', 'l', 'l', 'o' };
+    var owner_buf = [_]u8{ 'o', 'w', 'n', 'e', 'r' };
+    const entry = try ledger_inst.createTaskWithNumericId(&desc_buf, &owner_buf, 42);
+    const id = entry.task_id;
+
+    @memset(&desc_buf, 'X');
+    @memset(&owner_buf, 'Y');
+
+    const after = ledger_inst.getTask(&id).?;
+    try std.testing.expectEqualStrings("hello", after.description);
+    try std.testing.expectEqualStrings("owner", after.owner_session);
+}
+
+test "TaskLedger.markSucceeded owns result_summary" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+
+    const entry = try ledger_inst.createTask("done", "s1");
+    const id = entry.task_id;
+    try ledger_inst.markRunning(&id);
+
+    var result_buf = [_]u8{ 'o', 'k' };
+    try ledger_inst.markSucceeded(&id, &result_buf);
+    @memset(&result_buf, 'X');
+
+    const after = ledger_inst.getTask(&id).?;
+    try std.testing.expectEqualStrings("ok", after.result_summary.?);
+}
+
+test "TaskLedger.markFailed owns error_message" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+
+    const entry = try ledger_inst.createTask("oops", "s1");
+    const id = entry.task_id;
+    try ledger_inst.markRunning(&id);
+
+    var err_buf = [_]u8{ 'b', 'o', 'o', 'm' };
+    try ledger_inst.markFailed(&id, &err_buf);
+    @memset(&err_buf, 'X');
+
+    const after = ledger_inst.getTask(&id).?;
+    try std.testing.expectEqualStrings("boom", after.error_message.?);
+}
+
+test "TaskLedger.markSucceeded null result_summary stays null and leaks nothing" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+
+    const entry = try ledger_inst.createTask("silent", "s1");
+    const id = entry.task_id;
+    try ledger_inst.markRunning(&id);
+    try ledger_inst.markSucceeded(&id, null);
+
+    const after = ledger_inst.getTask(&id).?;
+    try std.testing.expect(after.result_summary == null);
+}
+
+test "TaskLedger.deinit frees owned result and error strings" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+
+    const ok_entry = try ledger_inst.createTask("ok", "s1");
+    const ok_id = ok_entry.task_id;
+    try ledger_inst.markRunning(&ok_id);
+    try ledger_inst.markSucceeded(&ok_id, "payload");
+
+    const bad_entry = try ledger_inst.createTask("bad", "s1");
+    const bad_id = bad_entry.task_id;
+    try ledger_inst.markRunning(&bad_id);
+    try ledger_inst.markFailed(&bad_id, "explanation");
+
+    // std.testing.allocator fails the test on leak — no explicit assertion
+    // needed beyond cleanup reaching this point.
+    ledger_inst.deinit();
+}
+
+test "TaskLedger replacing result_summary frees previous owned value" {
+    // The public state machine prevents a second markSucceeded, so we drive
+    // the replacement path directly on the ledger internals to prove the
+    // free-old-before-assign-new invariant holds. Behavior that matters for
+    // future internal callers: no leak, new value present.
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+
+    const entry = try ledger_inst.createTask("swap", "s1");
+    const id = entry.task_id;
+    try ledger_inst.markRunning(&id);
+    try ledger_inst.markSucceeded(&id, "first");
+
+    // Manually drive the same dupe-new-free-old dance markSucceeded uses.
+    const target = ledger_inst.getTaskMut(&id).?;
+    const replacement = try allocator.dupe(u8, "second");
+    if (target.result_summary) |old| allocator.free(old);
+    target.result_summary = replacement;
+
+    const after = ledger_inst.getTask(&id).?;
+    try std.testing.expectEqualStrings("second", after.result_summary.?);
 }

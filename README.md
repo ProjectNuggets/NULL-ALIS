@@ -57,6 +57,23 @@ Naming note:
 - Tool-call loop with reflection, bounded iterations, and fallback completion behavior.
 - Streaming reply transport via `/api/v1/chat/stream`.
 
+Operator slash commands (chat surface, not REST endpoints):
+
+| Command | Purpose |
+|---|---|
+| `/permissions` (alias `/perm`) | Read-only snapshot of permission, approval, and execution posture. |
+| `/mode [plan\|execute\|review\|background]` | Inspect or switch execution posture. |
+| `/plan`, `/review`, `/execute` | Direct execution-mode switches. `plan`/`review` block mutating tools; `execute` applies the current security policy. |
+| `/approve <allow-once\|deny>` | Resolve the single pending tool approval. |
+| `/usage [off\|tokens\|full\|cost]` | Toggle per-turn usage reporting. |
+| `/cost` | Read-only token/cost snapshot for the session. |
+| `/help` | Categorized discovery of all implemented commands. |
+
+See [src/agent/commands.zig](src/agent/commands.zig) for the full set, and
+[docs/online-agent-contract.md](docs/online-agent-contract.md) for the
+operator-surface contract. These are chat slash commands — REST parity is
+planned/deferred and is not implemented in v0.1.
+
 ### 2) Memory and State
 Hybrid memory architecture:
 - Workspace markdown files for human-readable continuity.
@@ -134,12 +151,20 @@ Important endpoints:
 - `/api/v1/chat/stream`
 - `/api/v1/users/*` tenant surfaces
 
-SSE chat stream contract:
+SSE chat stream contract (structured run events):
 - `event: status` (initial status)
-- `event: progress` (optional runtime progress hints)
+- `event: progress` (phase transitions, tool dispatch, keepalives)
+- `event: reasoning_summary` (short narration; when reasoning mode is on)
+- `event: tool_start` (tool invocation starting)
+- `event: tool_result` (tool invocation finished, success or failure)
+- `event: approval_required` (supervised mutating tool awaiting `/approve`)
+- `event: task_update` (subagent task state change)
 - `event: token` (assistant text deltas)
 - `event: error` (stream error payload)
 - `event: done` (terminal frame)
+
+Full schema, correlation ids (`run_id`, `tool_use_id`), approval behavior,
+and ordering invariants: [docs/online-agent-contract.md](docs/online-agent-contract.md).
 
 Integration handoff specs:
 - [ZAKI backend handoff](deploy/k8s/zaki-bot/ZAKI_BACKEND_HANDOFF.md)

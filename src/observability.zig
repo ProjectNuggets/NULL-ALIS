@@ -15,9 +15,25 @@ pub const NarrationFrameType = enum {
 /// Events the observer can record.
 pub const ObserverEvent = union(enum) {
     agent_start: struct { provider: []const u8, model: []const u8 },
-    llm_request: struct { provider: []const u8, model: []const u8, messages_count: usize },
-    llm_response: struct { provider: []const u8, model: []const u8, duration_ms: u64, success: bool, error_message: ?[]const u8 },
-    agent_end: struct { duration_ms: u64, tokens_used: ?u64 },
+    llm_request: struct {
+        provider: []const u8,
+        model: []const u8,
+        messages_count: usize,
+        run_id: ?[]const u8 = null,
+    },
+    llm_response: struct {
+        provider: []const u8,
+        model: []const u8,
+        duration_ms: u64,
+        success: bool,
+        error_message: ?[]const u8,
+        run_id: ?[]const u8 = null,
+    },
+    agent_end: struct {
+        duration_ms: u64,
+        tokens_used: ?u64,
+        run_id: ?[]const u8 = null,
+    },
     tool_call_start: struct {
         tool: []const u8,
         tool_use_id: ?[]const u8 = null,
@@ -25,6 +41,7 @@ pub const ObserverEvent = union(enum) {
         command: ?[]const u8 = null,
         files: ?[]const []const u8 = null,
         activity_label: ?[]const u8 = null,
+        run_id: ?[]const u8 = null,
     },
     tool_call: struct {
         tool: []const u8,
@@ -37,6 +54,7 @@ pub const ObserverEvent = union(enum) {
         command: ?[]const u8 = null,
         files: ?[]const []const u8 = null,
         exit_code: ?i32 = null,
+        run_id: ?[]const u8 = null,
     },
     tool_iterations_exhausted: struct { iterations: u32 },
     turn_cancelled: struct { reason: []const u8, iteration: u32 },
@@ -51,6 +69,7 @@ pub const ObserverEvent = union(enum) {
         heartbeat: bool = false,
         command: ?[]const u8 = null,
         files: ?[]const []const u8 = null,
+        run_id: ?[]const u8 = null,
     },
     turn_complete: void,
     channel_message: struct { channel: []const u8, direction: []const u8 },
@@ -67,6 +86,15 @@ pub const ObserverEvent = union(enum) {
         task_id: []const u8,
         status: []const u8,
         description: ?[]const u8 = null,
+        run_id: ?[]const u8 = null,
+    },
+    /// Emitted when a supervised mutating tool needs user approval before running.
+    /// Payload is intentionally non-sensitive — no raw tool arguments.
+    approval_required: struct {
+        tool: []const u8,
+        reason: []const u8,
+        risk_level: []const u8,
+        run_id: ?[]const u8 = null,
     },
 };
 
@@ -190,6 +218,7 @@ pub const LogObserver = struct {
             .err => |e| std.log.info("error component={s} message={s}", .{ e.component, e.message }),
             .narration_frame => |e| std.log.info("narration type={s} message={s}", .{ @tagName(e.frame_type), e.message }),
             .task_update => |e| std.log.info("task.update task_id={s} status={s}", .{ e.task_id, e.status }),
+            .approval_required => |e| std.log.info("approval.required tool={s} reason={s} risk_level={s}", .{ e.tool, e.reason, e.risk_level }),
         }
     }
 
@@ -385,6 +414,7 @@ pub const FileObserver = struct {
             .err => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"error\",\"component\":\"{s}\",\"message\":\"{s}\"}}", .{ e.component, e.message }) catch return,
             .narration_frame => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"narration_frame\",\"type\":\"{s}\",\"message\":\"{s}\"}}", .{ @tagName(e.frame_type), e.message }) catch return,
             .task_update => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"task_update\",\"task_id\":\"{s}\",\"status\":\"{s}\"}}", .{ e.task_id, e.status }) catch return,
+            .approval_required => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"approval_required\",\"tool\":\"{s}\",\"reason\":\"{s}\",\"risk_level\":\"{s}\"}}", .{ e.tool, e.reason, e.risk_level }) catch return,
         };
         self.appendToFile(line);
     }
@@ -644,6 +674,13 @@ pub const OtelObserver = struct {
                 self.addSpan("task.update", now, now, &.{
                     .{ .key = "task_id", .value = e.task_id },
                     .{ .key = "status", .value = e.status },
+                });
+            },
+            .approval_required => |e| {
+                self.addSpan("approval.required", now, now, &.{
+                    .{ .key = "tool", .value = e.tool },
+                    .{ .key = "reason", .value = e.reason },
+                    .{ .key = "risk_level", .value = e.risk_level },
                 });
             },
         }

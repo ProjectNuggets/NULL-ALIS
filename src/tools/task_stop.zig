@@ -12,7 +12,7 @@ pub const TaskStopTool = struct {
     delivery: *TaskDelivery,
 
     pub const tool_name = "task_stop";
-    pub const tool_description = "Cancel a queued or running task. Returns error if task is already in a terminal state.";
+    pub const tool_description = "Cancel a queued task. Running tasks cannot be interrupted — returns an error if the task is already running or in a terminal state.";
     pub const tool_params =
         \\{"type":"object","properties":{"task_id":{"type":"string","description":"The task ID to cancel"}},"required":["task_id"]}
     ;
@@ -27,10 +27,18 @@ pub const TaskStopTool = struct {
         const task_id = root.getString(args, "task_id") orelse
             return ToolResult.fail("task_id is required");
 
-        self.delivery.markCancelled(task_id) catch |err| switch (err) {
-            error.InvalidTransition => return ToolResult.fail("task is already in a terminal state"),
-            error.TaskNotFound => return ToolResult.fail("task not found"),
-        };
+        // WP2.1R: honest guard collapsed into a single atomic delivery
+        // operation so the "is it running?" check cannot interleave with a
+        // subagent lifecycle thread flipping queued → running between the
+        // check and the mark-cancelled. cancelQueued refuses running tasks
+        // outright (no live interruption) and does not mutate terminal or
+        // missing entries.
+        switch (self.delivery.cancelQueued(task_id)) {
+            .cancelled => {},
+            .running => return ToolResult.fail("cannot cancel a running task: live interruption is not supported"),
+            .terminal => return ToolResult.fail("task is already in a terminal state"),
+            .not_found => return ToolResult.fail("task not found"),
+        }
 
         const output = try std.fmt.allocPrint(allocator, "{{\"task_id\":\"{s}\",\"status\":\"cancelled\"}}", .{task_id});
         return .{ .success = true, .output = output };
@@ -82,6 +90,30 @@ test "TaskStopTool.execute with invalid task_id returns error" {
     const result = try ts.execute(allocator, args);
     try std.testing.expect(!result.success);
     try std.testing.expectEqualStrings("task not found", result.error_msg.?);
+}
+
+test "TaskStopTool.execute refuses to cancel running task" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+
+    const entry = try ledger_inst.createTask("running task", "s1");
+    const id = entry.task_id;
+    try ledger_inst.markRunning(&id);
+
+    var args = JsonObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("task_id", .{ .string = &id });
+
+    var ts = TaskStopTool{ .delivery = &delivery };
+    const result = try ts.execute(allocator, args);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "running") != null);
+    // Status must stay running — the guard must not silently mutate state.
+    const after = ledger_inst.getTask(&id).?;
+    try std.testing.expectEqual(tasks_mod.TaskStatus.running, after.status);
 }
 
 test "TaskStopTool.execute with terminated task returns error" {

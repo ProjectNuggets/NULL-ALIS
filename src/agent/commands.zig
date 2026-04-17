@@ -24,12 +24,80 @@ const util = @import("../util.zig");
 const channel_health = @import("../channel_health.zig");
 const security_review = @import("../security_review.zig");
 const health_mod = @import("../health.zig");
+const approval_modes_mod = @import("../security/approval_modes.zig");
+const tool_metadata_mod = @import("../tools/metadata.zig");
+const usage_runtime_mod = @import("../usage_runtime.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = struct {
     name: []const u8,
     arg: []const u8,
 };
+
+/// Categorized help surface. Lists only commands that are implemented in
+/// this runtime. Keep concise — this is a discovery aid, not a manual.
+const HELP_TEXT =
+    \\Commands
+    \\
+    \\Session:
+    \\  /new [model], /restart [model]
+    \\  /reset                       — checkpoint + clear history
+    \\  /resume <session_key>        — switch to a named session
+    \\  /status
+    \\
+    \\Identity & runtime:
+    \\  /whoami, /id, /runtime
+    \\  /model, /models, /model <name>
+    \\
+    \\Execution posture:
+    \\  /mode [plan|execute|review|background]
+    \\  /plan, /review, /execute     — direct execution-mode switches
+    \\
+    \\Safety & approvals:
+    \\  /permissions (alias /perm)   — read-only permission/approval posture
+    \\  /approve <allow-once|deny>   — resolve the pending tool approval
+    \\  /allowlist                   — per-session tool allowlist
+    \\
+    \\Usage & cost:
+    \\  /usage [off|tokens|full|cost]
+    \\  /cost                        — read-only token/cost snapshot
+    \\
+    \\Context & memory:
+    \\  /context, /compact
+    \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
+    \\  /learn [list|forget <key>]   — inspect/remove learned facts
+    \\  /persona                     — show persona profile from SOUL.md
+    \\
+    \\Diagnostics:
+    \\  /health                      — channel health dashboard
+    \\  /doctor                      — memory subsystem diagnostics
+    \\  /security-review             — structured security audit
+    \\  /debug [show|reset]
+    \\
+    \\Channels & docking:
+    \\  /dock-telegram, /dock-discord, /dock-slack
+    \\  /activation, /send
+    \\
+    \\Subagents & focus:
+    \\  /subagents, /agents
+    \\  /focus, /unfocus, /kill, /steer, /tell
+    \\
+    \\Voice & reasoning:
+    \\  /voice [on|off], /tts
+    \\  /think, /verbose, /reasoning
+    \\
+    \\Execution & tools:
+    \\  /exec, /queue, /stop, /poll, /bash, /skill, /elevated
+    \\
+    \\Config & export:
+    \\  /config, /capabilities
+    \\  /export-session, /export
+    \\  /session ttl <duration|off>
+    \\
+    \\  /help, /commands             — show this list
+    \\  exit, quit
+    \\
+;
 
 fn parseSlashCommand(message: []const u8) ?SlashCommand {
     const trimmed = std.mem.trim(u8, message, " \t\r\n");
@@ -1656,6 +1724,30 @@ fn handleModeCommand(self: anytype, arg: []const u8) ![]const u8 {
     return try self.allocator.dupe(u8, "Unknown mode. Options: plan, execute, review, background");
 }
 
+fn handlePlanCommand(self: anytype) ![]const u8 {
+    self.execution_mode = .plan;
+    return try self.allocator.dupe(
+        u8,
+        "Switched to plan mode. Mutating tools are blocked; read-only tools may run. See /permissions for current policy details.",
+    );
+}
+
+fn handleReviewCommand(self: anytype) ![]const u8 {
+    self.execution_mode = .review;
+    return try self.allocator.dupe(
+        u8,
+        "Switched to review mode. Mutating tools are blocked; read-only tools may run. See /permissions for current policy details.",
+    );
+}
+
+fn handleExecuteCommand(self: anytype) ![]const u8 {
+    self.execution_mode = .execute;
+    return try self.allocator.dupe(
+        u8,
+        "Switched to execute mode. Tools follow current security policy. See /permissions for current policy details.",
+    );
+}
+
 fn handleVerboseCommand(self: anytype, arg: []const u8) ![]const u8 {
     const level = firstToken(arg);
     if (level.len == 0 or std.ascii.eqlIgnoreCase(level, "status")) {
@@ -1820,6 +1912,48 @@ fn handleUsageCommand(self: anytype, arg: []const u8) ![]const u8 {
     self.usage_mode = parseUsageMode(@TypeOf(self.usage_mode), mode) orelse
         return try self.allocator.dupe(u8, "Invalid /usage value. Use: off|tokens|full|cost");
     return try std.fmt.allocPrint(self.allocator, "Usage mode set to: {s}", .{self.usage_mode.toSlice()});
+}
+
+// WP3.3: /cost — read-only token and cost status.
+//
+// Reports last turn and session totals using existing usage state. Never
+// mutates usage_mode, execution_mode, pending approvals, or counters. When
+// UsageRuntime has recorded a non-zero session_cost_usd we surface it;
+// otherwise we explicitly state that provider pricing is not wired — we do
+// NOT invent rates or maintain a local pricing table.
+fn handleCostCommand(self: anytype) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const w = out.writer(self.allocator);
+
+    var have_cost = false;
+    var cost_usd: f64 = 0.0;
+    if (self.usage_rt) |urt| {
+        const totals = urt.sessionTotals();
+        if (totals.cost > 0.0) {
+            have_cost = true;
+            cost_usd = totals.cost;
+        }
+    }
+
+    if (have_cost) {
+        try w.print("Session cost: ${d:.6}\n", .{cost_usd});
+    } else {
+        try w.writeAll("Cost estimate unavailable: provider pricing is not wired for this session.\n");
+    }
+
+    try w.print(
+        "Last turn: prompt={d} completion={d} total={d}\n",
+        .{
+            self.last_turn_usage.prompt_tokens,
+            self.last_turn_usage.completion_tokens,
+            self.last_turn_usage.total_tokens,
+        },
+    );
+    try w.print("Session total: tokens={d}\n", .{self.total_tokens});
+    try w.writeAll("Use /usage cost to append this status to future replies.");
+
+    return try out.toOwnedSlice(self.allocator);
 }
 
 fn handleTtsCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -2174,7 +2308,86 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     return try self.allocator.dupe(u8, text);
 }
 
+/// Resolve /approve when a generic pending tool approval exists.
+/// Handles: status display, allow-once, deny, and allow-always (treated as
+/// allow-once in v1 — there is no persistent generic allowlist yet).
+fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
+    const pending = self.pending_tool_approval.?;
+
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    if (trimmed.len == 0) {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Pending tool approval id={d} tool={s} risk={s} reason={s}\nUse /approve {d} allow-once|deny",
+            .{ pending.id, pending.tool_name, pending.risk_level.toSlice(), pending.reason, pending.id },
+        );
+    }
+
+    var requested_id: ?u64 = null;
+    var decision_token: []const u8 = firstToken(trimmed);
+
+    const first = splitFirstToken(trimmed);
+    if (parseTaskId(first.head)) |id| {
+        requested_id = id;
+        decision_token = firstToken(first.tail);
+    }
+
+    const decision = parseApproveDecision(decision_token) orelse
+        return try self.allocator.dupe(u8, "Usage: /approve <id?> allow-once|deny");
+
+    if (requested_id) |id| {
+        if (id != pending.id) {
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Approval id mismatch. Pending tool approval id is {d}.",
+                .{pending.id},
+            );
+        }
+    }
+
+    if (decision == .deny) {
+        const id_snapshot = pending.id;
+        self.clearPendingToolApproval();
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Tool approval id={d} denied.",
+            .{id_snapshot},
+        );
+    }
+
+    // Both allow-once and allow-always run the tool exactly once in v1.
+    // There is no persistent generic allowlist — say so explicitly.
+    const id_snapshot = pending.id;
+    const always_note: []const u8 = if (decision == .allow_always)
+        " (allow-always not supported for generic tool approval in v1 — ran once)"
+    else
+        "";
+
+    const result = self.executeApprovedPendingTool(self.allocator) catch |err| {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Approved tool execution failed: {s}",
+            .{@errorName(err)},
+        );
+    };
+    defer self.allocator.free(result.output);
+    return try std.fmt.allocPrint(
+        self.allocator,
+        "Approved tool (id={d}) success={any}.{s}\n{s}",
+        .{ id_snapshot, result.success, always_note, result.output },
+    );
+}
+
 fn handleApproveCommand(self: anytype, arg: []const u8) ![]const u8 {
+    // Generic pending tool approval (WP1.4) takes precedence over legacy
+    // shell/exec approval. When one is active, /approve resolves it and
+    // never falls through to the shell path.
+    if (@hasField(@TypeOf(self.*), "pending_tool_approval")) {
+        if (self.pending_tool_approval != null) {
+            return try handleGenericToolApprove(self, arg);
+        }
+    }
+
     const pending_command = self.pending_exec_command orelse
         return try self.allocator.dupe(u8, "No pending approval requests.");
 
@@ -2237,6 +2450,7 @@ fn taskStatusLabel(status: subagent_mod.TaskStatus) []const u8 {
         .running => "running",
         .completed => "completed",
         .failed => "failed",
+        .cancelled => "cancelled",
     };
 }
 
@@ -2273,6 +2487,7 @@ fn taskOutcomeLabel(state: *const subagent_mod.TaskState) []const u8 {
         .running => "in_progress",
         .completed => "completed",
         .failed => "failed",
+        .cancelled => "cancelled",
     };
 }
 
@@ -2297,6 +2512,7 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
     var completed: u32 = 0;
     var failed: u32 = 0;
     var queued: u32 = 0;
+    var cancelled: u32 = 0;
     var visible_count: u32 = 0;
 
     var it = manager.tasks.iterator();
@@ -2310,6 +2526,7 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
             .running => running += 1,
             .completed => completed += 1,
             .failed => failed += 1,
+            .cancelled => cancelled += 1,
         }
 
         try w.print("#{d} {s} [{s}] task={s} outcome={s}", .{
@@ -2333,7 +2550,7 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
         return try out.toOwnedSlice(self.allocator);
     }
 
-    try w.print("Totals: queued={d}, running={d}, completed={d}, failed={d}", .{ queued, running, completed, failed });
+    try w.print("Totals: queued={d}, running={d}, completed={d}, failed={d}, cancelled={d}", .{ queued, running, completed, failed, cancelled });
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2555,29 +2772,51 @@ fn handleKillCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     if (std.ascii.eqlIgnoreCase(target, "all")) {
-        var ids: std.ArrayListUnmanaged(u64) = .empty;
-        defer ids.deinit(self.allocator);
-
-        manager.mutex.lock();
-        defer manager.mutex.unlock();
-
+        // WP2.4: snapshot the visible queued/terminal ids under the lock
+        // so we can drive cancelQueued / fetchRemove afterwards without
+        // holding the manager mutex across the mirror to TaskDelivery.
+        var queued_ids: std.ArrayListUnmanaged(u64) = .empty;
+        defer queued_ids.deinit(self.allocator);
+        var terminal_ids: std.ArrayListUnmanaged(u64) = .empty;
+        defer terminal_ids.deinit(self.allocator);
         var running: u32 = 0;
-        var it = manager.tasks.iterator();
-        while (it.next()) |entry| {
-            const task_id = entry.key_ptr.*;
-            const state = entry.value_ptr.*;
-            if (!taskBelongsToCurrentSession(self, state)) continue;
-            if (state.status == .running) {
-                running += 1;
-            } else {
-                try ids.append(self.allocator, task_id);
+
+        {
+            manager.mutex.lock();
+            defer manager.mutex.unlock();
+            var it = manager.tasks.iterator();
+            while (it.next()) |entry| {
+                const task_id = entry.key_ptr.*;
+                const state = entry.value_ptr.*;
+                if (!taskBelongsToCurrentSession(self, state)) continue;
+                switch (state.status) {
+                    .queued => try queued_ids.append(self.allocator, task_id),
+                    .running => running += 1,
+                    .completed, .failed, .cancelled => try terminal_ids.append(self.allocator, task_id),
+                }
+            }
+        }
+
+        var cancelled_count: u32 = 0;
+        for (queued_ids.items) |task_id| {
+            switch (manager.cancelQueued(task_id)) {
+                .cancelled => cancelled_count += 1,
+                // Raced with the runtime — the task started running or
+                // completed between snapshot and cancel. The .running
+                // path is silently counted into the next /kill attempt
+                // via the live count reported below. Terminal/not_found
+                // are no-ops; we won't re-remove them here.
+                .running, .terminal, .not_found => {},
             }
         }
 
         var removed: u32 = 0;
-        for (ids.items) |task_id| {
-            if (manager.tasks.fetchRemove(task_id)) |kv| {
-                freeSubagentTaskState(manager, kv.value);
+        for (terminal_ids.items) |task_id| {
+            manager.mutex.lock();
+            const kv = manager.tasks.fetchRemove(task_id);
+            manager.mutex.unlock();
+            if (kv) |pair| {
+                freeSubagentTaskState(manager, pair.value);
                 removed += 1;
             }
         }
@@ -2585,37 +2824,57 @@ fn handleKillCommand(self: anytype, arg: []const u8) ![]const u8 {
         if (running > 0) {
             return try std.fmt.allocPrint(
                 self.allocator,
-                "Removed {d} completed tasks; {d} running tasks cannot be interrupted in this runtime.",
-                .{ removed, running },
+                "Cancelled {d} queued tasks; removed {d} terminal tasks; {d} running tasks cannot be interrupted in this runtime.",
+                .{ cancelled_count, removed, running },
             );
         }
-        return try std.fmt.allocPrint(self.allocator, "Removed {d} completed tasks.", .{removed});
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Cancelled {d} queued tasks; removed {d} terminal tasks.",
+            .{ cancelled_count, removed },
+        );
     }
 
     const task_id = parseTaskId(target) orelse
         return try self.allocator.dupe(u8, "Usage: /kill <id|all>");
 
-    manager.mutex.lock();
-    defer manager.mutex.unlock();
+    // Session-scoped visibility check + status snapshot under the lock.
+    const status_snapshot: ?subagent_mod.TaskStatus = blk: {
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+        const state = manager.tasks.get(task_id) orelse break :blk null;
+        if (!taskBelongsToCurrentSession(self, state)) break :blk null;
+        break :blk state.status;
+    };
 
-    const state = manager.tasks.get(task_id) orelse
+    const status = status_snapshot orelse
         return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
-    if (!taskBelongsToCurrentSession(self, state)) {
-        return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
-    }
-    if (state.status == .running) {
-        return try std.fmt.allocPrint(
+
+    switch (status) {
+        .queued => {
+            switch (manager.cancelQueued(task_id)) {
+                .cancelled => return try std.fmt.allocPrint(self.allocator, "Task #{d} cancelled (was queued).", .{task_id}),
+                .running => return try std.fmt.allocPrint(self.allocator, "Task #{d} is running and cannot be interrupted in this runtime.", .{task_id}),
+                .terminal => return try std.fmt.allocPrint(self.allocator, "Task #{d} already terminal; nothing to cancel.", .{task_id}),
+                .not_found => return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id}),
+            }
+        },
+        .running => return try std.fmt.allocPrint(
             self.allocator,
             "Task #{d} is running and cannot be interrupted in this runtime.",
             .{task_id},
-        );
+        ),
+        .completed, .failed, .cancelled => {
+            manager.mutex.lock();
+            const kv = manager.tasks.fetchRemove(task_id);
+            manager.mutex.unlock();
+            if (kv) |pair| {
+                freeSubagentTaskState(manager, pair.value);
+                return try std.fmt.allocPrint(self.allocator, "Task #{d} removed (was {s}).", .{ task_id, taskStatusLabel(status) });
+            }
+            return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+        },
     }
-
-    if (manager.tasks.fetchRemove(task_id)) |kv| {
-        freeSubagentTaskState(manager, kv.value);
-        return try std.fmt.allocPrint(self.allocator, "Task #{d} removed.", .{task_id});
-    }
-    return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
 }
 
 fn handleSubagentsCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -2751,6 +3010,7 @@ fn handlePollCommand(self: anytype) ![]const u8 {
         var completed: u32 = 0;
         var failed: u32 = 0;
         var queued: u32 = 0;
+        var cancelled: u32 = 0;
         var visible: u32 = 0;
 
         var it = manager.tasks.iterator();
@@ -2763,13 +3023,14 @@ fn handlePollCommand(self: anytype) ![]const u8 {
                 .running => running += 1,
                 .completed => completed += 1,
                 .failed => failed += 1,
+                .cancelled => cancelled += 1,
             }
         }
         if (visible > 0) {
             wrote_any = true;
             try w.print(
-                "Subagent tasks: queued={d}, running={d}, completed={d}, failed={d}\n",
-                .{ queued, running, completed, failed },
+                "Subagent tasks: queued={d}, running={d}, completed={d}, failed={d}, cancelled={d}\n",
+                .{ queued, running, completed, failed, cancelled },
             );
         }
     }
@@ -3388,33 +3649,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     }
 
     if (isSlashName(cmd, "help") or isSlashName(cmd, "commands")) {
-        return try self.allocator.dupe(u8,
-            \\Available commands:
-            \\  /new [model], /restart [model]
-            \\  /reset                     — Checkpoint + clear history (fresh start)
-            \\  /resume <session_key>      — Switch to a named session (reconnect with key)
-            \\  /help, /commands, /status, /runtime, /whoami, /id
-            \\  /model, /models, /model <name>
-            \\  /mode [plan|execute|review|background]
-            \\  /think, /verbose, /reasoning
-            \\  /exec, /queue, /usage, /tts, /voice
-            \\  /stop, /compact
-            \\  /allowlist, /approve, /context
-            \\  /export-session, /export
-            \\  /session ttl <duration|off>
-            \\  /subagents, /agents, /focus, /unfocus, /kill, /steer, /tell
-            \\  /config, /capabilities, /debug
-            \\  /dock-telegram, /dock-discord, /dock-slack
-            \\  /activation, /send, /elevated, /bash, /poll, /skill
-            \\  /doctor — memory subsystem diagnostics
-            \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
-            \\  /learn [list|forget <key>] — inspect and remove learned behavioral facts
-            \\  /persona — show current persona profile from SOUL.md
-            \\  /health — channel health dashboard
-            \\  /security-review — structured security audit with score
-            \\  /voice [on|off] — toggle voice-first mode
-            \\  exit, quit
-        );
+        return try self.allocator.dupe(u8, HELP_TEXT);
     }
 
     if (isSlashName(cmd, "status")) return try formatStatus(self);
@@ -3448,7 +3683,11 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "exec")) return try handleExecCommand(self, cmd.arg);
     if (isSlashName(cmd, "queue")) return try handleQueueCommand(self, cmd.arg);
     if (isSlashName(cmd, "mode")) return try handleModeCommand(self, cmd.arg);
+    if (isSlashName(cmd, "plan")) return try handlePlanCommand(self);
+    if (isSlashName(cmd, "review")) return try handleReviewCommand(self);
+    if (isSlashName(cmd, "execute")) return try handleExecuteCommand(self);
     if (isSlashName(cmd, "usage")) return try handleUsageCommand(self, cmd.arg);
+    if (isSlashName(cmd, "cost")) return try handleCostCommand(self);
     if (isSlashName(cmd, "tts")) return try handleTtsCommand(self, cmd.arg);
     if (isSlashName(cmd, "voice")) return try handleVoiceCommand(self, cmd.arg);
     if (isSlashName(cmd, "stop")) return try handleStopCommand(self);
@@ -3504,6 +3743,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "persona")) return try handlePersonaCommand(self, cmd.arg);
     if (isSlashName(cmd, "health")) return try handleHealthCommand(self);
     if (isSlashName(cmd, "security-review") or isSlashName(cmd, "security_review")) return try handleSecurityReviewCommand(self);
+    if (isSlashName(cmd, "permissions") or isSlashName(cmd, "perm")) return try handlePermissionsCommand(self);
 
     return null;
 }
@@ -3558,6 +3798,93 @@ fn handleSecurityReviewCommand(self: anytype) ![]const u8 {
     defer self.allocator.free(report.checks);
 
     return try security_review.formatReviewText(self.allocator, report);
+}
+
+/// Read-only snapshot of the agent's permission, approval, and execution posture.
+/// Does not mutate config, pending approvals, or any runtime state.
+fn handlePermissionsCommand(self: anytype) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const w = out.writer(self.allocator);
+
+    try w.writeAll("Permissions (read-only report)\n\n");
+    try w.print("Execution mode: {s}\n", .{self.execution_mode.toSlice()});
+
+    try w.writeAll("\nSecurity policy:\n");
+    if (self.policy) |pol| {
+        try w.writeAll("  status: configured\n");
+        try w.print("  autonomy: {s}\n", .{pol.autonomy.toString()});
+        try w.print("  workspace_dir: {s}\n", .{pol.workspace_dir});
+        try w.print("  workspace_only: {s}\n", .{if (pol.workspace_only) "true" else "false"});
+        try w.print("  max_actions_per_hour: {d}\n", .{pol.max_actions_per_hour});
+        try w.print("  rate_limited: {s}\n", .{if (pol.isRateLimited()) "yes" else "no"});
+    } else {
+        try w.writeAll("  status: not configured\n");
+    }
+
+    try w.writeAll("\nExec posture:\n");
+    try w.print("  host: {s}\n", .{self.exec_host.toSlice()});
+    try w.print("  security: {s}\n", .{self.exec_security.toSlice()});
+    try w.print("  ask: {s}\n", .{self.exec_ask.toSlice()});
+
+    var wrote_pending = false;
+    if (@hasField(@TypeOf(self.*), "pending_tool_approval")) {
+        if (self.pending_tool_approval) |p| {
+            try w.writeAll("\nPending tool approval:\n");
+            try w.print("  id: {d}\n", .{p.id});
+            try w.print("  tool: {s}\n", .{p.tool_name});
+            try w.print("  risk: {s}\n", .{p.risk_level.toSlice()});
+            try w.print("  reason: {s}\n", .{p.reason});
+            try w.print("  resolve: /approve {d} allow-once|deny\n", .{p.id});
+            wrote_pending = true;
+        }
+    }
+    if (self.pending_exec_command) |cmd| {
+        try w.writeAll("\nPending exec approval:\n");
+        try w.print("  id: {d}\n", .{self.pending_exec_id});
+        try w.print("  command: {s}\n", .{cmd});
+        try w.print("  resolve: /approve {d} allow-once|allow-always|deny\n", .{self.pending_exec_id});
+        wrote_pending = true;
+    }
+    if (!wrote_pending) {
+        try w.writeAll("\nPending approvals: none\n");
+    }
+
+    try w.writeAll("\nApproval rules for built-in tools:\n");
+    if (self.policy) |pol| {
+        const read_meta = tool_metadata_mod.ToolMetadata{
+            .name = "_read_only",
+            .flags = .{ .read_only = true },
+        };
+        const mutating_meta = tool_metadata_mod.ToolMetadata{
+            .name = "_mutating",
+            .flags = .{ .mutating = true },
+        };
+        const operator_meta = tool_metadata_mod.ToolMetadata{
+            .name = "_operator_only",
+            .flags = .{ .operator_only = true },
+        };
+        try w.print(
+            "  read-only tools:    {s}\n",
+            .{approval_modes_mod.ApprovalPolicy.forTool(read_meta, pol.autonomy).toSlice()},
+        );
+        try w.print(
+            "  mutating tools:     {s}\n",
+            .{approval_modes_mod.ApprovalPolicy.forTool(mutating_meta, pol.autonomy).toSlice()},
+        );
+        try w.print(
+            "  operator-only:      {s}\n",
+            .{approval_modes_mod.ApprovalPolicy.forTool(operator_meta, pol.autonomy).toSlice()},
+        );
+    } else {
+        try w.writeAll("  (no policy configured — approval rules not enforced)\n");
+    }
+
+    try w.writeAll(
+        "\nNote: generic allow-always is not persistent in v1 — an approved call runs once.\n",
+    );
+
+    return try out.toOwnedSlice(self.allocator);
 }
 
 fn handleVoiceCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -3939,17 +4266,18 @@ test "baseline: known command surface has expected breadth" {
     // This test validates the slash command set by checking parseSlashCommand
     // correctly parses each known command name.
     const known_commands = [_][]const u8{
-        "new",          "reset",           "resume",          "restart",      "help",
-        "commands",     "status",          "runtime",         "whoami",       "id",
-        "model",        "models",          "think",           "verbose",      "reasoning",
-        "exec",         "queue",           "usage",           "tts",          "voice",
-        "stop",         "compact",         "allowlist",       "approve",      "context",
-        "export-session", "export",        "session",         "subagents",    "agents",
-        "focus",        "unfocus",         "kill",            "steer",        "tell",
-        "config",       "capabilities",    "debug",           "dock-telegram","dock-discord",
-        "dock-slack",   "activation",      "send",            "elevated",     "bash",
-        "poll",         "skill",           "doctor",          "memory",       "learn",
-        "persona",      "health",          "security-review", "security_review",
+        "new",          "reset",          "resume",       "restart",         "help",
+        "commands",     "status",         "runtime",      "whoami",          "id",
+        "model",        "models",         "think",        "verbose",         "reasoning",
+        "exec",         "queue",          "usage",        "cost",            "tts",
+        "voice",        "stop",           "compact",      "allowlist",       "approve",
+        "context",      "export-session", "export",       "session",         "subagents",
+        "agents",       "focus",          "unfocus",      "kill",            "steer",
+        "tell",         "config",         "capabilities", "debug",           "dock-telegram",
+        "dock-discord", "dock-slack",     "activation",   "send",            "elevated",
+        "bash",         "poll",           "skill",        "doctor",          "memory",
+        "learn",        "persona",        "health",       "security-review", "security_review",
+        "permissions",  "perm",           "plan",         "review",          "execute",
     };
     for (known_commands) |name| {
         const input = std.fmt.allocPrint(std.testing.allocator, "/{s}", .{name}) catch unreachable;
@@ -3959,6 +4287,13 @@ test "baseline: known command surface has expected breadth" {
     }
     // Verify count — if someone adds a command, this test documents the current set size
     try std.testing.expect(known_commands.len >= 48);
+}
+
+test "parseSlashCommand recognizes /permissions and /perm" {
+    const p1 = parseSlashCommand("/permissions") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("permissions", p1.name);
+    const p2 = parseSlashCommand("/perm") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("perm", p2.name);
 }
 
 test "handleSlashCommand recognizes /health" {
@@ -3978,4 +4313,220 @@ test "handleSlashCommand recognizes /voice on" {
     try std.testing.expect(cmd != null);
     try std.testing.expectEqualStrings("voice", cmd.?.name);
     try std.testing.expectEqualStrings("on", std.mem.trim(u8, cmd.?.arg, " \t"));
+}
+
+// ── WP3.1: direct mode commands (/plan, /review, /execute) ─────────────
+
+test "parseSlashCommand recognizes /plan /review /execute" {
+    const p = parseSlashCommand("/plan") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("plan", p.name);
+    const r = parseSlashCommand("/review") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("review", r.name);
+    const e = parseSlashCommand("/execute") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("execute", e.name);
+}
+
+const ModeStubAgent = struct {
+    allocator: std.mem.Allocator,
+    execution_mode: execution_mode_mod.ExecutionMode,
+};
+
+test "handlePlanCommand sets mode to .plan and mentions safety hints" {
+    var agent = ModeStubAgent{
+        .allocator = std.testing.allocator,
+        .execution_mode = .execute,
+    };
+    const response = try handlePlanCommand(&agent);
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expectEqual(execution_mode_mod.ExecutionMode.plan, agent.execution_mode);
+    try std.testing.expect(std.mem.indexOf(u8, response, "plan mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Mutating tools are blocked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "read-only tools may run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/permissions") != null);
+}
+
+test "handleReviewCommand sets mode to .review and mentions safety hints" {
+    var agent = ModeStubAgent{
+        .allocator = std.testing.allocator,
+        .execution_mode = .execute,
+    };
+    const response = try handleReviewCommand(&agent);
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expectEqual(execution_mode_mod.ExecutionMode.review, agent.execution_mode);
+    try std.testing.expect(std.mem.indexOf(u8, response, "review mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Mutating tools are blocked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "read-only tools may run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/permissions") != null);
+}
+
+test "handleExecuteCommand sets mode to .execute and mentions security policy" {
+    var agent = ModeStubAgent{
+        .allocator = std.testing.allocator,
+        .execution_mode = .plan,
+    };
+    const response = try handleExecuteCommand(&agent);
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expectEqual(execution_mode_mod.ExecutionMode.execute, agent.execution_mode);
+    try std.testing.expect(std.mem.indexOf(u8, response, "execute mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "current security policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/permissions") != null);
+}
+
+test "handleModeCommand plan still sets mode to .plan" {
+    var agent = ModeStubAgent{
+        .allocator = std.testing.allocator,
+        .execution_mode = .execute,
+    };
+    const response = try handleModeCommand(&agent, "plan");
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expectEqual(execution_mode_mod.ExecutionMode.plan, agent.execution_mode);
+}
+
+// ── WP3.3: /cost — read-only token and cost status ─────────────────────
+
+const CostStubAgent = struct {
+    allocator: std.mem.Allocator,
+    last_turn_usage: providers.TokenUsage,
+    total_tokens: u64,
+    usage_rt: ?*usage_runtime_mod.UsageRuntime,
+    // Sentinel field asserted unchanged by /cost. Typed as u8 to avoid
+    // depending on the private Agent.UsageMode enum.
+    usage_mode: u8 = 0,
+};
+
+test "parseSlashCommand recognizes /cost" {
+    const cmd = parseSlashCommand("/cost") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("cost", cmd.name);
+    try std.testing.expectEqualStrings("", cmd.arg);
+}
+
+test "handleCostCommand with no usage reports zero-token status clearly" {
+    var agent = CostStubAgent{
+        .allocator = std.testing.allocator,
+        .last_turn_usage = .{},
+        .total_tokens = 0,
+        .usage_rt = null,
+    };
+    const response = try handleCostCommand(&agent);
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Cost estimate unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "provider pricing is not wired") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "prompt=0 completion=0 total=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "tokens=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/usage cost") != null);
+}
+
+test "handleCostCommand reports last_turn_usage and session total_tokens" {
+    var agent = CostStubAgent{
+        .allocator = std.testing.allocator,
+        .last_turn_usage = .{ .prompt_tokens = 12, .completion_tokens = 34, .total_tokens = 46 },
+        .total_tokens = 128,
+        .usage_rt = null,
+    };
+    const response = try handleCostCommand(&agent);
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "prompt=12 completion=34 total=46") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "tokens=128") != null);
+    // usage_rt is null → pricing is unwired; must say so explicitly.
+    try std.testing.expect(std.mem.indexOf(u8, response, "Cost estimate unavailable") != null);
+}
+
+test "handleCostCommand surfaces real cost from usage_rt when non-zero" {
+    var rt = usage_runtime_mod.UsageRuntime.init(std.testing.allocator);
+    defer rt.deinit();
+    rt.recordTurn("claude-3", 100, 50, 0.001234, 100);
+
+    var agent = CostStubAgent{
+        .allocator = std.testing.allocator,
+        .last_turn_usage = .{ .prompt_tokens = 100, .completion_tokens = 50, .total_tokens = 150 },
+        .total_tokens = 150,
+        .usage_rt = &rt,
+    };
+    const response = try handleCostCommand(&agent);
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Session cost: $") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Cost estimate unavailable") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "prompt=100 completion=50 total=150") != null);
+}
+
+test "handleCostCommand does not mutate usage_mode or counters" {
+    var agent = CostStubAgent{
+        .allocator = std.testing.allocator,
+        .last_turn_usage = .{ .prompt_tokens = 7, .completion_tokens = 3, .total_tokens = 10 },
+        .total_tokens = 99,
+        .usage_rt = null,
+        .usage_mode = 42,
+    };
+    const response = try handleCostCommand(&agent);
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expectEqual(@as(u8, 42), agent.usage_mode);
+    try std.testing.expectEqual(@as(u64, 99), agent.total_tokens);
+    try std.testing.expectEqual(@as(u32, 7), agent.last_turn_usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 3), agent.last_turn_usage.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 10), agent.last_turn_usage.total_tokens);
+}
+
+test "parseUsageMode still accepts cost (keeps /usage cost working)" {
+    const UsageModeLocal = enum { off, tokens, full, cost };
+    const m = parseUsageMode(UsageModeLocal, "cost") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(UsageModeLocal.cost, m);
+}
+
+// ── /help categorized discovery surface ─────────────────────────────────
+// handleSlashCommand monomorphizes against the caller's agent type and
+// compiles all branches, so we can't build a tiny stub for the /help
+// path alone. Instead, assert against the static HELP_TEXT constant
+// that /help dupes verbatim — the handler's only side effect is the
+// allocator copy, which is already exercised by integration tests.
+
+fn expectHelpContains(text: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, text, needle) == null) {
+        std.debug.print("help text missing: {s}\n", .{needle});
+        return error.TestExpectedEqual;
+    }
+}
+
+test "HELP_TEXT exposes implemented operator commands" {
+    // Must include the P0 operator-surface commands.
+    try expectHelpContains(HELP_TEXT, "/permissions");
+    try expectHelpContains(HELP_TEXT, "/perm");
+    try expectHelpContains(HELP_TEXT, "/plan");
+    try expectHelpContains(HELP_TEXT, "/review");
+    try expectHelpContains(HELP_TEXT, "/execute");
+    try expectHelpContains(HELP_TEXT, "/usage");
+    try expectHelpContains(HELP_TEXT, "/cost");
+    try expectHelpContains(HELP_TEXT, "/mode");
+}
+
+test "HELP_TEXT is categorized (contains section headers)" {
+    try expectHelpContains(HELP_TEXT, "Session:");
+    try expectHelpContains(HELP_TEXT, "Execution posture:");
+    try expectHelpContains(HELP_TEXT, "Safety & approvals:");
+    try expectHelpContains(HELP_TEXT, "Usage & cost:");
+    try expectHelpContains(HELP_TEXT, "Diagnostics:");
+}
+
+test "HELP_TEXT covers additional implemented commands" {
+    // Sanity: common existing commands should still appear in discovery.
+    try expectHelpContains(HELP_TEXT, "/new");
+    try expectHelpContains(HELP_TEXT, "/reset");
+    try expectHelpContains(HELP_TEXT, "/resume");
+    try expectHelpContains(HELP_TEXT, "/status");
+    try expectHelpContains(HELP_TEXT, "/model");
+    try expectHelpContains(HELP_TEXT, "/memory");
+    try expectHelpContains(HELP_TEXT, "/health");
+    try expectHelpContains(HELP_TEXT, "/doctor");
+    try expectHelpContains(HELP_TEXT, "/security-review");
+    try expectHelpContains(HELP_TEXT, "/approve");
+    try expectHelpContains(HELP_TEXT, "/allowlist");
+    try expectHelpContains(HELP_TEXT, "/voice");
+    try expectHelpContains(HELP_TEXT, "/compact");
 }

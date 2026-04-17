@@ -28,8 +28,12 @@ pub const TaskGetTool = struct {
         const task_id = root.getString(args, "task_id") orelse
             return ToolResult.fail("task_id is required");
 
-        const entry = self.delivery.getTask(task_id) orelse
+        // WP2.1R: take a copied snapshot rather than a borrowed pointer so a
+        // concurrent subagent lifecycle update cannot mutate the entry while
+        // we are serializing it.
+        const snap = self.delivery.getTaskSnapshot(task_id) orelse
             return ToolResult.fail("task not found");
+        const entry = &snap;
 
         var buf: std.ArrayListUnmanaged(u8) = .{};
         errdefer buf.deinit(allocator);

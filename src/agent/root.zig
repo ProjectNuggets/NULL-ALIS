@@ -29,6 +29,9 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const RateTracker = @import("../security/policy.zig").RateTracker;
+const approval_modes_mod = @import("../security/approval_modes.zig");
+const ApprovalPolicy = approval_modes_mod.ApprovalPolicy;
+const AutonomyLevel = @import("../security/policy.zig").AutonomyLevel;
 const hooks_mod = @import("../hooks.zig");
 const execution_mode_mod = @import("execution_mode.zig");
 const ExecutionMode = execution_mode_mod.ExecutionMode;
@@ -97,6 +100,7 @@ pub const Agent = struct {
                 .stage = "llm_first_token",
                 .iteration = ctx.iteration,
                 .duration_ms = first_token_ms,
+                .run_id = ctx.agent.current_run_id,
             } };
             ctx.agent.observer.recordEvent(&first_token_event);
         }
@@ -343,6 +347,26 @@ pub const Agent = struct {
     pending_exec_command: ?[]const u8 = null,
     pending_exec_command_owned: bool = false,
     pending_exec_id: u64 = 0,
+    /// Generic pending tool approval (WP1.4). Only one may exist at a time in v1.
+    /// All slices are owned — never borrow from model-response memory.
+    pending_tool_approval: ?PendingToolApproval = null,
+    pending_tool_approval_id_counter: u64 = 0,
+    /// Monotonically increasing run counter incremented at the start of every
+    /// `turn()` to mint a stable run ID for client event correlation (WP1.3).
+    run_id_counter: u64 = 0,
+    /// Stack-backed buffer holding the active turn's run ID. Lifetime is
+    /// scoped to a single `turn()` call — `current_run_id` is set on entry
+    /// and cleared on exit.
+    current_run_id_buf: [40]u8 = undefined,
+    /// Slice into `current_run_id_buf` valid only while a turn is executing.
+    /// Null between turns. Read by event-emit sites to populate `run_id` on
+    /// observer events without changing existing call signatures.
+    current_run_id: ?[]const u8 = null,
+    /// When true, `preflightToolPolicy` skips the generic approval gate.
+    /// Set during `executeApprovedPendingTool` so a user-approved call does
+    /// not re-trigger approval. Other gates (security, action budget,
+    /// execution mode) still apply.
+    approval_bypass_active: bool = false,
     session_ttl_secs: ?u64 = null,
     focus_target: ?[]const u8 = null,
     focus_target_owned: bool = false,
@@ -560,6 +584,7 @@ pub const Agent = struct {
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
         if (self.tts_provider_owned and self.tts_provider != null) self.allocator.free(self.tts_provider.?);
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
+        self.clearPendingToolApproval();
         if (self.focus_target_owned and self.focus_target != null) self.allocator.free(self.focus_target.?);
         if (self.dock_target_owned and self.dock_target != null) self.allocator.free(self.dock_target.?);
         for (self.history.items) |*msg| {
@@ -885,6 +910,36 @@ pub const Agent = struct {
         security_read_only,
         action_budget,
         execution_mode,
+        approval_required,
+        approval_denied,
+    };
+
+    /// Outcome of the approval policy gate resolved from tool metadata + autonomy.
+    /// Split out from `ApprovalPolicy` so `confirm_once`/`confirm_always` collapse
+    /// into a single actionable verdict for preflight.
+    const ApprovalGateOutcome = enum { allow, require_confirm, deny };
+
+    fn resolveApprovalGateOutcome(
+        meta: tool_metadata.ToolMetadata,
+        autonomy: AutonomyLevel,
+    ) ApprovalGateOutcome {
+        return switch (ApprovalPolicy.forTool(meta, autonomy)) {
+            .auto_approve => .allow,
+            .confirm_once, .confirm_always => .require_confirm,
+            .deny => .deny,
+        };
+    }
+
+    /// Owned snapshot of a tool call awaiting generic user approval.
+    /// Strings are duped from the call so they survive across turns and
+    /// are independent of model-response arenas.
+    pub const PendingToolApproval = struct {
+        id: u64,
+        tool_name: []const u8,
+        tool_call_id: ?[]const u8,
+        arguments_json: []const u8,
+        reason: []const u8,
+        risk_level: tool_metadata.RiskLevel,
     };
 
     const ToolPreflightAllowed = struct {
@@ -1057,6 +1112,80 @@ pub const Agent = struct {
         return tools_mod.refineMetadata(base_meta, args_obj);
     }
 
+    pub fn clearPendingToolApproval(self: *Agent) void {
+        const pending = self.pending_tool_approval orelse return;
+        self.allocator.free(pending.tool_name);
+        if (pending.tool_call_id) |id| self.allocator.free(id);
+        self.allocator.free(pending.arguments_json);
+        self.allocator.free(pending.reason);
+        self.pending_tool_approval = null;
+    }
+
+    fn setPendingToolApproval(
+        self: *Agent,
+        call: ParsedToolCall,
+        meta: tool_metadata.ToolMetadata,
+        reason: []const u8,
+    ) !u64 {
+        // v1 contract: exactly one pending generic approval at a time.
+        // Refuse to silently overwrite a prior request the user has not yet
+        // resolved — the caller decides how to surface the collision.
+        if (self.pending_tool_approval != null) return error.PendingToolApprovalAlreadyExists;
+
+        const tool_name = try self.allocator.dupe(u8, call.name);
+        errdefer self.allocator.free(tool_name);
+        const args_copy = try self.allocator.dupe(u8, call.arguments_json);
+        errdefer self.allocator.free(args_copy);
+        const reason_copy = try self.allocator.dupe(u8, reason);
+        errdefer self.allocator.free(reason_copy);
+        var tool_call_id_copy: ?[]const u8 = null;
+        errdefer if (tool_call_id_copy) |id| self.allocator.free(id);
+        if (call.tool_call_id) |id| {
+            tool_call_id_copy = try self.allocator.dupe(u8, id);
+        }
+
+        self.pending_tool_approval_id_counter += 1;
+        if (self.pending_tool_approval_id_counter == 0) self.pending_tool_approval_id_counter = 1;
+        const new_id = self.pending_tool_approval_id_counter;
+
+        self.pending_tool_approval = .{
+            .id = new_id,
+            .tool_name = tool_name,
+            .tool_call_id = tool_call_id_copy,
+            .arguments_json = args_copy,
+            .reason = reason_copy,
+            .risk_level = meta.risk_level,
+        };
+        return new_id;
+    }
+
+    /// Execute the currently pending approved tool exactly once.
+    /// Bypasses the generic approval preflight but preserves other gates.
+    /// Caller owns the returned output buffer (allocated on `tool_allocator`).
+    pub fn executeApprovedPendingTool(
+        self: *Agent,
+        tool_allocator: std.mem.Allocator,
+    ) !ToolExecutionResult {
+        const pending = self.pending_tool_approval orelse return error.NoPendingApproval;
+        // Rebuild a ParsedToolCall pointing at the owned snapshot so
+        // dispatch sees identical arguments to what the user approved.
+        const call = ParsedToolCall{
+            .name = pending.tool_name,
+            .arguments_json = pending.arguments_json,
+            .tool_call_id = pending.tool_call_id,
+        };
+        self.approval_bypass_active = true;
+        defer self.approval_bypass_active = false;
+        // Clear pending state first so the tool cannot trigger re-approval
+        // during its own execution path.
+        defer self.clearPendingToolApproval();
+        // Re-run preflight (security, budget, mode) but skip approval gate.
+        return switch (self.preflightToolPolicy(call)) {
+            .allowed => self.executeToolUnchecked(tool_allocator, call),
+            .blocked => |decision| decision.toToolExecutionResult(),
+        };
+    }
+
     fn preflightToolPolicy(self: *Agent, call: ParsedToolCall) PolicyPreflightResult {
         const meta = self.metadataForToolCall(call);
 
@@ -1073,8 +1202,7 @@ pub const Agent = struct {
                     .metadata = meta,
                 } };
             }
-            const allowed = pol.recordAction() catch true;
-            if (!allowed) {
+            if (pol.isRateLimited()) {
                 return .{ .blocked = .{
                     .name = call.name,
                     .tool_call_id = call.tool_call_id,
@@ -1116,6 +1244,89 @@ pub const Agent = struct {
                 } };
             }
         }
+        // Generic approval gate (WP1.4). Only applies when a SecurityPolicy is
+        // configured and bypass is not active for an already-approved call.
+        if (!self.approval_bypass_active) {
+            if (self.policy) |pol| {
+                const outcome = resolveApprovalGateOutcome(meta, pol.autonomy);
+                switch (outcome) {
+                    .allow => {},
+                    .deny => {
+                        return .{ .blocked = .{
+                            .name = call.name,
+                            .tool_call_id = call.tool_call_id,
+                            .output = "Tool denied by approval policy (operator-only)",
+                            .source = .approval_denied,
+                            .reason = "approval_policy_deny",
+                            .mode = self.execution_mode,
+                            .risk_level = meta.risk_level,
+                            .metadata = meta,
+                        } };
+                    },
+                    .require_confirm => {
+                        const reason_text: []const u8 = "supervised_mutating_requires_approval";
+                        _ = self.setPendingToolApproval(call, meta, reason_text) catch |err| switch (err) {
+                            // Collision: a prior pending approval is unresolved.
+                            // Leave it untouched, do not emit another event, and
+                            // tell the caller to resolve the existing one first.
+                            error.PendingToolApprovalAlreadyExists => return .{ .blocked = .{
+                                .name = call.name,
+                                .tool_call_id = call.tool_call_id,
+                                .output = "Another tool approval is already pending. Resolve it with /approve allow-once|deny before issuing new calls.",
+                                .source = .approval_required,
+                                .reason = "approval_already_pending",
+                                .mode = self.execution_mode,
+                                .risk_level = meta.risk_level,
+                                .metadata = meta,
+                            } },
+                            // Out-of-memory or other allocation failure: fail closed.
+                            else => return .{ .blocked = .{
+                                .name = call.name,
+                                .tool_call_id = call.tool_call_id,
+                                .output = "Approval required but could not register pending state",
+                                .source = .approval_required,
+                                .reason = reason_text,
+                                .mode = self.execution_mode,
+                                .risk_level = meta.risk_level,
+                                .metadata = meta,
+                            } },
+                        };
+                        const event = ObserverEvent{ .approval_required = .{
+                            .tool = meta.name,
+                            .reason = reason_text,
+                            .risk_level = meta.risk_level.toSlice(),
+                            .run_id = self.current_run_id,
+                        } };
+                        self.observer.recordEvent(&event);
+                        return .{ .blocked = .{
+                            .name = call.name,
+                            .tool_call_id = call.tool_call_id,
+                            .output = "Approval required. Use /approve allow-once|deny",
+                            .source = .approval_required,
+                            .reason = reason_text,
+                            .mode = self.execution_mode,
+                            .risk_level = meta.risk_level,
+                            .metadata = meta,
+                        } };
+                    },
+                }
+            }
+        }
+        if (self.policy) |pol| {
+            const allowed = pol.recordAction() catch true;
+            if (!allowed) {
+                return .{ .blocked = .{
+                    .name = call.name,
+                    .tool_call_id = call.tool_call_id,
+                    .output = "Action budget exhausted",
+                    .source = .action_budget,
+                    .reason = "action_budget_exhausted",
+                    .mode = self.execution_mode,
+                    .risk_level = meta.risk_level,
+                    .metadata = meta,
+                } };
+            }
+        }
         return .{ .allowed = .{ .metadata = meta } };
     }
 
@@ -1140,6 +1351,7 @@ pub const Agent = struct {
                 .command = command,
                 .files = files,
                 .activity_label = toolActivityLabel(call.name),
+                .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&tool_start_event);
 
@@ -1163,6 +1375,7 @@ pub const Agent = struct {
                 .result_summary = if (result.success) "completed" else "failed",
                 .command = command,
                 .files = files,
+                .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&tool_event);
 
@@ -1315,6 +1528,7 @@ pub const Agent = struct {
                 .command = command,
                 .files = files,
                 .activity_label = toolActivityLabel(call.name),
+                .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&tool_start_event);
 
@@ -1380,6 +1594,7 @@ pub const Agent = struct {
                 .result_summary = if (result.success) "completed" else "failed",
                 .command = command,
                 .files = files,
+                .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&tool_event);
             try results_buf.append(self.allocator, result);
@@ -1489,6 +1704,19 @@ pub const Agent = struct {
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         const turn_start_ms = std.time.milliTimestamp();
         self.cancellation_token.reset(); // Clear stale cancellation from previous turn
+
+        // ── WP1.3 Run ID ──────────────────────────────────────────────
+        // Mint one stable run ID per turn so all observer events (tool
+        // start/result, llm request/response, turn stages, approvals) can
+        // be grouped on the client. Stack-backed; lifetime is the turn.
+        self.run_id_counter +%= 1;
+        self.current_run_id = std.fmt.bufPrint(
+            &self.current_run_id_buf,
+            "r-{d}-{d}",
+            .{ turn_start_ms, self.run_id_counter },
+        ) catch null;
+        defer self.current_run_id = null;
+
         commands.refreshSubagentToolContext(self);
         var turn_llm_calls: u32 = 0;
         var turn_retry_attempts: u32 = 0;
@@ -1523,6 +1751,7 @@ pub const Agent = struct {
 
         const turn_start_event = ObserverEvent{ .turn_stage = .{
             .stage = "turn_start",
+            .run_id = self.current_run_id,
         } };
         self.observer.recordEvent(&turn_start_event);
 
@@ -1652,6 +1881,7 @@ pub const Agent = struct {
         const memory_stage_event = ObserverEvent{ .turn_stage = .{
             .stage = "memory_enrich",
             .duration_ms = enrich_duration_ms,
+            .run_id = self.current_run_id,
         } };
         self.observer.recordEvent(&memory_stage_event);
         self.current_turn_enriched_user = enriched;
@@ -1715,6 +1945,7 @@ pub const Agent = struct {
             const compact_stage_event = ObserverEvent{ .turn_stage = .{
                 .stage = "turn_compaction",
                 .duration_ms = 0,
+                .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&compact_stage_event);
         }
@@ -1748,6 +1979,7 @@ pub const Agent = struct {
                     self.ensureDurableContinuitySeed();
                     const cache_hit_event = ObserverEvent{ .turn_stage = .{
                         .stage = "response_cache_hit",
+                        .run_id = self.current_run_id,
                     } };
                     self.observer.recordEvent(&cache_hit_event);
                     self.last_turn_context.cache_hit = true;
@@ -1778,6 +2010,7 @@ pub const Agent = struct {
                 self.ensureDurableContinuitySeed();
                 const cache_hit_event = ObserverEvent{ .turn_stage = .{
                     .stage = "response_cache_hit",
+                    .run_id = self.current_run_id,
                 } };
                 self.observer.recordEvent(&cache_hit_event);
                 self.last_turn_context.cache_hit = true;
@@ -1801,6 +2034,7 @@ pub const Agent = struct {
                 const auto_compact_stage_event = ObserverEvent{ .turn_stage = .{
                     .stage = "turn_auto_compaction",
                     .duration_ms = auto_compact_duration_ms,
+                    .run_id = self.current_run_id,
                 } };
                 self.observer.recordEvent(&auto_compact_stage_event);
             }
@@ -1811,6 +2045,7 @@ pub const Agent = struct {
             .provider = self.provider.getName(),
             .model = self.model_name,
             .messages_count = self.history.items.len,
+            .run_id = self.current_run_id,
         } };
         self.observer.recordEvent(&start_event);
 
@@ -1858,6 +2093,7 @@ pub const Agent = struct {
                 .iteration = iteration,
                 .duration_ms = build_messages_duration_ms,
                 .count = @intCast(@min(self.history.items.len, std.math.maxInt(u32))),
+                .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&build_stage_event);
 
@@ -1904,6 +2140,7 @@ pub const Agent = struct {
                         .duration_ms = fail_duration,
                         .success = false,
                         .error_message = @errorName(err),
+                        .run_id = self.current_run_id,
                     } };
                     self.observer.recordEvent(&fail_event);
                     return err;
@@ -1947,6 +2184,7 @@ pub const Agent = struct {
                         .duration_ms = fail_duration,
                         .success = false,
                         .error_message = @errorName(err),
+                        .run_id = self.current_run_id,
                     } };
                     self.observer.recordEvent(&fail_event);
 
@@ -2042,6 +2280,7 @@ pub const Agent = struct {
                 .duration_ms = duration_ms,
                 .success = true,
                 .error_message = null,
+                .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&resp_event);
             if (!is_streaming or !saw_stream_first_token) {
@@ -2054,6 +2293,7 @@ pub const Agent = struct {
                     .stage = "llm_first_token_upper_bound",
                     .iteration = iteration,
                     .duration_ms = duration_ms,
+                    .run_id = self.current_run_id,
                 } };
                 self.observer.recordEvent(&first_token_bound_event);
             }
@@ -2153,6 +2393,7 @@ pub const Agent = struct {
                     .iteration = iteration,
                     .duration_ms = parse_duration_ms,
                     .count = @intCast(@min(parsed_calls.len, std.math.maxInt(u32))),
+                    .run_id = self.current_run_id,
                 } };
                 self.observer.recordEvent(&parse_stage_event);
             } else {
@@ -2176,6 +2417,7 @@ pub const Agent = struct {
                     .iteration = iteration,
                     .duration_ms = parse_duration_ms,
                     .count = @intCast(@min(parsed_calls.len, std.math.maxInt(u32))),
+                    .run_id = self.current_run_id,
                 } };
                 self.observer.recordEvent(&parse_stage_event);
             }
@@ -2253,6 +2495,7 @@ pub const Agent = struct {
                     .stage = "compose_final_reply",
                     .iteration = iteration,
                     .duration_ms = compose_duration_ms,
+                    .run_id = self.current_run_id,
                 } };
                 self.observer.recordEvent(&compose_stage_event);
                 errdefer self.allocator.free(final_text);
@@ -2275,6 +2518,7 @@ pub const Agent = struct {
                         .iteration = iteration,
                         .duration_ms = tts_duration_ms,
                         .count = @intCast(@min(tts_payload.len, std.math.maxInt(u32))),
+                        .run_id = self.current_run_id,
                     } };
                     self.observer.recordEvent(&tts_stage_event);
 
@@ -2315,6 +2559,7 @@ pub const Agent = struct {
                     .stage = "post_reply_compaction",
                     .iteration = iteration,
                     .duration_ms = compact_duration_ms,
+                    .run_id = self.current_run_id,
                 } };
                 self.observer.recordEvent(&compact_stage_event);
 
@@ -2485,6 +2730,7 @@ pub const Agent = struct {
                     .stage = "finalize_no_tools",
                     .iteration = iteration,
                     .duration_ms = finalize_duration_ms,
+                    .run_id = self.current_run_id,
                 } };
                 self.observer.recordEvent(&finalize_stage_event);
 
@@ -2595,6 +2841,7 @@ pub const Agent = struct {
                 .iteration = iteration,
                 .duration_ms = reflect_duration_ms,
                 .count = @intCast(@min(results_buf.items.len, std.math.maxInt(u32))),
+                .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&reflect_stage_event);
 
@@ -2643,6 +2890,7 @@ pub const Agent = struct {
                 .stage = "history_maintenance_after_tools",
                 .iteration = iteration,
                 .duration_ms = compact_duration_ms,
+                .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&compact_stage_event);
 
@@ -7733,4 +7981,854 @@ test "ttsAudioChannelSupported returns true for discord via voice_mode" {
 test "ttsAudioChannelSupported returns false for cli via voice_mode" {
     try std.testing.expect(!voice_mode.channelSupportsAudio("cli"));
     try std.testing.expect(!voice_mode.channelSupportsAudio("unknown"));
+}
+
+// ── WP1.4 approval-required tests ──────────────────────────────────
+
+const ApprovalEventCapture = struct {
+    tool: []const u8,
+    reason: []const u8,
+    risk_level: []const u8,
+    raw_data: []u8,
+    run_id: ?[]u8 = null,
+};
+
+const CapturingApprovalObserver = struct {
+    allocator: std.mem.Allocator,
+    events: std.ArrayListUnmanaged(ApprovalEventCapture),
+
+    const vtable_impl = observability.Observer.VTable{
+        .record_event = recordEventImpl,
+        .record_metric = recordMetricImpl,
+        .flush = flushImpl,
+        .name = nameImpl,
+    };
+
+    fn init(allocator: std.mem.Allocator) CapturingApprovalObserver {
+        return .{ .allocator = allocator, .events = .empty };
+    }
+
+    fn deinit(self: *CapturingApprovalObserver) void {
+        for (self.events.items) |e| {
+            self.allocator.free(e.raw_data);
+            if (e.run_id) |rid| self.allocator.free(rid);
+        }
+        self.events.deinit(self.allocator);
+    }
+
+    fn observer(self: *CapturingApprovalObserver) observability.Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_impl };
+    }
+
+    fn recordEventImpl(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *CapturingApprovalObserver = @ptrCast(@alignCast(ptr));
+        switch (event.*) {
+            .approval_required => |e| {
+                // Capture a JSON-shaped blob mirroring what the SSE frame
+                // will carry, so downstream tests can assert non-sensitivity.
+                const blob = std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"tool\":\"{s}\",\"reason\":\"{s}\",\"risk_level\":\"{s}\"}}",
+                    .{ e.tool, e.reason, e.risk_level },
+                ) catch return;
+                const run_id_copy: ?[]u8 = if (e.run_id) |rid|
+                    self.allocator.dupe(u8, rid) catch null
+                else
+                    null;
+                self.events.append(self.allocator, .{
+                    .tool = e.tool,
+                    .reason = e.reason,
+                    .risk_level = e.risk_level,
+                    .raw_data = blob,
+                    .run_id = run_id_copy,
+                }) catch {
+                    self.allocator.free(blob);
+                    if (run_id_copy) |rid| self.allocator.free(rid);
+                };
+            },
+            else => {},
+        }
+    }
+
+    fn recordMetricImpl(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flushImpl(_: *anyopaque) void {}
+    fn nameImpl(_: *anyopaque) []const u8 {
+        return "capturing_approval";
+    }
+};
+
+const ToolEventCapture = struct {
+    kind: enum { start, result },
+    tool: []u8,
+    tool_use_id: ?[]u8 = null,
+    run_id: ?[]u8 = null,
+};
+
+const CapturingToolEventObserver = struct {
+    allocator: std.mem.Allocator,
+    events: std.ArrayListUnmanaged(ToolEventCapture),
+
+    const vtable_impl = observability.Observer.VTable{
+        .record_event = recordEventImpl,
+        .record_metric = recordMetricImpl,
+        .flush = flushImpl,
+        .name = nameImpl,
+    };
+
+    fn init(allocator: std.mem.Allocator) CapturingToolEventObserver {
+        return .{ .allocator = allocator, .events = .empty };
+    }
+
+    fn deinit(self: *CapturingToolEventObserver) void {
+        for (self.events.items) |e| {
+            self.allocator.free(e.tool);
+            if (e.tool_use_id) |id| self.allocator.free(id);
+            if (e.run_id) |rid| self.allocator.free(rid);
+        }
+        self.events.deinit(self.allocator);
+    }
+
+    fn observer(self: *CapturingToolEventObserver) observability.Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_impl };
+    }
+
+    fn recordEventImpl(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *CapturingToolEventObserver = @ptrCast(@alignCast(ptr));
+        switch (event.*) {
+            .tool_call_start => |e| {
+                const tool_copy = self.allocator.dupe(u8, e.tool) catch return;
+                const id_copy: ?[]u8 = if (e.tool_use_id) |id| self.allocator.dupe(u8, id) catch null else null;
+                const rid_copy: ?[]u8 = if (e.run_id) |rid| self.allocator.dupe(u8, rid) catch null else null;
+                self.events.append(self.allocator, .{
+                    .kind = .start,
+                    .tool = tool_copy,
+                    .tool_use_id = id_copy,
+                    .run_id = rid_copy,
+                }) catch {
+                    self.allocator.free(tool_copy);
+                    if (id_copy) |id| self.allocator.free(id);
+                    if (rid_copy) |rid| self.allocator.free(rid);
+                };
+            },
+            .tool_call => |e| {
+                const tool_copy = self.allocator.dupe(u8, e.tool) catch return;
+                const id_copy: ?[]u8 = if (e.tool_use_id) |id| self.allocator.dupe(u8, id) catch null else null;
+                const rid_copy: ?[]u8 = if (e.run_id) |rid| self.allocator.dupe(u8, rid) catch null else null;
+                self.events.append(self.allocator, .{
+                    .kind = .result,
+                    .tool = tool_copy,
+                    .tool_use_id = id_copy,
+                    .run_id = rid_copy,
+                }) catch {
+                    self.allocator.free(tool_copy);
+                    if (id_copy) |id| self.allocator.free(id);
+                    if (rid_copy) |rid| self.allocator.free(rid);
+                };
+            },
+            else => {},
+        }
+    }
+
+    fn recordMetricImpl(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flushImpl(_: *anyopaque) void {}
+    fn nameImpl(_: *anyopaque) []const u8 {
+        return "capturing_tool_events";
+    }
+};
+
+fn makeSupervisedAgent(
+    allocator: std.mem.Allocator,
+    policy: *const SecurityPolicy,
+    obs: observability.Observer,
+) !Agent {
+    return Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = obs,
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .policy = policy,
+    };
+}
+
+test "approval gate: supervised mutating tool registers pending + emits event" {
+    const allocator = std.testing.allocator;
+    var capture = CapturingApprovalObserver.init(allocator);
+    defer capture.deinit();
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, capture.observer());
+    defer agent.deinit();
+
+    // shell is mutating + critical risk; default registry covers it.
+    const call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"echo hi\"}",
+        .tool_call_id = "call_xyz",
+    };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.approval_required, result.blocked.source);
+    try std.testing.expectEqualStrings("supervised_mutating_requires_approval", result.blocked.reason);
+
+    // Pending approval state is set with owned, duped strings.
+    try std.testing.expect(agent.pending_tool_approval != null);
+    const pending = agent.pending_tool_approval.?;
+    try std.testing.expectEqualStrings("shell", pending.tool_name);
+    try std.testing.expectEqualStrings("{\"command\":\"echo hi\"}", pending.arguments_json);
+    try std.testing.expect(pending.tool_call_id != null);
+    try std.testing.expectEqualStrings("call_xyz", pending.tool_call_id.?);
+    try std.testing.expectEqual(tool_metadata.RiskLevel.critical, pending.risk_level);
+    try std.testing.expect(pending.id != 0);
+
+    // Approval event was emitted with only safe fields.
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const evt = capture.events.items[0];
+    try std.testing.expectEqualStrings("shell", evt.tool);
+    try std.testing.expectEqualStrings("critical", evt.risk_level);
+    // The emitted payload must not leak raw argument content.
+    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "echo hi") == null);
+    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "command") == null);
+}
+
+test "approval gate: supervised read-only tool auto-approves without pending" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+    defer agent.deinit();
+
+    const call = ParsedToolCall{ .name = "file_read", .arguments_json = "{}", .tool_call_id = null };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .allowed);
+    try std.testing.expect(agent.pending_tool_approval == null);
+}
+
+test "approval gate: operator-only tool denies under supervised" {
+    const meta = tool_metadata.ToolMetadata{
+        .name = "admin_ops",
+        .flags = .{ .operator_only = true },
+        .risk_level = .high,
+    };
+    try std.testing.expectEqual(
+        Agent.ApprovalGateOutcome.deny,
+        Agent.resolveApprovalGateOutcome(meta, .supervised),
+    );
+    // Sanity: under full autonomy the same meta auto-approves.
+    try std.testing.expectEqual(
+        Agent.ApprovalGateOutcome.allow,
+        Agent.resolveApprovalGateOutcome(meta, .full),
+    );
+}
+
+test "approval gate: full autonomy allows mutating without approval" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{ .autonomy = .full, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+    defer agent.deinit();
+
+    const call = ParsedToolCall{ .name = "shell", .arguments_json = "{}", .tool_call_id = null };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .allowed);
+    try std.testing.expect(agent.pending_tool_approval == null);
+}
+
+test "/approve deny clears pending tool approval and does not execute" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+    defer agent.deinit();
+
+    const call = ParsedToolCall{ .name = "shell", .arguments_json = "{}", .tool_call_id = null };
+    _ = agent.preflightToolPolicy(call);
+    try std.testing.expect(agent.pending_tool_approval != null);
+
+    const resp = (try agent.handleSlashCommand("/approve deny")).?;
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "denied") != null);
+    try std.testing.expect(agent.pending_tool_approval == null);
+    // Legacy shell pending was never registered via this path.
+    try std.testing.expect(agent.pending_exec_command == null);
+}
+
+test "/approve with wrong id leaves pending tool approval untouched" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+    defer agent.deinit();
+
+    const call = ParsedToolCall{ .name = "shell", .arguments_json = "{}", .tool_call_id = null };
+    _ = agent.preflightToolPolicy(call);
+    const original_id = agent.pending_tool_approval.?.id;
+
+    const wrong_cmd = try std.fmt.allocPrint(allocator, "/approve {d} allow-once", .{original_id + 99});
+    defer allocator.free(wrong_cmd);
+    const resp = (try agent.handleSlashCommand(wrong_cmd)).?;
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "mismatch") != null);
+    try std.testing.expect(agent.pending_tool_approval != null);
+    try std.testing.expectEqual(original_id, agent.pending_tool_approval.?.id);
+}
+
+/// Trivial deterministic test tool: echoes a single "value" argument. No I/O
+/// so tests stay hermetic. Registered as mutating so the approval gate fires.
+const EchoTool = struct {
+    pub const tool_name = "test_echo_tool";
+    pub const tool_description = "Test echo tool";
+    pub const tool_params = "{}";
+    pub const tool_metadata: @import("../tools/metadata.zig").ToolMetadata = .{
+        .name = "test_echo_tool",
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    };
+
+    pub const vtable = tools_mod.ToolVTable(EchoTool);
+
+    pub fn tool(self: *EchoTool) tools_mod.Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(self: *EchoTool, allocator: std.mem.Allocator, args: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        _ = self;
+        const value: []const u8 = blk: {
+            if (args.get("value")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk "default";
+        };
+        const out = try std.fmt.allocPrint(allocator, "echoed:{s}", .{value});
+        return .{ .success = true, .output = out };
+    }
+};
+
+test "/approve allow-once executes pending tool exactly once" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var echo_impl = EchoTool{};
+    const echo_tool = echo_impl.tool();
+    const tools_arr = [_]Tool{echo_tool};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = tools_arr[0..],
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer agent.deinit();
+
+    // test_echo_tool is unknown to the default registry — falls back to
+    // conservative mutating metadata, so supervised requires approval.
+    const call = ParsedToolCall{
+        .name = "test_echo_tool",
+        .arguments_json = "{\"value\":\"hello\"}",
+        .tool_call_id = null,
+    };
+    const preflight = agent.preflightToolPolicy(call);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.approval_required, preflight.blocked.source);
+    try std.testing.expect(agent.pending_tool_approval != null);
+
+    const resp = (try agent.handleSlashCommand("/approve allow-once")).?;
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "echoed:hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "success=true") != null);
+    try std.testing.expect(agent.pending_tool_approval == null);
+    try std.testing.expect(!agent.approval_bypass_active);
+}
+
+test "approval gate does not consume budget until allow-once executes the tool" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var echo_impl = EchoTool{};
+    const echo_tool = echo_impl.tool();
+    const tools_arr = [_]Tool{echo_tool};
+    var tracker = RateTracker.init(allocator, 1);
+    defer tracker.deinit();
+    const policy = SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .max_actions_per_hour = 1,
+        .tracker = &tracker,
+    };
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = tools_arr[0..],
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer agent.deinit();
+
+    const call = ParsedToolCall{
+        .name = "test_echo_tool",
+        .arguments_json = "{\"value\":\"hello\"}",
+        .tool_call_id = null,
+    };
+
+    const preflight = agent.preflightToolPolicy(call);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.approval_required, preflight.blocked.source);
+    try std.testing.expect(agent.pending_tool_approval != null);
+    try std.testing.expectEqual(@as(usize, 0), tracker.count());
+
+    const resp = (try agent.handleSlashCommand("/approve allow-once")).?;
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "echoed:hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "success=true") != null);
+    try std.testing.expectEqual(@as(usize, 1), tracker.count());
+
+    const second = agent.preflightToolPolicy(call);
+    try std.testing.expect(second == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.action_budget, second.blocked.source);
+    try std.testing.expect(agent.pending_tool_approval == null);
+}
+
+test "approval gate checks exhausted budget before registering pending approval" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var tracker = RateTracker.init(allocator, 1);
+    defer tracker.deinit();
+    const policy = SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .max_actions_per_hour = 1,
+        .tracker = &tracker,
+    };
+    var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+    defer agent.deinit();
+
+    const consume_call = ParsedToolCall{
+        .name = "runtime_info",
+        .arguments_json = "{}",
+        .tool_call_id = null,
+    };
+    try std.testing.expect(agent.preflightToolPolicy(consume_call) == .allowed);
+    try std.testing.expectEqual(@as(usize, 1), tracker.count());
+
+    const mutating_call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"echo hi\"}",
+        .tool_call_id = null,
+    };
+    const blocked = agent.preflightToolPolicy(mutating_call);
+    try std.testing.expect(blocked == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.action_budget, blocked.blocked.source);
+    try std.testing.expect(agent.pending_tool_approval == null);
+}
+
+test "approval gate: second pending request does not overwrite the first" {
+    const allocator = std.testing.allocator;
+    var capture = CapturingApprovalObserver.init(allocator);
+    defer capture.deinit();
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, capture.observer());
+    defer agent.deinit();
+
+    const first_call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"echo first\"}",
+        .tool_call_id = "call_first",
+    };
+    const first_result = agent.preflightToolPolicy(first_call);
+    try std.testing.expect(first_result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.approval_required, first_result.blocked.source);
+    try std.testing.expectEqualStrings("supervised_mutating_requires_approval", first_result.blocked.reason);
+
+    const first_pending_id = agent.pending_tool_approval.?.id;
+    const first_args = agent.pending_tool_approval.?.arguments_json;
+    try std.testing.expectEqualStrings("{\"command\":\"echo first\"}", first_args);
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+
+    // Second supervised mutating call must NOT overwrite the first pending.
+    const second_call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"echo second\"}",
+        .tool_call_id = "call_second",
+    };
+    const second_result = agent.preflightToolPolicy(second_call);
+    try std.testing.expect(second_result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.approval_required, second_result.blocked.source);
+    try std.testing.expectEqualStrings("approval_already_pending", second_result.blocked.reason);
+    try std.testing.expect(std.mem.indexOf(u8, second_result.blocked.output, "already pending") != null);
+
+    // First pending is unchanged — id and arguments preserved verbatim.
+    try std.testing.expect(agent.pending_tool_approval != null);
+    try std.testing.expectEqual(first_pending_id, agent.pending_tool_approval.?.id);
+    try std.testing.expectEqualStrings(
+        "{\"command\":\"echo first\"}",
+        agent.pending_tool_approval.?.arguments_json,
+    );
+    try std.testing.expectEqualStrings("call_first", agent.pending_tool_approval.?.tool_call_id.?);
+
+    // No second approval_required event was emitted.
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+}
+
+test "legacy shell /approve flow preserved when no generic pending approval" {
+    const allocator = std.testing.allocator;
+    const shell_impl = try allocator.create(tools_mod.shell.ShellTool);
+    shell_impl.* = .{ .workspace_dir = "." };
+    const shell_tool = shell_impl.tool();
+    defer shell_tool.deinit(allocator);
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{shell_tool},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    // No generic pending — legacy shell approval path must still work.
+    try std.testing.expect(agent.pending_tool_approval == null);
+
+    const exec_resp = (try agent.handleSlashCommand("/exec ask=always")).?;
+    defer allocator.free(exec_resp);
+
+    const pending_resp = (try agent.handleSlashCommand("/bash echo legacy-check")).?;
+    defer allocator.free(pending_resp);
+    try std.testing.expect(agent.pending_exec_command != null);
+
+    // The generic pending slot was never populated.
+    try std.testing.expect(agent.pending_tool_approval == null);
+
+    const approve_resp = (try agent.handleSlashCommand("/approve allow-once")).?;
+    defer allocator.free(approve_resp);
+    try std.testing.expect(std.mem.indexOf(u8, approve_resp, "Approved exec") != null);
+    try std.testing.expect(agent.pending_exec_command == null);
+}
+
+// ── WP1.3 Run ID + tool event correlation tests ────────────────────
+
+test "approval_required event carries run_id when current_run_id is set" {
+    const allocator = std.testing.allocator;
+    var capture = CapturingApprovalObserver.init(allocator);
+    defer capture.deinit();
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, capture.observer());
+    defer agent.deinit();
+
+    // Simulate the run-ID lifecycle that turn() establishes.
+    agent.run_id_counter = 1;
+    const rid_slice = try std.fmt.bufPrint(&agent.current_run_id_buf, "r-{d}-{d}", .{
+        @as(i64, 12345),
+        agent.run_id_counter,
+    });
+    agent.current_run_id = rid_slice;
+    defer agent.current_run_id = null;
+
+    const call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"echo hi\"}",
+        .tool_call_id = "call_abc",
+    };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.approval_required, result.blocked.source);
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const evt = capture.events.items[0];
+    try std.testing.expect(evt.run_id != null);
+    try std.testing.expectEqualStrings(rid_slice, evt.run_id.?);
+}
+
+test "approval_required event has null run_id when none active" {
+    const allocator = std.testing.allocator;
+    var capture = CapturingApprovalObserver.init(allocator);
+    defer capture.deinit();
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, capture.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.current_run_id == null);
+    const call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"echo hi\"}",
+        .tool_call_id = "call_xyz",
+    };
+    _ = agent.preflightToolPolicy(call);
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    try std.testing.expect(capture.events.items[0].run_id == null);
+}
+
+test "tool dispatch emits tool_start and tool_result with matching run_id and tool_use_id" {
+    const allocator = std.testing.allocator;
+    var capture = CapturingToolEventObserver.init(allocator);
+    defer capture.deinit();
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = capture.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    // Establish a turn-scoped run ID.
+    agent.run_id_counter = 7;
+    const rid_slice = try std.fmt.bufPrint(&agent.current_run_id_buf, "r-{d}-{d}", .{
+        @as(i64, 99999),
+        agent.run_id_counter,
+    });
+    agent.current_run_id = rid_slice;
+    defer agent.current_run_id = null;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // No tool registered → executeTool returns "Unknown tool" but the
+    // start/result events still fire and must carry the run_id.
+    const call = ParsedToolCall{
+        .name = "ghost_tool",
+        .arguments_json = "{}",
+        .tool_call_id = "call_match_1",
+    };
+    const calls = [_]ParsedToolCall{call};
+    var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
+    defer results_buf.deinit(allocator);
+    try results_buf.ensureTotalCapacity(allocator, calls.len);
+    try agent.executeToolCallsSerial(arena.allocator(), 0, calls[0..], &results_buf);
+
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    const start_evt = capture.events.items[0];
+    const result_evt = capture.events.items[1];
+    try std.testing.expectEqual(@as(@TypeOf(start_evt.kind), .start), start_evt.kind);
+    try std.testing.expectEqual(@as(@TypeOf(result_evt.kind), .result), result_evt.kind);
+    try std.testing.expect(start_evt.run_id != null);
+    try std.testing.expect(result_evt.run_id != null);
+    try std.testing.expectEqualStrings(rid_slice, start_evt.run_id.?);
+    try std.testing.expectEqualStrings(rid_slice, result_evt.run_id.?);
+    try std.testing.expect(start_evt.tool_use_id != null);
+    try std.testing.expect(result_evt.tool_use_id != null);
+    try std.testing.expectEqualStrings("call_match_1", start_evt.tool_use_id.?);
+    try std.testing.expectEqualStrings("call_match_1", result_evt.tool_use_id.?);
+}
+
+test "Agent.run_id_counter increments and remains stable across event emit sites" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), agent.run_id_counter);
+    try std.testing.expect(agent.current_run_id == null);
+}
+
+test "/permissions without policy reports not-configured and exec posture" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const resp = (try agent.handleSlashCommand("/permissions")).?;
+    defer allocator.free(resp);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "not configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Exec posture:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "host:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "security:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "ask:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Execution mode:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Pending approvals: none") != null);
+}
+
+test "/permissions with supervised policy reports autonomy and approval rules" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp/work",
+        .workspace_only = true,
+        .max_actions_per_hour = 42,
+    };
+    var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+    defer agent.deinit();
+
+    const resp = (try agent.handleSlashCommand("/permissions")).?;
+    defer allocator.free(resp);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "status: configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "autonomy: supervised") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "/tmp/work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "workspace_only: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "max_actions_per_hour: 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "rate_limited: no") != null);
+    // Approval rules under supervised
+    try std.testing.expect(std.mem.indexOf(u8, resp, "read-only tools:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "auto_approve") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "confirm_once") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "allow-always is not persistent in v1") != null);
+}
+
+test "/permissions reports pending tool approval and does not clear it" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+    defer agent.deinit();
+
+    // shell is mutating + critical risk; supervised => registers pending approval.
+    const call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"echo secret-arg\"}",
+        .tool_call_id = "call_xyz",
+    };
+    _ = agent.preflightToolPolicy(call);
+    try std.testing.expect(agent.pending_tool_approval != null);
+    const pending_id = agent.pending_tool_approval.?.id;
+
+    const resp = (try agent.handleSlashCommand("/permissions")).?;
+    defer allocator.free(resp);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Pending tool approval:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "tool: shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "risk: critical") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "supervised_mutating_requires_approval") != null);
+    const id_str = try std.fmt.allocPrint(allocator, "id: {d}", .{pending_id});
+    defer allocator.free(id_str);
+    try std.testing.expect(std.mem.indexOf(u8, resp, id_str) != null);
+
+    // Raw generic arguments must never leak.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "secret-arg") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "arguments_json") == null);
+
+    // Report is read-only: the pending approval must still be present.
+    try std.testing.expect(agent.pending_tool_approval != null);
+    try std.testing.expectEqual(pending_id, agent.pending_tool_approval.?.id);
+}
+
+test "/permissions reports pending exec command and does not clear it" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    // Register a legacy pending exec command by hand (mirrors setPendingExecCommand).
+    agent.pending_exec_command = try allocator.dupe(u8, "ls -la /tmp");
+    agent.pending_exec_command_owned = true;
+    agent.pending_exec_id = 7;
+
+    const resp = (try agent.handleSlashCommand("/permissions")).?;
+    defer allocator.free(resp);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Pending exec approval:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "id: 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "command: ls -la /tmp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "allow-once|allow-always|deny") != null);
+
+    // Report is read-only: the pending exec must still be present.
+    try std.testing.expect(agent.pending_exec_command != null);
+    try std.testing.expectEqualStrings("ls -la /tmp", agent.pending_exec_command.?);
+    try std.testing.expectEqual(@as(u64, 7), agent.pending_exec_id);
+}
+
+test "/perm alias returns same class of report as /permissions" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+    defer agent.deinit();
+
+    const long_form = (try agent.handleSlashCommand("/permissions")).?;
+    defer allocator.free(long_form);
+    const alias_form = (try agent.handleSlashCommand("/perm")).?;
+    defer allocator.free(alias_form);
+
+    // Both reports start with the same header and mention the configured autonomy.
+    try std.testing.expect(std.mem.startsWith(u8, long_form, "Permissions (read-only report)"));
+    try std.testing.expect(std.mem.startsWith(u8, alias_form, "Permissions (read-only report)"));
+    try std.testing.expect(std.mem.indexOf(u8, alias_form, "autonomy: supervised") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alias_form, "Exec posture:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alias_form, "Approval rules for built-in tools:") != null);
 }
