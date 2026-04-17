@@ -229,6 +229,306 @@ pub fn assertToolInterface(comptime T: type) void {
     _ = vt.parameters_json;
 }
 
+// ── Default tool metadata registry ──────────────────────────────────
+//
+// Classifications for built-in tools created by `defaultToolsWithPaths` and
+// `allTools`. Used by agent preflight to gate tool dispatch per ExecutionMode.
+// Action-dependent tools (schedule, composio, git, http, browser,
+// skill_registry) are classified conservatively here; finer arg-aware policy
+// lives in `toolBlockedForCurrentTurn` and future approval layers.
+// Unknown/MCP/dynamic tools fall back to `ToolMetadata.conservative`.
+const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
+    // Read-only, safe in plan/review/background
+    .{
+        .name = runtime_info.RuntimeInfoTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = file_read.FileReadTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = memory_recall.MemoryRecallTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = memory_list.MemoryListTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = memory_timeline.MemoryTimelineTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = web_search.WebSearchTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = web_fetch.WebFetchTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = task_list.TaskListTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = task_get.TaskGetTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+
+    // Read-only, NOT background_safe (side channels, hardware, or sensitive output)
+    .{
+        .name = image.ImageInfoTool.tool_name,
+        .flags = .{ .read_only = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = cron_list.CronListTool.tool_name,
+        .flags = .{ .read_only = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = cron_runs.CronRunsTool.tool_name,
+        .flags = .{ .read_only = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = hardware_info.HardwareBoardInfoTool.tool_name,
+        .flags = .{ .read_only = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        // Read-only, but medium risk because it can expose screen contents.
+        .name = screenshot.ScreenshotTool.tool_name,
+        .flags = .{ .read_only = true },
+        .risk_level = .medium,
+    },
+
+    // Mutating / side-effecting — never allowed in plan/review, never background_safe
+    .{
+        .name = shell.ShellTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .critical,
+    },
+    .{
+        .name = file_write.FileWriteTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = file_edit.FileEditTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = file_append.FileAppendTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        // Action-dependent: some git subcommands are read-only, but the tool
+        // as a whole can mutate the working tree and remotes. Conservative.
+        .name = git.GitTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+    },
+    .{
+        .name = memory_store.MemoryStoreTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = memory_edit.MemoryEditTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = memory_forget.MemoryForgetTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+    },
+    .{
+        // Schedule has read-only actions (list/get/runs) but the tool as a
+        // whole mutates durable jobs. Arg-aware policy lives elsewhere.
+        .name = schedule.ScheduleTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = delegate.DelegateTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+    },
+    .{
+        .name = spawn.SpawnTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+    },
+    .{
+        .name = message.MessageTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = pushover.PushoverTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = cron_add.CronAddTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = cron_remove.CronRemoveTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = cron_update.CronUpdateTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = cron_run.CronRunTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        // Arbitrary outbound HTTP — treat as mutating network side-effect.
+        .name = http_request.HttpRequestTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+    },
+    .{
+        .name = browser.BrowserTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = browser_open.BrowserOpenTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        // Composio is action-dependent: list/get are read-only but execute
+        // can mutate third-party state. Conservative here; background policy
+        // handles the read-only execute whitelist for proactive turns.
+        .name = composio.ComposioTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+    },
+    .{
+        .name = skill_registry.SkillRegistryTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+    .{
+        .name = hardware_memory.HardwareMemoryTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+    },
+    .{
+        .name = i2c.I2cTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+    },
+    .{
+        .name = spi.SpiTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+    },
+    .{
+        .name = task_stop.TaskStopTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+    },
+};
+
+/// Return the static default metadata registry for built-in tools.
+/// Callers must still fall back to `ToolMetadata.conservative(name)` when
+/// `lookupMetadata` returns null (MCP tools, dynamic tools, future additions).
+pub fn defaultMetadataRegistry() []const metadata.ToolMetadata {
+    return &DEFAULT_TOOL_METADATA;
+}
+
+// ── Args-aware metadata refinement ──────────────────────────────────
+//
+// A handful of built-in tools dispatch on an `action`/`operation`/`method`
+// field whose value flips the call between read-only and mutating semantics.
+// `refineMetadata` is a central switch that inspects those args and
+// downgrades the base (conservative) metadata to read-only when the
+// specific call is known to be side-effect-free.
+//
+// Keeping this logic centralised (rather than per-tool `classifyArgs`) so
+// the audit surface lives beside the static registry. Tools whose arg
+// parsing grows more complex should migrate to a comptime hook instead of
+// growing this switch.
+
+fn isReadOnlyGitOperation(args: JsonObjectMap) bool {
+    const op = getString(args, "operation") orelse return false;
+    // Purely inspecting operations. `stash` mutates; `add/commit/checkout` mutate.
+    return std.ascii.eqlIgnoreCase(op, "status") or
+        std.ascii.eqlIgnoreCase(op, "diff") or
+        std.ascii.eqlIgnoreCase(op, "log") or
+        std.ascii.eqlIgnoreCase(op, "branch");
+}
+
+fn isReadOnlyHttpMethod(args: JsonObjectMap) bool {
+    const method = getString(args, "method") orelse "GET";
+    return std.ascii.eqlIgnoreCase(method, "GET") or
+        std.ascii.eqlIgnoreCase(method, "HEAD") or
+        std.ascii.eqlIgnoreCase(method, "OPTIONS");
+}
+
+fn isReadOnlySkillRegistryAction(args: JsonObjectMap) bool {
+    const action = getString(args, "action") orelse "list";
+    return std.ascii.eqlIgnoreCase(action, "list") or std.ascii.eqlIgnoreCase(action, "search");
+}
+
+fn isReadOnlyComposioCall(args: JsonObjectMap) bool {
+    const action = getString(args, "action") orelse "execute";
+    if (std.ascii.eqlIgnoreCase(action, "list") or std.ascii.eqlIgnoreCase(action, "get")) return true;
+    if (!std.ascii.eqlIgnoreCase(action, "execute")) return false;
+    return isReadOnlyComposioExecute(args);
+}
+
+/// Downgrade a base metadata entry to read-only when the specific call's
+/// arguments indicate a side-effect-free operation. Returns the base
+/// metadata unchanged when the call is mutating or the tool is not
+/// action-dependent.
+///
+/// The returned metadata is NOT marked background_safe — action-dependent
+/// tools must be explicitly whitelisted for the background lane (see
+/// `toolBlockedForCurrentTurn`).
+pub fn refineMetadata(base: metadata.ToolMetadata, args: JsonObjectMap) metadata.ToolMetadata {
+    if (base.flags.read_only) return base;
+
+    const is_read_only = blk: {
+        if (std.mem.eql(u8, base.name, schedule.ScheduleTool.tool_name)) break :blk isReadOnlyScheduleAction(args);
+        if (std.mem.eql(u8, base.name, composio.ComposioTool.tool_name)) break :blk isReadOnlyComposioCall(args);
+        if (std.mem.eql(u8, base.name, git.GitTool.tool_name)) break :blk isReadOnlyGitOperation(args);
+        if (std.mem.eql(u8, base.name, http_request.HttpRequestTool.tool_name)) break :blk isReadOnlyHttpMethod(args);
+        if (std.mem.eql(u8, base.name, skill_registry.SkillRegistryTool.tool_name)) break :blk isReadOnlySkillRegistryAction(args);
+        break :blk false;
+    };
+
+    if (!is_read_only) return base;
+    var refined = base;
+    refined.flags.read_only = true;
+    refined.flags.mutating = false;
+    return refined;
+}
+
 /// Create the default tool set (shell, file_read, file_write).
 pub fn defaultTools(
     allocator: std.mem.Allocator,
@@ -1496,6 +1796,267 @@ test "bindMemoryTools matches by vtable, not by colliding tool name" {
 
     try std.testing.expect(real_memory_store.memory != null);
     try std.testing.expectEqual(@as(usize, 0xDEADBEEF), fake_memory_store_name.sentinel);
+}
+
+// ── Default metadata registry tests ─────────────────────────────────
+
+test "defaultMetadataRegistry has unique tool names" {
+    const registry = defaultMetadataRegistry();
+    for (registry, 0..) |entry, i| {
+        for (registry[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, entry.name, other.name)) {
+                std.debug.print("duplicate name in registry: {s}\n", .{entry.name});
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "defaultMetadataRegistry flags all validate" {
+    const registry = defaultMetadataRegistry();
+    for (registry) |entry| {
+        try entry.flags.validate();
+    }
+}
+
+test "defaultMetadataRegistry classifies known read-only tools" {
+    const registry = defaultMetadataRegistry();
+    const read_only = [_][]const u8{
+        "runtime_info",   "file_read",      "image_info",       "memory_recall",
+        "memory_list",    "memory_timeline", "cron_list",       "cron_runs",
+        "task_list",      "task_get",        "web_fetch",       "web_search",
+        "hardware_board_info", "screenshot",
+    };
+    for (read_only) |name| {
+        const m = metadata.lookupMetadata(name, registry) orelse {
+            std.debug.print("missing registry entry: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(m.flags.read_only);
+        try std.testing.expect(!m.flags.mutating);
+    }
+}
+
+test "defaultMetadataRegistry classifies known mutating tools" {
+    const registry = defaultMetadataRegistry();
+    const mutating = [_][]const u8{
+        "shell",         "file_write",    "file_edit",     "file_append",
+        "git_operations", "memory_store", "memory_edit",   "memory_forget",
+        "schedule",      "delegate",      "spawn",         "message",
+        "pushover",      "cron_add",      "cron_remove",   "cron_update",
+        "cron_run",      "http_request",  "browser",       "browser_open",
+        "composio",      "skill_registry", "hardware_memory", "i2c",
+        "spi",           "task_stop",
+    };
+    for (mutating) |name| {
+        const m = metadata.lookupMetadata(name, registry) orelse {
+            std.debug.print("missing registry entry: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(m.flags.mutating);
+        try std.testing.expect(!m.flags.read_only);
+        try std.testing.expect(!m.flags.background_safe);
+    }
+}
+
+test "defaultMetadataRegistry only whitelists expected background_safe tools" {
+    const registry = defaultMetadataRegistry();
+    const background_safe_names = [_][]const u8{
+        "runtime_info", "file_read",      "memory_recall",
+        "memory_list",  "memory_timeline", "web_fetch",
+        "web_search",   "task_list",      "task_get",
+    };
+
+    // Everything in the whitelist must be background_safe.
+    for (background_safe_names) |name| {
+        const m = metadata.lookupMetadata(name, registry) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(m.flags.background_safe);
+    }
+
+    // Nothing else may be background_safe.
+    for (registry) |entry| {
+        var expected = false;
+        for (background_safe_names) |name| {
+            if (std.mem.eql(u8, entry.name, name)) expected = true;
+        }
+        if (!expected and entry.flags.background_safe) {
+            std.debug.print("unexpected background_safe tool: {s}\n", .{entry.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "defaultMetadataRegistry keeps sensitive tools off the background lane" {
+    const registry = defaultMetadataRegistry();
+    const must_not_be_background = [_][]const u8{
+        "message", "schedule", "composio", "shell", "spawn", "delegate",
+    };
+    for (must_not_be_background) |name| {
+        const m = metadata.lookupMetadata(name, registry) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(!m.flags.background_safe);
+    }
+}
+
+test "refineMetadata downgrades schedule list/get/runs to read-only" {
+    const registry = defaultMetadataRegistry();
+    const base = metadata.lookupMetadata("schedule", registry).?;
+    const read_actions = [_][]const u8{ "list", "get", "runs" };
+    for (read_actions) |action| {
+        const buf = try std.fmt.allocPrint(std.testing.allocator, "{{\"action\":\"{s}\"}}", .{action});
+        defer std.testing.allocator.free(buf);
+        const parsed = try parseTestArgs(buf);
+        defer parsed.deinit();
+        const refined = refineMetadata(base, parsed.value.object);
+        try std.testing.expect(refined.flags.read_only);
+        try std.testing.expect(!refined.flags.mutating);
+    }
+}
+
+test "refineMetadata keeps schedule create/update/remove mutating" {
+    const registry = defaultMetadataRegistry();
+    const base = metadata.lookupMetadata("schedule", registry).?;
+    const mutating_actions = [_][]const u8{ "create", "update", "remove", "ensure" };
+    for (mutating_actions) |action| {
+        const buf = try std.fmt.allocPrint(std.testing.allocator, "{{\"action\":\"{s}\"}}", .{action});
+        defer std.testing.allocator.free(buf);
+        const parsed = try parseTestArgs(buf);
+        defer parsed.deinit();
+        const refined = refineMetadata(base, parsed.value.object);
+        try std.testing.expect(refined.flags.mutating);
+        try std.testing.expect(!refined.flags.read_only);
+    }
+}
+
+test "refineMetadata downgrades git status/diff/log/branch" {
+    const registry = defaultMetadataRegistry();
+    const base = metadata.lookupMetadata("git_operations", registry).?;
+    const read_ops = [_][]const u8{ "status", "diff", "log", "branch" };
+    for (read_ops) |op| {
+        const buf = try std.fmt.allocPrint(std.testing.allocator, "{{\"operation\":\"{s}\"}}", .{op});
+        defer std.testing.allocator.free(buf);
+        const parsed = try parseTestArgs(buf);
+        defer parsed.deinit();
+        const refined = refineMetadata(base, parsed.value.object);
+        try std.testing.expect(refined.flags.read_only);
+    }
+}
+
+test "refineMetadata keeps git commit/add/checkout/stash mutating" {
+    const registry = defaultMetadataRegistry();
+    const base = metadata.lookupMetadata("git_operations", registry).?;
+    const mutating_ops = [_][]const u8{ "commit", "add", "checkout", "stash" };
+    for (mutating_ops) |op| {
+        const buf = try std.fmt.allocPrint(std.testing.allocator, "{{\"operation\":\"{s}\"}}", .{op});
+        defer std.testing.allocator.free(buf);
+        const parsed = try parseTestArgs(buf);
+        defer parsed.deinit();
+        const refined = refineMetadata(base, parsed.value.object);
+        try std.testing.expect(refined.flags.mutating);
+    }
+}
+
+test "refineMetadata downgrades HTTP GET/HEAD/OPTIONS" {
+    const registry = defaultMetadataRegistry();
+    const base = metadata.lookupMetadata("http_request", registry).?;
+
+    const safe_methods = [_][]const u8{ "GET", "get", "HEAD", "OPTIONS" };
+    for (safe_methods) |method| {
+        const buf = try std.fmt.allocPrint(std.testing.allocator, "{{\"url\":\"https://x\",\"method\":\"{s}\"}}", .{method});
+        defer std.testing.allocator.free(buf);
+        const parsed = try parseTestArgs(buf);
+        defer parsed.deinit();
+        try std.testing.expect(refineMetadata(base, parsed.value.object).flags.read_only);
+    }
+
+    const default_parsed = try parseTestArgs("{\"url\":\"https://x\"}");
+    defer default_parsed.deinit();
+    try std.testing.expect(refineMetadata(base, default_parsed.value.object).flags.read_only);
+}
+
+test "refineMetadata keeps HTTP POST/PUT/DELETE/PATCH mutating" {
+    const registry = defaultMetadataRegistry();
+    const base = metadata.lookupMetadata("http_request", registry).?;
+    const mutating_methods = [_][]const u8{ "POST", "PUT", "DELETE", "PATCH" };
+    for (mutating_methods) |method| {
+        const buf = try std.fmt.allocPrint(std.testing.allocator, "{{\"url\":\"https://x\",\"method\":\"{s}\"}}", .{method});
+        defer std.testing.allocator.free(buf);
+        const parsed = try parseTestArgs(buf);
+        defer parsed.deinit();
+        try std.testing.expect(refineMetadata(base, parsed.value.object).flags.mutating);
+    }
+}
+
+test "refineMetadata downgrades composio list/get and read-only execute" {
+    const registry = defaultMetadataRegistry();
+    const base = metadata.lookupMetadata("composio", registry).?;
+
+    const list_parsed = try parseTestArgs("{\"action\":\"list\",\"app\":\"gmail\"}");
+    defer list_parsed.deinit();
+    try std.testing.expect(refineMetadata(base, list_parsed.value.object).flags.read_only);
+
+    const read_execute_parsed = try parseTestArgs("{\"action\":\"execute\",\"tool_slug\":\"gmail-list-messages\"}");
+    defer read_execute_parsed.deinit();
+    try std.testing.expect(refineMetadata(base, read_execute_parsed.value.object).flags.read_only);
+
+    const send_parsed = try parseTestArgs("{\"action\":\"execute\",\"tool_slug\":\"gmail-send-email\"}");
+    defer send_parsed.deinit();
+    try std.testing.expect(refineMetadata(base, send_parsed.value.object).flags.mutating);
+
+    const connect_parsed = try parseTestArgs("{\"action\":\"connect\",\"app\":\"gmail\"}");
+    defer connect_parsed.deinit();
+    try std.testing.expect(refineMetadata(base, connect_parsed.value.object).flags.mutating);
+}
+
+test "refineMetadata downgrades skill_registry list/search" {
+    const registry = defaultMetadataRegistry();
+    const base = metadata.lookupMetadata("skill_registry", registry).?;
+
+    const list_parsed = try parseTestArgs("{\"action\":\"list\"}");
+    defer list_parsed.deinit();
+    try std.testing.expect(refineMetadata(base, list_parsed.value.object).flags.read_only);
+
+    const search_parsed = try parseTestArgs("{\"action\":\"search\",\"query\":\"animate\"}");
+    defer search_parsed.deinit();
+    try std.testing.expect(refineMetadata(base, search_parsed.value.object).flags.read_only);
+
+    const install_parsed = try parseTestArgs("{\"action\":\"install\",\"skill_ref\":\"x/y\"}");
+    defer install_parsed.deinit();
+    try std.testing.expect(refineMetadata(base, install_parsed.value.object).flags.mutating);
+}
+
+test "refineMetadata leaves already-read-only and unrelated tools unchanged" {
+    const registry = defaultMetadataRegistry();
+    const read_base = metadata.lookupMetadata("file_read", registry).?;
+    const parsed = try parseTestArgs("{\"action\":\"anything\"}");
+    defer parsed.deinit();
+    const refined_read = refineMetadata(read_base, parsed.value.object);
+    try std.testing.expectEqual(read_base.flags.read_only, refined_read.flags.read_only);
+    try std.testing.expectEqual(read_base.flags.background_safe, refined_read.flags.background_safe);
+
+    // shell has no action-dependent downgrade; stays mutating.
+    const shell_base = metadata.lookupMetadata("shell", registry).?;
+    const refined_shell = refineMetadata(shell_base, parsed.value.object);
+    try std.testing.expect(refined_shell.flags.mutating);
+    try std.testing.expect(!refined_shell.flags.read_only);
+}
+
+test "refineMetadata does not mark downgraded calls background_safe" {
+    const registry = defaultMetadataRegistry();
+    const base = metadata.lookupMetadata("git_operations", registry).?;
+    const parsed = try parseTestArgs("{\"operation\":\"status\"}");
+    defer parsed.deinit();
+    const refined = refineMetadata(base, parsed.value.object);
+    try std.testing.expect(refined.flags.read_only);
+    try std.testing.expect(!refined.flags.background_safe);
+}
+
+test "defaultMetadataRegistry unknown tool falls back to conservative" {
+    const registry = defaultMetadataRegistry();
+    try std.testing.expect(metadata.lookupMetadata("mcp_some_unknown_tool", registry) == null);
+    const fallback = metadata.ToolMetadata.conservative("mcp_some_unknown_tool");
+    try std.testing.expect(fallback.flags.mutating);
+    try std.testing.expect(!fallback.flags.read_only);
+    try std.testing.expect(!fallback.flags.background_safe);
 }
 
 test {

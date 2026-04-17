@@ -1018,12 +1018,33 @@ pub const Agent = struct {
                 } };
             }
         }
-        // Execution mode gate: block tools not allowed in current mode
+        // Execution mode gate: block tools not allowed in current mode.
+        // Uses the static default metadata registry for built-in tools, then
+        // applies args-aware refinement so read-only sub-actions of mutating
+        // tools (e.g. `schedule.list`, `git.status`, HTTP GET) are allowed in
+        // plan/review. Unknown tool names (MCP, dynamic) fall back to
+        // conservative policy.
         if (self.execution_mode != .execute) {
-            // TODO(phase-4+): wire comptime tool registry here instead of empty slice
-            // CR IN-03: known limitation — all non-hardcoded tools use conservative fallback in plan/review mode
-            const meta = tool_metadata.lookupMetadata(call.name, &.{}) orelse
+            const registry = tools_mod.defaultMetadataRegistry();
+            const base_meta = tool_metadata.lookupMetadata(call.name, registry) orelse
                 tool_metadata.ToolMetadata.conservative(call.name);
+
+            const meta = blk: {
+                if (base_meta.flags.read_only) break :blk base_meta;
+                const parsed = std.json.parseFromSlice(
+                    std.json.Value,
+                    self.allocator,
+                    call.arguments_json,
+                    .{},
+                ) catch break :blk base_meta;
+                defer parsed.deinit();
+                const args_obj = switch (parsed.value) {
+                    .object => |obj| obj,
+                    else => break :blk base_meta,
+                };
+                break :blk tools_mod.refineMetadata(base_meta, args_obj);
+            };
+
             if (!self.execution_mode.allowsTool(meta)) {
                 return .{
                     .blocked = .{
@@ -6191,6 +6212,161 @@ test "policy preflight reports action budget exhausted" {
     const second = agent.preflightToolPolicy(call);
     try std.testing.expect(second == .blocked);
     try std.testing.expectEqualStrings("Action budget exhausted", second.blocked.output);
+}
+
+test "preflight allows read-only tools in plan mode" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .plan;
+    const read_only_tools = [_][]const u8{
+        "runtime_info", "file_read", "memory_recall", "memory_list",
+        "memory_timeline", "web_fetch", "web_search", "task_list", "task_get",
+    };
+    for (read_only_tools) |name| {
+        const call = ParsedToolCall{ .name = name, .arguments_json = "{}", .tool_call_id = null };
+        const result = agent.preflightToolPolicy(call);
+        try std.testing.expect(result == .allowed);
+    }
+}
+
+test "preflight blocks mutating tools in plan mode" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .plan;
+    // Tools with no action-dependent downgrade; empty args stay mutating.
+    // (Action-dependent tools are covered by the "still blocks mutating
+    // sub-actions" test — they need concrete args to remain mutating.)
+    const mutating_tools = [_][]const u8{
+        "shell",        "file_write", "file_edit", "memory_store",
+        "delegate",     "spawn",      "message",
+    };
+    for (mutating_tools) |name| {
+        const call = ParsedToolCall{ .name = name, .arguments_json = "{}", .tool_call_id = null };
+        const result = agent.preflightToolPolicy(call);
+        try std.testing.expect(result == .blocked);
+        try std.testing.expect(std.mem.indexOf(u8, result.blocked.output, "plan mode") != null);
+    }
+}
+
+test "preflight blocks mutating tools in review mode" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .review;
+    const call = ParsedToolCall{ .name = "shell", .arguments_json = "{}", .tool_call_id = null };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .blocked);
+    try std.testing.expect(std.mem.indexOf(u8, result.blocked.output, "review mode") != null);
+}
+
+test "preflight allows read-only tools in review mode" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .review;
+    const call = ParsedToolCall{ .name = "file_read", .arguments_json = "{}", .tool_call_id = null };
+    try std.testing.expect(agent.preflightToolPolicy(call) == .allowed);
+}
+
+test "preflight blocks unknown tools in plan mode via conservative fallback" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .plan;
+    const call = ParsedToolCall{
+        .name = "mcp_unknown_tool",
+        .arguments_json = "{}",
+        .tool_call_id = null,
+    };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .blocked);
+}
+
+test "preflight permits unknown tools in execute mode" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .execute;
+    const call = ParsedToolCall{
+        .name = "mcp_unknown_tool",
+        .arguments_json = "{}",
+        .tool_call_id = null,
+    };
+    try std.testing.expect(agent.preflightToolPolicy(call) == .allowed);
+}
+
+test "preflight allows read-only sub-actions of mutating tools in plan mode" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .plan;
+
+    const cases = [_]struct { name: []const u8, args: []const u8 }{
+        .{ .name = "schedule", .args = "{\"action\":\"list\"}" },
+        .{ .name = "schedule", .args = "{\"action\":\"get\",\"id\":\"abc\"}" },
+        .{ .name = "git_operations", .args = "{\"operation\":\"status\"}" },
+        .{ .name = "git_operations", .args = "{\"operation\":\"diff\"}" },
+        .{ .name = "http_request", .args = "{\"url\":\"https://x\",\"method\":\"GET\"}" },
+        .{ .name = "http_request", .args = "{\"url\":\"https://x\"}" },
+        .{ .name = "composio", .args = "{\"action\":\"list\",\"app\":\"gmail\"}" },
+        .{ .name = "composio", .args = "{\"action\":\"execute\",\"tool_slug\":\"gmail-list-messages\"}" },
+        .{ .name = "skill_registry", .args = "{\"action\":\"list\"}" },
+    };
+    for (cases) |c| {
+        const call = ParsedToolCall{ .name = c.name, .arguments_json = c.args, .tool_call_id = null };
+        const result = agent.preflightToolPolicy(call);
+        try std.testing.expect(result == .allowed);
+    }
+}
+
+test "preflight still blocks mutating sub-actions in plan mode" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .plan;
+
+    const cases = [_]struct { name: []const u8, args: []const u8 }{
+        .{ .name = "schedule", .args = "{\"action\":\"create\",\"expression\":\"*/5 * * * *\",\"command\":\"echo\"}" },
+        .{ .name = "git_operations", .args = "{\"operation\":\"commit\",\"message\":\"x\"}" },
+        .{ .name = "http_request", .args = "{\"url\":\"https://x\",\"method\":\"POST\"}" },
+        .{ .name = "composio", .args = "{\"action\":\"execute\",\"tool_slug\":\"gmail-send-email\"}" },
+        .{ .name = "skill_registry", .args = "{\"action\":\"install\",\"skill_ref\":\"x/y\"}" },
+    };
+    for (cases) |c| {
+        const call = ParsedToolCall{ .name = c.name, .arguments_json = c.args, .tool_call_id = null };
+        const result = agent.preflightToolPolicy(call);
+        try std.testing.expect(result == .blocked);
+    }
+}
+
+test "preflight background mode allows background-safe tools and blocks others" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .background;
+
+    const safe_call = ParsedToolCall{ .name = "file_read", .arguments_json = "{}", .tool_call_id = null };
+    try std.testing.expect(agent.preflightToolPolicy(safe_call) == .allowed);
+
+    const unsafe_call = ParsedToolCall{ .name = "shell", .arguments_json = "{}", .tool_call_id = null };
+    const blocked = agent.preflightToolPolicy(unsafe_call);
+    try std.testing.expect(blocked == .blocked);
+    try std.testing.expect(std.mem.indexOf(u8, blocked.blocked.output, "background mode") != null);
+
+    // Sensitive non-background tools remain blocked.
+    const schedule_call = ParsedToolCall{ .name = "schedule", .arguments_json = "{}", .tool_call_id = null };
+    try std.testing.expect(agent.preflightToolPolicy(schedule_call) == .blocked);
 }
 
 test "slash additional commands are handled" {
