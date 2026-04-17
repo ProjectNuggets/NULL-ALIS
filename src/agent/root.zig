@@ -879,10 +879,46 @@ pub const Agent = struct {
         };
     }
 
-    const PolicyPreflightResult = union(enum) {
-        allowed,
-        blocked: ToolExecutionResult,
+    /// Why a tool was blocked during preflight. Keeps the decision
+    /// self-describing for dispatch consumers without requiring string parsing.
+    const ToolPreflightSource = enum {
+        security_read_only,
+        action_budget,
+        execution_mode,
     };
+
+    const ToolPreflightAllowed = struct {
+        metadata: tool_metadata.ToolMetadata,
+    };
+
+    const ToolPreflightBlocked = struct {
+        name: []const u8,
+        tool_call_id: ?[]const u8,
+        output: []const u8,
+        source: ToolPreflightSource,
+        reason: []const u8,
+        mode: ExecutionMode,
+        risk_level: tool_metadata.RiskLevel,
+        metadata: tool_metadata.ToolMetadata,
+
+        fn toToolExecutionResult(self: ToolPreflightBlocked) ToolExecutionResult {
+            return .{
+                .name = self.name,
+                .output = self.output,
+                .success = false,
+                .tool_call_id = self.tool_call_id,
+            };
+        }
+    };
+
+    const ToolPreflightDecision = union(enum) {
+        allowed: ToolPreflightAllowed,
+        blocked: ToolPreflightBlocked,
+    };
+
+    /// Kept as an alias of `ToolPreflightDecision` to minimise churn across
+    /// existing call sites and tests.
+    const PolicyPreflightResult = ToolPreflightDecision;
 
     const ParallelToolWorker = struct {
         agent: *Agent,
@@ -998,70 +1034,89 @@ pub const Agent = struct {
         return false;
     }
 
+    /// Resolve tool metadata for a call: registry lookup, conservative fallback,
+    /// then args-aware refinement (so e.g. `schedule.list` can downgrade to
+    /// read-only). Parse failure falls back to base metadata — matches the
+    /// historical behavior.
+    fn metadataForToolCall(self: *Agent, call: ParsedToolCall) tool_metadata.ToolMetadata {
+        const registry = tools_mod.defaultMetadataRegistry();
+        const base_meta = tool_metadata.lookupMetadata(call.name, registry) orelse
+            tool_metadata.ToolMetadata.conservative(call.name);
+        if (base_meta.flags.read_only) return base_meta;
+        const parsed = std.json.parseFromSlice(
+            std.json.Value,
+            self.allocator,
+            call.arguments_json,
+            .{},
+        ) catch return base_meta;
+        defer parsed.deinit();
+        const args_obj = switch (parsed.value) {
+            .object => |obj| obj,
+            else => return base_meta,
+        };
+        return tools_mod.refineMetadata(base_meta, args_obj);
+    }
+
     fn preflightToolPolicy(self: *Agent, call: ParsedToolCall) PolicyPreflightResult {
+        const meta = self.metadataForToolCall(call);
+
         if (self.policy) |pol| {
             if (!pol.canAct()) {
                 return .{ .blocked = .{
                     .name = call.name,
-                    .output = "Action blocked: agent is in read-only mode",
-                    .success = false,
                     .tool_call_id = call.tool_call_id,
+                    .output = "Action blocked: agent is in read-only mode",
+                    .source = .security_read_only,
+                    .reason = "security_policy_read_only",
+                    .mode = self.execution_mode,
+                    .risk_level = meta.risk_level,
+                    .metadata = meta,
                 } };
             }
             const allowed = pol.recordAction() catch true;
             if (!allowed) {
                 return .{ .blocked = .{
                     .name = call.name,
-                    .output = "Action budget exhausted",
-                    .success = false,
                     .tool_call_id = call.tool_call_id,
+                    .output = "Action budget exhausted",
+                    .source = .action_budget,
+                    .reason = "action_budget_exhausted",
+                    .mode = self.execution_mode,
+                    .risk_level = meta.risk_level,
+                    .metadata = meta,
                 } };
             }
         }
         // Execution mode gate: block tools not allowed in current mode.
-        // Uses the static default metadata registry for built-in tools, then
-        // applies args-aware refinement so read-only sub-actions of mutating
-        // tools (e.g. `schedule.list`, `git.status`, HTTP GET) are allowed in
-        // plan/review. Unknown tool names (MCP, dynamic) fall back to
-        // conservative policy.
+        // Built-in tools come from `defaultMetadataRegistry`; unknown tool
+        // names (MCP, dynamic) fall back to conservative policy via
+        // `metadataForToolCall`.
         if (self.execution_mode != .execute) {
-            const registry = tools_mod.defaultMetadataRegistry();
-            const base_meta = tool_metadata.lookupMetadata(call.name, registry) orelse
-                tool_metadata.ToolMetadata.conservative(call.name);
-
-            const meta = blk: {
-                if (base_meta.flags.read_only) break :blk base_meta;
-                const parsed = std.json.parseFromSlice(
-                    std.json.Value,
-                    self.allocator,
-                    call.arguments_json,
-                    .{},
-                ) catch break :blk base_meta;
-                defer parsed.deinit();
-                const args_obj = switch (parsed.value) {
-                    .object => |obj| obj,
-                    else => break :blk base_meta,
-                };
-                break :blk tools_mod.refineMetadata(base_meta, args_obj);
-            };
-
             if (!self.execution_mode.allowsTool(meta)) {
-                return .{
-                    .blocked = .{
-                        .name = call.name,
-                        .output = switch (self.execution_mode) {
-                            .plan => "Tool blocked: not allowed in plan mode (read-only tools only)",
-                            .review => "Tool blocked: not allowed in review mode (read-only tools only)",
-                            .background => "Tool blocked: not allowed in background mode (background-safe tools only)",
-                            .execute => unreachable, // execute allows all tools
-                        },
-                        .success = false,
-                        .tool_call_id = call.tool_call_id,
-                    },
+                const output: []const u8 = switch (self.execution_mode) {
+                    .plan => "Tool blocked: not allowed in plan mode (read-only tools only)",
+                    .review => "Tool blocked: not allowed in review mode (read-only tools only)",
+                    .background => "Tool blocked: not allowed in background mode (background-safe tools only)",
+                    .execute => unreachable, // execute allows all tools
                 };
+                const reason: []const u8 = switch (self.execution_mode) {
+                    .plan, .review => "mode_requires_read_only",
+                    .background => "mode_requires_background_safe",
+                    .execute => unreachable,
+                };
+                return .{ .blocked = .{
+                    .name = call.name,
+                    .tool_call_id = call.tool_call_id,
+                    .output = output,
+                    .source = .execution_mode,
+                    .reason = reason,
+                    .mode = self.execution_mode,
+                    .risk_level = meta.risk_level,
+                    .metadata = meta,
+                } };
             }
         }
-        return .allowed;
+        return .{ .allowed = .{ .metadata = meta } };
     }
 
     fn executeToolCallsSerial(
@@ -1264,9 +1319,9 @@ pub const Agent = struct {
             self.observer.recordEvent(&tool_start_event);
 
             switch (self.preflightToolPolicy(call)) {
-                .blocked => |result| {
+                .blocked => |decision| {
                     blocked[i] = true;
-                    ordered_results[i] = result;
+                    ordered_results[i] = decision.toToolExecutionResult();
                     continue;
                 },
                 .allowed => {},
@@ -2682,7 +2737,7 @@ pub const Agent = struct {
     fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
         return switch (self.preflightToolPolicy(call)) {
             .allowed => self.executeToolUnchecked(tool_allocator, call),
-            .blocked => |result| result,
+            .blocked => |decision| decision.toToolExecutionResult(),
         };
     }
 
@@ -6367,6 +6422,178 @@ test "preflight background mode allows background-safe tools and blocks others" 
     // Sensitive non-background tools remain blocked.
     const schedule_call = ParsedToolCall{ .name = "schedule", .arguments_json = "{}", .tool_call_id = null };
     try std.testing.expect(agent.preflightToolPolicy(schedule_call) == .blocked);
+}
+
+test "preflight allowed exposes read-only metadata for file_read in plan mode" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .plan;
+    const call = ParsedToolCall{ .name = "file_read", .arguments_json = "{}", .tool_call_id = null };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .allowed);
+    try std.testing.expect(result.allowed.metadata.flags.read_only);
+    try std.testing.expect(!result.allowed.metadata.flags.mutating);
+    try std.testing.expectEqualStrings("file_read", result.allowed.metadata.name);
+}
+
+test "preflight blocked shell in plan mode carries execution_mode source and critical risk" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .plan;
+    const call = ParsedToolCall{ .name = "shell", .arguments_json = "{}", .tool_call_id = null };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.execution_mode, result.blocked.source);
+    try std.testing.expectEqual(tool_metadata.RiskLevel.critical, result.blocked.risk_level);
+    try std.testing.expectEqual(ExecutionMode.plan, result.blocked.mode);
+    try std.testing.expectEqualStrings("mode_requires_read_only", result.blocked.reason);
+    try std.testing.expect(result.blocked.metadata.flags.mutating);
+}
+
+test "preflight blocked shell in review mode carries execution_mode source" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .review;
+    const call = ParsedToolCall{ .name = "shell", .arguments_json = "{}", .tool_call_id = null };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.execution_mode, result.blocked.source);
+    try std.testing.expectEqual(ExecutionMode.review, result.blocked.mode);
+    try std.testing.expectEqualStrings("mode_requires_read_only", result.blocked.reason);
+}
+
+test "preflight unknown tool in plan mode blocks with conservative mutating metadata" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .plan;
+    const call = ParsedToolCall{ .name = "mcp_unknown_tool", .arguments_json = "{}", .tool_call_id = null };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.execution_mode, result.blocked.source);
+    try std.testing.expectEqual(tool_metadata.RiskLevel.high, result.blocked.risk_level);
+    try std.testing.expect(result.blocked.metadata.flags.mutating);
+    try std.testing.expect(!result.blocked.metadata.flags.read_only);
+    try std.testing.expectEqualStrings("mcp_unknown_tool", result.blocked.metadata.name);
+}
+
+test "preflight unknown tool in execute mode is allowed with conservative metadata" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .execute;
+    const call = ParsedToolCall{ .name = "mcp_unknown_tool", .arguments_json = "{}", .tool_call_id = null };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .allowed);
+    try std.testing.expect(result.allowed.metadata.flags.mutating);
+    try std.testing.expectEqual(tool_metadata.RiskLevel.high, result.allowed.metadata.risk_level);
+    try std.testing.expectEqualStrings("mcp_unknown_tool", result.allowed.metadata.name);
+}
+
+test "preflight action budget exhaustion reports action_budget source" {
+    const allocator = std.testing.allocator;
+    var tracker = RateTracker.init(allocator, 1);
+    defer tracker.deinit();
+    var policy = SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .max_actions_per_hour = 1,
+        .tracker = &tracker,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 4,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer agent.deinit();
+
+    const call = ParsedToolCall{ .name = "runtime_info", .arguments_json = "{}", .tool_call_id = null };
+    _ = agent.preflightToolPolicy(call); // consume the single-action budget
+    const second = agent.preflightToolPolicy(call);
+    try std.testing.expect(second == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.action_budget, second.blocked.source);
+    try std.testing.expectEqualStrings("action_budget_exhausted", second.blocked.reason);
+    try std.testing.expectEqualStrings("Action budget exhausted", second.blocked.output);
+}
+
+test "preflight security read-only policy reports security_read_only source" {
+    const allocator = std.testing.allocator;
+    var tracker = RateTracker.init(allocator, 1);
+    defer tracker.deinit();
+    var policy = SecurityPolicy{
+        .autonomy = .read_only,
+        .workspace_dir = "/tmp",
+        .max_actions_per_hour = 100,
+        .tracker = &tracker,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 4,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer agent.deinit();
+
+    const call = ParsedToolCall{ .name = "shell", .arguments_json = "{}", .tool_call_id = null };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.security_read_only, result.blocked.source);
+    try std.testing.expectEqualStrings("security_policy_read_only", result.blocked.reason);
+    try std.testing.expectEqualStrings("Action blocked: agent is in read-only mode", result.blocked.output);
+}
+
+test "preflight blocked decision conversion preserves tool_call_id" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .plan;
+    const call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{}",
+        .tool_call_id = "call_abc123",
+    };
+    const result = agent.preflightToolPolicy(call);
+    try std.testing.expect(result == .blocked);
+    const converted = result.blocked.toToolExecutionResult();
+    try std.testing.expect(!converted.success);
+    try std.testing.expectEqualStrings("shell", converted.name);
+    try std.testing.expectEqualStrings(result.blocked.output, converted.output);
+    try std.testing.expect(converted.tool_call_id != null);
+    try std.testing.expectEqualStrings("call_abc123", converted.tool_call_id.?);
 }
 
 test "slash additional commands are handled" {
