@@ -550,15 +550,37 @@ pub const SubagentManager = struct {
             }
         }
 
-        // Route result via bus (outside lock)
-        if (self.bus) |b| {
-            const content = if (owned_result) |r|
-                std.fmt.allocPrint(self.allocator, "[Subagent '{s}' completed]\n{s}", .{ label, r }) catch return
-            else if (owned_err) |e|
-                std.fmt.allocPrint(self.allocator, "[Subagent '{s}' failed]\n{s}", .{ label, e }) catch return
-            else
-                std.fmt.allocPrint(self.allocator, "[Subagent '{s}' finished]", .{label}) catch return;
+        // ── Route result (outside lock) ──────────────────────────────
+        // PRECEDENCE: direct completion_delivery callback FIRST, bus SECOND.
+        //
+        // Rationale: when a caller has attached a direct callback (tenant
+        // mode: gateway.zig:1372 attaches appendSubagentCompletionToGateway
+        // Session), it is the semantically correct delivery — it writes to
+        // the parent's session history AND pushes SSE to live app clients.
+        // The bus path is a broadcast to an inbound queue that is only
+        // consumed by daemon.run() in shared mode (daemon.zig:1850). In
+        // tenant mode (gateway.runWithRole with role=.user_cell), the bus
+        // inbound queue has NO consumer — results vanish.
+        //
+        // The prior order (`if bus else if completion_delivery`) meant the
+        // tenant path was dead code since both fields are populated in
+        // production. Fixed by flipping precedence. Bus remains the path
+        // for shared/daemon deployments.
+        const content = if (owned_result) |r|
+            std.fmt.allocPrint(self.allocator, "[Subagent '{s}' completed]\n{s}", .{ label, r }) catch return
+        else if (owned_err) |e|
+            std.fmt.allocPrint(self.allocator, "[Subagent '{s}' failed]\n{s}", .{ label, e }) catch return
+        else
+            std.fmt.allocPrint(self.allocator, "[Subagent '{s}' finished]", .{label}) catch return;
 
+        if (self.completion_delivery) |delivery| {
+            defer self.allocator.free(content);
+            log.info("subagent.delivery path=direct task_id={d} session_key={s}", .{ task_id, request_session_key });
+            delivery(self.completion_delivery_ctx, request_session_key, content) catch |err| {
+                log.err("subagent: failed to append local completion: {}", .{err});
+            };
+        } else if (self.bus) |b| {
+            log.info("subagent.delivery path=bus task_id={d} session_key={s}", .{ task_id, request_session_key });
             const msg = bus_mod.makeInbound(
                 self.allocator,
                 origin_channel,
@@ -576,18 +598,9 @@ pub const SubagentManager = struct {
                 msg.deinit(self.allocator);
                 log.err("subagent: failed to publish result to bus: {}", .{err});
             };
-        } else if (self.completion_delivery) |delivery| {
-            const content = if (owned_result) |r|
-                std.fmt.allocPrint(self.allocator, "[Subagent '{s}' completed]\n{s}", .{ label, r }) catch return
-            else if (owned_err) |e|
-                std.fmt.allocPrint(self.allocator, "[Subagent '{s}' failed]\n{s}", .{ label, e }) catch return
-            else
-                std.fmt.allocPrint(self.allocator, "[Subagent '{s}' finished]", .{label}) catch return;
-            defer self.allocator.free(content);
-
-            delivery(self.completion_delivery_ctx, request_session_key, content) catch |err| {
-                log.err("subagent: failed to append local completion: {}", .{err});
-            };
+        } else {
+            self.allocator.free(content);
+            log.warn("subagent.delivery path=none task_id={d} — no bus or completion_delivery attached, result discarded", .{task_id});
         }
     }
 
@@ -1104,6 +1117,65 @@ test "SubagentManager completeTask falls back to local completion delivery witho
     try std.testing.expect(recorder.content != null);
     try std.testing.expectEqualStrings("agent:zaki-bot:user:1:thread:main", recorder.session_key.?);
     try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "result text") != null);
+}
+
+// ── TENANT-MODE REGRESSION TEST ─────────────────────────────────────
+//
+// When BOTH bus AND completion_delivery are attached (production tenant
+// mode: gateway.zig:1274 sets bus, :1372 attaches completion_delivery),
+// the direct callback MUST fire, not the bus publish. The bus inbound
+// queue has no consumer in tenant mode (daemon.run() does not run);
+// bus-only delivery meant sub-agent results vanished.
+//
+// This test locks in the precedence: completion_delivery wins over bus
+// when both are set. See .planning/DELEGATION-DIAGNOSIS.md for full trace.
+test "SubagentManager completeTask prefers completion_delivery over bus when both attached (tenant mode)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var bus = bus_mod.Bus.init();
+    defer bus.close();
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    // Mirror tenant runtime wiring: bus AND completion_delivery both attached.
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, &bus, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "tenant-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "tenant delivery check"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "tenant delivery check"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:7:main"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "zaki_app"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "chat-app-7"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+
+    mgr.markTaskRunning(1);
+    mgr.completeTask(1, "tenant result payload", null);
+
+    // completion_delivery recorder must have received the content.
+    try std.testing.expect(recorder.session_key != null);
+    try std.testing.expect(recorder.content != null);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:7:main", recorder.session_key.?);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "tenant result payload") != null);
+
+    // Bus must NOT have received the inbound message (precedence enforced).
+    // Note: consumeInbound() blocks on empty-open queue; close first so it
+    // returns null on drained instead of deadlocking the test.
+    bus.close();
+    try std.testing.expect(bus.consumeInbound() == null);
 }
 
 test "SubagentManager spawn stores session key" {
