@@ -8616,6 +8616,56 @@ const LiveSseCtx = struct {
     }
 };
 
+const LiveProviderRoundResetObserver = struct {
+    inner: observability.Observer,
+    live_seq: *usize,
+
+    const vtable = observability.Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = name,
+    };
+
+    fn observer(self: *LiveProviderRoundResetObserver) observability.Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    fn resolve(ptr: *anyopaque) *LiveProviderRoundResetObserver {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self = resolve(ptr);
+        switch (event.*) {
+            .turn_stage => |stage| {
+                if (std.mem.eql(u8, stage.stage, "build_provider_messages")) {
+                    self.live_seq.* = 0;
+                }
+            },
+            else => {},
+        }
+        self.inner.recordEvent(event);
+    }
+
+    fn recordMetric(ptr: *anyopaque, metric: *const observability.ObserverMetric) void {
+        const self = resolve(ptr);
+        self.inner.recordMetric(metric);
+    }
+
+    fn flush(ptr: *anyopaque) void {
+        const self = resolve(ptr);
+        self.inner.flush();
+    }
+
+    fn name(_: *anyopaque) []const u8 {
+        return "live_provider_round_reset";
+    }
+};
+
 fn liveStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     if (chunk.delta.len == 0) return; // skip empty/final-only chunks
     const ctx: *LiveSseCtx = @ptrCast(@alignCast(ctx_ptr));
@@ -8821,8 +8871,12 @@ fn handleApiChatStreamSseConnection(
         live_ctx.paced_sink = &paced_sink;
     }
     var noop_progress_observer = observability.NoopObserver{};
-    var run_event_observer_impl = gateway_run_events.RunEventObserver{
+    var live_provider_round_reset_observer = LiveProviderRoundResetObserver{
         .inner = noop_progress_observer.observer(),
+        .live_seq = &live_seq,
+    };
+    var run_event_observer_impl = gateway_run_events.RunEventObserver{
+        .inner = live_provider_round_reset_observer.observer(),
         .sink = live_ctx.frameSink(),
         .allocator = req_allocator,
     };
@@ -16058,6 +16112,196 @@ test "handleApiChatStreamSseConnection emits keepalive comments during slow turn
     try std.testing.expect(handled);
     try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "Still working on the reply") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "Hello after keepalive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: done") != null);
+}
+
+test "handleApiChatStreamSseConnection replays final reply when earlier live tokens came from tool planning" {
+    const EchoTool = struct {
+        const Self = @This();
+        pub const tool_name = "echo_tool";
+        pub const tool_description = "Returns a deterministic tool result";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) tools_mod.Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{
+                .success = true,
+                .output = try allocator.dupe(u8, "tool-ok"),
+            };
+        }
+    };
+
+    const StreamingToolProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "unexpected fallback"),
+                .tool_calls = &.{},
+                .usage = .{ .prompt_tokens = 1, .completion_tokens = 1, .total_tokens = 2 },
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                callback(callback_ctx, providers.StreamChunk.textDelta("Running tool"));
+                callback(callback_ctx, providers.StreamChunk.finalChunk());
+
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-1"),
+                    .name = try allocator.dupe(u8, "echo_tool"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "Running tool"),
+                    .tool_calls = tool_calls,
+                    .usage = .{ .prompt_tokens = 8, .completion_tokens = 4, .total_tokens = 12 },
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            // The final provider round intentionally emits no text deltas.
+            // Before the fix, the gateway treated the earlier tool-planning
+            // tokens as proof that the final reply had already streamed.
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(u8, "Final answer after tool"),
+                .tool_calls = &.{},
+                .usage = .{ .prompt_tokens = 6, .completion_tokens = 3, .total_tokens = 9 },
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "streaming-tool-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const FakeStream = struct {
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn writeAll(self: *@This(), bytes: []const u8) !void {
+            try self.buf.appendSlice(std.testing.allocator, bytes);
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(std.testing.allocator);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{workspace});
+    defer std.testing.allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+
+    var provider_state = StreamingToolProvider{};
+    const provider_vtable = providers.Provider.VTable{
+        .chatWithSystem = StreamingToolProvider.chatWithSystem,
+        .chat = StreamingToolProvider.chat,
+        .supportsNativeTools = StreamingToolProvider.supportsNativeTools,
+        .getName = StreamingToolProvider.getName,
+        .deinit = StreamingToolProvider.deinitFn,
+        .supports_streaming = StreamingToolProvider.supportsStreaming,
+        .stream_chat = StreamingToolProvider.streamChat,
+    };
+    const provider = providers.Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var echo_tool = EchoTool{};
+    const tools = [_]tools_mod.Tool{echo_tool.tool()};
+
+    var noop = observability.NoopObserver{};
+    var session_mgr = session_mod.SessionManager.init(
+        std.testing.allocator,
+        &cfg,
+        provider,
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer session_mgr.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = workspace;
+    state.workspace_dir = workspace;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"message\":\"hello\",\"session_key\":\"session:tool-live\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/chat/stream HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    var fake_stream = FakeStream{};
+    defer fake_stream.deinit();
+
+    const handled = handleApiChatStreamSseConnection(
+        std.testing.allocator,
+        req_allocator,
+        &fake_stream,
+        raw_request,
+        "POST",
+        "/api/v1/chat/stream",
+        &state,
+        null,
+        &session_mgr,
+    );
+
+    try std.testing.expect(handled);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "Running tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "Final answer after tool") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: done") != null);
 }
 
