@@ -910,6 +910,7 @@ pub const Agent = struct {
         security_read_only,
         action_budget,
         execution_mode,
+        background_origin,
         approval_required,
         approval_denied,
     };
@@ -1089,27 +1090,64 @@ pub const Agent = struct {
         return false;
     }
 
-    /// Resolve tool metadata for a call: registry lookup, conservative fallback,
-    /// then args-aware refinement (so e.g. `schedule.list` can downgrade to
-    /// read-only). Parse failure falls back to base metadata — matches the
-    /// historical behavior.
+    /// Resolve tool metadata for a call via the canonical helper in
+    /// `tools/root.zig`. Kept as a thin wrapper so agent preflight, reporting
+    /// paths (`/permissions`), and SecurityPolicy callers all read metadata
+    /// through the same registry + args-aware refinement.
     fn metadataForToolCall(self: *Agent, call: ParsedToolCall) tool_metadata.ToolMetadata {
-        const registry = tools_mod.defaultMetadataRegistry();
-        const base_meta = tool_metadata.lookupMetadata(call.name, registry) orelse
-            tool_metadata.ToolMetadata.conservative(call.name);
-        if (base_meta.flags.read_only) return base_meta;
+        return tools_mod.canonicalMetadataForCall(self.allocator, call.name, call.arguments_json);
+    }
+
+    /// Origin gate used by preflight. Parses args once locally so the gate
+    /// shares the same argument-aware behavior as the original
+    /// `toolBlockedForCurrentTurn` call site without relying on the caller
+    /// to pre-parse arguments.
+    fn checkBackgroundOriginGate(self: *Agent, call: ParsedToolCall, meta: tool_metadata.ToolMetadata) ?[]const u8 {
+        const turn_ctx = tools_mod.getTurnContext();
+        if (!tools_mod.isBackgroundTurnOrigin(turn_ctx.origin)) return null;
+
         const parsed = std.json.parseFromSlice(
             std.json.Value,
             self.allocator,
             call.arguments_json,
             .{},
-        ) catch return base_meta;
-        defer parsed.deinit();
-        const args_obj = switch (parsed.value) {
-            .object => |obj| obj,
-            else => return base_meta,
+        ) catch {
+            // If args aren't valid JSON we fall back to name-only check with an
+            // empty object — downstream tool exec will also reject the call.
+            var empty = std.json.ObjectMap.init(self.allocator);
+            defer empty.deinit();
+            return tools_mod.toolBlockedForCurrentTurnWithMeta(call.name, empty, meta);
         };
-        return tools_mod.refineMetadata(base_meta, args_obj);
+        defer parsed.deinit();
+        const args_obj: std.json.ObjectMap = switch (parsed.value) {
+            .object => |obj| obj,
+            else => blk: {
+                break :blk std.json.ObjectMap.init(self.allocator);
+            },
+        };
+        return tools_mod.toolBlockedForCurrentTurnWithMeta(call.name, args_obj, meta);
+    }
+
+    fn backgroundSendModeBlocked(self: *Agent, call: ParsedToolCall) bool {
+        if (!std.mem.eql(u8, call.name, tools_mod.message.MessageTool.tool_name)) return false;
+        const turn_ctx = tools_mod.getTurnContext();
+        if (!tools_mod.isBackgroundTurnOrigin(turn_ctx.origin)) return false;
+        return self.send_mode == .off;
+    }
+
+    fn appendPendingApprovalToolHistory(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        results: []const ToolExecutionResult,
+    ) !void {
+        if (results.len == 0) return;
+
+        const formatted_results = try dispatcher.formatToolResults(arena, results);
+        const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
+        try self.history.append(self.allocator, .{
+            .role = .user,
+            .content = try self.allocator.dupe(u8, scrubbed_results),
+        });
     }
 
     pub fn clearPendingToolApproval(self: *Agent) void {
@@ -1161,7 +1199,8 @@ pub const Agent = struct {
 
     /// Execute the currently pending approved tool exactly once.
     /// Bypasses the generic approval preflight but preserves other gates.
-    /// Caller owns the returned output buffer (allocated on `tool_allocator`).
+    /// Returned output may borrow either static storage or memory owned by
+    /// `tool_allocator`; keep that allocator alive until the caller is done.
     pub fn executeApprovedPendingTool(
         self: *Agent,
         tool_allocator: std.mem.Allocator,
@@ -1214,6 +1253,36 @@ pub const Agent = struct {
                     .metadata = meta,
                 } };
             }
+        }
+        // Background-origin gate: when the current turn runs on a background
+        // lane (heartbeat/wake/scheduler/proactive), enforce the per-origin
+        // policy before we consume budget or trigger approval. This used to
+        // run from `executeToolUnchecked` after the approval gate, which let
+        // budget be spent and approval be surfaced for calls the origin lane
+        // would never execute.
+        if (self.checkBackgroundOriginGate(call, meta)) |msg| {
+            return .{ .blocked = .{
+                .name = call.name,
+                .tool_call_id = call.tool_call_id,
+                .output = msg,
+                .source = .background_origin,
+                .reason = "background_origin_denied",
+                .mode = self.execution_mode,
+                .risk_level = meta.risk_level,
+                .metadata = meta,
+            } };
+        }
+        if (self.backgroundSendModeBlocked(call)) {
+            return .{ .blocked = .{
+                .name = call.name,
+                .tool_call_id = call.tool_call_id,
+                .output = "Proactive sends are disabled (send_mode=off)",
+                .source = .background_origin,
+                .reason = "send_mode_off",
+                .mode = self.execution_mode,
+                .risk_level = meta.risk_level,
+                .metadata = meta,
+            } };
         }
         // Execution mode gate: block tools not allowed in current mode.
         // Built-in tools come from `defaultMetadataRegistry`; unknown tool
@@ -1387,6 +1456,7 @@ pub const Agent = struct {
             });
 
             try results_buf.append(self.allocator, result);
+            if (self.pending_tool_approval != null) break;
         }
     }
 
@@ -2304,11 +2374,22 @@ pub const Agent = struct {
             if (self.usage_rt) |urt| {
                 const input: u64 = @intCast(response.usage.prompt_tokens);
                 const output: u64 = @intCast(response.usage.completion_tokens);
-                urt.recordTurn(
+                // WP5.1: consult the static provider pricing table. When
+                // the model is priced, record the USD cost; when the
+                // model is unknown we pass 0 and /cost reports
+                // "cost unavailable" rather than inventing $0.00.
+                const priced_model: []const u8 = if (response.model.len > 0) response.model else self.default_model;
+                const cost_usd: f64 = providers.pricing.costFor(
                     self.default_provider,
+                    priced_model,
                     input,
                     output,
-                    0.0, // Cost calculation deferred to provider-specific pricing
+                ) orelse 0.0;
+                urt.recordTurn(
+                    priced_model,
+                    input,
+                    output,
+                    cost_usd,
                     0, // Duration refined when timing context available
                 );
             }
@@ -2619,8 +2700,7 @@ pub const Agent = struct {
                         // the model treats it as an instruction, not user input.
                         try self.history.append(self.allocator, .{
                             .role = .user,
-                            .content = try self.allocator.dupe(u8,
-                                "SYSTEM: Review the recent conversation. If any user preferences, " ++
+                            .content = try self.allocator.dupe(u8, "SYSTEM: Review the recent conversation. If any user preferences, " ++
                                 "important decisions, or reusable procedures should be remembered " ++
                                 "long-term, save them now using the memory tool. Only save what " ++
                                 "has lasting relevance beyond this session."),
@@ -2639,8 +2719,7 @@ pub const Agent = struct {
                 {
                     try self.history.append(self.allocator, .{
                         .role = .user,
-                        .content = try self.allocator.dupe(u8,
-                            "SYSTEM: You just completed a multi-step task with multiple tool " ++
+                        .content = try self.allocator.dupe(u8, "SYSTEM: You just completed a multi-step task with multiple tool " ++
                             "calls. If this procedure could be useful in the future, consider " ++
                             "saving it as a reusable skill file (SKILL.md) in the workspace. " ++
                             "Only do this if the procedure is genuinely reusable — not for " ++
@@ -2785,7 +2864,10 @@ pub const Agent = struct {
             if (recent_call_idx >= LOOP_WINDOW) {
                 var all_same = true;
                 for (recent_call_hashes) |hv| {
-                    if (hv != call_set_hash) { all_same = false; break; }
+                    if (hv != call_set_hash) {
+                        all_same = false;
+                        break;
+                    }
                 }
                 if (all_same) {
                     loop_detected = true;
@@ -2815,6 +2897,30 @@ pub const Agent = struct {
                 if (used_parallel_dispatch) "parallel" else "serial",
                 parsed_calls.len,
             });
+
+            if (self.pending_tool_approval) |pending| {
+                try self.appendPendingApprovalToolHistory(arena, results_buf.items);
+                const approval_text = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Approval required for tool {s} (id={d}, risk={s}, reason={s}). Use /approve {d} allow-once|deny",
+                    .{
+                        pending.tool_name,
+                        pending.id,
+                        pending.risk_level.toSlice(),
+                        pending.reason,
+                        pending.id,
+                    },
+                );
+                errdefer self.allocator.free(approval_text);
+
+                try self.history.append(self.allocator, .{
+                    .role = .assistant,
+                    .content = try self.allocator.dupe(u8, approval_text),
+                });
+
+                self.freeResponseFields(&response);
+                return approval_text;
+            }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
             const reflect_start_ms = std.time.milliTimestamp();
@@ -2990,18 +3096,6 @@ pub const Agent = struct {
     }
 
     fn executeToolUnchecked(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
-        if (std.mem.eql(u8, call.name, tools_mod.message.MessageTool.tool_name)) {
-            const turn_ctx = tools_mod.getTurnContext();
-            if (tools_mod.isBackgroundTurnOrigin(turn_ctx.origin) and self.send_mode == .off) {
-                return .{
-                    .name = call.name,
-                    .output = "Proactive sends are disabled (send_mode=off)",
-                    .success = false,
-                    .tool_call_id = call.tool_call_id,
-                };
-            }
-        }
-
         for (self.tools) |t| {
             if (std.mem.eql(u8, t.name(), call.name)) {
                 // Parse arguments JSON to ObjectMap ONCE
@@ -3041,15 +3135,6 @@ pub const Agent = struct {
                             .tool_call_id = call.tool_call_id,
                         };
                     }
-                }
-
-                if (tools_mod.toolBlockedForCurrentTurn(call.name, args)) |msg| {
-                    return .{
-                        .name = call.name,
-                        .output = msg,
-                        .success = false,
-                        .tool_call_id = call.tool_call_id,
-                    };
                 }
 
                 const result = t.execute(tool_allocator, args) catch |err| {
@@ -6524,8 +6609,9 @@ test "preflight allows read-only tools in plan mode" {
 
     agent.execution_mode = .plan;
     const read_only_tools = [_][]const u8{
-        "runtime_info", "file_read", "memory_recall", "memory_list",
-        "memory_timeline", "web_fetch", "web_search", "task_list", "task_get",
+        "runtime_info",    "file_read", "memory_recall", "memory_list",
+        "memory_timeline", "web_fetch", "web_search",    "task_list",
+        "task_get",
     };
     for (read_only_tools) |name| {
         const call = ParsedToolCall{ .name = name, .arguments_json = "{}", .tool_call_id = null };
@@ -6544,8 +6630,8 @@ test "preflight blocks mutating tools in plan mode" {
     // (Action-dependent tools are covered by the "still blocks mutating
     // sub-actions" test — they need concrete args to remain mutating.)
     const mutating_tools = [_][]const u8{
-        "shell",        "file_write", "file_edit", "memory_store",
-        "delegate",     "spawn",      "message",
+        "shell",    "file_write", "file_edit", "memory_store",
+        "delegate", "spawn",      "message",
     };
     for (mutating_tools) |name| {
         const call = ParsedToolCall{ .name = name, .arguments_json = "{}", .tool_call_id = null };
@@ -8228,6 +8314,47 @@ test "approval gate: operator-only tool denies under supervised" {
     );
 }
 
+test "canonical policy boundary: preflight and SecurityPolicy.resolveApproval agree for known tools" {
+    // Parity regression: the /permissions report path calls
+    // `pol.resolveApproval(canonical_meta)` and the preflight path calls
+    // `resolveApprovalGateOutcome(meta, autonomy)`. Both must see identical
+    // metadata and resolve to identical verdicts — if the empty-registry
+    // drift returns, this test breaks.
+    const allocator = std.testing.allocator;
+    const pol = SecurityPolicy{ .autonomy = .supervised };
+
+    // file_read: declared read_only in the default registry.
+    {
+        const meta = tools_mod.canonicalMetadataForCall(allocator, "file_read", "{}");
+        try std.testing.expect(meta.flags.read_only);
+        try std.testing.expectEqual(ApprovalPolicy.auto_approve, pol.resolveApproval(meta));
+        try std.testing.expectEqual(Agent.ApprovalGateOutcome.allow, Agent.resolveApprovalGateOutcome(meta, pol.autonomy));
+    }
+
+    // shell: declared mutating in the default registry.
+    {
+        const meta = tools_mod.canonicalMetadataForCall(allocator, "shell", "{}");
+        try std.testing.expect(meta.flags.mutating);
+        try std.testing.expectEqual(ApprovalPolicy.confirm_once, pol.resolveApproval(meta));
+        try std.testing.expectEqual(Agent.ApprovalGateOutcome.require_confirm, Agent.resolveApprovalGateOutcome(meta, pol.autonomy));
+    }
+
+    // schedule.list: refined from mutating → read_only by args-aware path.
+    {
+        const meta = tools_mod.canonicalMetadataForCall(allocator, "schedule", "{\"action\":\"list\"}");
+        try std.testing.expect(meta.flags.read_only);
+        try std.testing.expectEqual(ApprovalPolicy.auto_approve, pol.resolveApproval(meta));
+        try std.testing.expectEqual(Agent.ApprovalGateOutcome.allow, Agent.resolveApprovalGateOutcome(meta, pol.autonomy));
+    }
+
+    // unknown tool: must stay conservative (confirm_once under supervised).
+    {
+        const meta = tools_mod.canonicalMetadataForCall(allocator, "mcp_unknown", "{}");
+        try std.testing.expect(meta.flags.mutating);
+        try std.testing.expectEqual(ApprovalPolicy.confirm_once, pol.resolveApproval(meta));
+    }
+}
+
 test "approval gate: full autonomy allows mutating without approval" {
     const allocator = std.testing.allocator;
     var noop = observability.NoopObserver{};
@@ -8311,6 +8438,43 @@ const EchoTool = struct {
     }
 };
 
+const StaticFailTool = struct {
+    pub const tool_name = "test_static_fail_tool";
+    pub const tool_description = "Test tool with a static failure";
+    pub const tool_params = "{}";
+    pub const vtable = tools_mod.ToolVTable(@This());
+
+    pub fn tool(self: *@This()) tools_mod.Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(self: *@This(), _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        _ = self;
+        return tools_mod.ToolResult.fail("static failure");
+    }
+};
+
+const CountingRuntimeInfoTool = struct {
+    call_count: usize = 0,
+
+    pub const tool_name = "runtime_info";
+    pub const tool_description = "Test runtime_info tool";
+    pub const tool_params = "{}";
+    pub const vtable = tools_mod.ToolVTable(@This());
+
+    pub fn tool(self: *@This()) tools_mod.Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(self: *@This(), allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        self.call_count += 1;
+        return .{
+            .success = true,
+            .output = try allocator.dupe(u8, "runtime-info"),
+        };
+    }
+};
+
 test "/approve allow-once executes pending tool exactly once" {
     const allocator = std.testing.allocator;
     var noop = observability.NoopObserver{};
@@ -8354,6 +8518,48 @@ test "/approve allow-once executes pending tool exactly once" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "success=true") != null);
     try std.testing.expect(agent.pending_tool_approval == null);
     try std.testing.expect(!agent.approval_bypass_active);
+}
+
+test "/approve allow-once handles static failure output without freeing literals" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var fail_impl = StaticFailTool{};
+    const fail_tool = fail_impl.tool();
+    const tools_arr = [_]Tool{fail_tool};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = tools_arr[0..],
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer agent.deinit();
+
+    const call = ParsedToolCall{
+        .name = "test_static_fail_tool",
+        .arguments_json = "{}",
+        .tool_call_id = null,
+    };
+    const preflight = agent.preflightToolPolicy(call);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.approval_required, preflight.blocked.source);
+    try std.testing.expect(agent.pending_tool_approval != null);
+
+    const resp = (try agent.handleSlashCommand("/approve allow-once")).?;
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "success=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "static failure") != null);
+    try std.testing.expect(agent.pending_tool_approval == null);
 }
 
 test "approval gate does not consume budget until allow-once executes the tool" {
@@ -8410,6 +8616,277 @@ test "approval gate does not consume budget until allow-once executes the tool" 
     try std.testing.expect(second == .blocked);
     try std.testing.expectEqual(Agent.ToolPreflightSource.action_budget, second.blocked.source);
     try std.testing.expect(agent.pending_tool_approval == null);
+}
+
+test "approval-required tool stops serial dispatch before later safe tools run" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var echo_impl = EchoTool{};
+    var runtime_impl = CountingRuntimeInfoTool{};
+    const tools_arr = [_]Tool{ echo_impl.tool(), runtime_impl.tool() };
+    var tracker = RateTracker.init(allocator, 1);
+    defer tracker.deinit();
+    const policy = SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .max_actions_per_hour = 1,
+        .tracker = &tracker,
+    };
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = tools_arr[0..],
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer agent.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const calls = [_]ParsedToolCall{
+        .{
+            .name = "test_echo_tool",
+            .arguments_json = "{\"value\":\"hello\"}",
+            .tool_call_id = "call-1",
+        },
+        .{
+            .name = "runtime_info",
+            .arguments_json = "{}",
+            .tool_call_id = "call-2",
+        },
+    };
+    var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
+    defer results_buf.deinit(allocator);
+    try results_buf.ensureTotalCapacity(allocator, calls.len);
+    try agent.executeToolCallsSerial(arena.allocator(), 0, calls[0..], &results_buf);
+
+    try std.testing.expectEqual(@as(usize, 1), results_buf.items.len);
+    try std.testing.expect(agent.pending_tool_approval != null);
+    try std.testing.expect(std.mem.indexOf(u8, results_buf.items[0].output, "Approval required") != null);
+    try std.testing.expectEqual(@as(usize, 0), tracker.count());
+    try std.testing.expectEqual(@as(usize, 0), runtime_impl.call_count);
+}
+
+test "turn returns approval prompt without another provider roundtrip" {
+    const ApprovalPendingProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-approval"),
+                    .name = try allocator.dupe(u8, "test_echo_tool"),
+                    .arguments = try allocator.dupe(u8, "{\"value\":\"hello\"}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "running"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "approval-pending-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = ApprovalPendingProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ApprovalPendingProvider.chatWithSystem,
+        .chat = ApprovalPendingProvider.chat,
+        .supportsNativeTools = ApprovalPendingProvider.supportsNativeTools,
+        .getName = ApprovalPendingProvider.getName,
+        .deinit = ApprovalPendingProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var echo_impl = EchoTool{};
+    const tool_list = [_]Tool{echo_impl.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{
+            .name = tool.name(),
+            .description = tool.description(),
+            .parameters_json = tool.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run tool");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Approval required for tool test_echo_tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/approve 1 allow-once|deny") != null);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+    try std.testing.expect(agent.pending_tool_approval != null);
+}
+
+test "turn preserves prior tool results in history before approval prompt" {
+    const ApprovalAfterSafeToolProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            const tool_calls = try allocator.alloc(providers.ToolCall, 2);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "call-safe"),
+                .name = try allocator.dupe(u8, "runtime_info"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            tool_calls[1] = .{
+                .id = try allocator.dupe(u8, "call-approval"),
+                .name = try allocator.dupe(u8, "test_echo_tool"),
+                .arguments = try allocator.dupe(u8, "{\"value\":\"hello\"}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "running"),
+                .tool_calls = tool_calls,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "approval-after-safe-tool-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = ApprovalAfterSafeToolProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ApprovalAfterSafeToolProvider.chatWithSystem,
+        .chat = ApprovalAfterSafeToolProvider.chat,
+        .supportsNativeTools = ApprovalAfterSafeToolProvider.supportsNativeTools,
+        .getName = ApprovalAfterSafeToolProvider.getName,
+        .deinit = ApprovalAfterSafeToolProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var echo_impl = EchoTool{};
+    var runtime_impl = CountingRuntimeInfoTool{};
+    const tool_list = [_]Tool{ runtime_impl.tool(), echo_impl.tool() };
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{
+            .name = tool.name(),
+            .description = tool.description(),
+            .parameters_json = tool.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run tool");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Approval required for tool test_echo_tool") != null);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), runtime_impl.call_count);
+    try std.testing.expect(agent.history.items.len >= 2);
+
+    const tool_history = agent.history.items[agent.history.items.len - 2];
+    try std.testing.expectEqual(providers.Role.user, tool_history.role);
+    try std.testing.expect(std.mem.indexOf(u8, tool_history.content, "runtime-info") != null);
+
+    const approval_history = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expectEqual(providers.Role.assistant, approval_history.role);
+    try std.testing.expect(std.mem.indexOf(u8, approval_history.content, "Approval required for tool test_echo_tool") != null);
 }
 
 test "approval gate checks exhausted budget before registering pending approval" {
@@ -8700,7 +9177,9 @@ test "/permissions without policy reports not-configured and exec posture" {
     defer allocator.free(resp);
 
     try std.testing.expect(std.mem.indexOf(u8, resp, "not configured") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "Exec posture:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Gate 1 — Execution mode:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Gate 2 — Generic tool approval:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Gate 3 — Legacy shell /exec:") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "host:") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "security:") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "ask:") != null);
@@ -8829,6 +9308,7 @@ test "/perm alias returns same class of report as /permissions" {
     try std.testing.expect(std.mem.startsWith(u8, long_form, "Permissions (read-only report)"));
     try std.testing.expect(std.mem.startsWith(u8, alias_form, "Permissions (read-only report)"));
     try std.testing.expect(std.mem.indexOf(u8, alias_form, "autonomy: supervised") != null);
-    try std.testing.expect(std.mem.indexOf(u8, alias_form, "Exec posture:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, alias_form, "Approval rules for built-in tools:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alias_form, "Gate 1 — Execution mode:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alias_form, "Gate 2 — Generic tool approval:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alias_form, "Gate 3 — Legacy shell /exec:") != null);
 }

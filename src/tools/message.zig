@@ -98,10 +98,12 @@ pub const MessageTool = struct {
         var resolved_telegram: ?runtime_resolver.DeliveryResolvedContext = null;
         defer if (resolved_telegram) |*ctx| ctx.deinit(allocator);
         const tenant_ctx = root.getTenantContext();
-        const can_direct_telegram = tenant_ctx.state_mgr != null and tenant_ctx.numeric_user_id != null;
+        const has_postgres_tenant = tenant_ctx.state_mgr != null and tenant_ctx.numeric_user_id != null;
+        const has_file_tenant = tenant_ctx.user_root != null;
+        const can_direct_telegram = has_postgres_tenant or has_file_tenant;
 
         if (is_telegram_channel and (is_background_origin or can_direct_telegram)) {
-            if (tenant_ctx.expect_postgres_state and (tenant_ctx.state_mgr == null or tenant_ctx.numeric_user_id == null)) {
+            if (tenant_ctx.expect_postgres_state and !has_postgres_tenant and !has_file_tenant) {
                 return ToolResult.fail("Telegram context is incomplete for background send");
             }
 
@@ -112,6 +114,7 @@ pub const MessageTool = struct {
                     .numeric_user_id = tenant_ctx.numeric_user_id,
                     .expect_postgres_state = tenant_ctx.expect_postgres_state,
                 },
+                .user_root = tenant_ctx.user_root,
                 .target_hint = chat_id_opt,
             }) catch blk: {
                 if (is_background_origin) {
@@ -218,18 +221,19 @@ pub const MessageTool = struct {
         requested_chat_id: ?[]const u8,
     ) ToolResult {
         const tenant_ctx = root.getTenantContext();
-        const state_mgr = tenant_ctx.state_mgr orelse
-            return ToolResult.fail("Telegram direct send unavailable: no tenant state");
-        const user_id = tenant_ctx.numeric_user_id orelse
-            return ToolResult.fail("Telegram direct send unavailable: no tenant user");
+        const has_postgres_tenant = tenant_ctx.state_mgr != null and tenant_ctx.numeric_user_id != null;
+        if (!has_postgres_tenant and tenant_ctx.user_root == null) {
+            return ToolResult.fail("Telegram direct send unavailable: no tenant state or user_root");
+        }
 
         var resolved = runtime_resolver.resolveRuntimeDeliveryContext(allocator, .{
             .channel = "telegram",
             .tenant_ctx = .{
-                .state_mgr = state_mgr,
-                .numeric_user_id = user_id,
+                .state_mgr = tenant_ctx.state_mgr,
+                .numeric_user_id = tenant_ctx.numeric_user_id,
                 .expect_postgres_state = tenant_ctx.expect_postgres_state,
             },
+            .user_root = tenant_ctx.user_root,
             .account_id_hint = requested_account_id,
             .target_hint = requested_chat_id,
         }) catch return ToolResult.fail("Failed to resolve Telegram runtime context");

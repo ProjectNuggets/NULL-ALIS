@@ -54,6 +54,7 @@ const channel_dispatch = @import("channels/dispatch.zig");
 const bus_mod = @import("bus.zig");
 const tasks_mod = @import("tasks/root.zig");
 const usage_runtime_mod = @import("usage_runtime.zig");
+const run_trace_store_mod = @import("run_trace_store.zig");
 const gateway_run_events = @import("gateway_run_events.zig");
 const channel_health_mod = @import("channel_health.zig");
 const security_review_mod = @import("security_review.zig");
@@ -360,23 +361,38 @@ fn appendSubagentCompletionToGatewaySession(
     var origin = try router.session_mgr.captureOriginSnapshot(session_key);
     defer origin.deinit(router.session_mgr.allocator);
 
-    try router.session_mgr.appendAssistantMessage(session_key, content);
-    const completion_event_id = try router.session_mgr.saveCompletionEvent(session_key, origin.channel, origin.account_id, origin.chat_id, content);
+    // Canonical delivery key. For zaki_app, the UI surfaces a single per-user
+    // chat — the `:main` lane. Thread / task / cron lanes are internal
+    // execution lanes, not UI surfaces, so a completion that lands on a
+    // non-main lane would be invisible to the user (no SSE subscriber watches
+    // execution lanes). Redirect to `:main` so completions always reach the
+    // main chat. For every other channel the session_key is already the
+    // user-visible destination — leave it alone.
+    var main_key_buf: [256]u8 = undefined;
+    const is_zaki_app = if (origin.channel) |channel_name|
+        std.mem.eql(u8, channel_name, "zaki_app")
+    else
+        false;
+    const delivery_key: []const u8 = if (is_zaki_app) blk: {
+        const user_id = zaki_session.parseUserIdFromSessionKey(session_key) orelse break :blk session_key;
+        break :blk zaki_session.userMainSessionKey(&main_key_buf, user_id);
+    } else session_key;
+
+    try router.session_mgr.appendAssistantMessage(delivery_key, content);
+    const completion_event_id = try router.session_mgr.saveCompletionEvent(delivery_key, origin.channel, origin.account_id, origin.chat_id, content);
     defer if (completion_event_id) |value| router.session_mgr.allocator.free(value);
 
-    if (origin.channel) |channel_name| {
-        if (std.mem.eql(u8, channel_name, "zaki_app")) {
-            if (completion_event_id) |event_id| {
-                const user_scope = zaki_session.parseUserIdFromSessionKey(session_key) orelse "";
-                _ = router.state.app_event_subscribers.publish(event_id, user_scope, session_key, content) catch false;
-            }
-            return;
+    if (is_zaki_app) {
+        if (completion_event_id) |event_id| {
+            const user_scope = zaki_session.parseUserIdFromSessionKey(delivery_key) orelse "";
+            _ = router.state.app_event_subscribers.publish(event_id, user_scope, delivery_key, content) catch false;
         }
+        return;
     }
 
     if (!shouldEmitSubagentCompletionOutbound(origin.channel, origin.chat_id)) return;
 
-    const user_id = zaki_session.parseUserIdFromSessionKey(session_key);
+    const user_id = zaki_session.parseUserIdFromSessionKey(delivery_key);
     const source_tag = if (completion_event_id) |event_id|
         try std.fmt.allocPrint(router.session_mgr.allocator, "subagent_completion:{s}", .{event_id})
     else
@@ -1054,9 +1070,10 @@ const TenantRuntime = struct {
     task_ledger: *tasks_mod.TaskLedger,
     task_delivery: *tasks_mod.TaskDelivery,
     usage_rt: *usage_runtime_mod.UsageRuntime,
+    trace_store: *run_trace_store_mod.RunTraceStore,
     log_obs: *observability.LogObserver,
     metrics_obs: LifecycleMetricsObserver,
-    observer_slots: [2]Observer,
+    observer_slots: [3]Observer,
     observer_multi: observability.MultiObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: std.atomic.Value(i64),
@@ -1125,6 +1142,7 @@ const TenantRuntime = struct {
             .task_ledger = undefined,
             .task_delivery = undefined,
             .usage_rt = undefined,
+            .trace_store = undefined,
             .log_obs = undefined,
             .metrics_obs = .{ .metrics = lifecycle_metrics },
             .observer_slots = undefined,
@@ -1290,9 +1308,23 @@ const TenantRuntime = struct {
         errdefer allocator.destroy(log_obs);
         log_obs.* = .{};
         runtime.log_obs = log_obs;
+
+        // Bounded in-process run-trace store (WP4.1). Attached to the
+        // observer chain so any event with a run_id is recorded as a
+        // sanitized summary for later read-only inspection via WP4.2.
+        const trace_store = try allocator.create(run_trace_store_mod.RunTraceStore);
+        errdefer allocator.destroy(trace_store);
+        trace_store.* = run_trace_store_mod.RunTraceStore.init(
+            allocator,
+            run_trace_store_mod.DEFAULT_MAX_RUNS,
+            run_trace_store_mod.DEFAULT_MAX_EVENTS_PER_RUN,
+        );
+        runtime.trace_store = trace_store;
+
         runtime.observer_slots = .{
             runtime.log_obs.observer(),
             runtime.metrics_obs.observer(),
+            runtime.trace_store.observer(),
         };
         runtime.observer_multi = .{ .observers = runtime.observer_slots[0..] };
 
@@ -1450,6 +1482,8 @@ const TenantRuntime = struct {
         if (self.sec_tracker) |*tracker| tracker.deinit();
         self.usage_rt.deinit();
         self.allocator.destroy(self.usage_rt);
+        self.trace_store.deinit();
+        self.allocator.destroy(self.trace_store);
         self.task_ledger.deinit();
         self.allocator.destroy(self.task_delivery);
         self.allocator.destroy(self.task_ledger);
@@ -9144,6 +9178,107 @@ fn handleTaskGet(
     return finalizeJsonBuf(allocator, &out);
 }
 
+// ── Task stop endpoint (WP2.5) ────────────────────────────────────────
+// POST /api/v1/users/{user_id}/tasks/{task_id}/stop
+//
+// Queued-only REST cancellation. Semantics mirror the in-chat `task_stop`
+// tool: the canonical SubagentManager.cancelQueued is the only mutation
+// path. Running tasks cannot be interrupted in v0.1 — 409 is returned
+// rather than pretending to kill a running task. The route never
+// materializes a tenant runtime on demand; missing runtime/manager → 404.
+
+/// Parse a canonical task id of the form `task_<11 lowercase hex digits>`
+/// into the numeric SubagentManager id. Returns null for any malformed
+/// input (wrong prefix, wrong length, non-hex char, uppercase hex).
+fn parseCanonicalTaskId(task_id: []const u8) ?u64 {
+    const prefix = "task_";
+    if (task_id.len != tasks_mod.ledger.TASK_ID_LEN) return null;
+    if (!std.mem.startsWith(u8, task_id, prefix)) return null;
+    const hex = task_id[prefix.len..];
+    if (hex.len != tasks_mod.ledger.TASK_ID_LEN - prefix.len) return null;
+    for (hex) |c| {
+        const is_digit = c >= '0' and c <= '9';
+        const is_lower_hex = c >= 'a' and c <= 'f';
+        if (!is_digit and !is_lower_hex) return null;
+    }
+    return std.fmt.parseInt(u64, hex, 16) catch null;
+}
+
+fn handleTaskStop(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    task_id: []const u8,
+    subagent_manager_opt: ?*subagent_mod.SubagentManager,
+    delivery_opt: ?*tasks_mod.TaskDelivery,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+
+    // Input validation mirrors handleTaskGet: non-empty, bounded, no
+    // control chars or slashes. Keeps the surface consistent across
+    // the three task endpoints.
+    if (task_id.len == 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing task_id\"}" };
+    }
+    if (task_id.len > 64) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"task_id too long\"}" };
+    }
+    for (task_id) |c| {
+        if (c < 0x20 or c == 0x7f or c == '/') {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid task_id\"}" };
+        }
+    }
+
+    const numeric_id = parseCanonicalTaskId(task_id) orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"malformed task_id\"}" };
+    };
+
+    // No subagent manager materialized for this tenant yet → the task
+    // cannot exist as far as this route is concerned. We never create
+    // a runtime on demand to answer a stop request.
+    const mgr = subagent_manager_opt orelse {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"task_not_found\"}" };
+    };
+
+    const outcome = mgr.cancelQueued(numeric_id);
+    switch (outcome) {
+        .cancelled => {
+            // Prefer the updated canonical TaskRecord snapshot so
+            // clients see timestamps + full entry shape. Fallback to a
+            // minimal payload if the delivery mirror is not attached.
+            if (delivery_opt) |delivery| {
+                if (delivery.getTaskSnapshot(task_id)) |snap| {
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    defer out.deinit(allocator);
+                    const w = out.writer(allocator);
+                    serializeTaskEntryJson(w, &snap) catch return response_build_err;
+                    return finalizeJsonBuf(allocator, &out);
+                }
+            }
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(allocator);
+            const w = out.writer(allocator);
+            w.writeAll("{\"task_id\":\"") catch return response_build_err;
+            jsonEscapeInto(w, task_id) catch return response_build_err;
+            w.writeAll("\",\"status\":\"cancelled\"}") catch return response_build_err;
+            return finalizeJsonBuf(allocator, &out);
+        },
+        .running => return .{
+            .status = "409 Conflict",
+            .body = "{\"error\":\"task_running\",\"message\":\"running tasks cannot be interrupted in v0.1\"}",
+        },
+        .terminal => return .{
+            .status = "409 Conflict",
+            .body = "{\"error\":\"task_terminal\",\"message\":\"task already terminal\"}",
+        },
+        .not_found => return .{
+            .status = "404 Not Found",
+            .body = "{\"error\":\"task_not_found\"}",
+        },
+    }
+}
+
 // ── Usage read-only endpoint (WP2.3) ──────────────────────────────────
 // GET /api/v1/users/{user_id}/usage returns a snapshot of UsageRuntime
 // for the user. It is READ-ONLY: it never materializes a tenant runtime
@@ -9205,6 +9340,159 @@ fn handleUserUsage(
     defer out.deinit(allocator);
     const w = out.writer(allocator);
     serializeUsageReportJson(w, &rpt) catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+// ── Run trace read-only endpoints (WP4.2) ─────────────────────────────
+// GET /api/v1/users/{user_id}/traces            → list of run ids
+// GET /api/v1/users/{user_id}/traces/{run_id}   → sanitized event timeline
+//
+// Mirrors the usage/task read contract: the route never materializes a
+// tenant runtime on demand. Missing runtime → empty list for the
+// collection; 404 for a specific run. Run ids are validated the same
+// way task_ids are: non-empty, bounded length, no control chars or
+// slashes. Only sanitized fields already exposed over SSE are
+// serialized — no provider API details, no raw tool payloads.
+
+fn isValidRunId(run_id: []const u8) bool {
+    if (run_id.len == 0 or run_id.len > 128) return false;
+    for (run_id) |c| {
+        if (c < 0x20 or c == 0x7f or c == '/') return false;
+    }
+    return true;
+}
+
+fn serializeTraceEventJson(
+    w: anytype,
+    evt: *const run_trace_store_mod.TraceEvent,
+) !void {
+    try w.writeAll("{\"kind\":\"");
+    try jsonEscapeInto(w, evt.kind.toSlice());
+    try w.print("\",\"ts_ms\":{d}", .{evt.ts_ms});
+    if (evt.phase) |v| {
+        try w.writeAll(",\"phase\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.tool) |v| {
+        try w.writeAll(",\"tool\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.tool_use_id) |v| {
+        try w.writeAll(",\"tool_use_id\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.label) |v| {
+        try w.writeAll(",\"label\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.risk_level) |v| {
+        try w.writeAll(",\"risk_level\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.status) |v| {
+        try w.writeAll(",\"status\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.task_id) |v| {
+        try w.writeAll(",\"task_id\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.success) |v| try w.print(",\"success\":{s}", .{if (v) "true" else "false"});
+    if (evt.duration_ms) |v| try w.print(",\"duration_ms\":{d}", .{v});
+    if (evt.iteration) |v| try w.print(",\"iteration\":{d}", .{v});
+    if (evt.exit_code) |v| try w.print(",\"exit_code\":{d}", .{v});
+    if (evt.usage_tokens) |v| try w.print(",\"usage_tokens\":{d}", .{v});
+    try w.writeAll("}");
+}
+
+fn handleTraceList(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    store_opt: ?*run_trace_store_mod.RunTraceStore,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    const store = store_opt orelse return .{ .body = "{\"traces\":[]}" };
+
+    var index = store.listRuns(allocator) catch return response_build_err;
+    defer index.deinit();
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"traces\":[") catch return response_build_err;
+    for (index.entries, 0..) |entry, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        w.writeAll("{\"run_id\":\"") catch return response_build_err;
+        jsonEscapeInto(w, entry.run_id) catch return response_build_err;
+        w.print(
+            "\",\"event_count\":{d},\"first_event_ms\":{d},\"last_event_ms\":{d},\"truncated\":{s}}}",
+            .{
+                entry.event_count,
+                entry.first_event_ms,
+                entry.last_event_ms,
+                if (entry.truncated) "true" else "false",
+            },
+        ) catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn handleTraceGet(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    run_id: []const u8,
+    store_opt: ?*run_trace_store_mod.RunTraceStore,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    if (run_id.len == 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing run_id\"}" };
+    }
+    if (!isValidRunId(run_id)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid run_id\"}" };
+    }
+
+    const store = store_opt orelse return .{
+        .status = "404 Not Found",
+        .body = "{\"error\":\"run_not_found\"}",
+    };
+
+    const snap_opt = store.snapshotRun(allocator, run_id) catch return response_build_err;
+    var snap = snap_opt orelse return .{
+        .status = "404 Not Found",
+        .body = "{\"error\":\"run_not_found\"}",
+    };
+    defer snap.deinit();
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"run_id\":\"") catch return response_build_err;
+    jsonEscapeInto(w, snap.run_id) catch return response_build_err;
+    w.print(
+        "\",\"first_event_ms\":{d},\"last_event_ms\":{d},\"truncated\":{s},\"events\":[",
+        .{
+            snap.first_event_ms,
+            snap.last_event_ms,
+            if (snap.truncated) "true" else "false",
+        },
+    ) catch return response_build_err;
+    for (snap.events, 0..) |*evt, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        serializeTraceEventJson(w, evt) catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
     return finalizeJsonBuf(allocator, &out);
 }
 
@@ -10863,18 +11151,41 @@ fn handleApiRoute(
     // We do NOT materialize a runtime on demand — a GET that arrives before
     // any agent work has happened for this user simply sees no tasks.
     if (std.mem.eql(u8, parsed.subpath, "tasks") or std.mem.startsWith(u8, parsed.subpath, "tasks/")) {
-        const effective_task_delivery: ?*tasks_mod.TaskDelivery = blk: {
+        // Look up both task_delivery and subagent_manager under a single
+        // tenant_runtime_mutex acquisition, then release the mutex before
+        // invoking cancelQueued (which takes manager-internal locks and,
+        // for the cancelled path, delivery-internal locks). This avoids
+        // lock-order inversion with the maintenance/prune path while
+        // preserving the "no runtime materialization on demand" invariant
+        // of WP2.2/WP2.3.
+        var effective_task_delivery: ?*tasks_mod.TaskDelivery = null;
+        var effective_subagent_mgr: ?*subagent_mod.SubagentManager = null;
+        {
             state.tenant_runtime_mutex.lock();
             defer state.tenant_runtime_mutex.unlock();
             if (state.tenant_runtimes.get(scoped_user_id)) |runtime| {
-                break :blk runtime.task_delivery;
+                effective_task_delivery = runtime.task_delivery;
+                effective_subagent_mgr = runtime.subagent_manager;
             }
-            break :blk null;
-        };
+        }
         if (std.mem.eql(u8, parsed.subpath, "tasks")) {
             return handleTaskList(req_allocator, method, effective_task_delivery);
         }
         const rest = parsed.subpath["tasks/".len..];
+        // Route /tasks/{task_id}/stop BEFORE the generic /tasks/{task_id}
+        // GET so a canonical id that happens to end with `/stop` style
+        // sub-path is dispatched to the stop handler (WP2.5).
+        const stop_suffix = "/stop";
+        if (rest.len > stop_suffix.len and std.mem.endsWith(u8, rest, stop_suffix)) {
+            const stop_task_id = rest[0 .. rest.len - stop_suffix.len];
+            return handleTaskStop(
+                req_allocator,
+                method,
+                stop_task_id,
+                effective_subagent_mgr,
+                effective_task_delivery,
+            );
+        }
         return handleTaskGet(req_allocator, method, rest, effective_task_delivery);
     }
 
@@ -10892,6 +11203,28 @@ fn handleApiRoute(
             break :blk null;
         };
         return handleUserUsage(req_allocator, method, effective_usage_rt);
+    }
+
+    // ── Run trace read-only endpoints (WP4.2) ───────────────────────────
+    // Resolve the per-tenant RunTraceStore without materializing a tenant
+    // runtime on demand. Collection returns empty when no runtime exists;
+    // a specific run_id returns 404.
+    if (std.mem.eql(u8, parsed.subpath, "traces") or
+        std.mem.startsWith(u8, parsed.subpath, "traces/"))
+    {
+        const effective_trace_store: ?*run_trace_store_mod.RunTraceStore = blk: {
+            state.tenant_runtime_mutex.lock();
+            defer state.tenant_runtime_mutex.unlock();
+            if (state.tenant_runtimes.get(scoped_user_id)) |runtime| {
+                break :blk runtime.trace_store;
+            }
+            break :blk null;
+        };
+        if (std.mem.eql(u8, parsed.subpath, "traces")) {
+            return handleTraceList(req_allocator, method, effective_trace_store);
+        }
+        const run_id = parsed.subpath["traces/".len..];
+        return handleTraceGet(req_allocator, method, run_id, effective_trace_store);
     }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"not found\"}" };
@@ -18971,6 +19304,165 @@ test "handleTaskGet returns snapshot JSON for existing task" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, &id) != null);
 }
 
+// ── WP2.5 task stop endpoint tests ───────────────────────────────────
+
+test "parseCanonicalTaskId accepts canonical id" {
+    try std.testing.expectEqual(@as(u64, 42), parseCanonicalTaskId("task_0000000002a").?);
+    try std.testing.expectEqual(@as(u64, 1), parseCanonicalTaskId("task_00000000001").?);
+}
+
+test "parseCanonicalTaskId rejects bad inputs" {
+    try std.testing.expect(parseCanonicalTaskId("") == null);
+    try std.testing.expect(parseCanonicalTaskId("task_") == null);
+    try std.testing.expect(parseCanonicalTaskId("task_XYZ") == null);
+    // Missing prefix
+    try std.testing.expect(parseCanonicalTaskId("0000000000000001") == null);
+    // Uppercase hex not accepted (canonical format is lowercase)
+    try std.testing.expect(parseCanonicalTaskId("task_00000000ABC") == null);
+    // Wrong length
+    try std.testing.expect(parseCanonicalTaskId("task_0000000001") == null);
+    try std.testing.expect(parseCanonicalTaskId("task_000000000001") == null);
+    // Non-hex char in payload
+    try std.testing.expect(parseCanonicalTaskId("task_0000000000g") == null);
+}
+
+const StopTestFixture = struct {
+    tmp: std.testing.TmpDir,
+    workspace: []const u8,
+    cfg: Config,
+    ledger: tasks_mod.TaskLedger,
+    noop: observability.NoopObserver,
+    delivery: tasks_mod.TaskDelivery,
+    mgr: subagent_mod.SubagentManager,
+
+    fn init() !*StopTestFixture {
+        const alloc = std.testing.allocator;
+        const fx = try alloc.create(StopTestFixture);
+        fx.tmp = std.testing.tmpDir(.{});
+        fx.workspace = try fx.tmp.dir.realpathAlloc(alloc, ".");
+        fx.cfg = Config{
+            .workspace_dir = fx.workspace,
+            .config_path = "/tmp/nullalis/config.json",
+            .allocator = alloc,
+        };
+        fx.ledger = tasks_mod.TaskLedger.init(alloc);
+        fx.noop = observability.NoopObserver{};
+        fx.delivery = tasks_mod.TaskDelivery{ .ledger = &fx.ledger, .observer = fx.noop.observer() };
+        fx.mgr = subagent_mod.SubagentManager.init(alloc, &fx.cfg, null, .{});
+        fx.mgr.attachTaskDelivery(&fx.delivery);
+        return fx;
+    }
+
+    fn deinit(fx: *StopTestFixture) void {
+        const alloc = std.testing.allocator;
+        fx.mgr.deinit();
+        fx.ledger.deinit();
+        alloc.free(fx.workspace);
+        fx.tmp.cleanup();
+        alloc.destroy(fx);
+    }
+
+    fn insertTask(fx: *StopTestFixture, numeric_id: u64, status: subagent_mod.TaskStatus) !void {
+        const alloc = std.testing.allocator;
+        const state = try alloc.create(subagent_mod.TaskState);
+        state.* = .{
+            .status = status,
+            .label = try alloc.dupe(u8, "stop-fixture"),
+            .task_summary = try alloc.dupe(u8, "stop fixture summary"),
+            .task_prompt = try alloc.dupe(u8, "stop fixture prompt"),
+            .session_key = try alloc.dupe(u8, "session:stop"),
+            .started_at = std.time.milliTimestamp(),
+            .completed_at = if (status == .completed or status == .failed or status == .cancelled)
+                std.time.milliTimestamp()
+            else
+                null,
+            .result = if (status == .completed) try alloc.dupe(u8, "done") else null,
+        };
+        try fx.mgr.tasks.put(alloc, numeric_id, state);
+        // Mirror into the canonical ledger so getTaskSnapshot sees it.
+        _ = try fx.delivery.createTaskWithNumericId(state.task_summary, state.session_key.?, numeric_id);
+        var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+        const slice = try std.fmt.bufPrint(&id_buf, "task_{x:0>11}", .{numeric_id});
+        if (status == .running) {
+            try fx.delivery.markRunning(slice);
+        } else if (status == .completed) {
+            try fx.delivery.markRunning(slice);
+            try fx.delivery.markSucceeded(slice, "done");
+        }
+    }
+};
+
+test "handleTaskStop rejects non-POST methods" {
+    const resp = handleTaskStop(std.testing.allocator, "GET", "task_00000000001", null, null);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleTaskStop returns 400 for empty task_id" {
+    const resp = handleTaskStop(std.testing.allocator, "POST", "", null, null);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "handleTaskStop returns 400 for malformed task_id" {
+    const resp = handleTaskStop(std.testing.allocator, "POST", "not_a_task_id", null, null);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "handleTaskStop returns 400 for control char in task_id" {
+    const resp = handleTaskStop(std.testing.allocator, "POST", "task_\x01000000001", null, null);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "handleTaskStop returns 404 when no manager resolved" {
+    const resp = handleTaskStop(std.testing.allocator, "POST", "task_00000000001", null, null);
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleTaskStop returns 404 for unknown task id" {
+    const fx = try StopTestFixture.init();
+    defer fx.deinit();
+    const resp = handleTaskStop(std.testing.allocator, "POST", "task_0000000beef", &fx.mgr, &fx.delivery);
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleTaskStop cancels a queued task and returns updated record" {
+    const alloc = std.testing.allocator;
+    const fx = try StopTestFixture.init();
+    defer fx.deinit();
+    try fx.insertTask(7, .queued);
+
+    const resp = handleTaskStop(alloc, "POST", "task_00000000007", &fx.mgr, &fx.delivery);
+    defer alloc.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"cancelled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "task_00000000007") != null);
+    // SubagentManager and canonical ledger should both reflect cancelled.
+    try std.testing.expectEqual(subagent_mod.TaskStatus.cancelled, fx.mgr.getTaskStatus(7).?);
+}
+
+test "handleTaskStop returns 409 for running task and leaves it running" {
+    const alloc = std.testing.allocator;
+    const fx = try StopTestFixture.init();
+    defer fx.deinit();
+    try fx.insertTask(3, .running);
+
+    const resp = handleTaskStop(alloc, "POST", "task_00000000003", &fx.mgr, &fx.delivery);
+    try std.testing.expectEqualStrings("409 Conflict", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "task_running") != null);
+    try std.testing.expectEqual(subagent_mod.TaskStatus.running, fx.mgr.getTaskStatus(3).?);
+}
+
+test "handleTaskStop returns 409 for terminal task" {
+    const alloc = std.testing.allocator;
+    const fx = try StopTestFixture.init();
+    defer fx.deinit();
+    try fx.insertTask(5, .completed);
+
+    const resp = handleTaskStop(alloc, "POST", "task_00000000005", &fx.mgr, &fx.delivery);
+    try std.testing.expectEqualStrings("409 Conflict", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "task_terminal") != null);
+    try std.testing.expectEqual(subagent_mod.TaskStatus.completed, fx.mgr.getTaskStatus(5).?);
+}
+
 // ── WP2.3 usage endpoint tests ───────────────────────────────────────
 
 test "handleUserUsage returns zero summary when no runtime resolved" {
@@ -19039,6 +19531,104 @@ test "handleUserUsage reports cost_available=true when cost accumulated" {
     const resp = handleUserUsage(alloc, "GET", &urt);
     defer alloc.free(resp.body);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"cost_available\":true") != null);
+}
+
+// ── WP4.2 run trace endpoint tests ───────────────────────────────────
+
+test "handleTraceList returns empty list when no runtime resolved" {
+    const resp = handleTraceList(std.testing.allocator, "GET", null);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expectEqualStrings("{\"traces\":[]}", resp.body);
+}
+
+test "handleTraceList rejects non-GET methods" {
+    const resp = handleTraceList(std.testing.allocator, "POST", null);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleTraceList returns chronological run summary" {
+    const alloc = std.testing.allocator;
+    var store = run_trace_store_mod.RunTraceStore.init(alloc, 4, 4);
+    defer store.deinit();
+    const obs = store.observer();
+    const e1 = observability.ObserverEvent{ .turn_stage = .{ .stage = "turn_start", .run_id = "a" } };
+    obs.recordEvent(&e1);
+    std.Thread.sleep(2 * std.time.ns_per_ms);
+    const e2 = observability.ObserverEvent{ .turn_stage = .{ .stage = "turn_start", .run_id = "b" } };
+    obs.recordEvent(&e2);
+
+    const resp = handleTraceList(alloc, "GET", &store);
+    defer alloc.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"run_id\":\"a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"run_id\":\"b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"event_count\":1") != null);
+}
+
+test "handleTraceGet returns 404 when store is null" {
+    const resp = handleTraceGet(std.testing.allocator, "GET", "r-1", null);
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "run_not_found") != null);
+}
+
+test "handleTraceGet returns 404 when run is missing" {
+    const alloc = std.testing.allocator;
+    var store = run_trace_store_mod.RunTraceStore.init(alloc, 2, 2);
+    defer store.deinit();
+    const resp = handleTraceGet(alloc, "GET", "absent", &store);
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleTraceGet rejects malformed run_id" {
+    const resp_empty = handleTraceGet(std.testing.allocator, "GET", "", null);
+    try std.testing.expectEqualStrings("400 Bad Request", resp_empty.status);
+
+    const resp_slash = handleTraceGet(std.testing.allocator, "GET", "a/b", null);
+    try std.testing.expectEqualStrings("400 Bad Request", resp_slash.status);
+
+    const resp_ctrl = handleTraceGet(std.testing.allocator, "GET", "a\nb", null);
+    try std.testing.expectEqualStrings("400 Bad Request", resp_ctrl.status);
+
+    const long_id = "x" ** 129;
+    const resp_long = handleTraceGet(std.testing.allocator, "GET", long_id, null);
+    try std.testing.expectEqualStrings("400 Bad Request", resp_long.status);
+}
+
+test "handleTraceGet returns sanitized events for a known run" {
+    const alloc = std.testing.allocator;
+    var store = run_trace_store_mod.RunTraceStore.init(alloc, 4, 4);
+    defer store.deinit();
+    const obs = store.observer();
+    const start = observability.ObserverEvent{ .tool_call_start = .{
+        .tool = "bash",
+        .tool_use_id = "call_1",
+        .run_id = "r-ok",
+    } };
+    obs.recordEvent(&start);
+    const done = observability.ObserverEvent{ .tool_call = .{
+        .tool = "bash",
+        .success = true,
+        .duration_ms = 9,
+        .tool_use_id = "call_1",
+        .run_id = "r-ok",
+    } };
+    obs.recordEvent(&done);
+
+    const resp = handleTraceGet(alloc, "GET", "r-ok", &store);
+    defer alloc.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"run_id\":\"r-ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"kind\":\"tool_call_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"kind\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"duration_ms\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tool_use_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"truncated\":false") != null);
+}
+
+test "handleTraceGet rejects non-GET methods" {
+    const resp = handleTraceGet(std.testing.allocator, "DELETE", "r-1", null);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
 }
 
 test "validateApproveInput rejects missing body" {
@@ -19463,4 +20053,226 @@ test "handleVoiceSynthesize returns 400 without text field" {
     const resp = handleVoiceSynthesize(std.testing.allocator, "POST", "POST /voice HTTP/1.1\r\n\r\n{\"voice\":\"nova\"}", &cfg);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "missing text") != null);
+}
+
+// ── appendSubagentCompletionToGatewaySession routing tests ──────────────────
+//
+// These tests lock down the single canonical delivery policy:
+//   * zaki_app completions — whatever lane the parent turn ran on — always
+//     land on the user's `:main` lane (the single UI surface per user).
+//   * Non-zaki_app completions stay on the session_key the subagent was
+//     spawned from (that key is already the user-visible destination for
+//     those channels).
+// A regression that re-introduces delivery to an execution lane (thread /
+// task / cron) would leave completions invisible to zaki_app clients — which
+// is the exact bug this routing logic exists to prevent.
+
+fn testGatewayRouterSessionManager(
+    allocator: std.mem.Allocator,
+    mock: *TestMockProvider,
+    cfg: *Config,
+    store: memory_mod.SessionStore,
+) session_mod.SessionManager {
+    cfg.* = .{
+        .workspace_dir = "/tmp/gw_router_test",
+        .config_path = "/tmp/gw_router_test/config.json",
+        .default_model = "test/mock-model",
+        .allocator = allocator,
+    };
+    return session_mod.SessionManager.init(
+        allocator,
+        cfg,
+        mock.provider(),
+        &.{},
+        null,
+        test_noop_observer.observer(),
+        store,
+        null,
+    );
+}
+
+test "appendSubagentCompletionToGatewaySession redirects zaki_app thread completion to user main lane" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var mock = TestMockProvider{};
+    var cfg: Config = undefined;
+    var sm = testGatewayRouterSessionManager(allocator, &mock, &cfg, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+
+    const thread_key = "agent:zaki-bot:user:42:thread:conv-1";
+    const main_key = "agent:zaki-bot:user:42:main";
+
+    const thread_session = try sm.getOrCreate(thread_key);
+    thread_session.origin_channel = try allocator.dupe(u8, "zaki_app");
+
+    var router = SubagentCompletionRouter{
+        .session_mgr = &sm,
+        .event_bus = null,
+        .config = &cfg,
+        .state = &state,
+    };
+
+    try appendSubagentCompletionToGatewaySession(@ptrCast(&router), thread_key, "subagent reply");
+
+    // Main lane got the assistant message; thread lane did not.
+    const main_session = try sm.getOrCreate(main_key);
+    try std.testing.expect(main_session.agent.historyLen() > 0);
+    const last_main = main_session.agent.history.items[main_session.agent.historyLen() - 1];
+    try std.testing.expectEqualStrings("subagent reply", last_main.content);
+
+    // Thread session must not have received the completion.
+    for (thread_session.agent.history.items) |msg| {
+        try std.testing.expect(!std.mem.eql(u8, msg.content, "subagent reply"));
+    }
+
+    // Completion event persisted under main key, not thread key.
+    const main_events = try sm.loadCompletionEvents(main_key);
+    defer memory_mod.freeCompletionEvents(allocator, main_events);
+    try std.testing.expectEqual(@as(usize, 1), main_events.len);
+    try std.testing.expectEqualStrings("subagent reply", main_events[0].content);
+
+    const thread_events = try sm.loadCompletionEvents(thread_key);
+    defer memory_mod.freeCompletionEvents(allocator, thread_events);
+    try std.testing.expectEqual(@as(usize, 0), thread_events.len);
+}
+
+test "appendSubagentCompletionToGatewaySession zaki_app main-lane completion stays on main" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var mock = TestMockProvider{};
+    var cfg: Config = undefined;
+    var sm = testGatewayRouterSessionManager(allocator, &mock, &cfg, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+
+    const main_key = "agent:zaki-bot:user:7:main";
+    const main_session = try sm.getOrCreate(main_key);
+    main_session.origin_channel = try allocator.dupe(u8, "zaki_app");
+
+    var router = SubagentCompletionRouter{
+        .session_mgr = &sm,
+        .event_bus = null,
+        .config = &cfg,
+        .state = &state,
+    };
+
+    try appendSubagentCompletionToGatewaySession(@ptrCast(&router), main_key, "main reply");
+
+    try std.testing.expect(main_session.agent.historyLen() > 0);
+    const last = main_session.agent.history.items[main_session.agent.historyLen() - 1];
+    try std.testing.expectEqualStrings("main reply", last.content);
+
+    const events = try sm.loadCompletionEvents(main_key);
+    defer memory_mod.freeCompletionEvents(allocator, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+}
+
+test "appendSubagentCompletionToGatewaySession non-zaki_app channel keeps original session key" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var mock = TestMockProvider{};
+    var cfg: Config = undefined;
+    var sm = testGatewayRouterSessionManager(allocator, &mock, &cfg, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+
+    const thread_key = "agent:zaki-bot:user:9:thread:tg-room";
+    const main_key = "agent:zaki-bot:user:9:main";
+
+    const thread_session = try sm.getOrCreate(thread_key);
+    thread_session.origin_channel = try allocator.dupe(u8, "telegram");
+    // Leave origin_chat_id null so the outbound dispatch path is skipped —
+    // the redirect-policy assertions don't need a real channel backend.
+
+    var router = SubagentCompletionRouter{
+        .session_mgr = &sm,
+        .event_bus = null,
+        .config = &cfg,
+        .state = &state,
+    };
+
+    try appendSubagentCompletionToGatewaySession(@ptrCast(&router), thread_key, "tg reply");
+
+    // Thread session got the message; main is untouched.
+    try std.testing.expect(thread_session.agent.historyLen() > 0);
+    const last = thread_session.agent.history.items[thread_session.agent.historyLen() - 1];
+    try std.testing.expectEqualStrings("tg reply", last.content);
+
+    const thread_events = try sm.loadCompletionEvents(thread_key);
+    defer memory_mod.freeCompletionEvents(allocator, thread_events);
+    try std.testing.expectEqual(@as(usize, 1), thread_events.len);
+
+    const main_events = try sm.loadCompletionEvents(main_key);
+    defer memory_mod.freeCompletionEvents(allocator, main_events);
+    try std.testing.expectEqual(@as(usize, 0), main_events.len);
+}
+
+test "appendSubagentCompletionToGatewaySession repeated zaki_app completions do not duplicate onto thread" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var mock = TestMockProvider{};
+    var cfg: Config = undefined;
+    var sm = testGatewayRouterSessionManager(allocator, &mock, &cfg, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+
+    const thread_key = "agent:zaki-bot:user:11:thread:abc";
+    const main_key = "agent:zaki-bot:user:11:main";
+
+    const thread_session = try sm.getOrCreate(thread_key);
+    thread_session.origin_channel = try allocator.dupe(u8, "zaki_app");
+
+    var router = SubagentCompletionRouter{
+        .session_mgr = &sm,
+        .event_bus = null,
+        .config = &cfg,
+        .state = &state,
+    };
+
+    try appendSubagentCompletionToGatewaySession(@ptrCast(&router), thread_key, "first");
+    try appendSubagentCompletionToGatewaySession(@ptrCast(&router), thread_key, "second");
+
+    // Thread session must have zero subagent-completion entries — every
+    // call was redirected. A duplicate-delivery regression would surface
+    // one or more "first"/"second" messages here.
+    for (thread_session.agent.history.items) |msg| {
+        try std.testing.expect(!std.mem.eql(u8, msg.content, "first"));
+        try std.testing.expect(!std.mem.eql(u8, msg.content, "second"));
+    }
+
+    // Main session carries exactly two appended assistant messages.
+    const main_session = try sm.getOrCreate(main_key);
+    try std.testing.expectEqual(@as(usize, 2), main_session.agent.historyLen());
+    try std.testing.expectEqualStrings("first", main_session.agent.history.items[0].content);
+    try std.testing.expectEqualStrings("second", main_session.agent.history.items[1].content);
+
+    // And exactly two persisted completion events — on main, none on thread.
+    const main_events = try sm.loadCompletionEvents(main_key);
+    defer memory_mod.freeCompletionEvents(allocator, main_events);
+    try std.testing.expectEqual(@as(usize, 2), main_events.len);
+
+    const thread_events = try sm.loadCompletionEvents(thread_key);
+    defer memory_mod.freeCompletionEvents(allocator, thread_events);
+    try std.testing.expectEqual(@as(usize, 0), thread_events.len);
 }

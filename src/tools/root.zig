@@ -502,6 +502,50 @@ fn isReadOnlyComposioCall(args: JsonObjectMap) bool {
     return isReadOnlyComposioExecute(args);
 }
 
+/// Look up base metadata for a tool by name using the default registry.
+/// Returns a conservative `mutating=true / risk=high` entry when the name is
+/// unknown (MCP/dynamic tools). This is the one-step lookup used by reporting
+/// paths that do not have parsed arguments on hand.
+///
+/// Callers that have `arguments_json` should prefer `canonicalMetadataForCall`
+/// so that args-aware refinement (e.g. `git status` downgrading to read-only)
+/// matches the runtime preflight decision.
+pub fn canonicalMetadataForName(tool_name: []const u8) metadata.ToolMetadata {
+    return metadata.lookupMetadata(tool_name, defaultMetadataRegistry()) orelse
+        metadata.ToolMetadata.conservative(tool_name);
+}
+
+/// Canonical tool-metadata resolver for a specific call (name + arguments).
+///
+/// This is the single source of truth for how a tool invocation maps to
+/// `ToolMetadata` before policy gates consult it. It performs:
+///   1. Registry lookup (`defaultMetadataRegistry`).
+///   2. Conservative fallback for unknown names.
+///   3. Args-aware refinement via `refineMetadata` (downgrades known
+///      read-only dispatch arguments like `schedule.list`, `git status`,
+///      HTTP GET, etc.).
+///
+/// Any runtime gate that classifies tools — agent preflight, `/permissions`
+/// reporting, SecurityPolicy.resolveApproval callers — must route through
+/// this helper (or its name-only counterpart) so they cannot disagree.
+/// Parse failures or non-object payloads fall back to the base metadata,
+/// mirroring the conservative posture of the preflight path.
+pub fn canonicalMetadataForCall(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+) metadata.ToolMetadata {
+    const base = canonicalMetadataForName(tool_name);
+    if (base.flags.read_only) return base;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{}) catch return base;
+    defer parsed.deinit();
+    const args_obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return base,
+    };
+    return refineMetadata(base, args_obj);
+}
+
 /// Downgrade a base metadata entry to read-only when the specific call's
 /// arguments indicate a side-effect-free operation. Returns the base
 /// metadata unchanged when the call is mutating or the tool is not
@@ -745,10 +789,16 @@ pub fn allTools(
         try list.append(allocator, sp.tool());
     }
 
-    if (opts.tool_profile == .main and opts.event_bus != null) {
+    // Always publish the message tool in the main profile; the tool itself
+    // handles bus-less runtimes by falling back to direct-send paths (e.g.
+    // file-mode Telegram via user_root) and reports a clear error when no
+    // delivery path is available. Keeping the tool advertised prevents the
+    // "Unknown tool" experience in local/CLI runtimes where the gateway bus
+    // is not wired in.
+    if (opts.tool_profile == .main) {
         const mt = try allocator.create(message.MessageTool);
         mt.* = .{
-            .event_bus = opts.event_bus.?,
+            .event_bus = opts.event_bus,
             .outbound_allocator = allocator,
         };
         try list.append(allocator, mt.tool());
@@ -877,6 +927,12 @@ pub const ToolTenantContext = struct {
     session_key: ?[]const u8 = null,
     state_mgr: ?*zaki_state.Manager = null,
     expect_postgres_state: bool = false,
+    /// Optional user-scoped filesystem root used by tools that need a
+    /// file-backed fallback for state or secrets (e.g. file-mode Telegram
+    /// direct send reads `<user_root>/channel_state.json` and
+    /// `<user_root>/secrets/telegram_bot_token`). Non-owning; the caller
+    /// owns the underlying buffer for the duration of the turn.
+    user_root: ?[]const u8 = null,
 };
 
 threadlocal var current_tenant_context: ToolTenantContext = .{};
@@ -1034,27 +1090,39 @@ fn isEnsureScheduleAction(args: JsonObjectMap) bool {
 }
 
 pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]const u8 {
+    const registry = defaultMetadataRegistry();
+    const base_meta = metadata.lookupMetadata(tool_name, registry) orelse
+        metadata.ToolMetadata.conservative(tool_name);
+    return toolBlockedForCurrentTurnWithMeta(tool_name, args, base_meta);
+}
+
+/// Metadata-aware variant so callers that already resolved metadata (e.g.
+/// `Agent.preflightToolPolicy`) don't re-lookup. Policy shape:
+///   * Non-background turn origin -> always allow.
+///   * Special-case tools (schedule, composio, message) keep their per-origin
+///     argument-aware rules.
+///   * Otherwise, defer to metadata: `read_only` or `background_safe` -> allow.
+///     Everything else is denied with a listing-style message so a misbehaving
+///     tool author can see which flag would have allowed the call.
+pub fn toolBlockedForCurrentTurnWithMeta(
+    tool_name: []const u8,
+    args: JsonObjectMap,
+    meta: metadata.ToolMetadata,
+) ?[]const u8 {
     const turn_ctx = getTurnContext();
     if (!isBackgroundTurnOrigin(turn_ctx.origin)) return null;
     const policy = backgroundPolicyForOrigin(turn_ctx.origin);
 
-    if (std.mem.eql(u8, tool_name, runtime_info.RuntimeInfoTool.tool_name)) return null;
+    // Tools with argument-aware origin rules.
     if (std.mem.eql(u8, tool_name, schedule.ScheduleTool.tool_name)) {
         if (isReadOnlyScheduleAction(args)) return null;
         if (policy.allow_schedule_ensure and isEnsureScheduleAction(args)) return null;
         return "Background turns may only inspect schedule state; only wake turns may use schedule ensure for canonical reconciliation";
     }
-    if (std.mem.eql(u8, tool_name, file_read.FileReadTool.tool_name)) return null;
-    if (std.mem.eql(u8, tool_name, memory_recall.MemoryRecallTool.tool_name)) return null;
-    if (std.mem.eql(u8, tool_name, memory_list.MemoryListTool.tool_name)) return null;
-    if (std.mem.eql(u8, tool_name, memory_timeline.MemoryTimelineTool.tool_name)) return null;
-    if (std.mem.eql(u8, tool_name, web_search.WebSearchTool.tool_name)) return null;
-    if (std.mem.eql(u8, tool_name, web_fetch.WebFetchTool.tool_name)) return null;
     if (std.mem.eql(u8, tool_name, message.MessageTool.tool_name)) {
         if (policy.allow_message) return null;
         return "Message is disabled for this background turn origin";
     }
-
     if (std.mem.eql(u8, tool_name, composio.ComposioTool.tool_name)) {
         const action = getString(args, "action") orelse "execute";
         if (std.ascii.eqlIgnoreCase(action, "connect")) {
@@ -1071,6 +1139,7 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
         return "Composio action is disabled for background turns";
     }
 
+    // Fast per-origin explicit denials that must never be relaxed via metadata.
     if (std.mem.eql(u8, tool_name, shell.ShellTool.tool_name)) {
         return "Shell is disabled for background turns";
     }
@@ -1080,7 +1149,14 @@ pub fn toolBlockedForCurrentTurn(tool_name: []const u8, args: JsonObjectMap) ?[]
     if (std.mem.eql(u8, tool_name, delegate.DelegateTool.tool_name)) {
         return "Delegate is disabled for background turns";
     }
-    return "Tool is disabled for this background turn; allowed: runtime_info, schedule(read/ensure on wake), file_read, memory_recall, memory_list, memory_timeline, web_search, web_fetch, and proactive-only delivery/integration tools";
+
+    // Metadata-driven default: allow read-only or background_safe tools.
+    // `read_only` is included so tools like grep/glob/cron_list (which are
+    // not yet marked background_safe but are inherently non-mutating) are
+    // not surprise-blocked in background lanes.
+    if (meta.flags.background_safe or meta.flags.read_only) return null;
+
+    return "Tool is disabled for this background turn; mark tool metadata `background_safe` or use schedule(read/ensure on wake), message/composio on proactive turns, or a read-only action";
 }
 
 pub fn bindRuntimeInfoTools(tools: []const Tool) void {
@@ -1427,6 +1503,39 @@ test "background turns block composio write execute" {
     try std.testing.expect(std.mem.indexOf(u8, blocked, "disabled") != null);
 }
 
+test "origin gate honors background_safe metadata for task_list/task_get" {
+    setTurnContext(.{ .origin = .heartbeat });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{}");
+    defer parsed.deinit();
+    try std.testing.expect(toolBlockedForCurrentTurn("task_list", parsed.value.object) == null);
+    try std.testing.expect(toolBlockedForCurrentTurn("task_get", parsed.value.object) == null);
+}
+
+test "origin gate blocks mutating tools lacking background_safe" {
+    setTurnContext(.{ .origin = .heartbeat });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{}");
+    defer parsed.deinit();
+    // pushover is mutating and not background_safe
+    try std.testing.expect(toolBlockedForCurrentTurn("pushover", parsed.value.object) != null);
+    // shell is always explicitly blocked regardless
+    try std.testing.expect(toolBlockedForCurrentTurn("shell", parsed.value.object) != null);
+}
+
+test "origin gate allows read-only tools without background_safe flag" {
+    setTurnContext(.{ .origin = .heartbeat });
+    defer clearTurnContext();
+
+    const parsed = try parseTestArgs("{}");
+    defer parsed.deinit();
+    // cron_list is read_only but not marked background_safe; it still inspects
+    // durable state and is safe to invoke on background turns.
+    try std.testing.expect(toolBlockedForCurrentTurn("cron_list", parsed.value.object) == null);
+}
+
 test "tool result fail" {
     const r = ToolResult.fail("boom");
     try std.testing.expect(!r.success);
@@ -1514,8 +1623,8 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 25 + http_request + web_fetch + web_search + browser = 29
-    try std.testing.expectEqual(@as(usize, 29), tools.len);
+    // base 26 (includes message) + http_request + web_fetch + web_search + browser = 30
+    try std.testing.expectEqual(@as(usize, 30), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -1530,8 +1639,8 @@ test "all tools excludes extras when disabled" {
     // shell + file_read + file_write + file_edit + file_append + git + image_info
     // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + memory_forget + delegate + schedule
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + spawn = 25
-    try std.testing.expectEqual(@as(usize, 25), tools.len);
+    // + runtime_info + skill_registry + spawn + message = 26
+    try std.testing.expectEqual(@as(usize, 26), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2057,6 +2166,53 @@ test "defaultMetadataRegistry unknown tool falls back to conservative" {
     try std.testing.expect(fallback.flags.mutating);
     try std.testing.expect(!fallback.flags.read_only);
     try std.testing.expect(!fallback.flags.background_safe);
+}
+
+test "canonicalMetadataForName resolves known tools via real registry (no empty-slice drift)" {
+    // Regression: `SecurityPolicy.resolveApproval` used to look up metadata in
+    // an empty slice, which forced every known tool to the conservative
+    // (mutating) default. Callers MUST use canonicalMetadataForName instead,
+    // and it MUST read from defaultMetadataRegistry().
+    const read = canonicalMetadataForName("file_read");
+    try std.testing.expect(read.flags.read_only);
+    try std.testing.expect(!read.flags.mutating);
+
+    const mut = canonicalMetadataForName("shell");
+    try std.testing.expect(mut.flags.mutating);
+    try std.testing.expect(!mut.flags.read_only);
+
+    const unk = canonicalMetadataForName("mcp_some_unknown_tool");
+    try std.testing.expect(unk.flags.mutating);
+    try std.testing.expect(!unk.flags.read_only);
+    try std.testing.expectEqual(metadata.RiskLevel.high, unk.risk_level);
+}
+
+test "canonicalMetadataForCall applies args-aware refinement (schedule.list, git status, GET)" {
+    const allocator = std.testing.allocator;
+
+    const sched = canonicalMetadataForCall(allocator, "schedule", "{\"action\":\"list\"}");
+    try std.testing.expect(sched.flags.read_only);
+    try std.testing.expect(!sched.flags.mutating);
+
+    const git_read = canonicalMetadataForCall(allocator, "git_operations", "{\"operation\":\"status\"}");
+    try std.testing.expect(git_read.flags.read_only);
+
+    const git_write = canonicalMetadataForCall(allocator, "git_operations", "{\"operation\":\"commit\"}");
+    try std.testing.expect(git_write.flags.mutating);
+    try std.testing.expect(!git_write.flags.read_only);
+
+    const http_get = canonicalMetadataForCall(allocator, "http_request", "{\"method\":\"GET\"}");
+    try std.testing.expect(http_get.flags.read_only);
+
+    const http_post = canonicalMetadataForCall(allocator, "http_request", "{\"method\":\"POST\"}");
+    try std.testing.expect(http_post.flags.mutating);
+}
+
+test "canonicalMetadataForCall falls back to base metadata on invalid JSON" {
+    const allocator = std.testing.allocator;
+    const bad = canonicalMetadataForCall(allocator, "shell", "not-json");
+    try std.testing.expect(bad.flags.mutating);
+    try std.testing.expect(!bad.flags.read_only);
 }
 
 test {

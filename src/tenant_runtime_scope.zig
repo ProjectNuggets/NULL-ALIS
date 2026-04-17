@@ -10,12 +10,14 @@ pub const ScopedTenantRuntime = struct {
     user_id: ?[]u8 = null,
     numeric_user_id: ?i64 = null,
     workspace_dir: ?[]u8 = null,
+    user_root: ?[]u8 = null,
     state_mgr: ?zaki_state.Manager = null,
     expect_postgres_state: bool = false,
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         if (self.state_mgr) |*mgr| mgr.deinit();
         if (self.workspace_dir) |value| allocator.free(value);
+        if (self.user_root) |value| allocator.free(value);
         if (self.user_id) |value| allocator.free(value);
     }
 
@@ -30,6 +32,7 @@ pub const ScopedTenantRuntime = struct {
             .session_key = session_key,
             .state_mgr = if (self.state_mgr) |*mgr| mgr else null,
             .expect_postgres_state = self.expect_postgres_state and self.user_id != null,
+            .user_root = self.user_root,
         };
     }
 };
@@ -43,6 +46,23 @@ pub fn tenantWorkspacePathForUser(
         return std.fmt.allocPrint(allocator, "{s}/{s}/workspace", .{ cfg.tenant.data_root, user_id });
     }
     return allocator.dupe(u8, cfg.workspace_dir);
+}
+
+/// User-scoped filesystem root for file-backed tenant state and secrets.
+/// In tenant mode this is `<data_root>/<user_id>`; otherwise we derive it
+/// from the non-workspace parent of `workspace_dir` (mirrors
+/// `runtime_info.zig` semantics) so local/CLI runs still find
+/// `channel_state.json` and `secrets/*` when state_mgr is null.
+pub fn tenantUserRootForUser(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    user_id: []const u8,
+) ![]u8 {
+    if (cfg.tenant.data_root.len > 0) {
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.tenant.data_root, user_id });
+    }
+    const user_root = std.fs.path.dirname(cfg.workspace_dir) orelse cfg.workspace_dir;
+    return allocator.dupe(u8, user_root);
 }
 
 pub fn resolveForAgentSession(
@@ -69,6 +89,7 @@ pub fn resolveForAgentSession(
     scoped.user_id = try allocator.dupe(u8, raw_user_id.?);
     scoped.numeric_user_id = std.fmt.parseInt(i64, scoped.user_id.?, 10) catch return error.InvalidTenantUserId;
     scoped.workspace_dir = try tenantWorkspacePathForUser(allocator, cfg, scoped.user_id.?);
+    scoped.user_root = try tenantUserRootForUser(allocator, cfg, scoped.user_id.?);
     cfg.workspace_dir = scoped.workspace_dir.?;
 
     scoped.expect_postgres_state = cfg.tenant.enabled and
@@ -110,6 +131,17 @@ test "tenantWorkspacePathForUser uses tenant data root" {
     const path = try tenantWorkspacePathForUser(std.testing.allocator, &cfg, "7");
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/tmp/users/7/workspace", path);
+}
+
+test "tenantUserRootForUser derives parent of local workspace" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/local-user/workspace",
+        .config_path = "/tmp/local-user/config.json",
+        .allocator = std.testing.allocator,
+    };
+    const path = try tenantUserRootForUser(std.testing.allocator, &cfg, "7");
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/tmp/local-user", path);
 }
 
 test "resolveForAgentSession scopes workspace from canonical tenant session key" {

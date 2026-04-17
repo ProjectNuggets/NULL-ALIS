@@ -277,12 +277,25 @@ pub const SecurityPolicy = struct {
         return false;
     }
 
-    /// Resolve approval policy for a tool based on its metadata and current autonomy level.
-    /// Returns the ApprovalPolicy that should govern this tool's execution.
-    pub fn resolveApproval(self: *const SecurityPolicy, tool_name: []const u8) approval_modes_mod.ApprovalPolicy {
-        // TODO(phase-4+): wire comptime tool registry here instead of empty slice
-        const meta = tool_metadata_mod.lookupMetadata(tool_name, &.{}) orelse
-            tool_metadata_mod.ToolMetadata.conservative(tool_name);
+    /// Resolve approval policy for a tool given its already-resolved metadata
+    /// and the current autonomy level.
+    ///
+    /// Callers MUST obtain `meta` through the canonical tool path
+    /// (`tools.root.canonicalMetadataForCall` or `canonicalMetadataForName`)
+    /// so that this decision cannot drift from agent preflight. Passing an
+    /// ad-hoc `ToolMetadata` with empty flags will collapse to the
+    /// conservative mutating policy for supervised autonomy — matching
+    /// what `ToolMetadata.conservative` would yield for an unknown tool.
+    ///
+    /// This function intentionally performs no registry lookup: an earlier
+    /// name-based overload silently consulted an empty registry, which
+    /// contradicted the agent preflight (which uses the real registry).
+    /// Keeping metadata resolution at a single site above the policy layer
+    /// prevents that class of bug.
+    pub fn resolveApproval(
+        self: *const SecurityPolicy,
+        meta: tool_metadata_mod.ToolMetadata,
+    ) approval_modes_mod.ApprovalPolicy {
         return approval_modes_mod.ApprovalPolicy.forTool(meta, self.autonomy);
     }
 };
@@ -507,14 +520,49 @@ fn lowerBuf(s: []const u8) LowerResult {
 
 test "resolveApproval returns confirm_once for supervised+conservative" {
     const pol = SecurityPolicy{ .autonomy = .supervised };
-    const result = pol.resolveApproval("some_tool");
+    const meta = tool_metadata_mod.ToolMetadata.conservative("some_tool");
+    const result = pol.resolveApproval(meta);
     try std.testing.expectEqual(approval_modes_mod.ApprovalPolicy.confirm_once, result);
 }
 
 test "resolveApproval returns auto_approve for full autonomy" {
     const pol = SecurityPolicy{ .autonomy = .full };
-    const result = pol.resolveApproval("some_tool");
+    const meta = tool_metadata_mod.ToolMetadata.conservative("some_tool");
+    const result = pol.resolveApproval(meta);
     try std.testing.expectEqual(approval_modes_mod.ApprovalPolicy.auto_approve, result);
+}
+
+test "resolveApproval auto-approves a known read-only tool in supervised (no empty-registry drift)" {
+    // Regression for the empty-registry contradiction: the previous
+    // `resolveApproval` signature looked up metadata in an empty slice and
+    // always fell back to the conservative (mutating) policy, which
+    // contradicted agent preflight for tools like file_read that are
+    // declared read-only in the default registry.
+    const pol = SecurityPolicy{ .autonomy = .supervised };
+    const read_meta = tool_metadata_mod.ToolMetadata{
+        .name = "file_read",
+        .flags = .{ .read_only = true },
+    };
+    try std.testing.expectEqual(
+        approval_modes_mod.ApprovalPolicy.auto_approve,
+        pol.resolveApproval(read_meta),
+    );
+}
+
+test "resolveApproval matches preflight decision for refined read-only dispatch" {
+    // A mutating tool like `schedule` refines to read-only for list/get/runs
+    // actions via tools.root.refineMetadata. The policy must honor the
+    // refined verdict so preflight and reporting agree.
+    const pol = SecurityPolicy{ .autonomy = .supervised };
+    const refined = tool_metadata_mod.ToolMetadata{
+        .name = "schedule",
+        .flags = .{ .read_only = true },
+        .risk_level = .medium,
+    };
+    try std.testing.expectEqual(
+        approval_modes_mod.ApprovalPolicy.auto_approve,
+        pol.resolveApproval(refined),
+    );
 }
 
 test "autonomy default is supervised" {

@@ -242,15 +242,28 @@ Usage and cost:
   pricing is wired, otherwise explicitly reports
   `Cost estimate unavailable`. Does not mutate usage mode or counters.
 
-Non-goals in v0.1:
+Non-goals in v0.1 (deferred, explicitly **not** implemented):
 
-- Persistent generic allowlist for auto-approving tool calls is **not**
-  implemented. `/approve allow-always` does not create durable state.
-- Approval queues with more than one pending entry are **not**
-  implemented — the gate is single-slot per session (Section 2).
-- Persistent run-event trace storage is **not** implemented (Section 7).
-- Planner artifacts (persisted plan objects, plan ids, plan inspection
-  APIs) are **not** implemented. `/plan` only switches execution posture.
+- **Durable trace storage.** The WP4.1 trace store is in-process only;
+  events are not persisted across restarts (Section 7).
+- **Persistent generic allowlist.** `/approve allow-always` does not
+  create durable state; there is no per-tool auto-approve ledger.
+- **Multi-slot approval queue.** At most one approval may be pending
+  per session (Section 2).
+- **Live subagent interruption.** Running subagent tasks cannot be
+  interrupted mid-flight. Only queued tasks can be cancelled via the
+  REST `/stop` endpoint or the `task_stop` tool.
+- **Planner artifacts.** Persisted plan objects, plan ids, and plan
+  inspection APIs are **not** implemented. `/plan` only switches
+  execution posture.
+- **Budget enforcement.** `cost_usd` is recorded when the model is
+  priced (WP5.1), but no hard/soft budget gate exists.
+- **`cost_update` SSE event.** Per-turn cost is exposed via `/usage`
+  and `/cost`; there is no streaming `cost_update` frame (Section 8).
+- **Full REST parity for slash commands.** Besides `/approve`, direct
+  operator controls remain chat-only.
+- **MCP runtime metadata registry.** MCP-provided tools are not yet
+  surfaced through the runtime's tool-metadata registry.
 
 ## 3. Replay Contract
 
@@ -329,26 +342,41 @@ following intentional gaps:
   turn-complete does not currently carry `run_id`. This is a known
   shortcoming — clients should rely on the preceding run-scoped events for
   correlation.
-- **No persistent trace storage.** The runtime does not yet persist run
-  event traces. Observers receive events in-process; after the turn ends,
-  events are not retrievable from a trace store.
+- **In-process trace store only (WP4.1 / WP4.2).** The runtime retains
+  recent per-run events in a bounded in-memory store
+  (`src/run_trace_store.zig`). Two read-only endpoints expose this:
+  `GET /api/v1/users/{user_id}/traces` lists retained run ids, and
+  `GET /api/v1/users/{user_id}/traces/{run_id}` returns a sanitized
+  event timeline for a single run (same public field subset as the SSE
+  run events, no raw tool payloads). Missing tenant runtime returns
+  `{"traces": []}` for the collection and `404` for a specific run —
+  the endpoint never materializes a runtime on demand. Storage is
+  bounded (default 64 runs × 256 events/run with LRU-style eviction);
+  **durable trace storage is still deferred** — events are not written
+  to disk or a database and do not survive a pod restart.
 - **No persistent approval allowlist.** `/approve allow-always` is
   accepted but is not stored durably in v1 (see Section 2).
-- **Read-only task query API.** Task state is visible via `task_update`
-  events on the SSE stream and via two read-only REST endpoints:
-  `GET /api/v1/users/{user_id}/tasks` and
-  `GET /api/v1/users/{user_id}/tasks/{task_id}`. Both return snapshots of
-  the canonical task ledger. Task creation and cancellation are **not**
-  exposed over REST — they flow through the agent tool surface (`spawn`
-  for creation, `task_stop` for cancellation) and the operator slash
-  commands (`/subagents kill <id|all>`). Cancellation is **queued-only**
-  (WP2.4): a queued task can be transitioned to `cancelled`, but a task
-  that has already started running cannot be interrupted in v0.1 — both
-  `task_stop` and `/subagents kill` report this honestly instead of
-  pretending to kill the task. Live interruption of a running subagent
-  is out of scope. If no tenant runtime exists for the user yet (no
+- **Task query + queued-only stop REST API.** Task state is visible via
+  `task_update` events on the SSE stream and via two read-only REST
+  endpoints: `GET /api/v1/users/{user_id}/tasks` and
+  `GET /api/v1/users/{user_id}/tasks/{task_id}`. Both return snapshots
+  of the canonical task ledger. Task **cancellation** is also exposed
+  over REST via
+  `POST /api/v1/users/{user_id}/tasks/{task_id}/stop` (WP2.5), which
+  routes through `SubagentManager.cancelQueued` — the same source of
+  truth used by the `task_stop` agent tool and the `/subagents kill`
+  slash command. Cancellation is **queued-only**: a queued task can be
+  transitioned to `cancelled`, but a task that has already started
+  running cannot be interrupted in v0.1. The REST endpoint returns
+  `409 Conflict` for running or already-terminal tasks and
+  `404 Not Found` when no task or tenant runtime exists. Live
+  interruption of a running subagent is **out of scope**. Task
+  **creation** remains **not** exposed over REST — new tasks still flow
+  exclusively through the agent tool surface (`spawn`) and the operator
+  slash commands. If no tenant runtime exists for the user yet (no
   agent work has happened), the list endpoint returns `{"tasks": []}`
-  rather than 404.
+  rather than 404, and the stop endpoint returns 404 without
+  materializing a runtime on demand.
 - **Read-only usage summary API.** Cumulative token usage and per-model
   breakdown are exposed via `GET /api/v1/users/{user_id}/usage`
   (WP2.3). The response matches the `UsageSummary` schema in
@@ -358,8 +386,15 @@ following intentional gaps:
   `cost_available: false` rather than 404. The endpoint never
   instantiates a tenant runtime on demand. The interactive `/usage` and
   `/cost` slash commands (see §2a) remain available and report against
-  the same underlying state. Persistent usage ledgers, budget
-  enforcement, provider pricing tables, and the `cost_update` SSE event
+  the same underlying state.
+  **Provider pricing (WP5.1).** The runtime now consults a small,
+  in-process static pricing table (`src/providers/pricing.zig`) when
+  recording per-turn usage. When the turn's model is priced, the
+  recorded `cost_usd` is real and `cost_available` flips to `true`
+  once any non-zero cost accumulates; when the model is unknown, cost
+  is left at `0.0` and `cost_available` stays `false` — the runtime
+  does not fabricate a $0.00 price for unknown models. Persistent
+  usage ledgers, budget enforcement, and the `cost_update` SSE event
   (see §8) are still deferred beyond v0.1.
 
 ## 8. Future / Deferred Event Candidates

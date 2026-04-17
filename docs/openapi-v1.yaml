@@ -1296,20 +1296,16 @@ paths:
   #
   # GET /api/v1/users/{user_id}/tasks and GET /tasks/{task_id} are
   # IMPLEMENTED as read-only snapshots of the canonical TaskLedger
-  # (WP2.2). See the operation entries below.
+  # (WP2.2). POST /tasks/{task_id}/stop is IMPLEMENTED as queued-only
+  # cancellation (WP2.5). See the operation entries below.
   #
-  # Deferred [future]: POST /api/v1/users/{user_id}/tasks/{task_id}/stop
-  #   - Cancel a queued subagent task over REST
-  #   - Response: updated TaskRecord with status=cancelled
-  #   - Task creation and cancellation currently flow through the agent
-  #     tool surface (`spawn` for creation, `task_stop` for cancellation)
-  #     and the operator command surface (`/subagents kill <id|all>`),
-  #     not REST.
-  #   - Cancellation is QUEUED-ONLY (WP2.4). A task that has already
-  #     transitioned to `running` cannot be interrupted in v0.1 — every
-  #     surface (`task_stop`, `/subagents kill`, and any future REST
-  #     endpoint) must report this honestly rather than pretending to
-  #     kill a running task. Live interruption is out of scope.
+  # Task creation over REST remains DEFERRED. New tasks are still
+  # produced exclusively through the agent tool surface (`spawn`) —
+  # the REST surface only observes existing tasks and cancels queued
+  # ones. Live interruption of a running subagent is OUT OF SCOPE in
+  # v0.1: `task_stop`, `/subagents kill`, and the REST /stop route all
+  # report 409/queued-only honestly instead of pretending to kill a
+  # running task.
   #
   # ── Remaining deferred items ───────────────────────────────────────
   #
@@ -1318,14 +1314,30 @@ paths:
   # below. The in-chat `/usage` and `/cost` slash commands remain the
   # interactive surface; both report the same underlying state.
   #
+  # Provider pricing IS now wired (WP5.1): a small static table in
+  # src/providers/pricing.zig supplies per-turn cost_usd for known
+  # hosted models. Unknown models keep cost_usd at 0.0 and
+  # cost_available remains false — the runtime never fabricates a
+  # $0.00 price for unpriced models.
+  #
+  # GET /api/v1/users/{user_id}/traces and
+  # GET /api/v1/users/{user_id}/traces/{run_id} are IMPLEMENTED as
+  # read-only snapshots of the bounded in-process RunTraceStore
+  # (WP4.1 / WP4.2). See the operation entries below.
+  #
   # Still deferred:
+  #   - Durable trace storage (traces survive only in-process; no
+  #     disk or DB persistence).
   #   - Persistent usage ledger (durable cross-session/cross-pod totals).
-  #   - Provider pricing tables and real cost_usd values from the agent
-  #     path (today the runtime records 0.0 per turn and cost_available
-  #     is `false` unless a non-zero cost has otherwise been recorded).
   #   - Budget enforcement (hard/soft limits, alerts).
   #   - The `cost_update` SSE event (see docs/online-agent-contract.md
   #     §8 — still deferred).
+  #   - Multi-slot approval queue (single-slot per session today).
+  #   - Persistent generic allowlist for `/approve allow-always`.
+  #   - Live subagent interruption (only queued tasks are cancellable).
+  #   - Planner artifacts (persisted plans / plan ids).
+  #   - Full REST parity for operator slash commands beyond /approve.
+  #   - MCP runtime metadata registry.
   #
 
   # ── Task read-only query surface (WP2.2, implemented) ─────────────
@@ -1374,6 +1386,47 @@ paths:
         '405':
           description: Method not allowed (only GET is supported)
 
+  /api/v1/users/{user_id}/tasks/{task_id}/stop:
+    post:
+      summary: Cancel a queued task (WP2.5)
+      description: >
+        Queued-only cancellation. Routes through
+        SubagentManager.cancelQueued, which is the single source of truth
+        for subagent task state. Running tasks CANNOT be interrupted in
+        v0.1 — this endpoint returns 409 rather than pretending to kill
+        the task. Terminal tasks (succeeded, failed, timed_out,
+        cancelled, lost) also return 409. No tenant runtime is ever
+        materialized on demand to answer a stop: if no runtime or
+        manager exists for this user, the endpoint returns 404.
+
+
+        On success the response is the updated TaskRecord snapshot
+        (preferred, from TaskDelivery.getTaskSnapshot) or, if the
+        canonical ledger mirror is not attached, a minimal payload
+        `{"task_id": "...", "status": "cancelled"}`.
+      operationId: stopUserTask
+      tags: [Tasks]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/TaskIdPath'
+      responses:
+        '200':
+          description: Task transitioned to cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskRecord'
+        '400':
+          description: Missing or malformed task_id (empty, too long, control chars, wrong canonical shape)
+        '404':
+          description: Task or tenant runtime not found
+        '405':
+          description: Method not allowed (only POST is supported)
+        '409':
+          description: >
+            Task cannot be cancelled — it is currently running (live
+            interruption is not supported in v0.1) or already terminal.
+
   # ── Usage read-only summary surface (WP2.3, implemented) ──────────
 
   /api/v1/users/{user_id}/usage:
@@ -1388,10 +1441,15 @@ paths:
         read-only — it never instantiates a tenant runtime on demand.
 
 
-        Provider pricing is not wired in v0.1, so `session_cost_usd` is
-        typically 0 and `cost_available` is `false`. Persistent usage
-        ledgers, budget enforcement, and real pricing tables are
-        deferred beyond v0.1.
+        Provider pricing IS wired in v0.1 via a small static table
+        (src/providers/pricing.zig). When the turn's model is priced,
+        `session_cost_usd` reflects the real accumulated cost and
+        `cost_available` becomes `true` once any non-zero cost is
+        recorded. For unknown models the runtime deliberately keeps
+        `cost_usd` at 0.0 and `cost_available` at `false` rather than
+        fabricating a $0.00 cost. Persistent usage ledgers, budget
+        enforcement, and the `cost_update` SSE event are deferred
+        beyond v0.1.
       operationId: getUserUsage
       tags: [Usage]
       parameters:
@@ -1403,6 +1461,72 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UsageSummary'
+        '405':
+          description: Method not allowed (only GET is supported)
+
+  # ── Run trace read-only surface (WP4.1 / WP4.2, implemented) ──────
+
+  /api/v1/users/{user_id}/traces:
+    get:
+      summary: List recent agent runs retained in the in-process trace store
+      description: >
+        Returns the set of run ids currently retained in the bounded
+        per-tenant RunTraceStore, along with each run's event count and
+        bookend timestamps. Storage is in-memory only and bounded
+        (default 64 runs × 256 events per run, deterministic eviction
+        of the oldest run). If no tenant runtime has been materialized
+        for this user yet the endpoint returns `{"traces": []}` rather
+        than 404. The endpoint never instantiates a tenant runtime on
+        demand. Durable trace storage is deferred beyond v0.1.
+      operationId: listUserTraces
+      tags: [Traces]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      responses:
+        '200':
+          description: Run index snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TraceListResponse'
+        '405':
+          description: Method not allowed (only GET is supported)
+
+  /api/v1/users/{user_id}/traces/{run_id}:
+    get:
+      summary: Get sanitized event timeline for a single run
+      description: >
+        Returns the sanitized event timeline for a single run from the
+        in-process RunTraceStore. Each event contains only the public
+        run-event fields already exposed over SSE (phase/state labels,
+        tool names, tool_use_id, durations, success, approval risk
+        levels, task status) — no raw tool payloads, no provider API
+        details, and all string fields are clamped to a small per-
+        event cap. Returns 404 when no tenant runtime exists for the
+        user or the run is not present in the store. Run ids must be
+        non-empty, ≤ 128 chars, and must not contain control
+        characters or `/`.
+      operationId: getUserTrace
+      tags: [Traces]
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - name: run_id
+          in: path
+          required: true
+          description: Opaque run identifier (≤128 chars, no control chars, no slashes).
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Trace snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TraceSnapshot'
+        '400':
+          description: Missing or malformed run_id
+        '404':
+          description: Run or tenant runtime not found
         '405':
           description: Method not allowed (only GET is supported)
 
@@ -1772,9 +1896,9 @@ components:
           type: number
           format: double
           description: >
-            USD cost accumulated across this model's turns. Today this is
-            0 unless a non-zero cost was explicitly recorded — provider
-            pricing tables are deferred beyond v0.1.
+            USD cost accumulated across this model's turns. Populated
+            from the static provider pricing table (WP5.1) when the
+            model is recognized; remains 0 for unknown models.
         turn_count:
           type: integer
           format: int32
@@ -1802,9 +1926,10 @@ components:
           type: number
           format: double
           description: >
-            Accumulated USD cost across all recorded turns for this user.
-            0 unless non-zero costs have been recorded (pricing tables
-            are deferred).
+            Accumulated USD cost across all recorded turns for this
+            user. Derived from the static provider pricing table
+            (WP5.1); remains 0 when none of the recorded turns used a
+            priced model.
         turn_count:
           type: integer
           format: int32
@@ -1816,9 +1941,106 @@ components:
         cost_available:
           type: boolean
           description: >
-            True when `session_cost_usd > 0`. Reflects whether any cost
-            has actually been attributed; in v0.1 this is typically
-            false because provider pricing is not wired.
+            True when `session_cost_usd > 0`. With the static pricing
+            table (WP5.1) wired in, this flips to true as soon as any
+            turn uses a priced model; it remains false while only
+            unpriced models have been used, rather than reporting a
+            fabricated $0.00.
+    TraceIndexEntry:
+      type: object
+      required: [run_id, event_count, first_event_ms, last_event_ms, truncated]
+      properties:
+        run_id:
+          type: string
+        event_count:
+          type: integer
+          format: int64
+        first_event_ms:
+          type: integer
+          format: int64
+          description: Milliseconds (Unix epoch) of the first retained event for this run.
+        last_event_ms:
+          type: integer
+          format: int64
+          description: Milliseconds (Unix epoch) of the most recent retained event.
+        truncated:
+          type: boolean
+          description: >
+            True when the per-run cap was reached and one or more of the
+            oldest events were dropped from the in-memory window.
+    TraceListResponse:
+      type: object
+      required: [traces]
+      properties:
+        traces:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceIndexEntry'
+    TraceEvent:
+      type: object
+      required: [kind, ts_ms]
+      properties:
+        kind:
+          type: string
+          enum:
+            - llm_request
+            - llm_response
+            - tool_call_start
+            - tool_call
+            - turn_stage
+            - task_update
+            - approval_required
+            - agent_end
+        ts_ms:
+          type: integer
+          format: int64
+        phase:
+          type: string
+        tool:
+          type: string
+        tool_use_id:
+          type: string
+        label:
+          type: string
+          description: Short sanitized label (reason, description, or summary). Clamped server-side.
+        risk_level:
+          type: string
+        status:
+          type: string
+        task_id:
+          type: string
+        success:
+          type: boolean
+        duration_ms:
+          type: integer
+          format: int64
+        iteration:
+          type: integer
+          format: int32
+        exit_code:
+          type: integer
+          format: int32
+        usage_tokens:
+          type: integer
+          format: int64
+    TraceSnapshot:
+      type: object
+      required: [run_id, first_event_ms, last_event_ms, truncated, events]
+      properties:
+        run_id:
+          type: string
+        first_event_ms:
+          type: integer
+          format: int64
+        last_event_ms:
+          type: integer
+          format: int64
+        truncated:
+          type: boolean
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceEvent'
     SessionContextResponse:
       type: object
       properties:

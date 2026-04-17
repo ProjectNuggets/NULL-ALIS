@@ -62,6 +62,7 @@ pub const identity = @import("identity.zig");
 pub const cost = @import("cost.zig");
 pub const usage_runtime = @import("usage_runtime.zig");
 pub const observability = @import("observability.zig");
+pub const run_trace_store = @import("run_trace_store.zig");
 pub const heartbeat = @import("heartbeat.zig");
 pub const runtime = @import("runtime.zig");
 

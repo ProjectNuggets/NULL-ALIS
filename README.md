@@ -150,6 +150,9 @@ Important endpoints:
 - `/internal/diagnostics`
 - `/api/v1/chat/stream`
 - `/api/v1/users/*` tenant surfaces
+- `/api/v1/users/{user_id}/usage` — read-only token and cost summary
+- `/api/v1/users/{user_id}/tasks` and `.../tasks/{task_id}` — task read surface; `.../tasks/{task_id}/stop` for queued-only cancellation
+- `/api/v1/users/{user_id}/traces` and `.../traces/{run_id}` — read-only sanitized run-event traces (in-memory, bounded)
 
 SSE chat stream contract (structured run events):
 - `event: status` (initial status)

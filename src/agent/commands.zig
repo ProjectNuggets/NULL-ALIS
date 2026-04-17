@@ -24,7 +24,6 @@ const util = @import("../util.zig");
 const channel_health = @import("../channel_health.zig");
 const security_review = @import("../security_review.zig");
 const health_mod = @import("../health.zig");
-const approval_modes_mod = @import("../security/approval_modes.zig");
 const tool_metadata_mod = @import("../tools/metadata.zig");
 const usage_runtime_mod = @import("../usage_runtime.zig");
 const log = std.log.scoped(.agent);
@@ -2363,14 +2362,16 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
     else
         "";
 
-    const result = self.executeApprovedPendingTool(self.allocator) catch |err| {
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+
+    const result = self.executeApprovedPendingTool(arena.allocator()) catch |err| {
         return try std.fmt.allocPrint(
             self.allocator,
             "Approved tool execution failed: {s}",
             .{@errorName(err)},
         );
     };
-    defer self.allocator.free(result.output);
     return try std.fmt.allocPrint(
         self.allocator,
         "Approved tool (id={d}) success={any}.{s}\n{s}",
@@ -3822,10 +3823,68 @@ fn handlePermissionsCommand(self: anytype) ![]const u8 {
         try w.writeAll("  status: not configured\n");
     }
 
-    try w.writeAll("\nExec posture:\n");
-    try w.print("  host: {s}\n", .{self.exec_host.toSlice()});
-    try w.print("  security: {s}\n", .{self.exec_security.toSlice()});
-    try w.print("  ask: {s}\n", .{self.exec_ask.toSlice()});
+    // Category archetypes used to describe per-category gate verdicts below.
+    // These are intentionally constructed by hand (not looked up from the
+    // registry) — they represent the canonical flag combinations a tool can
+    // carry, not a specific tool. Runtime decisions for a concrete tool must
+    // still go through tools.root.canonicalMetadataForCall on the agent path.
+    const read_meta = tool_metadata_mod.ToolMetadata{
+        .name = "_read_only",
+        .flags = .{ .read_only = true },
+    };
+    const mutating_meta = tool_metadata_mod.ToolMetadata{
+        .name = "_mutating",
+        .flags = .{ .mutating = true },
+    };
+    const operator_meta = tool_metadata_mod.ToolMetadata{
+        .name = "_operator_only",
+        .flags = .{ .operator_only = true },
+    };
+    const background_safe_meta = tool_metadata_mod.ToolMetadata{
+        .name = "_background_safe",
+        .flags = .{ .read_only = true, .background_safe = true },
+    };
+
+    // Gate 1 — execution mode gate.
+    // Reflects ExecutionMode.allowsTool for each category archetype; this is
+    // the same predicate preflightToolPolicy consults for the current mode.
+    try w.writeAll("\nGate 1 — Execution mode:\n");
+    try w.print("  current mode:            {s}\n", .{self.execution_mode.toSlice()});
+    try w.print("  allows read-only:        {s}\n", .{yesNo(self.execution_mode.allowsTool(read_meta))});
+    try w.print("  allows mutating:         {s}\n", .{yesNo(self.execution_mode.allowsTool(mutating_meta))});
+    try w.print("  allows background-safe:  {s}\n", .{yesNo(self.execution_mode.allowsTool(background_safe_meta))});
+
+    // Gate 2 — generic tool approval gate.
+    // Category decisions derived from the canonical approval path
+    // (SecurityPolicy.resolveApproval now takes pre-resolved metadata).
+    try w.writeAll("\nGate 2 — Generic tool approval:\n");
+    if (self.policy) |pol| {
+        try w.print("  autonomy:                {s}\n", .{pol.autonomy.toString()});
+        try w.print(
+            "  read-only tools:         {s}\n",
+            .{pol.resolveApproval(read_meta).toSlice()},
+        );
+        try w.print(
+            "  mutating tools:          {s}\n",
+            .{pol.resolveApproval(mutating_meta).toSlice()},
+        );
+        try w.print(
+            "  operator-only:           {s}\n",
+            .{pol.resolveApproval(operator_meta).toSlice()},
+        );
+        try w.writeAll("  unknown/MCP tools:       confirm_once (conservative)\n");
+    } else {
+        try w.writeAll("  (no SecurityPolicy configured — approval rules not enforced)\n");
+    }
+
+    // Gate 3 — legacy shell /exec approval gate.
+    // This is a separate (pre-registry) path scoped to shell command execs
+    // and NOT routed through ApprovalPolicy. Surfacing it explicitly so
+    // callers don't confuse its posture with Gate 2.
+    try w.writeAll("\nGate 3 — Legacy shell /exec:\n");
+    try w.print("  host:      {s}\n", .{self.exec_host.toSlice()});
+    try w.print("  security:  {s}\n", .{self.exec_security.toSlice()});
+    try w.print("  ask:       {s}\n", .{self.exec_ask.toSlice()});
 
     var wrote_pending = false;
     if (@hasField(@TypeOf(self.*), "pending_tool_approval")) {
@@ -3850,41 +3909,15 @@ fn handlePermissionsCommand(self: anytype) ![]const u8 {
         try w.writeAll("\nPending approvals: none\n");
     }
 
-    try w.writeAll("\nApproval rules for built-in tools:\n");
-    if (self.policy) |pol| {
-        const read_meta = tool_metadata_mod.ToolMetadata{
-            .name = "_read_only",
-            .flags = .{ .read_only = true },
-        };
-        const mutating_meta = tool_metadata_mod.ToolMetadata{
-            .name = "_mutating",
-            .flags = .{ .mutating = true },
-        };
-        const operator_meta = tool_metadata_mod.ToolMetadata{
-            .name = "_operator_only",
-            .flags = .{ .operator_only = true },
-        };
-        try w.print(
-            "  read-only tools:    {s}\n",
-            .{approval_modes_mod.ApprovalPolicy.forTool(read_meta, pol.autonomy).toSlice()},
-        );
-        try w.print(
-            "  mutating tools:     {s}\n",
-            .{approval_modes_mod.ApprovalPolicy.forTool(mutating_meta, pol.autonomy).toSlice()},
-        );
-        try w.print(
-            "  operator-only:      {s}\n",
-            .{approval_modes_mod.ApprovalPolicy.forTool(operator_meta, pol.autonomy).toSlice()},
-        );
-    } else {
-        try w.writeAll("  (no policy configured — approval rules not enforced)\n");
-    }
-
     try w.writeAll(
         "\nNote: generic allow-always is not persistent in v1 — an approved call runs once.\n",
     );
 
     return try out.toOwnedSlice(self.allocator);
+}
+
+fn yesNo(v: bool) []const u8 {
+    return if (v) "yes" else "no";
 }
 
 fn handleVoiceCommand(self: anytype, arg: []const u8) ![]const u8 {
