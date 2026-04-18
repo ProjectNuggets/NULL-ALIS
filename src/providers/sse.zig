@@ -2,61 +2,181 @@ const std = @import("std");
 const root = @import("root.zig");
 const http_native = @import("../http_native/root.zig");
 
+pub const SseToolCallDelta = struct {
+    index: usize,
+    id: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    arguments: ?[]const u8 = null,
+
+    fn deinit(self: *const SseToolCallDelta, allocator: std.mem.Allocator) void {
+        if (self.id) |id| allocator.free(id);
+        if (self.name) |name| allocator.free(name);
+        if (self.arguments) |arguments| allocator.free(arguments);
+    }
+};
+
 /// Result of parsing a single SSE line.
-pub const SseLineResult = union(enum) {
+pub const SseLineResult = struct {
     /// Text delta content (owned, caller frees).
-    delta: []const u8,
+    text: ?[]const u8 = null,
+    /// Structured tool call deltas (owned, caller frees).
+    tool_call_deltas: []const SseToolCallDelta = &.{},
     /// Stream is complete ([DONE] sentinel).
-    done: void,
-    /// Line should be skipped (empty, comment, or no content).
-    skip: void,
+    done: bool = false,
+
+    fn deinit(self: *const SseLineResult, allocator: std.mem.Allocator) void {
+        if (self.text) |text| allocator.free(text);
+        for (self.tool_call_deltas) |delta| delta.deinit(allocator);
+        if (self.tool_call_deltas.len > 0) allocator.free(self.tool_call_deltas);
+    }
+
+    fn isSkip(self: SseLineResult) bool {
+        return !self.done and self.text == null and self.tool_call_deltas.len == 0;
+    }
 };
 
 /// Parse a single SSE line in OpenAI streaming format.
 ///
 /// Handles:
 /// - `data: [DONE]` → `.done`
-/// - `data: {JSON}` → extracts `choices[0].delta.content` → `.delta`
+/// - `data: {JSON}` → extracts `choices[*].delta.content` and `choices[*].delta.tool_calls[*]`
 /// - Empty lines, comments (`:`) → `.skip`
 pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResult {
     const trimmed = std.mem.trimRight(u8, line, "\r");
 
-    if (trimmed.len == 0) return .skip;
-    if (trimmed[0] == ':') return .skip;
+    if (trimmed.len == 0) return .{};
+    if (trimmed[0] == ':') return .{};
 
-    const prefix = "data: ";
-    if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
+    const data = extractSseDataPayload(trimmed) orelse return .{};
 
-    const data = trimmed[prefix.len..];
+    if (std.mem.eql(u8, data, "[DONE]")) return .{ .done = true };
 
-    if (std.mem.eql(u8, data, "[DONE]")) return .done;
-
-    const content = try extractDeltaContent(allocator, data) orelse return .skip;
-    return .{ .delta = content };
+    return try extractSseEvent(allocator, data);
 }
 
-/// Extract `choices[0].delta.content` from an SSE JSON payload.
-/// Returns owned slice or null if no content found.
-pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?[]const u8 {
+fn extractSseDataPayload(line: []const u8) ?[]const u8 {
+    const prefix = "data:";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    return std.mem.trimLeft(u8, line[prefix.len..], " ");
+}
+
+/// Extract text and tool-call deltas from an OpenAI-compatible SSE JSON payload.
+pub fn extractSseEvent(allocator: std.mem.Allocator, json_str: []const u8) !SseLineResult {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch
         return error.InvalidSseJson;
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
-    const choices = obj.get("choices") orelse return null;
-    if (choices != .array or choices.array.items.len == 0) return null;
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return .{},
+    };
+    const choices = obj.get("choices") orelse return .{};
+    if (choices != .array or choices.array.items.len == 0) return .{};
 
-    const first = choices.array.items[0];
-    if (first != .object) return null;
+    var text_builder: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text_builder.deinit(allocator);
 
-    const delta = first.object.get("delta") orelse return null;
-    if (delta != .object) return null;
+    var tool_deltas: std.ArrayListUnmanaged(SseToolCallDelta) = .empty;
+    errdefer {
+        for (tool_deltas.items) |delta| delta.deinit(allocator);
+        tool_deltas.deinit(allocator);
+    }
 
-    const content = delta.object.get("content") orelse return null;
-    if (content != .string) return null;
-    if (content.string.len == 0) return null;
+    for (choices.array.items) |choice| {
+        const choice_obj = switch (choice) {
+            .object => |object| object,
+            else => continue,
+        };
 
-    return try allocator.dupe(u8, content.string);
+        const delta = choice_obj.get("delta") orelse continue;
+        const delta_obj = switch (delta) {
+            .object => |object| object,
+            else => continue,
+        };
+
+        if (delta_obj.get("content")) |content| {
+            if (content == .string and content.string.len > 0) {
+                try text_builder.appendSlice(allocator, content.string);
+            }
+        }
+
+        if (delta_obj.get("tool_calls")) |tool_calls| {
+            const tool_calls_array = switch (tool_calls) {
+                .array => |array| array,
+                else => continue,
+            };
+
+            for (tool_calls_array.items) |tool_call| {
+                const tool_call_obj = switch (tool_call) {
+                    .object => |object| object,
+                    else => continue,
+                };
+
+                const index_value = tool_call_obj.get("index") orelse continue;
+                const index = switch (index_value) {
+                    .integer => |value| if (value >= 0) @as(usize, @intCast(value)) else continue,
+                    else => continue,
+                };
+
+                var tool_delta = SseToolCallDelta{ .index = index };
+                errdefer tool_delta.deinit(allocator);
+
+                if (tool_call_obj.get("id")) |id_value| {
+                    if (id_value == .string and id_value.string.len > 0) {
+                        tool_delta.id = try allocator.dupe(u8, id_value.string);
+                    }
+                }
+
+                if (tool_call_obj.get("function")) |function_value| {
+                    if (function_value == .object) {
+                        const function_obj = function_value.object;
+                        if (function_obj.get("name")) |name_value| {
+                            if (name_value == .string and name_value.string.len > 0) {
+                                tool_delta.name = try allocator.dupe(u8, name_value.string);
+                            }
+                        }
+                        if (function_obj.get("arguments")) |arguments_value| {
+                            if (arguments_value == .string and arguments_value.string.len > 0) {
+                                tool_delta.arguments = try allocator.dupe(u8, arguments_value.string);
+                            }
+                        }
+                    }
+                }
+
+                try tool_deltas.append(allocator, tool_delta);
+            }
+        }
+    }
+
+    var result = SseLineResult{};
+    errdefer result.deinit(allocator);
+
+    if (text_builder.items.len > 0) {
+        result.text = try text_builder.toOwnedSlice(allocator);
+    } else {
+        text_builder.deinit(allocator);
+    }
+
+    if (tool_deltas.items.len > 0) {
+        result.tool_call_deltas = try tool_deltas.toOwnedSlice(allocator);
+    } else {
+        tool_deltas.deinit(allocator);
+    }
+
+    return result;
+}
+
+/// Extract `choices[*].delta.content` from an SSE JSON payload.
+/// Returns owned slice or null if no content found.
+pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?[]const u8 {
+    var event = try extractSseEvent(allocator, json_str);
+    defer event.deinit(allocator);
+
+    if (event.text) |text| {
+        const copy = try allocator.dupe(u8, text);
+        return copy;
+    }
+    return null;
 }
 
 /// Run curl in SSE streaming mode and parse output line by line.
@@ -146,12 +266,12 @@ fn curl_stream_fallback(
 
     try child.spawn();
 
-    // Read stdout line by line, parse SSE events
-    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
-    defer accumulated.deinit(allocator);
-
-    var line_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer line_buf.deinit(allocator);
+    var stream_ctx = OpenAiStreamCtx{
+        .allocator = allocator,
+        .callback = callback,
+        .callback_ctx = ctx,
+    };
+    defer stream_ctx.deinit();
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
@@ -163,44 +283,25 @@ fn curl_stream_fallback(
 
         for (read_buf[0..n]) |byte| {
             if (byte == '\n') {
-                const result = parseSseLine(allocator, line_buf.items) catch {
-                    line_buf.clearRetainingCapacity();
+                const keep_streaming = handleOpenAiLine(&stream_ctx) catch {
+                    stream_ctx.line_buf.clearRetainingCapacity();
                     continue;
                 };
-                line_buf.clearRetainingCapacity();
-                switch (result) {
-                    .delta => |text| {
-                        defer allocator.free(text);
-                        try accumulated.appendSlice(allocator, text);
-                        callback(ctx, root.StreamChunk.textDelta(text));
-                    },
-                    .done => {
-                        saw_done = true;
-                        break :outer;
-                    },
-                    .skip => {},
+                if (!keep_streaming) {
+                    saw_done = true;
+                    break :outer;
                 }
             } else {
-                try line_buf.append(allocator, byte);
+                try stream_ctx.line_buf.append(allocator, byte);
             }
         }
     }
 
     // Parse a trailing line when the stream ends without a final '\n'.
-    if (!saw_done and line_buf.items.len > 0) {
-        const trailing = parseSseLine(allocator, line_buf.items) catch null;
-        line_buf.clearRetainingCapacity();
-        if (trailing) |result| {
-            switch (result) {
-                .delta => |text| {
-                    defer allocator.free(text);
-                    try accumulated.appendSlice(allocator, text);
-                    callback(ctx, root.StreamChunk.textDelta(text));
-                },
-                .done => {},
-                .skip => {},
-            }
-        }
+    if (!saw_done and stream_ctx.line_buf.items.len > 0) {
+        _ = handleOpenAiLine(&stream_ctx) catch {
+            stream_ctx.line_buf.clearRetainingCapacity();
+        };
     }
 
     // Drain remaining stdout to prevent deadlock on wait()
@@ -215,20 +316,20 @@ fn curl_stream_fallback(
         else => return error.CurlFailed,
     }
 
-    // Signal stream completion only after curl exits successfully.
-    callback(ctx, root.StreamChunk.finalChunk());
-
-    const content = if (accumulated.items.len > 0)
-        try allocator.dupe(u8, accumulated.items)
-    else
-        null;
-
-    return .{
-        .content = content,
-        .usage = .{ .completion_tokens = @intCast((accumulated.items.len + 3) / 4) },
-        .model = "",
-    };
+    return finalizeOpenAiStream(&stream_ctx);
 }
+
+const ToolCallAccumulator = struct {
+    id: std.ArrayListUnmanaged(u8) = .empty,
+    name: std.ArrayListUnmanaged(u8) = .empty,
+    arguments: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *ToolCallAccumulator, allocator: std.mem.Allocator) void {
+        self.id.deinit(allocator);
+        self.name.deinit(allocator);
+        self.arguments.deinit(allocator);
+    }
+};
 
 const OpenAiStreamCtx = struct {
     allocator: std.mem.Allocator,
@@ -236,30 +337,126 @@ const OpenAiStreamCtx = struct {
     callback_ctx: *anyopaque,
     accumulated: std.ArrayListUnmanaged(u8) = .empty,
     line_buf: std.ArrayListUnmanaged(u8) = .empty,
+    tool_call_accumulators: std.ArrayListUnmanaged(ToolCallAccumulator) = .empty,
 
     fn deinit(self: *OpenAiStreamCtx) void {
         self.accumulated.deinit(self.allocator);
         self.line_buf.deinit(self.allocator);
+        for (self.tool_call_accumulators.items) |*accumulator| {
+            accumulator.deinit(self.allocator);
+        }
+        self.tool_call_accumulators.deinit(self.allocator);
     }
 };
+
+fn ensureToolCallAccumulator(
+    allocator: std.mem.Allocator,
+    accumulators: *std.ArrayListUnmanaged(ToolCallAccumulator),
+    index: usize,
+) !*ToolCallAccumulator {
+    while (accumulators.items.len <= index) {
+        try accumulators.append(allocator, .{});
+    }
+    return &accumulators.items[index];
+}
+
+fn appendToolCallDelta(ctx: *OpenAiStreamCtx, delta: SseToolCallDelta) !void {
+    const accumulator = try ensureToolCallAccumulator(ctx.allocator, &ctx.tool_call_accumulators, delta.index);
+    if (delta.id) |id| try accumulator.id.appendSlice(ctx.allocator, id);
+    if (delta.name) |name| try accumulator.name.appendSlice(ctx.allocator, name);
+    if (delta.arguments) |arguments| try accumulator.arguments.appendSlice(ctx.allocator, arguments);
+}
+
+fn processSseEvent(ctx: *OpenAiStreamCtx, event: SseLineResult) !bool {
+    defer event.deinit(ctx.allocator);
+
+    if (event.done) return false;
+
+    if (event.text) |text| {
+        try ctx.accumulated.appendSlice(ctx.allocator, text);
+        ctx.callback(ctx.callback_ctx, root.StreamChunk.textDelta(text));
+    }
+
+    for (event.tool_call_deltas) |delta| {
+        try appendToolCallDelta(ctx, delta);
+    }
+
+    return true;
+}
+
+fn handleOpenAiLine(ctx: *OpenAiStreamCtx) !bool {
+    const event = try parseSseLine(ctx.allocator, ctx.line_buf.items);
+    ctx.line_buf.clearRetainingCapacity();
+    return processSseEvent(ctx, event);
+}
+
+fn buildToolCalls(
+    allocator: std.mem.Allocator,
+    accumulators: []const ToolCallAccumulator,
+) ![]const root.ToolCall {
+    var calls: std.ArrayListUnmanaged(root.ToolCall) = .empty;
+    errdefer {
+        for (calls.items) |call| {
+            allocator.free(call.id);
+            allocator.free(call.name);
+            allocator.free(call.arguments);
+        }
+        calls.deinit(allocator);
+    }
+
+    for (accumulators, 0..) |accumulator, index| {
+        if (accumulator.name.items.len == 0) continue;
+
+        {
+            const id = if (accumulator.id.items.len > 0)
+                try allocator.dupe(u8, accumulator.id.items)
+            else
+                try std.fmt.allocPrint(allocator, "call_{d}", .{index});
+            errdefer allocator.free(id);
+
+            const name = try allocator.dupe(u8, accumulator.name.items);
+            errdefer allocator.free(name);
+
+            const arguments = if (accumulator.arguments.items.len > 0)
+                try allocator.dupe(u8, accumulator.arguments.items)
+            else
+                try allocator.dupe(u8, "{}");
+            errdefer allocator.free(arguments);
+
+            try calls.append(allocator, .{
+                .id = id,
+                .name = name,
+                .arguments = arguments,
+            });
+        }
+    }
+
+    if (calls.items.len == 0) {
+        calls.deinit(allocator);
+        return &.{};
+    }
+
+    return try calls.toOwnedSlice(allocator);
+}
+
+fn finalizeOpenAiStream(ctx: *OpenAiStreamCtx) !root.StreamChatResult {
+    ctx.callback(ctx.callback_ctx, root.StreamChunk.finalChunk());
+    return .{
+        .content = if (ctx.accumulated.items.len > 0) try ctx.allocator.dupe(u8, ctx.accumulated.items) else null,
+        .tool_calls = try buildToolCalls(ctx.allocator, ctx.tool_call_accumulators.items),
+        .usage = .{ .completion_tokens = @intCast((ctx.accumulated.items.len + 3) / 4) },
+        .model = "",
+    };
+}
 
 fn native_openai_chunk(ctx: *OpenAiStreamCtx, bytes: []const u8) anyerror!bool {
     for (bytes) |byte| {
         if (byte == '\n') {
-            const result = parseSseLine(ctx.allocator, ctx.line_buf.items) catch {
+            const keep_streaming = handleOpenAiLine(ctx) catch {
                 ctx.line_buf.clearRetainingCapacity();
                 continue;
             };
-            ctx.line_buf.clearRetainingCapacity();
-            switch (result) {
-                .delta => |text| {
-                    defer ctx.allocator.free(text);
-                    try ctx.accumulated.appendSlice(ctx.allocator, text);
-                    ctx.callback(ctx.callback_ctx, root.StreamChunk.textDelta(text));
-                },
-                .done => return false,
-                .skip => {},
-            }
+            if (!keep_streaming) return false;
         } else {
             try ctx.line_buf.append(ctx.allocator, byte);
         }
@@ -318,24 +515,12 @@ fn native_stream(
     if (status_code < 200 or status_code >= 300) return error.CurlFailed;
 
     if (stream_ctx.line_buf.items.len > 0) {
-        const trailing = parseSseLine(allocator, stream_ctx.line_buf.items) catch null;
-        stream_ctx.line_buf.clearRetainingCapacity();
-        if (trailing) |result| switch (result) {
-            .delta => |text| {
-                defer allocator.free(text);
-                try stream_ctx.accumulated.appendSlice(allocator, text);
-                callback(callback_ctx, root.StreamChunk.textDelta(text));
-            },
-            .done, .skip => {},
+        _ = handleOpenAiLine(&stream_ctx) catch {
+            stream_ctx.line_buf.clearRetainingCapacity();
         };
     }
 
-    callback(callback_ctx, root.StreamChunk.finalChunk());
-    return .{
-        .content = if (stream_ctx.accumulated.items.len > 0) try allocator.dupe(u8, stream_ctx.accumulated.items) else null,
-        .usage = .{ .completion_tokens = @intCast((stream_ctx.accumulated.items.len + 3) / 4) },
-        .model = "",
-    };
+    return finalizeOpenAiStream(&stream_ctx);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -379,10 +564,7 @@ pub fn parseAnthropicSseLine(allocator: std.mem.Allocator, line: []const u8, cur
     }
 
     // Handle "data: {JSON}" lines
-    const data_prefix = "data: ";
-    if (!std.mem.startsWith(u8, trimmed, data_prefix)) return .skip;
-
-    const data = trimmed[data_prefix.len..];
+    const data = extractSseDataPayload(trimmed) orelse return .skip;
 
     if (std.mem.eql(u8, current_event, "message_stop")) return .done;
 
@@ -700,38 +882,56 @@ fn native_stream_anthropic(
 test "parseSseLine valid delta" {
     const allocator = std.testing.allocator;
     const result = try parseSseLine(allocator, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
-    switch (result) {
-        .delta => |text| {
-            defer allocator.free(text);
-            try std.testing.expectEqualStrings("Hello", text);
-        },
-        else => return error.TestUnexpectedResult,
-    }
+    defer result.deinit(allocator);
+    try std.testing.expect(result.text != null);
+    try std.testing.expectEqualStrings("Hello", result.text.?);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_call_deltas.len);
+    try std.testing.expect(!result.done);
+}
+
+test "parseSseLine supports data prefix without trailing space" {
+    const allocator = std.testing.allocator;
+    const result = try parseSseLine(allocator, "data:{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
+    defer result.deinit(allocator);
+    try std.testing.expect(result.text != null);
+    try std.testing.expectEqualStrings("Hello", result.text.?);
+}
+
+test "parseSseLine extracts tool call delta" {
+    const allocator = std.testing.allocator;
+    const result = try parseSseLine(allocator, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"hrs\\\"}\"}}]}}]}");
+    defer result.deinit(allocator);
+    try std.testing.expect(result.text == null);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_call_deltas.len);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_call_deltas[0].index);
+    try std.testing.expectEqualStrings("call_abc", result.tool_call_deltas[0].id.?);
+    try std.testing.expectEqualStrings("web_search", result.tool_call_deltas[0].name.?);
+    try std.testing.expectEqualStrings("{\"query\":\"hrs\"}", result.tool_call_deltas[0].arguments.?);
 }
 
 test "parseSseLine DONE sentinel" {
     const result = try parseSseLine(std.testing.allocator, "data: [DONE]");
-    try std.testing.expect(result == .done);
+    try std.testing.expect(result.done);
 }
 
 test "parseSseLine empty line" {
     const result = try parseSseLine(std.testing.allocator, "");
-    try std.testing.expect(result == .skip);
+    try std.testing.expect(result.isSkip());
 }
 
 test "parseSseLine comment" {
     const result = try parseSseLine(std.testing.allocator, ":keep-alive");
-    try std.testing.expect(result == .skip);
+    try std.testing.expect(result.isSkip());
 }
 
 test "parseSseLine delta without content" {
     const result = try parseSseLine(std.testing.allocator, "data: {\"choices\":[{\"delta\":{}}]}");
-    try std.testing.expect(result == .skip);
+    try std.testing.expect(result.isSkip());
 }
 
 test "parseSseLine empty choices" {
     const result = try parseSseLine(std.testing.allocator, "data: {\"choices\":[]}");
-    try std.testing.expect(result == .skip);
+    try std.testing.expect(result.isSkip());
 }
 
 test "parseSseLine invalid JSON" {
@@ -753,6 +953,68 @@ test "extractDeltaContent without content" {
 test "extractDeltaContent empty content" {
     const result = try extractDeltaContent(std.testing.allocator, "{\"choices\":[{\"delta\":{\"content\":\"\"}}]}");
     try std.testing.expect(result == null);
+}
+
+const StreamRecorder = struct {
+    allocator: std.mem.Allocator,
+    text: std.ArrayListUnmanaged(u8) = .empty,
+    final_chunks: usize = 0,
+
+    fn deinit(self: *StreamRecorder) void {
+        self.text.deinit(self.allocator);
+    }
+
+    fn onChunk(ctx: *anyopaque, chunk: root.StreamChunk) void {
+        const self: *StreamRecorder = @ptrCast(@alignCast(ctx));
+        if (chunk.is_final) {
+            self.final_chunks += 1;
+            return;
+        }
+        self.text.appendSlice(self.allocator, chunk.delta) catch return;
+    }
+};
+
+fn freeStreamChatResult(allocator: std.mem.Allocator, result: *root.StreamChatResult) void {
+    if (result.content) |content| allocator.free(content);
+    for (result.tool_calls) |call| {
+        allocator.free(call.id);
+        allocator.free(call.name);
+        allocator.free(call.arguments);
+    }
+    if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
+    result.* = .{};
+}
+
+test "openai stream accumulates split tool calls and visible text" {
+    const allocator = std.testing.allocator;
+
+    var recorder = StreamRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var stream_ctx = OpenAiStreamCtx{
+        .allocator = allocator,
+        .callback = StreamRecorder.onChunk,
+        .callback_ctx = &recorder,
+    };
+    defer stream_ctx.deinit();
+
+    try stream_ctx.line_buf.appendSlice(allocator, "data: {\"choices\":[{\"delta\":{\"content\":\"Searching \",\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"H\"}}]}}]}");
+    try std.testing.expect(try handleOpenAiLine(&stream_ctx));
+
+    try stream_ctx.line_buf.appendSlice(allocator, "data: {\"choices\":[{\"delta\":{\"content\":\"now\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"RS news\\\"}\"}}]}}]}");
+    try std.testing.expect(try handleOpenAiLine(&stream_ctx));
+
+    var result = try finalizeOpenAiStream(&stream_ctx);
+    defer freeStreamChatResult(allocator, &result);
+
+    try std.testing.expectEqualStrings("Searching now", recorder.text.items);
+    try std.testing.expectEqual(@as(usize, 1), recorder.final_chunks);
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("Searching now", result.content.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_abc", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("web_search", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"query\":\"HRS news\"}", result.tool_calls[0].arguments);
 }
 
 test "StreamChunk textDelta token estimate" {
