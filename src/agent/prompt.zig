@@ -435,16 +435,20 @@ fn buildTaskDecompositionSection(w: anytype) !void {
 fn buildSafetySection(w: anytype) !void {
     try w.writeAll("## Safety\n\n");
     try w.writeAll("- Precedence: verified runtime state, tool results, and direct observations override workspace docs, memory, and inference.\n\n");
-    try w.writeAll("- Preferred tool paths: `schedule` for user time/date/recurrence work; `cron_*` for raw scheduler inspection; `runtime_info` for runtime/session/scheduler truth; `http_request` for known external APIs; `web_search`/`web_fetch` for open-web research; `spawn` for async-now work; `delegate` for specialist subtasks; `message` for explicit outbound sends; `shell` only when no more specific tool is better and policy allows.\n\n");
+    try w.writeAll("- Preferred tool paths: `schedule` for user time/date/recurrence work; `cron_*` for raw scheduler inspection; `runtime_info` for runtime/session/scheduler truth; `composio` for user OAuth-gated apps (Gmail, GitHub, Notion, Slack, etc. — handles auth/refresh); `http_request` for known public APIs or when composio lacks coverage; `web_search`/`web_fetch` for open-web research; `spawn` for async-now work; `delegate` for specialist subtasks; `message` for explicit outbound sends; `task_list`/`task_get`/`task_stop` to observe or cancel long-running work the user started; `shell` only when no more specific tool is better and policy allows.\n\n");
+    try w.writeAll("- Memory writes: use `memory_store` only for facts that will be useful in FUTURE conversations (user preferences, durable decisions, stable project context). Use `memory_edit` to correct existing entries, `memory_forget` to remove outdated ones. Do not save ephemeral turn details, restatements of visible workspace docs, or anything you can re-derive. Scope memory as `session` for per-conversation continuity and `global` for cross-session truths.\n\n");
     try w.writeAll("- On longer work, send short progress updates instead of going silent. Before risky multi-step changes, briefly state the plan. Default to concise, result-first replies and prefer artifacts or links over pasted output.\n\n");
     try w.writeAll(
         "- Slash commands: you may mention `/help` if the user asks what commands exist, `/reset` if they want to start over, `/new` if they ask for a fresh session, `/approve allow-once|deny` if a tool approval is pending. For everything else, prefer concrete actions via your tools over suggesting slash commands. Do not fabricate commands; the short list above is what you may surface by name.\n\n",
     );
+    try w.writeAll(
+        "- Self-control tools: use `set_execution_mode` to switch your own mode proactively — `plan` before a non-trivial implementation (multiple approaches, >2-3 files, architectural choice), back to `execute` once the approach is clear; `review` for read-only verification after changes; `background` only for automated/heartbeat turns. Always include a short `reason` so the user sees why you switched. Use `context_snapshot` to self-inspect (current mode, pending approvals, session key) before deciding on an approach. Both tools are read-only and safe to call.\n\n",
+    );
     try w.writeAll("- Never claim that an action has started or is in progress unless you emit the tool call in the same response. If no tool call is emitted, describe only verified results, limitations, or the next question.\n\n");
+    try w.writeAll("- Reversibility: before destructive or hard-to-undo actions (file delete, branch force-push, `git reset --hard`, schedule delete, large batch overwrite), pause and consider root cause. If unfamiliar state exists (unknown files, unexpected branches, lock files), investigate before overwriting — it may be the user's in-progress work. Resolve merge conflicts rather than discarding changes. Prefer `trash` over `rm`. Ask the user to perform the irreversible action when in doubt.\n\n");
+    try w.writeAll("- Implementation discipline: don't add features, refactor, or introduce abstractions beyond what the task requires. A bug fix doesn't need surrounding cleanup. Three similar lines is better than a premature abstraction. Don't add error handling, fallbacks, or validation for scenarios that can't happen — validate only at system boundaries (user input, external APIs). Default to writing no comments; only add one when the WHY is non-obvious (hidden constraint, subtle invariant, workaround for a specific bug).\n\n");
     try w.writeAll("- Do not exfiltrate private data.\n");
-    try w.writeAll("- Do not run destructive commands without asking.\n");
     try w.writeAll("- Do not bypass oversight or approval mechanisms.\n");
-    try w.writeAll("- Prefer `trash` over `rm`.\n");
     try w.writeAll("- When in doubt, ask before acting externally.\n\n");
     try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
     try w.writeAll("- Memory truth model: fixed workspace docs (`AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`, etc.) are contextual guidance and fallback reference. Canonical runtime memory and continuity live in the primary memory store. Do not assume that seeing a fact in `MEMORY.md` means it is semantically queryable.\n\n");
@@ -1291,6 +1295,7 @@ test "buildSafetySection does not contain turn classification text" {
     // Core safety content remains
     try std.testing.expect(std.mem.indexOf(u8, output, "Precedence: verified runtime state") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Preferred tool paths") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Never claim that an action has started or is in progress") != null);
 }
 
 test "buildConversationContextSection with null produces empty output" {
@@ -1490,7 +1495,8 @@ test "buildSystemPrompt safety characterization unaffected by twin_mode persona"
 
     // Safety rules must still be present
     try std.testing.expect(std.mem.indexOf(u8, p, "Do not exfiltrate private data.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p, "Do not run destructive commands without asking.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "Reversibility:") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "Do not bypass oversight or approval mechanisms.") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "Prefer `trash` over `rm`.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "Implementation discipline:") != null);
 }

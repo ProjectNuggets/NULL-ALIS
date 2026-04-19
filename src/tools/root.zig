@@ -9,6 +9,7 @@ const build_options = @import("build_options");
 const bus = @import("../bus.zig");
 const memory_mod = @import("../memory/root.zig");
 const zaki_state = @import("../zaki_state.zig");
+const observability = @import("../observability.zig");
 const Memory = memory_mod.Memory;
 
 // ── JSON arg extraction helpers ─────────────────────────────────
@@ -93,6 +94,8 @@ pub const task_get = @import("task_get.zig");
 pub const task_stop = @import("task_stop.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
+pub const set_execution_mode = @import("set_execution_mode.zig");
+pub const context_snapshot = @import("context_snapshot.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -427,6 +430,21 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .name = task_stop.TaskStopTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+    },
+
+    // Self-control & self-inspection — read-only, allowed in every mode
+    // including background (so background turns can still snapshot/plan).
+    // `set_execution_mode` is concurrency_safe=false so it's never parallel-
+    // dispatched alongside tools that would observe the old mode mid-batch.
+    .{
+        .name = set_execution_mode.SetExecutionModeTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = false },
+        .risk_level = .low,
+    },
+    .{
+        .name = context_snapshot.ContextSnapshotTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
     },
 };
 
@@ -843,6 +861,17 @@ pub fn allTools(
         try list.append(allocator, tst.tool());
     }
 
+    // Self-control & self-inspection tools — always registered; tools read
+    // the agent controller from a thread-local set by the agent per turn
+    // (see `setAgentController` in this module and `Agent.turn` in agent/root.zig).
+    const semt = try allocator.create(set_execution_mode.SetExecutionModeTool);
+    semt.* = .{};
+    try list.append(allocator, semt.tool());
+
+    const cst = try allocator.create(context_snapshot.ContextSnapshotTool);
+    cst.* = .{};
+    try list.append(allocator, cst.tool());
+
     // MCP tools (pre-initialized externally)
     if (opts.mcp_tools) |mt| {
         for (mt) |t| {
@@ -901,6 +930,76 @@ pub const ToolTenantContext = struct {
 
 threadlocal var current_tenant_context: ToolTenantContext = .{};
 threadlocal var current_turn_context: RuntimeTurnContext = .{};
+threadlocal var current_agent_controller: ?AgentController = null;
+
+/// Agent-self-introspection/control interface exposed to a narrow set of
+/// agent-invokable tools (set_execution_mode, context_snapshot). The agent
+/// installs one of these for the duration of each turn via
+/// `setAgentController`; tools retrieve it via `getAgentController`.
+///
+/// Why an interface (not a direct *Agent pointer): `tools/` cannot import
+/// `agent/root.zig` without creating an import cycle. The controller is
+/// populated on the agent side where it CAN see the full Agent struct.
+pub const AgentController = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        set_execution_mode: *const fn (*anyopaque, mode: []const u8) bool,
+        get_execution_mode: *const fn (*anyopaque) []const u8,
+        snapshot_json: *const fn (*anyopaque, std.mem.Allocator) anyerror![]u8,
+    };
+
+    pub fn setExecutionMode(self: AgentController, mode: []const u8) bool {
+        return self.vtable.set_execution_mode(self.ptr, mode);
+    }
+
+    pub fn getExecutionMode(self: AgentController) []const u8 {
+        return self.vtable.get_execution_mode(self.ptr);
+    }
+
+    pub fn snapshotJson(self: AgentController, allocator: std.mem.Allocator) ![]u8 {
+        return self.vtable.snapshot_json(self.ptr, allocator);
+    }
+};
+
+pub fn setAgentController(ctrl: AgentController) void {
+    current_agent_controller = ctrl;
+}
+
+pub fn clearAgentController() void {
+    current_agent_controller = null;
+}
+
+pub fn getAgentController() ?AgentController {
+    return current_agent_controller;
+}
+
+// ── Tool-scoped observer (per-turn) ─────────────────────────────────
+//
+// Tools that want to surface system_notice events (connector_stale,
+// multimodal_failure, etc.) to the caller's SSE stream read this threadlocal
+// instead of holding a direct Observer pointer. The agent sets it on turn
+// entry; the tool registry (`allTools`) is shared across sessions so
+// holding a pointer on the tool struct itself would bind the wrong session.
+//
+// Observers are per-agent. When running outside an agent (gateway webhook
+// parse, channel poll, etc.) this threadlocal stays null and tools silently
+// drop notices — those paths have no attached user SSE anyway.
+
+threadlocal var current_tool_observer: ?*observability.Observer = null;
+
+pub fn setToolObserver(obs: ?*observability.Observer) void {
+    current_tool_observer = obs;
+}
+
+pub fn clearToolObserver() void {
+    current_tool_observer = null;
+}
+
+pub fn getToolObserver() ?*observability.Observer {
+    return current_tool_observer;
+}
 
 pub fn setMessageTurnContext(ctx: ?MessageTurnContext) void {
     if (ctx) |value| {
@@ -1587,8 +1686,8 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 26 (includes message) + http_request + web_fetch + web_search + browser = 30
-    try std.testing.expectEqual(@as(usize, 30), tools.len);
+    // base 28 (includes message, set_execution_mode, context_snapshot) + http_request + web_fetch + web_search + browser = 32
+    try std.testing.expectEqual(@as(usize, 32), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -1603,8 +1702,8 @@ test "all tools excludes extras when disabled" {
     // shell + file_read + file_write + file_edit + file_append + git + image_info
     // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + memory_forget + delegate + schedule
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + spawn + message = 26
-    try std.testing.expectEqual(@as(usize, 26), tools.len);
+    // + runtime_info + skill_registry + spawn + message + set_execution_mode + context_snapshot = 28
+    try std.testing.expectEqual(@as(usize, 28), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -1730,7 +1829,7 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    try std.testing.expectEqual(@as(usize, 26), tools.len);
+    try std.testing.expectEqual(@as(usize, 28), tools.len);
 
     var found_message = false;
     for (tools) |t| {
@@ -1934,9 +2033,10 @@ test "defaultMetadataRegistry classifies known mutating tools" {
 test "defaultMetadataRegistry only whitelists expected background_safe tools" {
     const registry = defaultMetadataRegistry();
     const background_safe_names = [_][]const u8{
-        "runtime_info", "file_read",      "memory_recall",
-        "memory_list",  "memory_timeline", "web_fetch",
-        "web_search",   "task_list",      "task_get",
+        "runtime_info",    "file_read",      "memory_recall",
+        "memory_list",     "memory_timeline", "web_fetch",
+        "web_search",      "task_list",      "task_get",
+        "set_execution_mode", "context_snapshot",
     };
 
     // Everything in the whitelist must be background_safe.

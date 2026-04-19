@@ -1265,6 +1265,16 @@ pub const Agent = struct {
             tools_mod.setMessageTurnContext(self.message_ctx);
             defer tools_mod.clearMessageTurnContext();
 
+            // Parallel workers run on separate threads; each needs its own
+            // bound controller so self-inspection tools (context_snapshot) see
+            // the same agent as the main turn loop. set_execution_mode is
+            // flagged concurrency_safe=false so it never fans out here.
+            tools_mod.setAgentController(self.agent.controller());
+            defer tools_mod.clearAgentController();
+
+            tools_mod.setToolObserver(&self.agent.observer);
+            defer tools_mod.clearToolObserver();
+
             const worker_allocator = self.arena.allocator();
             const start_ms = std.time.milliTimestamp();
             self.result = self.agent.executeToolUnchecked(worker_allocator, self.call);
@@ -2025,11 +2035,93 @@ pub const Agent = struct {
         return commands.handleSlashCommand(self, message);
     }
 
+    // ── Agent controller (used by set_execution_mode / context_snapshot) ──
+    //
+    // Tools under `src/tools/` cannot import `agent/root.zig` (cycle), so we
+    // expose a narrow vtable they can consult through the thread-local set at
+    // the start of each turn. Self-control tools mutate the agent through
+    // this interface; other tools ignore it.
+
+    fn agentCtrlSetMode(ptr: *anyopaque, mode: []const u8) bool {
+        const agent: *Agent = @ptrCast(@alignCast(ptr));
+        const parsed = execution_mode_mod.ExecutionMode.fromString(mode) orelse return false;
+        agent.execution_mode = parsed;
+        return true;
+    }
+
+    fn agentCtrlGetMode(ptr: *anyopaque) []const u8 {
+        const agent: *Agent = @ptrCast(@alignCast(ptr));
+        return agent.execution_mode.toSlice();
+    }
+
+    fn agentCtrlSnapshot(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+        const agent: *Agent = @ptrCast(@alignCast(ptr));
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        const w = out.writer(allocator);
+        try w.writeAll("{\"execution_mode\":\"");
+        try w.writeAll(agent.execution_mode.toSlice());
+        try w.writeAll("\",\"verbose_level\":\"");
+        try w.writeAll(agent.verbose_level.toSlice());
+        try w.writeAll("\",\"reasoning_mode\":\"");
+        try w.writeAll(agent.reasoning_mode.toSlice());
+        try w.writeAll("\",\"session_key\":");
+        if (agent.memory_session_id) |sid| {
+            try w.print("\"{s}\"", .{sid});
+        } else {
+            try w.writeAll("null");
+        }
+        try w.writeAll(",\"pending_tool_approval\":");
+        if (agent.pending_tool_approval) |pta| {
+            try w.print("{{\"id\":{d},\"tool_name\":\"{s}\",\"risk_level\":\"{s}\"", .{
+                pta.id,
+                pta.tool_name,
+                pta.risk_level.toSlice(),
+            });
+            if (pta.tool_call_id) |tcid| {
+                try w.print(",\"tool_call_id\":\"{s}\"", .{tcid});
+            }
+            try w.writeAll("}");
+        } else {
+            try w.writeAll("null");
+        }
+        try w.writeAll(",\"run_id\":");
+        if (agent.current_run_id) |rid| {
+            try w.print("\"{s}\"", .{rid});
+        } else {
+            try w.writeAll("null");
+        }
+        try w.writeAll("}");
+        return try out.toOwnedSlice(allocator);
+    }
+
+    const agent_controller_vtable: tools_mod.AgentController.VTable = .{
+        .set_execution_mode = agentCtrlSetMode,
+        .get_execution_mode = agentCtrlGetMode,
+        .snapshot_json = agentCtrlSnapshot,
+    };
+
+    pub fn controller(self: *Agent) tools_mod.AgentController {
+        return .{ .ptr = @ptrCast(self), .vtable = &agent_controller_vtable };
+    }
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         const turn_start_ms = std.time.milliTimestamp();
         self.cancellation_token.reset(); // Clear stale cancellation from previous turn
+
+        // Bind the agent controller so self-control tools (set_execution_mode,
+        // context_snapshot) can read/write our state during this turn.
+        tools_mod.setAgentController(self.controller());
+        defer tools_mod.clearAgentController();
+
+        // Bind our observer so tools that emit system_notice events
+        // (connector_stale, etc.) can surface them on THIS session's SSE
+        // stream. Shared `tools_slice` means per-tool observer binding is
+        // wrong — threadlocal per-turn is the only correct scope.
+        tools_mod.setToolObserver(&self.observer);
+        defer tools_mod.clearToolObserver();
 
         // ── WP1.3 Run ID ──────────────────────────────────────────────
         // Mint one stable run ID per turn so all observer events (tool

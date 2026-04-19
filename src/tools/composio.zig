@@ -24,7 +24,10 @@ pub const ComposioTool = struct {
     observer: ?*observability.Observer = null,
 
     fn emitConnectorStaleNotice(self: *const ComposioTool, app_name: []const u8, detail: []const u8) void {
-        const obs = self.observer orelse return;
+        // Prefer the explicitly-bound observer (rare — tools_slice is shared
+        // across sessions so binding per-tool is generally wrong) then fall
+        // back to the per-turn threadlocal set by the running agent.
+        const obs = self.observer orelse root.getToolObserver() orelse return;
         var message_buf: [192]u8 = undefined;
         const message = std.fmt.bufPrint(
             &message_buf,
