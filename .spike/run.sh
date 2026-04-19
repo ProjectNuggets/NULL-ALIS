@@ -25,10 +25,12 @@ mkdir -p "$OUT_DIR"
 
 QUIET=0
 ONLY=""
+POLLUTED=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --quiet) QUIET=1; shift ;;
     --one) ONLY="$2"; shift 2 ;;
+    --polluted) POLLUTED=1; shift ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -56,10 +58,18 @@ grade_one() {
   local outfile="$OUT_DIR/${id}.sse"
   local started
   started=$(date +%s%N)
-  # Unique per-benchmark session key so each test runs cold — no prior
-  # turn history polluting the conversation context.
-  # Lane must be main|thread:<id>|task:<id>|cron:<id>. Use thread:bench-*
-  local session_key="agent:zaki-bot:user:${USER_ID}:thread:bench-${id}-${SESSION_SUFFIX}"
+  # Session key selection:
+  # - cold (default): per-benchmark thread-lane session — no prior turns.
+  # - polluted (--polluted): all benchmarks share the user's :main session,
+  #   exercising the realistic case where accumulated history may contaminate
+  #   the agent's behavior. Used to measure how well prompt+summarizer
+  #   mitigations hold up in practice.
+  local session_key
+  if [[ $POLLUTED -eq 1 ]]; then
+    session_key="agent:zaki-bot:user:${USER_ID}:main"
+  else
+    session_key="agent:zaki-bot:user:${USER_ID}:thread:bench-${id}-${SESSION_SUFFIX}"
+  fi
 
   curl -sN -X POST "$URL" \
     -H "X-Internal-Token: $TOKEN" \
