@@ -305,6 +305,11 @@ pub fn buildSystemPrompt(
     // Tools section
     try buildToolsSection(w, ctx.tools);
 
+    // Response protocol — tool-first dispatch rules. Placed immediately after
+    // Tools so the model sees the tool catalog and the rules that govern its
+    // use as one unit, not as separate concerns.
+    try buildResponseProtocolSection(w);
+
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
 
@@ -445,6 +450,7 @@ fn buildSafetySection(w: anytype) !void {
         "- Self-control tools: use `set_execution_mode` to switch your own mode proactively — `plan` before a non-trivial implementation (multiple approaches, >2-3 files, architectural choice), back to `execute` once the approach is clear; `review` for read-only verification after changes; `background` only for automated/heartbeat turns. Always include a short `reason` so the user sees why you switched. Use `context_snapshot` to self-inspect (current mode, pending approvals, session key) before deciding on an approach. Both tools are read-only and safe to call.\n\n",
     );
     try w.writeAll("- Never claim that an action has started or is in progress unless you emit the tool call in the same response. If no tool call is emitted, describe only verified results, limitations, or the next question.\n\n");
+    try w.writeAll("- Never fabricate tool evidence. You only have search results from `web_search`/`web_fetch` calls you emit THIS turn, file contents from `file_read`/`shell` calls you emit this turn, snapshot data from `context_snapshot` calls you emit this turn, and memory hits from `memory_recall`/`memory_list`/`memory_timeline` calls you emit this turn. Phrasings like \"From my search:\", \"Based on the file:\", \"My snapshot shows:\", \"I checked memory and found:\" are prohibited unless the matching tool call appears in the same response. When the user asks about a product, service, framework, library, company, or any specific external term you have not verifiably encountered through a tool call in this session, `web_search` is not optional — it is your first action before answering, and you do not answer from guesses or training-data recall.\n\n");
     try w.writeAll("- Reversibility: before destructive or hard-to-undo actions (file delete, branch force-push, `git reset --hard`, schedule delete, large batch overwrite), pause and consider root cause. If unfamiliar state exists (unknown files, unexpected branches, lock files), investigate before overwriting — it may be the user's in-progress work. Resolve merge conflicts rather than discarding changes. Prefer `trash` over `rm`. Ask the user to perform the irreversible action when in doubt.\n\n");
     try w.writeAll("- Implementation discipline: don't add features, refactor, or introduce abstractions beyond what the task requires. A bug fix doesn't need surrounding cleanup. Three similar lines is better than a premature abstraction. Don't add error handling, fallbacks, or validation for scenarios that can't happen — validate only at system boundaries (user input, external APIs). Default to writing no comments; only add one when the WHY is non-obvious (hidden constraint, subtle invariant, workaround for a specific bug).\n\n");
     try w.writeAll("- Do not exfiltrate private data.\n");
@@ -510,6 +516,23 @@ fn buildToolsSection(w: anytype, tools: []const Tool) !void {
         });
     }
     try w.writeAll("\n");
+}
+
+/// Emit the response protocol — tool-first dispatch rules.
+/// Appears immediately after the Tools section so the model reads the tool
+/// catalog and the rules governing their use as one unit.
+fn buildResponseProtocolSection(w: anytype) !void {
+    try w.writeAll("## Response Protocol\n\n");
+    try w.writeAll("Before composing any reply, classify the request and fire the minimum grounding tool. These are not suggestions — they are the protocol.\n\n");
+    try w.writeAll("- External term (product, framework, library, company, person, unfamiliar concept): `web_search` FIRST. Answering from training recall about a specific named thing is a failure mode, even if you feel confident.\n");
+    try w.writeAll("- \"Read this file\", \"what does X file say\", \"summarize file Y\": `file_read` FIRST.\n");
+    try w.writeAll("- \"Run command\", \"check commit\", \"list files\", \"git log\", \"show me output\": `shell` FIRST.\n");
+    try w.writeAll("- \"What mode are you in\", \"what tools do you have\", \"self-inspect\", \"context snapshot\": `context_snapshot` FIRST.\n");
+    try w.writeAll("- \"What have I / you done\", \"recent work\", \"last session\", \"yesterday\", \"earlier\": `memory_timeline` or `memory_recall` FIRST.\n");
+    try w.writeAll("- \"Fetch this URL\", \"what's at link X\": `web_fetch` FIRST.\n\n");
+    try w.writeAll("A confident answer to any of the above WITHOUT the matching tool call in the same response is hallucination. The phrase \"From my search:\" or \"I checked and found:\" without a matching tool call in the same response is prohibited — the user has a log of your tool calls and will see you did not actually call the tool.\n\n");
+    try w.writeAll("Skip the tool only when: (a) the answer is already in this turn's context (tool results you see above, user-provided file content, user-quoted text), or (b) the question is purely about reasoning/preference that no tool could ground (\"what's 2+2\", \"tell me a joke\", \"do you think X is a good idea\").\n\n");
+    try w.writeAll("When multiple tools apply, pick the most specific: `file_read` over `shell cat`, `memory_recall` over `shell grep ~/.memory`, `schedule` over `cron_*`.\n\n");
 }
 
 fn appendChannelAttachmentsSection(w: anytype) !void {

@@ -79,12 +79,14 @@ grade_one() {
     return
   fi
 
-  # Extract tool calls from progress frames
+  # Extract tool calls from SSE. Tool-start events arrive as reasoning_summary
+  # frames of shape: {"type":"reasoning_summary","phase":"tool","tool":"NAME",...}
+  # Match the phase+tool combination (no state field on these frames).
   local tools_fired
-  tools_fired=$(grep -oE '"phase":"tool","state":"start"[^}]*"tool":"[^"]+"' "$outfile" \
+  tools_fired=$(grep -oE '"phase":"tool"[^}]*"tool":"[^"]+"' "$outfile" \
     | grep -oE '"tool":"[^"]+"' | sort -u | tr '\n' ',' | sed 's/,$//')
   local tool_count
-  tool_count=$(grep -c '"phase":"tool","state":"start"' "$outfile" || true)
+  tool_count=$(grep -oE '"phase":"tool"[^}]*"tool":"[^"]+"' "$outfile" | wc -l | tr -d ' ')
   TOOL_CALL_SUM=$((TOOL_CALL_SUM + tool_count))
 
   # Reconstruct reply by concatenating deltas (skip narration, only final_reply kind)
