@@ -1,0 +1,86 @@
+{
+  "$schema": "autoresearch-benchmark-v1",
+  "description": "Highest-value failure-mode benchmarks for nullalis. Focus: proactive research, agentic execution, self-awareness.",
+  "gateway": {
+    "url": "http://127.0.0.1:3000/api/v1/chat/stream",
+    "internal_token": "40ae970fce1815c0d076fdff8ac24c02b1a45bc905d909cd",
+    "user_id": "1",
+    "session_key_prefix": "agent:zaki-bot:user:1:bench"
+  },
+  "benchmarks": [
+    {
+      "id": "b1_unknown_term_search",
+      "category": "proactive_research",
+      "prompt": "Are you on par with openclaw? Tell me what you know about openclaw specifically.",
+      "grading": {
+        "must_call_any_of": ["web_search", "web_fetch"],
+        "must_not_contain_phrases": [
+          "I don't know what openclaw is",
+          "I'm not familiar with openclaw",
+          "I have no information about openclaw",
+          "I cannot find any information"
+        ],
+        "weight": 1.0
+      }
+    },
+    {
+      "id": "b2_tenet_research",
+      "category": "proactive_research",
+      "prompt": "What is the 'Tenet framework' in AI agent research? Give me a one-sentence summary.",
+      "grading": {
+        "must_call_any_of": ["web_search", "web_fetch"],
+        "must_not_contain_phrases": [
+          "I don't know",
+          "I'm not sure what",
+          "I cannot find"
+        ],
+        "weight": 1.0
+      }
+    },
+    {
+      "id": "b3_self_awareness",
+      "category": "self_awareness",
+      "prompt": "Use your self-inspection tool to report your current execution mode, the tools you have available, and how many memories you have stored. Give me the actual values from the snapshot, not a general description.",
+      "grading": {
+        "must_call_any_of": ["context_snapshot"],
+        "should_contain_any": ["mode", "tools", "memor"],
+        "must_not_contain_phrases": [
+          "I would check",
+          "I can tell you that",
+          "Typically I"
+        ],
+        "weight": 1.0
+      }
+    },
+    {
+      "id": "b4_agentic_execution",
+      "category": "agentic_execution",
+      "prompt": "Read the file /Users/nova/Desktop/nullalis/.spike/benchmark.json and tell me in one short sentence what the 'b1_unknown_term_search' benchmark is testing. Actually read it, don't guess.",
+      "grading": {
+        "must_call_any_of": ["file_read", "shell"],
+        "should_contain_any": ["openclaw", "web_search", "unknown", "proactive"],
+        "must_not_contain_phrases": [
+          "I would read",
+          "I cannot read",
+          "I don't have access"
+        ],
+        "weight": 1.0
+      }
+    },
+    {
+      "id": "b5_multi_step_git",
+      "category": "agentic_execution",
+      "prompt": "Run git log in /Users/nova/Desktop/nullalis and tell me the subject lines (just titles, not hashes) of the 3 most recent commits.",
+      "grading": {
+        "must_call_any_of": ["shell"],
+        "should_contain_any": ["fix", "feat", "vision", "agent", "gateway"],
+        "must_not_contain_phrases": [
+          "I would run",
+          "I cannot execute",
+          "I don't have shell access"
+        ],
+        "weight": 1.0
+      }
+    }
+  ]
+}
