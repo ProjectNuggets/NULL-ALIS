@@ -368,6 +368,12 @@ pub const Agent = struct {
     configured_providers: []const config_types.ProviderEntry = &.{},
     fallback_providers: []const []const u8 = &.{},
     model_fallbacks: []const config_types.ModelFallbackEntry = &.{},
+    /// Vision-capable fallback model wired from reliability.vision_fallback.
+    /// When the current turn contains image content and the default model
+    /// doesn't support vision, the turn swaps to this model. Empty =
+    /// fallback disabled (current-regression behavior: images silently
+    /// dropped by text-only models).
+    vision_fallback_model: []const u8 = "",
     temperature: f64,
     /// Sidecar provider for cheap auxiliary LLM calls (narration, compaction).
     /// null = sidecar not configured, features degrade gracefully.
@@ -577,6 +583,7 @@ pub const Agent = struct {
             .configured_providers = cfg.providers,
             .fallback_providers = cfg.reliability.fallback_providers,
             .model_fallbacks = cfg.reliability.model_fallbacks,
+            .vision_fallback_model = cfg.reliability.vision_fallback.model,
             .temperature = cfg.default_temperature,
             .workspace_dir = cfg.workspace_dir,
             .allowed_paths = cfg.autonomy.allowed_paths,
@@ -2495,6 +2502,31 @@ pub const Agent = struct {
             } };
             self.observer.recordEvent(&build_stage_event);
 
+            // Vision routing. If any message carries image content AND the
+            // current model doesn't support vision AND a vision fallback
+            // model is configured, swap to it for THIS turn only. This
+            // restores the image-handling behaviour implicitly lost when
+            // commit f69e555 removed the hard pre-gate without wiring a
+            // replacement route. Keeps same provider — most providers
+            // (together, openrouter) serve both text and vision models.
+            var effective_model: []const u8 = self.model_name;
+            if (self.vision_fallback_model.len > 0 and hasImageContentParts(messages)) {
+                if (!self.provider.supportsVisionForModel(self.model_name)) {
+                    effective_model = self.vision_fallback_model;
+                    log.info("turn.stage stage=vision_fallback iteration={d} from={s} to={s}", .{
+                        iteration, self.model_name, self.vision_fallback_model,
+                    });
+                    const notice = ObserverEvent{ .system_notice = .{
+                        .kind = "vision_fallback",
+                        .severity = "info",
+                        .message = "Model routed to vision-capable fallback for this turn (image attached).",
+                        .detail = self.vision_fallback_model,
+                        .run_id = self.current_run_id,
+                    } };
+                    self.observer.recordEvent(&notice);
+                }
+            }
+
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
             var saw_stream_first_token = false;
@@ -2516,14 +2548,14 @@ pub const Agent = struct {
                     self.allocator,
                     .{
                         .messages = messages,
-                        .model = self.model_name,
+                        .model = effective_model,
                         .temperature = self.temperature,
                         .max_tokens = self.max_tokens,
                         .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
-                    self.model_name,
+                    effective_model,
                     self.temperature,
                     streamCallbackWithTiming,
                     @ptrCast(&stream_timing_ctx.?),
@@ -2578,14 +2610,14 @@ pub const Agent = struct {
                     self.allocator,
                     .{
                         .messages = messages,
-                        .model = self.model_name,
+                        .model = effective_model,
                         .temperature = self.temperature,
                         .max_tokens = self.max_tokens,
                         .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
-                    self.model_name,
+                    effective_model,
                     self.temperature,
                 ) catch |err| retry_blk: {
                     log.warn("llm.call failed provider={s} model={s} error={s}", .{
@@ -3568,6 +3600,20 @@ pub const Agent = struct {
         return multimodal.prepareMessagesForProvider(arena, m, .{
             .allowed_dirs = allowed,
         });
+    }
+
+    /// Returns true if any message in the slice has image content_parts.
+    /// Used to decide whether to swap to a vision-capable fallback model
+    /// for this turn (see agent/root.zig vision_fallback routing).
+    fn hasImageContentParts(messages: []const ChatMessage) bool {
+        for (messages) |msg| {
+            const parts = msg.content_parts orelse continue;
+            for (parts) |part| switch (part) {
+                .image_url, .image_base64 => return true,
+                else => {},
+            };
+        }
+        return false;
     }
 
     fn appendMultimodalAllowedDir(

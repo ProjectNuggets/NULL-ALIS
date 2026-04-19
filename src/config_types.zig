@@ -136,6 +136,26 @@ pub const ReliabilityConfig = struct {
     fallback_providers: []const []const u8 = &.{},
     api_keys: []const []const u8 = &.{},
     model_fallbacks: []const ModelFallbackEntry = &.{},
+    /// Vision-capable fallback used when the current turn contains image
+    /// content but the default model doesn't support vision. Restores the
+    /// behaviour implicitly lost in commit f69e555 (2026-03-14), which
+    /// removed the hard `ProviderDoesNotSupportVision` gate in favour of
+    /// soft observability without wiring a replacement route. When empty
+    /// (defaults), image-containing turns still run on the default model
+    /// and the model simply ignores them — current regression. Set this
+    /// to route those turns through a cheap vision-capable model instead.
+    vision_fallback: VisionFallbackConfig = .{},
+};
+
+pub const VisionFallbackConfig = struct {
+    /// Provider name (must match an entry in `models.providers`).
+    /// Empty string disables vision routing.
+    provider: []const u8 = "",
+    /// Model name at that provider. Suggested cheap choices:
+    ///   together: `meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo`
+    ///   openrouter: `google/gemini-2.0-flash-exp:free`
+    ///   groq: `meta-llama/llama-4-scout-17b-16e-instruct`
+    model: []const u8 = "",
 };
 
 pub const SchedulerConfig = struct {
