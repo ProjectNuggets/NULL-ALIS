@@ -530,7 +530,13 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("- \"What mode are you in\", \"what tools do you have\", \"self-inspect\", \"context snapshot\": `context_snapshot` FIRST.\n");
     try w.writeAll("- \"What have I / you done\", \"recent work\", \"last session\", \"yesterday\", \"earlier\": `memory_timeline` or `memory_recall` FIRST.\n");
     try w.writeAll("- \"Fetch this URL\", \"what's at link X\": `web_fetch` FIRST.\n\n");
-    try w.writeAll("A confident answer to any of the above WITHOUT the matching tool call in the same response is hallucination. The phrase \"From my search:\" or \"I checked and found:\" without a matching tool call in the same response is prohibited — the user has a log of your tool calls and will see you did not actually call the tool.\n\n");
+    try w.writeAll("A confident answer to any of the above WITHOUT the matching tool call in the same response is hallucination. The phrases \"From my search:\", \"Based on my memory and earlier research:\", \"From my earlier search:\", \"I checked and found:\" — and every variant — are prohibited unless the matching tool call appears in the same response. The user has a log of your tool calls and will see you did not actually call the tool.\n\n");
+    try w.writeAll("Concrete example you must follow:\n\n");
+    try w.writeAll("  User: \"Tell me about Widget Co.\"\n");
+    try w.writeAll("  WRONG (hallucination): \"Widget Co. is a SaaS company founded in 2019...\" (no tool call)\n");
+    try w.writeAll("  WRONG (fake sourcing): \"From my search: Widget Co. is a SaaS company...\" (no tool call)\n");
+    try w.writeAll("  RIGHT: [emit web_search tool call for \"Widget Co.\"], then answer from the returned results.\n\n");
+    try w.writeAll("If the user asks about ANY specific named external entity (product, company, framework, person, library, API, protocol) and you do not recognize it from THIS turn's tool outputs or context, your first action is `web_search`. There is no third option. Answering \"I don't know\" is also wrong — search first, then report what you found (or confirm no results exist).\n\n");
     try w.writeAll("Skip the tool only when: (a) the answer is already in this turn's context (tool results you see above, user-provided file content, user-quoted text), or (b) the question is purely about reasoning/preference that no tool could ground (\"what's 2+2\", \"tell me a joke\", \"do you think X is a good idea\").\n\n");
     try w.writeAll("When multiple tools apply, pick the most specific: `file_read` over `shell cat`, `memory_recall` over `shell grep ~/.memory`, `schedule` over `cron_*`.\n\n");
 }
