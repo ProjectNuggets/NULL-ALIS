@@ -197,12 +197,21 @@ pub const RunEventObserver = struct {
                 }
             },
             .narration_frame => |e| {
-                // The model's actual reasoning_content arrives here with
-                // frame_type=.thinking. Route it to `reasoning_summary` so
-                // the UI's narration channel shows the agent's own voice,
-                // not just static phase labels. Other frame types
-                // (tool_start/tool_done/waiting/listening/etc.) stay as
-                // `progress` events — they're chrome, not prose.
+                // Dual emit for compatibility: preserve the existing
+                // `progress phase=thinking` stream that the zaki-prod
+                // frontend already renders as narration AND add the
+                // `reasoning_summary` stream so future frontends (or
+                // richer renderings) can consume the same content as
+                // structured narration events. Reverting this to one
+                // channel only would break either the Saturday UI or
+                // the richer consumer path. Both fire; frontend picks
+                // whichever it renders.
+                self.emit(.{ .progress = .{
+                    .phase = @tagName(e.frame_type),
+                    .state = "update",
+                    .label = e.message,
+                    .tool = e.tool_name,
+                } });
                 switch (e.frame_type) {
                     .thinking, .plan_step => {
                         self.emitReasoningSummary(
@@ -213,14 +222,7 @@ pub const RunEventObserver = struct {
                             null,
                         );
                     },
-                    else => {
-                        self.emit(.{ .progress = .{
-                            .phase = @tagName(e.frame_type),
-                            .state = "update",
-                            .label = e.message,
-                            .tool = e.tool_name,
-                        } });
-                    },
+                    else => {},
                 }
             },
             .agent_end => |e| self.emit(.{ .done = .{
@@ -495,7 +497,10 @@ test "turn_stage produces progress SSE frame with label" {
     try std.testing.expect(std.mem.indexOf(u8, frame, "Running tools") != null);
 }
 
-test "narration_frame thinking produces reasoning_summary SSE frame" {
+test "narration_frame thinking produces both progress AND reasoning_summary SSE frames" {
+    // Dual-emit is intentional: the legacy frontend renders narration from
+    // the `progress phase=thinking` event; richer consumers read
+    // `reasoning_summary`. Both must fire so either UI shows the agent's voice.
     var noop = observability.NoopObserver{};
     const allocator = std.testing.allocator;
     var test_sink = TestFrameSink.init(allocator);
@@ -507,11 +512,14 @@ test "narration_frame thinking produces reasoning_summary SSE frame" {
         .frame_type = .thinking,
     } };
     obs.recordEvent(&evt);
-    const frame = test_sink.firstFrameWithPrefix("event: reasoning_summary\n") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, frame, "\"phase\":\"thinking\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "The user is asking about X") != null);
-    // Should NOT also produce a progress frame for the same event.
-    try std.testing.expect(test_sink.firstFrameWithPrefix("event: progress\n") == null);
+
+    const progress_frame = test_sink.firstFrameWithPrefix("event: progress\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, progress_frame, "\"phase\":\"thinking\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, progress_frame, "The user is asking about X") != null);
+
+    const reasoning_frame = test_sink.firstFrameWithPrefix("event: reasoning_summary\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, reasoning_frame, "\"phase\":\"thinking\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reasoning_frame, "The user is asking about X") != null);
 }
 
 test "narration_frame produces progress SSE frame" {
