@@ -1309,37 +1309,15 @@ pub const Agent = struct {
         return @intCast(hash % 100);
     }
 
-    fn toolCallHasAction(allocator: std.mem.Allocator, arguments_json: []const u8, expected_action: []const u8) bool {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{}) catch return false;
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |obj| obj,
-            else => return false,
-        };
-        const raw = switch (object.get("action") orelse return false) {
-            .string => |value| value,
-            else => return false,
-        };
-        return std.mem.eql(u8, raw, expected_action);
-    }
-
     fn isParallelSafeToolCall(self: *const Agent, call: ParsedToolCall) bool {
-        if (std.mem.eql(u8, call.name, tools_mod.runtime_info.RuntimeInfoTool.tool_name)) return true;
-        if (std.mem.eql(u8, call.name, tools_mod.file_read.FileReadTool.tool_name)) return true;
-        if (std.mem.eql(u8, call.name, tools_mod.web_search.WebSearchTool.tool_name)) return true;
-        if (std.mem.eql(u8, call.name, tools_mod.web_fetch.WebFetchTool.tool_name)) return true;
-
-        if (std.mem.eql(u8, call.name, tools_mod.schedule.ScheduleTool.tool_name)) {
-            return toolCallHasAction(self.allocator, call.arguments_json, "list") or
-                toolCallHasAction(self.allocator, call.arguments_json, "get") or
-                toolCallHasAction(self.allocator, call.arguments_json, "runs");
-        }
-
-        if (std.mem.eql(u8, call.name, tools_mod.composio.ComposioTool.tool_name)) {
-            return toolCallHasAction(self.allocator, call.arguments_json, "list");
-        }
-
-        return false;
+        // Single source of truth: `ToolMetadata.flags.concurrency_safe`
+        // resolved via canonicalMetadataForCall (which performs args-aware
+        // refinement for action-dispatched tools like schedule/composio).
+        // This used to be a hardcoded allowlist that drifted from the
+        // metadata registry — see the migration note in tools/root.zig's
+        // refineMetadata.
+        const meta = tools_mod.canonicalMetadataForCall(self.allocator, call.name, call.arguments_json);
+        return meta.flags.concurrency_safe;
     }
 
     /// Resolve tool metadata for a call via the canonical helper in
@@ -8109,6 +8087,112 @@ test "Agent parallel dispatcher rollout canary gates by session bucket" {
     agent.parallel_tools_rollout_percent = 1;
     const bucket = agent.parallelDispatchSessionBucket();
     try std.testing.expectEqual(bucket < 1, agent.parallelDispatchCanaryAllowsSession());
+}
+
+test "isParallelSafeToolCall derives from metadata, not a hardcoded allowlist" {
+    // Regression lock: before this refactor, parallel-dispatch eligibility
+    // was a hardcoded name/action allowlist that drifted from the metadata
+    // registry. Several tools (memory_recall, task_list, context_snapshot,
+    // etc.) carried concurrency_safe=true but were never parallel-dispatched.
+    // After the fix, the metadata flag is the single source of truth.
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .parallel_tools = true,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    // Read-only + concurrency_safe → parallel-safe.
+    try std.testing.expect(agent.isParallelSafeToolCall(.{
+        .name = "memory_recall",
+        .arguments_json = "{\"query\":\"x\"}",
+        .tool_call_id = null,
+    }));
+    try std.testing.expect(agent.isParallelSafeToolCall(.{
+        .name = "context_snapshot",
+        .arguments_json = "{}",
+        .tool_call_id = null,
+    }));
+    try std.testing.expect(agent.isParallelSafeToolCall(.{
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"x\"}",
+        .tool_call_id = null,
+    }));
+    try std.testing.expect(agent.isParallelSafeToolCall(.{
+        .name = "web_fetch",
+        .arguments_json = "{\"url\":\"https://example.com\"}",
+        .tool_call_id = null,
+    }));
+
+    // Read-only self-control but explicitly concurrency_safe=false — must NOT parallel.
+    try std.testing.expect(!agent.isParallelSafeToolCall(.{
+        .name = "set_execution_mode",
+        .arguments_json = "{\"mode\":\"plan\",\"reason\":\"x\"}",
+        .tool_call_id = null,
+    }));
+
+    // Mutating base tool — never parallel.
+    try std.testing.expect(!agent.isParallelSafeToolCall(.{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"ls\"}",
+        .tool_call_id = null,
+    }));
+    try std.testing.expect(!agent.isParallelSafeToolCall(.{
+        .name = "file_write",
+        .arguments_json = "{\"path\":\"x\",\"content\":\"y\"}",
+        .tool_call_id = null,
+    }));
+
+    // Args-aware refinement: schedule.list/get/runs → parallel-safe; schedule.create → not.
+    try std.testing.expect(agent.isParallelSafeToolCall(.{
+        .name = "schedule",
+        .arguments_json = "{\"action\":\"list\"}",
+        .tool_call_id = null,
+    }));
+    try std.testing.expect(agent.isParallelSafeToolCall(.{
+        .name = "schedule",
+        .arguments_json = "{\"action\":\"get\",\"id\":\"x\"}",
+        .tool_call_id = null,
+    }));
+    try std.testing.expect(!agent.isParallelSafeToolCall(.{
+        .name = "schedule",
+        .arguments_json = "{\"action\":\"create\",\"expression\":\"* * * * *\"}",
+        .tool_call_id = null,
+    }));
+
+    // Composio: list → parallel-safe, execute → not.
+    try std.testing.expect(agent.isParallelSafeToolCall(.{
+        .name = "composio",
+        .arguments_json = "{\"action\":\"list\"}",
+        .tool_call_id = null,
+    }));
+    try std.testing.expect(!agent.isParallelSafeToolCall(.{
+        .name = "composio",
+        .arguments_json = "{\"action\":\"execute\",\"action_name\":\"gmail.send\"}",
+        .tool_call_id = null,
+    }));
+
+    // Unknown tool → conservative (mutating=true, concurrency_safe=false).
+    try std.testing.expect(!agent.isParallelSafeToolCall(.{
+        .name = "no_such_tool",
+        .arguments_json = "{}",
+        .tool_call_id = null,
+    }));
 }
 
 test "Agent streaming fields can be set" {

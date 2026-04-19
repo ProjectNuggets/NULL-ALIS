@@ -265,12 +265,12 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         .name = web_search.WebSearchTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true },
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
     },
     .{
         .name = web_fetch.WebFetchTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true },
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .medium,
     },
     .{
@@ -564,6 +564,13 @@ pub fn refineMetadata(base: metadata.ToolMetadata, args: JsonObjectMap) metadata
     var refined = base;
     refined.flags.read_only = true;
     refined.flags.mutating = false;
+    // Read-only action-specific dispatch is inherently concurrency-safe —
+    // no write side-effects means no racing on shared state. This keeps
+    // the single-source-of-truth invariant: `flags.concurrency_safe` is
+    // the canonical signal for parallel-dispatch eligibility. Without
+    // this, `schedule list` / `composio list` would lose parallel-dispatch
+    // capability when we rely on metadata (see `isParallelSafeToolCall`).
+    refined.flags.concurrency_safe = true;
     return refined;
 }
 
