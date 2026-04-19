@@ -8691,6 +8691,13 @@ const LiveSseCtx = struct {
     /// Paced sink for inter-chunk delays (human-pacing). When non-null,
     /// liveStreamCallback writes through this instead of sendFrameFn directly.
     paced_sink: ?*gateway_run_events.PacedFrameSink = null,
+    /// Buffer for incomplete UTF-8 byte sequences that straddle a provider
+    /// chunk boundary. Max unfinished codepoint is 3 bytes (a 4-byte UTF-8
+    /// codepoint minus its lead byte). Next chunk prepends these bytes so
+    /// multi-byte codepoints (emoji, em-dash, etc.) emit intact instead of
+    /// being turned into U+FFFD by the JSON encoder.
+    utf8_tail: [4]u8 = undefined,
+    utf8_tail_len: u8 = 0,
 
     /// FrameSink-compatible write that delegates to the error-returning
     /// sendFrameFn, setting client_gone on failure. Used as the inner
@@ -8757,11 +8764,88 @@ const LiveProviderRoundResetObserver = struct {
     }
 };
 
+/// Returns the index up to which `bytes` is safe to emit as UTF-8. If the
+/// tail contains an incomplete multi-byte codepoint, returns the byte index
+/// of the incomplete lead byte; everything before that is complete. Caller
+/// should hold back `bytes[ret..]` and prepend it to the next chunk.
+fn utf8SafeEmitLen(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    // UTF-8: ≤4 bytes per codepoint, so the tail can hold at most 3
+    // continuation bytes before the missing lead byte. Walk backward that
+    // far at most.
+    var i: usize = bytes.len;
+    var cont_count: usize = 0;
+    // `cont_count <= 3` is critical: a 4-byte codepoint has 3 continuation
+    // bytes after its lead byte, so we must allow one more iteration
+    // AFTER walking past 3 continuations to actually inspect the lead.
+    while (i > 0 and cont_count <= 3) {
+        const b = bytes[i - 1];
+        if ((b & 0b1000_0000) == 0) {
+            // ASCII byte — codepoint self-contained, safe to emit to end.
+            return bytes.len;
+        }
+        if ((b & 0b1100_0000) == 0b1000_0000) {
+            // Continuation byte — walk further back.
+            i -= 1;
+            cont_count += 1;
+            continue;
+        }
+        // Lead byte. Determine expected codepoint length from its high bits.
+        const expected: usize = if ((b & 0b1111_1000) == 0b1111_0000)
+            4
+        else if ((b & 0b1111_0000) == 0b1110_0000)
+            3
+        else if ((b & 0b1110_0000) == 0b1100_0000)
+            2
+        else
+            1; // malformed lead byte; treat as single
+        const available = bytes.len - (i - 1);
+        if (available < expected) {
+            // Incomplete codepoint — hold back from the lead byte onward.
+            return i - 1;
+        }
+        return bytes.len;
+    }
+    // Three continuation bytes in a row without a lead — malformed. Hold
+    // them back; the next chunk may provide the lead (or they stay as
+    // bad input, but that's not something we can fix here).
+    return i;
+}
+
 fn liveStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
-    if (chunk.delta.len == 0) return; // skip empty/final-only chunks
     const ctx: *LiveSseCtx = @ptrCast(@alignCast(ctx_ptr));
     if (ctx.client_gone.*) return; // client disconnected — skip remaining tokens
-    const frame = sseTokenFrame(ctx.allocator, chunk.delta, ctx.seq.*) catch return;
+
+    if (chunk.is_final) {
+        // Stream end. If the UTF-8 tail still holds an incomplete sequence,
+        // drop it — provider truncated mid-codepoint and emitting garbage
+        // bytes would just become U+FFFD at the frontend.
+        ctx.utf8_tail_len = 0;
+        return;
+    }
+    if (chunk.delta.len == 0) return; // empty/keep-alive chunks
+
+    // Prepend any held tail bytes so a multi-byte codepoint that straddled
+    // the provider's chunk boundary is stitched back together before we
+    // emit anything.
+    var merged: std.ArrayListUnmanaged(u8) = .empty;
+    defer merged.deinit(ctx.allocator);
+    if (ctx.utf8_tail_len > 0) {
+        merged.appendSlice(ctx.allocator, ctx.utf8_tail[0..ctx.utf8_tail_len]) catch return;
+    }
+    merged.appendSlice(ctx.allocator, chunk.delta) catch return;
+    ctx.utf8_tail_len = 0;
+
+    const emit_len = utf8SafeEmitLen(merged.items);
+    const remaining = merged.items[emit_len..];
+    if (remaining.len > 0 and remaining.len <= ctx.utf8_tail.len) {
+        @memcpy(ctx.utf8_tail[0..remaining.len], remaining);
+        ctx.utf8_tail_len = @intCast(remaining.len);
+    }
+
+    if (emit_len == 0) return; // nothing complete to emit yet
+
+    const frame = sseTokenFrame(ctx.allocator, merged.items[0..emit_len], ctx.seq.*) catch return;
     defer ctx.allocator.free(frame);
     if (ctx.paced_sink) |paced| {
         paced.sink().write(frame);
@@ -17633,6 +17717,64 @@ test "larkSessionKeyRouted uses route engine when config exists" {
 }
 
 // ── extractBody tests ────────────────────────────────────────────
+
+test "utf8SafeEmitLen handles ASCII-only chunks" {
+    const s = "hello world";
+    try std.testing.expectEqual(s.len, utf8SafeEmitLen(s));
+}
+
+test "utf8SafeEmitLen handles complete 2-byte codepoint at end" {
+    const s = "café"; // ends with 'é' = 0xC3 0xA9
+    try std.testing.expectEqual(s.len, utf8SafeEmitLen(s));
+}
+
+test "utf8SafeEmitLen handles complete 3-byte codepoint at end (em-dash)" {
+    // "ok —" = 'o' 'k' ' ' 0xE2 0x80 0x94
+    const bytes = [_]u8{ 'o', 'k', ' ', 0xE2, 0x80, 0x94 };
+    try std.testing.expectEqual(bytes.len, utf8SafeEmitLen(&bytes));
+}
+
+test "utf8SafeEmitLen handles complete 4-byte codepoint at end (fire emoji)" {
+    // 🔥 = 0xF0 0x9F 0x94 0xA5
+    const bytes = [_]u8{ 'h', 'i', ' ', 0xF0, 0x9F, 0x94, 0xA5 };
+    try std.testing.expectEqual(bytes.len, utf8SafeEmitLen(&bytes));
+}
+
+test "utf8SafeEmitLen holds back incomplete 4-byte codepoint (1 of 4)" {
+    // Only the lead byte of 🔥
+    const bytes = [_]u8{ 'h', 'i', ' ', 0xF0 };
+    try std.testing.expectEqual(@as(usize, 3), utf8SafeEmitLen(&bytes));
+}
+
+test "utf8SafeEmitLen holds back incomplete 4-byte codepoint (2 of 4)" {
+    // Lead + 1 continuation of 🔥
+    const bytes = [_]u8{ 'h', 'i', ' ', 0xF0, 0x9F };
+    try std.testing.expectEqual(@as(usize, 3), utf8SafeEmitLen(&bytes));
+}
+
+test "utf8SafeEmitLen holds back incomplete 4-byte codepoint (3 of 4)" {
+    // Lead + 2 continuations of 🔥
+    const bytes = [_]u8{ 'h', 'i', ' ', 0xF0, 0x9F, 0x94 };
+    try std.testing.expectEqual(@as(usize, 3), utf8SafeEmitLen(&bytes));
+}
+
+test "utf8SafeEmitLen holds back incomplete 3-byte codepoint (2 of 3)" {
+    // Em-dash lead + 1 continuation
+    const bytes = [_]u8{ 'o', 'k', ' ', 0xE2, 0x80 };
+    try std.testing.expectEqual(@as(usize, 3), utf8SafeEmitLen(&bytes));
+}
+
+test "utf8SafeEmitLen holds back incomplete 2-byte codepoint (1 of 2)" {
+    // 'é' lead only
+    const bytes = [_]u8{ 'c', 'a', 'f', 0xC3 };
+    try std.testing.expectEqual(@as(usize, 3), utf8SafeEmitLen(&bytes));
+}
+
+test "utf8SafeEmitLen emits everything when previous codepoint completes mid-buffer" {
+    // Complete 🔥 followed by ASCII — everything emits.
+    const bytes = [_]u8{ 0xF0, 0x9F, 0x94, 0xA5, ' ', 'o', 'k' };
+    try std.testing.expectEqual(bytes.len, utf8SafeEmitLen(&bytes));
+}
 
 test "extractBody finds body after headers" {
     const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\n\r\n{\"message\":\"hi\"}";
