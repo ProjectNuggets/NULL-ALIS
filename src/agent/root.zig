@@ -3586,6 +3586,18 @@ pub const Agent = struct {
             m[i] = self.providerMessageForOwned(msg);
         }
 
+        // Runtime history hygiene: elide assistant replies that look like
+        // laundered hallucinations before sending them back to the model.
+        // An assistant message is suspect when it carries multiple red-flag
+        // patterns (e.g. "is an open-source X", "Based on my earlier search",
+        // "already been established as blocked") AND the surrounding turn
+        // (between the prior user message and this reply) had NO tool result.
+        // Such replies are almost always the agent's own prior hallucination
+        // or cached refusal — feeding them back re-anchors the model to the
+        // same mistake. Replace their content with a short elision marker so
+        // the turn structure survives but the contamination does not.
+        elideUnverifiedHistory(m);
+
         // Allow local multimodal reads from:
         // - workspace (e.g. screenshot tool output),
         // - autonomy.allowed_paths,
@@ -3643,6 +3655,53 @@ pub const Agent = struct {
             if (std.mem.eql(u8, dir, target)) return true;
         }
         return false;
+    }
+
+    /// Elide assistant replies that look like laundered hallucinations before
+    /// sending them back to the provider. Mutates `messages` in place.
+    ///
+    /// An assistant message is elided when:
+    ///   1. Its content contains >=2 red-flag patterns from the summarizer
+    ///      heuristic (e.g. "is an open-source", "Based on my earlier
+    ///      search", "already been established as blocked"), AND
+    ///   2. The enclosing turn (between the prior user message and this
+    ///      reply, inclusive) contains NO messages with role == .tool.
+    ///
+    /// Messages that meet both conditions have their content replaced with
+    /// a short elision marker; their role remains .assistant so the turn
+    /// shape is preserved. Messages backed by a tool result in the same
+    /// turn are trusted and left untouched.
+    ///
+    /// This is the runtime companion to the summarizer-side `C` heuristic
+    /// that prevents NEW hallucinations from becoming canonical continuity.
+    /// Together they bound both incoming (new) and outgoing (replay) paths
+    /// for agent-laundered fabrications.
+    fn elideUnverifiedHistory(messages: []ChatMessage) void {
+        const elision = "[prior unverified claim elided — re-verify with a tool this turn]";
+        for (messages, 0..) |*msg, i| {
+            if (msg.role != .assistant) continue;
+            if (msg.content.len == 0) continue;
+            if (memory_mod.countRedFlagMatches(msg.content) < 2) continue;
+
+            // Walk backward to the prior user message (turn boundary).
+            // If any .tool message sits between that boundary and this
+            // assistant message, the reply is tool-grounded — trust it.
+            var tool_seen = false;
+            var j = i;
+            while (j > 0) {
+                j -= 1;
+                switch (messages[j].role) {
+                    .tool => {
+                        tool_seen = true;
+                        break;
+                    },
+                    .user => break,
+                    else => continue,
+                }
+            }
+            if (tool_seen) continue;
+            msg.content = elision;
+        }
     }
 
     /// Build a flat ChatMessage slice from owned history.

@@ -289,19 +289,46 @@ const red_flag_patterns = [_][]const u8{
     " MIT license",
     " Apache license",
     " Apache-2.0",
-    // Fake-source phrases
+    // Fake-source phrases (prior-session hallucination dodge variants)
     "Based on my search",
     "Based on my research",
     "Based on my memory and",
+    "Based on my earlier search",
+    "Based on my earlier verification",
+    "Based on my earlier work",
+    "Based on my web search",
+    "Based on my prior",
     "From my search",
     "From my earlier search",
     "From my prior search",
+    "From my web search",
     "From my research",
+    "From memory, I can see",
     "I searched for",
     "I checked and found",
     "My search shows",
     "According to my earlier",
+    // Cached-refusal echo patterns
+    "already been established as blocked",
+    "confirmed from multiple prior",
+    "confirmed from 5+ prior",
+    "confirmed from 6+ prior",
+    "as established earlier this session",
+    "this has already been",
+    "limitation (confirmed from",
 };
+
+/// Count how many red-flag patterns appear in `content`. Case-insensitive.
+/// Used by the agent-level history filter to decide whether an assistant
+/// message is likely a laundered hallucination that should be elided from
+/// the conversation context fed to the provider.
+pub fn countRedFlagMatches(content: []const u8) usize {
+    var count: usize = 0;
+    for (red_flag_patterns) |pattern| {
+        if (std.ascii.indexOfIgnoreCase(content, pattern) != null) count += 1;
+    }
+    return count;
+}
 
 /// Conservative heuristic: does the summary contain external-entity claims
 /// made without any tool grounding in the source conversation?

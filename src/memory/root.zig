@@ -140,6 +140,7 @@ pub const shouldSummarize = summarizer.shouldSummarize;
 pub const buildSummarizationPrompt = summarizer.buildSummarizationPrompt;
 pub const parseSummaryResponse = summarizer.parseSummaryResponse;
 pub const hasUnverifiedExternalClaims = summarizer.hasUnverifiedExternalClaims;
+pub const countRedFlagMatches = summarizer.countRedFlagMatches;
 
 // Lifecycle: semantic cache
 pub const SemanticCache = semantic_cache.SemanticCache;
