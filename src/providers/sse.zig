@@ -379,6 +379,17 @@ const OpenAiStreamCtx = struct {
     line_buf: std.ArrayListUnmanaged(u8) = .empty,
     tool_call_accumulators: std.ArrayListUnmanaged(ToolCallAccumulator) = .empty,
 
+    /// Live-stream XML tool-call suppression state. When the model falls back
+    /// to emitting `<invoke>`/`<tool_call>` XML inside content (Kimi K2.5
+    /// regression, 2026-04-19), we don't want those tokens to flash live on
+    /// the user's screen. This state lets processSseEvent filter the text
+    /// deltas pushed to the user-facing callback. The full text still
+    /// accumulates in `accumulated` for post-stream parseToolCalls — only
+    /// the VISUAL stream is filtered.
+    xml_suppress_depth: u32 = 0,
+    xml_tail: [15]u8 = undefined,
+    xml_tail_len: usize = 0,
+
     fn deinit(self: *OpenAiStreamCtx) void {
         self.accumulated.deinit(self.allocator);
         self.reasoning_accumulated.deinit(self.allocator);
@@ -389,6 +400,124 @@ const OpenAiStreamCtx = struct {
         self.tool_call_accumulators.deinit(self.allocator);
     }
 };
+
+/// Filter a text delta chunk so that content inside `<invoke>...</invoke>`
+/// and `<tool_call>...</tool_call>` XML blocks doesn't reach the live
+/// user-facing callback. The filtering is stateful across chunks using
+/// `xml_tail` as carry-over (since an opening tag may be split across
+/// chunk boundaries). Returns a slice into `scratch` containing the
+/// filtered text to emit.
+fn filterLiveXmlBlocks(
+    ctx: *OpenAiStreamCtx,
+    chunk: []const u8,
+    scratch: *std.ArrayListUnmanaged(u8),
+) ![]const u8 {
+    scratch.clearRetainingCapacity();
+
+    // Work off carry + chunk to catch tags split across chunk boundaries.
+    const carry_slice = ctx.xml_tail[0..ctx.xml_tail_len];
+    var work: std.ArrayListUnmanaged(u8) = .empty;
+    defer work.deinit(ctx.allocator);
+    try work.appendSlice(ctx.allocator, carry_slice);
+    try work.appendSlice(ctx.allocator, chunk);
+    const buf = work.items;
+
+    // We must hold back the last up-to-15 bytes so we don't emit a partial
+    // opening/closing tag mid-detection. The held-back portion becomes the
+    // new carry for the next chunk.
+    const hold_back: usize = @min(buf.len, 15);
+    const scan_end: usize = buf.len - hold_back;
+
+    var i: usize = 0;
+    while (i < scan_end) {
+        if (ctx.xml_suppress_depth == 0) {
+            if (std.mem.startsWith(u8, buf[i..], "<invoke ") or
+                std.mem.startsWith(u8, buf[i..], "<tool_call>"))
+            {
+                ctx.xml_suppress_depth += 1;
+                if (std.mem.startsWith(u8, buf[i..], "<invoke ")) {
+                    i += "<invoke ".len;
+                } else {
+                    i += "<tool_call>".len;
+                }
+                continue;
+            }
+            try scratch.append(ctx.allocator, buf[i]);
+            i += 1;
+        } else {
+            if (std.mem.startsWith(u8, buf[i..], "</invoke>")) {
+                ctx.xml_suppress_depth -|= 1;
+                i += "</invoke>".len;
+                continue;
+            }
+            if (std.mem.startsWith(u8, buf[i..], "</tool_call>")) {
+                ctx.xml_suppress_depth -|= 1;
+                i += "</tool_call>".len;
+                continue;
+            }
+            // Character inside suppression block — drop it.
+            i += 1;
+        }
+    }
+
+    // Save the hold-back portion as next carry.
+    const new_carry = buf[scan_end..];
+    if (new_carry.len > ctx.xml_tail.len) {
+        // Shouldn't happen because hold_back <= 15, but be defensive.
+        const start = new_carry.len - ctx.xml_tail.len;
+        @memcpy(ctx.xml_tail[0..], new_carry[start..]);
+        ctx.xml_tail_len = ctx.xml_tail.len;
+    } else {
+        @memcpy(ctx.xml_tail[0..new_carry.len], new_carry);
+        ctx.xml_tail_len = new_carry.len;
+    }
+
+    return scratch.items;
+}
+
+/// On stream finalize, flush the xml_tail carry-over through the filter
+/// so any tail bytes that aren't part of a pending tag get emitted. Since
+/// there's no more data coming, scan the entire tail (hold_back = 0) and
+/// emit anything not in a suppression block.
+fn flushLiveXmlTail(
+    ctx: *OpenAiStreamCtx,
+    scratch: *std.ArrayListUnmanaged(u8),
+) ![]const u8 {
+    scratch.clearRetainingCapacity();
+    const buf = ctx.xml_tail[0..ctx.xml_tail_len];
+    var i: usize = 0;
+    while (i < buf.len) {
+        if (ctx.xml_suppress_depth == 0) {
+            if (std.mem.startsWith(u8, buf[i..], "<invoke ") or
+                std.mem.startsWith(u8, buf[i..], "<tool_call>"))
+            {
+                ctx.xml_suppress_depth += 1;
+                if (std.mem.startsWith(u8, buf[i..], "<invoke ")) {
+                    i += "<invoke ".len;
+                } else {
+                    i += "<tool_call>".len;
+                }
+                continue;
+            }
+            try scratch.append(ctx.allocator, buf[i]);
+            i += 1;
+        } else {
+            if (std.mem.startsWith(u8, buf[i..], "</invoke>")) {
+                ctx.xml_suppress_depth -|= 1;
+                i += "</invoke>".len;
+                continue;
+            }
+            if (std.mem.startsWith(u8, buf[i..], "</tool_call>")) {
+                ctx.xml_suppress_depth -|= 1;
+                i += "</tool_call>".len;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    ctx.xml_tail_len = 0;
+    return scratch.items;
+}
 
 fn ensureToolCallAccumulator(
     allocator: std.mem.Allocator,
@@ -414,8 +543,20 @@ fn processSseEvent(ctx: *OpenAiStreamCtx, event: SseLineResult) !bool {
     if (event.done) return false;
 
     if (event.text) |text| {
+        // Full-text accumulation is unfiltered — post-stream parseToolCalls
+        // still needs to see the raw XML to extract tool invocations.
         try ctx.accumulated.appendSlice(ctx.allocator, text);
-        ctx.callback(ctx.callback_ctx, root.StreamChunk.textDelta(text));
+
+        // The user-facing stream IS filtered — suppress `<invoke>…</invoke>`
+        // and `<tool_call>…</tool_call>` blocks so the user doesn't see raw
+        // XML flash on their screen when the model falls back to emitting
+        // tool calls as content (Kimi K2.5 regression).
+        var scratch: std.ArrayListUnmanaged(u8) = .empty;
+        defer scratch.deinit(ctx.allocator);
+        const filtered = try filterLiveXmlBlocks(ctx, text, &scratch);
+        if (filtered.len > 0) {
+            ctx.callback(ctx.callback_ctx, root.StreamChunk.textDelta(filtered));
+        }
     }
 
     // Accumulate reasoning deltas. Not forwarded to the live streaming
@@ -502,6 +643,16 @@ fn buildToolCalls(
 }
 
 fn finalizeOpenAiStream(ctx: *OpenAiStreamCtx) !root.StreamChatResult {
+    // Flush any carry-over bytes held back for mid-chunk tag detection.
+    // Without this, the final few chars of prose never reach the user.
+    if (ctx.xml_tail_len > 0) {
+        var scratch: std.ArrayListUnmanaged(u8) = .empty;
+        defer scratch.deinit(ctx.allocator);
+        const flushed = try flushLiveXmlTail(ctx, &scratch);
+        if (flushed.len > 0) {
+            ctx.callback(ctx.callback_ctx, root.StreamChunk.textDelta(flushed));
+        }
+    }
     ctx.callback(ctx.callback_ctx, root.StreamChunk.finalChunk());
     return .{
         .content = if (ctx.accumulated.items.len > 0) try ctx.allocator.dupe(u8, ctx.accumulated.items) else null,
@@ -513,6 +664,129 @@ fn finalizeOpenAiStream(ctx: *OpenAiStreamCtx) !root.StreamChatResult {
         .usage = .{ .completion_tokens = @intCast((ctx.accumulated.items.len + 3) / 4) },
         .model = "",
     };
+}
+
+// ── Live-stream XML filter tests ─────────────────────────────────────
+
+fn captureTextDelta(cb_ctx: *anyopaque, chunk: root.StreamChunk) void {
+    const buf: *std.ArrayListUnmanaged(u8) = @ptrCast(@alignCast(cb_ctx));
+    if (chunk.is_final) return;
+    if (chunk.delta.len == 0) return;
+    buf.appendSlice(std.testing.allocator, chunk.delta) catch return;
+}
+
+test "stream filter strips a single complete <invoke> block" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(std.testing.allocator);
+    var ctx = OpenAiStreamCtx{
+        .allocator = std.testing.allocator,
+        .callback = captureTextDelta,
+        .callback_ctx = @ptrCast(&captured),
+    };
+    defer ctx.deinit();
+
+    // Simulate the full text arriving as one chunk.
+    const chunk =
+        \\I'll check now.
+        \\<invoke name="runtime_info">
+        \\{"section":"summary"}
+        \\</invoke>
+        \\Done.
+    ;
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    const filtered = try filterLiveXmlBlocks(&ctx, chunk, &scratch);
+    try captured.appendSlice(std.testing.allocator, filtered);
+    // Flush the carry at end-of-stream.
+    const tail = try flushLiveXmlTail(&ctx, &scratch);
+    try captured.appendSlice(std.testing.allocator, tail);
+
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "<invoke") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "I'll check now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "Done.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "runtime_info") == null);
+}
+
+test "stream filter strips <tool_call> block" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(std.testing.allocator);
+    var ctx = OpenAiStreamCtx{
+        .allocator = std.testing.allocator,
+        .callback = captureTextDelta,
+        .callback_ctx = @ptrCast(&captured),
+    };
+    defer ctx.deinit();
+
+    const chunk =
+        \\Before.
+        \\<tool_call>
+        \\{"name":"shell","arguments":{"command":"ls"}}
+        \\</tool_call>
+        \\After.
+    ;
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    const filtered = try filterLiveXmlBlocks(&ctx, chunk, &scratch);
+    try captured.appendSlice(std.testing.allocator, filtered);
+    const tail = try flushLiveXmlTail(&ctx, &scratch);
+    try captured.appendSlice(std.testing.allocator, tail);
+
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "<tool_call>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "</tool_call>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "Before.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "After.") != null);
+}
+
+test "stream filter handles tag split across chunk boundary" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(std.testing.allocator);
+    var ctx = OpenAiStreamCtx{
+        .allocator = std.testing.allocator,
+        .callback = captureTextDelta,
+        .callback_ctx = @ptrCast(&captured),
+    };
+    defer ctx.deinit();
+
+    // Chunks deliberately split in the middle of `<invoke ` and `</invoke>`.
+    const chunks = [_][]const u8{
+        "Hello <inv",
+        "oke name=\"x\">{}</inv",
+        "oke> done",
+    };
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    for (chunks) |chunk| {
+        const filtered = try filterLiveXmlBlocks(&ctx, chunk, &scratch);
+        try captured.appendSlice(std.testing.allocator, filtered);
+    }
+    const tail = try flushLiveXmlTail(&ctx, &scratch);
+    try captured.appendSlice(std.testing.allocator, tail);
+
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "<invoke") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "</invoke>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "Hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "done") != null);
+}
+
+test "stream filter passes prose through unchanged when no tags present" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(std.testing.allocator);
+    var ctx = OpenAiStreamCtx{
+        .allocator = std.testing.allocator,
+        .callback = captureTextDelta,
+        .callback_ctx = @ptrCast(&captured),
+    };
+    defer ctx.deinit();
+
+    const chunk = "This is just prose with no XML tags in it at all.";
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    const filtered = try filterLiveXmlBlocks(&ctx, chunk, &scratch);
+    try captured.appendSlice(std.testing.allocator, filtered);
+    const tail = try flushLiveXmlTail(&ctx, &scratch);
+    try captured.appendSlice(std.testing.allocator, tail);
+
+    try std.testing.expectEqualStrings(chunk, captured.items);
 }
 
 fn native_openai_chunk(ctx: *OpenAiStreamCtx, bytes: []const u8) anyerror!bool {
