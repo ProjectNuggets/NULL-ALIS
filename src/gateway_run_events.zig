@@ -197,21 +197,17 @@ pub const RunEventObserver = struct {
                 }
             },
             .narration_frame => |e| {
-                // Dual emit for compatibility: preserve the existing
-                // `progress phase=thinking` stream that the zaki-prod
-                // frontend already renders as narration AND add the
-                // `reasoning_summary` stream so future frontends (or
-                // richer renderings) can consume the same content as
-                // structured narration events. Reverting this to one
-                // channel only would break either the Saturday UI or
-                // the richer consumer path. Both fire; frontend picks
-                // whichever it renders.
-                self.emit(.{ .progress = .{
-                    .phase = @tagName(e.frame_type),
-                    .state = "update",
-                    .label = e.message,
-                    .tool = e.tool_name,
-                } });
+                // Single-emit per frame_type. The zaki-prod thinking card
+                // (NullalisRuntimeWidgets.tsx: isRealReasoningEntry) ONLY
+                // surfaces entries with source="reasoning_summary" and
+                // length ≥ 40. Earlier dual-emit to both `progress` and
+                // `reasoning_summary` caused the frontend's transcript
+                // dedup (entrySemanticKey) to hit the progress entry
+                // first, drop the reasoning_summary entry as duplicate,
+                // and the card fell back to generic labels. So: route
+                // model-voice frames (thinking / plan_step) ONLY to
+                // reasoning_summary, and tool-chrome frames ONLY to
+                // progress.
                 switch (e.frame_type) {
                     .thinking, .plan_step => {
                         self.emitReasoningSummary(
@@ -222,7 +218,14 @@ pub const RunEventObserver = struct {
                             null,
                         );
                     },
-                    else => {},
+                    else => {
+                        self.emit(.{ .progress = .{
+                            .phase = @tagName(e.frame_type),
+                            .state = "update",
+                            .label = e.message,
+                            .tool = e.tool_name,
+                        } });
+                    },
                 }
             },
             .agent_end => |e| self.emit(.{ .done = .{
@@ -497,10 +500,12 @@ test "turn_stage produces progress SSE frame with label" {
     try std.testing.expect(std.mem.indexOf(u8, frame, "Running tools") != null);
 }
 
-test "narration_frame thinking produces both progress AND reasoning_summary SSE frames" {
-    // Dual-emit is intentional: the legacy frontend renders narration from
-    // the `progress phase=thinking` event; richer consumers read
-    // `reasoning_summary`. Both must fire so either UI shows the agent's voice.
+test "narration_frame thinking produces ONLY reasoning_summary, not progress" {
+    // Single-emit for .thinking frames: zaki-prod's thinking card reads
+    // reasoning_summary only. Emitting both caused the frontend's
+    // transcript dedup to drop the reasoning_summary entry as a
+    // duplicate of the progress entry, making the thinking card fall
+    // back to generic labels. See commit e07f237 → reverted.
     var noop = observability.NoopObserver{};
     const allocator = std.testing.allocator;
     var test_sink = TestFrameSink.init(allocator);
@@ -513,13 +518,13 @@ test "narration_frame thinking produces both progress AND reasoning_summary SSE 
     } };
     obs.recordEvent(&evt);
 
-    const progress_frame = test_sink.firstFrameWithPrefix("event: progress\n") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, progress_frame, "\"phase\":\"thinking\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, progress_frame, "The user is asking about X") != null);
-
     const reasoning_frame = test_sink.firstFrameWithPrefix("event: reasoning_summary\n") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, reasoning_frame, "\"phase\":\"thinking\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, reasoning_frame, "The user is asking about X") != null);
+
+    // Must NOT also produce a progress frame for .thinking (would collide
+    // in frontend dedup and silence the reasoning_summary channel).
+    try std.testing.expect(test_sink.firstFrameWithPrefix("event: progress\n") == null);
 }
 
 test "narration_frame produces progress SSE frame" {
