@@ -1245,14 +1245,12 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             parsed.extracted_facts.len,
             next,
         });
-    } else {
-        log.info("memory.timeline_summary status=fallback session={s} reason={s} entries={d} next={s}", .{
-            session_id,
-            reason,
-            entries.len,
-            next,
-        });
     }
+    // When parsed_summary is null, we arrived here via one of three paths that
+    // each already logged their own status event above (deterministic /
+    // fallback=structured reason=provider_error / fallback=structured
+    // reason=parse_error). Emitting another `status=fallback` here is redundant
+    // and previously caused double-logging in every non-LLM turn.
     return true;
 }
 
