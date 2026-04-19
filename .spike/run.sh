@@ -37,7 +37,10 @@ URL=$(jq -r '.gateway.url' "$BENCH_FILE")
 TOKEN=$(jq -r '.gateway.internal_token' "$BENCH_FILE")
 USER_ID=$(jq -r '.gateway.user_id' "$BENCH_FILE")
 PREFIX=$(jq -r '.gateway.session_key_prefix' "$BENCH_FILE")
-SESSION_KEY="agent:zaki-bot:user:${USER_ID}:main"
+# Per-benchmark session keys make each run cold (no prior turn accumulation).
+# The :main session can have hundreds of prior turns that pollute context.
+# Use :bench-<id>-<timestamp> so each benchmark run is clean.
+SESSION_SUFFIX=$(date +%s)
 
 COMMIT=$(git rev-parse --short HEAD)
 PASS=0
@@ -53,13 +56,17 @@ grade_one() {
   local outfile="$OUT_DIR/${id}.sse"
   local started
   started=$(date +%s%N)
+  # Unique per-benchmark session key so each test runs cold — no prior
+  # turn history polluting the conversation context.
+  # Lane must be main|thread:<id>|task:<id>|cron:<id>. Use thread:bench-*
+  local session_key="agent:zaki-bot:user:${USER_ID}:thread:bench-${id}-${SESSION_SUFFIX}"
 
   curl -sN -X POST "$URL" \
     -H "X-Internal-Token: $TOKEN" \
     -H "X-Zaki-User-Id: $USER_ID" \
     -H "Content-Type: application/json" \
     --max-time 180 \
-    -d "$(jq -n --arg m "$prompt" --arg s "$SESSION_KEY" '{message:$m, session_key:$s}')" \
+    -d "$(jq -n --arg m "$prompt" --arg s "$session_key" '{message:$m, session_key:$s}')" \
     > "$outfile" 2>&1
 
   local rc=$?
