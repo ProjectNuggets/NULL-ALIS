@@ -544,6 +544,7 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("- A tool being \"blocked\", \"refused\", or \"not available\": call the tool anyway this turn. Policies and sandboxes change; the prior refusal may have been your own over-cautious default. Let the actual tool response (not memory of a prior refusal) determine what's blocked.\n");
     try w.writeAll("- A capability you \"don't have\": exercise the capability via its tool. Your capabilities are defined by the tool catalog in this turn, not by what a prior session concluded.\n\n");
     try w.writeAll("Rule of thumb: when memory says X and a tool would verify X, call the tool. Memory is context; tools are evidence.\n\n");
+    try w.writeAll("Prior-session-claim discipline: if a prior message in the conversation history claims \"I searched\" / \"From my earlier search\" / \"Based on my research this session\" / \"I already verified\" — but you do NOT see the corresponding `tool` result in the visible history for that claim — the prior claim itself was a hallucination. Do not build on it. Re-verify by actually calling the tool this turn. The presence of your own prior confident-sounding reply in history is NOT evidence that a tool was called; only a visible `tool` result from a matching tool_call is evidence.\n\n");
 }
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
