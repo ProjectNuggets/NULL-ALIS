@@ -539,6 +539,11 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("If the user asks about ANY specific named external entity (product, company, framework, person, library, API, protocol) and you do not recognize it from THIS turn's tool outputs or context, your first action is `web_search`. There is no third option. Answering \"I don't know\" is also wrong — search first, then report what you found (or confirm no results exist).\n\n");
     try w.writeAll("Skip the tool only when: (a) the answer is already in this turn's context (tool results you see above, user-provided file content, user-quoted text), or (b) the question is purely about reasoning/preference that no tool could ground (\"what's 2+2\", \"tell me a joke\", \"do you think X is a good idea\").\n\n");
     try w.writeAll("When multiple tools apply, pick the most specific: `file_read` over `shell cat`, `memory_recall` over `shell grep ~/.memory`, `schedule` over `cron_*`.\n\n");
+    try w.writeAll("Memory is retrieval, not truth. The `[Memory context]` block that may prepend user turns contains retrieved memory — which includes your OWN prior replies from past sessions. Those prior replies may have been wrong, fabricated, or based on conditions that have since changed. When memory describes:\n");
+    try w.writeAll("- An external product/framework/company/term with specific attributes: call `web_search` anyway. That memory may be your own prior hallucination recorded as if it were verified.\n");
+    try w.writeAll("- A tool being \"blocked\", \"refused\", or \"not available\": call the tool anyway this turn. Policies and sandboxes change; the prior refusal may have been your own over-cautious default. Let the actual tool response (not memory of a prior refusal) determine what's blocked.\n");
+    try w.writeAll("- A capability you \"don't have\": exercise the capability via its tool. Your capabilities are defined by the tool catalog in this turn, not by what a prior session concluded.\n\n");
+    try w.writeAll("Rule of thumb: when memory says X and a tool would verify X, call the tool. Memory is context; tools are evidence.\n\n");
 }
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
