@@ -2236,9 +2236,11 @@ pub const Agent = struct {
                 if (save_key) |key| {
                     defer self.allocator.free(key);
                     if (mem.store(key, user_message, .conversation, self.memory_session_id)) |_| {
-                        // Vector sync after auto-save
+                        // Vector sync after auto-save (fire-and-forget — the
+                        // user's visible save succeeded; vector sync status
+                        // reaches operators via log.warn, not the user).
                         if (self.mem_rt) |rt| {
-                            rt.syncVectorAfterStore(self.allocator, key, user_message);
+                            _ = rt.syncVectorAfterStore(self.allocator, key, user_message);
                         }
                     } else |_| {}
                 }
@@ -3023,9 +3025,10 @@ pub const Agent = struct {
                         if (save_key) |key| {
                             defer self.allocator.free(key);
                             if (mem.store(key, visible_reply, .conversation, self.memory_session_id)) |_| {
-                                // Vector sync after auto-save
+                                // Vector sync after auto-save (fire-and-forget
+                                // — see user-message autosave above).
                                 if (self.mem_rt) |rt| {
-                                    rt.syncVectorAfterStore(self.allocator, key, visible_reply);
+                                    _ = rt.syncVectorAfterStore(self.allocator, key, visible_reply);
                                 }
                             } else |_| {}
                         }

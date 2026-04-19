@@ -54,12 +54,27 @@ pub const MemoryStoreTool = struct {
             return ToolResult{ .success = false, .output = msg };
         };
 
-        // Vector sync: embed and upsert into vector store (best-effort)
-        if (self.mem_rt) |rt| {
-            rt.syncVectorAfterStore(allocator, key, content);
-        }
+        // Vector sync: embed and upsert. Surface the outcome to the agent
+        // so it knows whether the memory is semantically retrievable yet
+        // (synced / deferred) or only keyword-retrievable (skipped / failed).
+        // Silent drop here caused trust erosion: "Stored memory" implied
+        // full retrieval readiness when vector sync had failed.
+        const sync_status: ?mem_root.MemoryRuntime.VectorSyncResult = if (self.mem_rt) |rt|
+            rt.syncVectorAfterStore(allocator, key, content)
+        else
+            null;
 
-        const msg = try std.fmt.allocPrint(allocator, "Stored memory: {s} ({s})", .{ key, category.toString() });
+        const msg = if (sync_status) |status| blk: {
+            if (status.isSuccessOrDeferred() or status.isSkipped()) {
+                break :blk try std.fmt.allocPrint(allocator, "Stored memory: {s} ({s}, vector_sync={s})", .{ key, category.toString(), status.toSlice() });
+            }
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "Stored memory: {s} ({s}, vector_sync={s}) — keyword retrieval works; semantic recall may miss this entry until sync recovers",
+                .{ key, category.toString(), status.toSlice() },
+            );
+        } else try std.fmt.allocPrint(allocator, "Stored memory: {s} ({s})", .{ key, category.toString() });
+
         return ToolResult{ .success = true, .output = msg };
     }
 

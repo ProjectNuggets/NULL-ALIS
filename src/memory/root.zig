@@ -1210,37 +1210,94 @@ pub const MemoryRuntime = struct {
     /// Best-effort vector sync after a store() call.
     /// Embeds the content and upserts into the vector store.
     /// Errors are caught and logged, never propagated.
-    pub fn syncVectorAfterStore(self: *MemoryRuntime, allocator: std.mem.Allocator, key: []const u8, content: []const u8) void {
-        if (!shouldEmbedMemoryEntry(key, content)) return;
+    /// Outcome of a vector-sync attempt. Callers that need the result to
+    /// reach the agent (tools/memory_store, tools/memory_edit) inspect this
+    /// and include it in their ToolResult. Fire-and-forget callers may
+    /// discard with `_ = rt.syncVectorAfterStore(...)`.
+    pub const VectorSyncResult = enum {
+        synced,
+        deferred_to_outbox,
+        enqueue_failed,
+        skipped_not_embeddable,
+        skipped_no_provider,
+        skipped_no_vector_store,
+        skipped_circuit_open,
+        skipped_empty_embedding,
+        failed_embed,
+        failed_upsert,
+
+        /// Returns true when the sync is either complete or reliably queued.
+        /// Tools can rely on eventual retrieval when this is true.
+        pub fn isSuccessOrDeferred(self: VectorSyncResult) bool {
+            return self == .synced or self == .deferred_to_outbox;
+        }
+
+        /// Returns true when the sync was legitimately skipped (not a failure).
+        /// Skipped means: not embeddable, no provider/store configured, or
+        /// the content was empty after embedding. These are expected no-ops,
+        /// not drops.
+        pub fn isSkipped(self: VectorSyncResult) bool {
+            return switch (self) {
+                .skipped_not_embeddable,
+                .skipped_no_provider,
+                .skipped_no_vector_store,
+                .skipped_circuit_open,
+                .skipped_empty_embedding,
+                => true,
+                else => false,
+            };
+        }
+
+        pub fn toSlice(self: VectorSyncResult) []const u8 {
+            return switch (self) {
+                .synced => "synced",
+                .deferred_to_outbox => "deferred_to_outbox",
+                .enqueue_failed => "enqueue_failed",
+                .skipped_not_embeddable => "skipped_not_embeddable",
+                .skipped_no_provider => "skipped_no_provider",
+                .skipped_no_vector_store => "skipped_no_vector_store",
+                .skipped_circuit_open => "skipped_circuit_open",
+                .skipped_empty_embedding => "skipped_empty_embedding",
+                .failed_embed => "failed_embed",
+                .failed_upsert => "failed_upsert",
+            };
+        }
+    };
+
+    pub fn syncVectorAfterStore(self: *MemoryRuntime, allocator: std.mem.Allocator, key: []const u8, content: []const u8) VectorSyncResult {
+        if (!shouldEmbedMemoryEntry(key, content)) return .skipped_not_embeddable;
         // Durable mode: enqueue and return (drain happens at turn boundaries / shutdown).
         if (self._outbox) |ob| {
             ob.enqueue(self._vector_user_id, key, "upsert") catch |err| {
                 log.warn("outbox enqueue failed for key '{s}': {}", .{ key, err });
+                return .enqueue_failed;
             };
-            return;
+            return .deferred_to_outbox;
         }
 
-        const provider = self._embedding_provider orelse return;
-        const vs = self._vector_store orelse return;
+        const provider = self._embedding_provider orelse return .skipped_no_provider;
+        const vs = self._vector_store orelse return .skipped_no_vector_store;
 
         // Check circuit breaker
         if (self._circuit_breaker) |cb| {
-            if (!cb.allow()) return;
+            if (!cb.allow()) return .skipped_circuit_open;
         }
 
         const emb = provider.embed(allocator, content) catch |err| {
             log.warn("vector sync embed failed for key '{s}': {}", .{ key, err });
             if (self._circuit_breaker) |cb| cb.recordFailure();
-            return;
+            return .failed_embed;
         };
         defer allocator.free(emb);
 
         if (self._circuit_breaker) |cb| cb.recordSuccess();
-        if (emb.len == 0) return;
+        if (emb.len == 0) return .skipped_empty_embedding;
 
         vs.upsertScoped(self._vector_user_id, key, emb) catch |err| {
             log.warn("vector sync upsert failed for key '{s}': {}", .{ key, err });
+            return .failed_upsert;
         };
+        return .synced;
     }
 
     /// Drain the durable outbox (if configured).
@@ -2790,7 +2847,8 @@ test "syncVectorAfterStore enqueues when durable outbox is active" {
     const ob = rt._outbox orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), try ob.pendingCount());
 
-    rt.syncVectorAfterStore(std.testing.allocator, "k1", "content");
+    const result = rt.syncVectorAfterStore(std.testing.allocator, "k1", "content");
+    try std.testing.expectEqual(MemoryRuntime.VectorSyncResult.deferred_to_outbox, result);
     try std.testing.expectEqual(@as(usize, 1), try ob.pendingCount());
 }
 
@@ -2836,8 +2894,9 @@ test "MemoryRuntime.syncVectorAfterStore with no provider is no-op" {
         ._circuit_breaker = null,
         ._outbox = null,
     };
-    // Should not crash — just a no-op
-    rt.syncVectorAfterStore(std.testing.allocator, "key", "content");
+    // Should not crash — just a no-op. Returns skipped_no_provider.
+    const result = rt.syncVectorAfterStore(std.testing.allocator, "key", "content");
+    try std.testing.expectEqual(MemoryRuntime.VectorSyncResult.skipped_no_provider, result);
 }
 
 test "shouldEmbedMemoryEntry skips bookkeeping artifacts and oversize content" {

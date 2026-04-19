@@ -66,7 +66,7 @@ pub const MemoryEditTool = struct {
         };
 
         if (self.mem_rt) |rt| {
-            rt.syncVectorAfterStore(allocator, existing.key, content);
+            _ = rt.syncVectorAfterStore(allocator, existing.key, content);
         }
 
         const msg = try std.fmt.allocPrint(allocator, "Edited memory: {s}", .{key});

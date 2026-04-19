@@ -910,7 +910,7 @@ fn updateTimelineIndex(
     const content = out.toOwnedSlice(allocator) catch return;
     defer allocator.free(content);
     mem.store("timeline_index/current", content, .core, null) catch return;
-    if (rt) |mem_rt| mem_rt.syncVectorAfterStore(allocator, "timeline_index/current", content);
+    if (rt) |mem_rt| _ = mem_rt.syncVectorAfterStore(allocator, "timeline_index/current", content);
 }
 
 const SummaryOrigin = struct {
@@ -1190,7 +1190,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     ) catch return false;
     defer self.allocator.free(timeline_key);
     const timeline_written = if (mem.store(timeline_key, summary_content, .daily, null)) |_| blk: {
-        if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, timeline_key, summary_content);
+        if (rt) |mem_rt| _ = mem_rt.syncVectorAfterStore(self.allocator, timeline_key, summary_content);
         break :blk true;
     } else |_| false;
     if (!timeline_written) return false;
@@ -1211,7 +1211,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     defer self.allocator.free(latest_content);
     if (shouldPromoteSummaryLatest(self.allocator, mem, latest_key, summary_quality)) {
         if (mem.store(latest_key, latest_content, .core, null)) |_| {
-            if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, latest_key, latest_content);
+            if (rt) |mem_rt| _ = mem_rt.syncVectorAfterStore(self.allocator, latest_key, latest_content);
         } else |_| {}
     } else {
         log.info("memory.summary_latest promote=blocked session={s} reason={s} quality={s}", .{
@@ -1235,7 +1235,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             ) catch continue;
             defer self.allocator.free(fact_key);
             if (mem.store(fact_key, fact.content, .core, null)) |_| {
-                if (rt) |mem_rt| mem_rt.syncVectorAfterStore(self.allocator, fact_key, fact.content);
+                if (rt) |mem_rt| _ = mem_rt.syncVectorAfterStore(self.allocator, fact_key, fact.content);
             } else |_| {}
         }
         log.info("memory.timeline_summary status=ok session={s} reason={s} entries={d} facts={d} next={s}", .{
@@ -1311,7 +1311,7 @@ pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool 
 
     mem.store(checkpoint_key, checkpoint_content, .daily, null) catch return false;
     if (self.mem_rt) |rt| {
-        rt.syncVectorAfterStore(self.allocator, checkpoint_key, checkpoint_content);
+        _ = rt.syncVectorAfterStore(self.allocator, checkpoint_key, checkpoint_content);
     }
 
     const summary_written = persistSessionSemanticSummary(self, checkpoint_content, session_id, reason, now_s, now_iso);
@@ -1334,7 +1334,7 @@ pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool 
     defer self.allocator.free(anchor_content);
     mem.store("context_anchor_current", anchor_content, .core, null) catch return false;
     if (self.mem_rt) |rt| {
-        rt.syncVectorAfterStore(self.allocator, "context_anchor_current", anchor_content);
+        _ = rt.syncVectorAfterStore(self.allocator, "context_anchor_current", anchor_content);
     }
     return summary_written;
 }
