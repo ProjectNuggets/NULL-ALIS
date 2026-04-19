@@ -277,7 +277,31 @@ When handing off work, include:
 4. Remaining risks / unknowns
 5. Next recommended action
 
-## 12) Vibe Coding Guardrails
+## 12) Branch Policy (V1 Convergence)
+
+Under the V1 convergence plan, the branch surface is kept narrow.
+
+**Protected branches (never delete):**
+- `main` — stable trunk. All V1 convergence lands here via PRs.
+
+**Active convergence branches:**
+- Current in-flight convergence work gets a single named branch, e.g. `feat/v1-convergence-wave-1`. Delete after merge.
+
+**Deprecated / archival branches (safe to delete after confirming no unmerged commits):**
+- `feat/arch-cleanup-v1`, `feat/context-introspection-v1`, `feat/kernel-ux-v1`, `feat/summary-first-continuity-v1`, `feat/native-http-transport` — merged or superseded by completed phases.
+- `phase-2-5-multi-instance`, `phase/02.1-*`, `program/v0.2-sota-exec*` (all) — prior program branches, v0.2-era, covered by history on main.
+- `scale-agent-*`, `scale-plan-docs`, `scale-agent-b-pooling` — scale-era exploration, not V1.
+- `codex/*`, `claude/*`, `heartbeat-*`, `preflight*`, `correction`, `DB`, `main-origions`, `reliability-ops-guardrails` — one-off branches, covered by main.
+
+**Rules:**
+1. Do not open a new long-lived branch without mapping it to a binding work package.
+2. Feature/fix branches die within one week of merge.
+3. No branch carries uncommitted binary artifacts, secrets, or local-only config.
+4. Before deleting a branch, run `git log main..<branch>` to confirm no unmerged commits, OR accept the loss and note it.
+
+Branch cleanup is an operator action (destructive). Agents propose the list; the maintainer executes `git branch -D` after review.
+
+## 13) Vibe Coding Guardrails
 
 When working in fast iterative mode:
 

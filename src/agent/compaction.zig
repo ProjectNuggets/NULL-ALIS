@@ -208,6 +208,9 @@ pub fn indexOfUserTurn(history: []const OwnedMessage, turn_index: usize) ?usize 
 /// begins with this marker, it means the cached summary is still present and
 /// we can amortize the sidecar LLM cost across multiple subsequent turns.
 const COMPACTION_SUMMARY_PREFIX: []const u8 = "[Compaction summary";
+/// Marker prefix written by the hot-path trim (V1 convergence). Distinct from
+/// the legacy summary prefix so both are detectable in mixed-state histories.
+const COMPACTION_MARKER_PREFIX: []const u8 = "[Compaction marker";
 
 /// Re-compaction threshold: how many NEW overflow messages must accumulate
 /// past the cached summary before we pay the sidecar LLM cost again. Five
@@ -247,8 +250,19 @@ pub fn compactByTurnWindow(
     //
     // This amortizes the 12s compaction cost from every-turn to every
     // 4-5 turns in steady state.
+    // Recognize both the legacy "[Compaction summary" artifact (pre-hot-path-kill)
+    // and the current "[Compaction marker" trim marker. Either should short-circuit
+    // the cache check so steady-state sessions avoid re-trimming every turn.
     const existing_summary_present = history.items[start].role == .assistant and
-        std.mem.startsWith(u8, history.items[start].content, COMPACTION_SUMMARY_PREFIX);
+        (std.mem.startsWith(u8, history.items[start].content, COMPACTION_SUMMARY_PREFIX) or
+            std.mem.startsWith(u8, history.items[start].content, COMPACTION_MARKER_PREFIX));
+
+    // `provider` and `model_name` are no longer used on the hot path — the
+    // LLM summarizer call was moved to the post-reply lifecycle pipeline
+    // (memory_lifecycle_summarizer). Kept in the signature for ABI stability
+    // and because force/manual compaction callers still pass them through.
+    _ = provider;
+    _ = model_name;
 
     if (existing_summary_present) {
         // Messages past the cached summary that would be newly rolled in.
@@ -261,69 +275,44 @@ pub fn compactByTurnWindow(
             return false;
         }
         log.info(
-            "compaction.window: cache miss — {d} new overflow msgs at/over threshold {d}, re-summarizing",
+            "compaction.window: cache miss — {d} new overflow msgs at/over threshold {d}, trimming (summary deferred to lifecycle)",
             .{ new_overflow_msgs, COMPACTION_RECOMPUTE_MSG_THRESHOLD },
         );
     }
 
-    // Build a summary of history.items[start..keep_start] using the existing
-    // summarization helper. If the overflow is large, split in halves to stay
-    // within max_source_chars.
-    const summary = if ((keep_start - start) > 10) blk: {
-        const mid = start + (keep_start - start) / 2;
-        const summary_a = summarizeSlice(allocator, provider, model_name, history.items, start, mid, config) catch |err| {
-            log.warn("compaction.window: summarize_a failed ({}) — skipping window pass", .{err});
-            return false;
-        };
-        defer allocator.free(summary_a);
-        const summary_b = summarizeSlice(allocator, provider, model_name, history.items, mid, keep_start, config) catch |err| {
-            log.warn("compaction.window: summarize_b failed ({}) — skipping window pass", .{err});
-            return false;
-        };
-        defer allocator.free(summary_b);
-        const merged = try std.fmt.allocPrint(
-            allocator,
-            "Earlier context:\n{s}\n\nMore recent context:\n{s}",
-            .{ summary_a, summary_b },
-        );
-        if (merged.len > config.max_summary_chars) {
-            const truncated = try allocator.dupe(u8, merged[0..config.max_summary_chars]);
-            allocator.free(merged);
-            break :blk truncated;
-        }
-        break :blk merged;
-    } else summarizeSlice(allocator, provider, model_name, history.items, start, keep_start, config) catch |err| {
-        log.warn("compaction.window: summarize failed ({}) — skipping window pass", .{err});
-        return false;
-    };
-    defer allocator.free(summary);
+    // ── Hot-path kill (V1 convergence) ────────────────────────────────────
+    // Previously this block called `summarizeSlice` → LLM, which blocked the
+    // turn for 20–180+ seconds on long-history first turns. The summary is
+    // not required inline: the post-reply lifecycle summarizer
+    // (memory_lifecycle_summarizer → timeline_summary/summary_latest) keeps
+    // durable continuity alive, and memory_loader surfaces those artifacts
+    // into warm recall on the next turn. So on the hot path we trim only
+    // and drop a lightweight marker in the compacted slot. Cost: O(ms).
+    //
+    // If no existing summary is present (first-time compaction on a long
+    // session), this turn ships without a compaction summary inline — the
+    // model still receives warm continuity (summary_latest, durable_fact,
+    // context_anchor_current) via memory_loader when those artifacts exist
+    // from prior lifecycle cycles. The very first long-history turn accepts
+    // a marker-only degradation as an explicit trade for predictable latency.
 
-    const workspace_context = try readWorkspaceContextForSummary(allocator, config.workspace_dir);
-    defer allocator.free(workspace_context);
-
-    const summary_with_context = if (workspace_context.len > 0)
-        try std.fmt.allocPrint(allocator, "{s}{s}", .{ summary, workspace_context })
-    else
-        try allocator.dupe(u8, summary);
-    defer allocator.free(summary_with_context);
-
-    const summary_content = try std.fmt.allocPrint(
+    const marker = try std.fmt.allocPrint(
         allocator,
-        "[Compaction summary — {d} earlier turns collapsed]\n{s}",
-        .{ overflow_turns, summary_with_context },
+        "[Compaction marker — {d} earlier turns trimmed; durable summary is produced post-reply via memory_lifecycle_summarizer and recalled via warm memory on subsequent turns]",
+        .{overflow_turns},
     );
 
-    // Free the messages being compacted
+    // Free the messages being trimmed
     for (history.items[start..keep_start]) |*msg| {
         msg.deinit(allocator);
     }
 
-    // Replace the first compacted slot with the summary (role=.assistant is
+    // Replace the first trimmed slot with the marker (role=.assistant is
     // what all providers accept; .user would also work, but assistant is
     // closer to semantic truth: the runtime is providing meta-context).
     history.items[start] = .{
         .role = .assistant,
-        .content = summary_content,
+        .content = marker,
     };
 
     // Shift remaining messages left
@@ -333,7 +322,7 @@ pub fn compactByTurnWindow(
         history.items.len -= (keep_start - start - 1);
     }
 
-    log.info("compaction.window: collapsed {d} overflow turns into summary; kept {d} recent turns", .{
+    log.info("compaction.window: trimmed {d} overflow turns; kept {d} recent turns (summary deferred to lifecycle)", .{
         overflow_turns,
         window,
     });

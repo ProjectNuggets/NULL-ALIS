@@ -1371,7 +1371,7 @@ pub const TelegramChannel = struct {
                 const file_id_val = vobj.object.get("file_id") orelse break :blk_content null;
                 const file_id = if (file_id_val == .string) file_id_val.string else break :blk_content null;
 
-                if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id, self.transcriber, self.proxy)) |transcribed| {
+                if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id, self.transcriber, self.proxy, null)) |transcribed| {
                     defer allocator.free(transcribed);
                     var result: std.ArrayListUnmanaged(u8) = .empty;
                     result.appendSlice(allocator, "[Voice]: ") catch break :blk_content null;

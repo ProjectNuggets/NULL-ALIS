@@ -10,8 +10,27 @@ const platform = @import("platform.zig");
 const json_util = @import("json_util.zig");
 const http_util = @import("http_util.zig");
 const telegram_token = @import("telegram_token.zig");
+const observability = @import("observability.zig");
 
 const log = std.log.scoped(.voice);
+
+/// Emit a system_notice via the optional observer when a multimodal path
+/// fails. Binding rule: no silent fallback. Callers that have an observer
+/// handle pass it; callers that don't pass null and the notice is dropped
+/// at this level (the existing std.log warnings still fire).
+fn emitMultimodalFailureNotice(
+    obs: ?*observability.Observer,
+    detail: []const u8,
+) void {
+    const observer = obs orelse return;
+    const event = observability.ObserverEvent{ .system_notice = .{
+        .kind = "multimodal_failure",
+        .severity = "warning",
+        .message = "Voice/transcription step failed. Text channel unaffected; the message may have arrived without audio transcript.",
+        .detail = detail,
+    } };
+    observer.recordEvent(&event);
+}
 
 pub const TelegramSttMetrics = struct {
     transcriber_configured: u64,
@@ -694,6 +713,7 @@ pub fn transcribeTelegramVoice(
     file_id: []const u8,
     t: ?Transcriber,
     proxy: ?[]const u8,
+    obs: ?*observability.Observer,
 ) ?[]const u8 {
     const transcr = t orelse {
         markTelegramSttSkippedNoTranscriber();
@@ -712,6 +732,7 @@ pub fn transcribeTelegramVoice(
         markTelegramSttFailedGetFile();
         log.err("getFile failed: {}", .{err});
         log.warn("telegram.stt.fail reason=get_file_failed err={}", .{err});
+        emitMultimodalFailureNotice(obs, "telegram STT: getFile failed");
         return null;
     };
     defer allocator.free(tg_file_path);
@@ -722,6 +743,7 @@ pub fn transcribeTelegramVoice(
         markTelegramSttFailedDownload();
         log.err("download failed: {}", .{err});
         log.warn("telegram.stt.fail reason=download_failed err={}", .{err});
+        emitMultimodalFailureNotice(obs, "telegram STT: download failed");
         return null;
     };
     defer {
@@ -736,6 +758,7 @@ pub fn transcribeTelegramVoice(
         markTelegramSttFailedTranscriber();
         log.err("transcription failed: {}", .{err});
         log.warn("telegram.stt.fail reason=transcriber_failed err={}", .{err});
+        emitMultimodalFailureNotice(obs, "telegram STT: transcriber failed");
         return null;
     };
     if (text != null) {
@@ -745,6 +768,7 @@ pub fn transcribeTelegramVoice(
         markTelegramSttFailed();
         markTelegramSttFailedEmptyTranscript();
         log.warn("telegram.stt.fail reason=empty_transcript", .{});
+        emitMultimodalFailureNotice(obs, "telegram STT: empty transcript");
     }
 
     return text;
@@ -1097,7 +1121,7 @@ test "voice transcribeFile returns error for nonexistent file" {
 
 test "voice transcribeTelegramVoice returns null without transcriber" {
     // No transcriber configured, so should return null
-    const result = transcribeTelegramVoice(std.testing.allocator, "fake:token", "fake_file_id", null, null);
+    const result = transcribeTelegramVoice(std.testing.allocator, "fake:token", "fake_file_id", null, null, null);
     try std.testing.expect(result == null);
 }
 

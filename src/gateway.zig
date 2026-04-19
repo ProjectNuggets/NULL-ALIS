@@ -35,7 +35,7 @@ const json_util = @import("json_util.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const onboard = @import("onboard.zig");
 const zaki_state_mod = @import("zaki_state.zig");
-const zaki_session = @import("zaki_session.zig");
+const zaki_session = @import("session/root.zig");
 const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
 const tool_dispatcher = @import("tool_dispatcher.zig");
@@ -5254,7 +5254,7 @@ fn telegramWebhookExtractInboundText(
         if (voice_val == .object) {
             if (voice_val.object.get("file_id")) |file_id_val| {
                 if (file_id_val == .string) {
-                    if (voice.transcribeTelegramVoice(allocator, bot_token, file_id_val.string, transcriber, proxy)) |transcribed| {
+                    if (voice.transcribeTelegramVoice(allocator, bot_token, file_id_val.string, transcriber, proxy, null)) |transcribed| {
                         defer allocator.free(transcribed);
                         return std.fmt.allocPrint(allocator, "[Voice]: {s}", .{transcribed}) catch null;
                     }
@@ -5268,7 +5268,7 @@ fn telegramWebhookExtractInboundText(
         if (audio_val == .object) {
             if (audio_val.object.get("file_id")) |file_id_val| {
                 if (file_id_val == .string) {
-                    if (voice.transcribeTelegramVoice(allocator, bot_token, file_id_val.string, transcriber, proxy)) |transcribed| {
+                    if (voice.transcribeTelegramVoice(allocator, bot_token, file_id_val.string, transcriber, proxy, null)) |transcribed| {
                         defer allocator.free(transcribed);
                         return std.fmt.allocPrint(allocator, "[Voice]: {s}", .{transcribed}) catch null;
                     }
@@ -7482,6 +7482,39 @@ fn sseReasoningSummaryFrame(
     return buf.toOwnedSlice(allocator);
 }
 
+fn sseSystemNoticeFrame(
+    allocator: std.mem.Allocator,
+    kind: []const u8,
+    severity: []const u8,
+    message: []const u8,
+    detail: ?[]const u8,
+    run_id: ?[]const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("event: system_notice\ndata: {\"type\":\"system_notice\",\"kind\":\"");
+    try jsonEscapeInto(w, kind);
+    try w.writeAll("\",\"severity\":\"");
+    try jsonEscapeInto(w, severity);
+    try w.writeAll("\",\"message\":\"");
+    try jsonEscapeInto(w, message);
+    try w.writeAll("\"");
+    if (detail) |detail_text| {
+        try w.writeAll(",\"detail\":\"");
+        try jsonEscapeInto(w, detail_text);
+        try w.writeAll("\"");
+    }
+    if (run_id) |rid| {
+        try w.writeAll(",\"run_id\":\"");
+        try jsonEscapeInto(w, rid);
+        try w.writeAll("\"");
+    }
+    try w.writeAll("}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
 fn SseProgressObserver(comptime StreamType: type) type {
     return struct {
         allocator: std.mem.Allocator,
@@ -7713,6 +7746,35 @@ fn SseProgressObserver(comptime StreamType: type) type {
                     var label_buf: [192]u8 = undefined;
                     const label = std.fmt.bufPrint(&label_buf, "Task {s}: {s}", .{ e.task_id, e.status }) catch "Task update";
                     self.emit("task", "update", label, null, null, null);
+                },
+                .narration_frame => |e| {
+                    // Route real thinking narration (native reasoning_content or
+                    // sidecar-generated) to the SSE reasoning_summary stream so
+                    // the UI can show actual thought content instead of generic
+                    // stage labels. Previously this was silently dropped.
+                    const phase_str: []const u8 = switch (e.frame_type) {
+                        .thinking => "thinking",
+                        .tool_start => "tool",
+                        .tool_done => "tool",
+                        .waiting => "waiting",
+                        .plan_step => "thinking",
+                        .listening => "listening",
+                        .speaking => "speaking",
+                        .error_recovery => "error_recovery",
+                    };
+                    self.emitReasoningSummary(e.message, phase_str, null, null);
+                },
+                .system_notice => |e| {
+                    // Binding rule: no silent fallback. Emit a distinct
+                    // `event: system_notice` SSE frame so the frontend can
+                    // render as chrome (toast/badge), not as reply text.
+                    if (self.stream_failed) return;
+                    const frame = sseSystemNoticeFrame(self.allocator, e.kind, e.severity, e.message, e.detail, e.run_id) catch return;
+                    defer self.allocator.free(frame);
+                    self.stream.sendFrame(frame) catch {
+                        self.stream_failed = true;
+                        return;
+                    };
                 },
                 else => {},
             }
@@ -7963,6 +8025,35 @@ const BufferedSseProgressObserver = struct {
                 var label_buf: [192]u8 = undefined;
                 const label = std.fmt.bufPrint(&label_buf, "Task {s}: {s}", .{ e.task_id, e.status }) catch "Task update";
                 self.emit("task", "update", label, null, null, null);
+            },
+            .narration_frame => |e| {
+                // Same wiring as the live SSE observer: route real thinking
+                // narration into the buffered reasoning_summary stream so
+                // non-live (buffered) chat payloads also show real thought
+                // content, not just generic stage labels.
+                const phase_str: []const u8 = switch (e.frame_type) {
+                    .thinking => "thinking",
+                    .tool_start => "tool",
+                    .tool_done => "tool",
+                    .waiting => "waiting",
+                    .plan_step => "thinking",
+                    .listening => "listening",
+                    .speaking => "speaking",
+                    .error_recovery => "error_recovery",
+                };
+                self.emitReasoningSummary(e.message, phase_str, null, null);
+            },
+            .system_notice => |e| {
+                // Same wiring as the live observer — emit a distinct
+                // system_notice SSE frame to the buffered payload so the
+                // non-live chat path also carries visible fallback notices.
+                if (self.stream_failed) return;
+                const frame = sseSystemNoticeFrame(self.allocator, e.kind, e.severity, e.message, e.detail, e.run_id) catch return;
+                defer self.allocator.free(frame);
+                self.frames.appendSlice(self.allocator, frame) catch {
+                    self.stream_failed = true;
+                    return;
+                };
             },
             else => {},
         }
@@ -9371,6 +9462,101 @@ fn serializeUsageReportJson(w: anytype, rpt: *const usage_runtime_mod.UsageRepor
     try w.writeAll("],\"cost_available\":");
     try w.writeAll(if (rpt.session_cost_usd > 0.0) "true" else "false");
     try w.writeByte('}');
+}
+
+// GET /api/v1/users/{user_id}/diagnostics/context
+// GET /api/v1/users/{user_id}/diagnostics/memory-doctor
+//
+// Read-only structured diagnostics. Mirrors the /context detail and /memory
+// doctor slash commands but returns JSON for the frontend PowerUserSheet.
+// Never materializes a session on demand — a GET before any agent activity
+// returns `{"active": false}`. When the user's main-lane session exists we
+// produce the report from its agent state.
+
+const agent_context_report = @import("agent/context_report.zig");
+const agent_root = @import("agent/root.zig");
+const mem_lifecycle_diag = @import("memory/lifecycle/diagnostics.zig");
+
+fn handleUserDiagnosticsContext(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    session_mgr_opt: ?*session_mod.SessionManager,
+    scoped_user_id: []const u8,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    const session_mgr = session_mgr_opt orelse return .{
+        .body = "{\"active\":false,\"reason\":\"session_manager_unavailable\"}",
+    };
+
+    var key_buf: [zaki_session.SessionIdentity.MAX_KEY_LEN + 1]u8 = undefined;
+    const session_key = zaki_session.userMainSessionKey(&key_buf, scoped_user_id);
+
+    const session = session_mgr.getIfPresent(session_key) orelse return .{
+        .body = "{\"active\":false,\"reason\":\"no_active_session\"}",
+    };
+
+    session.mutex.lock();
+    defer session.mutex.unlock();
+
+    const report = agent_context_report.fromAgent(&session.agent);
+    const inner = agent_context_report.formatJson(allocator, report) catch return response_build_err;
+    defer allocator.free(inner);
+
+    // Wrap so the frontend can distinguish an active-session payload from
+    // the no-session envelope above.
+    const body = std.fmt.allocPrint(allocator, "{{\"active\":true,\"report\":{s}}}", .{inner}) catch return response_build_err;
+    return .{ .body = body };
+}
+
+fn handleUserDiagnosticsMemoryDoctor(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    session_mgr_opt: ?*session_mod.SessionManager,
+    scoped_user_id: []const u8,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    const session_mgr = session_mgr_opt orelse return .{
+        .body = "{\"active\":false,\"reason\":\"session_manager_unavailable\"}",
+    };
+
+    var key_buf: [zaki_session.SessionIdentity.MAX_KEY_LEN + 1]u8 = undefined;
+    const session_key = zaki_session.userMainSessionKey(&key_buf, scoped_user_id);
+
+    const session = session_mgr.getIfPresent(session_key) orelse return .{
+        .body = "{\"active\":false,\"reason\":\"no_active_session\"}",
+    };
+
+    session.mutex.lock();
+    defer session.mutex.unlock();
+
+    const rt_opt: ?*memory_mod.MemoryRuntime = if (@hasField(@TypeOf(session.agent), "mem_rt"))
+        session.agent.mem_rt
+    else
+        null;
+    const rt = rt_opt orelse return .{
+        .body = "{\"active\":true,\"runtime\":false,\"reason\":\"memory_runtime_not_configured\"}",
+    };
+
+    const diag_report = mem_lifecycle_diag.diagnose(rt);
+    // Memory diagnostics doesn't yet have a JSON formatter — wrap the
+    // human-readable text in a JSON envelope so frontend can display it
+    // today. Structured JSON for memory-doctor is a follow-up that should
+    // mirror agent_context_report.formatJson's pattern.
+    const text = mem_lifecycle_diag.formatReport(diag_report, allocator) catch return response_build_err;
+    defer allocator.free(text);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    w.writeAll("{\"active\":true,\"runtime\":true,\"report_text\":\"") catch return response_build_err;
+    jsonEscapeInto(w, text) catch return response_build_err;
+    w.writeAll("\"}") catch return response_build_err;
+
+    return finalizeJsonBuf(allocator, &buf);
 }
 
 fn handleUserUsage(
@@ -11241,6 +11427,17 @@ fn handleApiRoute(
             );
         }
         return handleTaskGet(req_allocator, method, rest, effective_task_delivery);
+    }
+
+    // ── Diagnostics (context detail + memory doctor) ────────────────────
+    // Read-only per-user endpoints that mirror the /context detail and
+    // /memory doctor slash commands as JSON for the frontend PowerUserSheet.
+    // Never materialize a session on demand.
+    if (std.mem.eql(u8, parsed.subpath, "diagnostics/context")) {
+        return handleUserDiagnosticsContext(req_allocator, method, session_mgr_opt, scoped_user_id);
+    }
+    if (std.mem.eql(u8, parsed.subpath, "diagnostics/memory-doctor")) {
+        return handleUserDiagnosticsMemoryDoctor(req_allocator, method, session_mgr_opt, scoped_user_id);
     }
 
     // ── Usage summary endpoint (WP2.3) ──────────────────────────────────
@@ -16115,7 +16312,7 @@ test "handleApiChatStreamSseConnection emits keepalive comments during slow turn
     try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: done") != null);
 }
 
-test "handleApiChatStreamSseConnection replays final reply when earlier live tokens came from tool planning" {
+test "handleApiChatStreamSseConnection suppresses streamed tool-planning text and still delivers final reply" {
     const EchoTool = struct {
         const Self = @This();
         pub const tool_name = "echo_tool";
@@ -16300,7 +16497,7 @@ test "handleApiChatStreamSseConnection replays final reply when earlier live tok
     );
 
     try std.testing.expect(handled);
-    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "Running tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "Running tool") == null);
     try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "Final answer after tool") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: done") != null);
 }

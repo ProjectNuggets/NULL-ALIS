@@ -18,6 +18,7 @@ pub const RunEventType = enum {
     tool_result,
     approval_required,
     task_update,
+    system_notice,
     done,
 
     pub fn toSlice(self: RunEventType) []const u8 {
@@ -30,6 +31,7 @@ pub const RunEventType = enum {
             .tool_result => "tool_result",
             .approval_required => "approval_required",
             .task_update => "task_update",
+            .system_notice => "system_notice",
             .done => "done",
         };
     }
@@ -118,6 +120,24 @@ pub const DonePayload = struct {
     run_id: ?[]const u8 = null,
 };
 
+/// Binding principle: no silent fallback. When nullalis degrades or has a
+/// notable internal state change the user deserves to know about, emit a
+/// system_notice. The frontend should render these as chrome (badge / toast)
+/// separate from the reply content.
+pub const SystemNoticePayload = struct {
+    /// Category — compaction | provider_fallback | connector_stale | multimodal_failure | generic.
+    /// Add new kinds as distinct surfaces appear. Keep stable so frontend
+    /// can style/route per kind.
+    kind: []const u8,
+    /// info | warning | error.
+    severity: []const u8,
+    /// Short user-facing message. Keep under 200 chars.
+    message: []const u8,
+    /// Optional additional detail (tool name, provider name, etc.).
+    detail: ?[]const u8 = null,
+    run_id: ?[]const u8 = null,
+};
+
 // ── RunEvent Tagged Union ────────────────────────────────────────────
 
 pub const RunEvent = union(enum) {
@@ -129,6 +149,7 @@ pub const RunEvent = union(enum) {
     tool_result: ToolResultPayload,
     approval_required: ApprovalRequiredPayload,
     task_update: TaskUpdatePayload,
+    system_notice: SystemNoticePayload,
     done: DonePayload,
 };
 
@@ -142,6 +163,7 @@ pub fn eventType(event: RunEvent) RunEventType {
         .tool_result => .tool_result,
         .approval_required => .approval_required,
         .task_update => .task_update,
+        .system_notice => .system_notice,
         .done => .done,
     };
 }
@@ -283,6 +305,18 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
+        .system_notice => |p| {
+            try w.writeAll("{\"type\":\"system_notice\",\"kind\":\"");
+            try jsonEscapeInto(w, p.kind);
+            try w.writeAll("\",\"severity\":\"");
+            try jsonEscapeInto(w, p.severity);
+            try w.writeAll("\",\"message\":\"");
+            try jsonEscapeInto(w, p.message);
+            try w.writeAll("\"");
+            try writeOptionalStringField(w, "detail", p.detail);
+            try writeOptionalStringField(w, "run_id", p.run_id);
+            try w.writeAll("}");
+        },
         .done => |p| {
             try w.writeAll("{\"type\":\"done\"");
             if (p.session_id) |sid| {
@@ -358,9 +392,9 @@ fn writeOptionalStringArrayField(writer: anytype, field_name: []const u8, value:
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-test "RunEventType has exactly 9 variants" {
+test "RunEventType has exactly 10 variants" {
     const fields = @typeInfo(RunEventType).@"enum".fields;
-    try std.testing.expectEqual(@as(usize, 9), fields.len);
+    try std.testing.expectEqual(@as(usize, 10), fields.len);
 }
 
 test "RunEventType.toSlice returns correct strings" {
@@ -372,6 +406,7 @@ test "RunEventType.toSlice returns correct strings" {
     try std.testing.expectEqualStrings("tool_result", RunEventType.tool_result.toSlice());
     try std.testing.expectEqualStrings("approval_required", RunEventType.approval_required.toSlice());
     try std.testing.expectEqualStrings("task_update", RunEventType.task_update.toSlice());
+    try std.testing.expectEqualStrings("system_notice", RunEventType.system_notice.toSlice());
     try std.testing.expectEqualStrings("done", RunEventType.done.toSlice());
 }
 

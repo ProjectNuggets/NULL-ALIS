@@ -19,6 +19,10 @@ pub const SseToolCallDelta = struct {
 pub const SseLineResult = struct {
     /// Text delta content (owned, caller frees).
     text: ?[]const u8 = null,
+    /// Reasoning / thinking delta content (owned, caller frees).
+    /// Populated when the provider streams `delta.reasoning_content` or the
+    /// choice-level `reasoning` field (Kimi / GLM / some OpenRouter models).
+    reasoning: ?[]const u8 = null,
     /// Structured tool call deltas (owned, caller frees).
     tool_call_deltas: []const SseToolCallDelta = &.{},
     /// Stream is complete ([DONE] sentinel).
@@ -26,12 +30,13 @@ pub const SseLineResult = struct {
 
     fn deinit(self: *const SseLineResult, allocator: std.mem.Allocator) void {
         if (self.text) |text| allocator.free(text);
+        if (self.reasoning) |reasoning| allocator.free(reasoning);
         for (self.tool_call_deltas) |delta| delta.deinit(allocator);
         if (self.tool_call_deltas.len > 0) allocator.free(self.tool_call_deltas);
     }
 
     fn isSkip(self: SseLineResult) bool {
-        return !self.done and self.text == null and self.tool_call_deltas.len == 0;
+        return !self.done and self.text == null and self.reasoning == null and self.tool_call_deltas.len == 0;
     }
 };
 
@@ -76,6 +81,9 @@ pub fn extractSseEvent(allocator: std.mem.Allocator, json_str: []const u8) !SseL
     var text_builder: std.ArrayListUnmanaged(u8) = .empty;
     errdefer text_builder.deinit(allocator);
 
+    var reasoning_builder: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer reasoning_builder.deinit(allocator);
+
     var tool_deltas: std.ArrayListUnmanaged(SseToolCallDelta) = .empty;
     errdefer {
         for (tool_deltas.items) |delta| delta.deinit(allocator);
@@ -88,6 +96,14 @@ pub fn extractSseEvent(allocator: std.mem.Allocator, json_str: []const u8) !SseL
             else => continue,
         };
 
+        // Choice-level `reasoning` fallback (some providers put reasoning here
+        // at the choice level rather than inside delta).
+        if (choice_obj.get("reasoning")) |reasoning_value| {
+            if (reasoning_value == .string and reasoning_value.string.len > 0) {
+                try reasoning_builder.appendSlice(allocator, reasoning_value.string);
+            }
+        }
+
         const delta = choice_obj.get("delta") orelse continue;
         const delta_obj = switch (delta) {
             .object => |object| object,
@@ -97,6 +113,21 @@ pub fn extractSseEvent(allocator: std.mem.Allocator, json_str: []const u8) !SseL
         if (delta_obj.get("content")) |content| {
             if (content == .string and content.string.len > 0) {
                 try text_builder.appendSlice(allocator, content.string);
+            }
+        }
+
+        // OpenAI-compatible reasoning streaming: Kimi/GLM/some OpenRouter
+        // models emit `delta.reasoning_content` per chunk. Without this path
+        // the thinking stream is silently dropped and the UI shows only
+        // generic stage labels.
+        if (delta_obj.get("reasoning_content")) |reasoning_value| {
+            if (reasoning_value == .string and reasoning_value.string.len > 0) {
+                try reasoning_builder.appendSlice(allocator, reasoning_value.string);
+            }
+        }
+        if (delta_obj.get("reasoning")) |reasoning_value| {
+            if (reasoning_value == .string and reasoning_value.string.len > 0) {
+                try reasoning_builder.appendSlice(allocator, reasoning_value.string);
             }
         }
 
@@ -155,6 +186,12 @@ pub fn extractSseEvent(allocator: std.mem.Allocator, json_str: []const u8) !SseL
         result.text = try text_builder.toOwnedSlice(allocator);
     } else {
         text_builder.deinit(allocator);
+    }
+
+    if (reasoning_builder.items.len > 0) {
+        result.reasoning = try reasoning_builder.toOwnedSlice(allocator);
+    } else {
+        reasoning_builder.deinit(allocator);
     }
 
     if (tool_deltas.items.len > 0) {
@@ -336,11 +373,15 @@ const OpenAiStreamCtx = struct {
     callback: root.StreamCallback,
     callback_ctx: *anyopaque,
     accumulated: std.ArrayListUnmanaged(u8) = .empty,
+    /// Reasoning / thinking deltas accumulated across the stream. Surfaced
+    /// on `StreamChatResult.reasoning_content` when the stream finalizes.
+    reasoning_accumulated: std.ArrayListUnmanaged(u8) = .empty,
     line_buf: std.ArrayListUnmanaged(u8) = .empty,
     tool_call_accumulators: std.ArrayListUnmanaged(ToolCallAccumulator) = .empty,
 
     fn deinit(self: *OpenAiStreamCtx) void {
         self.accumulated.deinit(self.allocator);
+        self.reasoning_accumulated.deinit(self.allocator);
         self.line_buf.deinit(self.allocator);
         for (self.tool_call_accumulators.items) |*accumulator| {
             accumulator.deinit(self.allocator);
@@ -377,6 +418,15 @@ fn processSseEvent(ctx: *OpenAiStreamCtx, event: SseLineResult) !bool {
         ctx.callback(ctx.callback_ctx, root.StreamChunk.textDelta(text));
     }
 
+    // Accumulate reasoning deltas. Not forwarded to the live streaming
+    // callback yet — the callback is the reply-text channel. Reasoning is
+    // surfaced on `StreamChatResult.reasoning_content` at finalize and
+    // emitted by the agent loop as a `.narration_frame .thinking` observer
+    // event, which the gateway routes into the SSE reasoning_summary stream.
+    if (event.reasoning) |reasoning| {
+        try ctx.reasoning_accumulated.appendSlice(ctx.allocator, reasoning);
+    }
+
     for (event.tool_call_deltas) |delta| {
         try appendToolCallDelta(ctx, delta);
     }
@@ -405,7 +455,19 @@ fn buildToolCalls(
     }
 
     for (accumulators, 0..) |accumulator, index| {
-        if (accumulator.name.items.len == 0) continue;
+        if (accumulator.name.items.len == 0) {
+            // A streamed tool_call delta arrived without a name ever appearing
+            // in any of its deltas. This should not happen with well-behaved
+            // providers but has been observed as a silent drop in the past.
+            // Log it so a "tools unreliable" report has a trail to follow.
+            if (accumulator.id.items.len > 0 or accumulator.arguments.items.len > 0) {
+                std.log.scoped(.sse).warn(
+                    "sse.buildToolCalls: dropping tool_call at index={d} with empty name (id_len={d} args_len={d}) — provider emitted partial deltas",
+                    .{ index, accumulator.id.items.len, accumulator.arguments.items.len },
+                );
+            }
+            continue;
+        }
 
         {
             const id = if (accumulator.id.items.len > 0)
@@ -443,6 +505,10 @@ fn finalizeOpenAiStream(ctx: *OpenAiStreamCtx) !root.StreamChatResult {
     ctx.callback(ctx.callback_ctx, root.StreamChunk.finalChunk());
     return .{
         .content = if (ctx.accumulated.items.len > 0) try ctx.allocator.dupe(u8, ctx.accumulated.items) else null,
+        .reasoning_content = if (ctx.reasoning_accumulated.items.len > 0)
+            try ctx.allocator.dupe(u8, ctx.reasoning_accumulated.items)
+        else
+            null,
         .tool_calls = try buildToolCalls(ctx.allocator, ctx.tool_call_accumulators.items),
         .usage = .{ .completion_tokens = @intCast((ctx.accumulated.items.len + 3) / 4) },
         .model = "",
@@ -1015,6 +1081,54 @@ test "openai stream accumulates split tool calls and visible text" {
     try std.testing.expectEqualStrings("call_abc", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("web_search", result.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"query\":\"HRS news\"}", result.tool_calls[0].arguments);
+}
+
+test "openai stream accumulates multiple parallel tool calls" {
+    // Regression guard: when the LLM emits two parallel tool calls (index=0
+    // and index=1) interleaved across stream events, both must survive into
+    // the finalized result. A silent drop here is the failure mode that
+    // would make the agent "execute one of many promised tools."
+    const allocator = std.testing.allocator;
+
+    var recorder = StreamRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var stream_ctx = OpenAiStreamCtx{
+        .allocator = allocator,
+        .callback = StreamRecorder.onChunk,
+        .callback_ctx = &recorder,
+    };
+    defer stream_ctx.deinit();
+
+    // Delta 1: index=0 introduces web_search, index=1 introduces runtime_info
+    try stream_ctx.line_buf.appendSlice(
+        allocator,
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[" ++
+            "{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"q\\\":\\\"x\"}}," ++
+            "{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"runtime_info\",\"arguments\":\"{}\"}}" ++
+            "]}}]}",
+    );
+    try std.testing.expect(try handleOpenAiLine(&stream_ctx));
+
+    // Delta 2: completes web_search arguments on index=0
+    try stream_ctx.line_buf.appendSlice(
+        allocator,
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[" ++
+            "{\"index\":0,\"function\":{\"arguments\":\"\\\"}\"}}" ++
+            "]}}]}",
+    );
+    try std.testing.expect(try handleOpenAiLine(&stream_ctx));
+
+    var result = try finalizeOpenAiStream(&stream_ctx);
+    defer freeStreamChatResult(allocator, &result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_a", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("web_search", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"q\":\"x\"}", result.tool_calls[0].arguments);
+    try std.testing.expectEqualStrings("call_b", result.tool_calls[1].id);
+    try std.testing.expectEqualStrings("runtime_info", result.tool_calls[1].name);
+    try std.testing.expectEqualStrings("{}", result.tool_calls[1].arguments);
 }
 
 test "StreamChunk textDelta token estimate" {

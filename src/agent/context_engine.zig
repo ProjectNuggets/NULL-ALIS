@@ -14,6 +14,16 @@ const context_builder = @import("context_builder.zig");
 const context_cache = @import("context_cache.zig");
 const compaction = @import("compaction.zig");
 
+// ── Internal stages (W1.2) ─────────────────────────────────────────────────
+// `context_engine` is the single public entry point for turn-packet assembly.
+// The two modules below were previously public peers; they are now re-exported
+// as internals of context_engine. External consumers should reach them via
+// `agent.context_engine.builder` and `agent.context_engine.memory_loader`.
+// Behavior is unchanged; this is a public-surface collapse only.
+
+pub const builder = context_builder;
+pub const memory_loader = @import("memory_loader.zig");
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Phase Enum
 // ═══════════════════════════════════════════════════════════════════════════

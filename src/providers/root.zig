@@ -248,6 +248,12 @@ pub const StreamChatResult = struct {
     /// Reasoning/thinking content accumulated during streaming.
     /// Populated by providers that stream thinking blocks (Claude, GLM, Kimi).
     reasoning_content: ?[]const u8 = null,
+    /// Non-null when the primary provider/model failed and a fallback was
+    /// used. Value is the name of the fallback provider that succeeded
+    /// (e.g. "openrouter" when primary "together" failed). Caller (agent
+    /// loop) reads this to emit a `system_notice kind=provider_fallback`
+    /// so the user sees visible degradation rather than silent switching.
+    used_fallback: ?[]const u8 = null,
 };
 
 /// Tool specification for function-calling APIs.

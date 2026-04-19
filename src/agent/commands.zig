@@ -2151,7 +2151,7 @@ fn handleResumeCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try self.allocator.dupe(u8, "Error: session key too long (max 255 chars).");
     }
     // Validate ownership: target session key must belong to the current user (T-03-05)
-    const zaki_session = @import("../zaki_session.zig");
+    const zaki_session = @import("../session/root.zig");
     const current_user_id = zaki_session.parseUserIdFromSessionKey(self.memory_session_id orelse "") orelse {
         return try self.allocator.dupe(u8, "Error: cannot determine current user for ownership check.");
     };
@@ -2372,11 +2372,82 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
             .{@errorName(err)},
         );
     };
-    return try std.fmt.allocPrint(
+
+    // ── Continue-turn-after-approval fix (2026-04-18) ─────────────────
+    // Previously this returned the tool's raw output as the /approve
+    // reply, which meant the agent's turn loop never saw the tool result
+    // and never produced its next reasoning step. The user clicked approve
+    // and got "Approved tool... output=..." but the agent had already
+    // ended its previous turn; the tool ran out-of-band.
+    //
+    // Fix: build a synthetic continuation message that embeds the real
+    // tool output and invokes agent.turn(). The LLM sees the tool result
+    // in context and produces the coherent next response. Return THAT as
+    // the /approve reply — not the raw tool output.
+    //
+    // On tool failure (result.success == false) we still continue-turn
+    // because the model should reason about the failure too (retry a
+    // different approach, ask the user, etc.). That's the honest flow.
+    //
+    // Output is capped at 4000 chars to avoid blowing context on huge
+    // tool outputs. Tools that produce more than that should already be
+    // returning summaries or file-backed results.
+
+    const continues_turn = if (@hasField(@TypeOf(self.*), "approval_continues_turn"))
+        self.approval_continues_turn
+    else
+        true;
+
+    // Legacy path (tests without a live provider): return the tool output
+    // as the reply directly. Production default is `continues_turn = true`.
+    if (!continues_turn) {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Approved tool (id={d}) success={any}.{s}\n{s}",
+            .{ id_snapshot, result.success, always_note, result.output },
+        );
+    }
+
+    const MAX_SYNTHETIC_OUTPUT_CHARS: usize = 4000;
+    const truncated_output = if (result.output.len > MAX_SYNTHETIC_OUTPUT_CHARS)
+        result.output[0..MAX_SYNTHETIC_OUTPUT_CHARS]
+    else
+        result.output;
+    const truncation_note = if (result.output.len > MAX_SYNTHETIC_OUTPUT_CHARS)
+        "\n\n[output truncated — full length was larger]"
+    else
+        "";
+
+    const success_word = if (result.success) "succeeded" else "failed";
+    const synthetic = try std.fmt.allocPrint(
         self.allocator,
-        "Approved tool (id={d}) success={any}.{s}\n{s}",
-        .{ id_snapshot, result.success, always_note, result.output },
+        "[Approved tool execution: id={d} tool={s} status={s}{s}]\n\nOutput:\n{s}{s}\n\nContinue your reasoning based on this tool result. Produce the next step for the user.",
+        .{
+            id_snapshot,
+            pending.tool_name,
+            success_word,
+            always_note,
+            truncated_output,
+            truncation_note,
+        },
     );
+    defer self.allocator.free(synthetic);
+
+    // If the continuation turn itself fails, fall back to returning
+    // the raw tool output so the user at least sees what happened.
+    // `self: anytype` forces us to cast through `anyerror` explicitly
+    // so the error set resolves at the call site instead of propagating
+    // through the caller's inferred union.
+    const continuation_result: anyerror![]const u8 = self.turn(synthetic);
+    if (continuation_result) |continuation| {
+        return continuation;
+    } else |err| {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Approved tool (id={d}) {s}.{s}\n{s}\n\n[Continuation turn failed: {s}]",
+            .{ id_snapshot, success_word, always_note, result.output, @errorName(err) },
+        );
+    }
 }
 
 fn handleApproveCommand(self: anytype, arg: []const u8) ![]const u8 {

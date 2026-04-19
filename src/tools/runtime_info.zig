@@ -10,7 +10,7 @@ const tool_dispatcher = @import("../tool_dispatcher.zig");
 const process_util = @import("process_util.zig");
 const voice = @import("../voice.zig");
 const lane_metrics = @import("../lane_metrics.zig");
-const zaki_session = @import("../zaki_session.zig");
+const zaki_session = @import("../session/root.zig");
 const root = @import("root.zig");
 
 const Tool = root.Tool;

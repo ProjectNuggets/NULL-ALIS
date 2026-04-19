@@ -96,6 +96,18 @@ pub const ObserverEvent = union(enum) {
         risk_level: []const u8,
         run_id: ?[]const u8 = null,
     },
+    /// Binding principle: no silent fallback. When nullalis degrades or has a
+    /// notable internal state change the user deserves to know about, emit a
+    /// system_notice. Frontend should render as chrome (badge / toast) separate
+    /// from reply content. kinds: compaction | provider_fallback |
+    /// connector_stale | multimodal_failure | generic.
+    system_notice: struct {
+        kind: []const u8,
+        severity: []const u8,
+        message: []const u8,
+        detail: ?[]const u8 = null,
+        run_id: ?[]const u8 = null,
+    },
 };
 
 /// Numeric metrics.
@@ -219,6 +231,7 @@ pub const LogObserver = struct {
             .narration_frame => |e| std.log.info("narration type={s} message={s}", .{ @tagName(e.frame_type), e.message }),
             .task_update => |e| std.log.info("task.update task_id={s} status={s}", .{ e.task_id, e.status }),
             .approval_required => |e| std.log.info("approval.required tool={s} reason={s} risk_level={s}", .{ e.tool, e.reason, e.risk_level }),
+            .system_notice => |e| std.log.info("system.notice kind={s} severity={s} message={s}", .{ e.kind, e.severity, e.message }),
         }
     }
 
@@ -415,6 +428,7 @@ pub const FileObserver = struct {
             .narration_frame => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"narration_frame\",\"type\":\"{s}\",\"message\":\"{s}\"}}", .{ @tagName(e.frame_type), e.message }) catch return,
             .task_update => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"task_update\",\"task_id\":\"{s}\",\"status\":\"{s}\"}}", .{ e.task_id, e.status }) catch return,
             .approval_required => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"approval_required\",\"tool\":\"{s}\",\"reason\":\"{s}\",\"risk_level\":\"{s}\"}}", .{ e.tool, e.reason, e.risk_level }) catch return,
+            .system_notice => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"system_notice\",\"kind\":\"{s}\",\"severity\":\"{s}\",\"message\":\"{s}\"}}", .{ e.kind, e.severity, e.message }) catch return,
         };
         self.appendToFile(line);
     }
@@ -681,6 +695,13 @@ pub const OtelObserver = struct {
                     .{ .key = "tool", .value = e.tool },
                     .{ .key = "reason", .value = e.reason },
                     .{ .key = "risk_level", .value = e.risk_level },
+                });
+            },
+            .system_notice => |e| {
+                self.addSpan("system.notice", now, now, &.{
+                    .{ .key = "kind", .value = e.kind },
+                    .{ .key = "severity", .value = e.severity },
+                    .{ .key = "message", .value = e.message },
                 });
             },
         }

@@ -3,7 +3,7 @@ const build_options = @import("build_options");
 const Config = @import("config.zig").Config;
 const tools_mod = @import("tools/root.zig");
 const user_settings = @import("user_settings.zig");
-const zaki_session = @import("zaki_session.zig");
+const zaki_session = @import("session/root.zig");
 const zaki_state = @import("zaki_state.zig");
 
 pub const ScopedTenantRuntime = struct {

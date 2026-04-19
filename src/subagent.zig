@@ -16,7 +16,7 @@ const channel_loop = @import("channel_loop.zig");
 const json_util = @import("json_util.zig");
 const observability = @import("observability.zig");
 const tasks_mod = @import("tasks/root.zig");
-const zaki_session = @import("zaki_session.zig");
+const zaki_session = @import("session/root.zig");
 const zaki_state = @import("zaki_state.zig");
 
 const log = std.log.scoped(.subagent);

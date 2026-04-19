@@ -32,7 +32,7 @@ References:
 - [ops runbook](docs/reliability-ops-runbook.md)
 - [v0.1 declaration (2026-03-18)](docs/releases/v0.1-declaration-2026-03-18.md)
 - [v1.1 next steps](docs/releases/v1.1-next-steps.md)
-- [historical archive note](docs/historical-archive.md)
+- [historical archive note](docs/archive/historical-archive.md)
 
 ## What nullALIS Is
 

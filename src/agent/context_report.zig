@@ -198,7 +198,10 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
     try std.fmt.format(w, "    hot: last_n={d} raw_only=yes\n", .{
         report.history_trim_limit_messages,
     });
-    try std.fmt.format(w, "    warm: summary_latest={s} anchor={s} recall_limit={d} timeline_fallback_limit={d} durable={d} timeline={d} search={d} fallback={d} continuity_bucket={d}/{d} semantic_bucket={d}/{d} fallback_bucket={d}/{d}\n", .{
+    // W2.6: `recall_cap` is the intended per-turn cap (static). `search` below
+    // is the actual delivered count on this turn. Keep them distinct in the
+    // label so the operator can tell capacity from delivery at a glance.
+    try std.fmt.format(w, "    warm: summary_latest={s} anchor={s} recall_cap={d} timeline_fallback_cap={d} durable={d} timeline={d} search={d} fallback={d} continuity_bucket={d}/{d} semantic_bucket={d}/{d} fallback_bucket={d}/{d}\n", .{
         boolWord(report.last_turn.memory_selection.summary_latest_used),
         boolWord(report.last_turn.memory_selection.context_anchor_used),
         config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT,
@@ -630,7 +633,7 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory: enabled=yes runtime=yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "retrieval: mode=hybrid provider=together vector=pgvector rollout=on") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "hot: last_n=80 raw_only=yes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "warm: summary_latest=yes anchor=no recall_limit=10 timeline_fallback_limit=2 durable=1 timeline=2 search=1 fallback=0 continuity_bucket=1/12 semantic_bucket=3/18 fallback_bucket=0/0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "warm: summary_latest=yes anchor=no recall_cap=10 timeline_fallback_cap=2 durable=1 timeline=2 search=1 fallback=0 continuity_bucket=1/12 semantic_bucket=3/18 fallback_bucket=0/0") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "cold: tools=memory_recall,memory_timeline,memory_list discovery=timeline_index transcripts=autosave(exact_history) retention=forever") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "durable_refresh: triggered=yes reason=compaction:auto") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "cache: stable_prefix=yes refresh_needed=yes reason=workspace") != null);

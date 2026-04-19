@@ -1375,62 +1375,19 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 // ── Hardware ─────────────────────────────────────────────────────
 
 fn runHardware(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    if (sub_args.len < 1) {
-        std.debug.print(
-            \\Usage: nullalis hardware <command> [args]
-            \\
-            \\Commands:
-            \\  scan                          Scan for connected hardware
-            \\  flash                         Not implemented
-            \\  monitor                       Not implemented
-            \\
-        , .{});
-        std.process.exit(1);
-    }
-
-    const subcmd = sub_args[0];
-
-    if (std.mem.eql(u8, subcmd, "scan")) {
-        std.debug.print("Scanning for hardware devices...\n", .{});
-        std.debug.print("Known board registry: {d} entries\n", .{yc.hardware.knownBoards().len});
-
-        const devices = yc.hardware.discoverHardware(allocator) catch |err| {
-            std.debug.print("Discovery failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
-        };
-        defer yc.hardware.freeDiscoveredDevices(allocator, devices);
-
-        if (devices.len == 0) {
-            std.debug.print("No recognized devices found.\n", .{});
-        } else {
-            std.debug.print("Discovered {d} device(s):\n", .{devices.len});
-            for (devices) |dev| {
-                std.debug.print("  {s}", .{dev.name});
-                if (dev.detail) |det| {
-                    std.debug.print(" ({s})", .{det});
-                }
-                if (dev.device_path) |path| {
-                    std.debug.print(" @ {s}", .{path});
-                }
-                std.debug.print("\n", .{});
-            }
-        }
-    } else if (std.mem.eql(u8, subcmd, "flash")) {
-        if (sub_args.len < 2) {
-            std.debug.print("Usage: nullalis hardware flash <firmware_file> [--target <board>]\n", .{});
-            std.process.exit(1);
-        }
-        std.debug.print("Not implemented: nullalis hardware flash\n", .{});
-        std.debug.print("Firmware file provided: {s}\n", .{sub_args[1]});
-        std.process.exit(2);
-    } else if (std.mem.eql(u8, subcmd, "monitor")) {
-        std.debug.print("Not implemented: nullalis hardware monitor\n", .{});
-        std.debug.print("Use `nullalis hardware scan` to discover devices first.\n", .{});
-        std.process.exit(2);
-    } else {
-        std.debug.print("Unknown hardware command: {s}\n", .{subcmd});
-        std.process.exit(1);
-    }
+    _ = allocator;
+    _ = sub_args;
+    // Hardware/IoT CLI was removed in V1 convergence. Nullalis is a
+    // second-brain runtime; embedded-device discovery is out of scope.
+    // Keeping the dispatch stub so the `nullalis hardware` command surface
+    // returns a clear message for one release cycle rather than a parse
+    // error. Remove the dispatch entirely in the next cleanup pass.
+    std.debug.print(
+        "The `nullalis hardware` command was removed in V1 convergence.\n" ++
+            "Nullalis is a second-brain runtime; hardware/IoT discovery is not supported.\n",
+        .{},
+    );
+    std.process.exit(2);
 }
 
 // ── Migrate ──────────────────────────────────────────────────────

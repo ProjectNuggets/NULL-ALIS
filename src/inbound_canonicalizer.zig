@@ -1,6 +1,6 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
-const zaki_session = @import("zaki_session.zig");
+const zaki_session = @import("session/root.zig");
 const zaki_state = @import("zaki_state.zig");
 
 pub const CanonicalSessionLane = enum {

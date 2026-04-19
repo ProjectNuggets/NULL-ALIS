@@ -215,13 +215,19 @@ pub const MemoryRecallTool = struct {
             try buf.appendSlice(allocator, entry.key);
             try buf.appendSlice(allocator, "] [");
             try buf.appendSlice(allocator, entry.category.toString());
-            try buf.appendSlice(allocator, "] channel=");
+            try buf.appendSlice(allocator, "] role=");
+            try buf.appendSlice(allocator, mem_root.classifyArtifactKey(entry.key).toSlice());
+            try buf.appendSlice(allocator, " channel=");
             try buf.appendSlice(allocator, provenance.channel);
             try buf.appendSlice(allocator, " lane=");
             try buf.appendSlice(allocator, provenance.lane);
             if (provenance.session_id) |session_id| {
                 try buf.appendSlice(allocator, " session=");
                 try buf.appendSlice(allocator, session_id);
+            }
+            if (entry.timestamp.len > 0) {
+                try buf.appendSlice(allocator, " at=");
+                try buf.appendSlice(allocator, entry.timestamp);
             }
             try buf.appendSlice(allocator, ": ");
             try buf.appendSlice(allocator, entry.content);

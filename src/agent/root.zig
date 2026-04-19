@@ -43,7 +43,10 @@ const cache = memory_mod.cache;
 pub const abort = @import("abort.zig");
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
-pub const context_builder = @import("context_builder.zig");
+// W1.2: context_builder is now an internal stage of context_engine.
+// External consumers should use `agent.context_engine.builder`.
+// Kept as a private const here for internal agent/root.zig callers.
+const context_builder = @import("context_builder.zig");
 pub const context_cache = @import("context_cache.zig");
 pub const context_tokens = @import("context_tokens.zig");
 pub const context_report = @import("context_report.zig");
@@ -55,7 +58,10 @@ pub const task_planner = @import("task_planner.zig");
 pub const learning = @import("learning.zig");
 pub const run_event_types = @import("run_event_types.zig");
 const usage_runtime_mod = @import("../usage_runtime.zig");
-pub const memory_loader = @import("memory_loader.zig");
+// W1.2: memory_loader is now an internal stage of context_engine.
+// External consumers should use `agent.context_engine.memory_loader`.
+// Kept as a private const here for internal agent/root.zig callers.
+const memory_loader = @import("memory_loader.zig");
 pub const transcript = @import("transcript.zig");
 pub const commands = @import("commands.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
@@ -76,6 +82,12 @@ const DEFAULT_MAX_HISTORY: u32 = 50;
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Agent = struct {
+    const StreamEmissionMode = enum {
+        undecided,
+        pass_through,
+        hold_for_validation,
+    };
+
     const StreamTimingContext = struct {
         agent: *Agent,
         callback: providers.StreamCallback,
@@ -84,6 +96,41 @@ pub const Agent = struct {
         provider_start_ms: i64,
         first_token_recorded: bool = false,
         first_token_ms: ?u64 = null,
+        emission_mode: StreamEmissionMode = .undecided,
+        buffered_text: std.ArrayListUnmanaged(u8) = .empty,
+        final_pending: bool = false,
+
+        fn deinit(self: *StreamTimingContext) void {
+            self.buffered_text.deinit(self.agent.allocator);
+        }
+
+        fn flushBuffered(self: *StreamTimingContext) void {
+            if (self.buffered_text.items.len > 0) {
+                self.callback(self.callback_ctx, providers.StreamChunk.textDelta(self.buffered_text.items));
+                self.buffered_text.clearRetainingCapacity();
+            }
+            if (self.final_pending) {
+                self.callback(self.callback_ctx, providers.StreamChunk.finalChunk());
+                self.final_pending = false;
+            }
+            self.emission_mode = .pass_through;
+        }
+
+        fn flushValidatedReply(self: *StreamTimingContext, reply_text: []const u8) void {
+            if (self.emission_mode == .pass_through) return;
+            self.buffered_text.clearRetainingCapacity();
+            if (reply_text.len > 0) {
+                self.callback(self.callback_ctx, providers.StreamChunk.textDelta(reply_text));
+            }
+            self.callback(self.callback_ctx, providers.StreamChunk.finalChunk());
+            self.final_pending = false;
+            self.emission_mode = .pass_through;
+        }
+
+        fn recordBufferedDelta(self: *StreamTimingContext, delta: []const u8) bool {
+            self.buffered_text.appendSlice(self.agent.allocator, delta) catch return false;
+            return true;
+        }
     };
 
     fn streamCallbackWithTiming(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
@@ -104,7 +151,28 @@ pub const Agent = struct {
             } };
             ctx.agent.observer.recordEvent(&first_token_event);
         }
-        ctx.callback(ctx.callback_ctx, chunk);
+        if (ctx.emission_mode == .pass_through) {
+            ctx.callback(ctx.callback_ctx, chunk);
+            return;
+        }
+        if (chunk.is_final) {
+            ctx.final_pending = true;
+            return;
+        }
+        if (chunk.delta.len == 0) return;
+        if (!ctx.recordBufferedDelta(chunk.delta)) {
+            ctx.flushBuffered();
+            ctx.callback(ctx.callback_ctx, chunk);
+            return;
+        }
+
+        const buffered_line = Agent.firstNonEmptyLine(ctx.buffered_text.items) orelse return;
+        if (Agent.looksLikeStreamingStatusPrefix(buffered_line)) {
+            ctx.emission_mode = .hold_for_validation;
+            return;
+        }
+
+        ctx.flushBuffered();
     }
 
     const TtsSynthesizeFn = *const fn (
@@ -367,6 +435,13 @@ pub const Agent = struct {
     /// not re-trigger approval. Other gates (security, action budget,
     /// execution mode) still apply.
     approval_bypass_active: bool = false,
+    /// When true (production default), resolving `/approve allow-once` runs
+    /// the tool AND invokes a continuation turn so the LLM reasons about the
+    /// tool result and produces the final user-facing reply. Fixes the
+    /// "approval drops after click" bug (2026-04-18). Tests that do not
+    /// provide a live provider may set this to false to preserve the legacy
+    /// "return tool output as reply text" behavior.
+    approval_continues_turn: bool = true,
     session_ttl_secs: ?u64 = null,
     focus_target: ?[]const u8 = null,
     focus_target_owned: bool = false,
@@ -831,6 +906,8 @@ pub const Agent = struct {
             if (containsAsciiIgnoreCase(text, pattern)) return true;
         }
 
+        if (looksLikeInProgressStatusClaim(text)) return true;
+
         const exact_patterns = [_][]const u8{
             "сейчас попробую",
             "Сейчас попробую",
@@ -853,9 +930,174 @@ pub const Agent = struct {
         return false;
     }
 
+    const strong_in_progress_status_prefixes = [_][]const u8{
+        "executing ",
+        "running ",
+        "searching ",
+        "fetching ",
+        "checking ",
+        "trying ",
+        "attempting ",
+        "looking up ",
+        "working on ",
+        "opening ",
+        "calling ",
+        "sending ",
+        "querying ",
+        "inspecting ",
+        "verifying ",
+    };
+
+    const weak_in_progress_status_prefixes = [_][]const u8{
+        "using ",
+        "reading ",
+        "loading ",
+    };
+
+    fn looksLikeInProgressStatusClaim(text: []const u8) bool {
+        const raw_line = firstNonEmptyLine(text) orelse return false;
+        const line = trimActionStatusLeadIn(raw_line);
+        if (line.len == 0 or line.len > 160) return false;
+
+        var matched_strong_prefix = false;
+        inline for (strong_in_progress_status_prefixes) |prefix| {
+            if (startsWithAsciiIgnoreCase(line, prefix)) {
+                matched_strong_prefix = true;
+                break;
+            }
+        }
+        if (matched_strong_prefix) {
+            return !looksLikeNonActionExplanation(line);
+        }
+
+        var matched_weak_prefix = false;
+        inline for (weak_in_progress_status_prefixes) |prefix| {
+            if (startsWithAsciiIgnoreCase(line, prefix)) {
+                matched_weak_prefix = true;
+                break;
+            }
+        }
+        if (!matched_weak_prefix) return false;
+        if (looksLikeNonActionExplanation(line)) return false;
+
+        return std.mem.endsWith(u8, line, ":") or
+            std.mem.endsWith(u8, line, "...") or
+            std.mem.endsWith(u8, line, "…") or
+            containsAsciiIgnoreCase(line, " now") or
+            containsAsciiIgnoreCase(line, " before i") or
+            containsAsciiIgnoreCase(line, " for you") or
+            containsAsciiIgnoreCase(line, " to check") or
+            containsAsciiIgnoreCase(line, " to verify");
+    }
+
+    fn looksLikeStreamingStatusPrefix(line: []const u8) bool {
+        const normalized = trimActionStatusLeadIn(line);
+        if (normalized.len == 0 or normalized.len > 160) return false;
+        inline for (strong_in_progress_status_prefixes) |prefix| {
+            if (matchesAsciiPrefixPartially(normalized, prefix)) return true;
+        }
+        inline for (weak_in_progress_status_prefixes) |prefix| {
+            if (matchesAsciiPrefixPartially(normalized, prefix)) return true;
+        }
+        return false;
+    }
+
+    fn trimActionStatusLeadIn(line: []const u8) []const u8 {
+        var rest = std.mem.trimLeft(u8, line, " \t([{<\"'`*_#>-");
+        var iterations: u8 = 0;
+        while (iterations < 3 and rest.len > 0) : (iterations += 1) {
+            const marker = extractLeadingAsciiWord(rest) orelse break;
+            if (!isActionStatusLeadInMarker(marker.word)) break;
+            rest = std.mem.trimLeft(u8, rest[marker.end_index..], " \t,:;.!?-)]}>\"'`*_#");
+        }
+        return rest;
+    }
+
+    fn extractLeadingAsciiWord(text: []const u8) ?struct { word: []const u8, end_index: usize } {
+        if (text.len == 0 or !std.ascii.isAlphabetic(text[0])) return null;
+        var idx: usize = 0;
+        while (idx < text.len and std.ascii.isAlphabetic(text[idx])) : (idx += 1) {}
+        return .{ .word = text[0..idx], .end_index = idx };
+    }
+
+    fn isActionStatusLeadInMarker(word: []const u8) bool {
+        const markers = [_][]const u8{
+            "actually",
+            "ok",
+            "okay",
+            "alright",
+            "right",
+            "sure",
+            "well",
+            "so",
+            "then",
+            "now",
+            "great",
+            "fine",
+        };
+        inline for (markers) |marker| {
+            if (std.ascii.eqlIgnoreCase(word, marker)) return true;
+        }
+        return false;
+    }
+
+    fn looksLikeNonActionExplanation(line: []const u8) bool {
+        const negative_markers = [_][]const u8{
+            " not ",
+            "n't ",
+            "cannot ",
+            "can't ",
+            "unable ",
+            "unsupported",
+            "unavailable",
+            "unnecessary",
+            "no need",
+            "not necessary",
+            "disabled",
+            "impossible",
+            "without ",
+        };
+        inline for (negative_markers) |marker| {
+            if (containsAsciiIgnoreCase(line, marker)) return true;
+        }
+        return false;
+    }
+
+    fn firstNonEmptyLine(text: []const u8) ?[]const u8 {
+        var start: usize = 0;
+        while (start < text.len) {
+            while (start < text.len and (text[start] == '\n' or text[start] == '\r')) : (start += 1) {}
+            if (start >= text.len) return null;
+            const line_end_rel = std.mem.indexOfAnyPos(u8, text, start, "\r\n") orelse text.len;
+            const line = std.mem.trim(u8, text[start..line_end_rel], " \t");
+            if (line.len > 0) return line;
+            start = line_end_rel + 1;
+        }
+        return null;
+    }
+
     fn startsWithToolCallMarkup(text: []const u8) bool {
         const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
         return std.mem.startsWith(u8, trimmed, "<tool_call>");
+    }
+
+    fn startsWithAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0 or haystack.len < needle.len) return false;
+        var i: usize = 0;
+        while (i < needle.len) : (i += 1) {
+            if (std.ascii.toLower(haystack[i]) != std.ascii.toLower(needle[i])) return false;
+        }
+        return true;
+    }
+
+    fn matchesAsciiPrefixPartially(haystack: []const u8, needle: []const u8) bool {
+        if (haystack.len == 0 or needle.len == 0) return false;
+        const limit = @min(haystack.len, needle.len);
+        var i: usize = 0;
+        while (i < limit) : (i += 1) {
+            if (std.ascii.toLower(haystack[i]) != std.ascii.toLower(needle[i])) return false;
+        }
+        return true;
     }
 
     fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -1148,6 +1390,20 @@ pub const Agent = struct {
             .role = .user,
             .content = try self.allocator.dupe(u8, scrubbed_results),
         });
+    }
+
+    pub const PendingApprovalSnapshot = struct {
+        exec_id: u64,
+        command: []const u8,
+    };
+
+    /// W2.3: Read-only snapshot of the current pending tool approval.
+    /// Returns null when no approval is pending. The returned `command` slice
+    /// points into Agent-owned memory; callers must copy it if they need to
+    /// outlive the Agent's mutex window.
+    pub fn pendingApprovalSnapshot(self: *const Agent) ?PendingApprovalSnapshot {
+        const cmd = self.pending_exec_command orelse return null;
+        return .{ .exec_id = self.pending_exec_id, .command = cmd };
     }
 
     pub fn clearPendingToolApproval(self: *Agent) void {
@@ -2170,12 +2426,14 @@ pub const Agent = struct {
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
             var saw_stream_first_token = false;
+            var stream_timing_ctx: ?StreamTimingContext = null;
+            defer if (stream_timing_ctx) |*ctx| ctx.deinit();
             turn_llm_calls += 1;
 
             // Call provider: streaming or blocking. Reliable wrappers may retry/fallback internally.
             var response: ChatResponse = undefined;
             if (is_streaming) {
-                var stream_timing_ctx = StreamTimingContext{
+                stream_timing_ctx = .{
                     .agent = self,
                     .callback = self.stream_callback.?,
                     .callback_ctx = self.stream_ctx.?,
@@ -2196,7 +2454,7 @@ pub const Agent = struct {
                     self.model_name,
                     self.temperature,
                     streamCallbackWithTiming,
-                    @ptrCast(&stream_timing_ctx),
+                    @ptrCast(&stream_timing_ctx.?),
                 ) catch |err| {
                     log.warn("llm.call failed provider={s} model={s} error={s}", .{
                         self.provider.getName(),
@@ -2215,8 +2473,8 @@ pub const Agent = struct {
                     self.observer.recordEvent(&fail_event);
                     return err;
                 };
-                saw_stream_first_token = stream_timing_ctx.first_token_recorded;
-                if (stream_timing_ctx.first_token_ms) |value| {
+                saw_stream_first_token = stream_timing_ctx.?.first_token_recorded;
+                if (stream_timing_ctx.?.first_token_ms) |value| {
                     turn_first_token_ms = value;
                 }
                 response = ChatResponse{
@@ -2226,6 +2484,23 @@ pub const Agent = struct {
                     .model = stream_result.model,
                     .reasoning_content = stream_result.reasoning_content,
                 };
+
+                // Binding rule: no silent fallback. If the reliable wrapper
+                // tagged the result as served by a fallback provider, surface
+                // a system_notice so the user sees visible degradation
+                // (possibly degraded latency or capability on fallback).
+                if (stream_result.used_fallback) |fallback_name| {
+                    var detail_buf: [128]u8 = undefined;
+                    const detail = std.fmt.bufPrint(&detail_buf, "primary failed; served by {s}", .{fallback_name}) catch fallback_name;
+                    const notice_event = ObserverEvent{ .system_notice = .{
+                        .kind = "provider_fallback",
+                        .severity = "warning",
+                        .message = "Primary model provider failed; response served by fallback. Quality or latency may differ.",
+                        .detail = detail,
+                        .run_id = self.current_run_id,
+                    } };
+                    self.observer.recordEvent(&notice_event);
+                }
             } else {
                 response = self.provider.chat(
                     self.allocator,
@@ -2404,8 +2679,12 @@ pub const Agent = struct {
             // IS the narration. No sidecar call needed.
             if (response.reasoning_content) |thinking| {
                 if (thinking.len > 0) {
-                    // Truncate to a reasonable narration length for the UI
-                    const max_narration = @min(thinking.len, 200);
+                    // Cap at 2000 chars (was 200 — too short to convey
+                    // actual thought content). Frontend is free to further
+                    // truncate/format; the runtime's job is to emit the
+                    // truth. 2000 chars covers a full paragraph of
+                    // reasoning without flooding the SSE channel.
+                    const max_narration = @min(thinking.len, 2000);
                     const thinking_event = ObserverEvent{ .narration_frame = .{
                         .message = thinking[0..max_narration],
                         .frame_type = .thinking,
@@ -2515,8 +2794,7 @@ pub const Agent = struct {
                 // Guardrail: if the model promises "I'll try/check now" but emits no
                 // tool call, force one follow-up completion to either act now or
                 // explicitly state the limitation without deferred promises.
-                if (!is_streaming and
-                    forced_follow_through_count < 2 and
+                if (forced_follow_through_count < 2 and
                     iteration + 1 < self.max_tool_iterations and
                     (shouldForceActionFollowThrough(display_text) or malformed_tool_markup))
                 {
@@ -2525,9 +2803,10 @@ pub const Agent = struct {
                             "Emit valid, closed <tool_call>...</tool_call> tags now for each tool action. " ++
                             "If no tool is needed, answer in plain text with no <tool_call> tags."
                     else
-                        "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
+                        "SYSTEM: You just promised or claimed that you were taking action now " ++
+                            "(for example: \"I'll check now\" or \"Executing web search...\"). " ++
                             "Do it in this turn by issuing the appropriate tool call(s). " ++
-                            "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.";
+                            "If no tool can perform it, respond with a clear limitation now and do not promise or imply that work has started.";
                     try self.history.append(self.allocator, .{
                         .role = .assistant,
                         .content = try self.allocator.dupe(u8, display_text),
@@ -2558,6 +2837,21 @@ pub const Agent = struct {
                     const was_force = self.context_force_compressed;
                     self.context_was_compacted = false;
                     self.context_force_compressed = false;
+
+                    // Emit a system_notice alongside the inline prefix so the
+                    // frontend can render a distinct chrome notice (not buried
+                    // in reply text). Binding rule: no silent fallback.
+                    const notice_event = ObserverEvent{ .system_notice = .{
+                        .kind = "compaction",
+                        .severity = if (was_force) "warning" else "info",
+                        .message = if (was_force)
+                            "Older messages were dropped to fit the context window. Some history may be inaccessible."
+                        else
+                            "Context was compacted to stay within the window. Durable continuity was preserved via memory.",
+                        .run_id = self.current_run_id,
+                    } };
+                    self.observer.recordEvent(&notice_event);
+
                     const prefix = if (was_force)
                         // Hard-drop: older messages were removed without summarization.
                         // User deserves a clear signal that continuity is broken.
@@ -2814,8 +3108,14 @@ pub const Agent = struct {
                 self.observer.recordEvent(&finalize_stage_event);
 
                 if (tts_audio_reply_text) |audio_reply| {
+                    if (stream_timing_ctx) |*ctx| {
+                        ctx.flushValidatedReply(audio_reply);
+                    }
                     self.allocator.free(final_text);
                     return audio_reply;
+                }
+                if (stream_timing_ctx) |*ctx| {
+                    ctx.flushValidatedReply(final_text);
                 }
                 return final_text;
             }
@@ -2951,12 +3251,17 @@ pub const Agent = struct {
             } };
             self.observer.recordEvent(&reflect_stage_event);
 
+            // Native reasoning was already emitted as a narration_frame up at
+            // the response-parse site (see "Native thinking narration" block).
+            // We only need the sidecar fallback here when no native thinking
+            // was produced this turn.
+            const had_native_thinking = response.reasoning_content != null and
+                response.reasoning_content.?.len > 0;
+
             // ── Thinking narration fallback (sidecar) ──
             // If the model didn't return native reasoning_content on this turn,
             // fall back to the sidecar for narration every N tool iterations.
             // This covers models without native thinking support.
-            const had_native_thinking = response.reasoning_content != null and
-                response.reasoning_content.?.len > 0;
             if (!had_native_thinking and
                 self.sidecar_provider != null and self.narration_interval > 0 and
                 turn_tool_iterations > 1 and
@@ -3601,9 +3906,15 @@ test "narration module reexport" {
     _ = narration.FrameType;
 }
 
-test "memory_loader module reexport" {
-    _ = memory_loader.loadContext;
-    _ = memory_loader.enrichMessage;
+test "memory_loader accessible as internal stage of context_engine" {
+    _ = context_engine.memory_loader.loadContext;
+    _ = context_engine.memory_loader.enrichMessage;
+}
+
+test "context_builder accessible as internal stage of context_engine" {
+    _ = context_engine.builder.buildSnapshot;
+    _ = context_engine.builder.buildPromptRefreshPlan;
+    _ = context_engine.builder.buildLastTurnContext;
 }
 
 test "task_planner module reexport" {
@@ -7738,9 +8049,146 @@ test "Agent streaming fields can be set" {
     try std.testing.expect(agent.stream_ctx != null);
 }
 
+test "Agent streaming follow-through retries false in-progress claims" {
+    const StreamingFollowThroughProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "unexpected chat path"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            const content = if (self.call_count == 1)
+                "Executing the next step now:"
+            else
+                "done";
+            callback(callback_ctx, providers.StreamChunk.textDelta(content));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(u8, content),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "streaming-follow-through-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const StreamRecorder = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            if (chunk.delta.len == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch {};
+        }
+
+        fn deinit(self: *@This()) void {
+            self.chunks.deinit(std.testing.allocator);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = StreamingFollowThroughProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamingFollowThroughProvider.chatWithSystem,
+        .chat = StreamingFollowThroughProvider.chat,
+        .supportsNativeTools = StreamingFollowThroughProvider.supportsNativeTools,
+        .getName = StreamingFollowThroughProvider.getName,
+        .deinit = StreamingFollowThroughProvider.deinitFn,
+        .supports_streaming = StreamingFollowThroughProvider.supportsStreaming,
+        .stream_chat = StreamingFollowThroughProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var recorder = StreamRecorder{};
+    defer recorder.deinit();
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .stream_callback = StreamRecorder.onChunk,
+        .stream_ctx = @ptrCast(&recorder),
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("do the thing");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "Executing the next step now:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "done") != null);
+}
+
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll try again with a different filename now."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("let me check that and get back in a moment"));
+}
+
+test "Agent shouldForceActionFollowThrough detects generic in-progress status claims" {
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Executing the next step now:"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Checking the environment for you now."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Running a verification pass before I answer."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Actually executing web_search NOW:)"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Okay, searching the web for that now."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("**Actually executing tool discovery - no memory, no context, just real system calls**"));
+}
+
+test "Agent shouldForceActionFollowThrough ignores neutral gerund phrasing" {
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Using tools is not necessary here."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Running code locally is unsupported in this environment."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("**Using the old cache format is unsupported in this environment.**"));
 }
 
 test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
@@ -8493,6 +8941,7 @@ test "/approve allow-once executes pending tool exactly once" {
         .model_name = "test-model",
         .temperature = 0.7,
         .workspace_dir = "/tmp",
+        .approval_continues_turn = false,
         .max_tool_iterations = 2,
         .max_history_messages = 20,
         .auto_save = false,
@@ -8538,6 +8987,7 @@ test "/approve allow-once handles static failure output without freeing literals
         .model_name = "test-model",
         .temperature = 0.7,
         .workspace_dir = "/tmp",
+        .approval_continues_turn = false,
         .max_tool_iterations = 2,
         .max_history_messages = 20,
         .auto_save = false,
@@ -8587,6 +9037,7 @@ test "approval gate does not consume budget until allow-once executes the tool" 
         .model_name = "test-model",
         .temperature = 0.7,
         .workspace_dir = "/tmp",
+        .approval_continues_turn = false,
         .max_tool_iterations = 2,
         .max_history_messages = 20,
         .auto_save = false,
@@ -8643,6 +9094,7 @@ test "approval-required tool stops serial dispatch before later safe tools run" 
         .model_name = "test-model",
         .temperature = 0.7,
         .workspace_dir = "/tmp",
+        .approval_continues_turn = false,
         .max_tool_iterations = 2,
         .max_history_messages = 20,
         .auto_save = false,

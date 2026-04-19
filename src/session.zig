@@ -201,8 +201,8 @@ pub const SessionManager = struct {
         }
 
         // Per-user session count limit (DoS mitigation T-03-04)
-        const zaki_session = @import("zaki_session.zig");
-        const session_identity = @import("session/identity.zig");
+        const zaki_session = @import("session/root.zig");
+        const session_identity = zaki_session.identity;
         if (zaki_session.parseUserIdFromSessionKey(session_key)) |uid| {
             var user_count: usize = 0;
             var key_it = self.sessions.keyIterator();
@@ -259,6 +259,15 @@ pub const SessionManager = struct {
     }
 
     /// Find or create a session for the given key. Thread-safe.
+    /// Read-only session lookup. Returns null if no session exists for the
+    /// given key. Used by diagnostic HTTP endpoints that must not trigger
+    /// session creation as a side effect of reading state.
+    pub fn getIfPresent(self: *SessionManager, session_key: []const u8) ?*Session {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.sessions.get(session_key);
+    }
+
     pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
         return self.getOrCreateInternal(session_key, false);
     }

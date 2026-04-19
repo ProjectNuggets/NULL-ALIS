@@ -69,6 +69,16 @@ fn defaultChannels() ChannelSelection {
     return selection;
 }
 
+/// V1 default channel selection: CLI (admin/ops) + Telegram (product).
+/// Per the V1 convergence plan, all other channels are frozen and must be
+/// explicitly re-enabled via `-Dchannels=all` or a comma-separated list.
+fn v1DefaultChannels() ChannelSelection {
+    var selection = ChannelSelection{};
+    selection.enable_channel_cli = true;
+    selection.enable_channel_telegram = true;
+    return selection;
+}
+
 fn parseChannelsOption(raw: []const u8) !ChannelSelection {
     var selection = ChannelSelection{};
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
@@ -264,17 +274,23 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.2.25";
+    // V1 convergence flag. When true (default), the build narrows defaults to
+    // V1-safe choices: channel default becomes `cli,telegram` only. Pass
+    // `-Dv1=false` to restore pre-V1 defaults (all channels enabled) as an
+    // escape hatch for one release cycle. Explicit `-Dchannels=...` always
+    // wins over the v1 default.
+    const v1 = b.option(bool, "v1", "V1 convergence mode: narrow defaults to V1-safe subsystems (default: true)") orelse true;
     const channels_raw = b.option(
         []const u8,
         "channels",
-        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal (default: all)",
+        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal (default: cli,telegram under -Dv1=true; all under -Dv1=false)",
     );
     const channels = if (channels_raw) |raw| blk: {
         const parsed = parseChannelsOption(raw) catch {
             std.process.exit(1);
         };
         break :blk parsed;
-    } else defaultChannels();
+    } else if (v1) v1DefaultChannels() else defaultChannels();
 
     const engines_raw = b.option(
         []const u8,
@@ -337,6 +353,7 @@ pub fn build(b: *std.Build) void {
 
     var build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
+    build_options.addOption(bool, "v1", v1);
     build_options.addOption(bool, "enable_memory_none", enable_memory_none);
     build_options.addOption(bool, "enable_memory_markdown", enable_memory_markdown);
     build_options.addOption(bool, "enable_memory_memory", enable_memory_memory);

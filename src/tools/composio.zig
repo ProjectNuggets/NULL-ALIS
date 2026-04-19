@@ -1,6 +1,7 @@
 const std = @import("std");
 const appendJsonEscaped = @import("../util.zig").appendJsonEscaped;
 const root = @import("root.zig");
+const observability = @import("../observability.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
@@ -15,6 +16,29 @@ const COMPOSIO_API_BASE_V3 = "https://backend.composio.dev/api/v3";
 pub const ComposioTool = struct {
     api_key: []const u8,
     entity_id: []const u8,
+    /// Optional observer for surfacing connector_stale notices to the user
+    /// when OAuth/auth config failures happen. Binding rule: no silent
+    /// fallback. Callers that have an observer handle may set this;
+    /// callers that don't leave it null and notices are dropped here
+    /// (log warnings still fire).
+    observer: ?*observability.Observer = null,
+
+    fn emitConnectorStaleNotice(self: *const ComposioTool, app_name: []const u8, detail: []const u8) void {
+        const obs = self.observer orelse return;
+        var message_buf: [192]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &message_buf,
+            "Connector auth failed for {s}. You may need to reconnect.",
+            .{app_name},
+        ) catch "Connector auth failed. You may need to reconnect.";
+        const event = observability.ObserverEvent{ .system_notice = .{
+            .kind = "connector_stale",
+            .severity = "warning",
+            .message = message,
+            .detail = detail,
+        } };
+        obs.recordEvent(&event);
+    }
 
     pub const tool_name = "composio";
     pub const tool_description = "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). " ++
@@ -323,6 +347,9 @@ pub const ComposioTool = struct {
         else blk: {
             const app_name = app orelse return ToolResult.fail("Missing 'app' for connect");
             auth_config_id_owned = self.resolveAuthConfigIdV3(allocator, app_name) catch |err| {
+                // Binding rule: no silent fallback. Surface as system_notice
+                // so the user sees the connector needs reconnection.
+                self.emitConnectorStaleNotice(app_name, @errorName(err));
                 return switch (err) {
                     error.AuthConfigNotFound => blk_err: {
                         const msg = allocator.dupe(u8, "No v3 auth_config found for app. Pass auth_config_id explicitly.") catch

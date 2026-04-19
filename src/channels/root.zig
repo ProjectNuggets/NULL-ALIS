@@ -112,6 +112,19 @@ pub const Channel = struct {
 // Channel Sub-modules
 // ════════════════════════════════════════════════════════════════════════════
 
+// V1 convergence channel disposition (2026-04-18):
+//   KEEP (active or potential product value): cli, telegram, discord, slack,
+//                                              whatsapp, email, maixcam.
+//   DELETE-ELIGIBLE (no personal-second-brain future): signal, imessage,
+//                                                       matrix, mattermost, irc,
+//                                                       line, lark, dingtalk,
+//                                                       onebot, qq.
+// The delete-eligible channels are currently flag-gated off in the V1 default
+// (-Dchannels=cli,telegram,discord,slack,whatsapp,email,maixcam) but the code
+// is still present because removing them requires a dedicated refactor pass
+// across channel_loop.zig, channel_manager.zig, channel_adapters.zig,
+// channel_catalog.zig, config.zig, config_types.zig, and build.zig (~89
+// reference sites). Tracked as a standalone follow-up package.
 pub const cli = @import("cli.zig");
 pub const telegram = @import("telegram.zig");
 pub const discord = @import("discord.zig");

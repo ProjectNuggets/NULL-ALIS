@@ -39,6 +39,7 @@ pub const update = @import("update.zig");
 pub const agent = @import("agent.zig");
 pub const session = @import("session.zig");
 pub const session_types = @import("session/root.zig");
+pub const user = @import("user.zig");
 pub const providers = @import("providers/root.zig");
 pub const memory = @import("memory/root.zig");
 pub const bootstrap = @import("bootstrap/root.zig");
@@ -80,10 +81,8 @@ pub const user_settings = @import("user_settings.zig");
 // Phase 4e: Agent Routing
 pub const agent_routing = @import("agent_routing.zig");
 
-// Phase 5: Hardware & Integrations
-pub const hardware = @import("hardware.zig");
+// Phase 5: Integrations (hardware + peripherals removed in V1 convergence — not a second-brain surface)
 pub const integrations = @import("integrations.zig");
-pub const peripherals = @import("peripherals.zig");
 pub const rag = @import("rag.zig");
 pub const skillforge = @import("skillforge.zig");
 pub const tunnel = @import("tunnel.zig");

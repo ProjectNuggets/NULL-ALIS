@@ -636,6 +636,8 @@ pub const ReliableProvider = struct {
                 callback,
                 callback_ctx,
             )) |result| {
+                // Primary succeeded — no fallback tag needed. Early return
+                // leaves `used_fallback` null on the result.
                 return result;
             }
 
@@ -647,7 +649,13 @@ pub const ReliableProvider = struct {
                     current_model,
                     callback,
                     callback_ctx,
-                )) |result| {
+                )) |tagged| {
+                    // Fallback provider succeeded after primary failed. Tag
+                    // the result so the caller (agent loop) can emit a
+                    // `system_notice kind=provider_fallback` to the user.
+                    // Binding rule: no silent fallback.
+                    var result = tagged;
+                    result.used_fallback = entry.name;
                     return result;
                 }
             }

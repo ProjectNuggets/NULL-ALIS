@@ -75,8 +75,6 @@ pub const skill_registry = @import("skill_registry.zig");
 pub const runtime_info = @import("runtime_info.zig");
 pub const screenshot = @import("screenshot.zig");
 pub const browser_open = @import("browser_open.zig");
-pub const hardware_info = @import("hardware_info.zig");
-pub const hardware_memory = @import("hardware_memory.zig");
 pub const cron_add = @import("cron_add.zig");
 pub const cron_list = @import("cron_list.zig");
 pub const cron_remove = @import("cron_remove.zig");
@@ -90,8 +88,6 @@ pub const web_search = @import("web_search.zig");
 pub const web_fetch = @import("web_fetch.zig");
 pub const file_append = @import("file_append.zig");
 pub const spawn = @import("spawn.zig");
-pub const i2c = @import("i2c.zig");
-pub const spi = @import("spi.zig");
 pub const task_list = @import("task_list.zig");
 pub const task_get = @import("task_get.zig");
 pub const task_stop = @import("task_stop.zig");
@@ -302,11 +298,6 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .risk_level = .low,
     },
     .{
-        .name = hardware_info.HardwareBoardInfoTool.tool_name,
-        .flags = .{ .read_only = true, .concurrency_safe = true },
-        .risk_level = .low,
-    },
-    .{
         // Read-only, but medium risk because it can expose screen contents.
         .name = screenshot.ScreenshotTool.tool_name,
         .flags = .{ .read_only = true },
@@ -431,21 +422,6 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .name = skill_registry.SkillRegistryTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
-    },
-    .{
-        .name = hardware_memory.HardwareMemoryTool.tool_name,
-        .flags = .{ .mutating = true },
-        .risk_level = .high,
-    },
-    .{
-        .name = i2c.I2cTool.tool_name,
-        .flags = .{ .mutating = true },
-        .risk_level = .high,
-    },
-    .{
-        .name = spi.SpiTool.tool_name,
-        .flags = .{ .mutating = true },
-        .risk_level = .high,
     },
     .{
         .name = task_stop.TaskStopTool.tool_name,
@@ -846,23 +822,11 @@ pub fn allTools(
         try list.append(allocator, bot.tool());
     }
 
-    if (opts.hardware_boards) |boards| {
-        const hbi = try allocator.create(hardware_info.HardwareBoardInfoTool);
-        hbi.* = .{ .boards = boards };
-        try list.append(allocator, hbi.tool());
-
-        const hmt = try allocator.create(hardware_memory.HardwareMemoryTool);
-        hmt.* = .{ .boards = boards };
-        try list.append(allocator, hmt.tool());
-
-        const i2ct = try allocator.create(i2c.I2cTool);
-        i2ct.* = .{};
-        try list.append(allocator, i2ct.tool());
-
-        const spit = try allocator.create(spi.SpiTool);
-        spit.* = .{};
-        try list.append(allocator, spit.tool());
-    }
+    // Hardware/IoT tools removed in V1 convergence — nullalis is a
+    // second-brain runtime, not an embedded-device runtime. If `opts.hardware_boards`
+    // is set by legacy callers it is now ignored; kept in the options struct
+    // for ABI stability across the one-release transition window.
+    _ = opts.hardware_boards;
 
     // Task management tools (Phase 2: REQ-006)
     if (opts.task_delivery) |delivery| {
@@ -1934,7 +1898,7 @@ test "defaultMetadataRegistry classifies known read-only tools" {
         "runtime_info",   "file_read",      "image_info",       "memory_recall",
         "memory_list",    "memory_timeline", "cron_list",       "cron_runs",
         "task_list",      "task_get",        "web_fetch",       "web_search",
-        "hardware_board_info", "screenshot",
+        "screenshot",
     };
     for (read_only) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse {
@@ -1954,8 +1918,7 @@ test "defaultMetadataRegistry classifies known mutating tools" {
         "schedule",      "delegate",      "spawn",         "message",
         "pushover",      "cron_add",      "cron_remove",   "cron_update",
         "cron_run",      "http_request",  "browser",       "browser_open",
-        "composio",      "skill_registry", "hardware_memory", "i2c",
-        "spi",           "task_stop",
+        "composio",      "skill_registry", "task_stop",
     };
     for (mutating) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse {

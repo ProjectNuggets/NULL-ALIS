@@ -3,7 +3,7 @@ const build_options = @import("build_options");
 const channel_catalog = @import("../channel_catalog.zig");
 const config_mod = @import("../config.zig");
 const http_util = @import("../http_util.zig");
-const zaki_session = @import("../zaki_session.zig");
+const zaki_session = @import("../session/root.zig");
 const zaki_state = @import("../zaki_state.zig");
 
 pub const Source = enum {

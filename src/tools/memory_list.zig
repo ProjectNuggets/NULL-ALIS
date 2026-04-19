@@ -77,10 +77,11 @@ pub const MemoryListTool = struct {
             if (!include_internal and mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
             if (written >= shown) break;
             const provenance = mem_root.resolveStoredMemoryProvenance(entry.content, entry.session_id, entry.key);
-            try w.print("  {d}. {s} [{s}] channel={s} lane={s}", .{
+            try w.print("  {d}. {s} [{s}] role={s} channel={s} lane={s}", .{
                 written + 1,
                 entry.key,
                 entry.category.toString(),
+                mem_root.classifyArtifactKey(entry.key).toSlice(),
                 provenance.channel,
                 provenance.lane,
             });

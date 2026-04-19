@@ -31,7 +31,7 @@ pub const SessionInfo = struct {
     }
 };
 const pg_helpers = @import("memory/engines/postgres.zig");
-const zaki_session = @import("zaki_session.zig");
+const zaki_session = @import("session/root.zig");
 const log = std.log.scoped(.zaki_state);
 
 const c = if (build_options.enable_postgres) @cImport({

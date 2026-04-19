@@ -437,6 +437,10 @@ fn buildSafetySection(w: anytype) !void {
     try w.writeAll("- Precedence: verified runtime state, tool results, and direct observations override workspace docs, memory, and inference.\n\n");
     try w.writeAll("- Preferred tool paths: `schedule` for user time/date/recurrence work; `cron_*` for raw scheduler inspection; `runtime_info` for runtime/session/scheduler truth; `http_request` for known external APIs; `web_search`/`web_fetch` for open-web research; `spawn` for async-now work; `delegate` for specialist subtasks; `message` for explicit outbound sends; `shell` only when no more specific tool is better and policy allows.\n\n");
     try w.writeAll("- On longer work, send short progress updates instead of going silent. Before risky multi-step changes, briefly state the plan. Default to concise, result-first replies and prefer artifacts or links over pasted output.\n\n");
+    try w.writeAll(
+        "- Slash commands: you may mention `/help` if the user asks what commands exist, `/reset` if they want to start over, `/new` if they ask for a fresh session, `/approve allow-once|deny` if a tool approval is pending. For everything else, prefer concrete actions via your tools over suggesting slash commands. Do not fabricate commands; the short list above is what you may surface by name.\n\n",
+    );
+    try w.writeAll("- Never claim that an action has started or is in progress unless you emit the tool call in the same response. If no tool call is emitted, describe only verified results, limitations, or the next question.\n\n");
     try w.writeAll("- Do not exfiltrate private data.\n");
     try w.writeAll("- Do not run destructive commands without asking.\n");
     try w.writeAll("- Do not bypass oversight or approval mechanisms.\n");

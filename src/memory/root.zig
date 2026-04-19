@@ -394,14 +394,79 @@ pub fn isInternalMemoryKey(key: []const u8) bool {
         std.mem.startsWith(u8, key, PromptBootstrapKeyPrefix);
 }
 
+// ── Artifact role taxonomy (W1.3) ───────────────────────────────────────────
+//
+// The nine system-owned artifact classes collapse into three named roles:
+//
+//   continuity  — searchable, injectable, carries current product truth:
+//                   summary_latest/{session_id}
+//                   session_summary/{session_id}/{timestamp}
+//                   timeline_summary/{session_id}/{timestamp}
+//                   context_anchor_current
+//                   durable_fact/{timestamp}/{idx}
+//
+//   audit       — cold deep-dive records, not injected by default:
+//                   autosave_user_{nanoseconds}
+//                   autosave_assistant_{nanoseconds}
+//                   session_checkpoint_{nanoseconds}
+//
+//   index       — discovery surface, not normal semantic payload:
+//                   timeline_index/current
+//
+// Anything not matched is user-authored memory (role = .user).
+//
+// `classifyArtifactKey` is the single source of truth. The predicates
+// `isContinuityArtifactKey`, `isAuditArtifactKey`, and `isIndexArtifactKey`
+// delegate to it. Orthogonal predicates (isInternalMemoryKey,
+// isSystemManagedMemoryKey, isAppendOnlyMemoryKey) remain unchanged; they
+// serve hiding, mutation-policy, and write-discipline concerns that cut
+// across the role taxonomy.
+
+pub const ArtifactRole = enum {
+    continuity,
+    audit,
+    index,
+    user,
+
+    pub fn toSlice(self: ArtifactRole) []const u8 {
+        return switch (self) {
+            .continuity => "continuity",
+            .audit => "audit",
+            .index => "index",
+            .user => "user",
+        };
+    }
+};
+
+pub fn classifyArtifactKey(key: []const u8) ArtifactRole {
+    // Audit: autosave + checkpoint
+    if (std.mem.startsWith(u8, key, "autosave_user_")) return .audit;
+    if (std.mem.startsWith(u8, key, "autosave_assistant_")) return .audit;
+    if (std.mem.startsWith(u8, key, "session_checkpoint_")) return .audit;
+
+    // Index: discovery surfaces
+    if (std.mem.eql(u8, key, "timeline_index/current")) return .index;
+
+    // Continuity: injectable/searchable continuity artifacts
+    if (std.mem.eql(u8, key, "context_anchor_current")) return .continuity;
+    if (std.mem.startsWith(u8, key, "summary_latest/")) return .continuity;
+    if (std.mem.startsWith(u8, key, "durable_fact/")) return .continuity;
+    if (std.mem.startsWith(u8, key, "session_summary/")) return .continuity;
+    if (std.mem.startsWith(u8, key, "timeline_summary/")) return .continuity;
+
+    return .user;
+}
+
+pub fn isContinuityArtifactKey(key: []const u8) bool {
+    return classifyArtifactKey(key) == .continuity;
+}
+
 pub fn isAuditArtifactKey(key: []const u8) bool {
-    return std.mem.startsWith(u8, key, "session_checkpoint_") or
-        std.mem.startsWith(u8, key, "autosave_user_") or
-        std.mem.startsWith(u8, key, "autosave_assistant_");
+    return classifyArtifactKey(key) == .audit;
 }
 
 pub fn isIndexArtifactKey(key: []const u8) bool {
-    return std.mem.eql(u8, key, "timeline_index/current");
+    return classifyArtifactKey(key) == .index;
 }
 
 pub fn isDefaultHiddenMemoryKey(key: []const u8) bool {
@@ -1888,6 +1953,68 @@ fn makeTestRetrievalCandidate(allocator: std.mem.Allocator, key: []const u8, con
         .end_line = 0,
         .created_at = 0,
     };
+}
+
+test "classifyArtifactKey: continuity — summary_latest" {
+    try std.testing.expectEqual(ArtifactRole.continuity, classifyArtifactKey("summary_latest/agent:zaki-bot:user:1:main"));
+}
+
+test "classifyArtifactKey: continuity — session_summary" {
+    try std.testing.expectEqual(ArtifactRole.continuity, classifyArtifactKey("session_summary/agent:zaki-bot:user:1:main/1700000000"));
+}
+
+test "classifyArtifactKey: continuity — timeline_summary" {
+    try std.testing.expectEqual(ArtifactRole.continuity, classifyArtifactKey("timeline_summary/agent:zaki-bot:user:1:main/1700000000"));
+}
+
+test "classifyArtifactKey: continuity — context_anchor_current" {
+    try std.testing.expectEqual(ArtifactRole.continuity, classifyArtifactKey("context_anchor_current"));
+}
+
+test "classifyArtifactKey: continuity — durable_fact" {
+    try std.testing.expectEqual(ArtifactRole.continuity, classifyArtifactKey("durable_fact/1700000000/0"));
+}
+
+test "classifyArtifactKey: audit — autosave_user" {
+    try std.testing.expectEqual(ArtifactRole.audit, classifyArtifactKey("autosave_user_1700000000000000000"));
+}
+
+test "classifyArtifactKey: audit — autosave_assistant" {
+    try std.testing.expectEqual(ArtifactRole.audit, classifyArtifactKey("autosave_assistant_1700000000000000000"));
+}
+
+test "classifyArtifactKey: audit — session_checkpoint" {
+    try std.testing.expectEqual(ArtifactRole.audit, classifyArtifactKey("session_checkpoint_1700000000000000000"));
+}
+
+test "classifyArtifactKey: index — timeline_index/current" {
+    try std.testing.expectEqual(ArtifactRole.index, classifyArtifactKey("timeline_index/current"));
+}
+
+test "classifyArtifactKey: user — arbitrary user memory key" {
+    try std.testing.expectEqual(ArtifactRole.user, classifyArtifactKey("daily/2026-04-18/notes"));
+    try std.testing.expectEqual(ArtifactRole.user, classifyArtifactKey("core/profile"));
+}
+
+test "role predicates agree with classifyArtifactKey" {
+    try std.testing.expect(isContinuityArtifactKey("summary_latest/x"));
+    try std.testing.expect(!isAuditArtifactKey("summary_latest/x"));
+    try std.testing.expect(!isIndexArtifactKey("summary_latest/x"));
+
+    try std.testing.expect(isAuditArtifactKey("autosave_user_1"));
+    try std.testing.expect(!isContinuityArtifactKey("autosave_user_1"));
+    try std.testing.expect(!isIndexArtifactKey("autosave_user_1"));
+
+    try std.testing.expect(isIndexArtifactKey("timeline_index/current"));
+    try std.testing.expect(!isContinuityArtifactKey("timeline_index/current"));
+    try std.testing.expect(!isAuditArtifactKey("timeline_index/current"));
+}
+
+test "ArtifactRole.toSlice returns canonical names" {
+    try std.testing.expectEqualStrings("continuity", ArtifactRole.continuity.toSlice());
+    try std.testing.expectEqualStrings("audit", ArtifactRole.audit.toSlice());
+    try std.testing.expectEqualStrings("index", ArtifactRole.index.toSlice());
+    try std.testing.expectEqualStrings("user", ArtifactRole.user.toSlice());
 }
 
 test "MemoryCategory toString roundtrip" {
