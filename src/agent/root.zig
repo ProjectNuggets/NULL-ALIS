@@ -2502,29 +2502,32 @@ pub const Agent = struct {
             } };
             self.observer.recordEvent(&build_stage_event);
 
-            // Vision routing. If any message carries image content AND the
-            // current model doesn't support vision AND a vision fallback
-            // model is configured, swap to it for THIS turn only. This
-            // restores the image-handling behaviour implicitly lost when
-            // commit f69e555 removed the hard pre-gate without wiring a
-            // replacement route. Keeps same provider — most providers
-            // (together, openrouter) serve both text and vision models.
+            // Vision routing. If any message carries image content AND a
+            // vision fallback model is configured, swap to it for THIS
+            // turn. Previously we gated on `provider.supportsVisionForModel`,
+            // but OpenAI-compatible providers return `true` unconditionally
+            // (they don't know which specific models are vision-capable),
+            // so the gate never fired for text-only models like Kimi K2.5
+            // and GLM-5.1 — images silently got dropped. Trust the
+            // operator's config: if they've wired a vision fallback, use
+            // it whenever images arrive. Skip the swap only if the
+            // effective default IS the fallback model (no-op).
             var effective_model: []const u8 = self.model_name;
-            if (self.vision_fallback_model.len > 0 and hasImageContentParts(messages)) {
-                if (!self.provider.supportsVisionForModel(self.model_name)) {
-                    effective_model = self.vision_fallback_model;
-                    log.info("turn.stage stage=vision_fallback iteration={d} from={s} to={s}", .{
-                        iteration, self.model_name, self.vision_fallback_model,
-                    });
-                    const notice = ObserverEvent{ .system_notice = .{
-                        .kind = "vision_fallback",
-                        .severity = "info",
-                        .message = "Model routed to vision-capable fallback for this turn (image attached).",
-                        .detail = self.vision_fallback_model,
-                        .run_id = self.current_run_id,
-                    } };
-                    self.observer.recordEvent(&notice);
-                }
+            if (self.vision_fallback_model.len > 0 and hasImageContentParts(messages) and
+                !std.mem.eql(u8, self.model_name, self.vision_fallback_model))
+            {
+                effective_model = self.vision_fallback_model;
+                log.info("turn.stage stage=vision_fallback iteration={d} from={s} to={s}", .{
+                    iteration, self.model_name, self.vision_fallback_model,
+                });
+                const notice = ObserverEvent{ .system_notice = .{
+                    .kind = "vision_fallback",
+                    .severity = "info",
+                    .message = "Model routed to vision-capable fallback for this turn (image attached).",
+                    .detail = self.vision_fallback_model,
+                    .run_id = self.current_run_id,
+                } };
+                self.observer.recordEvent(&notice);
             }
 
             const timer_start = std.time.milliTimestamp();
