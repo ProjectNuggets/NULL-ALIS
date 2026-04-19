@@ -2807,10 +2807,15 @@ pub const Agent = struct {
                     free_parsed_text = true;
                 }
 
-                // Build history content with serialized tool calls
+                // Build history with the STRIPPED text when XML fallback ran — otherwise
+                // the raw `<invoke>`/`<tool_call>` XML ends up in assistant history and
+                // the model sees its own previous XML emissions on the next turn,
+                // reinforcing the fallback pattern until /reset. Use response_text only
+                // when no stripping happened (native tool_calls, no XML found).
+                const history_text = if (free_parsed_text and parsed_text.len > 0) parsed_text else response_text;
                 assistant_history_content = try dispatcher.buildAssistantHistoryWithToolCalls(
                     self.allocator,
-                    response_text,
+                    history_text,
                     parsed_calls,
                 );
                 free_assistant_history = true;
@@ -2836,8 +2841,17 @@ pub const Agent = struct {
                 free_parsed_calls = true;
                 parsed_text = xml_parsed.text;
                 free_parsed_text = true;
-                // For XML path, store the raw response text as history
-                assistant_history_content = response_text;
+                // If parseToolCalls extracted calls (either <tool_call> or
+                // <invoke> format), use the STRIPPED text for history so the
+                // model doesn't see its own raw XML emissions on subsequent
+                // turns — otherwise a single XML-mode turn poisons history
+                // and every subsequent turn keeps emitting XML until /reset.
+                // When no calls were extracted, keep the full response_text
+                // (it's just prose, nothing to strip).
+                assistant_history_content = if (parsed_calls.len > 0 and parsed_text.len > 0)
+                    parsed_text
+                else
+                    response_text;
                 const parse_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - parse_start_ms));
                 log.info("turn.stage stage=parse_provider_response iteration={d} duration_ms={d} tool_calls={d}", .{
                     iteration,
