@@ -62,7 +62,14 @@ pub const DiagnosticsConfig = struct {
 };
 
 pub const AutonomyConfig = struct {
-    level: AutonomyLevel = .supervised,
+    /// V1 default: `.full` — auto-approve tool calls within SecurityPolicy
+    /// bounds. Rationale: nullalis v1 is a single-user pod, the pod owner
+    /// IS the user, and the SecurityPolicy still blocks high-risk shell
+    /// commands (`rm`, `sudo`, etc. — see `high_risk_commands` in
+    /// security/policy.zig). Approval friction served multi-tenant shared
+    /// scenarios, not the v1 per-user-pod shape. A UI toggle to flip back
+    /// to `.supervised` is tracked for future work.
+    level: AutonomyLevel = .full,
     workspace_only: bool = true,
     max_actions_per_hour: u32 = 100,
     require_approval_for_medium_risk: bool = true,
