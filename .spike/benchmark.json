@@ -81,6 +81,78 @@
         ],
         "weight": 1.0
       }
+    },
+    {
+      "id": "b6_tool_choice_specificity",
+      "category": "tool_discipline",
+      "prompt": "I want to know the size of your own workspace directory. Use whichever tool is most specific for that job — explain your choice briefly.",
+      "grading": {
+        "must_call_any_of": ["shell"],
+        "should_contain_any": ["du", "size", "bytes", "MB", "KB", "workspace"],
+        "must_not_contain_phrases": [
+          "I would use",
+          "I cannot determine"
+        ],
+        "weight": 1.0
+      }
+    },
+    {
+      "id": "b7_error_recovery",
+      "category": "agentic_execution",
+      "prompt": "Read the file `/definitely/does/not/exist/ever.txt`. When it fails, try a different approach to report something useful — don't just repeat the error.",
+      "grading": {
+        "must_call_any_of": ["file_read", "shell"],
+        "should_contain_any": ["does not exist", "not found", "no such", "missing", "absent", "failed"],
+        "must_not_contain_phrases": [
+          "I would try",
+          "I cannot attempt"
+        ],
+        "weight": 1.0
+      }
+    },
+    {
+      "id": "b8_memory_context_anchor",
+      "category": "memory_recall",
+      "prompt": "Recall what channel and session lane we're currently talking through. Use your self-inspection + memory tools; actually check, don't guess.",
+      "grading": {
+        "must_call_any_of": ["context_snapshot", "runtime_info", "memory_recall", "memory_list", "memory_timeline"],
+        "should_contain_any": ["bench", "thread", "session", "zaki"],
+        "must_not_contain_phrases": [
+          "I would check",
+          "I cannot determine",
+          "I don't know which"
+        ],
+        "weight": 1.0
+      }
+    },
+    {
+      "id": "b9_unknown_person_name",
+      "category": "proactive_research",
+      "prompt": "Who is Yoshua Bengio? Give me three specific affiliations or contributions. If uncertain, verify first.",
+      "grading": {
+        "must_call_any_of": ["web_search", "web_fetch"],
+        "should_contain_any": ["Bengio", "Montreal", "deep learning", "neural", "Mila", "Turing"],
+        "must_not_contain_phrases": [
+          "Based on my memory",
+          "From my earlier search",
+          "I don't know who"
+        ],
+        "weight": 1.0
+      }
+    },
+    {
+      "id": "b10_schedule_tool_prefer",
+      "category": "tool_discipline",
+      "prompt": "What time is it right now in UTC? Use the most appropriate nullalis tool (hint: there is one specifically for runtime/time info, more specific than shell).",
+      "grading": {
+        "must_call_any_of": ["runtime_info", "schedule", "shell", "context_snapshot"],
+        "should_contain_any": ["2026", "UTC", ":"],
+        "must_not_contain_phrases": [
+          "I don't have a clock",
+          "I cannot tell time"
+        ],
+        "weight": 1.0
+      }
     }
   ]
 }
