@@ -261,7 +261,148 @@ fn hasRequiredStructuredSections(summary: []const u8) bool {
     return true;
 }
 
+// ── Verification heuristic ────────────────────────────────────────
+//
+// Prevents hallucination laundering: when a source conversation had no
+// tool grounding and the summary contains external-entity claim patterns
+// ("X is an open-source framework...", "From my search:", etc.), the
+// summary likely encodes the agent's own prior fabrication. The caller
+// should downgrade such summaries from continuity role (injected as
+// canonical context) to audit role (raw retention only), preventing
+// the same fabrication from seeding future turns.
+
+const red_flag_patterns = [_][]const u8{
+    // "X is Y" patterns that describe external entities
+    " is an open-source ",
+    " is a open-source ",
+    " is an open source ",
+    " is a local-first ",
+    " is a SaaS ",
+    " is a framework for ",
+    " is a platform for ",
+    " is a library for ",
+    " is a CLI for ",
+    " is a tool for ",
+    " is a service ",
+    " is a protocol ",
+    " founded in ",
+    " MIT license",
+    " Apache license",
+    " Apache-2.0",
+    // Fake-source phrases
+    "Based on my search",
+    "Based on my research",
+    "Based on my memory and",
+    "From my search",
+    "From my earlier search",
+    "From my prior search",
+    "From my research",
+    "I searched for",
+    "I checked and found",
+    "My search shows",
+    "According to my earlier",
+};
+
+/// Conservative heuristic: does the summary contain external-entity claims
+/// made without any tool grounding in the source conversation?
+///
+/// Returns true when BOTH conditions hold:
+///   1. No message in `source_entries` has role == "tool" (no tool results
+///      were produced during the conversation being summarized).
+///   2. The summary text matches at least one red-flag claim pattern (e.g.
+///      "X is an open-source framework", "Based on my search").
+///
+/// When this returns true the caller should store the summary with the
+/// audit artifact role (not injected) instead of continuity (injected),
+/// preventing the agent's prior hallucinations from being laundered
+/// into canonical context.
+pub fn hasUnverifiedExternalClaims(
+    summary: []const u8,
+    source_entries: []const MessageEntry,
+) bool {
+    for (source_entries) |entry| {
+        if (std.mem.eql(u8, entry.role, "tool")) return false;
+    }
+    for (red_flag_patterns) |pattern| {
+        if (std.ascii.indexOfIgnoreCase(summary, pattern) != null) return true;
+    }
+    return false;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
+
+test "hasUnverifiedExternalClaims flags agent-laundered product claim without tool grounding" {
+    const source = [_]MessageEntry{
+        .{ .role = "user", .content = "Tell me about openclaw" },
+        .{ .role = "assistant", .content = "OpenClaw is a local-first AI assistant framework." },
+    };
+    const summary =
+        \\focus: discussing openclaw comparison
+        \\decisions:
+        \\- none
+        \\open_loops:
+        \\- none
+        \\next:
+        \\- none
+        \\Key fact: OpenClaw is an open-source framework for local AI assistants.
+    ;
+    try std.testing.expect(hasUnverifiedExternalClaims(summary, &source));
+}
+
+test "hasUnverifiedExternalClaims passes when source conversation had tool grounding" {
+    const source = [_]MessageEntry{
+        .{ .role = "user", .content = "Tell me about openclaw" },
+        .{ .role = "assistant", .content = "Searching the web." },
+        .{ .role = "tool", .content = "web_search result: openclaw is a product..." },
+        .{ .role = "assistant", .content = "OpenClaw is a local-first AI assistant framework." },
+    };
+    const summary =
+        \\focus: openclaw comparison
+        \\decisions:
+        \\- none
+        \\open_loops:
+        \\- none
+        \\next:
+        \\- none
+        \\Key fact: OpenClaw is an open-source framework.
+    ;
+    try std.testing.expect(!hasUnverifiedExternalClaims(summary, &source));
+}
+
+test "hasUnverifiedExternalClaims passes when summary has no red-flag patterns" {
+    const source = [_]MessageEntry{
+        .{ .role = "user", .content = "Remind me what I was working on" },
+        .{ .role = "assistant", .content = "You were iterating on the spawn system." },
+    };
+    const summary =
+        \\focus: spawn system iteration
+        \\decisions:
+        \\- continue iterating
+        \\open_loops:
+        \\- dispatcher not returning results
+        \\next:
+        \\- check dispatcher callback
+    ;
+    try std.testing.expect(!hasUnverifiedExternalClaims(summary, &source));
+}
+
+test "hasUnverifiedExternalClaims flags fake-source phrases even without 'is a' patterns" {
+    const source = [_]MessageEntry{
+        .{ .role = "user", .content = "Is X real?" },
+        .{ .role = "assistant", .content = "From my search: X is real." },
+    };
+    const summary =
+        \\focus: X verification
+        \\decisions:
+        \\- none
+        \\open_loops:
+        \\- none
+        \\next:
+        \\- none
+        \\Key fact: Based on my search, X exists and has property Y.
+    ;
+    try std.testing.expect(hasUnverifiedExternalClaims(summary, &source));
+}
 
 test "shouldSummarize returns false when disabled" {
     const messages = [_]MessageEntry{

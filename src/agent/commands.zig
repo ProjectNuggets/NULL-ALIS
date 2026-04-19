@@ -1183,6 +1183,23 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     const summary_content = appendOriginMetadata(self.allocator, summary_origin, content) catch return false;
     defer self.allocator.free(summary_content);
 
+    // C: downgrade summaries that encode external-entity claims without tool
+    // grounding in the source conversation. Such summaries are most likely
+    // laundering the agent's own prior hallucinations — storing them as
+    // continuity artifacts (timeline_summary/summary_latest/durable_fact)
+    // would re-inject them on every future turn and compound the error.
+    // The raw autosave_assistant/autosave_user entries remain intact for
+    // audit/debug; we just decline to promote the summary to canonical.
+    const unverified = memory_mod.hasUnverifiedExternalClaims(summary_content, entries);
+    if (unverified) {
+        log.info("memory.timeline_summary downgrade=audit session={s} reason={s} cause=unverified_external_claims entries={d}", .{
+            session_id,
+            reason,
+            entries.len,
+        });
+        return false;
+    }
+
     const timeline_key = std.fmt.allocPrint(
         self.allocator,
         "timeline_summary/{s}/{d}",

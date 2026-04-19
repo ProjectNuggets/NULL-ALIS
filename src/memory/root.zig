@@ -139,6 +139,7 @@ pub const SummaryResult = summarizer.SummaryResult;
 pub const shouldSummarize = summarizer.shouldSummarize;
 pub const buildSummarizationPrompt = summarizer.buildSummarizationPrompt;
 pub const parseSummaryResponse = summarizer.parseSummaryResponse;
+pub const hasUnverifiedExternalClaims = summarizer.hasUnverifiedExternalClaims;
 
 // Lifecycle: semantic cache
 pub const SemanticCache = semantic_cache.SemanticCache;
