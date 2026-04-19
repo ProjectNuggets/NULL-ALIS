@@ -451,15 +451,14 @@ fn buildSafetySection(w: anytype) !void {
     try w.writeAll("- Do not bypass oversight or approval mechanisms.\n");
     try w.writeAll("- When in doubt, ask before acting externally.\n\n");
     try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
-    try w.writeAll("- Memory truth model: fixed workspace docs (`AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`, etc.) are contextual guidance and fallback reference. Canonical runtime memory and continuity live in the primary memory store. Do not assume that seeing a fact in `MEMORY.md` means it is semantically queryable.\n\n");
+    try w.writeAll("- Memory truth model: workspace docs (`AGENTS.md`, `USER.md`, `MEMORY.md`, etc.) are contextual guidance and fallback reference. `SOUL.md` front-matter is parsed into the persona calibration above and IS load-bearing for voice and behavior; its body is contextual. Canonical runtime memory and continuity live in the primary memory store. Do not assume that seeing a fact in `MEMORY.md` means it is semantically queryable.\n\n");
     try w.writeAll("- When a user turn begins with `[Memory context]`, treat that block as retrieved runtime continuity for the current turn. If it contains a relevant fact, use it and do not say you lack memory unless direct user corrections, tool results, or fresher runtime state contradict it.\n\n");
     try w.writeAll("- Cold memory is tool-only by default. Use `memory_timeline` first for session/timeline discovery, `memory_recall` for semantic lookup, `memory_list` for raw record inspection, and transcripts only when exact historical detail is required.\n\n");
     try w.writeAll("- `memory_recall` and `memory_list` default to `scope=session`. Use `scope=global` when looking for durable or cross-session facts.\n\n");
     try w.writeAll("- Do not invent timing, scheduler, or delivery status claims. If unsure, say unknown or verify with tools first.\n\n");
     try w.writeAll("- For user-facing scheduled or proactive work, verify with `runtime_info` and use `schedule` first. Use `cron_*` only for raw inspection or explicit operator maintenance.\n\n");
     try w.writeAll("- Durable job repair decision tree: missing job -> `schedule ensure` or `schedule create`; paused or disabled job -> `schedule resume`; active job with `last_status=error` -> inspect with `schedule get`, then use `schedule ensure`. Never use `resume` to repair an active errored job.\n\n");
-    try w.writeAll("- Only wake turns may use `schedule ensure`, and only for canonical jobs declared in `AUTOMATIONS.json`. `HEARTBEAT.md` is wake policy only; it is not schedule truth.\n\n");
-    try w.writeAll("- Scheduler state is execution truth for jobs. If a job exists in `schedule`, it is valid and should run even if not declared in `AUTOMATIONS.json`. `AUTOMATIONS.json` is only for durable restore/repair, and scheduler-only jobs are not drift by themselves.\n\n");
+    try w.writeAll("- Scheduler authority: live `schedule` state is execution truth — any job present there should run. `AUTOMATIONS.json` is the canonical spec used ONLY by `schedule ensure` for durable restore/repair; a job can exist in `schedule` without being in `AUTOMATIONS.json` (user-created, ad-hoc) and is NOT drift. `HEARTBEAT.md` is wake-policy only, never schedule truth. `schedule ensure` reconciles live state toward the spec; it may run only on wake turns and only for jobs declared in `AUTOMATIONS.json`.\n\n");
 }
 
 /// Emit the workspace section.
@@ -848,7 +847,34 @@ test "buildSystemPrompt includes core sections" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "verify with `runtime_info` and use `schedule` first") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Never use `resume` to repair an active errored job") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "`AUTOMATIONS.json`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Scheduler state is execution truth for jobs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Scheduler authority") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "live `schedule` state is execution truth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "ad-hoc) and is NOT drift") != null);
+}
+
+// Dump-helper: writes the assembled prompt to /tmp/nullalis_prompt_full.txt
+// when env var NULLALIS_DUMP_PROMPT=1. Useful for end-to-end read-through
+// audits — normally a no-op. Skipped when the env var is unset.
+test "dump full system prompt when NULLALIS_DUMP_PROMPT=1" {
+    const env = std.process.getEnvVarOwned(std.testing.allocator, "NULLALIS_DUMP_PROMPT") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return, // skip
+        else => return err,
+    };
+    defer std.testing.allocator.free(env);
+    if (!std.mem.eql(u8, env, "1")) return;
+
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/Users/nova/Desktop/nullalis",
+        .model_name = "moonshotai/Kimi-K2.5",
+        .tools = &.{},
+        .sections = .{ .persona = .{ .warmth = .warm, .twin_mode = true } },
+    });
+    defer allocator.free(prompt);
+
+    const out = try std.fs.createFileAbsolute("/tmp/nullalis_prompt_full.txt", .{});
+    defer out.close();
+    try out.writeAll(prompt);
 }
 
 test "buildSystemPrompt includes workspace dir" {
