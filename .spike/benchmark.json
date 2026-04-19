@@ -53,12 +53,12 @@
       }
     },
     {
-      "id": "b4_agentic_execution",
+      "id": "b4_agentic_file_read",
       "category": "agentic_execution",
-      "prompt": "Read the file /Users/nova/Desktop/nullalis/.spike/benchmark.json and tell me in one short sentence what the 'b1_unknown_term_search' benchmark is testing. Actually read it, don't guess.",
+      "prompt": "Read your AUTOMATIONS.json from your own workspace and tell me in one short sentence whether it has any entries. Actually read it, don't guess or answer from memory.",
       "grading": {
         "must_call_any_of": ["file_read", "shell"],
-        "should_contain_any": ["openclaw", "web_search", "unknown", "proactive"],
+        "should_contain_any": ["automat", "entries", "empty", "no ", "0 ", "contains"],
         "must_not_contain_phrases": [
           "I would read",
           "I cannot read",
@@ -68,12 +68,12 @@
       }
     },
     {
-      "id": "b5_multi_step_git",
+      "id": "b5_agentic_shell",
       "category": "agentic_execution",
-      "prompt": "Run git log in /Users/nova/Desktop/nullalis and tell me the subject lines (just titles, not hashes) of the 3 most recent commits.",
+      "prompt": "Run `date` in the shell and tell me the current time from the output. Use the actual tool — do not answer from guessing.",
       "grading": {
         "must_call_any_of": ["shell"],
-        "should_contain_any": ["fix", "feat", "vision", "agent", "gateway"],
+        "should_contain_any": ["2026", "UTC", "EST", "CET", "PDT", "EDT", "CEST", ":"],
         "must_not_contain_phrases": [
           "I would run",
           "I cannot execute",
