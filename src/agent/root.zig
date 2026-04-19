@@ -2744,26 +2744,19 @@ pub const Agent = struct {
             const response_text = response.contentOrEmpty();
             const use_native = response.hasToolCalls();
 
-            // ── Native thinking narration ──
-            // If the model returned reasoning_content (Claude extended thinking,
-            // GLM <think> blocks, Kimi reasoning), emit it as a thinking narration
-            // frame. This is the Claude Code approach: the model's own reasoning
-            // IS the narration. No sidecar call needed.
-            if (response.reasoning_content) |thinking| {
-                if (thinking.len > 0) {
-                    // Cap at 2000 chars (was 200 — too short to convey
-                    // actual thought content). Frontend is free to further
-                    // truncate/format; the runtime's job is to emit the
-                    // truth. 2000 chars covers a full paragraph of
-                    // reasoning without flooding the SSE channel.
-                    const max_narration = @min(thinking.len, 2000);
-                    const thinking_event = ObserverEvent{ .narration_frame = .{
-                        .message = thinking[0..max_narration],
-                        .frame_type = .thinking,
-                    } };
-                    self.observer.recordEvent(&thinking_event);
-                }
-            }
+            // ── Native reasoning_content: kept for model's own context; NOT emitted as narration ──
+            // The model's raw reasoning_content remains available downstream
+            // (compose_final_reply, history, post-turn summarizer) so the agent
+            // keeps its own chain of thought. User-facing narration is now
+            // owned exclusively by the sidecar narrator (see
+            // narration_thinking_sidecar block below). This avoids two
+            // competing narration voices and puts the user's experience in
+            // the hands of a smaller, consistent first-person narrator rather
+            // than whatever raw shape the main model emits this turn.
+            //
+            // If you need to restore raw-CoT as narration for diagnostics,
+            // emit a narration_frame .thinking here — but expect dedup
+            // collisions and voice inconsistency with the sidecar.
 
             // Determine tool calls: structured (native) first, then XML fallback.
             // Keep the same loop semantics used by the reference runtime.
@@ -3338,20 +3331,16 @@ pub const Agent = struct {
             } };
             self.observer.recordEvent(&reflect_stage_event);
 
-            // Native reasoning was already emitted as a narration_frame up at
-            // the response-parse site (see "Native thinking narration" block).
-            // We only need the sidecar fallback here when no native thinking
-            // was produced this turn.
-            const had_native_thinking = response.reasoning_content != null and
-                response.reasoning_content.?.len > 0;
-
-            // ── Thinking narration fallback (sidecar) ──
-            // If the model didn't return native reasoning_content on this turn,
-            // fall back to the sidecar for narration every N tool iterations.
-            // This covers models without native thinking support.
-            if (!had_native_thinking and
-                self.sidecar_provider != null and self.narration_interval > 0 and
-                turn_tool_iterations > 1 and
+            // ── Thinking narration (sidecar-owned, always) ──
+            // Sidecar is the single source of user-facing narration. It runs
+            // every `narration_interval` tool iterations regardless of
+            // whether the main model produced native reasoning_content on
+            // this turn — consistent first-person voice, 50-word cap.
+            // Native reasoning_content is preserved in the main model's
+            // context but intentionally NOT shown to the user (see the
+            // response-parse site above).
+            if (self.sidecar_provider != null and self.narration_interval > 0 and
+                turn_tool_iterations >= 1 and
                 turn_tool_iterations % self.narration_interval == 0)
             {
                 const narration_thinking = @import("narration_thinking.zig");
