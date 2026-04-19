@@ -197,12 +197,31 @@ pub const RunEventObserver = struct {
                 }
             },
             .narration_frame => |e| {
-                self.emit(.{ .progress = .{
-                    .phase = @tagName(e.frame_type),
-                    .state = "update",
-                    .label = e.message,
-                    .tool = e.tool_name,
-                } });
+                // The model's actual reasoning_content arrives here with
+                // frame_type=.thinking. Route it to `reasoning_summary` so
+                // the UI's narration channel shows the agent's own voice,
+                // not just static phase labels. Other frame types
+                // (tool_start/tool_done/waiting/listening/etc.) stay as
+                // `progress` events — they're chrome, not prose.
+                switch (e.frame_type) {
+                    .thinking, .plan_step => {
+                        self.emitReasoningSummary(
+                            e.message,
+                            @tagName(e.frame_type),
+                            e.tool_name,
+                            null,
+                            null,
+                        );
+                    },
+                    else => {
+                        self.emit(.{ .progress = .{
+                            .phase = @tagName(e.frame_type),
+                            .state = "update",
+                            .label = e.message,
+                            .tool = e.tool_name,
+                        } });
+                    },
+                }
             },
             .agent_end => |e| self.emit(.{ .done = .{
                 .usage_tokens = e.tokens_used,
@@ -474,6 +493,25 @@ test "turn_stage produces progress SSE frame with label" {
     const frame = test_sink.firstFrameWithPrefix("event: progress\n").?;
     try std.testing.expect(std.mem.startsWith(u8, frame, "event: progress\n"));
     try std.testing.expect(std.mem.indexOf(u8, frame, "Running tools") != null);
+}
+
+test "narration_frame thinking produces reasoning_summary SSE frame" {
+    var noop = observability.NoopObserver{};
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    var reo = RunEventObserver{ .inner = noop.observer(), .sink = test_sink.sink(), .allocator = allocator };
+    const obs = reo.observer();
+    const evt = ObserverEvent{ .narration_frame = .{
+        .message = "The user is asking about X. Let me check Y before answering.",
+        .frame_type = .thinking,
+    } };
+    obs.recordEvent(&evt);
+    const frame = test_sink.firstFrameWithPrefix("event: reasoning_summary\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"phase\":\"thinking\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "The user is asking about X") != null);
+    // Should NOT also produce a progress frame for the same event.
+    try std.testing.expect(test_sink.firstFrameWithPrefix("event: progress\n") == null);
 }
 
 test "narration_frame produces progress SSE frame" {
