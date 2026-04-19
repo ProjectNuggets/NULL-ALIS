@@ -84,13 +84,11 @@ pub const agent_routing = @import("agent_routing.zig");
 // Phase 5: Integrations (hardware + peripherals removed in V1 convergence — not a second-brain surface)
 pub const integrations = @import("integrations.zig");
 pub const rag = @import("rag.zig");
-pub const skillforge = @import("skillforge.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const voice = @import("voice.zig");
 pub const zaki_state = @import("zaki_state.zig");
 pub const channel_identity_key = @import("channel_identity_key.zig");
 pub const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
-pub const channel_identity_backfill = @import("channel_identity_backfill.zig");
 
 // Phase 02.1: Streaming, Voice & Channel Polish
 pub const channel_health = @import("channel_health.zig");
