@@ -49,8 +49,198 @@ pub fn parseToolCalls(
             allocator.free(result.calls);
         }
     }
-    // Second: fall back to XML <tool_call> tag parsing
-    return parseXmlToolCalls(allocator, response);
+    // Second: try XML <tool_call> tag parsing (ZeroClaw / OpenClaw format)
+    const tool_call_result = try parseXmlToolCalls(allocator, response);
+    if (tool_call_result.calls.len > 0) return tool_call_result;
+
+    // Third: Anthropic-legacy `<invoke name="X"><parameter name="Y">Z</parameter></invoke>`.
+    // Some Kimi / Qwen / other models fall back to this format when native
+    // function calling isn't engaged or when the model's training data skews
+    // toward Anthropic's older XML tool-use docs. Parsing it recovers real
+    // tool invocations instead of leaving them as inert text in the reply.
+    if (std.mem.indexOf(u8, response, "<invoke ") != null or std.mem.indexOf(u8, response, "<invoke\t") != null) {
+        const invoke_result = try parseInvokeXmlToolCalls(allocator, response);
+        if (invoke_result.calls.len > 0) {
+            // Free the empty tool_call result before returning the invoke result.
+            allocator.free(tool_call_result.text);
+            allocator.free(tool_call_result.calls);
+            return invoke_result;
+        }
+        // <invoke> present but parse produced no calls — free it and fall through.
+        allocator.free(invoke_result.text);
+        allocator.free(invoke_result.calls);
+    }
+
+    return tool_call_result;
+}
+
+/// Parse `<invoke name="X"><parameter name="Y">Z</parameter>...</invoke>` segments
+/// (Anthropic-legacy XML tool-use format). Also accepts a raw JSON object body
+/// inside `<invoke name="X">{...}</invoke>` as some models emit that shape.
+///
+/// Returns a ParseResult where `text` is the response with all `<invoke>...</invoke>`
+/// segments removed and `calls` is the parsed tool calls.
+pub fn parseInvokeXmlToolCalls(
+    allocator: std.mem.Allocator,
+    response: []const u8,
+) !ParseResult {
+    const open_prefix = "<invoke ";
+    const close_tag = "</invoke>";
+
+    var text_parts: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer text_parts.deinit(allocator);
+
+    var calls: std.ArrayListUnmanaged(ParsedToolCall) = .empty;
+    errdefer {
+        for (calls.items) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        calls.deinit(allocator);
+    }
+
+    var cursor: usize = 0;
+
+    while (std.mem.indexOfPos(u8, response, cursor, open_prefix)) |start| {
+        const before = std.mem.trim(u8, response[cursor..start], " \t\r\n");
+        if (before.len > 0) try text_parts.append(allocator, before);
+
+        // Find the closing `>` of the <invoke ...> opening tag.
+        const tag_end_opt = std.mem.indexOfPos(u8, response, start + open_prefix.len, ">");
+        if (tag_end_opt == null) break;
+        const tag_end = tag_end_opt.?;
+
+        // Extract the `name="..."` attribute value.
+        const open_slice = response[start..tag_end];
+        const name_opt = extractXmlAttribute(open_slice, "name");
+
+        const inner_start = tag_end + 1;
+        const close_idx_opt = std.mem.indexOfPos(u8, response, inner_start, close_tag);
+        if (close_idx_opt == null) break;
+        const close_idx = close_idx_opt.?;
+        const inner = std.mem.trim(u8, response[inner_start..close_idx], " \t\r\n");
+
+        if (name_opt) |name| {
+            const arguments_json = try buildInvokeArgumentsJson(allocator, inner);
+            try calls.append(allocator, .{
+                .name = try allocator.dupe(u8, name),
+                .arguments_json = arguments_json,
+                .tool_call_id = null,
+            });
+        }
+
+        cursor = close_idx + close_tag.len;
+    }
+
+    const trailing = std.mem.trim(u8, response[cursor..], " \t\r\n");
+    if (trailing.len > 0) try text_parts.append(allocator, trailing);
+
+    const text = if (text_parts.items.len == 0)
+        try allocator.dupe(u8, "")
+    else
+        try std.mem.join(allocator, "\n", text_parts.items);
+
+    return .{
+        .text = text,
+        .calls = try calls.toOwnedSlice(allocator),
+    };
+}
+
+/// Extract the value of an XML attribute (attr="value") from an opening tag slice.
+/// Returns null if not found or malformed. Only handles double-quoted values.
+fn extractXmlAttribute(tag_slice: []const u8, attr: []const u8) ?[]const u8 {
+    var search_key_buf: [64]u8 = undefined;
+    if (attr.len + 2 > search_key_buf.len) return null;
+    const search_key = std.fmt.bufPrint(&search_key_buf, "{s}=\"", .{attr}) catch return null;
+    const key_idx = std.mem.indexOf(u8, tag_slice, search_key) orelse return null;
+    const value_start = key_idx + search_key.len;
+    const value_end_rel = std.mem.indexOfScalar(u8, tag_slice[value_start..], '"') orelse return null;
+    return tag_slice[value_start .. value_start + value_end_rel];
+}
+
+/// Build a JSON object string from the inner content of an `<invoke>` tag.
+/// - If inner is already a JSON object `{...}`, return it directly.
+/// - Otherwise parse `<parameter name="K">V</parameter>` segments into a JSON object.
+/// - If neither applies, return `{}`.
+fn buildInvokeArgumentsJson(allocator: std.mem.Allocator, inner: []const u8) ![]const u8 {
+    // Case 1: raw JSON object.
+    if (extractJsonObject(inner)) |json_slice| {
+        const trimmed = std.mem.trim(u8, json_slice, " \t\r\n");
+        if (trimmed.ptr == inner.ptr and trimmed.len == inner.len) {
+            return try allocator.dupe(u8, trimmed);
+        }
+    }
+
+    // Case 2: <parameter name="K">V</parameter> segments.
+    const param_open_prefix = "<parameter ";
+    const param_close_tag = "</parameter>";
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '{');
+
+    var cursor: usize = 0;
+    var first = true;
+
+    while (std.mem.indexOfPos(u8, inner, cursor, param_open_prefix)) |p_start| {
+        const tag_end_opt = std.mem.indexOfPos(u8, inner, p_start + param_open_prefix.len, ">");
+        if (tag_end_opt == null) break;
+        const tag_end = tag_end_opt.?;
+        const open_slice = inner[p_start..tag_end];
+        const param_name = extractXmlAttribute(open_slice, "name") orelse {
+            cursor = tag_end + 1;
+            continue;
+        };
+
+        const value_start = tag_end + 1;
+        const close_idx_opt = std.mem.indexOfPos(u8, inner, value_start, param_close_tag);
+        if (close_idx_opt == null) break;
+        const close_idx = close_idx_opt.?;
+        const value = std.mem.trim(u8, inner[value_start..close_idx], " \t\r\n");
+
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try out.append(allocator, '"');
+        try appendJsonEscaped(&out, allocator, param_name);
+        try out.appendSlice(allocator, "\":");
+        // If the value is already JSON-shaped (starts with { [ " digit t f n -), inline it.
+        // Otherwise quote it as a string.
+        if (valueLooksLikeJson(value)) {
+            try out.appendSlice(allocator, value);
+        } else {
+            try out.append(allocator, '"');
+            try appendJsonEscaped(&out, allocator, value);
+            try out.append(allocator, '"');
+        }
+
+        cursor = close_idx + param_close_tag.len;
+    }
+
+    try out.append(allocator, '}');
+    return try out.toOwnedSlice(allocator);
+}
+
+fn valueLooksLikeJson(value: []const u8) bool {
+    if (value.len == 0) return false;
+    const c = value[0];
+    if (c == '{' or c == '[' or c == '"') return true;
+    if (c == '-' or (c >= '0' and c <= '9')) return true;
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "null")) return true;
+    return false;
+}
+
+fn appendJsonEscaped(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, ch),
+        }
+    }
 }
 
 /// Parse tool calls from an LLM response using XML-style `<tool_call>` tags.
@@ -2148,4 +2338,153 @@ test "buildAssistantHistoryWithToolCalls escapes special chars in name" {
     defer parsed.deinit();
     const name = parsed.value.object.get("name").?.string;
     try std.testing.expectEqualStrings("shell\"injection", name);
+}
+
+// ── <invoke> parser regression locks ─────────────────────────────────
+//
+// These reproduce the exact payloads observed on 2026-04-19 when Kimi K2.5
+// on Together AI emitted Anthropic-legacy XML instead of native tool_calls.
+// If the parser regresses, these tests break.
+
+test "parseToolCalls recovers <invoke> with <parameter> shape" {
+    const response =
+        \\<invoke name="runtime_info">
+        \\<parameter name="section">summary</parameter>
+        \\</invoke>
+    ;
+    const result = try parseToolCalls(std.testing.allocator, response);
+    defer std.testing.allocator.free(result.text);
+    defer {
+        for (result.calls) |call| {
+            std.testing.allocator.free(call.name);
+            std.testing.allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| std.testing.allocator.free(id);
+        }
+        std.testing.allocator.free(result.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("runtime_info", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "\"section\":\"summary\"") != null);
+}
+
+test "parseToolCalls recovers <invoke> with inline JSON body shape" {
+    const response =
+        \\<invoke name="schedule">
+        \\{"action": "list"}
+        \\</invoke>
+    ;
+    const result = try parseToolCalls(std.testing.allocator, response);
+    defer std.testing.allocator.free(result.text);
+    defer {
+        for (result.calls) |call| {
+            std.testing.allocator.free(call.name);
+            std.testing.allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| std.testing.allocator.free(id);
+        }
+        std.testing.allocator.free(result.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("schedule", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "\"action\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "\"list\"") != null);
+}
+
+test "parseToolCalls handles multiple <invoke> calls in one response" {
+    const response =
+        \\<invoke name="memory_recall">
+        \\<parameter name="query">preferences</parameter>
+        \\<parameter name="limit">5</parameter>
+        \\</invoke>
+        \\<invoke name="schedule">
+        \\{"action": "list"}
+        \\</invoke>
+    ;
+    const result = try parseToolCalls(std.testing.allocator, response);
+    defer std.testing.allocator.free(result.text);
+    defer {
+        for (result.calls) |call| {
+            std.testing.allocator.free(call.name);
+            std.testing.allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| std.testing.allocator.free(id);
+        }
+        std.testing.allocator.free(result.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 2), result.calls.len);
+    try std.testing.expectEqualStrings("memory_recall", result.calls[0].name);
+    try std.testing.expectEqualStrings("schedule", result.calls[1].name);
+    // limit=5 should be inlined as a number, not quoted as a string.
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "\"limit\":5") != null);
+}
+
+test "parseToolCalls preserves surrounding text with <invoke>" {
+    const response =
+        \\Looking this up.
+        \\<invoke name="runtime_info">
+        \\<parameter name="section">session</parameter>
+        \\</invoke>
+        \\Then I'll summarize.
+    ;
+    const result = try parseToolCalls(std.testing.allocator, response);
+    defer std.testing.allocator.free(result.text);
+    defer {
+        for (result.calls) |call| {
+            std.testing.allocator.free(call.name);
+            std.testing.allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| std.testing.allocator.free(id);
+        }
+        std.testing.allocator.free(result.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "Looking this up") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "summarize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "<invoke") == null);
+}
+
+test "parseToolCalls escapes special chars in <parameter> values" {
+    const response =
+        \\<invoke name="shell">
+        \\<parameter name="command">echo "hi"</parameter>
+        \\</invoke>
+    ;
+    const result = try parseToolCalls(std.testing.allocator, response);
+    defer std.testing.allocator.free(result.text);
+    defer {
+        for (result.calls) |call| {
+            std.testing.allocator.free(call.name);
+            std.testing.allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| std.testing.allocator.free(id);
+        }
+        std.testing.allocator.free(result.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    // The inner quotes must be JSON-escaped.
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "echo \\\"hi\\\"") != null);
+    // Must still parse as valid JSON.
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result.calls[0].arguments_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("echo \"hi\"", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls prefers <tool_call> over <invoke> when both present" {
+    const response =
+        \\<tool_call>
+        \\{"name": "shell", "arguments": {"command": "ls"}}
+        \\</tool_call>
+        \\<invoke name="runtime_info">
+        \\<parameter name="section">summary</parameter>
+        \\</invoke>
+    ;
+    const result = try parseToolCalls(std.testing.allocator, response);
+    defer std.testing.allocator.free(result.text);
+    defer {
+        for (result.calls) |call| {
+            std.testing.allocator.free(call.name);
+            std.testing.allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| std.testing.allocator.free(id);
+        }
+        std.testing.allocator.free(result.calls);
+    }
+    // First-win: <tool_call> takes precedence to preserve existing behavior.
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("shell", result.calls[0].name);
 }
