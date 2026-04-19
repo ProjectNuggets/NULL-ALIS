@@ -2465,6 +2465,51 @@ test "parseToolCalls escapes special chars in <parameter> values" {
     try std.testing.expectEqualStrings("echo \"hi\"", parsed.value.object.get("command").?.string);
 }
 
+test "DIAGNOSTIC Nova exact payload context_snapshot trailing prose" {
+    const payload =
+        \\<invoke name="context_snapshot">
+        \\{}
+        \\</invoke> Live Runtime Test — Executing Now
+    ;
+    const result = try parseToolCalls(std.testing.allocator, payload);
+    defer std.testing.allocator.free(result.text);
+    defer {
+        for (result.calls) |c| {
+            std.testing.allocator.free(c.name);
+            std.testing.allocator.free(c.arguments_json);
+            if (c.tool_call_id) |id| std.testing.allocator.free(id);
+        }
+        std.testing.allocator.free(result.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("context_snapshot", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "<invoke") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "Live Runtime Test") != null);
+}
+
+test "DIAGNOSTIC Nova exact payload multi-invoke no newline between" {
+    const payload =
+        \\<invoke name="runtime_info">
+        \\{"section": "summary", "verbose": true}</invoke>
+        \\<invoke name="memory_recall">
+        \\{"query": "test memory system", "limit": 3}</invoke>
+    ;
+    const result = try parseToolCalls(std.testing.allocator, payload);
+    defer std.testing.allocator.free(result.text);
+    defer {
+        for (result.calls) |c| {
+            std.testing.allocator.free(c.name);
+            std.testing.allocator.free(c.arguments_json);
+            if (c.tool_call_id) |id| std.testing.allocator.free(id);
+        }
+        std.testing.allocator.free(result.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 2), result.calls.len);
+    try std.testing.expectEqualStrings("runtime_info", result.calls[0].name);
+    try std.testing.expectEqualStrings("memory_recall", result.calls[1].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "<invoke") == null);
+}
+
 test "parseToolCalls prefers <tool_call> over <invoke> when both present" {
     const response =
         \\<tool_call>
