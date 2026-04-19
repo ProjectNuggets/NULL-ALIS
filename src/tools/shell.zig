@@ -64,6 +64,34 @@ pub const ShellTool = struct {
                     error.ApprovalRequired => ToolResult.fail("Command requires approval (medium/high risk)"),
                 };
             };
+
+            // workspace_only cross-tenant guard. Shell's `cwd` is path-gated
+            // above, but shell COMMAND ARGUMENTS (e.g. `cat /other/user/path`)
+            // are not — they execute with the process UID and can read any
+            // file the process can read. In shared-runtime tenant mode
+            // (single binary serving many user_ids via same UID) that's a
+            // cross-tenant read vector. When `policy.workspace_only=true`
+            // and sandbox isn't enabled, we require the runtime to either:
+            //   (a) enable `sandbox.enabled=true` (proper filesystem jail), or
+            //   (b) explicitly set `autonomy.workspace_only=false` to
+            //       acknowledge the trust model (e.g. per-user pod).
+            // In tenant mode we refuse outright; in single-user/pod mode
+            // we log a warning but allow — the pod's process isolation
+            // provides the boundary.
+            if (pol.workspace_only and !self.sandbox_enabled) {
+                const tenant_ctx = root.getTenantContext();
+                if (tenant_ctx.expect_postgres_state) {
+                    return ToolResult.fail(
+                        "shell disabled in multi-tenant runtime: enable sandbox.enabled=true or set autonomy.workspace_only=false. Shell command arguments bypass cwd gating and can read cross-tenant files via process UID.",
+                    );
+                }
+                // Single-user/per-pod mode: allow with a one-line audit log
+                // so the choice is visible in operator logs.
+                std.log.scoped(.shell).debug(
+                    "workspace_only=true, sandbox disabled, single-tenant — allowing shell under process isolation",
+                    .{},
+                );
+            }
         }
 
         // Determine working directory
@@ -292,6 +320,110 @@ test "shell missing command param" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(result.error_msg != null);
+}
+
+test "shell refuses in tenant runtime when workspace_only=true and sandbox off" {
+    const pol = SecurityPolicy{
+        .workspace_only = true,
+        .block_high_risk_commands = true,
+        .allowed_commands = &.{"echo"},
+    };
+    var st = ShellTool{
+        .workspace_dir = ".",
+        .policy = &pol,
+        .sandbox_enabled = false,
+    };
+    const t = st.tool();
+
+    // Simulate tenant runtime by setting expect_postgres_state=true.
+    root.setTenantContext(.{ .expect_postgres_state = true, .user_id = "1" });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"command\":\"echo hi\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "multi-tenant") != null);
+}
+
+test "shell allows in single-user runtime when workspace_only=true and sandbox off" {
+    const pol = SecurityPolicy{
+        .workspace_only = true,
+        .block_high_risk_commands = true,
+        .allowed_commands = &.{"echo"},
+    };
+    var st = ShellTool{
+        .workspace_dir = ".",
+        .policy = &pol,
+        .sandbox_enabled = false,
+    };
+    const t = st.tool();
+
+    // No tenant context set — single-user/per-pod mode.
+    root.clearTenantContext();
+    const parsed = try root.parseTestArgs("{\"command\":\"echo single-user-ok\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "single-user-ok") != null);
+}
+
+test "shell allows in tenant runtime when autonomy.workspace_only=false" {
+    const pol = SecurityPolicy{
+        .workspace_only = false, // explicit acknowledgement
+        .block_high_risk_commands = true,
+        .allowed_commands = &.{"echo"},
+    };
+    var st = ShellTool{
+        .workspace_dir = ".",
+        .policy = &pol,
+        .sandbox_enabled = false,
+    };
+    const t = st.tool();
+
+    root.setTenantContext(.{ .expect_postgres_state = true, .user_id = "1" });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"command\":\"echo tenant-ok\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "tenant-ok") != null);
+}
+
+test "shell allows in tenant runtime when sandbox is enabled" {
+    const pol = SecurityPolicy{
+        .workspace_only = true,
+        .block_high_risk_commands = true,
+        .allowed_commands = &.{"echo"},
+    };
+    var st = ShellTool{
+        .workspace_dir = ".",
+        .policy = &pol,
+        .sandbox_enabled = true, // sandbox provides the filesystem jail
+    };
+    const t = st.tool();
+
+    root.setTenantContext(.{ .expect_postgres_state = true, .user_id = "1" });
+    defer root.clearTenantContext();
+
+    const parsed = try root.parseTestArgs("{\"command\":\"echo sandbox-ok\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    // With sandbox_enabled=true the shell tool will try to wrap the call —
+    // that path may fail in the test env without a real sandbox backend.
+    // We only care here that the workspace_only guard did NOT trigger.
+    if (result.error_msg) |msg| {
+        defer std.testing.allocator.free(msg);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "multi-tenant") == null);
+    }
+    if (result.output.len > 0) std.testing.allocator.free(result.output);
 }
 
 test "parseStringField basic" {
