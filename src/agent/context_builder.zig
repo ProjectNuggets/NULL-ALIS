@@ -244,7 +244,10 @@ pub fn buildSnapshot(self: anytype) Snapshot {
         .context_pressure_percent = pressurePercent(token_estimate, context_window_tokens),
         .history_trim_limit_messages = if (@hasField(AgentType, "max_history_messages")) self.max_history_messages else 0,
         .token_compaction_threshold = token_budget_policy.threshold,
-        .token_compaction_triggered = token_budget_policy.threshold > 0 and token_estimate > token_budget_policy.threshold,
+        // Context v2: fire compaction at the 50% trigger (Hermes standard),
+        // not at the reserve-based 65%+ threshold. The threshold remains the
+        // force-compress guard for the emergency path.
+        .token_compaction_triggered = token_budget_policy.compaction_trigger > 0 and token_estimate > token_budget_policy.compaction_trigger,
         .token_reply_reserve = token_budget_policy.reply_reserve,
         .token_tool_reserve = token_budget_policy.tool_reserve,
         .token_safety_reserve = token_budget_policy.safety_reserve,

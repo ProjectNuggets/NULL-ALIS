@@ -77,7 +77,15 @@ pub const TokenBudgetPolicy = struct {
     tool_reserve: u64,
     safety_reserve: u64,
     total_reserve: u64,
+    /// Reserve-based force-compress threshold. Hard guard against context
+    /// exhaustion; keep existing 65% floor semantics.
     threshold: u64,
+    /// Hermes-style early-compaction trigger. Fires when context pressure
+    /// crosses 50% of the model's resolved context window, letting the cheap
+    /// 3-pass escalation in autoCompactHistory (60/75/85%) engage BEFORE
+    /// pressure is high enough to need the expensive full-LLM summary pass.
+    /// Derived as (token_limit * 50) / 100.
+    compaction_trigger: u64,
 };
 
 pub fn buildTokenBudgetPolicy(token_limit: u64, max_tokens: u32) TokenBudgetPolicy {
@@ -88,6 +96,7 @@ pub fn buildTokenBudgetPolicy(token_limit: u64, max_tokens: u32) TokenBudgetPoli
             .safety_reserve = 0,
             .total_reserve = 0,
             .threshold = 0,
+            .compaction_trigger = 0,
         };
     }
 
@@ -103,6 +112,7 @@ pub fn buildTokenBudgetPolicy(token_limit: u64, max_tokens: u32) TokenBudgetPoli
         .safety_reserve = safety_reserve,
         .total_reserve = total_reserve,
         .threshold = @max(minimum_threshold, threshold_from_reserve),
+        .compaction_trigger = (token_limit * 50) / 100,
     };
 }
 
