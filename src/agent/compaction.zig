@@ -156,22 +156,28 @@ pub fn autoCompactHistory(
     var compacted = false;
     const estimate_before = tokenEstimate(history.items);
 
-    // ── Pass A: Cheap dedup + placeholder substitution at 60% ──
-    const cheap_threshold = (config.token_limit * 60) / 100;
+    // Context v2 "real-work" thresholds (iter20): 70 / 80 / 90 — lets the agent
+    // use the bulk of the model's context window before trimming, matching
+    // Hermes-style "fill, then compress" rather than the old 60/75/85 "keep
+    // small" discipline inherited from the edge-device-targeted nullclaw era.
+    // For Kimi K2.5 (262K window): Pass A ~183K, Pass B ~210K, Pass C ~236K.
+
+    // ── Pass A: Cheap dedup + placeholder substitution at 70% ──
+    const cheap_threshold = (config.token_limit * 70) / 100;
     if (estimate_before > cheap_threshold) {
         const reduced = cheapCompactionPass(allocator, history, config.keep_recent);
         if (reduced) compacted = true;
     }
 
-    // ── Pass B: Structured extraction at 75% ──
-    const structured_threshold = (config.token_limit * 75) / 100;
+    // ── Pass B: Structured extraction at 80% ──
+    const structured_threshold = (config.token_limit * 80) / 100;
     if (tokenEstimate(history.items) > structured_threshold) {
         const extracted = structuredExtractionPass(allocator, history, provider, model_name, config) catch false;
         if (extracted) compacted = true;
     }
 
-    // ── Pass C: Full LLM summarization at 85% ──
-    const llm_threshold = (config.token_limit * 85) / 100;
+    // ── Pass C: Full LLM summarization at 90% ──
+    const llm_threshold = (config.token_limit * 90) / 100;
     if (tokenEstimate(history.items) > llm_threshold) {
         const summarized = try compactHistoryKeepingRecent(allocator, history, provider, model_name, config, config.keep_recent);
         if (summarized) compacted = true;

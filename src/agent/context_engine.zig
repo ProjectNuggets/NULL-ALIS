@@ -105,14 +105,6 @@ pub const TurnContextResult = struct {
 /// four lifecycle methods in order each turn.
 pub const ContextEngine = struct {
     phase: LifecyclePhase = .idle,
-    /// Thrash guard: rolling 2-entry ring of the last compaction savings
-    /// percentages. If BOTH entries are under MIN_SAVINGS_PERCENT, skip the
-    /// next compaction attempt — repeatedly compacting a tightly-packed
-    /// session wastes LLM calls without shrinking the footprint.
-    /// Initialized to 100% so first compaction always runs.
-    compaction_savings_ring: [2]u8 = .{ 100, 100 },
-
-    const MIN_SAVINGS_PERCENT: u8 = 10;
 
     /// Phase 1: Ingest — record what came in this turn.
     ///
@@ -187,23 +179,13 @@ pub const ContextEngine = struct {
         };
     }
 
-    fn thrashGuardActive(self: *const ContextEngine) bool {
-        return self.compaction_savings_ring[0] < MIN_SAVINGS_PERCENT and
-            self.compaction_savings_ring[1] < MIN_SAVINGS_PERCENT;
-    }
-
-    fn recordCompactionSavings(self: *ContextEngine, before: usize, after: usize) void {
-        if (before == 0) return;
-        const saved: u64 = if (before > after) (before - after) else 0;
-        const pct: u8 = @intCast(@min(100, (saved * 100) / before));
-        self.compaction_savings_ring[1] = self.compaction_savings_ring[0];
-        self.compaction_savings_ring[0] = pct;
-    }
-
     /// Phase 3: Compact — trigger compaction if token pressure requires it.
     ///
     /// Caller should check assemble_result.compaction_recommended first.
     /// Tries auto-compaction first; falls back to force-compress if needed.
+    /// Note: anti-thrash guard is implemented inside Agent.autoCompactHistory
+    /// (the actual call site used by the turn loop). The gate here is just a
+    /// thin pass-through for callers that prefer the ContextEngine lifecycle.
     pub fn compact(self: *ContextEngine, agent: anytype) CompactResult {
         self.phase = .compacting;
         defer self.phase = .idle;
@@ -211,26 +193,10 @@ pub const ContextEngine = struct {
         const AgentType = @TypeOf(agent.*);
         const before = if (@hasField(AgentType, "history")) agent.history.items.len else 0;
 
-        // Anti-thrash: skip auto-compact if last two attempts both saved <10%.
-        // Force-compress still runs when called explicitly via separate path.
-        if (self.thrashGuardActive()) {
-            std.log.scoped(.agent).info("compaction.skipped reason=thrash_guard ring=[{d},{d}]", .{
-                self.compaction_savings_ring[0],
-                self.compaction_savings_ring[1],
-            });
-            return .{
-                .compacted = false,
-                .messages_before = before,
-                .messages_after = before,
-                .method = .none,
-            };
-        }
-
         // Try auto-compaction first.
         if (@hasDecl(AgentType, "autoCompactHistory")) {
             if (agent.autoCompactHistory() catch false) {
                 const after = agent.history.items.len;
-                self.recordCompactionSavings(before, after);
                 return .{
                     .compacted = true,
                     .messages_before = before,
@@ -244,7 +210,6 @@ pub const ContextEngine = struct {
         if (@hasDecl(AgentType, "forceCompressHistory")) {
             if (agent.forceCompressHistory()) {
                 const after = agent.history.items.len;
-                self.recordCompactionSavings(before, after);
                 return .{
                     .compacted = true,
                     .messages_before = before,

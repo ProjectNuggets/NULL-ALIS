@@ -77,6 +77,11 @@ const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
 
+/// Anti-thrash guard: if BOTH entries in compaction_savings_ring are under
+/// this percentage, Agent.autoCompactHistory skips the next attempt. Protects
+/// against repeated LLM summary calls on a tightly-packed session saving little.
+const COMPACTION_MIN_SAVINGS_PERCENT: u8 = 10;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
 // ═══════════════════════════════════════════════════════════════════════════
@@ -524,11 +529,19 @@ pub const Agent = struct {
     /// Compact explanation of what context was assembled on the last completed turn.
     last_turn_context: context_builder.LastTurnContext = .{},
 
-    /// Raw user content for the current turn when provider-facing enrichment is active.
+    /// Raw user content for the current turn (context v2: memory is not
+    /// substituted; raw is what goes to the provider).
     current_turn_raw_user: ?[]const u8 = null,
 
-    /// Enriched provider-facing user content for the current turn only.
+    /// Deprecated (context v2): enriched-user substitution path is removed.
+    /// Field kept only for transitional compatibility with tests; always null
+    /// in the live turn loop. TODO: remove field in a follow-up cleanup.
     current_turn_enriched_user: ?[]const u8 = null,
+
+    /// Anti-thrash ring (iter20): last two compaction savings percentages.
+    /// If both below COMPACTION_MIN_SAVINGS_PERCENT, autoCompactHistory skips
+    /// its next attempt. Force-compress path bypasses this guard.
+    compaction_savings_ring: [2]u8 = .{ 100, 100 },
 
     /// An owned copy of a ChatMessage, where content is heap-allocated.
     pub const OwnedMessage = struct {
@@ -685,10 +698,28 @@ pub const Agent = struct {
     /// Primary trigger: sliding-window (turn-count) — keeps last N user turns
     /// verbatim, collapses older into one summary block. Deterministic latency
     /// bound for stateless providers (Together/Groq) without prefix caching.
-    /// Fallback: token-based triggers (60%/75%/85%) if window is 0.
+    /// Fallback: token-based triggers (70%/80%/90% in context v2) if window is 0.
     /// Uses sidecar provider for LLM summarization if available (cost savings:
     /// Groq Llama 8B instead of Sonnet/GLM/K2.5). Falls back to main provider.
+    ///
+    /// Anti-thrash guard (iter20): if the last two compactions each saved less
+    /// than 10% of history size, skip this one and log `compaction.skipped
+    /// reason=thrash_guard`. Protects against the pathological case where a
+    /// tightly-packed session triggers expensive LLM summary calls every turn
+    /// for diminishing returns. Force-compress (emergency path) bypasses this
+    /// guard via `forceCompressHistory` which calls `compaction.*` directly.
     pub fn autoCompactHistory(self: *Agent) !bool {
+        // Thrash guard
+        if (self.compaction_savings_ring[0] < COMPACTION_MIN_SAVINGS_PERCENT and
+            self.compaction_savings_ring[1] < COMPACTION_MIN_SAVINGS_PERCENT)
+        {
+            log.info("compaction.skipped reason=thrash_guard ring=[{d},{d}]", .{
+                self.compaction_savings_ring[0],
+                self.compaction_savings_ring[1],
+            });
+            return false;
+        }
+
         const compact_provider = if (self.sidecar_provider) |sp| sp else self.provider;
         const compact_model = if (self.sidecar_provider != null) self.sidecar_model else self.model_name;
         const cfg = compaction.CompactionConfig{
@@ -703,16 +734,32 @@ pub const Agent = struct {
             .workspace_dir = self.workspace_dir,
         };
 
+        const before_count = self.history.items.len;
+
         // Primary: turn-based sliding window. When this fires, it supersedes
         // token-based passes for this invocation (the window already bounds payload).
         if (self.history_window_turns > 0) {
             const windowed = try compaction.compactByTurnWindow(self.allocator, &self.history, compact_provider, compact_model, cfg);
-            if (windowed) return true;
+            if (windowed) {
+                self.recordCompactionSavings(before_count, self.history.items.len);
+                return true;
+            }
         }
 
         // Fallback / complementary: token-based passes (handles runaway tool outputs
         // even when turn count is within window).
-        return compaction.autoCompactHistory(self.allocator, &self.history, compact_provider, compact_model, cfg);
+        const compacted = try compaction.autoCompactHistory(self.allocator, &self.history, compact_provider, compact_model, cfg);
+        if (compacted) self.recordCompactionSavings(before_count, self.history.items.len);
+        return compacted;
+    }
+
+    /// Update the 2-entry ring that the thrash guard reads next turn.
+    fn recordCompactionSavings(self: *Agent, before: usize, after: usize) void {
+        if (before == 0) return;
+        const saved: u64 = if (before > after) (before - after) else 0;
+        const pct: u8 = @intCast(@min(100, (saved * 100) / before));
+        self.compaction_savings_ring[1] = self.compaction_savings_ring[0];
+        self.compaction_savings_ring[0] = pct;
     }
 
     /// Manual compaction for explicit operator boundaries.
