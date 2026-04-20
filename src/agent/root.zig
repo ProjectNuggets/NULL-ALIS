@@ -727,6 +727,9 @@ pub const Agent = struct {
             // artifact via memory_timeline/memory_recall.
             .archive_memory = self.mem,
             .archive_session_id = self.memory_session_id,
+            // iter31: also index the summary into the vector store so it
+            // surfaces in semantic memory_recall, not just prefix-browse.
+            .archive_mem_rt = self.mem_rt,
         };
 
         // iter22 (Nova's Medium finding): measure thrash savings in TOKENS,
@@ -780,6 +783,7 @@ pub const Agent = struct {
             self.allocator,
             &self.history,
             self.mem,
+            self.mem_rt,
             self.memory_session_id,
         );
     }

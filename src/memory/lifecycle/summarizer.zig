@@ -142,6 +142,9 @@ pub fn buildSummarizationPrompt(
             "files_touched:\n- <absolute path or repo-relative path>  (omit if no file I/O)\n" ++
             "attachments:\n- <brief description of any image/PDF/file sent>  (omit if none)\n" ++
             "approvals:\n- <user approved/rejected X>  (omit if no explicit approval events)\n" ++
+            "errors:\n- <tool/command that failed with brief reason>  (omit if nothing failed)\n" ++
+            "entities:\n- <person/org/project/URL/system referenced>  (omit if none worth tracking)\n" ++
+            "tone: <one word — neutral/frustrated/excited/confused/urgent/etc>  (omit if unclear)\n" ++
             "Key fact: <long-lived fact if any>\n" ++
             "Key fact: <another long-lived fact if any>\n" ++
             "Keep it concise. Do not include timestamps, counts, metadata, or raw checkpoint labels.\n" ++

@@ -509,7 +509,13 @@ pub fn isAppendOnlyMemoryKey(key: []const u8) bool {
         std.mem.startsWith(u8, key, "session_checkpoint_") or
         std.mem.eql(u8, key, "timeline_index/current") or
         std.mem.startsWith(u8, key, "autosave_user_") or
-        std.mem.startsWith(u8, key, "autosave_assistant_");
+        std.mem.startsWith(u8, key, "autosave_assistant_") or
+        // iter31: system-written continuity artifacts from iter29 compaction
+        // persistence work. Append-only at construction; editable only via
+        // explicit cleanup paths (memory_purge_topic, etc).
+        std.mem.startsWith(u8, key, "compaction_summary/") or
+        std.mem.startsWith(u8, key, "summary_fallback/") or
+        std.mem.startsWith(u8, key, "compaction_dropped/");
 }
 
 pub fn isSystemManagedMemoryKey(key: []const u8) bool {

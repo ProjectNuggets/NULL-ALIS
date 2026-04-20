@@ -12,6 +12,7 @@ const memory_mod = @import("../memory/root.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
 const Memory = memory_mod.Memory;
+const MemoryRuntime = memory_mod.MemoryRuntime;
 
 const Agent = @import("root.zig").Agent;
 const OwnedMessage = Agent.OwnedMessage;
@@ -70,6 +71,10 @@ pub const CompactionConfig = struct {
     // the session.
     archive_memory: ?Memory = null,
     archive_session_id: ?[]const u8 = null,
+    // iter31: when set, archived artifacts also get indexed into the vector
+    // store via syncVectorAfterStore — so they're reachable by semantic
+    // memory_recall, not just prefix-browse via memory_timeline.
+    archive_mem_rt: ?*MemoryRuntime = null,
 };
 
 pub const TokenBudgetPolicy = struct {
@@ -364,7 +369,7 @@ fn compactHistoryKeepingRecent(
     // this, the summary evaporates when the session ends.
     if (config.archive_memory) |mem| {
         if (config.archive_session_id) |session_id| {
-            archiveCompactionSummary(allocator, mem, session_id, summary_with_context, compact_count) catch |err| {
+            archiveCompactionSummary(allocator, mem, config.archive_mem_rt, session_id, summary_with_context, compact_count) catch |err| {
                 log.warn("compaction: failed to archive Pass C summary: {}", .{err});
             };
         }
@@ -405,16 +410,19 @@ pub fn forceCompressHistory(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
 ) bool {
-    return forceCompressHistoryWithArchive(allocator, history, null, null);
+    return forceCompressHistoryWithArchive(allocator, history, null, null, null);
 }
 
 /// Force-compress history, optionally archiving dropped messages to memory.
 /// When mem and session_id are provided, dropped messages are saved as a
-/// compaction_archive/* entry before deletion — preventing silent context loss.
+/// compaction_dropped/{session}/{ts} entry before deletion — preventing
+/// silent context loss. iter31: mem_rt optional; when set, the archive is
+/// also indexed into the vector store for semantic recall.
 pub fn forceCompressHistoryWithArchive(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
-    mem: ?@import("../memory/root.zig").Memory,
+    mem: ?Memory,
+    mem_rt: ?*MemoryRuntime,
     session_id: ?[]const u8,
 ) bool {
     const has_system = history.items.len > 0 and history.items[0].role == .system;
@@ -430,7 +438,7 @@ pub fn forceCompressHistoryWithArchive(
 
     // Archive dropped messages to memory before deletion (best-effort)
     if (mem) |m| {
-        archiveDroppedMessages(allocator, m, session_id, history.items[start..keep_start], to_remove);
+        archiveDroppedMessages(allocator, m, mem_rt, session_id, history.items[start..keep_start], to_remove);
     }
 
     // Free messages being removed
@@ -447,9 +455,11 @@ pub fn forceCompressHistoryWithArchive(
 }
 
 /// Best-effort archive of messages about to be dropped.
+/// iter31: mem_rt optional — when set, indexes into vector store for recall.
 fn archiveDroppedMessages(
     allocator: std.mem.Allocator,
-    mem: @import("../memory/root.zig").Memory,
+    mem: Memory,
+    mem_rt: ?*MemoryRuntime,
     session_id: ?[]const u8,
     messages: []const OwnedMessage,
     count: usize,
@@ -488,17 +498,22 @@ fn archiveDroppedMessages(
         std.fmt.allocPrint(allocator, "compaction_dropped/{d}", .{ts}) catch return;
     defer allocator.free(key);
 
-    mem.store(key, buf.items, .conversation, session_id) catch |err| {
+    if (mem.store(key, buf.items, .conversation, session_id)) |_| {
+        if (mem_rt) |rt| _ = rt.syncVectorAfterStore(allocator, key, buf.items);
+    } else |err| {
         log.warn("compaction: failed to archive dropped messages: {}", .{err});
-    };
+    }
 }
 
 /// iter29: archive the Pass C emergency summary to memory so it becomes a
 /// recallable continuity artifact. Key shape: `compaction_summary/{session}/{ts}`.
 /// Category=.daily so memory_timeline lists it alongside lifecycle summaries.
+/// iter31: when mem_rt is provided, also indexes into the vector store so
+/// memory_recall semantic search can find it.
 fn archiveCompactionSummary(
     allocator: std.mem.Allocator,
     mem: Memory,
+    mem_rt: ?*MemoryRuntime,
     session_id: []const u8,
     summary_body: []const u8,
     compacted_message_count: usize,
@@ -517,6 +532,7 @@ fn archiveCompactionSummary(
     defer allocator.free(payload);
 
     try mem.store(key, payload, .daily, session_id);
+    if (mem_rt) |rt| _ = rt.syncVectorAfterStore(allocator, key, payload);
 }
 
 /// Trim history to prevent unbounded growth.
