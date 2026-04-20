@@ -3131,13 +3131,20 @@ pub const Agent = struct {
                     compact_duration_ms,
                     self.last_turn_compacted,
                 });
-                const compact_stage_event = ObserverEvent{ .turn_stage = .{
-                    .stage = "post_reply_compaction",
-                    .iteration = iteration,
-                    .duration_ms = compact_duration_ms,
-                    .run_id = self.current_run_id,
-                } };
-                self.observer.recordEvent(&compact_stage_event);
+                // iter34: only emit the observer event (which the frontend
+                // turns into "Compacting context window") when compaction
+                // actually ran. Previously this fired every turn regardless
+                // of whether any work happened, giving the user a phantom
+                // "compacting" UI flicker on every reply.
+                if (self.last_turn_compacted) {
+                    const compact_stage_event = ObserverEvent{ .turn_stage = .{
+                        .stage = "post_reply_compaction",
+                        .iteration = iteration,
+                        .duration_ms = compact_duration_ms,
+                        .run_id = self.current_run_id,
+                    } };
+                    self.observer.recordEvent(&compact_stage_event);
+                }
 
                 if (self.last_turn_compacted) {
                     self.refreshDurableContinuityAfterCompaction();
