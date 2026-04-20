@@ -2433,14 +2433,13 @@ pub const Agent = struct {
         }
 
         if (self.compact_context_enabled) {
+            // iter32: reset per-turn flag only. The previous "turn_compaction"
+            // stage event was a pre-flight heartbeat with duration_ms=0 — the
+            // frontend showed "Trimming context" on EVERY turn because the
+            // label fired regardless of whether any compaction actually ran.
+            // Misleading UI. Real compaction emits its own events later
+            // (post_reply_compaction, autoCompactHistory result recording).
             self.last_turn_compacted = false;
-            log.info("turn.stage stage=turn_compaction duration_ms=0 mode=auto", .{});
-            const compact_stage_event = ObserverEvent{ .turn_stage = .{
-                .stage = "turn_compaction",
-                .duration_ms = 0,
-                .run_id = self.current_run_id,
-            } };
-            self.observer.recordEvent(&compact_stage_event);
         }
 
         // ── Response/Semantic cache check ──
