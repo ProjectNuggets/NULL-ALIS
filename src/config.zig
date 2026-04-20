@@ -789,7 +789,6 @@ pub const Config = struct {
             .compaction_keep_recent = self.agent.compaction_keep_recent,
             .compaction_max_summary_chars = self.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
-            .history_window_turns = self.agent.history_window_turns,
             .message_timeout_secs = self.agent.message_timeout_secs,
             .session_ttl_secs = self.agent.session_ttl_secs,
             .activation_mode = self.agent.activation_mode,
@@ -1492,11 +1491,6 @@ test "save roundtrip preserves extended config sections" {
     cfg.agent.compaction_keep_recent = 20;
     cfg.agent.compaction_max_summary_chars = 16_000;
     cfg.agent.compaction_max_source_chars = 80_000;
-    // Sliding-window trigger: cap per-turn payload at ~20 user turns verbatim.
-    // Older turns collapse into one summary block. Primary mechanism for
-    // keeping fast-mode latency bounded on stateless providers (Together/Groq).
-    // Keep in sync with docs: .planning/sliding-window-and-workspace-files.md.
-    cfg.agent.history_window_turns = 20;
     cfg.agent.message_timeout_secs = 300;
 
     cfg.memory.search.provider = "openai";

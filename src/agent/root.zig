@@ -390,8 +390,6 @@ pub const Agent = struct {
     allowed_paths: []const []const u8 = &.{},
     max_tool_iterations: u32,
     max_history_messages: u32,
-    /// Sliding-window compaction trigger. See CompactionConfig.history_window_turns.
-    history_window_turns: u32 = 0,
     parallel_tools: bool = false,
     parallel_tools_rollout_percent: u8 = 100,
     tool_dispatcher_mode: ToolDispatcherMode = .auto,
@@ -597,7 +595,6 @@ pub const Agent = struct {
             .allowed_paths = cfg.autonomy.allowed_paths,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
-            .history_window_turns = cfg.agent.history_window_turns,
             .parallel_tools = cfg.agent.parallel_tools,
             .parallel_tools_rollout_percent = cfg.agent.parallel_tools_rollout_percent,
             .tool_dispatcher_mode = tool_dispatcher.parseMode(cfg.agent.tool_dispatcher).mode,
@@ -725,7 +722,6 @@ pub const Agent = struct {
             .max_tokens = self.max_tokens,
             .message_timeout_secs = self.message_timeout_secs,
             .max_history_messages = self.max_history_messages,
-            .history_window_turns = self.history_window_turns,
             .workspace_dir = self.workspace_dir,
         };
 
@@ -738,18 +734,9 @@ pub const Agent = struct {
         // we gate against when deciding to skip.
         const before_tokens = compaction.tokenEstimate(self.history.items);
 
-        // Primary: turn-based sliding window. When this fires, it supersedes
-        // token-based passes for this invocation (the window already bounds payload).
-        if (self.history_window_turns > 0) {
-            const windowed = try compaction.compactByTurnWindow(self.allocator, &self.history, compact_provider, compact_model, cfg);
-            if (windowed) {
-                self.recordCompactionSavings(before_tokens, compaction.tokenEstimate(self.history.items));
-                return true;
-            }
-        }
-
-        // Fallback / complementary: token-based passes (handles runaway tool outputs
-        // even when turn count is within window).
+        // iter23: turn-window trim deleted (12K-era leftover). Token-budget
+        // autoCompactHistory is the single source of truth for when to compact.
+        // Fires at compaction_trigger (50% of model window) via Pass A/B/C.
         const compacted = try compaction.autoCompactHistory(self.allocator, &self.history, compact_provider, compact_model, cfg);
         if (compacted) self.recordCompactionSavings(before_tokens, compaction.tokenEstimate(self.history.items));
         return compacted;
@@ -778,7 +765,6 @@ pub const Agent = struct {
             .max_tokens = self.max_tokens,
             .message_timeout_secs = self.message_timeout_secs,
             .max_history_messages = self.max_history_messages,
-            .history_window_turns = self.history_window_turns,
             .workspace_dir = self.workspace_dir,
         });
     }
