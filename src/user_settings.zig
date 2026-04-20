@@ -66,15 +66,21 @@ pub const OwnershipPlane = enum {
     unknown,
 };
 
+// iter35: ModeMapping is a lookup table for legacy-config inference only
+// (deriveNearestFromAgentObject → deriveNearestFromConfigJson → snap pre-
+// product_settings configs to an assistant_mode). Only queue_mode / queue_cap
+// / queue_drop / max_history_messages are read for scoring. Removed
+// summarizer_* (never read) and the dead `mappingFor` function.
+// Numeric values here are just snap SIGNAL — they reflect the pre-
+// context-v2 era's config shape so old configs still migrate cleanly.
+// Runtime behavior for each mode is driven by product_presets in
+// config_types.zig, NOT this table.
 const ModeMapping = struct {
     mode: AssistantMode,
     queue_mode: []const u8,
     queue_cap: u32,
     queue_drop: []const u8,
     max_history_messages: u32,
-    summarizer_enabled: bool,
-    summarizer_window_size_tokens: u32,
-    summarizer_summary_max_tokens: u32,
 };
 
 const mode_mappings = [_]ModeMapping{
@@ -84,9 +90,6 @@ const mode_mappings = [_]ModeMapping{
         .queue_cap = 8,
         .queue_drop = "newest",
         .max_history_messages = 40,
-        .summarizer_enabled = true,
-        .summarizer_window_size_tokens = 3000,
-        .summarizer_summary_max_tokens = 300,
     },
     .{
         .mode = .balanced,
@@ -94,9 +97,6 @@ const mode_mappings = [_]ModeMapping{
         .queue_cap = 12,
         .queue_drop = "summarize",
         .max_history_messages = 50,
-        .summarizer_enabled = true,
-        .summarizer_window_size_tokens = 4000,
-        .summarizer_summary_max_tokens = 500,
     },
     .{
         .mode = .deep,
@@ -104,9 +104,6 @@ const mode_mappings = [_]ModeMapping{
         .queue_cap = 20,
         .queue_drop = "summarize",
         .max_history_messages = 80,
-        .summarizer_enabled = true,
-        .summarizer_window_size_tokens = 6000,
-        .summarizer_summary_max_tokens = 700,
     },
 };
 
@@ -491,14 +488,6 @@ fn deriveNearestFromAgentObject(agent: std.json.ObjectMap) ProductSettings {
         result.session_timeout_minutes = clampSessionTimeoutMinutes(@max(1, secs / 60));
     }
     return result;
-}
-
-fn mappingFor(mode: AssistantMode) ModeMapping {
-    return switch (mode) {
-        .fast => mode_mappings[0],
-        .balanced => mode_mappings[1],
-        .deep => mode_mappings[2],
-    };
 }
 
 fn presetForMode(
