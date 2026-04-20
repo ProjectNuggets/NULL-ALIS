@@ -146,6 +146,16 @@ pub fn autoCompactHistory(
 
     var compacted = false;
     const estimate_before = tokenEstimate(history.items);
+    const pressure_pct: u8 = @intCast(@min(100, (estimate_before * 100) / config.token_limit));
+
+    // iter24: visibility log — so Nova can see the token-budget system is
+    // actually making decisions each turn. Prints current pressure vs the
+    // 70/80/90 trigger curve at the top of every auto-compaction call.
+    log.info("compaction.auto: evaluating tokens={d} limit={d} pressure={d}%", .{
+        estimate_before,
+        config.token_limit,
+        pressure_pct,
+    });
 
     // Context v2 "real-work" thresholds (iter20): 70 / 80 / 90 — lets the agent
     // use the bulk of the model's context window before trimming, matching
@@ -156,6 +166,7 @@ pub fn autoCompactHistory(
     // ── Pass A: Cheap dedup + placeholder substitution at 70% ──
     const cheap_threshold = (config.token_limit * 70) / 100;
     if (estimate_before > cheap_threshold) {
+        log.info("compaction.auto: pass=A firing (cheap dedup + placeholder)", .{});
         const reduced = cheapCompactionPass(allocator, history, config.keep_recent);
         if (reduced) compacted = true;
     }
@@ -163,6 +174,7 @@ pub fn autoCompactHistory(
     // ── Pass B: Structured extraction at 80% ──
     const structured_threshold = (config.token_limit * 80) / 100;
     if (tokenEstimate(history.items) > structured_threshold) {
+        log.info("compaction.auto: pass=B firing (structured extraction)", .{});
         const extracted = structuredExtractionPass(allocator, history, provider, model_name, config) catch false;
         if (extracted) compacted = true;
     }
@@ -170,8 +182,20 @@ pub fn autoCompactHistory(
     // ── Pass C: Full LLM summarization at 90% ──
     const llm_threshold = (config.token_limit * 90) / 100;
     if (tokenEstimate(history.items) > llm_threshold) {
+        log.info("compaction.auto: pass=C firing (LLM summarization)", .{});
         const summarized = try compactHistoryKeepingRecent(allocator, history, provider, model_name, config, config.keep_recent);
         if (summarized) compacted = true;
+    }
+
+    if (compacted) {
+        const estimate_after = tokenEstimate(history.items);
+        const saved = if (estimate_before > estimate_after) estimate_before - estimate_after else 0;
+        const saved_pct: u8 = if (estimate_before > 0) @intCast(@min(100, (saved * 100) / estimate_before)) else 0;
+        log.info("compaction.auto: compacted before={d} after={d} saved={d}%", .{
+            estimate_before,
+            estimate_after,
+            saved_pct,
+        });
     }
 
     return compacted;
