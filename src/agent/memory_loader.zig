@@ -63,6 +63,15 @@ pub const EnrichmentResult = struct {
     stats: SelectionStats,
 };
 
+/// Memory payload for the volatile system block. `fenced_content` is the
+/// retrieved memory wrapped in `<memory_for_turn>…</memory_for_turn>` markers,
+/// suitable for direct inclusion in PromptContext.memory_slot. Empty string
+/// means no memory was retrieved for this turn.
+pub const MemorySlot = struct {
+    fenced_content: []const u8,
+    stats: SelectionStats,
+};
+
 /// Truncate a UTF-8 slice to at most `max_len` bytes without splitting
 /// a multi-byte sequence. Backs up over trailing continuation bytes (0x80..0xBF).
 fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
@@ -765,6 +774,51 @@ pub fn enrichMessageWithRuntimeDetailed(
     defer allocator.free(result.context);
     return .{
         .text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.context, user_message }),
+        .stats = result.stats,
+    };
+}
+
+/// Load memory context for the current turn as a fenced payload for the
+/// volatile system block. This is the context-v2 replacement for
+/// enrichMessageWithRuntimeDetailed: instead of prepending memory into the
+/// user message (which broke byte-stability across turns), we return the
+/// memory as a self-contained fenced block that the caller places in
+/// PromptContext.memory_slot. The user message remains untouched.
+///
+/// Returns `fenced_content = ""` when no memory is available for this turn.
+/// Otherwise returns `<memory_for_turn>…retrieval payload…</memory_for_turn>`
+/// with a trailing newline.
+///
+/// Preserves all existing retrieval semantics via loadContext* — only the
+/// packaging changes.
+pub fn loadTurnMemorySlot(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    mem_rt: ?*MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+) !MemorySlot {
+    const result = if (mem_rt) |rt|
+        try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id)
+    else
+        try loadContextDetailed(allocator, mem, user_message, session_id);
+
+    if (result.context.len == 0) {
+        allocator.free(result.context);
+        return .{
+            .fenced_content = try allocator.dupe(u8, ""),
+            .stats = result.stats,
+        };
+    }
+
+    defer allocator.free(result.context);
+    const fenced = try std.fmt.allocPrint(
+        allocator,
+        "<memory_for_turn>\n{s}</memory_for_turn>\n",
+        .{result.context},
+    );
+    return .{
+        .fenced_content = fenced,
         .stats = result.stats,
     };
 }

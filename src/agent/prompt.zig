@@ -235,6 +235,11 @@ pub const PromptContext = struct {
     capabilities_section: ?[]const u8 = null,
     conversation_context: ?ConversationContext = null,
     sections: PromptSections = .{},
+    /// Retrieved-memory payload for the volatile system block, fenced as
+    /// `<memory_for_turn>...</memory_for_turn>`. Pre-formatted by
+    /// memory_loader.loadTurnMemorySlot. Omitted from the stable block to
+    /// preserve byte-identical caching of the stable prefix across turns.
+    memory_slot: ?[]const u8 = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -290,8 +295,16 @@ pub fn workspacePromptFingerprint(
     return hasher.final();
 }
 
-/// Build the full system prompt from workspace identity files, tools, and runtime context.
-pub fn buildSystemPrompt(
+/// Build the STABLE portion of the system prompt — deterministic, byte-identical
+/// across turns of the same session (assuming workspace files, tools, persona,
+/// and skills are unchanged). This is the prefix that every cache-capable
+/// provider backend will hit (Anthropic `cache_control: ephemeral`, Together/
+/// vLLM byte-prefix KV cache, OpenAI automatic prefix cache, etc.).
+///
+/// MUST NOT include: timestamps, session state, conversation context, retrieved
+/// memory, or any content that varies per turn. Those belong in the volatile
+/// block (see buildVolatileSystemPrompt).
+pub fn buildStableSystemPrompt(
     allocator: std.mem.Allocator,
     ctx: PromptContext,
 ) ![]const u8 {
@@ -312,9 +325,6 @@ pub fn buildSystemPrompt(
 
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
-
-    // Conversation context section (Signal-specific for now)
-    try buildConversationContextSection(w, ctx.conversation_context);
 
     if (ctx.capabilities_section) |section| {
         try w.writeAll(section);
@@ -352,11 +362,76 @@ pub fn buildSystemPrompt(
     // Workspace section
     try buildWorkspaceSection(w, ctx.workspace_dir);
 
-    // DateTime section
+    // Runtime section (model name is stable within a session)
+    try buildRuntimeSection(w, ctx.model_name);
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Build the VOLATILE portion of the system prompt — per-turn dynamic content
+/// (current datetime, ConversationContext, retrieved memory). This block is
+/// appended AFTER the stable block in the provider request. It is intentionally
+/// rebuilt every turn and is NOT cache-targeted — its bytes WILL differ from
+/// turn to turn, which is fine because it lives after the cached prefix.
+///
+/// Keep this small (target < 2000 tokens) so that cache savings from the
+/// stable block dominate. Memory, if present in ctx.memory_slot, is the
+/// largest contributor and comes from memory_loader.loadTurnMemorySlot.
+pub fn buildVolatileSystemPrompt(
+    allocator: std.mem.Allocator,
+    ctx: PromptContext,
+) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    // Conversation context (channel, sender, idle_gap, last_interaction timestamp).
+    // Per-session-state, but treated as volatile here because it may change
+    // mid-session when users switch channels or after long idle gaps.
+    try buildConversationContextSection(w, ctx.conversation_context);
+
+    // DateTime section — current UTC time. Always changes turn-to-turn.
     try appendDateTimeSection(allocator, w, ctx.workspace_dir);
 
-    // Runtime section
-    try buildRuntimeSection(w, ctx.model_name);
+    // Retrieved-memory payload for this turn, if any. Pre-fenced by
+    // memory_loader.loadTurnMemorySlot. Empty string means no memory this turn.
+    if (ctx.memory_slot) |slot| {
+        if (slot.len > 0) {
+            try w.writeAll(slot);
+            if (slot[slot.len - 1] != '\n') try w.writeAll("\n");
+            try w.writeAll("\n");
+        }
+    }
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Build the full system prompt by concatenating stable + volatile blocks.
+/// Stable bytes come FIRST so provider byte-prefix caches (vLLM, OpenAI
+/// automatic prefix cache) hit on the stable section naturally. Providers
+/// with explicit cache_control (Anthropic) should instead call
+/// buildStableSystemPrompt and buildVolatileSystemPrompt separately and
+/// emit them as a two-block system array with cache_control on the first.
+pub fn buildSystemPrompt(
+    allocator: std.mem.Allocator,
+    ctx: PromptContext,
+) ![]const u8 {
+    const stable = try buildStableSystemPrompt(allocator, ctx);
+    errdefer allocator.free(stable);
+
+    const volatile_part = try buildVolatileSystemPrompt(allocator, ctx);
+    defer allocator.free(volatile_part);
+
+    if (volatile_part.len == 0) return stable;
+
+    // Concatenate with a blank line separator. Stable always first.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.ensureTotalCapacityPrecise(allocator, stable.len + 1 + volatile_part.len);
+    try buf.appendSlice(allocator, stable);
+    if (stable.len == 0 or stable[stable.len - 1] != '\n') try buf.append(allocator, '\n');
+    try buf.appendSlice(allocator, volatile_part);
+    allocator.free(stable);
 
     return try buf.toOwnedSlice(allocator);
 }

@@ -776,11 +776,14 @@ pub const Agent = struct {
     }
 
     fn providerMessageForOwned(self: *const Agent, msg: *const OwnedMessage) ChatMessage {
-        if (msg.role == .user and self.isCurrentTurnRawUser(msg.content)) {
-            if (self.current_turn_enriched_user) |enriched| {
-                return .{ .role = msg.role, .content = enriched };
-            }
-        }
+        // Context v2: no more raw→enriched substitution. Memory lives in the
+        // volatile portion of the system prompt (PromptContext.memory_slot),
+        // not prepended to the user message. History holds raw user bytes
+        // and we emit them as-is to keep byte-stability across turns for
+        // provider KV-cache hits. The isCurrentTurnRawUser check is retained
+        // only because other call sites still use it; it now always returns
+        // the raw form.
+        _ = self;
         return msg.toChatMessage();
     }
 
@@ -2164,10 +2167,46 @@ pub const Agent = struct {
             .workspace_dir = self.workspace_dir,
         });
 
-        // Inject system prompt on first turn (or when tracked workspace files changed).
-        const prompt_refresh_plan = context_builder.buildPromptRefreshPlan(self);
+        // Context v2: memory is now part of the volatile system block instead
+        // of being prepended to the user message. Load it first so we can
+        // include it in the system prompt rebuild below.
+        const enrich_start_ms = std.time.milliTimestamp();
+        const memory_slot_result = if (self.mem) |mem|
+            memory_loader.loadTurnMemorySlot(self.allocator, mem, self.mem_rt, user_message, self.memory_session_id) catch |err| blk: {
+                log.warn("memory.enrichment_failed error={s} — proceeding without memory slot", .{@errorName(err)});
+                break :blk memory_loader.MemorySlot{
+                    .fenced_content = try self.allocator.dupe(u8, ""),
+                    .stats = .{},
+                };
+            }
+        else
+            memory_loader.MemorySlot{
+                .fenced_content = try self.allocator.dupe(u8, ""),
+                .stats = .{},
+            };
+        defer self.allocator.free(memory_slot_result.fenced_content);
+        const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
+        turn_memory_enrich_ms = enrich_duration_ms;
+        log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
+        const memory_stage_event = ObserverEvent{ .turn_stage = .{
+            .stage = "memory_enrich",
+            .duration_ms = enrich_duration_ms,
+            .run_id = self.current_run_id,
+        } };
+        self.observer.recordEvent(&memory_stage_event);
 
-        if (prompt_refresh_plan.should_refresh_system_prompt) {
+        // Build prompt refresh plan for diagnostics + last_turn_context.
+        // In context v2 we always rebuild the system prompt (volatile block
+        // changes per turn — datetime, conversation context, memory). The
+        // refresh plan no longer gates rebuild; it only feeds stats.
+        const prompt_refresh_plan = context_builder.buildPromptRefreshPlan(self);
+        self.last_turn_context = context_builder.buildLastTurnContext(
+            prompt_refresh_plan,
+            memory_slot_result.stats,
+            enrich_duration_ms,
+        );
+
+        {
             var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
             defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
             const cfg_for_caps_ptr: ?*const Config = if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded else null;
@@ -2191,23 +2230,53 @@ pub const Agent = struct {
                 .twin_mode = p.twin_mode,
             } else null;
 
-            const system_prompt = try prompt.buildSystemPrompt(self.allocator, .{
+            // Context v2: build stable + volatile separately so tool instructions
+            // can sit in the STABLE half (byte-identical across turns) rather than
+            // after the volatile block. This preserves byte-prefix cache stability
+            // on Together/vLLM and enables future Anthropic two-block emission.
+            const prompt_ctx = prompt.PromptContext{
                 .workspace_dir = self.workspace_dir,
                 .model_name = self.model_name,
                 .tools = self.tools,
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .sections = .{ .persona = persona_section },
-            });
-            defer self.allocator.free(system_prompt);
+                .memory_slot = if (memory_slot_result.fenced_content.len > 0) memory_slot_result.fenced_content else null,
+            };
 
-            // Append tool instructions
+            const stable_prompt = try prompt.buildStableSystemPrompt(self.allocator, prompt_ctx);
+            defer self.allocator.free(stable_prompt);
+
             const tool_instructions = try dispatcher.buildToolInstructions(self.allocator, self.tools);
             defer self.allocator.free(tool_instructions);
 
-            const full_system = try self.allocator.alloc(u8, system_prompt.len + tool_instructions.len);
-            @memcpy(full_system[0..system_prompt.len], system_prompt);
-            @memcpy(full_system[system_prompt.len..], tool_instructions);
+            const volatile_prompt = try prompt.buildVolatileSystemPrompt(self.allocator, prompt_ctx);
+            defer self.allocator.free(volatile_prompt);
+
+            // Layout: [stable][tool_instructions][volatile]
+            // stable + tool_instructions = byte-stable prefix (cached by provider KV).
+            // volatile = dynamic tail (datetime / conversation context / memory).
+            const stable_prefix_len = stable_prompt.len + tool_instructions.len;
+            const full_system = try self.allocator.alloc(u8, stable_prefix_len + volatile_prompt.len);
+            @memcpy(full_system[0..stable_prompt.len], stable_prompt);
+            @memcpy(full_system[stable_prompt.len..stable_prefix_len], tool_instructions);
+            @memcpy(full_system[stable_prefix_len..], volatile_prompt);
+
+            // Byte-stability diagnostic: log a hash of the stable prefix so
+            // operators can confirm byte-identical prefix across turns of the
+            // same session. Gated by NULLALIS_LOG_PREFIX_HASH=1 to keep noise
+            // out of prod logs.
+            if (std.process.getEnvVarOwned(self.allocator, "NULLALIS_LOG_PREFIX_HASH")) |env_value| {
+                defer self.allocator.free(env_value);
+                if (env_value.len > 0 and env_value[0] != '0') {
+                    const stable_hash = std.hash.Fnv1a_64.hash(full_system[0..stable_prefix_len]);
+                    log.info("prefix.stable hash={x} bytes={d} session={s}", .{
+                        stable_hash,
+                        stable_prefix_len,
+                        self.memory_session_id orelse "none",
+                    });
+                }
+            } else |_| {}
 
             // Keep exactly one canonical system prompt at history[0].
             // This allows /model to invalidate and refresh the prompt in place.
@@ -2254,43 +2323,12 @@ pub const Agent = struct {
             }
         }
 
-        // Enrich message with memory context for the current provider-facing turn only.
-        // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
-        const enrich_start_ms = std.time.milliTimestamp();
-        const enrichment = if (self.mem) |mem|
-            // Graceful degradation: if memory enrichment fails (backend error,
-            // connectivity issue), proceed with the raw user message rather
-            // than killing the entire turn. Memory is an enhancement, not a
-            // prerequisite for conversation.
-            memory_loader.enrichMessageWithRuntimeDetailed(self.allocator, mem, self.mem_rt, user_message, self.memory_session_id) catch |err| blk: {
-                log.warn("memory.enrichment_failed error={s} — proceeding with raw message", .{@errorName(err)});
-                break :blk memory_loader.EnrichmentResult{
-                    .text = try self.allocator.dupe(u8, user_message),
-                    .stats = .{},
-                };
-            }
-        else
-            memory_loader.EnrichmentResult{
-                .text = try self.allocator.dupe(u8, user_message),
-                .stats = .{},
-            };
-        const enriched = enrichment.text;
-        const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
-        turn_memory_enrich_ms = enrich_duration_ms;
-        self.last_turn_context = context_builder.buildLastTurnContext(
-            prompt_refresh_plan,
-            enrichment.stats,
-            enrich_duration_ms,
-        );
-        log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
-        const memory_stage_event = ObserverEvent{ .turn_stage = .{
-            .stage = "memory_enrich",
-            .duration_ms = enrich_duration_ms,
-            .run_id = self.current_run_id,
-        } };
-        self.observer.recordEvent(&memory_stage_event);
-        self.current_turn_enriched_user = enriched;
-        errdefer self.clearCurrentTurnProviderOverride();
+        // Context v2: memory enrichment happens BEFORE system prompt rebuild
+        // (see above). User message is no longer wrapped with memory context —
+        // the raw user message goes directly into history, and memory lives in
+        // the volatile portion of the system prompt via PromptContext.memory_slot.
+        // Byte-stable user messages + byte-stable stable system prefix = cache hits
+        // across turns on any KV-cache-capable backend.
 
         // NOTE: Narration frames flow only through the Observer event bus.
         // They must NEVER be appended to self.history — see narration.zig.
@@ -4538,7 +4576,7 @@ test "Agent buildProviderMessages allows workspace image paths" {
     try std.testing.expect(has_image_part);
 }
 
-test "Agent provider messages use current turn enrichment while history stays raw" {
+test "Agent provider messages emit raw user content (context v2, no enrichment substitution)" {
     const allocator = std.testing.allocator;
     var noop = observability.NoopObserver{};
     var agent = Agent{
@@ -4567,7 +4605,9 @@ test "Agent provider messages use current turn enrichment while history stays ra
         .content = raw,
     });
     agent.current_turn_raw_user = raw;
-    agent.current_turn_enriched_user = try allocator.dupe(u8, "[Memory context]\nraw user text");
+    // Context v2: current_turn_enriched_user is never set. Memory lives in the
+    // volatile portion of the system prompt via PromptContext.memory_slot, not
+    // prepended to the user message. Provider emissions must equal raw history.
 
     var arena_impl = std.heap.ArenaAllocator.init(allocator);
     defer arena_impl.deinit();
@@ -4575,13 +4615,13 @@ test "Agent provider messages use current turn enrichment while history stays ra
 
     const provider_messages = try agent.buildProviderMessages(arena);
     try std.testing.expectEqual(@as(usize, 1), provider_messages.len);
-    try std.testing.expectEqualStrings("[Memory context]\nraw user text", provider_messages[0].content);
+    try std.testing.expectEqualStrings("raw user text", provider_messages[0].content);
     try std.testing.expectEqualStrings("raw user text", agent.history.items[0].content);
 
     const flat_messages = try agent.buildMessageSlice();
     defer allocator.free(flat_messages);
     try std.testing.expectEqual(@as(usize, 1), flat_messages.len);
-    try std.testing.expectEqualStrings("[Memory context]\nraw user text", flat_messages[0].content);
+    try std.testing.expectEqualStrings("raw user text", flat_messages[0].content);
 }
 
 test "Agent max_tool_iterations default" {
