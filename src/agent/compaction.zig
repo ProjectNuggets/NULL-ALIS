@@ -8,8 +8,10 @@ const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
+const memory_mod = @import("../memory/root.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
+const Memory = memory_mod.Memory;
 
 const Agent = @import("root.zig").Agent;
 const OwnedMessage = Agent.OwnedMessage;
@@ -61,6 +63,13 @@ pub const CompactionConfig = struct {
     message_timeout_secs: u64 = 0,
     max_history_messages: u32 = 50,
     workspace_dir: ?[]const u8 = null,
+    // iter29: when both are set, Pass C and force-compress persist their
+    // output artifacts (emergency summary, dropped messages) to the memory
+    // backend so the agent can recall them via memory_timeline/memory_recall
+    // after the fact. Without these, compaction products evaporate with
+    // the session.
+    archive_memory: ?Memory = null,
+    archive_session_id: ?[]const u8 = null,
 };
 
 pub const TokenBudgetPolicy = struct {
@@ -349,6 +358,18 @@ fn compactHistoryKeepingRecent(
     // Create the compaction summary message
     const summary_content = try std.fmt.allocPrint(allocator, "[Compaction summary]\n{s}", .{summary_with_context});
 
+    // iter29: archive the emergency summary as a durable continuity artifact.
+    // Key shape: compaction_summary/{session}/{ts}. Retrievable by the agent
+    // via memory_timeline (warm) or transcript_read fallback (cold). Without
+    // this, the summary evaporates when the session ends.
+    if (config.archive_memory) |mem| {
+        if (config.archive_session_id) |session_id| {
+            archiveCompactionSummary(allocator, mem, session_id, summary_with_context, compact_count) catch |err| {
+                log.warn("compaction: failed to archive Pass C summary: {}", .{err});
+            };
+        }
+    }
+
     // Free old messages being compacted
     for (history.items[start..compact_end]) |*msg| {
         msg.deinit(allocator);
@@ -456,13 +477,46 @@ fn archiveDroppedMessages(
         }) catch break;
     }
 
+    // iter29: key shape changed from `compaction_archive/{ts}` to
+    // `compaction_dropped/{session}/{ts}` so agents can scope retrieval to
+    // a session via memory_timeline. Falls back to session-less key when
+    // session_id is unavailable (preserves old behavior as the off-path).
     const ts: u128 = @bitCast(std.time.nanoTimestamp());
-    const key = std.fmt.allocPrint(allocator, "compaction_archive/{d}", .{ts}) catch return;
+    const key = if (session_id) |sid|
+        std.fmt.allocPrint(allocator, "compaction_dropped/{s}/{d}", .{ sid, ts }) catch return
+    else
+        std.fmt.allocPrint(allocator, "compaction_dropped/{d}", .{ts}) catch return;
     defer allocator.free(key);
 
     mem.store(key, buf.items, .conversation, session_id) catch |err| {
         log.warn("compaction: failed to archive dropped messages: {}", .{err});
     };
+}
+
+/// iter29: archive the Pass C emergency summary to memory so it becomes a
+/// recallable continuity artifact. Key shape: `compaction_summary/{session}/{ts}`.
+/// Category=.daily so memory_timeline lists it alongside lifecycle summaries.
+fn archiveCompactionSummary(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    session_id: []const u8,
+    summary_body: []const u8,
+    compacted_message_count: usize,
+) !void {
+    const ts: u128 = @bitCast(std.time.nanoTimestamp());
+    const key = try std.fmt.allocPrint(allocator, "compaction_summary/{s}/{d}", .{ session_id, ts });
+    defer allocator.free(key);
+
+    // Prefix metadata so downstream timeline/recall tools recognize the
+    // provenance. Format mirrors summary_latest's metadata block.
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "type=compaction_summary\nsession={s}\nat={d}\ntrigger=autoCompactHistory:passC\nmessages_compacted={d}\n\n{s}",
+        .{ session_id, ts, compacted_message_count, summary_body },
+    );
+    defer allocator.free(payload);
+
+    try mem.store(key, payload, .daily, session_id);
 }
 
 /// Trim history to prevent unbounded growth.

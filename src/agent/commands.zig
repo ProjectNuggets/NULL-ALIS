@@ -1239,6 +1239,23 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                 .fallback => "fallback",
             },
         });
+        // iter29: write a fallback-quality artifact so the partial content is
+        // still retrievable. Blocking promotion to summary_latest prevents
+        // low-quality content from shadowing canonical recall, but silently
+        // dropping it makes the turn invisible to future retrieval. The
+        // summary_fallback/ namespace is discoverable via memory_timeline
+        // with a quality flag in the metadata.
+        const fallback_key = std.fmt.allocPrint(
+            self.allocator,
+            "summary_fallback/{s}/{d}",
+            .{ session_id, now_s },
+        ) catch null;
+        if (fallback_key) |fk| {
+            defer self.allocator.free(fk);
+            if (mem.store(fk, latest_content, .daily, session_id)) |_| {
+                if (rt) |mem_rt| _ = mem_rt.syncVectorAfterStore(self.allocator, fk, latest_content);
+            } else |_| {}
+        }
     }
 
     updateTimelineIndex(self.allocator, mem, rt, session_id, now_iso, focus, timeline_key, summary_origin);

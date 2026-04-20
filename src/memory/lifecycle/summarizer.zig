@@ -138,6 +138,10 @@ pub fn buildSummarizationPrompt(
             "decisions:\n- <decision or none>\n" ++
             "open_loops:\n- <open loop or none>\n" ++
             "next:\n- <next likely action or none>\n" ++
+            "tools_used:\n- <tool_name: short arg summary>  (omit if no tools called)\n" ++
+            "files_touched:\n- <absolute path or repo-relative path>  (omit if no file I/O)\n" ++
+            "attachments:\n- <brief description of any image/PDF/file sent>  (omit if none)\n" ++
+            "approvals:\n- <user approved/rejected X>  (omit if no explicit approval events)\n" ++
             "Key fact: <long-lived fact if any>\n" ++
             "Key fact: <another long-lived fact if any>\n" ++
             "Keep it concise. Do not include timestamps, counts, metadata, or raw checkpoint labels.\n" ++

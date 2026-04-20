@@ -723,6 +723,10 @@ pub const Agent = struct {
             .message_timeout_secs = self.message_timeout_secs,
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
+            // iter29: let Pass C persist its emergency summary as a durable
+            // artifact via memory_timeline/memory_recall.
+            .archive_memory = self.mem,
+            .archive_session_id = self.memory_session_id,
         };
 
         // iter22 (Nova's Medium finding): measure thrash savings in TOKENS,
