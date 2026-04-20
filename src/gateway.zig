@@ -1433,6 +1433,12 @@ const TenantRuntime = struct {
             runtime.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(runtime.tools, rt);
         }
+        // iter27: wire SessionStore for transcript_read. Tenant PG store wins;
+        // falls back to mem_rt.session_store for standalone.
+        tools_mod.bindSessionStore(
+            runtime.tools,
+            if (runtime.pg_session_store) |store| store.sessionStore() else if (runtime.mem_rt) |rt| rt.session_store else null,
+        );
         if (runtime.subagent_manager) |mgr| {
             mgr.attachTaskDelivery(runtime.task_delivery);
             if (runtime.completion_router) |router| {
@@ -14183,6 +14189,8 @@ pub fn runWithRole(
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
                 }
+                // iter27: transcript_read SessionStore binding (standalone gateway)
+                tools_mod.bindSessionStore(tools_slice, if (mem_rt) |rt| rt.session_store else null);
                 session_mgr_opt = sm;
                 if (subagent_manager_opt) |mgr| {
                     if (standalone_task_delivery) |*td| {

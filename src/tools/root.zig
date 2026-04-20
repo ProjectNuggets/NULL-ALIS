@@ -66,6 +66,7 @@ pub const memory_edit = @import("memory_edit.zig");
 pub const memory_recall = @import("memory_recall.zig");
 pub const memory_list = @import("memory_list.zig");
 pub const memory_timeline = @import("memory_timeline.zig");
+pub const transcript_read = @import("transcript_read.zig");
 pub const memory_forget = @import("memory_forget.zig");
 pub const memory_purge_topic = @import("memory_purge_topic.zig");
 pub const schedule = @import("schedule.zig");
@@ -261,6 +262,11 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         .name = memory_timeline.MemoryTimelineTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    .{
+        .name = transcript_read.TranscriptReadTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
     },
@@ -729,6 +735,10 @@ pub fn allTools(
     const mtt = try allocator.create(memory_timeline.MemoryTimelineTool);
     mtt.* = .{};
     try list.append(allocator, mtt.tool());
+
+    const trt = try allocator.create(transcript_read.TranscriptReadTool);
+    trt.* = .{};
+    try list.append(allocator, trt.tool());
 
     const mft = try allocator.create(memory_forget.MemoryForgetTool);
     mft.* = .{};
@@ -1301,6 +1311,23 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
         } else if (t.vtable == &memory_purge_topic.MemoryPurgeTopicTool.vtable) {
             const mt: *memory_purge_topic.MemoryPurgeTopicTool = @ptrCast(@alignCast(t.ptr));
             mt.mem_rt = mem_rt;
+        } else if (t.vtable == &transcript_read.TranscriptReadTool.vtable) {
+            const trt: *transcript_read.TranscriptReadTool = @ptrCast(@alignCast(t.ptr));
+            trt.session_store = if (mem_rt) |rt| rt.session_store else null;
+        }
+    }
+}
+
+/// Bind a SessionStore to tools that need raw-transcript access (currently:
+/// transcript_read). In tenant/per-user deployments the canonical session
+/// store is the per-user PG store (zaki_state.UserSessionStore); in
+/// standalone deployments it's mem_rt.session_store. Callers can use either
+/// source — this setter accepts the already-resolved SessionStore.
+pub fn bindSessionStore(tools: []const Tool, store: ?memory_mod.SessionStore) void {
+    for (tools) |t| {
+        if (t.vtable == &transcript_read.TranscriptReadTool.vtable) {
+            const trt: *transcript_read.TranscriptReadTool = @ptrCast(@alignCast(t.ptr));
+            trt.session_store = store;
         }
     }
 }
@@ -1712,8 +1739,8 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 29 (adds memory_purge_topic) + http_request + web_fetch + web_search + browser = 33
-    try std.testing.expectEqual(@as(usize, 33), tools.len);
+    // base 30 (adds memory_purge_topic + transcript_read) + http_request + web_fetch + web_search + browser = 34
+    try std.testing.expectEqual(@as(usize, 34), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -1726,10 +1753,10 @@ test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
     defer deinitTools(std.testing.allocator, tools);
     // shell + file_read + file_write + file_edit + file_append + git + image_info
-    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + memory_forget + memory_purge_topic + delegate + schedule
+    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + delegate + schedule
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + spawn + message + set_execution_mode + context_snapshot = 29
-    try std.testing.expectEqual(@as(usize, 29), tools.len);
+    // + runtime_info + skill_registry + spawn + message + set_execution_mode + context_snapshot = 30
+    try std.testing.expectEqual(@as(usize, 30), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -1855,7 +1882,7 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    try std.testing.expectEqual(@as(usize, 29), tools.len);
+    try std.testing.expectEqual(@as(usize, 30), tools.len);
 
     var found_message = false;
     for (tools) |t| {
@@ -2060,9 +2087,9 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
     const registry = defaultMetadataRegistry();
     const background_safe_names = [_][]const u8{
         "runtime_info",    "file_read",      "memory_recall",
-        "memory_list",     "memory_timeline", "web_fetch",
-        "web_search",      "task_list",      "task_get",
-        "set_execution_mode", "context_snapshot",
+        "memory_list",     "memory_timeline", "transcript_read",
+        "web_fetch",       "web_search",     "task_list",
+        "task_get",        "set_execution_mode", "context_snapshot",
     };
 
     // Everything in the whitelist must be background_safe.

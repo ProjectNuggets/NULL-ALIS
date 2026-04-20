@@ -429,6 +429,8 @@ pub const ChannelRuntime = struct {
         if (self.mem_rt) |*rt| {
             self.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(tools, rt);
+            // iter27: transcript_read SessionStore binding
+            tools_mod.bindSessionStore(tools, rt.session_store);
             // Wire audit trail into shell tool
             tools_mod.bindAuditMemory(tools, rt.memory, null);
         }

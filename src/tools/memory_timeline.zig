@@ -11,7 +11,7 @@ pub const MemoryTimelineTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_timeline";
-    pub const tool_description = "Browse or search session summaries and timeline continuity objects without raw transcript recall.";
+    pub const tool_description = "Browse or search session summaries and timeline continuity objects. This is the FIRST line of session recall — cheap, structured, and usually sufficient. If a summary lacks the exact detail you need (verbatim phrasing, precise tool arguments, content that was placeholder-truncated during compaction), fall back to `transcript_read` for raw message access.";
     pub const tool_params =
         \\{"type":"object","properties":{"session_id":{"type":"string","description":"Optional exact session lane to inspect"},"channel":{"type":"string","description":"Optional channel filter (app, telegram, discord, slack, etc.)"},"date_from":{"type":"string","description":"Optional lower date bound in YYYY-MM-DD"},"date_to":{"type":"string","description":"Optional upper date bound in YYYY-MM-DD"},"query":{"type":"string","description":"Optional case-insensitive substring match over summary content only"},"limit":{"type":"integer","description":"Max summaries to return (default: 5, max: 20)"}}}
     ;

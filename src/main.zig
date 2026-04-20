@@ -2792,6 +2792,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     if (mem_rt) |*rt| {
         yc.tools.bindMemoryRuntime(tools, rt);
     }
+    // iter27: transcript_read SessionStore binding (standalone path)
+    yc.tools.bindSessionStore(tools, if (mem_rt) |rt| rt.session_store else null);
 
     // Create provider with reliability wrapper (retry + fallback chains).
     var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config);
@@ -3111,6 +3113,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     if (mem_rt) |*rt| {
         yc.tools.bindMemoryRuntime(tools, rt);
     }
+    // iter27: transcript_read SessionStore binding
+    yc.tools.bindSessionStore(tools, if (mem_rt) |rt| rt.session_store else null);
 
     // Create noop observer
     var noop_obs = yc.observability.NoopObserver{};

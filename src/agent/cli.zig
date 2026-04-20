@@ -162,6 +162,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (mem_rt) |*rt| {
         tools_mod.bindMemoryRuntime(tools, rt);
     }
+    // iter27: transcript_read SessionStore binding
+    tools_mod.bindSessionStore(tools, if (mem_rt) |rt| rt.session_store else null);
 
     // Provider interface from runtime bundle (includes retries/fallbacks).
     const provider_i: Provider = runtime_provider.provider();
