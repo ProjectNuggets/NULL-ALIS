@@ -157,11 +157,12 @@ pub fn autoCompactHistory(
         pressure_pct,
     });
 
-    // Context v2 "real-work" thresholds (iter20): 70 / 80 / 90 — lets the agent
-    // use the bulk of the model's context window before trimming, matching
-    // Hermes-style "fill, then compress" rather than the old 60/75/85 "keep
-    // small" discipline inherited from the edge-device-targeted nullclaw era.
-    // For Kimi K2.5 (262K window): Pass A ~183K, Pass B ~210K, Pass C ~236K.
+    // iter28: two-tier hot-path compaction. Pass B (LLM-driven structured
+    // extraction at 80%) was deleted — it duplicated work the post-reply
+    // lifecycle summarizer already does, and made a second provider call
+    // in-turn that was redundant with Pass C.
+    //
+    // For Kimi K2.5 (262K window): Pass A ~183K, Pass C ~236K.
 
     // ── Pass A: Cheap dedup + placeholder substitution at 70% ──
     const cheap_threshold = (config.token_limit * 70) / 100;
@@ -169,14 +170,6 @@ pub fn autoCompactHistory(
         log.info("compaction.auto: pass=A firing (cheap dedup + placeholder)", .{});
         const reduced = cheapCompactionPass(allocator, history, config.keep_recent);
         if (reduced) compacted = true;
-    }
-
-    // ── Pass B: Structured extraction at 80% ──
-    const structured_threshold = (config.token_limit * 80) / 100;
-    if (tokenEstimate(history.items) > structured_threshold) {
-        log.info("compaction.auto: pass=B firing (structured extraction)", .{});
-        const extracted = structuredExtractionPass(allocator, history, provider, model_name, config) catch false;
-        if (extracted) compacted = true;
     }
 
     // ── Pass C: Full LLM summarization at 90% ──
@@ -255,101 +248,6 @@ fn cheapCompactionPass(
         log.info("compaction: cheap pass reduced old tool outputs (placeholder substitution + dedup)", .{});
     }
     return reduced;
-}
-
-/// Pass B: Structured extraction — uses the sidecar/provider to extract key state
-/// from older messages into a compact structured summary. Cheaper than full
-/// summarization because the input is shorter (middle messages only, ~2k tokens)
-/// and the output is structured bullets (~500 tokens).
-///
-/// Replaces middle messages (between system and keep_recent boundary) with the
-/// structured extraction. Falls back to no-op if the LLM call fails.
-fn structuredExtractionPass(
-    allocator: std.mem.Allocator,
-    history: *std.ArrayListUnmanaged(OwnedMessage),
-    provider: Provider,
-    model_name: []const u8,
-    config: CompactionConfig,
-) !bool {
-    const has_system = history.items.len > 0 and history.items[0].role == .system;
-    const start: usize = if (has_system) 1 else 0;
-    const non_system_count = history.items.len - start;
-    const keep_recent: usize = @min(non_system_count, config.keep_recent);
-    if (non_system_count <= keep_recent + 2) return false; // not enough to extract from
-
-    const extract_end = start + (non_system_count - keep_recent);
-
-    // Build a compact transcript of the middle messages for extraction
-    const transcript = try buildCompactionTranscript(allocator, history.items, start, extract_end, 8_000);
-    defer allocator.free(transcript);
-    if (transcript.len < 100) return false; // too short to bother
-
-    const extraction_system =
-        "You are a state extraction engine. Given a conversation transcript, extract: " ++
-        "(1) Key decisions made, (2) Files or resources modified, (3) Current task status, " ++
-        "(4) Unresolved items or open questions. Output as concise bullet points only. " ++
-        "No prose, no headers. Max 15 bullets.";
-    const extraction_user = std.fmt.allocPrint(
-        allocator,
-        "Extract key state from this conversation:\n\n{s}",
-        .{transcript},
-    ) catch return false;
-    defer allocator.free(extraction_user);
-
-    var messages: [2]providers.ChatMessage = .{
-        .{ .role = .system, .content = extraction_system },
-        .{ .role = .user, .content = extraction_user },
-    };
-
-    const resp = provider.chat(
-        allocator,
-        .{
-            .messages = &messages,
-            .model = model_name,
-            .temperature = 0.2,
-            .tools = null,
-            .timeout_secs = config.message_timeout_secs,
-        },
-        model_name,
-        0.2,
-    ) catch |err| {
-        log.warn("compaction: structured extraction failed ({}) — skipping pass B", .{err});
-        return false;
-    };
-    defer {
-        if (resp.content) |c| if (c.len > 0) allocator.free(c);
-        if (resp.model.len > 0) allocator.free(resp.model);
-        if (resp.reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
-    }
-
-    const extraction = resp.contentOrEmpty();
-    if (extraction.len < 20) return false; // extraction too short, skip
-
-    // Replace the middle messages with the structured extraction
-    const extraction_content = std.fmt.allocPrint(
-        allocator,
-        "[Structured context extraction]\n{s}",
-        .{extraction},
-    ) catch return false;
-
-    for (history.items[start..extract_end]) |*msg| {
-        msg.deinit(allocator);
-    }
-    history.items[start] = .{
-        .role = .assistant,
-        .content = extraction_content,
-    };
-    if (extract_end > start + 1) {
-        const src = history.items[extract_end..];
-        std.mem.copyForwards(OwnedMessage, history.items[start + 1 ..], src);
-        history.items.len -= (extract_end - start - 1);
-    }
-
-    log.info("compaction: structured extraction replaced {d} messages with {d}-char state summary", .{
-        extract_end - start,
-        extraction_content.len,
-    });
-    return true;
 }
 
 /// Manual compaction for explicit operator boundaries.
