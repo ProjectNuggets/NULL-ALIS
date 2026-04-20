@@ -199,11 +199,11 @@ pub const ProductPresetsConfig = struct {
     fast: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            // max_history_messages: safety valve for API payload size.
-            // Token-based compaction handles context quality. This cap prevents
-            // HTTP timeouts from 300+ message objects in a single API call.
-            // Context is preserved via compaction summaries before trim.
-            .max_history_messages = 500,
+            // iter26: 0 = uncapped. Nova directive 2026-04-20 — all competitors
+            // (Claude Code, Hermes, OpenClaw) use pure token budgets. autoCompactHistory
+            // (70/80/90 token thresholds) owns compaction. Mechanism preserved but
+            // dormant.
+            .max_history_messages = 0,
             .queue_mode = "serial",
             .queue_cap = 8,
             .queue_drop = "summarize",
@@ -234,7 +234,7 @@ pub const ProductPresetsConfig = struct {
     balanced: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            .max_history_messages = 500,
+            .max_history_messages = 0,
             .queue_mode = "serial",
             .queue_cap = 12,
             .queue_drop = "summarize",
@@ -260,7 +260,7 @@ pub const ProductPresetsConfig = struct {
     deep: AssistantModePresetConfig = .{
         .agent = .{
             .compact_context = true,
-            .max_history_messages = 500,
+            .max_history_messages = 0,
             .queue_mode = "serial",
             .queue_cap = 20,
             .queue_drop = "summarize",
@@ -307,7 +307,8 @@ pub const SidecarConfig = struct {
 pub const AgentConfig = struct {
     compact_context: bool = false,
     max_tool_iterations: u32 = 25,
-    max_history_messages: u32 = 50,
+    // iter26: 0 = uncapped (pure token-based). See product_presets.
+    max_history_messages: u32 = 0,
     /// Execute independent tool calls concurrently. Default true for per-pod
     /// deployments where there is no shared scheduler contention. Set to false
     /// only if a tool has side effects that require strict serial ordering.

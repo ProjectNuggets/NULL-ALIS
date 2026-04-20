@@ -19654,7 +19654,7 @@ test "tenant preference application uses operator-owned assistant mode presets" 
     try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
     try std.testing.expectEqual(@as(u32, 20), cfg.agent.queue_cap);
     try std.testing.expectEqualStrings("summarize", cfg.agent.queue_drop);
-    try std.testing.expectEqual(@as(u32, 500), cfg.agent.max_history_messages);
+    try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);
     try std.testing.expectEqualStrings("always", cfg.agent.activation_mode);
     try std.testing.expectEqualStrings("off", cfg.agent.send_mode);
     try std.testing.expectEqualStrings("inbound", cfg.agent.tts_mode);

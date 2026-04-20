@@ -652,7 +652,7 @@ test "applySettingsToConfig enables fast summarizer without changing fast preset
     try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
     try std.testing.expectEqual(@as(u32, 8), cfg.agent.queue_cap);
     try std.testing.expectEqualStrings("summarize", cfg.agent.queue_drop);
-    try std.testing.expectEqual(@as(u32, 500), cfg.agent.max_history_messages);
+    try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);
     try std.testing.expect(cfg.memory.summarizer.enabled);
     try std.testing.expectEqual(@as(u32, 3000), cfg.memory.summarizer.window_size_tokens);
     try std.testing.expectEqual(@as(u32, 300), cfg.memory.summarizer.summary_max_tokens);
@@ -691,7 +691,7 @@ test "applySettingsToConfig deep mode applies high-quality settings" {
     try std.testing.expectEqual(@as(u32, 100), cfg.agent.max_tool_iterations);
     // max_response_tokens not applied — no hard cap
     try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
-    try std.testing.expectEqual(@as(u32, 500), cfg.agent.max_history_messages);
+    try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);
     try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
     try std.testing.expectEqual(@as(u32, 8000), cfg.memory.summarizer.window_size_tokens);
     // Per-mode model/provider selection

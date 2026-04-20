@@ -579,7 +579,12 @@ pub fn trimHistoryDetailed(
         .history_after = history.items.len,
     };
 
+    // iter26: max=0 means "disabled" (pure token-based, no message-count cap).
+    // Competitors (Claude Code, Hermes, OpenClaw) all use pure token budgets; we
+    // follow suit. The mechanism remains for future per-deployment opt-in but is
+    // inert by default — autoCompactHistory (70/80/90 token-budget) owns compaction.
     const max = max_history_messages;
+    if (max == 0) return stats;
     if (history.items.len <= max + 1) return stats; // +1 for system prompt
 
     const has_system = history.items.len > 0 and history.items[0].role == .system;
