@@ -175,17 +175,51 @@ pub const MemoryTimelineTool = struct {
                 }
             }
 
-            const prefix = try mem_root.timelineSummaryPrefixForSession(allocator, session_id);
-            defer allocator.free(prefix);
+            // iter29 follow-up: timeline now recognizes multiple continuity
+            // families, not just timeline_summary/. Agent can browse:
+            //   - timeline_summary/{session}/*      (canonical lifecycle summary)
+            //   - compaction_summary/{session}/*    (Pass C emergency summary)
+            //   - summary_fallback/{session}/*      (quality=fallback preserved)
+            //   - compaction_dropped/{session}/*    (force-compress archive)
+            const timeline_prefix = try mem_root.timelineSummaryPrefixForSession(allocator, session_id);
+            defer allocator.free(timeline_prefix);
+            const compaction_prefix = try std.fmt.allocPrint(allocator, "compaction_summary/{s}/", .{session_id});
+            defer allocator.free(compaction_prefix);
+            const fallback_prefix = try std.fmt.allocPrint(allocator, "summary_fallback/{s}/", .{session_id});
+            defer allocator.free(fallback_prefix);
+            const dropped_prefix = try std.fmt.allocPrint(allocator, "compaction_dropped/{s}/", .{session_id});
+            defer allocator.free(dropped_prefix);
+
             const entries = try mem.list(allocator, .daily, null);
             defer mem_root.freeEntries(allocator, entries);
+            const daily_conversation_entries = try mem.list(allocator, .conversation, null);
+            defer mem_root.freeEntries(allocator, daily_conversation_entries);
+
             var matches: std.ArrayListUnmanaged(mem_root.MemoryEntry) = .empty;
             defer {
                 for (matches.items) |*entry| entry.deinit(allocator);
                 matches.deinit(allocator);
             }
+
+            const familyMatches = struct {
+                fn check(key: []const u8, p_tl: []const u8, p_cs: []const u8, p_fb: []const u8, p_dr: []const u8) bool {
+                    return std.mem.startsWith(u8, key, p_tl) or
+                        std.mem.startsWith(u8, key, p_cs) or
+                        std.mem.startsWith(u8, key, p_fb) or
+                        std.mem.startsWith(u8, key, p_dr);
+                }
+            };
+
             for (entries) |entry| {
-                if (!std.mem.startsWith(u8, entry.key, prefix)) continue;
+                if (!familyMatches.check(entry.key, timeline_prefix, compaction_prefix, fallback_prefix, dropped_prefix)) continue;
+                if (latest_source_key) |source_key| {
+                    if (std.mem.eql(u8, entry.key, source_key)) continue;
+                }
+                if (!summaryMatchesFilters(entry.content, entry.key, entry.key, entry.timestamp, filters)) continue;
+                try matches.append(allocator, try cloneEntry(allocator, entry));
+            }
+            for (daily_conversation_entries) |entry| {
+                if (!familyMatches.check(entry.key, timeline_prefix, compaction_prefix, fallback_prefix, dropped_prefix)) continue;
                 if (latest_source_key) |source_key| {
                     if (std.mem.eql(u8, entry.key, source_key)) continue;
                 }
