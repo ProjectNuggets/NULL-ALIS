@@ -19,6 +19,7 @@ const config_types = @import("config_types.zig");
 const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
+const mcp_mod = @import("mcp.zig");
 const memory_mod = @import("memory/root.zig");
 const zaki_dual_memory = @import("memory/engines/zaki_dual.zig");
 const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
@@ -1345,7 +1346,7 @@ const TenantRuntime = struct {
         usage_rt.* = usage_runtime_mod.UsageRuntime.init(allocator);
         runtime.usage_rt = usage_rt;
 
-        runtime.tools = tools_mod.allTools(allocator, runtime.config.workspace_dir, .{
+        const builtin_tools = tools_mod.allTools(allocator, runtime.config.workspace_dir, .{
             .config = &runtime.config,
             .http_enabled = runtime.config.http_request.enabled,
             .browser_enabled = runtime.config.browser.enabled,
@@ -1362,6 +1363,39 @@ const TenantRuntime = struct {
             .subagent_manager = runtime.subagent_manager,
             .task_delivery = runtime.task_delivery,
         }) catch &.{};
+        errdefer if (builtin_tools.len > 0) tools_mod.deinitTools(allocator, builtin_tools);
+
+        // Init MCP tools from configured servers and append to the tenant's
+        // tool list. MCP servers run as long-lived subprocess(es) whose
+        // discovered tools become first-class entries in the agent's catalog.
+        // On failure, continue with builtin tools only — MCP is additive.
+        const mcp_tools: []const tools_mod.Tool = if (runtime.config.mcp_servers.len > 0)
+            mcp_mod.initMcpTools(allocator, runtime.config.mcp_servers) catch |err| mcp_err: {
+                log.warn("mcp.init failed user={s} error={s} — continuing without MCP tools", .{ user_ctx.user_id, @errorName(err) });
+                break :mcp_err &.{};
+            }
+        else
+            &.{};
+        errdefer if (mcp_tools.len > 0) allocator.free(mcp_tools);
+
+        if (mcp_tools.len > 0) {
+            log.info("mcp.init ok user={s} servers={d} tools={d}", .{ user_ctx.user_id, runtime.config.mcp_servers.len, mcp_tools.len });
+            const merged = allocator.alloc(tools_mod.Tool, builtin_tools.len + mcp_tools.len) catch merge_err: {
+                log.warn("mcp.merge alloc failed user={s} — using builtin tools only", .{user_ctx.user_id});
+                break :merge_err null;
+            };
+            if (merged) |m| {
+                @memcpy(m[0..builtin_tools.len], builtin_tools);
+                @memcpy(m[builtin_tools.len..], mcp_tools);
+                allocator.free(builtin_tools);
+                allocator.free(mcp_tools);
+                runtime.tools = m;
+            } else {
+                runtime.tools = builtin_tools;
+            }
+        } else {
+            runtime.tools = builtin_tools;
+        }
         errdefer if (runtime.tools.len > 0) tools_mod.deinitTools(allocator, runtime.tools);
 
         const mem_opt: ?memory_mod.Memory = if (runtime.mem_rt) |rt| rt.memory else null;
