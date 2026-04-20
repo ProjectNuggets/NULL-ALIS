@@ -1337,7 +1337,7 @@ test "appendSkillsSection unavailable always=true skill renders in XML not full"
     try std.testing.expect(std.mem.indexOf(u8, output, "### Skill: broken-always") == null);
 }
 
-test "buildSystemPrompt datetime appears before runtime" {
+test "buildSystemPrompt datetime appears in volatile section AFTER runtime (context v2)" {
     const allocator = std.testing.allocator;
     const prompt = try buildSystemPrompt(allocator, .{
         .workspace_dir = "/tmp/nonexistent",
@@ -1346,9 +1346,44 @@ test "buildSystemPrompt datetime appears before runtime" {
     });
     defer allocator.free(prompt);
 
+    // Context v2: datetime moved out of the stable block into the volatile
+    // block (which comes AFTER Runtime in the stable section) so the stable
+    // prefix bytes stay identical across turns. Runtime is the final stable
+    // block item; datetime appears later as volatile.
     const dt_pos = std.mem.indexOf(u8, prompt, "## Current Date & Time") orelse return error.SectionNotFound;
     const rt_pos = std.mem.indexOf(u8, prompt, "## Runtime") orelse return error.SectionNotFound;
-    try std.testing.expect(dt_pos < rt_pos);
+    try std.testing.expect(rt_pos < dt_pos);
+}
+
+test "buildStableSystemPrompt excludes datetime and conversation context" {
+    const allocator = std.testing.allocator;
+    const stable = try buildStableSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(stable);
+
+    // Stable must NOT contain volatile content — that's the byte-stability
+    // invariant we're testing.
+    try std.testing.expect(std.mem.indexOf(u8, stable, "## Current Date & Time") == null);
+    // But must contain identity/tools/runtime — the stable inputs.
+    try std.testing.expect(std.mem.indexOf(u8, stable, "## Runtime") != null);
+}
+
+test "buildVolatileSystemPrompt includes datetime and optional memory slot" {
+    const allocator = std.testing.allocator;
+    const volatile_out = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .memory_slot = "<memory_for_turn>\ntest fact\n</memory_for_turn>\n",
+    });
+    defer allocator.free(volatile_out);
+
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "## Current Date & Time") != null);
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "<memory_for_turn>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "test fact") != null);
 }
 
 // ─── New section-builder tests (REQ-018) ────────────────────────────────────

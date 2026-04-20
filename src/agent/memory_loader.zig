@@ -711,72 +711,11 @@ pub fn loadContextWithRuntime(
     return result.context;
 }
 
-/// Enrich a user message with memory context prepended.
-/// If no context is available, returns an owned dupe of the original message.
-pub fn enrichMessage(
-    allocator: std.mem.Allocator,
-    mem: Memory,
-    user_message: []const u8,
-    session_id: ?[]const u8,
-) ![]const u8 {
-    const context = try loadContext(allocator, mem, user_message, session_id);
-    if (context.len == 0) {
-        allocator.free(context);
-        return try allocator.dupe(u8, user_message);
-    }
-
-    defer allocator.free(context);
-    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ context, user_message });
-}
-
-/// Enrich a user message using the retrieval engine if available, else raw recall.
-pub fn enrichMessageWithRuntime(
-    allocator: std.mem.Allocator,
-    mem: Memory,
-    mem_rt: ?*MemoryRuntime,
-    user_message: []const u8,
-    session_id: ?[]const u8,
-) ![]const u8 {
-    const context = if (mem_rt) |rt|
-        try loadContextWithRuntime(allocator, mem, rt, user_message, session_id)
-    else
-        try loadContext(allocator, mem, user_message, session_id);
-
-    if (context.len == 0) {
-        allocator.free(context);
-        return try allocator.dupe(u8, user_message);
-    }
-
-    defer allocator.free(context);
-    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ context, user_message });
-}
-
-pub fn enrichMessageWithRuntimeDetailed(
-    allocator: std.mem.Allocator,
-    mem: Memory,
-    mem_rt: ?*MemoryRuntime,
-    user_message: []const u8,
-    session_id: ?[]const u8,
-) !EnrichmentResult {
-    const result = if (mem_rt) |rt|
-        try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id)
-    else
-        try loadContextDetailed(allocator, mem, user_message, session_id);
-
-    if (result.context.len == 0) {
-        allocator.free(result.context);
-        return .{
-            .text = try allocator.dupe(u8, user_message),
-            .stats = result.stats,
-        };
-    }
-
-    defer allocator.free(result.context);
-    return .{
-        .text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.context, user_message }),
-        .stats = result.stats,
-    };
-}
+// enrichMessage / enrichMessageWithRuntime / enrichMessageWithRuntimeDetailed
+// were removed in iter21. Context v2 replaces the "prepend [Memory context]
+// to user message" pattern with `loadTurnMemorySlot` which packages memory
+// into the volatile portion of the system prompt instead. Production code
+// no longer has callers. Use loadTurnMemorySlot in new code.
 
 /// Load memory context for the current turn as a fenced payload for the
 /// volatile system block. This is the context-v2 replacement for
@@ -836,17 +775,6 @@ test "loadContext returns empty for no-op memory" {
     defer allocator.free(context);
 
     try std.testing.expectEqualStrings("", context);
-}
-
-test "enrichMessage with no context returns original" {
-    const allocator = std.testing.allocator;
-    var none_mem = memory_mod.NoneMemory.init();
-    const mem = none_mem.memory();
-
-    const enriched = try enrichMessage(allocator, mem, "hello", null);
-    defer allocator.free(enriched);
-
-    try std.testing.expectEqualStrings("hello", enriched);
 }
 
 test "loadContext with session_id includes global entries but not other sessions" {
@@ -1025,18 +953,18 @@ test "truncateUtf8 does not split multi-byte sequences" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8(s4, 2)));
 }
 
-test "enrichMessageWithRuntime with no memories returns original message" {
+test "loadTurnMemorySlot returns empty when no memory available" {
     const allocator = std.testing.allocator;
     var none_mem = memory_mod.NoneMemory.init();
     const mem = none_mem.memory();
 
-    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "hello world", null);
-    defer allocator.free(enriched);
+    const slot = try loadTurnMemorySlot(allocator, mem, null, "hello world", null);
+    defer allocator.free(slot.fenced_content);
 
-    try std.testing.expectEqualStrings("hello world", enriched);
+    try std.testing.expectEqualStrings("", slot.fenced_content);
 }
 
-test "enrichMessageWithRuntime with memories prepends context" {
+test "loadTurnMemorySlot fences retrieved memory with markers (context v2 packaging)" {
     const allocator = std.testing.allocator;
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
@@ -1045,20 +973,20 @@ test "enrichMessageWithRuntime with memories prepends context" {
 
     try mem.store("user_lang", "Zig is the favorite language", .core, null);
 
-    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "language", null);
-    defer allocator.free(enriched);
+    const slot = try loadTurnMemorySlot(allocator, mem, null, "language", null);
+    defer allocator.free(slot.fenced_content);
 
-    // Should contain [Memory context] header and the stored entry
-    try std.testing.expect(std.mem.indexOf(u8, enriched, "[Memory context]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, enriched, "Retrieved continuity from the canonical runtime memory store for this turn.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, enriched, "use it instead of saying you do not remember") != null);
-    try std.testing.expect(std.mem.indexOf(u8, enriched, "user_lang") != null);
-    try std.testing.expect(std.mem.indexOf(u8, enriched, "Zig is the favorite language") != null);
-    // The original message should appear at the end
-    try std.testing.expect(std.mem.endsWith(u8, enriched, "language"));
+    // Context v2: payload wrapped in <memory_for_turn>...</memory_for_turn> —
+    // the retrieval body is unchanged (still [Memory context] header) but
+    // it now lives inside the fence instead of being prepended to the user
+    // message. Placement in the volatile system block, not the user turn.
+    try std.testing.expect(std.mem.startsWith(u8, slot.fenced_content, "<memory_for_turn>\n"));
+    try std.testing.expect(std.mem.endsWith(u8, slot.fenced_content, "</memory_for_turn>\n"));
+    try std.testing.expect(std.mem.indexOf(u8, slot.fenced_content, "user_lang") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slot.fenced_content, "Zig is the favorite language") != null);
 }
 
-test "enrichMessageWithRuntimeDetailed reports selection stats" {
+test "loadTurnMemorySlot reports selection stats (context v2 packaging)" {
     const allocator = std.testing.allocator;
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
@@ -1080,25 +1008,25 @@ test "enrichMessageWithRuntimeDetailed reports selection stats" {
     try mem.store("durable_fact/shipping_pref", "shipping updates should stay concise", .core, null);
     try mem.store("session_fact", "current lane detail", .conversation, "agent:zaki-bot:user:1:main");
 
-    const enriched = try enrichMessageWithRuntimeDetailed(
+    const slot = try loadTurnMemorySlot(
         allocator,
         mem,
         null,
         "shipping",
         "agent:zaki-bot:user:1:main",
     );
-    defer allocator.free(enriched.text);
+    defer allocator.free(slot.fenced_content);
 
-    try std.testing.expect(enriched.stats.available);
-    try std.testing.expect(enriched.stats.injected);
-    try std.testing.expect(enriched.stats.summary_latest_used);
-    try std.testing.expect(!enriched.stats.context_anchor_used);
-    try std.testing.expect(enriched.stats.durable_fact_count >= 1);
-    try std.testing.expect(enriched.stats.continuity_bucket_entries >= 1);
-    try std.testing.expect(enriched.stats.semantic_bucket_entries >= 1);
-    try std.testing.expect(enriched.stats.context_bytes > 0);
-    try std.testing.expect(std.mem.startsWith(u8, enriched.text, "[Memory context]\n"));
-    try std.testing.expect(std.mem.indexOf(u8, enriched.text, "context_anchor_current") == null);
+    try std.testing.expect(slot.stats.available);
+    try std.testing.expect(slot.stats.injected);
+    try std.testing.expect(slot.stats.summary_latest_used);
+    try std.testing.expect(!slot.stats.context_anchor_used);
+    try std.testing.expect(slot.stats.durable_fact_count >= 1);
+    try std.testing.expect(slot.stats.continuity_bucket_entries >= 1);
+    try std.testing.expect(slot.stats.semantic_bucket_entries >= 1);
+    try std.testing.expect(slot.stats.context_bytes > 0);
+    try std.testing.expect(std.mem.startsWith(u8, slot.fenced_content, "<memory_for_turn>\n"));
+    try std.testing.expect(std.mem.indexOf(u8, slot.fenced_content, "context_anchor_current") == null);
 }
 
 test "global keyword fallback pulls cross-session entries when exact global recall misses punctuation variant" {
@@ -1180,17 +1108,17 @@ test "loadContextWithRuntime caps visible warm matches while overfetching raw ca
         ._allocator = allocator,
     };
 
-    const enriched = try enrichMessageWithRuntimeDetailed(allocator, mem, &rt, "shipping memory", null);
-    defer allocator.free(enriched.text);
+    const slot = try loadTurnMemorySlot(allocator, mem, &rt, "shipping memory", null);
+    defer allocator.free(slot.fenced_content);
 
-    try std.testing.expectEqual(@as(usize, 12), enriched.stats.candidate_count);
-    try std.testing.expect(enriched.stats.search_match_count >= 2);
-    try std.testing.expect(enriched.stats.search_match_count <= SEARCH_FALLBACK_BUCKET_MAX_ENTRIES);
-    try std.testing.expect(enriched.stats.fallback_bucket_entries <= SEARCH_FALLBACK_BUCKET_MAX_ENTRIES);
-    try std.testing.expectEqual(enriched.stats.fallback_bucket_entries, enriched.stats.global_fallback_count);
+    try std.testing.expectEqual(@as(usize, 12), slot.stats.candidate_count);
+    try std.testing.expect(slot.stats.search_match_count >= 2);
+    try std.testing.expect(slot.stats.search_match_count <= SEARCH_FALLBACK_BUCKET_MAX_ENTRIES);
+    try std.testing.expect(slot.stats.fallback_bucket_entries <= SEARCH_FALLBACK_BUCKET_MAX_ENTRIES);
+    try std.testing.expectEqual(slot.stats.fallback_bucket_entries, slot.stats.global_fallback_count);
 
     var recalled_lines: usize = 0;
-    var iter = std.mem.splitScalar(u8, enriched.text, '\n');
+    var iter = std.mem.splitScalar(u8, slot.fenced_content, '\n');
     while (iter.next()) |line| {
         if (std.mem.startsWith(u8, line, "- warm_fact_")) recalled_lines += 1;
     }

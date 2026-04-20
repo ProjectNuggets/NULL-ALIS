@@ -533,11 +533,6 @@ pub const Agent = struct {
     /// substituted; raw is what goes to the provider).
     current_turn_raw_user: ?[]const u8 = null,
 
-    /// Deprecated (context v2): enriched-user substitution path is removed.
-    /// Field kept only for transitional compatibility with tests; always null
-    /// in the live turn loop. TODO: remove field in a follow-up cleanup.
-    current_turn_enriched_user: ?[]const u8 = null,
-
     /// Anti-thrash ring (iter20): last two compaction savings percentages.
     /// If both below COMPACTION_MIN_SAVINGS_PERCENT, autoCompactHistory skips
     /// its next attempt. Force-compress path bypasses this guard.
@@ -809,27 +804,17 @@ pub const Agent = struct {
         return false;
     }
 
+    /// Reset per-turn scratch state. Kept for turn-boundary hygiene.
+    /// Context v2 removed the enriched-user substitution path, so this just
+    /// clears the raw-user pointer tracking now.
     fn clearCurrentTurnProviderOverride(self: *Agent) void {
-        if (self.current_turn_enriched_user) |enriched| {
-            self.allocator.free(enriched);
-        }
-        self.current_turn_enriched_user = null;
         self.current_turn_raw_user = null;
     }
 
-    fn isCurrentTurnRawUser(self: *const Agent, content: []const u8) bool {
-        const current = self.current_turn_raw_user orelse return false;
-        return current.len == content.len and current.ptr == content.ptr;
-    }
-
     fn providerMessageForOwned(self: *const Agent, msg: *const OwnedMessage) ChatMessage {
-        // Context v2: no more raw→enriched substitution. Memory lives in the
-        // volatile portion of the system prompt (PromptContext.memory_slot),
-        // not prepended to the user message. History holds raw user bytes
-        // and we emit them as-is to keep byte-stability across turns for
-        // provider KV-cache hits. The isCurrentTurnRawUser check is retained
-        // only because other call sites still use it; it now always returns
-        // the raw form.
+        // Context v2: history holds raw user bytes; emit as-is to preserve
+        // byte-stability across turns for provider KV-cache hits. No
+        // substitution, no prior-memory prepending.
         _ = self;
         return msg.toChatMessage();
     }
@@ -4177,7 +4162,7 @@ test "narration module reexport" {
 
 test "memory_loader accessible as internal stage of context_engine" {
     _ = context_engine.memory_loader.loadContext;
-    _ = context_engine.memory_loader.enrichMessage;
+    _ = context_engine.memory_loader.loadTurnMemorySlot;
 }
 
 test "context_builder accessible as internal stage of context_engine" {
