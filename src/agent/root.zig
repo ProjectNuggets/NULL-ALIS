@@ -3461,6 +3461,13 @@ pub const Agent = struct {
             // Native reasoning_content is preserved in the main model's
             // context but intentionally NOT shown to the user (see the
             // response-parse site above).
+            if (self.sidecar_provider == null) {
+                log.info("narration.sidecar_skipped reason=no_provider iteration={d} tool_iterations={d}", .{ iteration, turn_tool_iterations });
+            } else if (self.narration_interval == 0) {
+                log.info("narration.sidecar_skipped reason=interval_disabled iteration={d}", .{iteration});
+            } else if (turn_tool_iterations < 1 or turn_tool_iterations % self.narration_interval != 0) {
+                log.info("narration.sidecar_skipped reason=interval_gate tool_iterations={d} interval={d}", .{ turn_tool_iterations, self.narration_interval });
+            }
             if (self.sidecar_provider != null and self.narration_interval > 0 and
                 turn_tool_iterations >= 1 and
                 turn_tool_iterations % self.narration_interval == 0)
