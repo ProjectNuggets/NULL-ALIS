@@ -1381,7 +1381,7 @@ const TenantRuntime = struct {
         if (mcp_tools.len > 0) {
             log.info("mcp.init ok user={s} servers={d} tools={d}", .{ user_ctx.user_id, runtime.config.mcp_servers.len, mcp_tools.len });
             const merged = allocator.alloc(tools_mod.Tool, builtin_tools.len + mcp_tools.len) catch merge_err: {
-                log.warn("mcp.merge alloc failed user={s} — using builtin tools only", .{user_ctx.user_id});
+                log.warn("mcp.merge alloc failed user={s} — deinitializing MCP tools and using builtin only", .{user_ctx.user_id});
                 break :merge_err null;
             };
             if (merged) |m| {
@@ -1391,6 +1391,12 @@ const TenantRuntime = struct {
                 allocator.free(mcp_tools);
                 runtime.tools = m;
             } else {
+                // Fix (iter22, Nova's High finding): mcp_tools contains initialized
+                // subprocess-backed MCP tools. On merge-alloc failure we must
+                // deinitialize them (tear down child processes, free per-tool
+                // state) — not just drop the slice, which would strand child
+                // processes with no owner.
+                tools_mod.deinitTools(allocator, mcp_tools);
                 runtime.tools = builtin_tools;
             }
         } else {

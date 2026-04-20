@@ -729,14 +729,21 @@ pub const Agent = struct {
             .workspace_dir = self.workspace_dir,
         };
 
-        const before_count = self.history.items.len;
+        // iter22 (Nova's Medium finding): measure thrash savings in TOKENS,
+        // not message count. Some compaction passes (Pass A cheap dedup,
+        // tool-result truncation) shrink bytes WITHIN messages without
+        // removing messages — counting messages would falsely flag these
+        // as "no savings" and suppress useful future compactions. Token
+        // pressure is what triggers compaction, so token pressure is what
+        // we gate against when deciding to skip.
+        const before_tokens = compaction.tokenEstimate(self.history.items);
 
         // Primary: turn-based sliding window. When this fires, it supersedes
         // token-based passes for this invocation (the window already bounds payload).
         if (self.history_window_turns > 0) {
             const windowed = try compaction.compactByTurnWindow(self.allocator, &self.history, compact_provider, compact_model, cfg);
             if (windowed) {
-                self.recordCompactionSavings(before_count, self.history.items.len);
+                self.recordCompactionSavings(before_tokens, compaction.tokenEstimate(self.history.items));
                 return true;
             }
         }
@@ -744,15 +751,17 @@ pub const Agent = struct {
         // Fallback / complementary: token-based passes (handles runaway tool outputs
         // even when turn count is within window).
         const compacted = try compaction.autoCompactHistory(self.allocator, &self.history, compact_provider, compact_model, cfg);
-        if (compacted) self.recordCompactionSavings(before_count, self.history.items.len);
+        if (compacted) self.recordCompactionSavings(before_tokens, compaction.tokenEstimate(self.history.items));
         return compacted;
     }
 
     /// Update the 2-entry ring that the thrash guard reads next turn.
-    fn recordCompactionSavings(self: *Agent, before: usize, after: usize) void {
-        if (before == 0) return;
-        const saved: u64 = if (before > after) (before - after) else 0;
-        const pct: u8 = @intCast(@min(100, (saved * 100) / before));
+    /// Inputs are TOKEN estimates (not message counts). See comment in
+    /// autoCompactHistory for rationale.
+    fn recordCompactionSavings(self: *Agent, before_tokens: u64, after_tokens: u64) void {
+        if (before_tokens == 0) return;
+        const saved: u64 = if (before_tokens > after_tokens) (before_tokens - after_tokens) else 0;
+        const pct: u8 = @intCast(@min(100, (saved * 100) / before_tokens));
         self.compaction_savings_ring[1] = self.compaction_savings_ring[0];
         self.compaction_savings_ring[0] = pct;
     }
@@ -2290,6 +2299,13 @@ pub const Agent = struct {
             // volatile = dynamic tail (datetime / conversation context / memory).
             const stable_prefix_len = stable_prompt.len + tool_instructions.len;
             const full_system = try self.allocator.alloc(u8, stable_prefix_len + volatile_prompt.len);
+            // iter22 (Nova's Medium finding): errdefer guards the window between
+            // alloc and ownership transfer into history. If history.insert or
+            // history.append fails (OOM on the ArrayList resize), without this
+            // errdefer the full_system buffer would orphan. Cleared manually
+            // on each success branch so ownership cleanly transfers.
+            var full_system_owned = true;
+            errdefer if (full_system_owned) self.allocator.free(full_system);
             @memcpy(full_system[0..stable_prompt.len], stable_prompt);
             @memcpy(full_system[stable_prompt.len..stable_prefix_len], tool_instructions);
             @memcpy(full_system[stable_prefix_len..], volatile_prompt);
@@ -2312,22 +2328,30 @@ pub const Agent = struct {
 
             // Keep exactly one canonical system prompt at history[0].
             // This allows /model to invalidate and refresh the prompt in place.
+            // Each branch transfers ownership of full_system into history on
+            // success, flipping full_system_owned = false so the errdefer no
+            // longer tries to free it. try insert/append path: if the call
+            // fails the errdefer will free full_system (insert/append do not
+            // take ownership on failure).
             if (self.history.items.len > 0 and self.history.items[0].role == .system) {
                 self.history.items[0].deinit(self.allocator);
                 self.history.items[0] = .{
                     .role = .system,
                     .content = full_system,
                 };
+                full_system_owned = false;
             } else if (self.history.items.len > 0) {
                 try self.history.insert(self.allocator, 0, .{
                     .role = .system,
                     .content = full_system,
                 });
+                full_system_owned = false;
             } else {
                 try self.history.append(self.allocator, .{
                     .role = .system,
                     .content = full_system,
                 });
+                full_system_owned = false;
             }
             self.has_system_prompt = true;
             self.system_prompt_has_conversation_context = prompt_refresh_plan.conversation_context_present;
