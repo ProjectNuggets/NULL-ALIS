@@ -455,6 +455,12 @@ pub fn classifyArtifactKey(key: []const u8) ArtifactRole {
     if (std.mem.startsWith(u8, key, "durable_fact/")) return .continuity;
     if (std.mem.startsWith(u8, key, "session_summary/")) return .continuity;
     if (std.mem.startsWith(u8, key, "timeline_summary/")) return .continuity;
+    // iter33: iter29 families are continuity by design — they feed the same
+    // warm-recall surface as timeline_summary. Without classification,
+    // memory_list and diagnostics tag them as .user which is wrong.
+    if (std.mem.startsWith(u8, key, "compaction_summary/")) return .continuity;
+    if (std.mem.startsWith(u8, key, "summary_fallback/")) return .continuity;
+    if (std.mem.startsWith(u8, key, "compaction_dropped/")) return .continuity;
 
     return .user;
 }
@@ -594,11 +600,19 @@ pub fn deriveSessionIdFromMemoryKey(key: []const u8) ?[]const u8 {
         return if (session_id.len > 0) session_id else null;
     }
 
-    const summary_prefixes = [_][]const u8{
+    // iter33: all per-session continuity artifacts follow the shape
+    // `<family>/<session_id>/<suffix>` — extract the session_id from between
+    // the family prefix and the final '/'. Without this helper recognizing
+    // the iter29 families, memory_timeline's session filter silently rejects
+    // compaction_summary/*, summary_fallback/*, and compaction_dropped/*.
+    const session_scoped_prefixes = [_][]const u8{
         "session_summary/",
         "timeline_summary/",
+        "compaction_summary/",
+        "summary_fallback/",
+        "compaction_dropped/",
     };
-    for (summary_prefixes) |prefix| {
+    for (session_scoped_prefixes) |prefix| {
         if (!std.mem.startsWith(u8, key, prefix)) continue;
         const rest = key[prefix.len..];
         const slash_idx = std.mem.lastIndexOfScalar(u8, rest, '/') orelse return null;

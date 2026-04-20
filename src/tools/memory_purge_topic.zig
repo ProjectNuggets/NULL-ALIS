@@ -54,7 +54,15 @@ pub const MemoryPurgeTopicTool = struct {
             std.mem.startsWith(u8, key, "session_checkpoint_") or
             std.mem.startsWith(u8, key, "timeline_summary/") or
             std.mem.startsWith(u8, key, "summary_latest/") or
-            std.mem.startsWith(u8, key, "durable_fact/");
+            std.mem.startsWith(u8, key, "durable_fact/") or
+            // iter33: iter29 continuity families. Polluted content in these
+            // namespaces must be scrubbable via the topic purge lever, same
+            // as the older families. Without this the agent could not clean
+            // hallucinations that landed in Pass C summaries or fallback
+            // stores.
+            std.mem.startsWith(u8, key, "compaction_summary/") or
+            std.mem.startsWith(u8, key, "summary_fallback/") or
+            std.mem.startsWith(u8, key, "compaction_dropped/");
     }
 
     pub fn execute(self: *MemoryPurgeTopicTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
@@ -77,7 +85,11 @@ pub const MemoryPurgeTopicTool = struct {
         defer mem_root.freeEntries(allocator, scoped);
 
         var purged: usize = 0;
-        var by_family = [_]usize{ 0, 0, 0, 0, 0, 0 }; // autosave_a, autosave_u, checkpoint, timeline, summary_latest, durable_fact
+        // iter33: extended counters for the iter29 families so the agent's
+        // purge summary reports accurately.
+        var by_family = [_]usize{ 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        // autosave_a, autosave_u, checkpoint, timeline, summary_latest,
+        // durable_fact, compaction_summary, summary_fallback, compaction_dropped
         for (scoped) |entry| {
             if (!isPurgeableFamily(entry.key)) continue;
             if (std.ascii.indexOfIgnoreCase(entry.content, topic) == null) continue;
@@ -91,7 +103,10 @@ pub const MemoryPurgeTopicTool = struct {
             else if (std.mem.startsWith(u8, entry.key, "session_checkpoint_")) by_family[2] += 1
             else if (std.mem.startsWith(u8, entry.key, "timeline_summary/")) by_family[3] += 1
             else if (std.mem.startsWith(u8, entry.key, "summary_latest/")) by_family[4] += 1
-            else if (std.mem.startsWith(u8, entry.key, "durable_fact/")) by_family[5] += 1;
+            else if (std.mem.startsWith(u8, entry.key, "durable_fact/")) by_family[5] += 1
+            else if (std.mem.startsWith(u8, entry.key, "compaction_summary/")) by_family[6] += 1
+            else if (std.mem.startsWith(u8, entry.key, "summary_fallback/")) by_family[7] += 1
+            else if (std.mem.startsWith(u8, entry.key, "compaction_dropped/")) by_family[8] += 1;
 
             // Best-effort vector store cleanup
             if (self.mem_rt) |rt| rt.deleteFromVectorStore(entry.key);
@@ -99,8 +114,8 @@ pub const MemoryPurgeTopicTool = struct {
 
         const msg = try std.fmt.allocPrint(
             allocator,
-            "Purged {d} agent-generated entries matching topic \"{s}\" (autosave_assistant={d}, autosave_user={d}, session_checkpoint={d}, timeline_summary={d}, summary_latest={d}, durable_fact={d}). User-authored memories untouched.",
-            .{ purged, topic, by_family[0], by_family[1], by_family[2], by_family[3], by_family[4], by_family[5] },
+            "Purged {d} agent-generated entries matching topic \"{s}\" (autosave_assistant={d}, autosave_user={d}, session_checkpoint={d}, timeline_summary={d}, summary_latest={d}, durable_fact={d}, compaction_summary={d}, summary_fallback={d}, compaction_dropped={d}). User-authored memories untouched.",
+            .{ purged, topic, by_family[0], by_family[1], by_family[2], by_family[3], by_family[4], by_family[5], by_family[6], by_family[7], by_family[8] },
         );
         return ToolResult{ .success = true, .output = msg };
     }
