@@ -67,6 +67,7 @@ pub const memory_recall = @import("memory_recall.zig");
 pub const memory_list = @import("memory_list.zig");
 pub const memory_timeline = @import("memory_timeline.zig");
 pub const memory_forget = @import("memory_forget.zig");
+pub const memory_purge_topic = @import("memory_purge_topic.zig");
 pub const schedule = @import("schedule.zig");
 pub const delegate = @import("delegate.zig");
 pub const browser = @import("browser.zig");
@@ -349,6 +350,14 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .name = memory_forget.MemoryForgetTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .low,
+    },
+    .{
+        // Topic-scoped bulk purge of agent-generated artifacts. Mutating;
+        // medium risk because an ill-chosen topic could delete more than
+        // intended (heuristic protects against overly-short topics).
+        .name = memory_purge_topic.MemoryPurgeTopicTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
     },
     .{
         // Schedule has read-only actions (list/get/runs) but the tool as a
@@ -724,6 +733,10 @@ pub fn allTools(
     const mft = try allocator.create(memory_forget.MemoryForgetTool);
     mft.* = .{};
     try list.append(allocator, mft.tool());
+
+    const mpt = try allocator.create(memory_purge_topic.MemoryPurgeTopicTool);
+    mpt.* = .{};
+    try list.append(allocator, mpt.tool());
 
     // Delegate and schedule tools
     if (opts.tool_profile == .main) {
@@ -1259,6 +1272,9 @@ pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
         } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
             const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
+        } else if (t.vtable == &memory_purge_topic.MemoryPurgeTopicTool.vtable) {
+            const mt: *memory_purge_topic.MemoryPurgeTopicTool = @ptrCast(@alignCast(t.ptr));
+            mt.memory = memory;
         }
     }
 }
@@ -1281,6 +1297,9 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
             mt.mem_rt = mem_rt;
         } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
             const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
+            mt.mem_rt = mem_rt;
+        } else if (t.vtable == &memory_purge_topic.MemoryPurgeTopicTool.vtable) {
+            const mt: *memory_purge_topic.MemoryPurgeTopicTool = @ptrCast(@alignCast(t.ptr));
             mt.mem_rt = mem_rt;
         }
     }
@@ -1693,8 +1712,8 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 28 (includes message, set_execution_mode, context_snapshot) + http_request + web_fetch + web_search + browser = 32
-    try std.testing.expectEqual(@as(usize, 32), tools.len);
+    // base 29 (adds memory_purge_topic) + http_request + web_fetch + web_search + browser = 33
+    try std.testing.expectEqual(@as(usize, 33), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -1707,10 +1726,10 @@ test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
     defer deinitTools(std.testing.allocator, tools);
     // shell + file_read + file_write + file_edit + file_append + git + image_info
-    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + memory_forget + delegate + schedule
+    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + memory_forget + memory_purge_topic + delegate + schedule
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + spawn + message + set_execution_mode + context_snapshot = 28
-    try std.testing.expectEqual(@as(usize, 28), tools.len);
+    // + runtime_info + skill_registry + spawn + message + set_execution_mode + context_snapshot = 29
+    try std.testing.expectEqual(@as(usize, 29), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -1836,7 +1855,7 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    try std.testing.expectEqual(@as(usize, 28), tools.len);
+    try std.testing.expectEqual(@as(usize, 29), tools.len);
 
     var found_message = false;
     for (tools) |t| {
