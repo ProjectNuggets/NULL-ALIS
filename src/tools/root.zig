@@ -73,6 +73,7 @@ pub const schedule = @import("schedule.zig");
 pub const delegate = @import("delegate.zig");
 pub const browser = @import("browser.zig");
 pub const image = @import("image.zig");
+pub const image_generate = @import("image_generate.zig");
 pub const composio = @import("composio.zig");
 pub const skill_registry = @import("skill_registry.zig");
 pub const runtime_info = @import("runtime_info.zig");
@@ -295,6 +296,13 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     .{
         .name = image.ImageInfoTool.tool_name,
         .flags = .{ .read_only = true, .concurrency_safe = true },
+        .risk_level = .low,
+    },
+    // image_generate: side-effectful (writes to external API, returns URL).
+    // Not read_only, not background_safe (user-initiated action), low risk.
+    .{
+        .name = image_generate.ImageGenerateTool.tool_name,
+        .flags = .{ .concurrency_safe = true },
         .risk_level = .low,
     },
     .{
@@ -714,6 +722,12 @@ pub fn allTools(
     const it = try allocator.create(image.ImageInfoTool);
     it.* = .{};
     try list.append(allocator, it.tool());
+
+    // image_generate: api_key_override left empty at construction; the bind
+    // helper `bindImageGenerate` wires the together api key at boot.
+    const igt = try allocator.create(image_generate.ImageGenerateTool);
+    igt.* = .{};
+    try list.append(allocator, igt.tool());
 
     // Memory tools (work gracefully without a backend)
     const mst = try allocator.create(memory_store.MemoryStoreTool);
@@ -1332,6 +1346,39 @@ pub fn bindSessionStore(tools: []const Tool, store: ?memory_mod.SessionStore) vo
     }
 }
 
+/// Wire Together API key (and optional model override) into the
+/// image_generate tool. Callers pass the already-resolved key from their
+/// provider config (cfg.providers[together].api_key) so each runtime keeps
+/// its own tenant-scoped credential flow. Empty string = fall back to
+/// TOGETHER_API_KEY env var at invocation time.
+pub fn bindImageGenerate(tools: []const Tool, together_api_key: []const u8, model_override: []const u8) void {
+    for (tools) |t| {
+        if (t.vtable == &image_generate.ImageGenerateTool.vtable) {
+            const igt: *image_generate.ImageGenerateTool = @ptrCast(@alignCast(t.ptr));
+            igt.api_key_override = together_api_key;
+            igt.model_override = model_override;
+        }
+    }
+}
+
+/// Helper: look up a provider's api_key from cfg.providers[].
+/// Returns empty string if not found — the consuming tool's resolver will
+/// then fall back to the env var or surface a clear "not configured" error.
+/// The returned slice is borrowed from the providers array and lives as
+/// long as the Config.
+pub fn lookupProviderApiKey(
+    providers: []const @import("../config_types.zig").ProviderEntry,
+    provider_name: []const u8,
+) []const u8 {
+    for (providers) |entry| {
+        if (std.mem.eql(u8, entry.name, provider_name)) {
+            if (entry.api_key) |k| return k;
+            return "";
+        }
+    }
+    return "";
+}
+
 /// Wire audit memory into tools that support command logging (currently: shell).
 /// Called after memory initialization, similar to bindMemoryRuntime.
 pub fn bindAuditMemory(tools: []const Tool, mem: memory_mod.Memory, session_id: ?[]const u8) void {
@@ -1739,8 +1786,8 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 30 (adds memory_purge_topic + transcript_read) + http_request + web_fetch + web_search + browser = 34
-    try std.testing.expectEqual(@as(usize, 34), tools.len);
+    // base 31 (adds image_generate) + http_request + web_fetch + web_search + browser = 35
+    try std.testing.expectEqual(@as(usize, 35), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -1752,11 +1799,11 @@ test "all tools excludes extras when disabled" {
     };
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
     defer deinitTools(std.testing.allocator, tools);
-    // shell + file_read + file_write + file_edit + file_append + git + image_info
+    // shell + file_read + file_write + file_edit + file_append + git + image_info + image_generate
     // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + delegate + schedule
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + spawn + message + set_execution_mode + context_snapshot = 30
-    try std.testing.expectEqual(@as(usize, 30), tools.len);
+    // + runtime_info + skill_registry + spawn + message + set_execution_mode + context_snapshot = 31
+    try std.testing.expectEqual(@as(usize, 31), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -1882,7 +1929,7 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    try std.testing.expectEqual(@as(usize, 30), tools.len);
+    try std.testing.expectEqual(@as(usize, 31), tools.len);
 
     var found_message = false;
     for (tools) |t| {

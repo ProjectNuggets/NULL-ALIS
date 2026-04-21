@@ -1439,6 +1439,14 @@ const TenantRuntime = struct {
             runtime.tools,
             if (runtime.pg_session_store) |store| store.sessionStore() else if (runtime.mem_rt) |rt| rt.session_store else null,
         );
+        // N1: wire Together API key into image_generate. The slice lives in
+        // runtime.config.providers which outlives the tool. Empty key makes
+        // the tool fall back to TOGETHER_API_KEY env at invocation time.
+        tools_mod.bindImageGenerate(
+            runtime.tools,
+            tools_mod.lookupProviderApiKey(runtime.config.providers, "together"),
+            "",
+        );
         if (runtime.subagent_manager) |mgr| {
             mgr.attachTaskDelivery(runtime.task_delivery);
             if (runtime.completion_router) |router| {
@@ -14191,6 +14199,12 @@ pub fn runWithRole(
                 }
                 // iter27: transcript_read SessionStore binding (standalone gateway)
                 tools_mod.bindSessionStore(tools_slice, if (mem_rt) |rt| rt.session_store else null);
+                // N1: image_generate Together key
+                tools_mod.bindImageGenerate(
+                    tools_slice,
+                    tools_mod.lookupProviderApiKey(cfg.providers, "together"),
+                    "",
+                );
                 session_mgr_opt = sm;
                 if (subagent_manager_opt) |mgr| {
                     if (standalone_task_delivery) |*td| {

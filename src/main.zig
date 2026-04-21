@@ -2794,6 +2794,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     }
     // iter27: transcript_read SessionStore binding (standalone path)
     yc.tools.bindSessionStore(tools, if (mem_rt) |rt| rt.session_store else null);
+    // N1: image_generate Together key (standalone)
+    yc.tools.bindImageGenerate(tools, yc.tools.lookupProviderApiKey(config.providers, "together"), "");
 
     // Create provider with reliability wrapper (retry + fallback chains).
     var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config);
@@ -3115,6 +3117,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     }
     // iter27: transcript_read SessionStore binding
     yc.tools.bindSessionStore(tools, if (mem_rt) |rt| rt.session_store else null);
+    // N1: image_generate Together key
+    yc.tools.bindImageGenerate(tools, yc.tools.lookupProviderApiKey(config.providers, "together"), "");
 
     // Create noop observer
     var noop_obs = yc.observability.NoopObserver{};

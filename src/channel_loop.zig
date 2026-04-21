@@ -434,6 +434,8 @@ pub const ChannelRuntime = struct {
             // Wire audit trail into shell tool
             tools_mod.bindAuditMemory(tools, rt.memory, null);
         }
+        // N1: image_generate Together key (channel runtime)
+        tools_mod.bindImageGenerate(tools, tools_mod.lookupProviderApiKey(self.config.providers, "together"), "");
         if (self.subagent_manager) |mgr| {
             if (self.completion_router) |router| {
                 router.* = .{
