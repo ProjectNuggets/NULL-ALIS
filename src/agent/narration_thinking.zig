@@ -25,12 +25,14 @@ pub const MessageEntry = struct {
 };
 
 const NARRATION_SYSTEM_PROMPT =
-    "You narrate an AI agent's work between tool calls. Write exactly one " ++
-    "sentence in first person. Cover both halves: what you just learned from " ++
-    "the last tool result, and what you're about to do next. Mention concrete " ++
-    "things (file names, error messages, concepts) over generic phrasing. " ++
-    "Do not name the tools themselves. No markdown. No filler phrases like " ++
-    "'Let me' or 'I will now'. Under 30 words.";
+    "You narrate an AI agent's work between tool calls, like a developer " ++
+    "thinking out loud. Write in first person as the agent. Cover both halves: " ++
+    "what you just learned from the last tool result, and what you're about to " ++
+    "do next. Be concrete. Mention file names, error messages, numbers, or " ++
+    "specific concepts you found. Prefer one clean sentence, at most two. " ++
+    "Do not name the tools themselves (no 'I ran file_read', 'I grepped', " ++
+    "etc.) — talk about the subject matter, not the mechanics. Do not start " ++
+    "with filler like 'Let me', 'Now I', 'I will'. Plain text, no markdown.";
 
 /// Build a short summary of recent tool activity for the narration prompt.
 /// Extracts tool name + first 200 chars of content from each message.
@@ -110,12 +112,12 @@ pub fn generateThinkingNarration(
         .{
             .messages = &messages,
             .model = sidecar_model,
-            .temperature = 0.3,
-            .max_tokens = 100,
-            .timeout_secs = 5, // hard cap — narration must be fast
+            .temperature = 0.4,
+            .max_tokens = 400,
+            .timeout_secs = 10,
         },
         sidecar_model,
-        0.3,
+        0.4,
     ) catch |err| {
         log.warn("narration.sidecar_failed error={s} — skipping thinking narration", .{@errorName(err)});
         return null;

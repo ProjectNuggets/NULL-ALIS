@@ -354,7 +354,17 @@ pub fn synthesizeTextToTempAudio(
 
     const format = sanitizeSynthesisFormat(opts.format);
 
-    const body = buildSynthesisRequestBody(allocator, model, opts.voice, format, text) catch return error.ApiRequestFailed;
+    // Voice resolution: if caller passed the fallback default "alloy" (only
+    // valid on OpenAI) while the provider is Together or another non-OpenAI
+    // engine, swap to the provider's correct default. Prevents a silent 400
+    // from sending `voice: "alloy"` to Orpheus/Cartesia.
+    const provider_default_voice = defaultSynthesisVoice(provider);
+    const voice = if (std.mem.eql(u8, opts.voice, "alloy") and provider_default_voice.len > 0)
+        provider_default_voice
+    else
+        opts.voice;
+
+    const body = buildSynthesisRequestBody(allocator, model, voice, format, text) catch return error.ApiRequestFailed;
     defer allocator.free(body);
 
     var auth_buf: [256]u8 = undefined;
@@ -480,12 +490,31 @@ fn generateBoundary() ![32]u8 {
 }
 
 fn defaultSynthesisModel(provider: []const u8) []const u8 {
-    if (std.mem.eql(u8, provider, "openai") or
-        std.mem.eql(u8, provider, "openrouter") or
-        std.mem.eql(u8, provider, "together") or
-        std.mem.eql(u8, provider, "together-ai"))
-    {
+    // Each provider has its own TTS model catalog. Picking a cross-provider
+    // default (e.g. "gpt-4o-mini-tts") breaks silently — the sender provider
+    // returns 400 and the agent logs "synthesis failed" while the user gets
+    // no audio. Route per provider.
+    if (std.mem.eql(u8, provider, "openai") or std.mem.eql(u8, provider, "openrouter")) {
         return "gpt-4o-mini-tts";
+    }
+    if (std.mem.eql(u8, provider, "together") or std.mem.eql(u8, provider, "together-ai")) {
+        // Orpheus-3B-FT: human-quality, $15/M chars — fits the $23/mo product
+        // comfortably at typical usage. Better voice presence than Kokoro.
+        return "canopylabs/orpheus-3b-0.1-ft";
+    }
+    return "";
+}
+
+/// Default voice when the caller doesn't specify one. Must be compatible
+/// with the provider's default TTS model (see `defaultSynthesisModel`).
+/// Returns an empty string for unknown providers so callers can surface
+/// a clear "no default voice" error instead of sending an incompatible one.
+fn defaultSynthesisVoice(provider: []const u8) []const u8 {
+    if (std.mem.eql(u8, provider, "openai") or std.mem.eql(u8, provider, "openrouter")) {
+        return "alloy";
+    }
+    if (std.mem.eql(u8, provider, "together") or std.mem.eql(u8, provider, "together-ai")) {
+        return "tara"; // Orpheus-3B human voice; other options: leo, zoe, jess, dan, leah, mia, zac
     }
     return "";
 }
@@ -1198,6 +1227,23 @@ test "voice buildSynthesisRequestBody contains required fields" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"voice\":\"alloy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"response_format\":\"mp3\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":\"Hello from test\"") != null);
+}
+
+test "defaultSynthesisModel routes per provider" {
+    try std.testing.expectEqualStrings("gpt-4o-mini-tts", defaultSynthesisModel("openai"));
+    try std.testing.expectEqualStrings("gpt-4o-mini-tts", defaultSynthesisModel("openrouter"));
+    try std.testing.expectEqualStrings("canopylabs/orpheus-3b-0.1-ft", defaultSynthesisModel("together"));
+    try std.testing.expectEqualStrings("canopylabs/orpheus-3b-0.1-ft", defaultSynthesisModel("together-ai"));
+    try std.testing.expectEqualStrings("", defaultSynthesisModel("groq"));
+    try std.testing.expectEqualStrings("", defaultSynthesisModel("unknown"));
+}
+
+test "defaultSynthesisVoice routes per provider" {
+    try std.testing.expectEqualStrings("alloy", defaultSynthesisVoice("openai"));
+    try std.testing.expectEqualStrings("alloy", defaultSynthesisVoice("openrouter"));
+    try std.testing.expectEqualStrings("tara", defaultSynthesisVoice("together"));
+    try std.testing.expectEqualStrings("tara", defaultSynthesisVoice("together-ai"));
+    try std.testing.expectEqualStrings("", defaultSynthesisVoice("groq"));
 }
 
 test "voice looksLikeJsonError detects api error payloads" {
