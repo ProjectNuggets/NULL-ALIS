@@ -725,8 +725,9 @@ pub fn allTools(
 
     // image_generate: api_key_override left empty at construction; the bind
     // helper `bindImageGenerate` wires the together api key at boot.
+    // workspace_dir is set here so saved images land in the agent's workspace.
     const igt = try allocator.create(image_generate.ImageGenerateTool);
-    igt.* = .{};
+    igt.* = .{ .workspace_dir = workspace_dir };
     try list.append(allocator, igt.tool());
 
     // Memory tools (work gracefully without a backend)
