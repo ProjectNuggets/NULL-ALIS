@@ -763,8 +763,16 @@ pub fn allTools(
     mpt.* = .{};
     try list.append(allocator, mpt.tool());
 
-    // Delegate and schedule tools
-    if (opts.tool_profile == .main) {
+    // Delegate + spawn: dormant by default for V1. Both are coded but have
+    // incomplete end-to-end behavior (subagent result visibility on follow-up
+    // turns, delegation agent config prereqs). Showing them in the catalog
+    // creates a broken-capability feel. Opt-in via NULLALIS_ENABLE_MULTIAGENT=1.
+    const multiagent_enabled = blk: {
+        const raw = std.process.getEnvVarOwned(allocator, "NULLALIS_ENABLE_MULTIAGENT") catch break :blk false;
+        defer allocator.free(raw);
+        break :blk std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "1");
+    };
+    if (opts.tool_profile == .main and multiagent_enabled) {
         const dlt = try allocator.create(delegate.DelegateTool);
         dlt.* = .{
             .agents = opts.agents orelse &.{},
@@ -821,8 +829,8 @@ pub fn allTools(
     skrt.* = .{ .workspace_dir = workspace_dir };
     try list.append(allocator, skrt.tool());
 
-    // Spawn tool (async subagent)
-    if (opts.tool_profile == .main) {
+    // Spawn tool (async subagent) — dormant by default, same env gate as delegate.
+    if (opts.tool_profile == .main and multiagent_enabled) {
         const sp = try allocator.create(spawn.SpawnTool);
         sp.* = .{ .manager = opts.subagent_manager };
         try list.append(allocator, sp.tool());
@@ -1787,8 +1795,8 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 31 (adds image_generate) + http_request + web_fetch + web_search + browser = 35
-    try std.testing.expectEqual(@as(usize, 35), tools.len);
+    // base 29 (delegate + spawn dormant by default) + http_request + web_fetch + web_search + browser = 33
+    try std.testing.expectEqual(@as(usize, 33), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -1800,11 +1808,12 @@ test "all tools excludes extras when disabled" {
     };
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
     defer deinitTools(std.testing.allocator, tools);
+    // Core tool catalog (delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT):
     // shell + file_read + file_write + file_edit + file_append + git + image_info + image_generate
-    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + delegate + schedule
+    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + schedule
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + spawn + message + set_execution_mode + context_snapshot = 31
-    try std.testing.expectEqual(@as(usize, 31), tools.len);
+    // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot = 29
+    try std.testing.expectEqual(@as(usize, 29), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -1930,7 +1939,8 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    try std.testing.expectEqual(@as(usize, 31), tools.len);
+    // 29 core tools; delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT.
+    try std.testing.expectEqual(@as(usize, 29), tools.len);
 
     var found_message = false;
     for (tools) |t| {
@@ -1971,7 +1981,7 @@ test "all tools excludes spawn delegate and message in subagent profile" {
     }
 }
 
-test "all tools keeps spawn delegate and message in main profile" {
+test "spawn + delegate are dormant by default in main profile" {
     const Config = @import("../config.zig").Config;
     const subagent_mod = @import("../subagent.zig");
 
@@ -1993,6 +2003,8 @@ test "all tools keeps spawn delegate and message in main profile" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
+    // delegate + spawn are gated behind NULLALIS_ENABLE_MULTIAGENT. Absent
+    // the env var, neither should register. message must stay present.
     var found_spawn = false;
     var found_delegate = false;
     var found_message = false;
@@ -2002,12 +2014,12 @@ test "all tools keeps spawn delegate and message in main profile" {
         if (std.mem.eql(u8, t.name(), "message")) found_message = true;
     }
 
-    try std.testing.expect(found_spawn);
-    try std.testing.expect(found_delegate);
+    try std.testing.expect(!found_spawn);
+    try std.testing.expect(!found_delegate);
     try std.testing.expect(found_message);
 }
 
-test "all tools wires subagent manager into spawn tool" {
+test "all tools: spawn not registered when NULLALIS_ENABLE_MULTIAGENT unset" {
     const Config = @import("../config.zig").Config;
     const subagent_mod = @import("../subagent.zig");
 
@@ -2021,19 +2033,15 @@ test "all tools wires subagent manager into spawn tool" {
 
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
         .config = &cfg,
+        .tool_profile = .main,
         .subagent_manager = &manager,
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    var checked_spawn = false;
+    // Verify the dormant-by-default gate holds: spawn absent from catalog.
     for (tools) |t| {
-        if (!std.mem.eql(u8, t.name(), "spawn")) continue;
-        const spawn_tool: *spawn.SpawnTool = @ptrCast(@alignCast(t.ptr));
-        try std.testing.expect(spawn_tool.manager == &manager);
-        checked_spawn = true;
-        break;
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "spawn"));
     }
-    try std.testing.expect(checked_spawn);
 }
 
 test "bindMemoryTools matches by vtable, not by colliding tool name" {
