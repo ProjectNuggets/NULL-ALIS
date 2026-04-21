@@ -25,11 +25,12 @@ pub const MessageEntry = struct {
 };
 
 const NARRATION_SYSTEM_PROMPT =
-    "You are a narration assistant for an AI agent. Given the agent's recent tool " ++
-    "calls and their results, write 1-2 sentences explaining: (1) what the agent " ++
-    "just figured out, and (2) what it plans to do next. Be specific — mention " ++
-    "file names, function names, error messages, concepts discovered. Write in " ++
-    "first person as the agent. Do not use markdown. Keep it under 50 words.";
+    "You narrate an AI agent's work between tool calls. Write exactly one " ++
+    "sentence in first person. Cover both halves: what you just learned from " ++
+    "the last tool result, and what you're about to do next. Mention concrete " ++
+    "things (file names, error messages, concepts) over generic phrasing. " ++
+    "Do not name the tools themselves. No markdown. No filler phrases like " ++
+    "'Let me' or 'I will now'. Under 30 words.";
 
 /// Build a short summary of recent tool activity for the narration prompt.
 /// Extracts tool name + first 200 chars of content from each message.

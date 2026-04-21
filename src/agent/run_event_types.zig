@@ -117,6 +117,7 @@ pub const DonePayload = struct {
     message_id: ?i64 = null,
     usage_tokens: ?u64 = null,
     cost_usd: ?f64 = null,
+    duration_ms: ?u64 = null,
     run_id: ?[]const u8 = null,
 };
 
@@ -332,6 +333,9 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             }
             if (p.cost_usd) |cost| {
                 try w.print(",\"cost_usd\":{d:.6}", .{cost});
+            }
+            if (p.duration_ms) |d| {
+                try w.print(",\"duration_ms\":{d}", .{d});
             }
             try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");

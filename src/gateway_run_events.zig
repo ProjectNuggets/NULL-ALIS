@@ -230,6 +230,7 @@ pub const RunEventObserver = struct {
             },
             .agent_end => |e| self.emit(.{ .done = .{
                 .usage_tokens = e.tokens_used,
+                .duration_ms = e.duration_ms,
                 .run_id = e.run_id,
             } }),
             .task_update => |e| self.emit(.{ .task_update = .{

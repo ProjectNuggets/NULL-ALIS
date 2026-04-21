@@ -3460,24 +3460,24 @@ pub const Agent = struct {
             } };
             self.observer.recordEvent(&reflect_stage_event);
 
-            // ── Thinking narration (sidecar-owned, always) ──
-            // Sidecar is the single source of user-facing narration. It runs
-            // every `narration_interval` tool iterations regardless of
-            // whether the main model produced native reasoning_content on
-            // this turn — consistent first-person voice, 50-word cap.
+            // ── Thinking narration (sidecar-owned, after every tool burst) ──
+            // Sidecar is the single source of user-facing narration. It fires
+            // after every tool_reflection that produced at least one tool
+            // result — one first-person line between tool bursts, Codex-style.
             // Native reasoning_content is preserved in the main model's
             // context but intentionally NOT shown to the user (see the
             // response-parse site above).
+            // `narration_interval == 0` still disables narration entirely
+            // (kept as a kill switch); any non-zero value means "every burst".
             if (self.sidecar_provider == null) {
                 log.info("narration.sidecar_skipped reason=no_provider iteration={d} tool_iterations={d}", .{ iteration, turn_tool_iterations });
             } else if (self.narration_interval == 0) {
-                log.info("narration.sidecar_skipped reason=interval_disabled iteration={d}", .{iteration});
-            } else if (turn_tool_iterations < 1 or turn_tool_iterations % self.narration_interval != 0) {
-                log.info("narration.sidecar_skipped reason=interval_gate tool_iterations={d} interval={d}", .{ turn_tool_iterations, self.narration_interval });
+                log.info("narration.sidecar_skipped reason=disabled iteration={d}", .{iteration});
+            } else if (turn_tool_iterations < 1 or results_buf.items.len == 0) {
+                log.info("narration.sidecar_skipped reason=no_tool_results tool_iterations={d} results={d}", .{ turn_tool_iterations, results_buf.items.len });
             }
             if (self.sidecar_provider != null and self.narration_interval > 0 and
-                turn_tool_iterations >= 1 and
-                turn_tool_iterations % self.narration_interval == 0)
+                turn_tool_iterations >= 1 and results_buf.items.len > 0)
             {
                 const narration_thinking = @import("narration_thinking.zig");
                 if (narration_thinking.generateThinkingNarration(
