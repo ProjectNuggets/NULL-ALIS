@@ -192,9 +192,15 @@ pub const RunEventObserver = struct {
                     .files = e.files,
                     .run_id = e.run_id,
                 } });
-                if (reasoningSummaryForStage(e.stage)) |summary| {
-                    self.emitReasoningSummary(summary, reasoningPhaseForStage(e.stage), null, e.iteration, e.run_id);
-                }
+                // iter20 (gauntlet): removed the synthetic reasoning_summary
+                // emission that aliased stage labels ("Checking context and
+                // memory", "Preparing the model request", etc). Those are
+                // stage CHROME, not thinking — the `progress` event above
+                // already carries them via stageLabel for the UI status row.
+                // reasoning_summary now fires ONLY on narration_frame (real
+                // sidecar or model-native reasoning), matching opencode's
+                // pattern where the thinking surface contains real content
+                // only — never templated status.
             },
             .narration_frame => |e| {
                 // Single-emit per frame_type. The zaki-prod thinking card
