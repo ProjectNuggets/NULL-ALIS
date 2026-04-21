@@ -383,28 +383,11 @@ fn stageLabel(stage: []const u8) []const u8 {
     return stage;
 }
 
-fn reasoningSummaryForStage(stage: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, stage, "turn_start")) return "Checking context and memory";
-    if (std.mem.eql(u8, stage, "memory_enrich")) return "Checking context and memory";
-    if (std.mem.eql(u8, stage, "build_provider_messages")) return "Preparing the model request";
-    if (std.mem.eql(u8, stage, "response_cache_hit")) return "Reusing a cached answer";
-    if (std.mem.eql(u8, stage, "dispatch_tools")) return "Running tools";
-    if (std.mem.eql(u8, stage, "tool_reflection")) return "Reviewing tool results";
-    if (std.mem.eql(u8, stage, "compose_final_reply")) return "Preparing the final answer";
-    if (std.mem.eql(u8, stage, "finalize_no_tools")) return "Finishing the response";
-    if (std.mem.eql(u8, stage, "post_reply_compaction")) return "Compacting context window";
-    return null;
-}
-
-fn reasoningPhaseForStage(stage: []const u8) []const u8 {
-    if (std.mem.eql(u8, stage, "response_cache_hit")) return "compose";
-    if (std.mem.eql(u8, stage, "dispatch_tools")) return "tool";
-    if (std.mem.eql(u8, stage, "tool_reflection")) return "tool";
-    if (std.mem.eql(u8, stage, "compose_final_reply")) return "compose";
-    if (std.mem.eql(u8, stage, "finalize_no_tools")) return "finalize";
-    if (std.mem.eql(u8, stage, "post_reply_compaction")) return "finalize";
-    return "thinking";
-}
+// Note: `reasoningSummaryForStage` and `reasoningPhaseForStage` helpers were
+// removed in iter20 — stage labels are no longer aliased as reasoning
+// content. Progress events carry the UI status via stageLabel(); reasoning
+// content flows only through narration_frame events (real sidecar /
+// model-native reasoning).
 
 // ── Tests ────────────────────────────────────────────────────────────
 
