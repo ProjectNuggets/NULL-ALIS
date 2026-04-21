@@ -7708,12 +7708,10 @@ fn SseProgressObserver(comptime StreamType: type) type {
             _ = count;
             if (std.mem.eql(u8, stage, "turn_start")) {
                 self.emit("thinking", "start", "Gathering context", null, iteration, duration_ms);
-                self.emitReasoningSummary("Checking context and memory", "thinking", null, iteration);
                 return;
             }
             if (std.mem.eql(u8, stage, "memory_enrich")) {
                 self.emit("thinking", "update", "Retrieving memory", null, iteration, duration_ms);
-                self.emitReasoningSummary("Checking context and memory", "thinking", null, iteration);
                 return;
             }
             if (std.mem.eql(u8, stage, "turn_compaction") or std.mem.eql(u8, stage, "compact_trim")) {
@@ -7722,12 +7720,10 @@ fn SseProgressObserver(comptime StreamType: type) type {
             }
             if (std.mem.eql(u8, stage, "build_provider_messages")) {
                 self.emit("thinking", "update", "Preparing model request", null, iteration, duration_ms);
-                self.emitReasoningSummary("Preparing the model request", "thinking", null, iteration);
                 return;
             }
             if (std.mem.eql(u8, stage, "response_cache_hit")) {
                 self.emit("compose", "update", "Using cached response", null, iteration, duration_ms);
-                self.emitReasoningSummary("Reusing a cached answer", "compose", null, iteration);
                 return;
             }
             if (std.mem.eql(u8, stage, "parse_provider_response")) {
@@ -7736,22 +7732,18 @@ fn SseProgressObserver(comptime StreamType: type) type {
             }
             if (std.mem.eql(u8, stage, "dispatch_tools")) {
                 self.emit("tool", "update", "Running tools", null, iteration, duration_ms);
-                self.emitReasoningSummary("Running tools to verify the answer", "tool", null, iteration);
                 return;
             }
             if (std.mem.eql(u8, stage, "tool_reflection")) {
                 self.emit("thinking", "update", "Reflecting on tool results", null, iteration, duration_ms);
-                self.emitReasoningSummary("Reviewing tool results", "thinking", null, iteration);
                 return;
             }
             if (std.mem.eql(u8, stage, "compose_final_reply")) {
                 self.emit("compose", "update", "Preparing final reply", null, iteration, duration_ms);
-                self.emitReasoningSummary("Preparing the final answer", "compose", null, iteration);
                 return;
             }
             if (std.mem.eql(u8, stage, "finalize_no_tools")) {
                 self.emit("finalize", "update", "Finalizing reply", null, iteration, duration_ms);
-                self.emitReasoningSummary("Finishing the response", "finalize", null, iteration);
                 return;
             }
         }
@@ -7761,7 +7753,8 @@ fn SseProgressObserver(comptime StreamType: type) type {
             switch (event.*) {
                 .llm_request => {
                     self.emit("thinking", "start", "Thinking", null, null, null);
-                    self.emitReasoningSummary("Thinking through the request", "thinking", null, null);
+                    // iter20: no templated reasoning_summary here. progress
+                    // event above carries the "Thinking" status.
                 },
                 .llm_response => |e| {
                     if (e.success) {
@@ -7783,7 +7776,12 @@ fn SseProgressObserver(comptime StreamType: type) type {
                     else
                         (std.fmt.bufPrint(&label_buf, "Using {s}", .{e.tool}) catch "Using tool");
                     self.emit("tool", "start", label, e.tool, null, null);
-                    self.emitReasoningSummary(label, "tool", e.tool, null);
+                    // iter20: only surface as reasoning when there's a real
+                    // agent-generated activity_label. Template "Using <tool>"
+                    // goes only to the progress/tool_start channel above.
+                    if (e.activity_label != null) {
+                        self.emitReasoningSummary(label, "tool", e.tool, null);
+                    }
                 },
                 .tool_call => |e| {
                     var label_buf: [192]u8 = undefined;
@@ -7987,12 +7985,10 @@ const BufferedSseProgressObserver = struct {
         _ = count;
         if (std.mem.eql(u8, stage, "turn_start")) {
             self.emit("thinking", "start", "Gathering context", null, iteration, duration_ms);
-            self.emitReasoningSummary("Checking context and memory", "thinking", null, iteration);
             return;
         }
         if (std.mem.eql(u8, stage, "memory_enrich")) {
             self.emit("thinking", "update", "Retrieving memory", null, iteration, duration_ms);
-            self.emitReasoningSummary("Checking context and memory", "thinking", null, iteration);
             return;
         }
         if (std.mem.eql(u8, stage, "turn_compaction") or std.mem.eql(u8, stage, "compact_trim")) {
@@ -8001,12 +7997,10 @@ const BufferedSseProgressObserver = struct {
         }
         if (std.mem.eql(u8, stage, "build_provider_messages")) {
             self.emit("thinking", "update", "Preparing model request", null, iteration, duration_ms);
-            self.emitReasoningSummary("Preparing the model request", "thinking", null, iteration);
             return;
         }
         if (std.mem.eql(u8, stage, "response_cache_hit")) {
             self.emit("compose", "update", "Using cached response", null, iteration, duration_ms);
-            self.emitReasoningSummary("Reusing a cached answer", "compose", null, iteration);
             return;
         }
         if (std.mem.eql(u8, stage, "parse_provider_response")) {
@@ -8015,22 +8009,18 @@ const BufferedSseProgressObserver = struct {
         }
         if (std.mem.eql(u8, stage, "dispatch_tools")) {
             self.emit("tool", "update", "Running tools", null, iteration, duration_ms);
-            self.emitReasoningSummary("Running tools to verify the answer", "tool", null, iteration);
             return;
         }
         if (std.mem.eql(u8, stage, "tool_reflection")) {
             self.emit("thinking", "update", "Reflecting on tool results", null, iteration, duration_ms);
-            self.emitReasoningSummary("Reviewing tool results", "thinking", null, iteration);
             return;
         }
         if (std.mem.eql(u8, stage, "compose_final_reply")) {
             self.emit("compose", "update", "Preparing final reply", null, iteration, duration_ms);
-            self.emitReasoningSummary("Preparing the final answer", "compose", null, iteration);
             return;
         }
         if (std.mem.eql(u8, stage, "finalize_no_tools")) {
             self.emit("finalize", "update", "Finalizing reply", null, iteration, duration_ms);
-            self.emitReasoningSummary("Finishing the response", "finalize", null, iteration);
             return;
         }
     }
@@ -8040,7 +8030,7 @@ const BufferedSseProgressObserver = struct {
         switch (event.*) {
             .llm_request => {
                 self.emit("thinking", "start", "Thinking", null, null, null);
-                self.emitReasoningSummary("Thinking through the request", "thinking", null, null);
+                // iter20: no template reasoning_summary — progress above carries "Thinking".
             },
             .llm_response => |e| {
                 if (e.success) {
@@ -8062,7 +8052,10 @@ const BufferedSseProgressObserver = struct {
                 else
                     (std.fmt.bufPrint(&label_buf, "Using {s}", .{e.tool}) catch "Using tool");
                 self.emit("tool", "start", label, e.tool, null, null);
-                self.emitReasoningSummary(label, "tool", e.tool, null);
+                // iter20: only surface as reasoning when there's a real activity_label.
+                if (e.activity_label != null) {
+                    self.emitReasoningSummary(label, "tool", e.tool, null);
+                }
             },
             .tool_call => |e| {
                 var label_buf: [192]u8 = undefined;
@@ -15927,7 +15920,9 @@ test "handleApiRoute chat stream includes buffered progress and reasoning summar
     try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", response.content_type);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "event: status") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "event: progress") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response.body, "event: reasoning_summary") != null);
+    // iter20: reasoning_summary is now conditional — only fires when real
+    // narration content exists (sidecar or model reasoning_content). Stage
+    // labels no longer alias as reasoning. Progress carries UI status.
     try std.testing.expect(std.mem.indexOf(u8, response.body, "event: reply_start") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "\"stream_kind\":\"final_reply\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "\"live\":false") != null);

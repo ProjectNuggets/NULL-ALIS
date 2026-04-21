@@ -132,7 +132,9 @@ pub const RunEventObserver = struct {
                     .label = "Thinking",
                     .run_id = e.run_id,
                 } });
-                self.emitReasoningSummary("Thinking through the request", "thinking", null, null, e.run_id);
+                // iter20: removed "Thinking through the request" template
+                // from reasoning_summary — it's stage chrome, routed via the
+                // progress event above.
             },
             .llm_response => |e| {
                 self.emit(.{ .progress = .{
@@ -153,14 +155,14 @@ pub const RunEventObserver = struct {
                     .activity_label = e.activity_label,
                     .run_id = e.run_id,
                 } });
-                // Stack buffer for summary — safe because emitReasoningSummary→emit→toSseFrame
-                // copies the string synchronously before this frame returns.
-                var summary_buf: [196]u8 = undefined;
-                const summary = if (e.activity_label) |label|
-                    label
-                else
-                    std.fmt.bufPrint(&summary_buf, "Using {s}", .{e.tool}) catch "Using a tool";
-                self.emitReasoningSummary(summary, "tool", e.tool, null, e.run_id);
+                // iter20: only emit reasoning_summary if there's a REAL
+                // activity_label (agent-generated per-tool description).
+                // Skip the generic "Using <tool>" template — the tool_start
+                // event above already carries the tool name for the UI
+                // status row.
+                if (e.activity_label) |label| {
+                    self.emitReasoningSummary(label, "tool", e.tool, null, e.run_id);
+                }
             },
             .tool_call => |e| {
                 self.emit(.{ .tool_result = .{
