@@ -18,10 +18,15 @@
 //!      download-link fallback).
 //!
 //! Endpoint: https://api.together.xyz/v1/images/generations
-//! Default model: black-forest-labs/FLUX.1-dev
-//!   - Better text rendering, composition, and scene quality than schnell.
-//!   - $0.025/image — fits a $23/mo product even at dozens of gens per user.
-//!   - ~8-12s per image (acceptable; agent streams "generating..." narration).
+//! Default model: black-forest-labs/FLUX.1-schnell
+//!   - Serverless-tier compatible (FLUX.1-dev and FLUX.1-pro require Together's
+//!     dedicated paid endpoints; verified 2026-04-21 via live 400 response).
+//!   - $0.003/image — fits a $23/mo product comfortably even at hundreds of
+//!     gens per user.
+//!   - ~2-4s per image (4 steps). Fast enough that the generation feels
+//!     immediate in the UI.
+//!   - Operators with dedicated endpoints can override via `model_override`
+//!     in config to use FLUX.1-dev or FLUX.1-pro for higher quality.
 //! Image-to-image model: black-forest-labs/FLUX.1-Kontext-pro
 //!   - Engaged when `reference_urls` is non-empty.
 //!   - Single-image input.
@@ -38,11 +43,16 @@ const JsonObjectMap = root.JsonObjectMap;
 
 const TOGETHER_IMAGE_URL = "https://api.together.xyz/v1/images/generations";
 const TOGETHER_HOST = "api.together.xyz";
-const DEFAULT_TEXT_MODEL = "black-forest-labs/FLUX.1-dev";
+// CORRECTED 2026-04-21: FLUX.1-dev requires Together's DEDICATED endpoint
+// (paid, not serverless). Serverless-tier accounts get 400 "Unable to access
+// non-serverless model". Schnell IS available serverless. Verified via live
+// API call against a serverless Together account. If the operator has a
+// dedicated endpoint, they can override via model_override in config.
+const DEFAULT_TEXT_MODEL = "black-forest-labs/FLUX.1-schnell";
 const DEFAULT_IMG2IMG_MODEL = "black-forest-labs/FLUX.1-Kontext-pro";
 const DEFAULT_WIDTH: u32 = 1024;
 const DEFAULT_HEIGHT: u32 = 1024;
-const DEFAULT_STEPS: u32 = 28; // FLUX.1-dev default
+const DEFAULT_STEPS: u32 = 4; // schnell optimized for 1-4 steps
 const MAX_STEPS: u32 = 50;
 const MIN_STEPS: u32 = 1;
 const MIN_DIM: u32 = 256;
@@ -528,17 +538,17 @@ test "buildRequestBody includes image_url when reference provided" {
 test "buildRequestBody omits image_url when no reference" {
     const body = try buildRequestBody(
         std.testing.allocator,
-        "black-forest-labs/FLUX.1-dev",
+        "black-forest-labs/FLUX.1-schnell",
         "a sunset",
         null,
         1024,
         1024,
-        28,
+        4,
         1,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "image_url") == null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"black-forest-labs/FLUX.1-dev\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"black-forest-labs/FLUX.1-schnell\"") != null);
 }
 
 test "detectImageExtensionFromUrl handles common formats and query strings" {
