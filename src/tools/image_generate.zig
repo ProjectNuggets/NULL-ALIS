@@ -53,7 +53,13 @@ const DEFAULT_IMG2IMG_MODEL = "black-forest-labs/FLUX.1-Kontext-pro";
 const DEFAULT_WIDTH: u32 = 1024;
 const DEFAULT_HEIGHT: u32 = 1024;
 const DEFAULT_STEPS: u32 = 4; // schnell optimized for 1-4 steps
-const MAX_STEPS: u32 = 50;
+// Discovered via live 400: FLUX.1-schnell serverless caps steps at 12.
+// FLUX.1-dev allows up to ~28, -pro up to ~50. Clamping per-model below so
+// agent's ambitious retry doesn't 400. If operator configures a dedicated
+// endpoint variant with higher limits, they can bump MAX_STEPS via model
+// override (future: make step-cap fully model-aware via a small lookup).
+const MAX_STEPS_SCHNELL: u32 = 12;
+const MAX_STEPS_DEFAULT: u32 = 50;
 const MIN_STEPS: u32 = 1;
 const MIN_DIM: u32 = 256;
 const MAX_DIM: u32 = 1440;
@@ -84,7 +90,7 @@ pub const ImageGenerateTool = struct {
         "image is saved to the agent's workspace and returned as markdown — include " ++
         "the output in your reply so the UI renders it inline.";
     pub const tool_params =
-        \\{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed text description of the image to generate. Include style, subject, mood, colors, composition, lighting."},"reference_urls":{"type":"array","items":{"type":"string"},"description":"Optional image URL(s) to use as visual reference. When provided, the tool switches to image-to-image mode (FLUX.1-Kontext-pro). Currently only the first URL is used."},"width":{"type":"integer","description":"Image width in pixels (rounded to nearest multiple of 64, range 256-1440). Default 1024."},"height":{"type":"integer","description":"Image height in pixels (same constraints as width). Default 1024."},"steps":{"type":"integer","description":"Diffusion steps 1-50. Default 28 for FLUX.1-dev. Higher = slower + potentially better."},"n":{"type":"integer","description":"Number of variations 1-4. Default 1."}},"required":["prompt"]}
+        \\{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed text description of the image to generate. Include style, subject, mood, colors, composition, lighting."},"reference_urls":{"type":"array","items":{"type":"string"},"description":"Optional image URL(s) to use as visual reference. When provided, the tool switches to image-to-image mode (FLUX.1-Kontext-pro). Currently only the first URL is used."},"width":{"type":"integer","description":"Image width in pixels (rounded to nearest multiple of 64, range 256-1440). Default 1024."},"height":{"type":"integer","description":"Image height in pixels (same constraints as width). Default 1024."},"steps":{"type":"integer","description":"Diffusion steps. Default 4 (fast). FLUX.1-schnell max is 12; other variants max 50. The tool clamps automatically based on model."},"n":{"type":"integer","description":"Number of variations 1-4. Default 1."}},"required":["prompt"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -107,13 +113,16 @@ pub const ImageGenerateTool = struct {
         const height_raw = optionalU32(args, "height") orelse DEFAULT_HEIGHT;
         const width = roundToStride(clampU32(width_raw, MIN_DIM, MAX_DIM));
         const height = roundToStride(clampU32(height_raw, MIN_DIM, MAX_DIM));
-        const steps = clampU32(optionalU32(args, "steps") orelse DEFAULT_STEPS, MIN_STEPS, MAX_STEPS);
         const n = clampU32(optionalU32(args, "n") orelse 1, 1, 4);
 
         // Model selection: reference-image mode switches to Kontext-pro.
         const model_default = if (reference_url != null) DEFAULT_IMG2IMG_MODEL else DEFAULT_TEXT_MODEL;
         const model_raw = if (self.model_override.len > 0) self.model_override else model_default;
         const model = std.mem.trim(u8, model_raw, " \t\r\n");
+
+        // Model-aware step cap (FLUX.1-schnell serverless rejects steps > 12).
+        const max_steps = maxStepsForModel(model);
+        const steps = clampU32(optionalU32(args, "steps") orelse DEFAULT_STEPS, MIN_STEPS, max_steps);
 
         const api_key = resolveApiKey(allocator, self.api_key_override) orelse {
             return ToolResult.fail(
@@ -219,6 +228,17 @@ fn clampU32(v: u32, lo: u32, hi: u32) u32 {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
+}
+
+/// Per-model step-cap. Together's serverless FLUX.1-schnell rejects steps > 12.
+/// Larger FLUX variants (dev/pro/Kontext) accept higher. Kept as a small
+/// lookup so the agent's ambitious parameter choice doesn't silently 400.
+fn maxStepsForModel(model: []const u8) u32 {
+    // Match on substring so both bare names and org-prefixed forms work
+    // (e.g. "FLUX.1-schnell" and "black-forest-labs/FLUX.1-schnell").
+    if (std.ascii.indexOfIgnoreCase(model, "flux.1-schnell") != null) return MAX_STEPS_SCHNELL;
+    if (std.ascii.indexOfIgnoreCase(model, "flux-1-schnell") != null) return MAX_STEPS_SCHNELL;
+    return MAX_STEPS_DEFAULT;
 }
 
 /// Round to nearest multiple of DIM_STRIDE, keeping within [MIN_DIM, MAX_DIM].
@@ -471,6 +491,15 @@ test "clampU32 bounds" {
     try std.testing.expectEqual(@as(u32, 256), clampU32(100, 256, 1440));
     try std.testing.expectEqual(@as(u32, 1440), clampU32(2048, 256, 1440));
     try std.testing.expectEqual(@as(u32, 512), clampU32(512, 256, 1440));
+}
+
+test "maxStepsForModel caps schnell at 12, others at 50" {
+    try std.testing.expectEqual(@as(u32, 12), maxStepsForModel("black-forest-labs/FLUX.1-schnell"));
+    try std.testing.expectEqual(@as(u32, 12), maxStepsForModel("FLUX.1-schnell"));
+    try std.testing.expectEqual(@as(u32, 12), maxStepsForModel("flux-1-schnell"));
+    try std.testing.expectEqual(@as(u32, 50), maxStepsForModel("black-forest-labs/FLUX.1-dev"));
+    try std.testing.expectEqual(@as(u32, 50), maxStepsForModel("black-forest-labs/FLUX.1-Kontext-pro"));
+    try std.testing.expectEqual(@as(u32, 50), maxStepsForModel("unknown/model"));
 }
 
 test "roundToStride snaps to multiples of 64" {
