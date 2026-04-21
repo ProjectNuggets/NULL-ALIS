@@ -364,7 +364,10 @@ fn saveImageToWorkspace(
     defer allocator.free(filename);
 
     const full_path = try std.fs.path.join(allocator, &.{ images_dir, filename });
-    errdefer allocator.free(full_path);
+    // Review-fix: every `return null` below would have leaked full_path because
+    // `errdefer` only fires on propagated `!`-errors. Use a success flag + defer.
+    var ok = false;
+    defer if (!ok) allocator.free(full_path);
 
     // Fetch image bytes. SSRF + DNS-rebinding protection applied.
     const image_host = net_security.extractHost(url) orelse return null;
@@ -391,9 +394,17 @@ fn saveImageToWorkspace(
     if (data.body.len == 0) return null;
 
     const file = std.fs.createFileAbsolute(full_path, .{}) catch return null;
+    // Review-fix: if writeAll fails mid-stream we'd leave a partial file
+    // on disk forever. Track write success and unlink on failure. Register
+    // the unlink BEFORE file.close so LIFO gives us close-then-unlink
+    // (portable; Windows dislikes unlink-while-open).
+    var write_ok = false;
+    defer if (!write_ok) std.fs.deleteFileAbsolute(full_path) catch {};
     defer file.close();
     file.writeAll(data.body) catch return null;
+    write_ok = true;
 
+    ok = true;
     return full_path;
 }
 
