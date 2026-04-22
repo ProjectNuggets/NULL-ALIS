@@ -1068,7 +1068,7 @@ pub const BrowserConfig = struct {
 // ── HTTP request config ─────────────────────────────────────────
 
 pub const HttpRequestConfig = struct {
-    enabled: bool = false,
+    enabled: bool = true,
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 30,
     allowed_domains: []const []const u8 = &.{},
