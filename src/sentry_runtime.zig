@@ -57,23 +57,23 @@ pub const Runtime = struct {
     }
 
     fn bootstrap(self: *Runtime) !void {
-        const dsn = try getEnvVarOwned(self.allocator, "NULLCLAW_SENTRY_DSN");
+        const dsn = try getEnvVarOwnedWithFallback(self.allocator, "NULLALIS_SENTRY_DSN", "NULLCLAW_SENTRY_DSN");
         if (dsn == null) return;
         self.dsn = dsn;
         errdefer self.resetOwned();
 
-        self.environment = try getEnvVarOwned(self.allocator, "NULLCLAW_SENTRY_ENVIRONMENT");
-        if (try getEnvVarOwned(self.allocator, "NULLCLAW_SENTRY_RELEASE")) |release| {
+        self.environment = try getEnvVarOwnedWithFallback(self.allocator, "NULLALIS_SENTRY_ENVIRONMENT", "NULLCLAW_SENTRY_ENVIRONMENT");
+        if (try getEnvVarOwnedWithFallback(self.allocator, "NULLALIS_SENTRY_RELEASE", "NULLCLAW_SENTRY_RELEASE")) |release| {
             self.release = release;
         } else {
             self.release = try std.fmt.allocPrint(self.allocator, "nullalis@{s}", .{version.string});
         }
 
-        const sample_rate = readEnvF64(self.allocator, "NULLCLAW_SENTRY_SAMPLE_RATE", 1.0);
-        const traces_sample_rate = readEnvF64(self.allocator, "NULLCLAW_SENTRY_TRACES_SAMPLE_RATE", 0.0);
-        const debug = readEnvBool(self.allocator, "NULLCLAW_SENTRY_DEBUG", false);
-        const auto_session_tracking = readEnvBool(self.allocator, "NULLCLAW_SENTRY_AUTO_SESSION", false);
-        const install_signal_handlers = readEnvBool(self.allocator, "NULLCLAW_SENTRY_INSTALL_SIGNAL_HANDLERS", false);
+        const sample_rate = readEnvF64WithFallback(self.allocator, "NULLALIS_SENTRY_SAMPLE_RATE", "NULLCLAW_SENTRY_SAMPLE_RATE", 1.0);
+        const traces_sample_rate = readEnvF64WithFallback(self.allocator, "NULLALIS_SENTRY_TRACES_SAMPLE_RATE", "NULLCLAW_SENTRY_TRACES_SAMPLE_RATE", 0.0);
+        const debug = readEnvBoolWithFallback(self.allocator, "NULLALIS_SENTRY_DEBUG", "NULLCLAW_SENTRY_DEBUG", false);
+        const auto_session_tracking = readEnvBoolWithFallback(self.allocator, "NULLALIS_SENTRY_AUTO_SESSION", "NULLCLAW_SENTRY_AUTO_SESSION", false);
+        const install_signal_handlers = readEnvBoolWithFallback(self.allocator, "NULLALIS_SENTRY_INSTALL_SIGNAL_HANDLERS", "NULLCLAW_SENTRY_INSTALL_SIGNAL_HANDLERS", false);
 
         self.client = try sentry.init(self.allocator, .{
             .dsn = self.dsn.?,
@@ -86,7 +86,7 @@ pub const Runtime = struct {
             .install_signal_handlers = install_signal_handlers,
         });
 
-        if (readEnvBool(self.allocator, "NULLCLAW_SENTRY_STARTUP_EVENT", false)) {
+        if (readEnvBoolWithFallback(self.allocator, "NULLALIS_SENTRY_STARTUP_EVENT", "NULLCLAW_SENTRY_STARTUP_EVENT", false)) {
             self.captureMessage("nullalis startup", .info);
         }
     }
@@ -114,16 +114,57 @@ fn getEnvVarOwned(allocator: Allocator, key: []const u8) !?[]u8 {
     };
 }
 
+// Rebrand chokepoint: read NULLALIS_* primary, fall back to legacy NULLCLAW_*.
+// Deprecate fallbacks one wave at a time per Sprint 8 W5.3.
+fn getEnvVarOwnedWithFallback(allocator: Allocator, primary: []const u8, fallback: []const u8) !?[]u8 {
+    if (try getEnvVarOwned(allocator, primary)) |value| return value;
+    if (try getEnvVarOwned(allocator, fallback)) |value| {
+        std.log.warn("env {s} is deprecated; use {s}", .{ fallback, primary });
+        return value;
+    }
+    return null;
+}
+
 fn readEnvBool(allocator: Allocator, key: []const u8, default_value: bool) bool {
     const raw = std.process.getEnvVarOwned(allocator, key) catch return default_value;
     defer allocator.free(raw);
     return parseBool(raw) orelse default_value;
 }
 
+fn readEnvBoolIfSet(allocator: Allocator, key: []const u8) ?bool {
+    const raw = std.process.getEnvVarOwned(allocator, key) catch return null;
+    defer allocator.free(raw);
+    return parseBool(raw);
+}
+
+fn readEnvBoolWithFallback(allocator: Allocator, primary: []const u8, fallback: []const u8, default_value: bool) bool {
+    if (readEnvBoolIfSet(allocator, primary)) |v| return v;
+    if (readEnvBoolIfSet(allocator, fallback)) |v| {
+        std.log.warn("env {s} is deprecated; use {s}", .{ fallback, primary });
+        return v;
+    }
+    return default_value;
+}
+
 fn readEnvF64(allocator: Allocator, key: []const u8, default_value: f64) f64 {
     const raw = std.process.getEnvVarOwned(allocator, key) catch return default_value;
     defer allocator.free(raw);
     return std.fmt.parseFloat(f64, std.mem.trim(u8, raw, " \t\r\n")) catch default_value;
+}
+
+fn readEnvF64IfSet(allocator: Allocator, key: []const u8) ?f64 {
+    const raw = std.process.getEnvVarOwned(allocator, key) catch return null;
+    defer allocator.free(raw);
+    return std.fmt.parseFloat(f64, std.mem.trim(u8, raw, " \t\r\n")) catch null;
+}
+
+fn readEnvF64WithFallback(allocator: Allocator, primary: []const u8, fallback: []const u8, default_value: f64) f64 {
+    if (readEnvF64IfSet(allocator, primary)) |v| return v;
+    if (readEnvF64IfSet(allocator, fallback)) |v| {
+        std.log.warn("env {s} is deprecated; use {s}", .{ fallback, primary });
+        return v;
+    }
+    return default_value;
 }
 
 fn parseBool(raw: []const u8) ?bool {
