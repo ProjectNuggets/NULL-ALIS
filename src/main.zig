@@ -2,6 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const yc = @import("nullalis");
+const log_fmt = @import("log_fmt.zig");
+
+// Install custom log formatter — picks text or JSON based on NULLALIS_LOG_FORMAT.
+// Must be declared at the root module so Zig's std.log picks it up.
+pub const std_options: std.Options = .{
+    .logFn = log_fmt.logFn,
+};
 
 var sentry_runtime: ?*yc.sentry_runtime.Runtime = null;
 
@@ -332,6 +339,10 @@ pub fn main() !void {
     if (comptime builtin.os.tag == .windows) {
         _ = std.os.windows.kernel32.SetConsoleOutputCP(65001);
     }
+
+    // Resolve log format before any log call so everything (including Sentry
+    // bootstrap) honors the chosen format.
+    log_fmt.init();
 
     const allocator = std.heap.smp_allocator;
     var runtime = yc.sentry_runtime.Runtime.init(allocator);
