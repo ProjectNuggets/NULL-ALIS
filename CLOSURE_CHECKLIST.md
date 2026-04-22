@@ -14,23 +14,46 @@
 Goal: prod emits real signal; no active user-visible data-loss or first-click bugs.
 
 ### Observability
-- [ ] **S1.1** Wire `NULLCLAW_SENTRY_DSN` — add to `config.example.json`, `deploy/k8s/zaki-bot/05-deployment.yaml` envFrom, set secret in zaki-infra. Cite: P4_telemetry.
-- [ ] **S1.2** Hook `ObserverEvent.err` → `captureError` in `src/sentry_runtime.zig` so inner-loop errors (tool/LLM/channel) reach Sentry. Cite: P4_telemetry.
-- [ ] **S1.3** Enable signal handlers in sentry_runtime for crash capture. Cite: P4_telemetry.
-- [ ] **S1.4** Override `std_options.logFn` → JSON structured logs to stderr. Cite: P4_telemetry.
-- [ ] **S1.5** Instantiate `OtelObserver` in gateway + daemon boot (currently dead outside tests). Cite: P4_telemetry.
+- [x] **S1.1** Wire `NULLCLAW_SENTRY_DSN` — add to `config.example.json`, `deploy/k8s/zaki-bot/05-deployment.yaml` envFrom, set secret in zaki-infra. Cite: P4_telemetry.
+- [x] **S1.2** Hook `ObserverEvent.err` → `captureError` in `src/sentry_runtime.zig` so inner-loop errors (tool/LLM/channel) reach Sentry. Cite: P4_telemetry.
+- [x] **S1.3** Enable signal handlers in sentry_runtime for crash capture. Cite: P4_telemetry.
+- [x] **S1.4** Override `std_options.logFn` → JSON structured logs to stderr. Cite: P4_telemetry.
+- [x] **S1.5** Instantiate `OtelObserver` in gateway + daemon boot (currently dead outside tests). Cite: P4_telemetry.
 
 ### Wave 0 — data-loss + broken-first-click
-- [ ] **S1.6** `daemon.zig:1456` — replace `cron.loadJobs catch {}` with `loadJobsStrict` + `loaded_from_disk: bool` on `CronScheduler`, gate `saveJobs` in recoverable-error branch of `reloadJobs` (`cron.zig:1902-1909`). Cite: P2_scheduler.
-- [ ] **S1.7** Implement `UserSessionStore.clearAutoSaved` postgres DELETE on `autosave_*` keys (`zaki_state.zig:432-435`) + test. Cite: P2_session_storage.
-- [ ] **S1.8** Voice TTS inbound gate — fix `[voice:` vs `[Voice]:` substring mismatch (case-insensitive or both forms) + telegram-marker test. Cite: P2_voice.
-- [ ] **S1.9** Run-scoped approval — either wire `DecisionSource.session_cache` through `executeToolUnchecked` with test, or correct the declaration + comment to reflect reality. Cite: P2_tools, P2_subagent_delegate.
-- [ ] **S1.10** Subagent "received" fabrication — replace `gateway.zig:9184 + :10562` with `TurnOutcome` struct from `session.zig:530` → `{text, tool_calls_executed, spawned_task_ids}` + structured tool-only-turn SSE. Defense: guard `subagent.zig:643` against empty-but-non-null `owned_result`. Tests. Cite: P2_subagent_delegate.
-- [ ] **S1.11** Settings page first-click fix — BFF `/v1/me/bot/settings PATCH` must target nullalis `/settings` (not `/config` which returns 403). zaki-prod-side change. Cite: P4_ops_truth drift #1, P4_zaki_prod_bff.
-- [ ] **S1.12** `NULLCLAW_STATE_MASTER_KEY` — add `valueFrom.secretKeyRef` in `deploy/k8s/zaki-bot/05-deployment.yaml` + set secret via sealed-secrets or operator. Cite: P4_ops_truth drift #2, state-secrets-wiring.md:51-52.
-- [ ] **S1.13** pgvector dim-mismatch guard — `store_pgvector.zig:394-410` → refuse + log-error + document migration path, do NOT drop. Cite: P4_schema risk #1.
+- [x] **S1.6** `daemon.zig:1456` — replace `cron.loadJobs catch {}` with `loadJobsStrict` + `loaded_from_disk: bool` on `CronScheduler`, gate `saveJobs` in recoverable-error branch of `reloadJobs` (`cron.zig:1902-1909`). Cite: P2_scheduler.
+- [x] **S1.7** Implement `UserSessionStore.clearAutoSaved` postgres DELETE on `autosave_*` keys (`zaki_state.zig:432-435`) + test. Cite: P2_session_storage.
+- [x] **S1.8** Voice TTS inbound gate — fix `[voice:` vs `[Voice]:` substring mismatch (case-insensitive or both forms) + telegram-marker test. Cite: P2_voice.
+- [x] **S1.9** Run-scoped approval — either wire `DecisionSource.session_cache` through `executeToolUnchecked` with test, or correct the declaration + comment to reflect reality. Cite: P2_tools, P2_subagent_delegate.
+- [x] **S1.10** Subagent "received" fabrication — replace `gateway.zig:9184 + :10562` with `TurnOutcome` struct from `session.zig:530` → `{text, tool_calls_executed, spawned_task_ids}` + structured tool-only-turn SSE. Defense: guard `subagent.zig:643` against empty-but-non-null `owned_result`. Tests. Cite: P2_subagent_delegate.
+- [x] **S1.11** Settings page first-click fix — BFF `/v1/me/bot/settings PATCH` must target nullalis `/settings` (not `/config` which returns 403). zaki-prod-side change. Cite: P4_ops_truth drift #1, P4_zaki_prod_bff.
+- [x] **S1.12** `NULLCLAW_STATE_MASTER_KEY` — add `valueFrom.secretKeyRef` in `deploy/k8s/zaki-bot/05-deployment.yaml` + set secret via sealed-secrets or operator. Cite: P4_ops_truth drift #2, state-secrets-wiring.md:51-52.
+- [x] **S1.13** pgvector dim-mismatch guard — `store_pgvector.zig:394-410` → refuse + log-error + document migration path, do NOT drop. Cite: P4_schema risk #1.
 
 **Sprint 1 DoD:** Sentry captures a test error in staging. Logs ship as JSON. `grep "catch {}" src/daemon.zig` shows the 3 fixed sites replaced. Open settings → no 403. Telegram voice note → voice reply. Subagent task with no post-tool text → clear `[no reply]` placeholder, actual result arrives on follow-up.
+
+**Sprint 1 — CLOSED 2026-04-22 at `963fc92`** (nullalis) + `c329e9a` (zaki-infra).
+
+Ship:
+- Observability triad live: Sentry DSN + inner-loop `.err`→`captureError` + signal handlers default-on + JSON log format, all opt-in via env with NULLCLAW_→NULLALIS_ fallback.
+- OtelObserver instantiated when `NULLALIS_OTEL_ENDPOINT` set; NoopObserver in slot otherwise — composition stable across deployments.
+- Data-loss landmines closed: cron.json wipe guard (`loaded_from_disk` + strict boot load), pgvector destructive-rebuild refusal + explicit opt-in override.
+- User-visible bugs fixed: `/new` actually clears postgres `autosave_*` rows; Telegram voice replies fire on real voice notes; gateway no longer fabricates `"received"` as a reply body.
+- Inert run-scoped approval scaffolding removed with design doc embedded for proper revival.
+- Carried `http_request` default flip landed as its own commit for clean audit.
+- zaki-infra chart README documents NULLALIS_* secrets + observability keys + rebrand migration path.
+- S1.11 verified stale (BFF was already correct) — no code change.
+
+DoD verification:
+- `zig build test -Dengines=all` green at every commit (postgres path compiled in).
+- Per-item grep sanity sweep passes (see sprint-1 close-out chat log).
+- `.spike/run.sh` cold + polluted — pending (operator-gated; Nova to run pre-merge).
+
+Deferred-but-tracked (with rationale):
+- **S1.10 full TurnOutcome refactor**: interim honest placeholder shipped. Full `{text, tool_calls_executed, spawned_task_ids}` struct return + structured tool-only-turn SSE frame touches gateway / session / agent signatures and requires BFF + frontend consumers. Queued for its own sprint.
+- **Run-scoped approval feature (S1.9)**: enum value deleted; full design documented in `src/security/approval_modes.zig` for revival when the user-facing verb + cache lifetime are built end-to-end. Queued for Sprint 4+ or Wave M.
+
+PR path: merge `repair/sprint-1-visibility` → `main` once `.spike/run.sh` confirms baseline. Tag post-merge. Then branch `repair/sprint-2-revenue-loop`.
 
 ---
 
