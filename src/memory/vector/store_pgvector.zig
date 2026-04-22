@@ -387,8 +387,26 @@ pub const PgvectorVectorStore = struct {
 
         if (try self.readEmbeddingDimensions(conn)) |existing_dims| {
             if (existing_dims != self.dimensions) {
+                // REFUSE by default — silently dropping the table loses every
+                // embedding ever computed for every user. Operators must opt
+                // into the destructive rebuild explicitly, after exporting or
+                // accepting data loss.
+                const allow_destructive = allowDestructiveRebuild(self.allocator);
+                if (!allow_destructive) {
+                    log.err(
+                        "pgvector dimension mismatch for table '{s}': existing={d} expected={d}. " ++
+                            "Refusing to drop the table (all embeddings would be lost). " ++
+                            "To continue: either (a) change the embedding provider back to a model " ++
+                            "producing dim={d}, (b) rename the table via memory.vector_store.table_name " ++
+                            "to start a fresh side-by-side table, or (c) set " ++
+                            "NULLALIS_PGVECTOR_ALLOW_DESTRUCTIVE_REBUILD=1 to explicitly accept the data loss.",
+                        .{ self.table_name, existing_dims, self.dimensions, existing_dims },
+                    );
+                    return error.PgVectorDimensionMismatch;
+                }
                 log.warn(
-                    "pgvector dimension mismatch for table '{s}': existing={d} expected={d}; rebuilding vector table",
+                    "pgvector dimension mismatch for table '{s}': existing={d} expected={d}; " ++
+                        "NULLALIS_PGVECTOR_ALLOW_DESTRUCTIVE_REBUILD=1 set — rebuilding and dropping existing embeddings",
                     .{ self.table_name, existing_dims, self.dimensions },
                 );
                 const drop_sql_plain = try std.fmt.allocPrint(self.allocator, "DROP TABLE IF EXISTS {s}", .{self.qualified_table_name});
@@ -408,6 +426,29 @@ pub const PgvectorVectorStore = struct {
                 try self.createTable(conn);
             }
         }
+    }
+
+    fn allowDestructiveRebuild(allocator: std.mem.Allocator) bool {
+        const primary = std.process.getEnvVarOwned(allocator, "NULLALIS_PGVECTOR_ALLOW_DESTRUCTIVE_REBUILD") catch null;
+        if (primary) |raw| {
+            defer allocator.free(raw);
+            return isTruthy(raw);
+        }
+        const legacy = std.process.getEnvVarOwned(allocator, "NULLCLAW_PGVECTOR_ALLOW_DESTRUCTIVE_REBUILD") catch return false;
+        defer allocator.free(legacy);
+        if (isTruthy(legacy)) {
+            log.warn("env NULLCLAW_PGVECTOR_ALLOW_DESTRUCTIVE_REBUILD is deprecated; use NULLALIS_PGVECTOR_ALLOW_DESTRUCTIVE_REBUILD", .{});
+            return true;
+        }
+        return false;
+    }
+
+    fn isTruthy(raw: []const u8) bool {
+        const v = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, v, "1") or
+            std.ascii.eqlIgnoreCase(v, "true") or
+            std.ascii.eqlIgnoreCase(v, "yes") or
+            std.ascii.eqlIgnoreCase(v, "on");
     }
 
     fn createTable(self: *Self, conn: *c.PGconn) !void {
