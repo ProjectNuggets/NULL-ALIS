@@ -26,6 +26,20 @@ const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
 const sentry_runtime = @import("sentry_runtime.zig");
+
+/// Placeholder body emitted when a turn returned an empty reply (tool-only
+/// turn — the model called spawn/delegate or a silent tool and produced no
+/// post-tool assistant text). Prior shipped versions emitted the literal
+/// "received" here, which users read as the actual reply and closed the
+/// session — missing the real subagent output that arrived on a later SSE
+/// frame. See project_subagent_received_bug.md for the full diagnosis and
+/// P2_subagent_delegate.md for the architectural TurnOutcome refactor that
+/// replaces this string path entirely (tracked separately).
+///
+/// The interim honest text makes the absence of a reply explicit so the
+/// user knows to wait for follow-up content rather than treating the
+/// fabricated string as the answer.
+pub const EMPTY_TURN_PLACEHOLDER = "[tools ran, no direct reply this turn — results may arrive on a follow-up.]";
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const agent_routing = @import("agent_routing.zig");
@@ -9197,7 +9211,7 @@ fn handleApiChatStreamSseConnection(
     const payload_text = if (reply.len > 0)
         reply
     else
-        "received";
+        EMPTY_TURN_PLACEHOLDER;
 
     // Determine if live streaming actually delivered tokens. If the provider
     // does not support streaming, live_seq stays 0 and we must fall back to
@@ -10575,7 +10589,7 @@ fn handleApiRoute(
         const payload_text = if (reply.len > 0)
             req_allocator.dupe(u8, reply) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" }
         else
-            req_allocator.dupe(u8, "received") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" };
+            req_allocator.dupe(u8, EMPTY_TURN_PLACEHOLDER) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" };
         defer req_allocator.free(payload_text);
         const sse_start_ms = std.time.milliTimestamp();
         const sse = sseBufferedChatPayload(req_allocator, status_frame, progress_observer_impl.frames.items, payload_text, session_key) catch {
