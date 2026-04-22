@@ -1075,7 +1075,9 @@ const TenantRuntime = struct {
     trace_store: *run_trace_store_mod.RunTraceStore,
     log_obs: *observability.LogObserver,
     metrics_obs: LifecycleMetricsObserver,
-    observer_slots: [4]Observer,
+    otel_obs: ?*observability.OtelObserver = null,
+    noop_obs: observability.NoopObserver = .{},
+    observer_slots: [5]Observer,
     observer_multi: observability.MultiObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: std.atomic.Value(i64),
@@ -1323,11 +1325,19 @@ const TenantRuntime = struct {
         );
         runtime.trace_store = trace_store;
 
+        if (observability.OtelObserver.fromEnv(allocator)) |otel_init| {
+            const otel_ptr = allocator.create(observability.OtelObserver) catch null;
+            if (otel_ptr) |p| {
+                p.* = otel_init;
+                runtime.otel_obs = p;
+            }
+        }
         runtime.observer_slots = .{
             runtime.log_obs.observer(),
             runtime.metrics_obs.observer(),
             runtime.trace_store.observer(),
             sentry_runtime.globalOrFallback().observer(),
+            if (runtime.otel_obs) |otel| otel.observer() else runtime.noop_obs.observer(),
         };
         runtime.observer_multi = .{ .observers = runtime.observer_slots[0..] };
 
@@ -1545,6 +1555,10 @@ const TenantRuntime = struct {
         self.allocator.destroy(self.task_ledger);
         self.provider_bundle.deinit();
         self.allocator.destroy(self.log_obs);
+        if (self.otel_obs) |otel| {
+            otel.deinit();
+            self.allocator.destroy(otel);
+        }
         self.allocator.free(self.workspace_path);
         self.allocator.free(self.user_id);
         self.allocator.destroy(self);
@@ -14009,7 +14023,10 @@ pub fn runWithRole(
     var standalone_usage_rt: ?usage_runtime_mod.UsageRuntime = null;
     var log_obs_gateway = observability.LogObserver{};
     var metrics_obs_gateway = LifecycleMetricsObserver{ .metrics = &state.lifecycle_metrics };
-    var gateway_observer_slots: [3]Observer = undefined;
+    var noop_obs_gateway = observability.NoopObserver{};
+    var otel_obs_gateway_opt: ?observability.OtelObserver = observability.OtelObserver.fromEnv(allocator);
+    defer if (otel_obs_gateway_opt) |*otel| otel.deinit();
+    var gateway_observer_slots: [4]Observer = undefined;
     var gateway_observer_multi = observability.MultiObserver{ .observers = &.{} };
     const needs_local_agent = gatewayRoleNeedsLocalAgent(role, event_bus != null);
 
@@ -14156,6 +14173,7 @@ pub fn runWithRole(
                     log_obs_gateway.observer(),
                     metrics_obs_gateway.observer(),
                     sentry_runtime.globalOrFallback().observer(),
+                    if (otel_obs_gateway_opt) |*otel| otel.observer() else noop_obs_gateway.observer(),
                 };
                 gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
 
