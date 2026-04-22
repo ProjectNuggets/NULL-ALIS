@@ -855,7 +855,14 @@ pub const Agent = struct {
         return switch (self.tts_mode) {
             .off => false,
             .always => true,
-            .inbound => containsAsciiIgnoreCase(user_message, "[voice:") or containsAsciiIgnoreCase(user_message, "[audio:"),
+            // Telegram + other channel adapters emit "[Voice]: <transcript>" and
+            // "[Audio]: <transcript>" (bracket closes before the colon). The
+            // prior form "[voice:" / "[audio:" matched the bracketed sentinel
+            // used by the agent output pipeline, not the inbound-channel prefix,
+            // so voice_replies=on was silently a no-op on real voice notes.
+            // Match "[voice]" / "[audio]" instead, which is a prefix of both
+            // forms and is case-insensitive-safe.
+            .inbound => containsAsciiIgnoreCase(user_message, "[voice]") or containsAsciiIgnoreCase(user_message, "[audio]"),
             .tagged => containsAsciiIgnoreCase(user_message, "#tts") or containsAsciiIgnoreCase(user_message, "[tts]"),
         };
     }
