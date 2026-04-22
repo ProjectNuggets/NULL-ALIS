@@ -152,7 +152,9 @@ pub const Runtime = struct {
         const traces_sample_rate = readEnvF64WithFallback(self.allocator, "NULLALIS_SENTRY_TRACES_SAMPLE_RATE", "NULLCLAW_SENTRY_TRACES_SAMPLE_RATE", 0.0);
         const debug = readEnvBoolWithFallback(self.allocator, "NULLALIS_SENTRY_DEBUG", "NULLCLAW_SENTRY_DEBUG", false);
         const auto_session_tracking = readEnvBoolWithFallback(self.allocator, "NULLALIS_SENTRY_AUTO_SESSION", "NULLCLAW_SENTRY_AUTO_SESSION", false);
-        const install_signal_handlers = readEnvBoolWithFallback(self.allocator, "NULLALIS_SENTRY_INSTALL_SIGNAL_HANDLERS", "NULLCLAW_SENTRY_INSTALL_SIGNAL_HANDLERS", false);
+        // Signal handlers ON by default so crashes (SIGSEGV, SIGABRT, etc.) are
+        // captured. Operators can opt out explicitly by setting the env var to 0.
+        const install_signal_handlers = readEnvBoolWithFallback(self.allocator, "NULLALIS_SENTRY_INSTALL_SIGNAL_HANDLERS", "NULLCLAW_SENTRY_INSTALL_SIGNAL_HANDLERS", true);
 
         self.client = try sentry.init(self.allocator, .{
             .dsn = self.dsn.?,
