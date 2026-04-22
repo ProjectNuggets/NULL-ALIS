@@ -1,8 +1,38 @@
 const std = @import("std");
 const sentry = @import("sentry-zig");
 const version = @import("version.zig");
+const observability = @import("observability.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// Process-global Sentry runtime pointer. Set once by main.zig after boot so
+/// observability composition sites (gateway, session, channel_loop) can attach
+/// a SentryObserver without threading the runtime through every init call.
+var current_runtime: ?*Runtime = null;
+
+pub fn setGlobal(rt: *Runtime) void {
+    current_runtime = rt;
+}
+
+pub fn clearGlobal() void {
+    current_runtime = null;
+}
+
+pub fn currentGlobal() ?*Runtime {
+    return current_runtime;
+}
+
+/// Always-disabled stub used as an observer fallback when the real Runtime
+/// hasn't been set yet (unit tests, pre-main setup). The stub's client stays
+/// null so every captureError is a no-op.
+var fallback_disabled: Runtime = .{ .allocator = undefined };
+
+/// Return the process Sentry runtime if registered, otherwise a safe disabled
+/// stub. Callers wiring the observer chain should use this so they can always
+/// attach a Sentry observer without threading null-checks through composition.
+pub fn globalOrFallback() *Runtime {
+    return current_runtime orelse &fallback_disabled;
+}
 
 pub const Runtime = struct {
     allocator: Allocator,
@@ -54,6 +84,55 @@ pub const Runtime = struct {
         if (self.client) |client| {
             _ = client.flush(timeout_ms);
         }
+    }
+
+    // ── Observer interface ────────────────────────────────────────────
+    //
+    // Runtime implements observability.Observer directly so composition sites
+    // can attach it alongside LogObserver / MetricsObserver without a separate
+    // wrapper struct. Only ObserverEvent.err and elevated .system_notice are
+    // captured — other events are noise for Sentry.
+
+    const runtime_observer_vtable = observability.Observer.VTable{
+        .record_event = observerRecordEvent,
+        .record_metric = observerRecordMetric,
+        .flush = observerFlush,
+        .name = observerName,
+    };
+
+    pub fn observer(self: *Runtime) observability.Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &runtime_observer_vtable };
+    }
+
+    fn resolveObserver(ptr: *anyopaque) *Runtime {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn observerRecordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self = resolveObserver(ptr);
+        if (!self.isEnabled()) return;
+        switch (event.*) {
+            .err => |e| self.captureError(e.component, e.message),
+            .system_notice => |n| {
+                const is_elevated = std.ascii.eqlIgnoreCase(n.severity, "error") or
+                    std.ascii.eqlIgnoreCase(n.severity, "critical");
+                if (!is_elevated) return;
+                var buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ n.kind, n.message }) catch n.message;
+                self.captureError(n.kind, msg);
+            },
+            else => {},
+        }
+    }
+
+    fn observerRecordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+
+    fn observerFlush(ptr: *anyopaque) void {
+        resolveObserver(ptr).flush(2000);
+    }
+
+    fn observerName(_: *anyopaque) []const u8 {
+        return "sentry";
     }
 
     fn bootstrap(self: *Runtime) !void {
@@ -193,4 +272,21 @@ test "parseBool supports common true/false values" {
     try std.testing.expectEqual(@as(?bool, false), parseBool("false"));
     try std.testing.expectEqual(@as(?bool, false), parseBool("0"));
     try std.testing.expectEqual(@as(?bool, null), parseBool("maybe"));
+}
+
+test "Runtime observer is a safe no-op when Sentry disabled" {
+    var rt = Runtime{ .allocator = std.testing.allocator };
+    try std.testing.expect(!rt.isEnabled());
+
+    const o = rt.observer();
+    const e = observability.ObserverEvent{ .err = .{ .component = "test", .message = "boom" } };
+    o.recordEvent(&e);
+    o.flush();
+
+    const notice = observability.ObserverEvent{
+        .system_notice = .{ .kind = "generic", .severity = "info", .message = "noise" },
+    };
+    o.recordEvent(&notice);
+
+    try std.testing.expectEqualStrings("sentry", o.getName());
 }

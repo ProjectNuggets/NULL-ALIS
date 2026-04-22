@@ -25,6 +25,7 @@ const zaki_dual_memory = @import("memory/engines/zaki_dual.zig");
 const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
+const sentry_runtime = @import("sentry_runtime.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const agent_routing = @import("agent_routing.zig");
@@ -1074,7 +1075,7 @@ const TenantRuntime = struct {
     trace_store: *run_trace_store_mod.RunTraceStore,
     log_obs: *observability.LogObserver,
     metrics_obs: LifecycleMetricsObserver,
-    observer_slots: [3]Observer,
+    observer_slots: [4]Observer,
     observer_multi: observability.MultiObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: std.atomic.Value(i64),
@@ -1326,6 +1327,7 @@ const TenantRuntime = struct {
             runtime.log_obs.observer(),
             runtime.metrics_obs.observer(),
             runtime.trace_store.observer(),
+            sentry_runtime.globalOrFallback().observer(),
         };
         runtime.observer_multi = .{ .observers = runtime.observer_slots[0..] };
 
@@ -14007,7 +14009,7 @@ pub fn runWithRole(
     var standalone_usage_rt: ?usage_runtime_mod.UsageRuntime = null;
     var log_obs_gateway = observability.LogObserver{};
     var metrics_obs_gateway = LifecycleMetricsObserver{ .metrics = &state.lifecycle_metrics };
-    var gateway_observer_slots: [2]Observer = undefined;
+    var gateway_observer_slots: [3]Observer = undefined;
     var gateway_observer_multi = observability.MultiObserver{ .observers = &.{} };
     const needs_local_agent = gatewayRoleNeedsLocalAgent(role, event_bus != null);
 
@@ -14153,6 +14155,7 @@ pub fn runWithRole(
                 gateway_observer_slots = .{
                     log_obs_gateway.observer(),
                     metrics_obs_gateway.observer(),
+                    sentry_runtime.globalOrFallback().observer(),
                 };
                 gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
 

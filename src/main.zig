@@ -339,6 +339,11 @@ pub fn main() !void {
     sentry_runtime = &runtime;
     defer sentry_runtime = null;
 
+    // Register globally so gateway/session observer chains can attach a
+    // SentryObserver without threading the runtime through every init call.
+    yc.sentry_runtime.setGlobal(&runtime);
+    defer yc.sentry_runtime.clearGlobal();
+
     runMain(allocator) catch |err| {
         runtime.captureError("main", @errorName(err));
         runtime.flush(2000);
