@@ -11070,84 +11070,247 @@ fn handleApiRoute(
     }
 
     if (std.mem.startsWith(u8, parsed.subpath, "secrets/")) {
-        const secret_key = parsed.subpath["secrets/".len..];
-        const secret_path = resolveSecretPath(req_allocator, user_ctx.secrets_dir, secret_key) catch {
-            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid secret key\"}" };
-        };
-        defer req_allocator.free(secret_path);
+        // D8 (S2.12–S2.16) — hard replacement of the legacy
+        // secrets/<key> surface. The old GET returned plaintext
+        // (plan.md §3 explicit vulnerability); the old PUT/DELETE
+        // mutated without confirmation. The new surface is
+        // metadata-only + two-phase mutation gated by the
+        // ConfirmationTokenStore (src/gateway/secret_vault.zig).
+        // BFF callers that depended on the legacy GET-plaintext
+        // behavior MUST migrate to caching the value at PUT time;
+        // nullalis no longer reveals secrets post-save.
+        //
+        // Routes dispatched here:
+        //   GET    secrets/<key>          → metadata (S2.12)
+        //   POST   secrets/<key>/prepare  → confirmation token (S2.13)
+        //   PUT    secrets/<key>          → write (S2.14, token required)
+        //   DELETE secrets/<key>          → delete (S2.15, token required)
+        //   GET    secrets/<key>/audit    → recent mutations (S2.16)
+        const rest = parsed.subpath["secrets/".len..];
+        const prepare_suffix = "/prepare";
+        const audit_suffix = "/audit";
 
-        if (std.mem.eql(u8, method, "GET")) {
-            var owned_secret: ?[]u8 = null;
-            defer if (owned_secret) |v| req_allocator.free(v);
-            const value_text: []const u8 = if (state.zaki_state) |mgr| blk: {
-                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                const secret_value = mgr.getSecret(req_allocator, user_id, secret_key) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
-                };
-                if (secret_value) |v| {
-                    owned_secret = v;
-                    break :blk v;
-                }
-                break :blk "";
-            } else blk: {
-                break :blk readFileOrDefault(req_allocator, secret_path, "") catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
-                };
+        const Route = union(enum) {
+            prepare: []const u8, // inner is the secret key
+            audit: []const u8,
+            key_only: []const u8,
+        };
+
+        const route: Route = blk: {
+            if (std.mem.endsWith(u8, rest, prepare_suffix) and rest.len > prepare_suffix.len) {
+                break :blk .{ .prepare = rest[0 .. rest.len - prepare_suffix.len] };
+            }
+            if (std.mem.endsWith(u8, rest, audit_suffix) and rest.len > audit_suffix.len) {
+                break :blk .{ .audit = rest[0 .. rest.len - audit_suffix.len] };
+            }
+            break :blk .{ .key_only = rest };
+        };
+
+        const secret_key: []const u8 = switch (route) {
+            .prepare => |k| k,
+            .audit => |k| k,
+            .key_only => |k| k,
+        };
+        if (!isValidIdentifier(secret_key)) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_secret_key\"}" };
+        }
+
+        const mgr = state.zaki_state orelse {
+            // Gated API requires DB-backed audit. File-only backends
+            // can't satisfy the mutation audit contract; rather than
+            // falling back silently we 503 so operators notice.
+            return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"secret_vault_requires_state_backend\"}" };
+        };
+        const user_id_numeric = parseNumericUserId(scoped_user_id) catch {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+        };
+        const actor_id = extractZakiUserId(raw_request);
+
+        // S2.13 — POST secrets/<key>/prepare
+        if (route == .prepare) {
+            if (!std.mem.eql(u8, method, "POST")) {
+                return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            }
+            const body = extractBody(raw_request) orelse return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"missing_body\",\"detail\":\"expected {\\\"action\\\":\\\"put\\\"|\\\"delete\\\"}\"}",
             };
-            if (value_text.len == 0) return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" };
+            const action_str = jsonStringField(body, "action") orelse return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"missing_action\",\"detail\":\"expected \\\"put\\\" or \\\"delete\\\"\"}",
+            };
+            const action = secret_vault.SecretAction.fromSlice(action_str) orelse {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_action\",\"detail\":\"must be \\\"put\\\" or \\\"delete\\\"\"}" };
+            };
+
+            var token_buf: [secret_vault.TOKEN_HEX_LEN]u8 = undefined;
+            const token = state.secret_tokens.prepare(scoped_user_id, secret_key, action, &token_buf) catch {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, action.toSlice(), actor_id, "prepare_failed", null) catch {};
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"token_prepare_failed\"}" };
+            };
+
+            mgr.recordSecretMutation(user_id_numeric, secret_key, action.toSlice(), actor_id, "prepare_issued", null) catch {};
+
+            const ttl = state.secret_tokens.ttl_secs;
+            const expires_at = std.time.timestamp() + ttl;
             var resp: std.ArrayListUnmanaged(u8) = .empty;
             defer resp.deinit(req_allocator);
             const w = resp.writer(req_allocator);
-            w.print("{{\"key\":\"{s}\",\"value\":\"", .{secret_key}) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
-            jsonEscapeInto(w, value_text) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
-            w.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            w.print("{{\"token\":\"{s}\",\"expires_at_unix\":{d},\"action\":\"{s}\"}}", .{ token, expires_at, action.toSlice() }) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            };
             return .{ .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"response build failed\"}" };
         }
+
+        // S2.16 — GET secrets/<key>/audit
+        if (route == .audit) {
+            if (!std.mem.eql(u8, method, "GET")) {
+                return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            }
+            const records = mgr.listSecretMutations(req_allocator, user_id_numeric, 25) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"audit_read_failed\"}" };
+            };
+            defer {
+                for (records) |r| r.deinit(req_allocator);
+                req_allocator.free(records);
+            }
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            defer resp.deinit(req_allocator);
+            const w = resp.writer(req_allocator);
+            w.print("{{\"key\":\"{s}\",\"mutations\":[", .{secret_key}) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            };
+            var first: bool = true;
+            for (records) |r| {
+                // Filter to the requested key only — the DB query pulls ALL
+                // recent mutations for the user; the audit endpoint scopes
+                // to one key. (Alternative would be a key-filtered query,
+                // but the current list is capped at 100 rows total — cheap
+                // to filter in memory.)
+                if (!std.mem.eql(u8, r.key, secret_key)) continue;
+                if (!first) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                first = false;
+                w.writeAll("{\"id\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, r.id) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\",\"action\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, r.action) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\",\"outcome\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, r.outcome) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\",\"actor\":") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                if (r.actor) |a| {
+                    w.writeAll("\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                    jsonEscapeInto(w, a) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                    w.writeAll("\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                } else {
+                    w.writeAll("null") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                }
+                w.print(",\"at_unix\":{d}}}", .{r.at_unix}) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            }
+            w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"response build failed\"}" };
+        }
+
+        // route == .key_only — GET metadata / PUT / DELETE
+        if (std.mem.eql(u8, method, "GET")) {
+            // S2.12 — metadata only, NEVER reveal plaintext.
+            const meta = mgr.getSecretMetadata(req_allocator, user_id_numeric, secret_key) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"metadata_read_failed\"}" };
+            } orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"secret_not_found\"}" };
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            defer resp.deinit(req_allocator);
+            const w = resp.writer(req_allocator);
+            w.print("{{\"key\":\"{s}\",\"created_at_unix\":{d},\"updated_at_unix\":{d}}}", .{
+                secret_key,
+                meta.created_at_unix,
+                meta.updated_at_unix,
+            }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"response build failed\"}" };
+        }
+
         if (std.mem.eql(u8, method, "PUT")) {
-            const body = extractBody(raw_request) orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
-            const value = jsonStringField(body, "value") orelse body;
+            // S2.14 — write requires a prior prepare token for action=put.
+            const body = extractBody(raw_request) orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_body\"}" };
+            const token = jsonStringField(body, "confirmation_token") orelse {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_no_token", null) catch {};
+                return .{ .status = "401 Unauthorized", .body = "{\"error\":\"confirmation_token_required\",\"detail\":\"call POST /secrets/<key>/prepare first\"}" };
+            };
+            const value = jsonStringField(body, "value") orelse {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_no_value", null) catch {};
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_value\"}" };
+            };
+
+            switch (state.secret_tokens.consume(token, scoped_user_id, secret_key, .put)) {
+                .ok => {},
+                .not_found => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_token_invalid", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_invalid\"}" };
+                },
+                .expired => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_token_expired", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_expired\"}" };
+                },
+                .mismatch => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_action_mismatch", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_action_mismatch\"}" };
+                },
+            }
+
             if (std.mem.eql(u8, secret_key, "telegram_bot_token")) {
                 const normalized = normalizeTelegramBotToken(value);
                 if (!isLikelyTelegramBotToken(normalized)) {
-                    return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid telegram bot token\"}" };
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_invalid_format", "telegram_bot_token") catch {};
+                    return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_telegram_bot_token\"}" };
                 }
             }
-            if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                const write_value = if (std.mem.eql(u8, secret_key, "telegram_bot_token"))
-                    normalizeTelegramBotToken(value)
-                else
-                    value;
-                mgr.putSecret(user_id, secret_key, write_value) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-                };
-            } else {
-                const write_value = if (std.mem.eql(u8, secret_key, "telegram_bot_token"))
-                    normalizeTelegramBotToken(value)
-                else
-                    value;
-                writeFile(secret_path, write_value) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-                };
-            }
+            const write_value = if (std.mem.eql(u8, secret_key, "telegram_bot_token"))
+                normalizeTelegramBotToken(value)
+            else
+                value;
+            mgr.putSecret(user_id_numeric, secret_key, write_value) catch {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "write_failed", null) catch {};
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write_failed\"}" };
+            };
+            mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "ok", null) catch {};
             return .{ .body = "{\"status\":\"updated\"}" };
         }
+
         if (std.mem.eql(u8, method, "DELETE")) {
-            if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                const deleted = mgr.deleteSecret(user_id, secret_key) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete failed\"}" };
-                };
-                if (!deleted) return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" };
-            } else {
-                std.fs.deleteFileAbsolute(secret_path) catch |err| switch (err) {
-                    error.FileNotFound => return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" },
-                    else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete failed\"}" },
-                };
+            // S2.15 — delete requires a prior prepare token for action=delete.
+            const body = extractBody(raw_request) orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_body\",\"detail\":\"expected {\\\"confirmation_token\\\":\\\"...\\\"}\"}" };
+            const token = jsonStringField(body, "confirmation_token") orelse {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "rejected_no_token", null) catch {};
+                return .{ .status = "401 Unauthorized", .body = "{\"error\":\"confirmation_token_required\"}" };
+            };
+
+            switch (state.secret_tokens.consume(token, scoped_user_id, secret_key, .delete)) {
+                .ok => {},
+                .not_found => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "rejected_token_invalid", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_invalid\"}" };
+                },
+                .expired => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "rejected_token_expired", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_expired\"}" };
+                },
+                .mismatch => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "rejected_action_mismatch", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_action_mismatch\"}" };
+                },
             }
+
+            const deleted = mgr.deleteSecret(user_id_numeric, secret_key) catch {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "write_failed", null) catch {};
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete_failed\"}" };
+            };
+            if (!deleted) {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "not_found", null) catch {};
+                return .{ .status = "404 Not Found", .body = "{\"error\":\"secret_not_found\"}" };
+            }
+            mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "ok", null) catch {};
             return .{ .body = "{\"status\":\"deleted\"}" };
         }
-        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
     }
 
     if (parseUserChannelBindingsSubpath(parsed.subpath)) |bindings_path| {

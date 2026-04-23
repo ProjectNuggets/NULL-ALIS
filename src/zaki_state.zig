@@ -92,6 +92,34 @@ pub const UserOwnershipLeaseSnapshot = struct {
     }
 };
 
+// D8 (secret vault) — types hoisted to module scope so both the
+// postgres-backed ManagerImpl and the no-postgres stub Manager can
+// reference them uniformly.
+
+pub const SecretMetadata = struct {
+    created_at_unix: i64,
+    updated_at_unix: i64,
+};
+
+pub const SecretMutationRecord = struct {
+    id: []const u8,
+    key: []const u8,
+    action: []const u8,
+    actor: ?[]const u8,
+    outcome: []const u8,
+    detail: ?[]const u8,
+    at_unix: i64,
+
+    pub fn deinit(self: *const SecretMutationRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.key);
+        allocator.free(self.action);
+        if (self.actor) |a| allocator.free(a);
+        allocator.free(self.outcome);
+        if (self.detail) |d| allocator.free(d);
+    }
+};
+
 pub const TaskSnapshot = struct {
     id: []u8,
     session_id: ?[]u8,
@@ -173,6 +201,20 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     }
     pub fn listSecretKeys(_: *@This(), allocator: std.mem.Allocator, _: i64) ![][]const u8 {
         return allocator.alloc([]const u8, 0);
+    }
+    // D8 — no-postgres stubs. The gated secret vault requires the DB
+    // backend for audit integrity; callers see 503 from the gateway
+    // handler when `state.zaki_state` is null, but these stubs still
+    // need to exist so comptime method lookup resolves on the
+    // non-postgres Manager variant.
+    pub fn getSecretMetadata(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?SecretMetadata {
+        return null;
+    }
+    pub fn recordSecretMutation(_: *@This(), _: i64, _: []const u8, _: []const u8, _: ?[]const u8, _: []const u8, _: ?[]const u8) !void {
+        return error.PostgresNotEnabled;
+    }
+    pub fn listSecretMutations(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]SecretMutationRecord {
+        return allocator.alloc(SecretMutationRecord, 0);
     }
     pub fn listUserSessions(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]SessionInfo {
         return allocator.alloc(SessionInfo, 0);
@@ -1200,11 +1242,6 @@ const ManagerImpl = struct {
     // `created_at` + `updated_at` as unix-seconds so the client can
     // show "last rotated 3 days ago" without decryption ever running.
 
-    pub const SecretMetadata = struct {
-        created_at_unix: i64,
-        updated_at_unix: i64,
-    };
-
     pub fn getSecretMetadata(self: *Self, allocator: std.mem.Allocator, user_id: i64, key: []const u8) !?SecretMetadata {
         const q = try self.buildQuery(
             "SELECT EXTRACT(EPOCH FROM created_at)::bigint, EXTRACT(EPOCH FROM updated_at)::bigint " ++
@@ -1280,25 +1317,6 @@ const ManagerImpl = struct {
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
     }
-
-    pub const SecretMutationRecord = struct {
-        id: []const u8,
-        key: []const u8,
-        action: []const u8,
-        actor: ?[]const u8,
-        outcome: []const u8,
-        detail: ?[]const u8,
-        at_unix: i64,
-
-        pub fn deinit(self: *const SecretMutationRecord, allocator: std.mem.Allocator) void {
-            allocator.free(self.id);
-            allocator.free(self.key);
-            allocator.free(self.action);
-            if (self.actor) |a| allocator.free(a);
-            allocator.free(self.outcome);
-            if (self.detail) |d| allocator.free(d);
-        }
-    };
 
     pub fn listSecretMutations(
         self: *Self,
