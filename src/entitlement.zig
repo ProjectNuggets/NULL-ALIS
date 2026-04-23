@@ -281,13 +281,23 @@ fn defaultResolver(user_id: []const u8) ?Entitlement {
 /// Called from gateway handlers that process provision + revocation
 /// events. The `user_id` slice is duplicated; callers may free their
 /// buffer after the call returns.
+///
+/// Self-review finding: dupe BEFORE the getOrPut so an allocation
+/// failure cannot leave a map entry keyed on a dangling slice. If the
+/// entry already exists, drop the fresh dupe — we keep the original
+/// owned key to preserve pointer stability for any concurrent reader
+/// that already computed its hash from the previous key bytes.
 pub fn installEntitlement(user_id: []const u8, ent: Entitlement) !void {
     store_mutex.lock();
     defer store_mutex.unlock();
     const alloc = store_allocator orelse return error.DefaultStoreNotInitialized;
-    const gop = try store_map.getOrPut(alloc, user_id);
-    if (!gop.found_existing) {
-        gop.key_ptr.* = try alloc.dupe(u8, user_id);
+    const owned_key = try alloc.dupe(u8, user_id);
+    errdefer alloc.free(owned_key);
+    const gop = try store_map.getOrPut(alloc, owned_key);
+    if (gop.found_existing) {
+        alloc.free(owned_key);
+    } else {
+        gop.key_ptr.* = owned_key;
     }
     gop.value_ptr.* = ent;
 }
@@ -339,6 +349,35 @@ test "default resolver returns null for unknown users" {
 
     useDefaultResolver(std.testing.allocator);
     try std.testing.expect(resolveUserEntitlement("nobody-home") == null);
+}
+
+test "installEntitlement does not leak owned keys when caller slice is reused (self-review)" {
+    resetDefaultStore();
+    defer resetDefaultStore();
+    clearResolver();
+    defer clearResolver();
+
+    useDefaultResolver(std.testing.allocator);
+
+    // Install using a short-lived stack buffer — the store must dupe
+    // so the entry survives after the buffer is overwritten. This is
+    // the invariant that the FINDING 1 fix preserves: dupe-before-put,
+    // so an allocation failure cannot leave a map entry keyed on a
+    // dangling slice. The positive path (no failure) is what we cover
+    // here; OOM injection would need a failing-allocator test harness.
+    var scratch: [16]u8 = undefined;
+    @memcpy(scratch[0..3], "u42");
+    try installEntitlement(scratch[0..3], Entitlement.defaultsFor(.pro));
+    // Overwrite the caller's buffer to catch any dangling-key reads.
+    @memcpy(scratch[0..3], "xxx");
+
+    const got = resolveUserEntitlement("u42") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Tier.pro, got.tier);
+
+    // Re-install under the same user_id — must not double-dupe or leak.
+    try installEntitlement("u42", Entitlement.defaultsFor(.team));
+    const after = resolveUserEntitlement("u42") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Tier.team, after.tier);
 }
 
 test "resolver honors set fn" {
