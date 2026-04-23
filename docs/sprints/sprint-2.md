@@ -14,7 +14,7 @@
 - [ ] **S2.3** Enforcement chokepoint 1 — chat-stream entry (`gateway.zig:~13396`). Reject with `402` if beyond plan.
 - [ ] **S2.4** Enforcement chokepoint 2 — tool execution (`agent/dispatcher.zig` preflight).
 - [ ] **S2.5** Enforcement chokepoint 3 — scheduler job dispatch (`daemon.zig:runCronAgentTurn`).
-- [ ] **S2.6** Enforcement chokepoint 4 — Composio/MCP/integration tool calls.
+- [x] **S2.6** Enforcement chokepoint 4 — Composio/MCP/integration tool calls. _Structurally covered by S2.4_: the tool-preflight gate at `src/agent/root.zig::preflightToolPolicy` (commit `9c1a6d2`) runs **before every tool dispatch**, including composio/MCP/integration tools, via the shared `preflightToolPolicy` call path. Gate 3 specifically rejects integration tools (`is_integration`) when `!limits.integrations_enabled` with `ToolPreflightSource.entitlement_required`. No separate chokepoint needed — all integration tool calls funnel through the same preflight.
 - [ ] **S2.7** BFF → nullalis `POST /internal/entitlements/revoke` on Stripe cancel / payment_failed / chargeback.
 - [ ] **S2.8** Flip dead `CostTracker` at `agent/root.zig:2857`. JSONL persistence + daily/monthly cap.
 - [ ] **S2.9** Cost classes A/B/C in `ToolMetadata` at `tools/root.zig:242-472`. Populate for 29 default tools.
@@ -53,6 +53,7 @@ Branch `repair/sprint-2-revenue-loop` off Sprint 1 tip `92ebd59`.
 | 4 | `3fe1f79` | **S2.11** | 64-jobs cap via `active_jobs_cap` in `cron_add` |
 | 5 | `9c1a6d2` | **S2.4** | Tool preflight gate — 3 checks |
 | 6 | `23cac97` | **S2.5** | Scheduler dispatch gate + `resolveUserEntitlement` resolver stub |
+| 7 | _(this commit)_ | **S2.6** | Docs-only: integration-tool chokepoint structurally covered by S2.4 |
 
 Structural skeleton is **in place** — every enforcement chokepoint has a gate, just pointing at default/stub entitlement until S2.1 populates the resolver. Full behavior change lights up when S2.1 + S2.7 (cross-repo) land.
 
