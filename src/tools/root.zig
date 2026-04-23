@@ -10,7 +10,10 @@ const bus = @import("../bus.zig");
 const memory_mod = @import("../memory/root.zig");
 const zaki_state = @import("../zaki_state.zig");
 const observability = @import("../observability.zig");
+const entitlement_mod = @import("../entitlement.zig");
 const Memory = memory_mod.Memory;
+
+pub const Entitlement = entitlement_mod.Entitlement;
 
 // ── JSON arg extraction helpers ─────────────────────────────────
 // Used by all tool implementations to extract typed fields from
@@ -1027,6 +1030,13 @@ pub const RuntimeTurnContext = struct {
     session_key: ?[]const u8 = null,
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    /// Per-session billing + capability state. Default construction gives
+    /// "pro active unlimited" so existing tests + un-plumbed call paths
+    /// keep working. S2.1 (BFF provision response extension) installs the
+    /// real Entitlement when a user session starts; S2.7 revocation
+    /// webhook can swap it mid-session. S2.3-S2.6 enforcement sites read
+    /// this field in preflight. See `src/entitlement.zig` for the type.
+    entitlement: Entitlement = .{},
 };
 
 pub const ToolTenantContext = struct {
