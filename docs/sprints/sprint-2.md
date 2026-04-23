@@ -10,16 +10,16 @@
 ### Entitlement propagation + enforcement (11)
 
 - [ ] **S2.1** Extend `/api/v1/users/provision` response with `plan_tier`, `status`, `period_end`. zaki-prod BFF side.
-- [ ] **S2.2** Nullalis stores entitlement per-session, exposes via `TurnContext.entitlement`.
-- [ ] **S2.3** Enforcement chokepoint 1 — chat-stream entry (`gateway.zig:~13396`). Reject with `402` if beyond plan.
-- [ ] **S2.4** Enforcement chokepoint 2 — tool execution (`agent/dispatcher.zig` preflight).
-- [ ] **S2.5** Enforcement chokepoint 3 — scheduler job dispatch (`daemon.zig:runCronAgentTurn`).
+- [x] **S2.2** Nullalis stores entitlement per-session, exposes via `TurnContext.entitlement`. _Shipped `c13813b` — `Entitlement` type + `RuntimeTurnContext.entitlement` field + per-tier limits; per-session hydration flips on at S2.1._
+- [x] **S2.3** Enforcement chokepoint 1 — chat-stream entry. Reject with `402` if inactive. _Shipped `dae9bea` — 402 gate in both `handleApiChatStreamSseConnection` (SSE) and `handleApiRoute` chat-stream fallback; dormant behind default `.pro/.active` until S2.1 lights up resolver._
+- [x] **S2.4** Enforcement chokepoint 2 — tool execution (`agent/dispatcher.zig` preflight). _Shipped `9c1a6d2` — 3-gate preflight in `preflightToolPolicy`: (1) inactive→block non-read tools, (2) tier-gate class-C for free, (3) integrations-disabled block — all bypassed by `approval_bypass_active`._
+- [x] **S2.5** Enforcement chokepoint 3 — scheduler job dispatch (`daemon.zig:runCronAgentTurn`). _Shipped `23cac97` — entitlement check in `runCronAgentTurnWithBus` after origin resolution; skip + log when `!canAct` or proactive-disabled. Resolver stub landed same commit._
 - [x] **S2.6** Enforcement chokepoint 4 — Composio/MCP/integration tool calls. _Structurally covered by S2.4_: the tool-preflight gate at `src/agent/root.zig::preflightToolPolicy` (commit `9c1a6d2`) runs **before every tool dispatch**, including composio/MCP/integration tools, via the shared `preflightToolPolicy` call path. Gate 3 specifically rejects integration tools (`is_integration`) when `!limits.integrations_enabled` with `ToolPreflightSource.entitlement_required`. No separate chokepoint needed — all integration tool calls funnel through the same preflight.
 - [ ] **S2.7** BFF → nullalis `POST /internal/entitlements/revoke` on Stripe cancel / payment_failed / chargeback.
 - [ ] **S2.8** Flip dead `CostTracker` at `agent/root.zig:2857`. JSONL persistence + daily/monthly cap.
-- [ ] **S2.9** Cost classes A/B/C in `ToolMetadata` at `tools/root.zig:242-472`. Populate for 29 default tools.
+- [x] **S2.9** Cost classes A/B/C in `ToolMetadata` at `tools/root.zig:242-472`. Populate for 29 default tools. _Shipped `f51128d` — `CostClass` enum (weights 1/5/25) + all 39 `DEFAULT_TOOL_METADATA` entries classified (23 class-A / 9 class-B / 7 class-C)._
 - [ ] **S2.10** `Idempotency-Key` enforced on legacy `/api/agent/*` mutating routes.
-- [ ] **S2.11** Enforce "64 active jobs per user" cap in `tools/schedule.zig` + `zaki_state.zig`.
+- [x] **S2.11** Enforce "64 active jobs per user" cap in `tools/schedule.zig` + `zaki_state.zig`. _Shipped `3fe1f79` — cap enforced in `cron_add` via `Entitlement.limitsFor(tier).active_jobs_cap` (free=4/pro=64/team=256/enterprise=unlimited); rejection message carries tier._
 
 ### Secret vault API (5)
 
@@ -53,7 +53,8 @@ Branch `repair/sprint-2-revenue-loop` off Sprint 1 tip `92ebd59`.
 | 4 | `3fe1f79` | **S2.11** | 64-jobs cap via `active_jobs_cap` in `cron_add` |
 | 5 | `9c1a6d2` | **S2.4** | Tool preflight gate — 3 checks |
 | 6 | `23cac97` | **S2.5** | Scheduler dispatch gate + `resolveUserEntitlement` resolver stub |
-| 7 | _(this commit)_ | **S2.6** | Docs-only: integration-tool chokepoint structurally covered by S2.4 |
+| 7 | `2a8405a` | **S2.6** | Docs-only: integration-tool chokepoint structurally covered by S2.4 |
+| 8 | `dae9bea` | **S2.3** | Chat-stream 402 gate (SSE + fallback paths) via `resolveUserEntitlement` |
 
 Structural skeleton is **in place** — every enforcement chokepoint has a gate, just pointing at default/stub entitlement until S2.1 populates the resolver. Full behavior change lights up when S2.1 + S2.7 (cross-repo) land.
 
