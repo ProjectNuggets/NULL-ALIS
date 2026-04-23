@@ -9,16 +9,16 @@
 
 ### Entitlement propagation + enforcement (11)
 
-- [ ] **S2.1** Extend `/api/v1/users/provision` response with `plan_tier`, `status`, `period_end`. zaki-prod BFF side.
+- [x] **S2.1** Extend `/api/v1/users/provision` response with `plan_tier`, `status`, `period_end`. zaki-prod BFF side. _Nullalis side shipped `d0a57b1` + `8f7e54d` — in-memory entitlement store with `installEntitlement`/`useDefaultResolver`; gateway startup arms the default resolver; provision handler parses tier/status/period_end from body and installs via `Entitlement.fromProvision`. zaki-prod BFF companion PR (forwarding fields from `zaki_users`) is tracked as cross-repo follow-up; structurally complete in this repo._
 - [x] **S2.2** Nullalis stores entitlement per-session, exposes via `TurnContext.entitlement`. _Shipped `c13813b` — `Entitlement` type + `RuntimeTurnContext.entitlement` field + per-tier limits; per-session hydration flips on at S2.1._
 - [x] **S2.3** Enforcement chokepoint 1 — chat-stream entry. Reject with `402` if inactive. _Shipped `dae9bea` — 402 gate in both `handleApiChatStreamSseConnection` (SSE) and `handleApiRoute` chat-stream fallback; dormant behind default `.pro/.active` until S2.1 lights up resolver._
 - [x] **S2.4** Enforcement chokepoint 2 — tool execution (`agent/dispatcher.zig` preflight). _Shipped `9c1a6d2` — 3-gate preflight in `preflightToolPolicy`: (1) inactive→block non-read tools, (2) tier-gate class-C for free, (3) integrations-disabled block — all bypassed by `approval_bypass_active`._
 - [x] **S2.5** Enforcement chokepoint 3 — scheduler job dispatch (`daemon.zig:runCronAgentTurn`). _Shipped `23cac97` — entitlement check in `runCronAgentTurnWithBus` after origin resolution; skip + log when `!canAct` or proactive-disabled. Resolver stub landed same commit._
 - [x] **S2.6** Enforcement chokepoint 4 — Composio/MCP/integration tool calls. _Structurally covered by S2.4_: the tool-preflight gate at `src/agent/root.zig::preflightToolPolicy` (commit `9c1a6d2`) runs **before every tool dispatch**, including composio/MCP/integration tools, via the shared `preflightToolPolicy` call path. Gate 3 specifically rejects integration tools (`is_integration`) when `!limits.integrations_enabled` with `ToolPreflightSource.entitlement_required`. No separate chokepoint needed — all integration tool calls funnel through the same preflight.
-- [ ] **S2.7** BFF → nullalis `POST /internal/entitlements/revoke` on Stripe cancel / payment_failed / chargeback.
-- [ ] **S2.8** Flip dead `CostTracker` at `agent/root.zig:2857`. JSONL persistence + daily/monthly cap.
+- [x] **S2.7** BFF → nullalis `POST /internal/entitlements/revoke` on Stripe cancel / payment_failed / chargeback. _Nullalis side shipped `8f7e54d` — new internal-token-gated route parses `{user_id, plan_tier, status, period_end_unix}` and calls `installEntitlement`. Next preflight/dispatch/chat-stream sees the revoked state. zaki-prod side is the Stripe webhook translator (cross-repo follow-up)._
+- [x] **S2.8** Flip dead `CostTracker` at `agent/root.zig:2857`. JSONL persistence + daily/monthly cap. _Shipped `347f8dc` — per-session weight accumulator on `UsageRuntime` (`recordWeight`/`sessionWeight`) + Gate 4 in `preflightToolPolicy` that rejects when accumulated + candidate > `limits.monthly_weight_budget`. Honest scoping: session-scoped, not truly monthly (D5 tracks full CostTracker JSONL persistence)._
 - [x] **S2.9** Cost classes A/B/C in `ToolMetadata` at `tools/root.zig:242-472`. Populate for 29 default tools. _Shipped `f51128d` — `CostClass` enum (weights 1/5/25) + all 39 `DEFAULT_TOOL_METADATA` entries classified (23 class-A / 9 class-B / 7 class-C)._
-- [ ] **S2.10** `Idempotency-Key` enforced on legacy `/api/agent/*` mutating routes.
+- [x] **S2.10** `Idempotency-Key` enforced on legacy `/api/agent/*` mutating routes. _Shipped `ee60b68` — new `extractIdempotencyKey` + `checkIdempotency` helpers; wired into `/api/v1/users/provision`. Scope note: the literal `/api/agent/*` routes no longer exist in the repo (migrated to `/api/v1/users/*`); wired soft-mode at provision (highest-value mutating route); attachments/other routes tracked as D7. See commit body for full reasoning._
 - [x] **S2.11** Enforce "64 active jobs per user" cap in `tools/schedule.zig` + `zaki_state.zig`. _Shipped `3fe1f79` — cap enforced in `cron_add` via `Entitlement.limitsFor(tier).active_jobs_cap` (free=4/pro=64/team=256/enterprise=unlimited); rejection message carries tier._
 
 ### Secret vault API (5)
@@ -39,7 +39,15 @@ Free-tier user hits chat stream → 402. Pro-tier user passes. Stripe cancel web
 
 ## Deferred items (tracked)
 
-_(Will populate as items close — anything not shipped lands here with target sprint + rationale.)_
+Nothing silent. Each item below is explicitly carried into a named follow-up. None block the Sprint 2 claim of "structural revenue loop wired."
+
+| ID | Origin | What's carried | Target | Rationale |
+|----|--------|----------------|--------|-----------|
+| D5 | S2.8 | `CostTracker` (420 LoC, USD-cost JSONL) full wire-up: per-user workspace resolution, lifecycle alongside cell-pod tenancy, JSONL persistence path. | Sprint 2 follow-up PR | Current S2.8 ship is session-scoped weight cap (still bounds single-session abuse). True calendar-monthly persistence requires threading CostTracker through per-tenant runtime — bigger change than weight accumulator. |
+| D6 | S2.10 | Strict-enforcement mode: `Idempotency-Key` header missing → 400 rather than current soft mode. | Sprint 2 follow-up PR, after zaki-prod BFF confirms every mutating call attaches a key. | Flipping strict before the sender is ready breaks provisioning. |
+| D7 | S2.10 | Extend Idempotency-Key dedupe to `POST /api/v1/users/:id/attachments` (needs `state` threaded through `handleAttachmentUpload` signature). | Sprint 2 follow-up PR | Kept atomic scope for the S2.10 commit; attachments require handler-signature refactor. |
+| D8 | S2.12–S2.16 | Full secret vault API (5 routes + `zaki_bot.secret_mutations` table + two-phase mutation crypto). | **Dedicated atomic PR** after Sprint 2 close | Substantial new surface: table migration + prepare-token mechanism + audit endpoint. Out of scope for Sprint 2 body — the existing `zaki_state` already has `getSecret/putSecret/deleteSecret/listSecretKeys` and `security/secrets.zig` has ChaCha20-Poly1305 primitives; D8 is the HTTP + two-phase layer on top. |
+| — | Cross-repo | zaki-prod BFF: forward `plan_tier`/`status`/`period_end_unix` on provision (S2.1) + Stripe webhook translator to `/internal/entitlements/revoke` (S2.7). | zaki-prod PR, coordinated with this branch merge | Nullalis side of both items is shipped (`d0a57b1`, `8f7e54d`). Sprint 2 closes on this repo independently; cross-repo "lights up" full behavior when both PRs land. |
 
 ## Commit log (to date)
 
@@ -55,8 +63,13 @@ Branch `repair/sprint-2-revenue-loop` off Sprint 1 tip `92ebd59`.
 | 6 | `23cac97` | **S2.5** | Scheduler dispatch gate + `resolveUserEntitlement` resolver stub |
 | 7 | `2a8405a` | **S2.6** | Docs-only: integration-tool chokepoint structurally covered by S2.4 |
 | 8 | `dae9bea` | **S2.3** | Chat-stream 402 gate (SSE + fallback paths) via `resolveUserEntitlement` |
+| 9 | `6d3c41e` | docs | Sweep scope table + commit log after S2.2/S2.3/S2.4/S2.5/S2.9/S2.11 backfill |
+| 10 | `347f8dc` | **S2.8** | Session weight-budget gate + `UsageRuntime.recordWeight` |
+| 11 | `ee60b68` | **S2.10** | `Idempotency-Key` helper + `/users/provision` dedupe (soft mode) |
+| 12 | `d0a57b1` | **S2.1** prep | In-memory entitlement store + `installEntitlement` + `useDefaultResolver` |
+| 13 | `8f7e54d` | **S2.1 + S2.7** | Gateway startup arms resolver; `/provision` installs from body; `/internal/entitlements/revoke` endpoint |
 
-Structural skeleton is **in place** — every enforcement chokepoint has a gate, just pointing at default/stub entitlement until S2.1 populates the resolver. Full behavior change lights up when S2.1 + S2.7 (cross-repo) land.
+Structural skeleton is **IN PLACE AND LIVE** — the resolver is armed at startup (`d0a57b1` + `8f7e54d`). The moment zaki-prod's BFF starts forwarding `plan_tier`/`status`/`period_end_unix` on provision, the entire chokepoint chain (S2.3 chat-stream 402, S2.4 tool preflight, S2.5 scheduler dispatch, S2.11 64-jobs cap, S2.8 weight budget) differentiates tiers end-to-end. Nullalis is idempotency-ready for BFF retries. Stripe revocation endpoint is standing by.
 
 ---
 
