@@ -1,0 +1,225 @@
+name: Spike benchmark
+
+# S3.2 — gates PRs touching `src/` against the V-infinity battery
+# (.spike/benchmark.json). A regression in pass rate here catches
+# agent-behavior breakage that unit tests cannot see (provider
+# dispatch, tool preflight, memory retrieval, context engine).
+#
+# Execution model:
+#   - Runs postgres as a service container + starts the gateway
+#     binary in background + runs `.spike/run.sh`.
+#   - Requires `TOGETHER_API_KEY` secret. Jobs without the secret
+#     available (forks, first-time contributors) skip with a warning
+#     rather than fail — keeps the gate meaningful for core PRs
+#     without blocking OSS contributions.
+#   - Pass threshold: >= 80% cold pass rate (20/25 on the current
+#     battery). Flakier than 80% is treated as a regression.
+#     Polluted is informational — the absolute number is posted as
+#     a job summary but not gated (polluted run-to-run variance is
+#     higher than cold).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - '.spike/**'
+      - '.github/workflows/spike.yml'
+
+jobs:
+  check-secret:
+    name: Check spike secret availability
+    runs-on: ubuntu-latest
+    outputs:
+      has_secret: ${{ steps.check.outputs.has_secret }}
+    steps:
+      - id: check
+        env:
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+        run: |
+          if [ -n "${TOGETHER_API_KEY:-}" ]; then
+            echo "has_secret=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_secret=false" >> $GITHUB_OUTPUT
+            echo "::warning::TOGETHER_API_KEY not set on this runner — spike benchmark will be skipped (fork / first-time contributor / org secret not propagated). A maintainer should re-run after approval."
+          fi
+
+  spike:
+    name: V-infinity battery (cold + polluted)
+    needs: check-secret
+    if: needs.check-secret.outputs.has_secret == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: nullalis_ci
+          POSTGRES_PASSWORD: nullalis_ci
+          POSTGRES_DB: nullalis_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (pinned via .zigversion)
+        uses: mlugg/setup-zig@v2
+        with:
+          version-file: .zigversion
+
+      - name: Install runtime deps (libpq, jq, curl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev jq curl
+
+      - name: Build nullalis (canonical production engines)
+        run: zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dchannels=cli,telegram
+
+      - name: Write spike test config
+        env:
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+        run: |
+          mkdir -p "$HOME/.nullalis"
+          cat > "$HOME/.nullalis/config.json" <<EOF
+          {
+            "agents": {
+              "defaults": {
+                "model": {
+                  "primary": "together-ai/moonshotai/kimi-k2.5"
+                }
+              }
+            },
+            "models": {
+              "providers": {
+                "together-ai": {
+                  "api_key": "${TOGETHER_API_KEY}",
+                  "base_url": "https://api.together.xyz/v1"
+                }
+              }
+            },
+            "gateway": {
+              "port": 3000,
+              "host": "127.0.0.1",
+              "internal_service_tokens": ["40ae970fce1815c0d076fdff8ac24c02b1a45bc905d909cd"]
+            },
+            "state": {
+              "backend": "postgres",
+              "postgres": {
+                "host": "127.0.0.1",
+                "port": 5432,
+                "database": "nullalis_ci",
+                "user": "nullalis_ci",
+                "password": "nullalis_ci"
+              }
+            }
+          }
+          EOF
+
+      - name: Start gateway in background
+        run: |
+          ./zig-out/bin/nullalis gateway --host 127.0.0.1 --port 3000 \
+            > gateway.log 2>&1 &
+          echo "GATEWAY_PID=$!" >> $GITHUB_ENV
+
+      - name: Wait for gateway /health
+        run: |
+          for i in {1..30}; do
+            if curl -sf http://127.0.0.1:3000/health >/dev/null; then
+              echo "gateway up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::gateway failed to start within 30s"
+          cat gateway.log
+          exit 1
+
+      - name: Provision benchmark user
+        run: |
+          curl -sf -X POST http://127.0.0.1:3000/api/v1/users/provision \
+            -H "X-Internal-Token: 40ae970fce1815c0d076fdff8ac24c02b1a45bc905d909cd" \
+            -H "Content-Type: application/json" \
+            -d '{"user_id":"1","plan_tier":"pro","status":"active","period_end_unix":9999999999}' \
+            || { echo "::error::provision failed"; cat gateway.log; exit 1; }
+
+      - name: Run spike cold
+        id: cold
+        run: |
+          set -o pipefail
+          ./.spike/run.sh --quiet 2>&1 | tee cold.txt
+          LAST=$(tail -n 1 cold.txt)
+          echo "tsv=$LAST" >> $GITHUB_OUTPUT
+          PASS_RATE=$(echo "$LAST" | awk -F'\t' '{print $2}')
+          echo "pass_rate=$PASS_RATE" >> $GITHUB_OUTPUT
+
+      - name: Run spike polluted
+        id: polluted
+        if: always() && steps.cold.outcome != 'cancelled'
+        run: |
+          set -o pipefail
+          ./.spike/run.sh --polluted --quiet 2>&1 | tee polluted.txt
+          LAST=$(tail -n 1 polluted.txt)
+          echo "tsv=$LAST" >> $GITHUB_OUTPUT
+          PASS_RATE=$(echo "$LAST" | awk -F'\t' '{print $2}')
+          echo "pass_rate=$PASS_RATE" >> $GITHUB_OUTPUT
+
+      - name: Compare to baseline
+        env:
+          COLD_PASS: ${{ steps.cold.outputs.pass_rate }}
+          POLLUTED_PASS: ${{ steps.polluted.outputs.pass_rate }}
+        run: |
+          set -euo pipefail
+          FLOOR="0.80"
+          echo "## Spike benchmark result" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Battery | Pass rate | Floor | Verdict |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----------|-------|---------|" >> $GITHUB_STEP_SUMMARY
+
+          COLD_OK=$(awk -v p="$COLD_PASS" -v f="$FLOOR" 'BEGIN { print (p+0 >= f+0) ? "1" : "0" }')
+          if [ "$COLD_OK" = "1" ]; then
+            echo "| Cold | $COLD_PASS | $FLOOR | PASS |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Cold | $COLD_PASS | $FLOOR | **BLOCK** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "| Polluted | $POLLUTED_PASS | — | informational |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$COLD_OK" != "1" ]; then
+            echo "::error::cold pass rate $COLD_PASS below floor $FLOOR — blocking PR merge"
+            exit 1
+          fi
+
+      - name: Collect gateway log on failure
+        if: failure()
+        run: |
+          echo "## gateway.log" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -n 200 gateway.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload spike run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-runs-${{ github.run_id }}
+          path: |
+            .spike/runs/
+            cold.txt
+            polluted.txt
+            gateway.log
+          retention-days: 7
+
+      - name: Shutdown gateway
+        if: always()
+        run: |
+          if [ -n "${GATEWAY_PID:-}" ]; then
+            kill "$GATEWAY_PID" 2>/dev/null || true
+          fi
