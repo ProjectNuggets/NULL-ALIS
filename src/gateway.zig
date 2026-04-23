@@ -59,6 +59,7 @@ const run_trace_store_mod = @import("run_trace_store.zig");
 const gateway_run_events = @import("gateway_run_events.zig");
 const channel_health_mod = @import("channel_health.zig");
 const security_review_mod = @import("security_review.zig");
+const secret_vault = @import("gateway/secret_vault.zig");
 const log = std.log.scoped(.gateway);
 
 /// Maximum request body size (10MB) — sized for file attachments (images as
@@ -762,6 +763,11 @@ pub const GatewayState = struct {
     pinned_user_id_owned: bool = false,
     rate_limiter: GatewayRateLimiter,
     idempotency: IdempotencyStore,
+    /// Two-phase mutation tokens for the secret vault API (D8). Issued
+    /// by `POST /api/v1/users/:id/secrets/:key/prepare`; consumed by
+    /// subsequent PUT/DELETE on the same key. In-memory, 5-min TTL,
+    /// single-use. See `src/gateway/secret_vault.zig`.
+    secret_tokens: secret_vault.TokenStore,
     whatsapp_verify_token: []const u8,
     whatsapp_app_secret: []const u8,
     whatsapp_access_token: []const u8,
@@ -871,6 +877,7 @@ pub const GatewayState = struct {
             .allocator = allocator,
             .rate_limiter = GatewayRateLimiter.init(10, 30),
             .idempotency = IdempotencyStore.init(300),
+            .secret_tokens = secret_vault.TokenStore.init(allocator, secret_vault.DEFAULT_TTL_SECS),
             .whatsapp_verify_token = verify_token,
             .whatsapp_app_secret = "",
             .whatsapp_access_token = "",
@@ -889,6 +896,7 @@ pub const GatewayState = struct {
         }
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
+        self.secret_tokens.deinit();
         self.user_preparation_gate.deinit();
         self.tenant_runtime_mutex.lock();
         defer self.tenant_runtime_mutex.unlock();
