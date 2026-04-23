@@ -2675,6 +2675,45 @@ pub fn extractHeader(raw: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Parse the `Idempotency-Key` header value, or null when the header is
+/// absent. Thin wrapper over `extractHeader` exported so mutating-route
+/// handlers can consult dedupe state without re-reading headers manually.
+pub fn extractIdempotencyKey(raw_request: []const u8) ?[]const u8 {
+    return extractHeader(raw_request, "Idempotency-Key");
+}
+
+pub const IdempotencyCheck = enum {
+    /// No `Idempotency-Key` header present. Soft-mode: proceed without
+    /// dedupe so existing clients that never learned about the header
+    /// continue to work. Strict enforcement turns on once the zaki-prod
+    /// BFF is confirmed to always send the header (tracked as D6).
+    none,
+    /// Key present and newly recorded in the store. Caller proceeds
+    /// with its normal handler flow.
+    new,
+    /// Key matches a prior request within the store's TTL window. The
+    /// caller should return a dedupe-acknowledgement response instead
+    /// of re-running the handler — preserves at-most-once semantics.
+    duplicate,
+    /// Key present but invalid (empty or absurdly long). Treated as a
+    /// client bug, not a server error; caller should 400.
+    invalid,
+};
+
+/// Consult the gateway-wide `IdempotencyStore` for a request's
+/// `Idempotency-Key`. Length cap (1..=256) matches Stripe's convention
+/// and is tight enough that a short malicious key cannot waste store
+/// memory. See `IdempotencyStore` for the TTL sweep logic.
+pub fn checkIdempotency(
+    state: *GatewayState,
+    allocator: std.mem.Allocator,
+    raw_request: []const u8,
+) IdempotencyCheck {
+    const key = extractIdempotencyKey(raw_request) orelse return .none;
+    if (key.len == 0 or key.len > 256) return .invalid;
+    return if (state.idempotency.recordIfNew(allocator, key)) .new else .duplicate;
+}
+
 /// Extract the bearer token from an Authorization header value.
 /// "Bearer <token>" -> "<token>", or null if format doesn't match.
 pub fn extractBearerToken(auth_header: []const u8) ?[]const u8 {
@@ -10660,6 +10699,16 @@ fn handleApiRoute(
         if (!std.mem.eql(u8, method, "POST")) {
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         }
+        // S2.10 — Idempotency-Key dedupe on a high-value mutating route.
+        // Duplicate POSTs from a retrying BFF or mobile client used to
+        // re-run the provisioning pipeline (user_cell ensure, state
+        // allocation, scaffold) end-to-end. With a key attached, the
+        // second call short-circuits to an at-most-once ack.
+        switch (checkIdempotency(state, req_allocator, raw_request)) {
+            .duplicate => return .{ .status = "200 OK", .body = "{\"status\":\"duplicate\",\"detail\":\"already provisioned within idempotency window\"}" },
+            .invalid => return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_idempotency_key\",\"detail\":\"Idempotency-Key must be 1..=256 bytes\"}" },
+            .none, .new => {},
+        }
         const body = extractBody(raw_request);
         const body_user_id = if (body) |b| jsonStringField(b, "user_id") else null;
         const user_id = resolveGatewayRequestUserId(state, extractZakiUserId(raw_request), body_user_id, false) catch |err| {
@@ -14485,6 +14534,17 @@ test "idempotency store allows different keys" {
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "b"));
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "c"));
     try std.testing.expect(!store.recordIfNew(std.testing.allocator, "a"));
+}
+
+test "extractIdempotencyKey reads the header case-insensitively (S2.10)" {
+    const raw1 = "POST /x HTTP/1.1\r\nIdempotency-Key: abc-123\r\nHost: h\r\n\r\n";
+    try std.testing.expectEqualStrings("abc-123", extractIdempotencyKey(raw1).?);
+
+    const raw2 = "POST /x HTTP/1.1\r\nidempotency-key: lower-case\r\nHost: h\r\n\r\n";
+    try std.testing.expectEqualStrings("lower-case", extractIdempotencyKey(raw2).?);
+
+    const raw3 = "POST /x HTTP/1.1\r\nHost: h\r\n\r\n";
+    try std.testing.expect(extractIdempotencyKey(raw3) == null);
 }
 
 test "gateway module compiles" {
