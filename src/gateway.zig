@@ -10756,6 +10756,27 @@ fn handleApiRoute(
         };
         scaffoldUserWorkspace(req_allocator, &user_ctx);
         prep_guard.release();
+
+        // S2.1 — install entitlement from BFF-provided billing fields.
+        // The BFF now attaches `plan_tier`, `status`, and
+        // `period_end_unix` to its provision request. We parse them
+        // best-effort and update the in-memory resolver store; absent
+        // fields collapse to `fromProvision`'s defaults (tier=free
+        // when missing, status=expired when missing). The updated
+        // entry is visible to the next chat-stream / tool-preflight /
+        // scheduler-tick via the default resolver armed at startup.
+        if (body) |b| {
+            const bft_tier = jsonStringField(b, "plan_tier");
+            const bft_status = jsonStringField(b, "status");
+            const bft_period_end = jsonIntField(b, "period_end_unix");
+            if (bft_tier != null or bft_status != null or bft_period_end != null) {
+                const ent = entitlement_mod.Entitlement.fromProvision(bft_tier, bft_status, bft_period_end);
+                entitlement_mod.installEntitlement(user_id, ent) catch |err| {
+                    log.warn("entitlement.install_failed user={s} err={s}", .{ user_id, @errorName(err) });
+                };
+            }
+        }
+
         return .{ .body = "{\"status\":\"provisioned\"}" };
     }
 
@@ -13459,7 +13480,7 @@ fn handleAcceptedConnection(
     defer _ = state.in_flight_requests.fetchSub(1, .acq_rel);
 
     // Simple routing — control endpoints + descriptor-driven channel webhooks + ZAKI API.
-    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, cell_resolve, cell_ensure, cell_status, cell_drain, drain, undrain, shutdown };
+    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, cell_resolve, cell_ensure, cell_status, cell_drain, drain, undrain, shutdown, entitlements_revoke };
     const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
         .{ "/health", .health },
         .{ "/ready", .ready },
@@ -13476,6 +13497,7 @@ fn handleAcceptedConnection(
         .{ "/internal/drain", .drain },
         .{ "/internal/undrain", .undrain },
         .{ "/internal/shutdown", .shutdown },
+        .{ "/internal/entitlements/revoke", .entitlements_revoke },
     });
     const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
     const is_chat_stream_path = std.mem.eql(u8, base_path, "/api/v1/chat/stream");
@@ -13917,6 +13939,47 @@ fn handleAcceptedConnection(
                 response_body = "{\"status\":\"shutdown_requested\"}";
             }
         },
+        // S2.7 — Stripe webhook revocation sink. zaki-prod's Stripe
+        // handler translates `customer.subscription.deleted`,
+        // `customer.subscription.updated` (status transitions),
+        // `invoice.payment_failed`, and `charge.dispute.created` into
+        // POSTs here. We parse the minimal billing tuple and update
+        // the in-memory entitlement store; the next turn's preflight
+        // (S2.4) / scheduler tick (S2.5) / chat-stream entry (S2.3)
+        // reads the fresh value and blocks appropriately.
+        .entitlements_revoke => {
+            if (!std.mem.eql(u8, method_str, "POST")) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (!validateInternalServiceToken(raw, state)) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                const body_opt = extractBody(raw);
+                const body = body_opt orelse "";
+                const user_id = jsonStringField(body, "user_id");
+                if (user_id == null) {
+                    response_status = "400 Bad Request";
+                    response_body = "{\"error\":\"missing user_id\"}";
+                } else {
+                    const plan_tier = jsonStringField(body, "plan_tier");
+                    const status_raw = jsonStringField(body, "status");
+                    const period_end = jsonIntField(body, "period_end_unix");
+                    const ent = entitlement_mod.Entitlement.fromProvision(plan_tier, status_raw, period_end);
+                    if (entitlement_mod.installEntitlement(user_id.?, ent)) {
+                        log.info("entitlement.revoke user={s} tier={s} status={s}", .{
+                            user_id.?,
+                            ent.tier.toSlice(),
+                            ent.status.toSlice(),
+                        });
+                        response_body = "{\"status\":\"ok\"}";
+                    } else |_| {
+                        response_status = "500 Internal Server Error";
+                        response_body = "{\"error\":\"entitlement_store_unavailable\"}";
+                    }
+                }
+            }
+        },
     } else {
         response_status = "404 Not Found";
         response_body = "{\"error\":\"not found\"}";
@@ -14083,6 +14146,14 @@ pub fn runWithRole(
 
     var state = GatewayState.init(allocator);
     defer state.deinit();
+    // S2.1 — arm the default entitlement resolver so the structural
+    // gates wired in S2.3/S2.4/S2.5 actually consult a real store when
+    // the BFF calls `/api/v1/users/provision` or Stripe pokes
+    // `/internal/entitlements/revoke`. Before this call the resolver
+    // is `null` and every gate falls back to the default
+    // `Entitlement{}` (pro/active/unlimited) — the "nothing breaks
+    // until S2.1 lights up" invariant that Sprint 2 relied on.
+    entitlement_mod.useDefaultResolver(allocator);
     state.role = role;
     state.controller_url = controller_url;
     if (advertise_url) |value| {
