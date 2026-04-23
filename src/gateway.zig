@@ -74,6 +74,7 @@ const run_trace_store_mod = @import("run_trace_store.zig");
 const gateway_run_events = @import("gateway_run_events.zig");
 const channel_health_mod = @import("channel_health.zig");
 const security_review_mod = @import("security_review.zig");
+const entitlement_mod = @import("entitlement.zig");
 const log = std.log.scoped(.gateway);
 
 /// Maximum request body size (10MB) — sized for file attachments (images as
@@ -8997,6 +8998,29 @@ fn handleApiChatStreamSseConnection(
         return true;
     }
 
+    // ── S2.3 entitlement chokepoint 1: chat-stream entry ──────────────
+    // Reject with 402 Payment Required when the caller's effective tier
+    // is inactive (canceled past period_end, expired, past_due). The
+    // resolver is populated by S2.1's provision-response path and S2.7's
+    // Stripe revocation webhook; until those land the resolver returns
+    // null, which we treat as the default `.pro/.active` fallback so
+    // nothing breaks mid-sprint. See plan-v02 §6 and
+    // docs/sprints/sprint-2.md for the enforcement chokepoint matrix.
+    {
+        const ent = entitlement_mod.resolveUserEntitlement(user_id) orelse entitlement_mod.Entitlement{};
+        const now_unix = std.time.timestamp();
+        if (!ent.canAct(now_unix)) {
+            sendSseErrorResponse(
+                stream,
+                req_allocator,
+                "402 Payment Required",
+                "entitlement_inactive",
+                "subscription inactive — update billing to continue",
+            );
+            return true;
+        }
+    }
+
     var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
         sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "invalid_user", "invalid user");
         return true;
@@ -10428,6 +10452,20 @@ fn handleApiRoute(
                 .status = "500 Internal Server Error",
                 .body = "{\"error\":\"chat_stream_requires_streaming_path\"}",
             };
+        }
+        // ── S2.3 entitlement chokepoint 1 (non-streaming fallback) ────
+        // Mirrors the SSE path at handleApiChatStreamSseConnection.
+        // Legacy clients that land on the non-streaming path must still
+        // hit the 402 when their tier is inactive.
+        {
+            const ent = entitlement_mod.resolveUserEntitlement(user_id) orelse entitlement_mod.Entitlement{};
+            const now_unix = std.time.timestamp();
+            if (!ent.canAct(now_unix)) {
+                return .{
+                    .status = "402 Payment Required",
+                    .body = "{\"error\":\"entitlement_inactive\",\"message\":\"subscription inactive — update billing to continue\"}",
+                };
+            }
         }
         var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
