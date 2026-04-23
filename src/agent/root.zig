@@ -1683,6 +1683,31 @@ pub const Agent = struct {
                     .metadata = meta,
                 } };
             }
+
+            // Gate 4 (S2.8): cumulative tool-weight budget. maxInt means
+            // "unlimited" (enterprise) — skip the check entirely. Otherwise
+            // ask: if this tool runs, does the session's accumulated weight
+            // exceed the tier's budget? Conservatively session-scoped here
+            // rather than calendar-monthly; true monthly persistence lands
+            // with D5 (CostTracker full wire-up). Session-scoping still
+            // bounds single-session abuse — a free user cannot run 100
+            // class-C tools in a single session and stay under budget=500.
+            if (limits.monthly_weight_budget != std.math.maxInt(u64)) {
+                const candidate: u64 = @intCast(meta.cost_class.weight());
+                const accumulated: u64 = if (self.usage_rt) |urt| urt.sessionWeight() else 0;
+                if (accumulated +| candidate > limits.monthly_weight_budget) {
+                    return .{ .blocked = .{
+                        .name = call.name,
+                        .tool_call_id = call.tool_call_id,
+                        .output = "Usage budget reached for this billing period. Upgrade your plan or wait until next reset.",
+                        .source = .entitlement_required,
+                        .reason = "entitlement_weight_budget",
+                        .mode = self.execution_mode,
+                        .risk_level = meta.risk_level,
+                        .metadata = meta,
+                    } };
+                }
+            }
         }
 
         // Generic approval gate (WP1.4). Only applies when a SecurityPolicy is
@@ -3698,6 +3723,19 @@ pub const Agent = struct {
     fn executeToolUnchecked(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
         for (self.tools) |t| {
             if (std.mem.eql(u8, t.name(), call.name)) {
+                // Record this dispatch against the session weight budget
+                // (S2.8). Fires here rather than in preflightToolPolicy
+                // because preflight is also used for dry-run approval
+                // checks — we want weight charged only when the tool is
+                // actually about to execute. Preflight-Gate-4 reads
+                // sessionWeight() on the NEXT dispatch, so this increment
+                // is visible to the next tool in the same turn or any
+                // subsequent turn of the same session.
+                if (self.usage_rt) |urt| {
+                    const meta = self.metadataForToolCall(call);
+                    urt.recordWeight(@intCast(meta.cost_class.weight()));
+                }
+
                 // Parse arguments JSON to ObjectMap ONCE
                 const parsed = std.json.parseFromSlice(
                     std.json.Value,
