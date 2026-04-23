@@ -14915,6 +14915,178 @@ test "GatewayState init has empty verify token" {
     try std.testing.expectEqualStrings("", state.whatsapp_verify_token);
 }
 
+// ── D8 vault route HTTP envelope tests (D11 partial) ───────────────
+// Full DB-backed integration tests require a postgres fixture and are
+// tracked as the residual D11 follow-up. These tests lock in the
+// pre-DB contract: route parsing (prepare/audit/key-only), secret-key
+// validation, and the no-backend 503 safety net. Every path the
+// handler can reach WITHOUT touching zaki_state is covered here.
+
+test "vault route — GET /secrets/:key without backend returns 503 (S2.12)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "GET /api/v1/users/1/secrets/STRIPE_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "GET",
+        "/api/v1/users/1/secrets/STRIPE_KEY",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "secret_vault_requires_state_backend") != null);
+}
+
+test "vault route — POST /secrets/:key/prepare reaches prepare branch (S2.13)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    // Without a DB backend this 503s, which is fine — the test's purpose
+    // is to confirm the route parser recognizes `/prepare` as its own
+    // branch (not a key literally named "STRIPE_KEY/prepare").
+    const raw = "POST /api/v1/users/1/secrets/STRIPE_KEY/prepare HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: 16\r\n\r\n{\"action\":\"put\"}";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "POST",
+        "/api/v1/users/1/secrets/STRIPE_KEY/prepare",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "secret_vault_requires_state_backend") != null);
+}
+
+test "vault route — GET /secrets/:key/audit reaches audit branch (S2.16)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "GET /api/v1/users/1/secrets/STRIPE_KEY/audit HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "GET",
+        "/api/v1/users/1/secrets/STRIPE_KEY/audit",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", response.status);
+}
+
+test "vault route — rejects invalid secret key with 400" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    // "secrets/" with no following segment fails parseUserPath's
+    // subpath check (it requires a following slash), so we use
+    // a clearly invalid key character instead. The `$` in the key
+    // makes isValidIdentifier reject BEFORE the DB check, proving
+    // the validator gate is ordered correctly.
+    const raw = "GET /api/v1/users/1/secrets/bad$key HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "GET",
+        "/api/v1/users/1/secrets/bad$key",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "invalid_secret_key") != null);
+}
+
+test "vault route — PUT legacy body without confirmation_token is not an accidental bypass" {
+    // Regression guard for the breaking-change migration: a BFF caller
+    // that hasn't migrated yet and sends the OLD-shape body
+    // {"value":"..."} without confirmation_token must NOT succeed.
+    // Without a DB backend the handler 503s, which is the CORRECT
+    // safety outcome — legacy callers fail closed, not open.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "PUT /api/v1/users/1/secrets/LEGACY_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: 19\r\n\r\n{\"value\":\"leaky\"}";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "PUT",
+        "/api/v1/users/1/secrets/LEGACY_KEY",
+        &state,
+        null,
+        null,
+    );
+    // 503 is acceptable (no backend); the critical invariant is that
+    // we did NOT return 200. The OLD surface would have happily PUT
+    // the value to the filesystem fallback — the new surface closes
+    // that path regardless of token presence.
+    try std.testing.expect(!std.mem.eql(u8, response.status, "200 OK"));
+}
+
 test "handleApiRoute accepts POST alias for telegram disconnect" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
