@@ -210,6 +210,62 @@ pub const Entitlement = struct {
     }
 };
 
+// ── Per-user resolver ───────────────────────────────────────────────
+//
+// Pluggable lookup from a user_id string to the canonical Entitlement.
+// S2.1 (BFF provision push) will populate the backing store; the daemon
+// and gateway chat-stream call this at enforcement time.
+//
+// Until S2.1 lands, the resolver returns null so callers fall back to
+// the default Entitlement{} (pro/active/unlimited). That preserves
+// pre-enforcement behavior and gives S2.1 a concrete wire-up target
+// without further refactoring.
+
+/// Signature for the pluggable resolver. Implementations must be
+/// allocator-free and thread-safe — called from both the gateway hot
+/// path and the daemon scheduler tick.
+pub const ResolveFn = *const fn (user_id: []const u8) ?Entitlement;
+
+var resolver: ?ResolveFn = null;
+
+pub fn setResolver(fn_ptr: ResolveFn) void {
+    resolver = fn_ptr;
+}
+
+pub fn clearResolver() void {
+    resolver = null;
+}
+
+/// Return the stored entitlement for a user, or null when no resolver
+/// is registered / the user is unknown. Callers should fall back to
+/// the `Entitlement{}` default (pro/active/unlimited) on null so
+/// pre-S2.1 deployments keep working.
+pub fn resolveUserEntitlement(user_id: []const u8) ?Entitlement {
+    if (resolver) |f| return f(user_id);
+    return null;
+}
+
+test "resolver defaults to null" {
+    clearResolver();
+    try std.testing.expect(resolveUserEntitlement("any") == null);
+}
+
+test "resolver honors set fn" {
+    const Impl = struct {
+        fn resolve(user_id: []const u8) ?Entitlement {
+            if (std.mem.eql(u8, user_id, "42")) {
+                return Entitlement.defaultsFor(.free);
+            }
+            return null;
+        }
+    };
+    setResolver(&Impl.resolve);
+    defer clearResolver();
+    const found = resolveUserEntitlement("42") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Tier.free, found.tier);
+    try std.testing.expect(resolveUserEntitlement("missing") == null);
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "Tier roundtrip via slice" {
