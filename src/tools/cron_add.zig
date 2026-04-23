@@ -7,6 +7,7 @@ const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 const config_mod = @import("../config.zig");
+const entitlement_mod = @import("../entitlement.zig");
 
 const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
 const TestCronStore = struct {
@@ -77,6 +78,24 @@ pub const CronAddTool = struct {
         var scheduler = loaded.scheduler;
         const tenant = loaded.tenant;
         defer scheduler.deinit();
+
+        // Per-tier active-jobs cap enforcement (S2.11). The aspirational "64
+        // active jobs per user" from reliability-ops-runbook.md:108 had no
+        // enforcement anywhere (P4_ops_truth drift #3). Entitlement-resolved
+        // cap: free=4, pro=64, team=256, enterprise=unlimited. canceled/
+        // expired collapse to free automatically via effectiveTier.
+        const turn_ctx = root.getTurnContext();
+        const now_unix = std.time.timestamp();
+        const effective_tier = turn_ctx.entitlement.effectiveTier(now_unix);
+        const active_cap = entitlement_mod.Entitlement.limitsFor(effective_tier).active_jobs_cap;
+        if (scheduler.jobs.items.len >= active_cap) {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "Active job cap reached: {d}/{d} jobs for tier '{s}'. Remove a job with /cron remove before adding another, or upgrade for a higher cap.",
+                .{ scheduler.jobs.items.len, active_cap, effective_tier.toSlice() },
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        }
 
         // Prefer expression (recurring) over delay (one-shot)
         if (expression) |expr| {
