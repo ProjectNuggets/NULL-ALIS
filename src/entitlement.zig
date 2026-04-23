@@ -245,9 +245,100 @@ pub fn resolveUserEntitlement(user_id: []const u8) ?Entitlement {
     return null;
 }
 
+// ── Default in-memory store (S2.1 + S2.7 backing) ──────────────────
+//
+// Production path: zaki-prod BFF calls `/api/v1/users/provision` with
+// the user's tier/status/period_end, which the gateway turns into an
+// `installEntitlement(user_id, ent)` call. Stripe webhook revocation
+// lands at `/internal/entitlements/revoke` and uses the same install
+// call. The default resolver (`defaultResolver`) reads from this map.
+//
+// Threadsafety: a single mutex guards all map mutations + reads. The
+// map stores OWNED user_id strings; installEntitlement duplicates the
+// caller's slice so Entitlement survives request-lifetime input.
+
+var store_mutex: std.Thread.Mutex = .{};
+var store_map: std.StringHashMapUnmanaged(Entitlement) = .{};
+var store_allocator: ?std.mem.Allocator = null;
+
+/// Register the in-memory entitlement store as the active resolver.
+/// Idempotent — safe to call multiple times during startup. Must be
+/// paired with `resetDefaultStore` in tests to keep state isolated.
+pub fn useDefaultResolver(allocator: std.mem.Allocator) void {
+    store_mutex.lock();
+    defer store_mutex.unlock();
+    if (store_allocator == null) store_allocator = allocator;
+    resolver = &defaultResolver;
+}
+
+fn defaultResolver(user_id: []const u8) ?Entitlement {
+    store_mutex.lock();
+    defer store_mutex.unlock();
+    return store_map.get(user_id);
+}
+
+/// Persist (or replace) a user's entitlement in the in-memory store.
+/// Called from gateway handlers that process provision + revocation
+/// events. The `user_id` slice is duplicated; callers may free their
+/// buffer after the call returns.
+pub fn installEntitlement(user_id: []const u8, ent: Entitlement) !void {
+    store_mutex.lock();
+    defer store_mutex.unlock();
+    const alloc = store_allocator orelse return error.DefaultStoreNotInitialized;
+    const gop = try store_map.getOrPut(alloc, user_id);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try alloc.dupe(u8, user_id);
+    }
+    gop.value_ptr.* = ent;
+}
+
+/// Clear the in-memory store. Test-only; production callers should
+/// never invoke this (revocation replaces entries via
+/// `installEntitlement`).
+pub fn resetDefaultStore() void {
+    store_mutex.lock();
+    defer store_mutex.unlock();
+    if (store_allocator) |alloc| {
+        var it = store_map.iterator();
+        while (it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
+        store_map.deinit(alloc);
+    }
+    store_map = .{};
+}
+
 test "resolver defaults to null" {
     clearResolver();
     try std.testing.expect(resolveUserEntitlement("any") == null);
+}
+
+test "default resolver roundtrips installEntitlement (S2.1)" {
+    resetDefaultStore();
+    defer resetDefaultStore();
+    clearResolver();
+    defer clearResolver();
+
+    useDefaultResolver(std.testing.allocator);
+    try installEntitlement("99", Entitlement.defaultsFor(.free));
+    const got = resolveUserEntitlement("99") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Tier.free, got.tier);
+    try std.testing.expectEqual(Status.active, got.status);
+
+    // Revocation via re-install.
+    try installEntitlement("99", Entitlement.fromProvision("free", "canceled", 0));
+    const after = resolveUserEntitlement("99") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Status.canceled, after.status);
+    // canAct at t=1 should collapse to false (period_end=0 < 1).
+    try std.testing.expect(!after.canAct(1));
+}
+
+test "default resolver returns null for unknown users" {
+    resetDefaultStore();
+    defer resetDefaultStore();
+    clearResolver();
+    defer clearResolver();
+
+    useDefaultResolver(std.testing.allocator);
+    try std.testing.expect(resolveUserEntitlement("nobody-home") == null);
 }
 
 test "resolver honors set fn" {
