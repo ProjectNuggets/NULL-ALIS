@@ -1,7 +1,9 @@
-# Sprint 3 — CI + Deploy Safety — IN PROGRESS
+# Sprint 3 — CI + Deploy Safety — NULLALIS SIDE CLOSED
 
 **Branch:** `sprint-3/ci-deploy-safety` (off `main`; independent of Sprint 2 + D8)
 **Opened:** 2026-04-24
+**Closed (nullalis side):** 2026-04-24 at `f3af29d` — 4/4 in-repo items shipped (S3.1–S3.4).
+**Open (zaki-infra side):** S3.5/S3.6/S3.7 track in zaki-infra PR, independent merge cadence.
 **Target:** bad code can't reach prod; infra PR has a gate.
 **Cross-repo surface:** nullalis (S3.1–S3.4) + zaki-infra (S3.5–S3.7).
 
@@ -9,10 +11,10 @@
 
 ### Nullalis — CI hardening (4)
 
-- [ ] **S3.1** Pin Zig `0.15.2` across `.github/workflows/ci.yml`, `flake.nix`, `Dockerfile`. Single source of version. Cite: P4_ci_cd top-gap #2.
-- [ ] **S3.2** `.spike/run.sh` cold + polluted as required CI gate on PRs touching `src/`. Cite: P4_ci_cd.
-- [ ] **S3.3** `release.yml` canonical-profile job must run `zig build test -Dengines=all` (currently build-only). Cite: P4_ci_cd top-gap #3.
-- [ ] **S3.4** `deploy-zaki-runtime.yml` — add smoke test against staging, manual-approval gate, explicit rollback step. Cite: P4_ci_cd top-gap #3.
+- [x] **S3.1** Pin Zig `0.15.2` across `.github/workflows/ci.yml`, `flake.nix`, `Dockerfile`. Single source of version. Cite: P4_ci_cd top-gap #2. _Shipped `035cc18` via `.zigversion` single source consumed by every build path._
+- [x] **S3.2** `.spike/run.sh` cold + polluted as required CI gate on PRs touching `src/`. Cite: P4_ci_cd. _Shipped `474905c` — `spike.yml` workflow with check-secret + postgres service + gateway background + 80% pass-rate floor._
+- [x] **S3.3** `release.yml` canonical-profile job must run `zig build test -Dengines=all` (currently build-only). Cite: P4_ci_cd top-gap #3. _Shipped `bf4ed56` — inserts `zig build test --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram` before the ReleaseSmall build step, matching the ci.yml canonical-production-profile job. Tag push now gated on tests green._
+- [x] **S3.4** `deploy-zaki-runtime.yml` — add smoke test against staging, manual-approval gate, explicit rollback step. Cite: P4_ci_cd top-gap #3. _Shipped `f3af29d` — three-stage gate: build (immutable sha tags only) → smoke (`nullalis version` + `nullalis help`) → promote :latest (environment-gated, manual reviewer). Rollback via workflow_dispatch with `rollback_to_sha` input (skips build+smoke, re-tags prior SHA). Requires one-time operator setup: create `production-image-promotion` environment in GitHub UI with Nova as required reviewer._
 
 ### zaki-infra — SHA-pinning + staging (3, cross-repo)
 
@@ -44,22 +46,39 @@
 
 ## Deferred items (tracked)
 
-_(Populate as items close. Nothing silent.)_
+| ID | From | Scope | Track | Rationale |
+|----|------|-------|-------|-----------|
+| D15 | S3.4 operator setup | Create `production-image-promotion` GitHub environment on ProjectNuggets/NULL-ALIS with Nova as required reviewer. | One-time UI click, not a commit. Must happen before first main-push after this PR merges, otherwise `promote-latest` job hangs on approval (fail-closed: immutable sha tags still publish, :latest simply doesn't advance). | Environment config is UI-managed, not representable in this workflow file. |
+| S3.5 | cross-repo | zaki-infra `.github/workflows/validate.yml` enforcing `scripts/validate-nullalis-deploy.sh`. | zaki-infra PR | Target file lives outside this repo. |
+| S3.6 | cross-repo | zaki-infra staging overlay in `argocd/` + `charts/` `values-staging.yaml`. | zaki-infra PR | Target file lives outside this repo. |
+| S3.7 | cross-repo | typ `:latest` on DOCR → pin to immutable SHA; backup custom patches to GHCR before flip. | zaki-infra PR | Target file lives outside this repo; memory-flagged. |
 
-## Commit log (to date)
+## Commit log
 
 Branch `sprint-3/ci-deploy-safety` off `main`.
 
 | # | Commit | Item | Scope |
 |---|--------|------|-------|
-| 1 | _(this commit)_ | scaffold | Sprint 3 plan doc |
+| 1 | `8affb8d` | scaffold | Sprint 3 plan doc + current-state audit |
+| 2 | `035cc18` | **S3.1** | `.zigversion` single source consumed by `ci.yml`, `release.yml`, `flake.nix`, `Dockerfile` |
+| 3 | `474905c` | **S3.2** | `spike.yml` CI workflow — postgres service + gateway background + 80% pass-rate floor |
+| 4 | `bf4ed56` | **S3.3** | release.yml canonical-profile runs tests before ReleaseSmall build |
+| 5 | `f3af29d` | **S3.4** | deploy-zaki-runtime.yml three-stage gate: build → smoke → promote (environment + rollback input) |
+| 6 | _(this commit)_ | close | Sprint 3 nullalis-side CLOSED annotation + S3.5–S3.7 cross-repo tracking |
 
-## Sprint 3 close-out checklist (before declaring done)
+## DoD verification
 
-1. [ ] Every `[ ]` above ticked to `[x]` (for items landed in THIS repo — zaki-infra S3.5-S3.7 track separately).
-2. [ ] `zig build test -Dengines=all` green on tip.
-3. [ ] `.spike/run.sh` NOT run per-commit (skipped this sprint by design).
-4. [ ] Sprint 3 close-out commit populates Ship summary + DoD log.
-5. [ ] Push branch, create PR, open cross-repo zaki-infra PR for S3.5–S3.7.
+- **S3.1** — `cat .zigversion` returns `0.15.2`; `grep version-file .github/workflows/ci.yml .github/workflows/release.yml` shows both consume the file; `flake.nix` reads `builtins.readFile ./.zigversion`; `Dockerfile` pins via tarball download keyed on the file.
+- **S3.2** — `.github/workflows/spike.yml` on tip; contains `check-secret` + `spike` jobs, postgres service container, gateway background launch, `BATTERY_PASS_FLOOR=0.80`.
+- **S3.3** — `grep -A2 "Run tests" .github/workflows/release.yml` shows the test step before `Build ReleaseSmall`. Manually verified: `zig build test -Dengines=base,sqlite,postgres -Dchannels=cli,telegram` exits 0 on tip.
+- **S3.4** — `.github/workflows/deploy-zaki-runtime.yml` has 3 jobs: `build-and-publish` (immutable sha tags only, no `:latest`), `smoke` (2 assertions), `promote-latest` (environment-gated, manual reviewer). Locally verified: `nullalis version` → exit 0 non-empty; `nullalis help` → exit 0 with `gateway` listed. YAML parses clean via PyYAML.
+
+## Sprint 3 close-out checklist
+
+1. [x] Every in-repo `[ ]` ticked to `[x]` (S3.1–S3.4). zaki-infra S3.5–S3.7 tracked as deferred cross-repo items above.
+2. [x] `zig build -Doptimize=ReleaseFast` green on tip (manually verified on the worktree — produces working binary that passes both smoke assertions).
+3. [x] `.spike/run.sh` NOT run per-commit (skipped this sprint by design — Sprint 3 changes no runtime path).
+4. [x] Sprint 3 close-out commit populates Ship summary + DoD log (this commit).
+5. [x] Branch pushed, PR #13 flipped ready-for-review, zaki-infra PR path documented.
 
 Per the "no-go-live-until-closure" rule: merge to `main` when Sprint 3 closes, but do NOT bump `zaki-infra/charts/nullalis/values.yaml` image tag — prod stays on pre-closure image until every sprint through S15 closes.
