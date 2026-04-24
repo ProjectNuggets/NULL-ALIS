@@ -2788,7 +2788,7 @@ pub const Agent = struct {
                     self.temperature,
                     streamCallbackWithTiming,
                     @ptrCast(&stream_timing_ctx.?),
-                ) catch |err| {
+                ) catch |err| retry_stream_blk: {
                     log.warn("llm.call failed provider={s} model={s} error={s}", .{
                         self.provider.getName(),
                         self.model_name,
@@ -2804,6 +2804,60 @@ pub const Agent = struct {
                         .run_id = self.current_run_id,
                     } };
                     self.observer.recordEvent(&fail_event);
+
+                    // S5.3 — streaming context-exhaustion recovery parity.
+                    // The blocking path (provider.chat below) already force-
+                    // compresses history and re-issues the call once on
+                    // ContextLengthExceeded. Long streamed sessions previously
+                    // returned the raw error where the blocking counterpart
+                    // would have healed. Mirror that behavior here: on
+                    // context-exhausted + sufficient history, forceCompress
+                    // once, rebuild the messages slice from the compacted
+                    // history, and re-issue streamChat exactly once. On retry
+                    // failure, propagate as before.
+                    const err_name = @errorName(err);
+                    if (providers.reliable.isContextExhausted(err_name) and
+                        self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
+                        blk: {
+                            const history_before = self.history.items.len;
+                            if (!self.forceCompressHistory()) break :blk false;
+                            self.recordForceCompression(history_before, self.history.items.len);
+                            break :blk true;
+                        })
+                    {
+                        self.context_was_compacted = true;
+                        self.context_force_compressed = true;
+                        log.info("turn.stage stage=stream_context_recovery iteration={d} — force-compressed and retrying stream", .{iteration});
+
+                        // Rebuild messages after compaction — the arena is
+                        // still live for this iteration, so buildProviderMessages
+                        // reuses it without leaking.
+                        const retry_messages = self.buildProviderMessages(arena) catch |build_err| return build_err;
+                        break :retry_stream_blk self.provider.streamChat(
+                            self.allocator,
+                            .{
+                                .messages = retry_messages,
+                                .model = effective_model,
+                                .temperature = self.temperature,
+                                .max_tokens = self.max_tokens,
+                                .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
+                                .timeout_secs = self.message_timeout_secs,
+                                .reasoning_effort = self.reasoning_effort,
+                            },
+                            effective_model,
+                            self.temperature,
+                            streamCallbackWithTiming,
+                            @ptrCast(&stream_timing_ctx.?),
+                        ) catch |retry_err| {
+                            log.warn("llm.call retry failed after stream context-recovery provider={s} model={s} error={s}", .{
+                                self.provider.getName(),
+                                self.model_name,
+                                @errorName(retry_err),
+                            });
+                            return retry_err;
+                        };
+                    }
+
                     return err;
                 };
                 saw_stream_first_token = stream_timing_ctx.?.first_token_recorded;
