@@ -1203,7 +1203,12 @@ const TenantRuntime = struct {
                     } else {
                         log.warn("tenant config normalize failed for user {s}", .{user_ctx.user_id});
                     }
-                    runtime.config.applyProfileDefaults() catch {};
+                    // S4.8 — tenant profile-defaults silent catch closed. Drop
+                    // here means user ran on the tenant-supplied config WITHOUT
+                    // the usual per-profile defaults (model caps, memory caps,
+                    // feature toggles) baked on top — silent misconfiguration.
+                    runtime.config.applyProfileDefaults() catch |err|
+                        log.warn("tenant.config.applyProfileDefaults_failed user={s} err={s}", .{ user_ctx.user_id, @errorName(err) });
                     runtime.config.memory.applyProfileDefaults();
                     user_settings.applySettingsToConfig(&runtime.config, runtime.resolved_settings);
                 } else {
@@ -1228,7 +1233,10 @@ const TenantRuntime = struct {
                                     log.warn("tenant seeded config parse failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
                                 };
                             }
-                            runtime.config.applyProfileDefaults() catch {};
+                            // S4.9 — same rationale as S4.8; this branch fires on
+                            // the postgres-seeded-from-file path.
+                            runtime.config.applyProfileDefaults() catch |err|
+                                log.warn("tenant.config.applyProfileDefaults_failed_seeded user={s} err={s}", .{ user_ctx.user_id, @errorName(err) });
                             runtime.config.memory.applyProfileDefaults();
                             user_settings.applySettingsToConfig(&runtime.config, runtime.resolved_settings);
                         } else |err| {
@@ -6295,7 +6303,11 @@ fn loadDiagnosticsConfigSnapshot(
     const base_config_path = state.configPath();
     if (base_config_path.len > 0) {
         if (readFileOrDefault(a, base_config_path, "{}\n")) |base_json| {
-            cfg.parseJson(base_json) catch {};
+            // S4.11 — base-config parse silent catch closed. Malformed base
+            // config.json means the tenant starts from the Config-struct
+            // defaults with no log. Operator sees "why are limits wrong?".
+            cfg.parseJson(base_json) catch |err|
+                log.warn("tenant.config.base_parse_failed path={s} err={s}", .{ base_config_path, @errorName(err) });
         } else |_| {}
     }
 
@@ -6304,9 +6316,18 @@ fn loadDiagnosticsConfigSnapshot(
     if (normalized) |snapshot| {
         settings = snapshot.settings;
         ignored_override_count = snapshot.ignored_override_count;
-        cfg.parseJson(snapshot.json) catch {};
+        // S4.11 — tenant-overlay parse silent catch closed. If the per-user
+        // overlay parse fails, cfg keeps the base-config values — which may
+        // be the right fallback, but an operator needs to know a user's
+        // overrides were dropped.
+        cfg.parseJson(snapshot.json) catch |err|
+            log.warn("tenant.config.user_parse_failed err={s}", .{@errorName(err)});
     }
-    cfg.applyProfileDefaults() catch {};
+    // S4.10 — build-path applyProfileDefaults silent catch closed. Same
+    // rationale as S4.8 but on the config-builder helper rather than the
+    // per-request runtime path.
+    cfg.applyProfileDefaults() catch |err|
+        log.warn("tenant.config.applyProfileDefaults_failed_builder err={s}", .{@errorName(err)});
     cfg.memory.applyProfileDefaults();
     user_settings.applySettingsToConfig(&cfg, settings);
 
