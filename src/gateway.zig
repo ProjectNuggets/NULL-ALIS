@@ -1,14 +1,26 @@
 //! HTTP Gateway — lightweight HTTP server for nullalis.
 //!
-//! Mirrors ZeroClaw's axum-based gateway with:
+//! Core surfaces:
 //!   - Sliding-window rate limiting (per-key)
-//!   - Idempotency store (deduplicates webhook requests)
-//!   - Body size limits (64KB max)
+//!   - Idempotency-Key dedupe on mutating routes
+//!   - Body size limits (64 KiB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /slack/events
+//!   - Entitlement enforcement at 3 chokepoints (chat-stream / tool preflight / scheduler)
+//!   - Two-phase secret vault API (prepare → mutate) with audit trail
 //!
-//! Uses std.http.Server (built-in, no external deps).
+//! Endpoints (non-exhaustive — see handleApiRoute / handleControlRoute
+//! dispatch tables for the canonical list; a header comment drifts
+//! faster than the routes do):
+//!   Control plane    — /health, /ready, /pair, /settings, /metrics,
+//!                      /internal/entitlements/revoke
+//!   Channel inbound  — /webhook, /whatsapp, /telegram, /line, /lark,
+//!                      /slack/events, /dingtalk, /facebook, /viber, /discord
+//!   API v1           — /api/v1/users/:id/{chat/stream, secrets/:key, ...},
+//!                      /api/v1/users/provision, /api/v1/users/:id/attachments
+//!
+//! Uses hand-rolled std.net.Server (NOT std.http.Server — the pre-S6.5
+//! header comment claimed the latter; that was drift).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -54,7 +66,7 @@ const zaki_state_mod = @import("zaki_state.zig");
 const zaki_session = @import("session/root.zig");
 const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
-const tool_dispatcher = @import("tool_dispatcher.zig");
+const tool_dispatcher = @import("tool_mode.zig");
 const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
 const channel_identity_key = @import("channel_identity_key.zig");
 const multimodal = @import("multimodal.zig");

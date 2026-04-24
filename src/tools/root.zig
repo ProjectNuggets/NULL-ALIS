@@ -539,9 +539,83 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
 /// Return the static default metadata registry for built-in tools.
 /// Callers must still fall back to `ToolMetadata.conservative(name)` when
 /// `lookupMetadata` returns null (MCP tools, dynamic tools, future additions).
+///
+/// S6.3 — delegate/spawn entries are kept in `DEFAULT_TOOL_METADATA` but
+/// filtered out at lookup time when `NULLALIS_ENABLE_MULTIAGENT` is not set
+/// to "1". Runtime tool registration at `buildDefaultTools` already gates
+/// the tool instances behind the same env; without this filter the metadata
+/// registry claimed classification for tools that weren't installed, which
+/// confused `classifyTool` callers when a model hallucinated a `delegate`
+/// call-by-name.
 pub fn defaultMetadataRegistry() []const metadata.ToolMetadata {
-    return &DEFAULT_TOOL_METADATA;
+    if (multiagentEnabledEnv()) return &DEFAULT_TOOL_METADATA;
+    return &CORE_TOOL_METADATA;
 }
+
+/// Read `NULLALIS_ENABLE_MULTIAGENT` from the process env. Returns true
+/// only for exact value "1" (allows whitespace trim). Mirrors the gate at
+/// `buildDefaultTools` so metadata stays in lockstep with registration.
+///
+/// Post-review fix (MED-3 from sprint-4-5-6-review): cache the result
+/// in a module-scoped atomic so the answer is determined once per
+/// process. Without the cache the registry reader and the runtime-tool
+/// registration reader could in principle disagree if third-party code
+/// inside the process called `setenv()` between them. Nullalis doesn't
+/// setenv today, but the drift would be invisible and hard to debug —
+/// first-reader-wins is cheap insurance.
+///
+/// Encoding: 0 = unread (first caller populates), 1 = false, 2 = true.
+/// Acquire-release ordering keeps the string-read visible before the
+/// cache transitions out of 0.
+var multiagent_env_cache: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+
+fn multiagentEnabledEnv() bool {
+    const cached = multiagent_env_cache.load(.acquire);
+    if (cached != 0) return cached == 2;
+
+    // First caller performs the actual env read. 16-byte FBA is enough for
+    // realistic values ("0" / "1" / "true" / "false"); longer values fall
+    // through to `catch return false` which is semantically correct (fail
+    // closed on multiagent when we can't confirm the enable flag).
+    var fba_buf: [16]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    const allocator = fba.allocator();
+    const enabled = blk: {
+        const raw = std.process.getEnvVarOwned(allocator, "NULLALIS_ENABLE_MULTIAGENT") catch break :blk false;
+        defer allocator.free(raw);
+        break :blk std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "1");
+    };
+
+    // Racy first-write is fine: two first-readers would write the same
+    // value (env didn't change between their reads). compareAndSwap from
+    // 0 ensures we don't clobber an answer that somebody else may have
+    // already stored + read.
+    _ = multiagent_env_cache.cmpxchgStrong(0, if (enabled) 2 else 1, .release, .monotonic);
+    return enabled;
+}
+
+/// Test helper — clear the multiagent env cache. Only call from tests
+/// that deliberately want to re-read the env. Production code should
+/// never invalidate this cache.
+pub fn resetMultiagentEnvCacheForTest() void {
+    multiagent_env_cache.store(0, .release);
+}
+
+/// Core metadata slice — `DEFAULT_TOOL_METADATA` minus delegate + spawn.
+/// Computed at comptime; no runtime allocation. Kept in sync with the
+/// runtime filter in `defaultMetadataRegistry` — if you add a new
+/// multiagent-gated tool, it needs to be excluded here too.
+const CORE_TOOL_METADATA = blk: {
+    var out: [DEFAULT_TOOL_METADATA.len]metadata.ToolMetadata = undefined;
+    var count: usize = 0;
+    for (DEFAULT_TOOL_METADATA) |m| {
+        if (std.mem.eql(u8, m.name, delegate.DelegateTool.tool_name)) continue;
+        if (std.mem.eql(u8, m.name, spawn.SpawnTool.tool_name)) continue;
+        out[count] = m;
+        count += 1;
+    }
+    break :blk out[0..count].*;
+};
 
 // ── Args-aware metadata refinement ──────────────────────────────────
 //
@@ -2191,11 +2265,16 @@ test "defaultMetadataRegistry classifies known read-only tools" {
 }
 
 test "defaultMetadataRegistry classifies known mutating tools" {
+    // S6.3 — delegate + spawn are no longer in the default-lane registry
+    // when NULLALIS_ENABLE_MULTIAGENT is unset. They're still in
+    // `DEFAULT_TOOL_METADATA` (the extended static slice) and still
+    // classified correctly there — see the separate "multiagent-gated
+    // tools still classify" test below.
     const registry = defaultMetadataRegistry();
     const mutating = [_][]const u8{
         "shell",         "file_write",    "file_edit",     "file_append",
         "git_operations", "memory_store", "memory_edit",   "memory_forget",
-        "schedule",      "delegate",      "spawn",         "message",
+        "schedule",      "message",
         "pushover",      "cron_add",      "cron_remove",   "cron_update",
         "cron_run",      "http_request",  "browser",       "browser_open",
         "composio",      "skill_registry", "task_stop",
@@ -2203,6 +2282,24 @@ test "defaultMetadataRegistry classifies known mutating tools" {
     for (mutating) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse {
             std.debug.print("missing registry entry: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(m.flags.mutating);
+        try std.testing.expect(!m.flags.read_only);
+        try std.testing.expect(!m.flags.background_safe);
+    }
+}
+
+test "multiagent-gated tools (delegate, spawn) still classify as mutating + non-background in the extended registry" {
+    // The default lane filters delegate + spawn out of the registry
+    // unless NULLALIS_ENABLE_MULTIAGENT is set. But the classifications
+    // must still be correct in DEFAULT_TOOL_METADATA for the multiagent
+    // path to use them. This test guards that they stay classified
+    // correctly even though operators on the default lane can't see them.
+    const registry: []const metadata.ToolMetadata = &DEFAULT_TOOL_METADATA;
+    for ([_][]const u8{ "delegate", "spawn" }) |name| {
+        const m = metadata.lookupMetadata(name, registry) orelse {
+            std.debug.print("missing multiagent registry entry: {s}\n", .{name});
             return error.TestUnexpectedResult;
         };
         try std.testing.expect(m.flags.mutating);
@@ -2240,9 +2337,13 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
 }
 
 test "defaultMetadataRegistry keeps sensitive tools off the background lane" {
+    // S6.3 — as above: delegate + spawn are filtered out of the default
+    // registry when NULLALIS_ENABLE_MULTIAGENT is unset. Background-lane
+    // safety for those two is asserted in the adjacent test against the
+    // extended `DEFAULT_TOOL_METADATA` slice.
     const registry = defaultMetadataRegistry();
     const must_not_be_background = [_][]const u8{
-        "message", "schedule", "composio", "shell", "spawn", "delegate",
+        "message", "schedule", "composio", "shell",
     };
     for (must_not_be_background) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse return error.TestUnexpectedResult;

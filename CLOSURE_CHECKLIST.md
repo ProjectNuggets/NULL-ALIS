@@ -214,13 +214,32 @@ Goal: architectural claims match wire behavior.
 
 Goal: every line earns its place.
 
-- [ ] **S6.1** Remove `hardware` surface — `main.zig` (5 hunks), `config.zig` (field + re-exports + tests + printer), `config_types.zig` (struct + enum), `config_parse.zig`, `status.zig:210`, `user_settings.zig:145`, `capabilities.zig:48-49,88-89`, `tools/root.zig:653,897,900`, `root.zig:5,84,86`. Delete `src/rag.zig` (dead module).
-- [ ] **S6.2** Remove dead `POST /api/v1/chat/stream` + `GET /api/v1/chat/events` buffered paths — `gateway.zig:10377-10582`, `:10584+` (~200 LoC). Cite: P2_gateway.
-- [ ] **S6.3** Gate `delegate`/`spawn` metadata in `DEFAULT_TOOL_METADATA:384-392` behind `NULLALIS_ENABLE_MULTIAGENT` to match runtime registration. Cite: P2_tools.
-- [ ] **S6.4** Consolidate legacy `pending_exec_*` into `pending_tool_approval`. Cite: P2_tools.
-- [ ] **S6.5** Fix `gateway.zig:11` file header (`std.http.Server` → `std.net.Server`) + refresh endpoint list at `:9`. Cite: P2_gateway.
-- [ ] **S6.6** Rename `tool_dispatcher.zig` → `tool_mode.zig`. Update all imports. Cite: P2_tools, P1_arch.
-- [ ] **S6.7** `voice_mode.zig` — add file-header comment noting metadata-only. Cite: P2_voice, P1_arch.
+- [~] **S6.1** Remove `hardware` surface — `main.zig` (5 hunks), `config.zig` (field + re-exports + tests + printer), `config_types.zig` (struct + enum), `config_parse.zig`, `status.zig:210`, `user_settings.zig:145`, `capabilities.zig:48-49,88-89`, `tools/root.zig:653,897,900`, `root.zig:5,84,86`. Delete `src/rag.zig` (dead module). _S6.1a shipped `4492bf3` (rag.zig removed); S6.1b (hardware surface, 9-file surgery) carried → **D19**._
+- [ ] **S6.2** Remove dead `POST /api/v1/chat/stream` + `GET /api/v1/chat/events` buffered paths — `gateway.zig:10377-10582`, `:10584+` (~200 LoC). Cite: P2_gateway. _Carried → **D20** — line numbers pre-drift; need re-verification against current tip before deletion._
+- [x] **S6.3** Gate `delegate`/`spawn` metadata in `DEFAULT_TOOL_METADATA:384-392` behind `NULLALIS_ENABLE_MULTIAGENT` to match runtime registration. Cite: P2_tools. _Shipped `917b9ce` — comptime-computed `CORE_TOOL_METADATA` subset + `multiagentEnabledEnv()` helper + test updates + new test for extended-registry classification._
+- [ ] **S6.4** Consolidate legacy `pending_exec_*` into `pending_tool_approval`. Cite: P2_tools. _Carried → **D21** — two parallel approval systems; user-facing surface; needs dedicated read-through + test coverage before merge._
+- [x] **S6.5** Fix `gateway.zig:11` file header (`std.http.Server` → `std.net.Server`) + refresh endpoint list at `:9`. Cite: P2_gateway. _Shipped `08f3729` — header rewrite points at dispatch table (drifts more slowly than enumerated comments) + corrects stdlib citation._
+- [x] **S6.6** Rename `tool_dispatcher.zig` → `tool_mode.zig`. Update all imports. Cite: P2_tools, P1_arch. _Shipped `46ef65e` — `git mv` + 3 import paths + file header documenting the rename and the stability of the user-facing config key._
+- [x] **S6.7** `voice_mode.zig` — add file-header comment noting metadata-only. Cite: P2_voice, P1_arch. _Shipped `08f3729` — header block states responsibility boundary + warns that TTS-capable flags for discord/whatsapp/slack advertise intent not working paths._
+
+**Sprint 6 — CLOSED 2026-04-24 at `4492bf3`** — 5/7 shipped (S6.1a + S6.3 + S6.5 + S6.6 + S6.7); S6.1b → **D19**, S6.2 → **D20**, S6.4 → **D21**.
+
+Ship:
+- `src/rag.zig` deleted (13 KiB dead datasheet-RAG module with sole consumer being its own re-export in root.zig).
+- `delegate` + `spawn` metadata gated behind `NULLALIS_ENABLE_MULTIAGENT` — registry now matches runtime registration; hallucinated-by-name tool calls fail cleanly at lookup instead of confusing the preflight policy.
+- Two file-header comment fixes: gateway.zig now honestly says `std.net.Server` + points at the dispatch table; voice_mode.zig declares itself metadata-only with a warning about its aspirational TTS-capability flags.
+- `tool_dispatcher.zig` → `tool_mode.zig` rename removes the grep-trap where readers confused the 70-line config-helper with the real ~1700-LoC dispatcher at `src/agent/dispatcher.zig`.
+
+DoD verification:
+- `zig build` green at each commit.
+- `zig build test` exit 0 on tip; 5560 tests pass, 35 skipped, 0 failures.
+- New unit test guards delegate/spawn classification against the extended registry so future multiagent-path regressions fire immediately.
+- Zero stale `@import("tool_dispatcher.zig")` references after the rename.
+
+Deferred-but-tracked:
+- **D19** — S6.1b hardware surface removal. 9-file surgery; inert today (CLI is a deprecation-stub, tools don't register, config_parse silently ignores); ~200 lines to remove cleanly.
+- **D20** — S6.2 dead `/api/v1/chat/stream` + `/api/v1/chat/events` buffered paths. Line numbers pre-drift; need re-verification before deletion — dead-looking code that's actually consumed is a classic regression.
+- **D21** — S6.4 `pending_exec_*` consolidation. Two parallel approval systems; user-facing; risky merge without dedicated review.
 
 **Sprint 6 DoD:** `zig build test` green. Line count in `src/` reduced. No references to removed symbols.
 

@@ -1,3 +1,17 @@
+//! Tool-mode helper — parse the `agent.tool_dispatcher` config key into a
+//! small enum describing serial vs parallel tool execution.
+//!
+//! **Not the dispatcher.** This file is ~70 LoC of parsing + mode
+//! resolution. The real tool dispatcher lives at `src/agent/dispatcher.zig`
+//! (handles tool-call parsing, preflight policy, dispatch, tool-result
+//! formatting). Pre-S6.6 this file was named `tool_dispatcher.zig`, which
+//! created a trap: readers grepping for "dispatcher" found both and
+//! confused the small config helper with the real dispatch engine.
+//! Renamed to `tool_mode.zig` to match actual responsibility. The
+//! user-facing config key `agent.tool_dispatcher` was NOT renamed —
+//! that would break every existing config.json. Only the internal file
+//! + import paths moved.
+
 const std = @import("std");
 
 pub const Mode = enum {
