@@ -14,13 +14,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig (pinned via .zigversion)
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version-file: .zigversion
 
       - name: Install Postgres headers/libs
         run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Run tests (canonical production engines)
+        # S3.3 — release.yml canonical-profile must run tests before build.
+        # Same engine/channel set as the build step and as ci.yml canonical-production-profile,
+        # so a green tag push proves the shipped binary is exercised by the test suite.
+        run: zig build test --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram
 
       - name: Build ReleaseSmall (canonical production engines)
         run: zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dchannels=cli,telegram
@@ -67,10 +73,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig (pinned via .zigversion)
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version-file: .zigversion
 
       - name: Build ReleaseSmall
         run: zig build -Doptimize=ReleaseSmall ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}

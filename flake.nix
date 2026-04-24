@@ -13,8 +13,20 @@
     (flake-utils.lib.eachDefaultSystem (
       system:
       let
+        # S3.1 — pin Zig version to the value in `.zigversion` so the
+        # dev-shell matches the CI + Docker build pipeline. Previously
+        # used `zig-latest` which drifted whenever zig2nix upstream
+        # updated. If the transformed attribute doesn't exist on
+        # zig2nix (e.g. pinning an older version that was removed),
+        # the flake fails loudly rather than silently picking up a
+        # different release — loud fail is the point.
+        zigVersion =
+          let raw = builtins.readFile ./.zigversion;
+          in
+          builtins.replaceStrings [ "\n" " " "\t" ] [ "" "" "" ] raw;
+        zigAttrName = "zig-" + builtins.replaceStrings [ "." ] [ "_" ] zigVersion;
         env = zig2nix.outputs.zig-env.${system} {
-          zig = zig2nix.outputs.packages.${system}.zig-latest;
+          zig = zig2nix.outputs.packages.${system}.${zigAttrName};
         };
         pkgs = env.pkgs;
         project = "nullalis";

@@ -3,13 +3,32 @@
 # ── Stage 1: Build ────────────────────────────────────────────
 FROM alpine:3.23 AS builder
 
-RUN apk add --no-cache git zig musl-dev postgresql-dev
+# S3.1 — pin Zig to the same version ci.yml + release.yml use via
+# `.zigversion`. The Alpine `zig` package drifts with Alpine releases;
+# downloading the official tarball at a pinned version eliminates the
+# drift hazard and keeps the whole build pipeline on one Zig release.
+RUN apk add --no-cache git musl-dev postgresql-dev curl xz tar
 
 ARG TARGETARCH
 
 WORKDIR /app
+COPY .zigversion ./
 COPY build.zig build.zig.zon ./
 COPY src/ src/
+
+RUN ZIG_VERSION="$(cat .zigversion | tr -d '[:space:]')" && \
+    case "${TARGETARCH}" in \
+      amd64) ZIG_ARCH=x86_64 ;; \
+      arm64) ZIG_ARCH=aarch64 ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" \
+      -o /tmp/zig.tar.xz && \
+    mkdir -p /opt/zig && \
+    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && \
+    ln -s /opt/zig/zig /usr/local/bin/zig && \
+    rm /tmp/zig.tar.xz && \
+    zig version
 
 RUN case "${TARGETARCH}" in \
       amd64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dchannels=cli,telegram -Dcpu=haswell ;; \
