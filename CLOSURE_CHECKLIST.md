@@ -297,14 +297,16 @@ Goal: features users touch don't lie.
 
 Goal: W5 ambiguities resolved. Each gets a YES/NO/DEFER with written rationale; resulting code work queued into later sprint if needed.
 
-- [ ] **S8.1** W5.1 Lane-aware memory retrieval — decision + code (filter vs label vs keep-as-is). Cite: P2_memory_pipeline, P2_lanes.
-- [ ] **S8.2** W5.2 `buildThreadSessionKey` legacy vs canonical — migrate, dual-parser, or deprecate. Cite: P2_lanes.
-- [ ] **S8.3** W5.3 NULLCLAW_ → NULLALIS_ rebrand — bridge shim (`tryNullalisThenNullclaw` helper) or park. Currently 42 vs 5. Cite: P1_quality.
-- [ ] **S8.4** W5.4 Dormant channel implementations — 15 impls; delete, formalize as flag set, or keep. Cite: P1_arch.
-- [ ] **S8.5** W5.5 `.task` lane production path — wire when multiagent flips, delete until ready, or keep inert. Cite: P2_lanes.
-- [ ] **S8.6** W5.6 `channels/dingtalk.zig` — add tests or mark dormant. Cite: P1_quality.
+- [x] **S8.1** W5.1 Lane-aware memory retrieval — **B (Label)**. `MemoryEntry` and `RetrievalCandidate` now carry a `lane: []const u8` field, populated via the new public `laneFromSessionId()` helper. Sqlite row reader hydrates it from `session_id`; entries-to-candidates mirrors it. Borrowed-string-literal pointer (no alloc/free coupling). Future evolution to vtable-level filtering (Option C) preserved if cross-lane noise ever shows in production. Sha: `462ce54`.
+- [x] **S8.2** W5.2 `buildThreadSessionKey` legacy vs canonical — **B (Dual-formatter, formalize)**. Investigation revealed they're not legacy-vs-canonical at all: `agent_routing.buildThreadSessionKey` operates on the channel-routed family (`agent:{agent_id}:{channel}:{kind}:{id}`) used by `daemon.zig:1709`; `session/root.zig::userThreadSessionKey` operates on the user-cell family (`agent:zaki-bot:user:{id}:thread:{conv}`) used by HTTP/SSE. Migration would have produced wrong key shapes. Both formatters now carry doc comments cross-referencing each other; `daemon.zig:1709` carries an inline anti-migrate guard. Sha: `d722b39`.
+- [x] **S8.3** W5.3 NULLCLAW_ → NULLALIS_ rebrand — **C (Park with deadline)**. Sunset 2026-05-15 baked into `sentry_runtime.NULLCLAW_SUNSET_DATE`. Three `*WithFallback` shim helpers fire a once-per-process banner via cmpxchg-guarded atomic flag, and per-key warns include the date. `observability.zig::OtelObserver.fromEnv` warning text matches. Direct-read sites in `cell_k8s_api.zig` (16 vars) and `providers/api_key.zig` deferred to D28 — they need a coordinated infra+code migration before sunset. Sha: `1be6e1a`.
+- [x] **S8.4** W5.4 Dormant channel implementations — **A (Delete dingtalk; defer flag-gating)**. Investigation: 19 channels (not 15), 13 live + 5 dormant-working + 1 dormant-stub. Only dingtalk (121 LoC, 0 tests, comment admitted incomplete Stream Mode WebSocket) was a delete candidate; the other 5 dormant-working channels (whatsapp/lark/email/line/maixcam) carry real implementations and stay as roadmap code. Formalizing flag-gating as `@import` conditionals deferred to a dedicated infrastructure PR. Sha: `c969e88` (combined with S8.6).
+- [x] **S8.5** W5.5 `.task` lane production path — **A (Already wired; tick and close)**. The premise of the original W5.5 question was stale. Audit found `.task` lane is fully wired across `subagent.zig:890` (`isTaskLaneSession`), `spawn.zig:178`, `runtime_info.zig` (multiple test asserts), `diagnostics/runtime_truth.zig:323`, plus the gateway lane-metric counters. Activation is gated by `NULLALIS_ENABLE_MULTIAGENT` (S6.3); when off, the spawn tool is filtered from the metadata registry so task-lane sessions never get created — but the machinery is ready. No code change needed; closure is the doc capture itself.
+- [x] **S8.6** W5.6 `channels/dingtalk.zig` — **C (Delete)**. Rolled into S8.4 (`c969e88`). 121 LoC, 0 tests, no roadmap signal — recreating from scratch costs less than maintaining a dead stub.
 
-**Sprint 8 DoD:** each decision has a line in CLAUDE.md or similar explaining the call + date. Follow-up code queued.
+**Sprint 8 DoD:** all 6 decisions captured in `docs/sprints/sprint-8.md` with date, rationale, and SHAs. Follow-up code queued in deferred-register (D28: NULLCLAW_ direct-read migration; D29: vtable-level memory filtering if cross-lane noise observed).
+
+**Sprint 8 — CLOSED 2026-04-24.** Branch `repair/sprint-8-design-decisions`. 5 commits: `c969e88` (S8.4+S8.6), `d722b39` (S8.2), `462ce54` (S8.1), `1be6e1a` (S8.3), + a docs commit for S8.5 + closure artifacts.
 
 ---
 

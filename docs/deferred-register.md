@@ -84,6 +84,16 @@ one-line reason.
 
 ---
 
+## From Sprint 8 (Design Decisions)
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| D28 | Migrate the ~16 NULLCLAW_CELL_* direct-reads in `src/cell_k8s_api.zig` + the `NULLCLAW_API_KEY` generic fallback in `src/providers/api_key.zig` + the `NULLCLAW_POSTGRES_TEST_URL` test gates in `src/zaki_state.zig` to dual-name (NULLALIS_ primary, NULLCLAW_ fallback) before the 2026-05-15 sunset | S8.3 shipped sunset deadline + once-per-process banner + per-key warn for the SHIM-helper paths in `sentry_runtime.zig` and `observability.zig`. Direct-read sites bypass the shim helpers and need coordinated env-file + k8s-manifest + sealed-secrets migration. Hard deadline forcing function — must close before sunset | Dedicated NULLCLAW-migration PR with k8s manifest companion in zaki-infra | **open — sunset 2026-05-15** |
+| D29 | Vtable-level lane filtering (`VectorStore.searchScopedByLane(user_id, lane, ...)` + Memory.recall lane parameter) if cross-lane noise becomes observable | S8.1 shipped Label (Option B) — entries and candidates carry `lane` field for ranking heuristics. Filter (Option C) was deferred because today's 3-tier retrieval strategy already handles scope via session_id; promoting lane to a vtable parameter would churn ~6-8 files and force every backend impl to reimplement filtering. Activate only if production retrieval shows real cross-lane confusion | Dedicated retrieval refactor PR | **open — conditional, not scheduled** |
+| D30 | Rename `agent_routing.buildThreadSessionKey` → `buildChannelRoutedThreadSessionKey` to remove the name collision with `session/root.userThreadSessionKey` | S8.2 shipped doc-comment cross-references on both formatters and an inline anti-migrate guard at `daemon.zig:1709`. A rename would make the family difference unmistakable but costs ~20 ref-site updates plus test renames. Optional polish; not load-bearing | Dedicated rename PR if the dual-formatter design ever causes a real bug | **open — optional polish** |
+
+---
+
 ## From Sprint 4/5/6 post-hoc self-review
 
 | ID | Shape | Why deferred | Target | Status |
@@ -118,4 +128,4 @@ one-line reason.
 - **Superseding an item:** change `open` → `obsolete` with a one-line reason. Do NOT delete the row.
 - **Reviewing "what's still open":** `grep 'open' docs/deferred-register.md | wc -l` gives the live count.
 
-Last audit: **2026-04-24** at Sprint 6 close — 18 items open, 4 shipped, 0 obsolete.
+Last audit: **2026-04-24** at Sprint 8 close — 21 items open, 4 shipped, 0 obsolete. (Note: Sprint 7B's D25-D27 land via PR #21 when it merges; this branch was cut from main before #21.)
