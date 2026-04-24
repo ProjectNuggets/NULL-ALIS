@@ -581,13 +581,58 @@ fn buildIdentitySection(
     try injectPreferredMemoryFile(allocator, w, workspace_dir);
 }
 
-fn buildToolsSection(w: anytype, tools: []const Tool) !void {
+fn buildToolsSection(w: anytype, tools: anytype) !void {
+    // S5.4 — sort tools by name for byte-stable prompt prefix. Without this,
+    // any caller whose tool slice order depends on hashmap enumeration,
+    // insertion history, or flag-dependent registration would drift the
+    // stable prefix bytes across runs and invalidate provider cache.
+    // Iterate via a sorted index array so the input slice stays untouched.
+    //
+    // `tools` is anytype to preserve duck-typing symmetry with
+    // dispatcher.buildToolInstructions (which takes MockTool in tests).
+    // Any slice whose element has .name() .description() .parametersJson()
+    // methods satisfies the shape.
     try w.writeAll("## Tools\n\n");
-    for (tools) |t| {
+
+    var idx_buf: [256]usize = undefined;
+    const n = @min(tools.len, idx_buf.len);
+    if (tools.len > idx_buf.len) {
+        // Belt-and-braces: 256 is well above any realistic catalog size (29
+        // default tools today). If we ever exceed, fall back to unsorted —
+        // we still render, just without the byte-stability guarantee, and
+        // the byte-equality test in S5.6 will catch the regression.
+        for (tools) |t| {
+            try std.fmt.format(w, "- **{s}**: {s}\n  Parameters: `{s}`\n", .{
+                t.name(),
+                t.description(),
+                t.parametersJson(),
+            });
+        }
+        try w.writeAll("\n");
+        return;
+    }
+    var i: usize = 0;
+    while (i < n) : (i += 1) idx_buf[i] = i;
+
+    // Simple insertion sort — N is small (29 today, bounded by 256), O(N²)
+    // acceptable, no allocations, branchless-friendly on modern CPUs.
+    i = 1;
+    while (i < n) : (i += 1) {
+        var j: usize = i;
+        while (j > 0) : (j -= 1) {
+            if (std.mem.lessThan(u8, tools[idx_buf[j]].name(), tools[idx_buf[j - 1]].name())) {
+                const tmp = idx_buf[j];
+                idx_buf[j] = idx_buf[j - 1];
+                idx_buf[j - 1] = tmp;
+            } else break;
+        }
+    }
+
+    for (idx_buf[0..n]) |k| {
         try std.fmt.format(w, "- **{s}**: {s}\n  Parameters: `{s}`\n", .{
-            t.name(),
-            t.description(),
-            t.parametersJson(),
+            tools[k].name(),
+            tools[k].description(),
+            tools[k].parametersJson(),
         });
     }
     try w.writeAll("\n");
@@ -1369,6 +1414,51 @@ test "buildStableSystemPrompt excludes datetime and conversation context" {
     try std.testing.expect(std.mem.indexOf(u8, stable, "## Current Date & Time") == null);
     // But must contain identity/tools/runtime — the stable inputs.
     try std.testing.expect(std.mem.indexOf(u8, stable, "## Runtime") != null);
+}
+
+test "buildToolsSection emits tools sorted by name regardless of input order [S5.4]" {
+    // Prove the sort directly with a duck-typed MockTool slice. Three tools
+    // in reversed input order ("zebra", "mike", "alpha") must render as
+    // alpha → mike → zebra in the output. If the sort regresses, the
+    // substring-order check here fails before any higher-level prefix test
+    // would — localized fast signal for the change.
+    const allocator = std.testing.allocator;
+    const MockTool = struct {
+        tool_name: []const u8,
+        tool_desc: []const u8,
+        tool_params: []const u8,
+        fn name(self: @This()) []const u8 {
+            return self.tool_name;
+        }
+        fn description(self: @This()) []const u8 {
+            return self.tool_desc;
+        }
+        fn parametersJson(self: @This()) []const u8 {
+            return self.tool_params;
+        }
+    };
+    const reversed = [_]MockTool{
+        .{ .tool_name = "zebra", .tool_desc = "Z", .tool_params = "{}" },
+        .{ .tool_name = "mike", .tool_desc = "M", .tool_params = "{}" },
+        .{ .tool_name = "alpha", .tool_desc = "A", .tool_params = "{}" },
+    };
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buildToolsSection(buf.writer(allocator), reversed[0..]);
+
+    const out = buf.items;
+    const alpha_pos = std.mem.indexOf(u8, out, "**alpha**") orelse return error.AlphaMissing;
+    const mike_pos = std.mem.indexOf(u8, out, "**mike**") orelse return error.MikeMissing;
+    const zebra_pos = std.mem.indexOf(u8, out, "**zebra**") orelse return error.ZebraMissing;
+    try std.testing.expect(alpha_pos < mike_pos);
+    try std.testing.expect(mike_pos < zebra_pos);
+
+    // Byte-stability: same input twice produces byte-identical output.
+    var buf2: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf2.deinit(allocator);
+    try buildToolsSection(buf2.writer(allocator), reversed[0..]);
+    try std.testing.expectEqualStrings(buf.items, buf2.items);
 }
 
 test "buildStableSystemPrompt is byte-stable across back-to-back calls with identical inputs" {
