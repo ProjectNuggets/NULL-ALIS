@@ -25,10 +25,19 @@ pub fn channelSupportsAudio(channel: []const u8) bool {
 /// Known audio-capable channels: telegram, discord, whatsapp, slack.
 /// Unknown channels default to no audio support.
 pub fn resolveCapability(channel: []const u8) VoiceCapability {
+    // S7.9 — capability honesty. Pre-S7.9 this function claimed
+    // discord/whatsapp/slack were STT+TTS capable; an audit of the
+    // channel implementations confirmed only `telegram.zig` has an
+    // audio-send path (`sendAudio` / `sendVoice` Bot API calls). The
+    // other three channels had no code to deliver the audio the
+    // capability descriptor promised — tool callers would build an
+    // attachment that silently dropped on send.
+    //
+    // Truth now matches wire: only telegram reports STT+TTS. When the
+    // discord/whatsapp/slack audio send paths actually ship, add them
+    // back one at a time with their matching attachment-dispatch code
+    // landing in the same commit.
     if (std.ascii.eqlIgnoreCase(channel, "telegram")) return .{ .stt = true, .tts = true };
-    if (std.ascii.eqlIgnoreCase(channel, "discord")) return .{ .stt = true, .tts = true };
-    if (std.ascii.eqlIgnoreCase(channel, "whatsapp")) return .{ .stt = true, .tts = true };
-    if (std.ascii.eqlIgnoreCase(channel, "slack")) return .{ .stt = true, .tts = true };
     if (std.ascii.eqlIgnoreCase(channel, "zaki_app")) return .{ .stt = false, .tts = false }; // frontend must implement
     return .{ .stt = false, .tts = false };
 }
@@ -69,12 +78,12 @@ test "channelSupportsAudio returns true for telegram" {
     try std.testing.expect(channelSupportsAudio("telegram"));
 }
 
-test "channelSupportsAudio returns true for discord" {
-    try std.testing.expect(channelSupportsAudio("discord"));
+test "channelSupportsAudio returns false for discord (S7.9 — no audio-send path yet)" {
+    try std.testing.expect(!channelSupportsAudio("discord"));
 }
 
-test "channelSupportsAudio returns true for whatsapp" {
-    try std.testing.expect(channelSupportsAudio("whatsapp"));
+test "channelSupportsAudio returns false for whatsapp (S7.9 — no audio-send path yet)" {
+    try std.testing.expect(!channelSupportsAudio("whatsapp"));
 }
 
 test "channelSupportsAudio returns false for cli" {
@@ -129,16 +138,20 @@ test "VoiceMode.NarrationLabel constants are correct" {
     try std.testing.expectEqualStrings("Speaking...", VoiceMode.NarrationLabel.speaking);
 }
 
-test "channelSupportsAudio is case-insensitive" {
+test "channelSupportsAudio is case-insensitive (telegram)" {
+    // S7.9 — case-insensitivity only exercises telegram now, since it's
+    // the only channel with a real audio-send path. Discord/WhatsApp/Slack
+    // return false regardless of case.
     try std.testing.expect(channelSupportsAudio("Telegram"));
-    try std.testing.expect(channelSupportsAudio("DISCORD"));
-    try std.testing.expect(channelSupportsAudio("WhatsApp"));
+    try std.testing.expect(channelSupportsAudio("TELEGRAM"));
+    try std.testing.expect(!channelSupportsAudio("DISCORD"));
+    try std.testing.expect(!channelSupportsAudio("WhatsApp"));
 }
 
-test "resolveCapability slack returns full audio" {
+test "resolveCapability slack returns no audio (S7.9 — no audio-send path yet)" {
     const cap = resolveCapability("slack");
-    try std.testing.expect(cap.stt);
-    try std.testing.expect(cap.tts);
+    try std.testing.expect(!cap.stt);
+    try std.testing.expect(!cap.tts);
 }
 
 test "resolveCapability zaki_app returns no audio" {
