@@ -25,6 +25,21 @@ const zaki_dual_memory = @import("memory/engines/zaki_dual.zig");
 const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
+const sentry_runtime = @import("sentry_runtime.zig");
+
+/// Placeholder body emitted when a turn returned an empty reply (tool-only
+/// turn — the model called spawn/delegate or a silent tool and produced no
+/// post-tool assistant text). Prior shipped versions emitted the literal
+/// "received" here, which users read as the actual reply and closed the
+/// session — missing the real subagent output that arrived on a later SSE
+/// frame. See project_subagent_received_bug.md for the full diagnosis and
+/// P2_subagent_delegate.md for the architectural TurnOutcome refactor that
+/// replaces this string path entirely (tracked separately).
+///
+/// The interim honest text makes the absence of a reply explicit so the
+/// user knows to wait for follow-up content rather than treating the
+/// fabricated string as the answer.
+pub const EMPTY_TURN_PLACEHOLDER = "[tools ran, no direct reply this turn — results may arrive on a follow-up.]";
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const agent_routing = @import("agent_routing.zig");
@@ -1074,7 +1089,9 @@ const TenantRuntime = struct {
     trace_store: *run_trace_store_mod.RunTraceStore,
     log_obs: *observability.LogObserver,
     metrics_obs: LifecycleMetricsObserver,
-    observer_slots: [3]Observer,
+    otel_obs: ?*observability.OtelObserver = null,
+    noop_obs: observability.NoopObserver = .{},
+    observer_slots: [5]Observer,
     observer_multi: observability.MultiObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: std.atomic.Value(i64),
@@ -1322,10 +1339,19 @@ const TenantRuntime = struct {
         );
         runtime.trace_store = trace_store;
 
+        if (observability.OtelObserver.fromEnv(allocator)) |otel_init| {
+            const otel_ptr = allocator.create(observability.OtelObserver) catch null;
+            if (otel_ptr) |p| {
+                p.* = otel_init;
+                runtime.otel_obs = p;
+            }
+        }
         runtime.observer_slots = .{
             runtime.log_obs.observer(),
             runtime.metrics_obs.observer(),
             runtime.trace_store.observer(),
+            sentry_runtime.globalOrFallback().observer(),
+            if (runtime.otel_obs) |otel| otel.observer() else runtime.noop_obs.observer(),
         };
         runtime.observer_multi = .{ .observers = runtime.observer_slots[0..] };
 
@@ -1543,6 +1569,10 @@ const TenantRuntime = struct {
         self.allocator.destroy(self.task_ledger);
         self.provider_bundle.deinit();
         self.allocator.destroy(self.log_obs);
+        if (self.otel_obs) |otel| {
+            otel.deinit();
+            self.allocator.destroy(otel);
+        }
         self.allocator.free(self.workspace_path);
         self.allocator.free(self.user_id);
         self.allocator.destroy(self);
@@ -9181,7 +9211,7 @@ fn handleApiChatStreamSseConnection(
     const payload_text = if (reply.len > 0)
         reply
     else
-        "received";
+        EMPTY_TURN_PLACEHOLDER;
 
     // Determine if live streaming actually delivered tokens. If the provider
     // does not support streaming, live_seq stays 0 and we must fall back to
@@ -10559,7 +10589,7 @@ fn handleApiRoute(
         const payload_text = if (reply.len > 0)
             req_allocator.dupe(u8, reply) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" }
         else
-            req_allocator.dupe(u8, "received") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" };
+            req_allocator.dupe(u8, EMPTY_TURN_PLACEHOLDER) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" };
         defer req_allocator.free(payload_text);
         const sse_start_ms = std.time.milliTimestamp();
         const sse = sseBufferedChatPayload(req_allocator, status_frame, progress_observer_impl.frames.items, payload_text, session_key) catch {
@@ -14007,7 +14037,10 @@ pub fn runWithRole(
     var standalone_usage_rt: ?usage_runtime_mod.UsageRuntime = null;
     var log_obs_gateway = observability.LogObserver{};
     var metrics_obs_gateway = LifecycleMetricsObserver{ .metrics = &state.lifecycle_metrics };
-    var gateway_observer_slots: [2]Observer = undefined;
+    var noop_obs_gateway = observability.NoopObserver{};
+    var otel_obs_gateway_opt: ?observability.OtelObserver = observability.OtelObserver.fromEnv(allocator);
+    defer if (otel_obs_gateway_opt) |*otel| otel.deinit();
+    var gateway_observer_slots: [4]Observer = undefined;
     var gateway_observer_multi = observability.MultiObserver{ .observers = &.{} };
     const needs_local_agent = gatewayRoleNeedsLocalAgent(role, event_bus != null);
 
@@ -14153,6 +14186,8 @@ pub fn runWithRole(
                 gateway_observer_slots = .{
                     log_obs_gateway.observer(),
                     metrics_obs_gateway.observer(),
+                    sentry_runtime.globalOrFallback().observer(),
+                    if (otel_obs_gateway_opt) |*otel| otel.observer() else noop_obs_gateway.observer(),
                 };
                 gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
 

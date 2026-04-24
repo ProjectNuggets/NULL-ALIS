@@ -430,8 +430,8 @@ const ManagerImpl = struct {
         }
 
         fn clearAutoSaved(ptr: *anyopaque, session_id: ?[]const u8) anyerror!void {
-            _ = ptr;
-            _ = session_id;
+            const self: *UserSessionStore = @ptrCast(@alignCast(ptr));
+            try self.manager.clearAutoSavedMemory(self.user_id, session_id);
         }
 
         fn saveCompletionEventBridge(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8, content: []const u8) anyerror![]u8 {
@@ -1690,6 +1690,42 @@ const ManagerImpl = struct {
         const affected = c.PQcmdTuples(result);
         if (affected == null) return false;
         return !std.mem.eql(u8, std.mem.span(affected), "0");
+    }
+
+    /// Delete autosave_user_* and autosave_assistant_* memory rows for the
+    /// given user. When session_id is provided, scope the delete to that
+    /// session; otherwise clear autosave rows across all of the user's
+    /// sessions. Used by SessionStore.clearAutoSaved so `/new` actually
+    /// clears ghost context instead of silently leaving rows behind.
+    pub fn clearAutoSavedMemory(self: *Self, user_id: i64, session_id: ?[]const u8) !void {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        if (session_id) |sid| {
+            const q = try self.buildQuery(
+                "DELETE FROM {schema}.memories " ++
+                    "WHERE user_id = $1 AND session_id = $2 " ++
+                    "AND (key LIKE 'autosave_user_%' OR key LIKE 'autosave_assistant_%')",
+            );
+            defer self.allocator.free(q);
+            const sid_z = try self.allocator.dupeZ(u8, sid);
+            defer self.allocator.free(sid_z);
+            const params = [_]?[*:0]const u8{ user_s.ptr, sid_z };
+            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(sid.len) };
+            const result = try self.execParams(q, &params, &lengths);
+            defer c.PQclear(result);
+        } else {
+            const q = try self.buildQuery(
+                "DELETE FROM {schema}.memories " ++
+                    "WHERE user_id = $1 " ++
+                    "AND (key LIKE 'autosave_user_%' OR key LIKE 'autosave_assistant_%')",
+            );
+            defer self.allocator.free(q);
+            const params = [_]?[*:0]const u8{user_s.ptr};
+            const lengths = [_]c_int{@intCast(user_s.len)};
+            const result = try self.execParams(q, &params, &lengths);
+            defer c.PQclear(result);
+        }
     }
 
     pub fn countMemories(self: *Self, user_id: i64) !usize {

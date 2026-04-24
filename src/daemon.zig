@@ -1452,8 +1452,18 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         before_tick.deinit(allocator);
     }
 
-    // Initial load from disk (ignore errors — start empty if file missing/corrupt)
-    cron.loadJobs(&scheduler) catch {};
+    // Initial load from disk. Use the strict policy so a transient boot-time
+    // read/parse error is surfaced loudly rather than silently starting with
+    // an empty scheduler that would then let the reload self-heal path
+    // overwrite cron.json with the empty state (permanent data loss).
+    // FileNotFound is legitimate (fresh install) and is swallowed inside
+    // loadJobsStrict. Any other error leaves loaded_from_disk=false, which
+    // the reload-self-heal branch in cron.zig refuses to overwrite.
+    cron.loadJobsStrict(&scheduler) catch |err| {
+        log.err("scheduler boot-load failed; starting with empty in-memory jobs and refusing to overwrite cron.json until a successful load: {s}", .{@errorName(err)});
+        state.markError("scheduler", @errorName(err));
+        health.markComponentError("scheduler", @errorName(err));
+    };
 
     state.markRunning("scheduler");
     health.markComponentOk("scheduler");
