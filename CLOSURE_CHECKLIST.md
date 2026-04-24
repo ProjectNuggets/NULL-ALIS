@@ -135,16 +135,33 @@ Goal: system stops failing silently. Pattern: `catch {}` → `catch |err| log.wa
 
 Goal: architectural claims match wire behavior.
 
-- [ ] **S5.1** Anthropic two-block cache — change `serializeSystemCacheable` to emit `[{type:"text", text: stable+tools, cache_control: ephemeral}, {type:"text", text: volatile}]`. Cite: `anthropic.zig:480/547`, P2_context_v2, P2_providers. Verify with p50 TTFT proxy.
-- [ ] **S5.2** Error classification carrier — `reliable.zig:296-301` replace `storeErrorName(@errorName)` with `{kind: ApiErrorKind, retry_after_ms: ?u64}` populated from body parsers. Delete 4 dead helpers (`isRateLimited`/`isContextExhausted`/`isNonRetryable`/`parseRetryAfterMs`). Cite: P2_providers.
-- [ ] **S5.3** Streaming context-exhaustion recovery parity — `agent/root.zig:2652` mirror the `:2731-2760` force-compress-and-retry flow. Cite: P2_turn_loop.
-- [ ] **S5.4** Sort tools prose block — `prompt.zig:584-594` sort `self.tools` by name before rendering. Cite: P2_context_v2.
-- [ ] **S5.5** Sort skills directory iteration — `prompt.zig:639-719` `listSkillsMerged` must sort before rendering. Cite: P2_context_v2.
-- [ ] **S5.6** Byte-equality test — unit test calling `buildStableSystemPrompt` twice with identical inputs, `expectEqualStrings`. Cite: P2_context_v2.
-- [ ] **S5.7** `Config.load` memoize — `agent/root.zig:2245` honor workspace_prompt_fingerprint; only reload on change. Cite: P2_turn_loop.
-- [ ] **S5.8** Stage-17 disambiguate — `agent/root.zig:3524+` and `:2561` separate loop-detected-exit from iteration-exhausted in observer event + return prefix. Cite: P2_turn_loop.
+- [ ] **S5.1** Anthropic two-block cache — change `serializeSystemCacheable` to emit `[{type:"text", text: stable+tools, cache_control: ephemeral}, {type:"text", text: volatile}]`. Cite: `anthropic.zig:480/547`, P2_context_v2, P2_providers. Verify with p50 TTFT proxy. _Carried → **D17** — cross-cutting ChatRequest plumbing needed; value latent while Together is primary._
+- [ ] **S5.2** Error classification carrier — `reliable.zig:296-301` replace `storeErrorName(@errorName)` with `{kind: ApiErrorKind, retry_after_ms: ?u64}` populated from body parsers. Delete 4 dead helpers (`isRateLimited`/`isContextExhausted`/`isNonRetryable`/`parseRetryAfterMs`). Cite: P2_providers. _Carried → **D18** — Zig error payload limitation forces threadlocal/out-param; string-matchers work; hygiene not live bug._
+- [x] **S5.3** Streaming context-exhaustion recovery parity — `agent/root.zig:2652` mirror the `:2731-2760` force-compress-and-retry flow. Cite: P2_turn_loop. _Shipped `4a23d6c` — streamChat retry on `ContextLengthExceeded` via `forceCompressHistory` + rebuilt messages + one retry._
+- [x] **S5.4** Sort tools prose block — `prompt.zig:584-594` sort `self.tools` by name before rendering. Cite: P2_context_v2. _Shipped `3a8da9e` — index-array insertion sort + duck-typed anytype signature + MockTool test._
+- [x] **S5.5** Sort skills directory iteration — `prompt.zig:639-719` `listSkillsMerged` must sort before rendering. Cite: P2_context_v2. _Shipped `831a50c` — `std.mem.sort` + `skillLessThanByName` comparator applied in both `listSkills` and post-merge in `listSkillsMerged`; new unit test._
+- [x] **S5.6** Byte-equality test — unit test calling `buildStableSystemPrompt` twice with identical inputs, `expectEqualStrings`. Cite: P2_context_v2. _Shipped `477d520` — three-call identity assertion inline._
+- [x] **S5.7** `Config.load` memoize — `agent/root.zig:2245` honor workspace_prompt_fingerprint; only reload on change. Cite: P2_turn_loop. _Shipped `3550539` — cached-Config + load-once-per-Agent-lifetime; 50-msg burst drops from 50 disk I/Os to 1._
+- [x] **S5.8** Stage-17 disambiguate — `agent/root.zig:3524+` and `:2561` separate loop-detected-exit from iteration-exhausted in observer event + return prefix. Cite: P2_turn_loop. _Shipped `0e997de` — new `ObserverEvent.loop_detected` variant + distinct `turn.profile kind=tool_loop_detected` + "[Tool loop detected at N/N]" user-visible prefix; 3 exhaustive-switch arms updated in observability.zig._
 
 **Sprint 5 DoD:** Anthropic cache hit p50 TTFT drops ≥ 10% on turn 2+. `reliable.zig` has no `indexOf` heuristics. Byte-eq test green. stage-17 observer events match actual exit cause.
+
+**Sprint 5 — CLOSED 2026-04-24 at `4a23d6c`** — 6/8 shipped; S5.1 → **D17** (Anthropic two-block, latent value), S5.2 → **D18** (error carrier, Zig-error-payload refactor).
+
+Ship:
+- Byte-stability invariant now has an inline regression guard (S5.6) + explicit sorts on both surfaces that could drift it (S5.4 tools prose, S5.5 skills directory). Any future HashMap-enum / directory-walk introduction fires the test.
+- Loop-detected exits distinct from iterations-exhausted end-to-end: new observer event variant, distinct logs, distinct `turn.profile kind`, distinct user-visible return prefix. Operator dashboards can aggregate separately.
+- Config.load memoized: 50-msg burst goes from 50 disk I/Os + 50 JSON parses + 50 Config deinits → 1 each at first turn.
+- Streaming sessions now heal on context-exhaustion the same way blocking sessions do (mirror of the pre-existing force-compress + retry pattern in `provider.chat`).
+
+DoD verification:
+- `zig build` green at each commit.
+- `zig build test` exits 0 on tip; 38 test binaries pass; three new unit tests added.
+- Byte-eq test green.
+
+Deferred-but-tracked:
+- **D17** — S5.1 Anthropic two-block cache on the wire. Requires plumbing stable-prefix-length through ChatRequest (or side channel) so `serializeSystemCacheable` can split without re-parsing. Together is current primary; Anthropic path is a latent cost sink. Worth a dedicated PR with a primary-switch trigger to prove the cache hit.
+- **D18** — S5.2 error classification carrier + deletion of `isNonRetryable` / `isContextExhausted` / `isRateLimited` / `parseRetryAfterMs` string-matchers. Zig errors can't carry payloads, so the carrier needs threadlocal / Provider-held state / signature change. String-matchers are imperfect but working today. Hygiene refactor, not a live bug.
 
 ---
 
