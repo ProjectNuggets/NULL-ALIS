@@ -906,6 +906,12 @@ pub const SqliteMemory = struct {
             }
         };
 
+        // S8.1 — populate `lane` from the row's session_id when present.
+        // `laneFromSessionId` returns a string literal; the field
+        // borrows it without alloc/free coupling. When session_id is
+        // null the entry was stored unscoped, so lane stays "unknown".
+        const lane: []const u8 = if (sid) |s| root.laneFromSessionId(s) else "unknown";
+
         return MemoryEntry{
             .id = id,
             .key = key,
@@ -914,6 +920,7 @@ pub const SqliteMemory = struct {
             .timestamp = timestamp,
             .session_id = sid,
             .score = null,
+            .lane = lane,
         };
     }
 

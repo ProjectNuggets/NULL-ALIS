@@ -78,6 +78,12 @@ pub const RetrievalCandidate = struct {
     start_line: u32,
     end_line: u32,
     created_at: i64 = 0,
+    /// Sprint 8 (S8.1) — origin lane mirrored from the source MemoryEntry
+    /// (set by `entriesToCandidates`). Borrowed string-literal pointer;
+    /// NOT allocated, NOT freed. Lets the agent layer heuristically
+    /// rank same-lane candidates higher than cross-lane ones without
+    /// needing to re-parse session_id at every call site.
+    lane: []const u8 = "unknown",
 
     pub fn deinit(self: *const RetrievalCandidate, allocator: Allocator) void {
         allocator.free(self.id);
@@ -90,6 +96,7 @@ pub const RetrievalCandidate = struct {
             .custom => |name| allocator.free(name),
             else => {},
         }
+        // self.lane is a borrowed string literal — do not free.
     }
 };
 
@@ -145,6 +152,8 @@ pub fn entriesToCandidates(allocator: Allocator, entries: []const MemoryEntry) !
             .start_line = 0,
             .end_line = 0,
             .created_at = created_at,
+            // S8.1 — mirror the source entry's lane label.
+            .lane = entry.lane,
         };
         initialized += 1;
     }
