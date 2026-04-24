@@ -64,6 +64,10 @@ const user_settings = @import("user_settings.zig");
 const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
 const lane_metrics = @import("lane_metrics.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
+// S7.13 — constant-time byte comparison for webhook secret verification.
+// The pairing module already exports a well-tested helper; reuse it rather
+// than adding a local copy so there is one canonical timing-safe compare.
+const constantTimeEq = @import("security/pairing.zig").constantTimeEq;
 const channels = @import("channels/root.zig");
 const channel_manager = @import("channel_manager.zig");
 const channel_dispatch = @import("channels/dispatch.zig");
@@ -12460,7 +12464,16 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing telegram secret token\"}";
                 return;
             }
-            if (!std.mem.eql(u8, provided_secret, expected_secret)) {
+            // S7.13 — constant-time compare on attacker-controlled input.
+            // `provided_secret` comes from the X-Telegram-Bot-Api-Secret-Token
+            // header, which an attacker can manipulate one byte at a time.
+            // `std.mem.eql` short-circuits on first mismatch — the wall-clock
+            // time to reject leaks the position of the first differing byte,
+            // which is enough to recover the expected secret byte-by-byte.
+            // `constantTimeEq` (shared with the pairing verification path)
+            // compares in time proportional to max(a.len, b.len) regardless
+            // of content, closing that oracle.
+            if (!constantTimeEq(provided_secret, expected_secret)) {
                 _ = ctx.state.telegram_webhook_rejected_total.fetchAdd(1, .monotonic);
                 ctx.response_status = "403 Forbidden";
                 ctx.response_body = "{\"error\":\"invalid telegram secret token\"}";
