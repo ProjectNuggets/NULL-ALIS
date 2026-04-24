@@ -187,6 +187,13 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn deleteTelegramState(_: *@This(), _: i64) !void {
         return error.PostgresNotEnabled;
     }
+    // S7.2 — GDPR row-level user delete. Single DELETE on tenant `users`
+    // cascades to every FK-linked table (17 tables per schema). Postgres
+    // only; stub returns PostgresNotEnabled so the GDPR orchestrator can
+    // surface a clean 503 when the tenant backend isn't wired.
+    pub fn deleteUser(_: *@This(), _: i64) !void {
+        return error.PostgresNotEnabled;
+    }
     pub fn recordTelegramChat(_: *@This(), _: i64, _: []const u8, _: i64) !void {
         return error.PostgresNotEnabled;
     }
@@ -1137,6 +1144,28 @@ const ManagerImpl = struct {
         const q = try self.buildQuery(
             "UPDATE {schema}.channel_state SET telegram = '{}'::jsonb, updated_at = NOW() WHERE user_id = $1",
         );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    /// S7.2 — GDPR row-level user delete. Every per-user FK references
+    /// `{schema}.users(user_id)` with `ON DELETE CASCADE` (see schema at
+    /// lines 743–974 of this file), so a single DELETE on the users row
+    /// cascades through: user_config, user_secrets, secret_mutations,
+    /// sessions, messages, completion_events, memories, memory_events,
+    /// channel_state, telegram_updates, channel_identity_bindings,
+    /// heartbeat, onboarding, tenant_user_leases, jobs, job_runs, tasks.
+    ///
+    /// Note: `memory_vectors` (pgvector) has no FK to users and is NOT
+    /// covered by this cascade — the GDPR orchestrator deletes those
+    /// embeddings separately via `VectorStore.deleteAllForUser`.
+    pub fn deleteUser(self: *Self, user_id: i64) !void {
+        const q = try self.buildQuery("DELETE FROM {schema}.users WHERE user_id = $1");
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
