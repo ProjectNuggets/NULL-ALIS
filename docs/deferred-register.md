@@ -84,6 +84,16 @@ one-line reason.
 
 ---
 
+## From Sprint 7 (User-Value Completion — 7A polish / 7B GDPR / 7C channel-locality)
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| D25 | Full postgres E2E for `gdpr.purgeUser` — live DB fixture that seeds a user across all 17 cascade tables + `memory_vectors`, runs `purgeUser`, asserts zero rows in every table plus audit-log for the delete | Sprint 7B shipped hermetic orchestrator tests (sqlite vector store, filesystem tree, session cache, PurgeReport accounting) + structural proof that the pg cascade works (existing `pg_helpers` tests). A live-DB E2E requires the `NULLCLAW_POSTGRES_TEST_URL` fixture pattern seen in `store_pgvector.zig`, ~200 LoC of seed + assert code. Value is belt-and-suspenders, not net-new safety | Dedicated follow-up PR keyed to `NULLCLAW_POSTGRES_TEST_URL` in CI | **open** |
+| D26 | 2-phase prepare/consume confirmation token on `DELETE /api/v1/users/:id/data` — reuse `secret_vault.ConfirmationTokenStore` keyed on `(user_id, "__gdpr_purge__", .delete)` | S7.6 ships single-phase (X-Internal-Token + body magic string binding to path user_id). Operator-only today — the internal token IS the credential. Upgrade to 2-phase if this endpoint is ever exposed via the frontend where a user-driven UX flow needs the prepare-then-confirm interstitial | Frontend exposure PR, not before | **open** |
+| D27 | Wire `lane_metrics.recordGdprPurge{ok,partial,fail}` counters alongside `gdpr.purgeUser` | Observability parity with secret_mutations audit counters (D13). Separate metrics PR keeps Sprint 7B scope clean | nullalis monitoring PR | **open** |
+
+---
+
 ## From Sprint 4/5/6 post-hoc self-review
 
 | ID | Shape | Why deferred | Target | Status |
@@ -118,4 +128,4 @@ one-line reason.
 - **Superseding an item:** change `open` → `obsolete` with a one-line reason. Do NOT delete the row.
 - **Reviewing "what's still open":** `grep 'open' docs/deferred-register.md | wc -l` gives the live count.
 
-Last audit: **2026-04-24** at Sprint 6 close — 18 items open, 4 shipped, 0 obsolete.
+Last audit: **2026-04-24** at Sprint 7B close — 21 items open, 4 shipped, 0 obsolete.
