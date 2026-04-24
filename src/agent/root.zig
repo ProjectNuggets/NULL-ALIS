@@ -507,6 +507,16 @@ pub const Agent = struct {
     /// Used to refresh the prompt clock without rebuilding every turn.
     system_prompt_time_bucket_min: i64 = -1,
 
+    /// S5.7 — memoized Config load. Populated on first use by
+    /// `cachedConfigForCaps()`. Config is effectively immutable during an
+    /// Agent's lifetime (no hot-reload path exists), so reading config.json
+    /// on every turn is pure waste — a 50-message burst today does 50 file
+    /// reads + JSON parses. `cached_config_loaded` disambiguates "never
+    /// attempted" from "attempted and failed" so a transient filesystem
+    /// hiccup at first use doesn't re-spin the load every turn afterwards.
+    cached_config: ?Config = null,
+    cached_config_loaded: bool = false,
+
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
 
@@ -665,8 +675,28 @@ pub const Agent = struct {
         return .inherit;
     }
 
+    /// S5.7 — return a pointer into the memoized Config. First call loads
+    /// from disk and caches; subsequent calls return the cached value (or
+    /// null if the initial load failed, which we remember via
+    /// `cached_config_loaded`). The pointer is valid until `deinit`.
+    pub fn cachedConfigForCaps(self: *Agent) ?*const Config {
+        if (!self.cached_config_loaded) {
+            self.cached_config_loaded = true;
+            if (Config.load(self.allocator)) |loaded| {
+                self.cached_config = loaded;
+            } else |err| {
+                // First-load failure: leave cache empty but mark loaded so we
+                // don't retry every turn. Operator can restart the agent to
+                // force a reload.
+                log.warn("config.load_failed_for_caps err={s} — caps will render without config context", .{@errorName(err)});
+            }
+        }
+        return if (self.cached_config) |*cfg| cfg else null;
+    }
+
     pub fn deinit(self: *Agent) void {
         self.clearCurrentTurnProviderOverride();
+        if (self.cached_config) |*cfg| cfg.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -2350,9 +2380,10 @@ pub const Agent = struct {
         );
 
         {
-            var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
-            defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
-            const cfg_for_caps_ptr: ?*const Config = if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded else null;
+            // S5.7 — memoized Config fetch. Replaces a per-turn
+            // `Config.load` + JSON parse + deinit triad. The cached_config
+            // lives on the Agent until deinit; see `cachedConfigForCaps`.
+            const cfg_for_caps_ptr: ?*const Config = self.cachedConfigForCaps();
 
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
