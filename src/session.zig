@@ -134,6 +134,14 @@ pub const SessionManager = struct {
         response_cache: ?*memory_mod.cache.ResponseCache,
     ) SessionManager {
         tools_mod.bindMemoryTools(tools, mem);
+        // S7.10 — audit memory for shell command logging on gateway-hosted
+        // sessions. Pre-S7.10 this was only wired in channel_loop; shell
+        // commands from HTTP/SSE-driven agent sessions silently bypassed
+        // the audit trail. bindAuditMemory is a no-op if mem is null or
+        // the tool set lacks a shell tool.
+        if (mem) |mem_for_audit| {
+            tools_mod.bindAuditMemory(tools, mem_for_audit, null);
+        }
 
         return .{
             .allocator = allocator,

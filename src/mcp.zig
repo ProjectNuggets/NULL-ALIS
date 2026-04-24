@@ -33,6 +33,11 @@ pub const McpServer = struct {
     config: McpServerConfig,
     child: ?std.process.Child,
     next_id: u32,
+    /// S7.12 — background thread draining the child's stderr pipe.
+    /// Spawned by `connect`, joined by `deinit`. If we don't drain,
+    /// a chatty MCP server fills the pipe buffer (~64 KiB on Linux)
+    /// and blocks on write, which stalls the MCP turn.
+    stderr_drain_thread: ?std.Thread = null,
 
     pub fn init(allocator: Allocator, config: McpServerConfig) McpServer {
         return .{
@@ -41,6 +46,7 @@ pub const McpServer = struct {
             .config = config,
             .child = null,
             .next_id = 1,
+            .stderr_drain_thread = null,
         };
     }
 
@@ -84,6 +90,16 @@ pub const McpServer = struct {
 
         try child.spawn();
         self.child = child;
+
+        // S7.12 — spawn stderr drain thread. The OS pipe buffer is bounded
+        // (~64 KiB on Linux). If nobody reads stderr, a log-heavy MCP
+        // server blocks on its next stderr write, which stalls every
+        // request through this MCP instance. The drain thread reads lines
+        // until EOF and forwards them via log.warn with the server name
+        // prefix so operators see what the child is complaining about.
+        if (self.child.?.stderr) |_| {
+            self.stderr_drain_thread = std.Thread.spawn(.{}, drainStderr, .{self}) catch null;
+        }
 
         // Send initialize request
         const init_params = try std.fmt.allocPrint(
@@ -144,6 +160,58 @@ pub const McpServer = struct {
             _ = child.wait() catch {};
         }
         self.child = null;
+        // S7.12 — drain thread must be joined AFTER kill+wait so the read
+        // loop sees EOF on the closed stderr pipe and exits cleanly. Not
+        // joining leaks a thread handle per MCP deinit.
+        if (self.stderr_drain_thread) |t| {
+            t.join();
+            self.stderr_drain_thread = null;
+        }
+    }
+
+    /// S7.12 — background reader for the child's stderr pipe. Reads
+    /// line-by-line (bounded by `STDERR_LINE_MAX` to avoid runaway
+    /// allocation on binary output); forwards each line at warn level
+    /// with the server name. Returns on EOF, read error, or the parent
+    /// closing the pipe via `child.wait()`.
+    fn drainStderr(self: *McpServer) void {
+        const STDERR_LINE_MAX: usize = 4096;
+        const stderr = (self.child orelse return).stderr orelse return;
+        var line_buf: [STDERR_LINE_MAX]u8 = undefined;
+        var line_len: usize = 0;
+        var byte: [1]u8 = undefined;
+        while (true) {
+            const n = stderr.read(&byte) catch return;
+            if (n == 0) {
+                // EOF — flush any partial line and exit.
+                if (line_len > 0) {
+                    std.log.scoped(.mcp).warn("[{s}] {s}", .{ self.name, line_buf[0..line_len] });
+                }
+                return;
+            }
+            if (byte[0] == '\n') {
+                if (line_len > 0) {
+                    std.log.scoped(.mcp).warn("[{s}] {s}", .{ self.name, line_buf[0..line_len] });
+                }
+                line_len = 0;
+                continue;
+            }
+            if (byte[0] == '\r') continue;
+            if (line_len < STDERR_LINE_MAX) {
+                line_buf[line_len] = byte[0];
+                line_len += 1;
+            } else {
+                // Line too long — log what we have + drop the rest until newline.
+                std.log.scoped(.mcp).warn("[{s}] {s}...(truncated)", .{ self.name, line_buf[0..line_len] });
+                line_len = 0;
+                // Skip ahead until we hit a newline or EOF
+                while (true) {
+                    const m = stderr.read(&byte) catch return;
+                    if (m == 0) return;
+                    if (byte[0] == '\n') break;
+                }
+            }
+        }
     }
 
     // ── Internal I/O ────────────────────────────────────────────
@@ -188,7 +256,39 @@ pub const McpServer = struct {
         errdefer line_buf.deinit(allocator);
         var byte: [1]u8 = undefined;
         const stdout = self.child.?.stdout orelse return error.NoStdout;
+
+        // S7.11 — bounded wait for the next readable byte. A hung MCP server
+        // (child process alive, no stdout, no EOF) would otherwise block
+        // this thread indefinitely. Compute a monotonic deadline once;
+        // each iteration polls with the remaining budget. `timeout_secs == 0`
+        // disables the timeout (pre-S7.11 blocking behavior preserved for
+        // deployments that explicitly opt out). Windows path currently
+        // falls through to the blocking read — `std.posix.poll` isn't
+        // portable there; tracked as a follow-up. Prod target is Linux.
+        const timeout_secs: u64 = self.config.read_line_timeout_secs;
+        const use_timeout = timeout_secs > 0 and @import("builtin").os.tag != .windows;
+        const deadline_ns: i128 = if (use_timeout)
+            std.time.nanoTimestamp() + @as(i128, @intCast(timeout_secs)) * std.time.ns_per_s
+        else
+            0;
+
         while (true) {
+            if (use_timeout) {
+                const remaining_ns = deadline_ns - std.time.nanoTimestamp();
+                if (remaining_ns <= 0) return error.ReadTimeout;
+                const remaining_ms: i32 = @intCast(@min(@as(i128, std.math.maxInt(i32)), @divTrunc(remaining_ns, std.time.ns_per_ms)));
+                var pfd = [_]std.posix.pollfd{.{
+                    .fd = stdout.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = std.posix.poll(&pfd, remaining_ms) catch return error.ReadFailed;
+                if (ready == 0) return error.ReadTimeout;
+                // POLLHUP / POLLERR without POLLIN: peer closed, no more data.
+                if ((pfd[0].revents & std.posix.POLL.IN) == 0) {
+                    return error.EndOfStream;
+                }
+            }
             const n = stdout.read(&byte) catch return error.ReadFailed;
             if (n == 0) return error.EndOfStream;
             if (byte[0] == '\n') break;

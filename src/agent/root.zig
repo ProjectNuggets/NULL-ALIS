@@ -971,6 +971,15 @@ pub const Agent = struct {
             .{},
         ) catch |err| {
             log.warn("tts audio synth failed: provider={s} reason={s}", .{ provider_name, @errorName(err) });
+            // S7.7 — TTS failure-notice parity with STT. Previously the
+            // return-null path dropped audio to text silently; STT has
+            // emitted a `system_notice` via `emitMultimodalFailureNotice`
+            // since its initial wiring. Now both directions surface the
+            // same operator-visible frame so "audio channel degraded"
+            // chrome fires consistently.
+            var detail_buf: [128]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buf, "tts synth failed: provider={s} reason={s}", .{ provider_name, @errorName(err) }) catch "tts synth failed";
+            voice_mod.emitMultimodalFailureNotice(&self.observer, detail);
             return null;
         };
         defer allocator.free(synthesized_path);
@@ -9180,12 +9189,17 @@ test "baseline: Agent deinit on minimal instance does not leak" {
     try std.testing.expectEqual(@as(u32, 50), agent.max_history_messages);
 }
 
-test "ttsAudioChannelSupported returns true for discord via voice_mode" {
-    // Proves the hardcoded telegram-only check has been replaced with
-    // voice_mode.channelSupportsAudio which supports multiple channels.
-    try std.testing.expect(voice_mode.channelSupportsAudio("discord"));
+test "ttsAudioChannelSupported routes through voice_mode (S7.9 — telegram only today)" {
+    // S7.9 — previous version asserted discord + whatsapp also returned
+    // true; voice_mode.zig's capability table was flipped because only
+    // telegram has a real audio-send path in the channel implementations.
+    // This test now proves the indirection through voice_mode still
+    // fires correctly (the routing refactor from the telegram-only
+    // hardcode hasn't regressed) AND reflects the current honest state.
     try std.testing.expect(voice_mode.channelSupportsAudio("telegram"));
-    try std.testing.expect(voice_mode.channelSupportsAudio("whatsapp"));
+    try std.testing.expect(!voice_mode.channelSupportsAudio("discord"));
+    try std.testing.expect(!voice_mode.channelSupportsAudio("whatsapp"));
+    try std.testing.expect(!voice_mode.channelSupportsAudio("slack"));
 }
 
 test "ttsAudioChannelSupported returns false for cli via voice_mode" {

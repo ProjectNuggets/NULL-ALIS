@@ -584,6 +584,13 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                 }
 
+                // S7.11 — optional read_line_timeout_secs override.
+                // Missing key keeps the struct default (30s); 0 disables
+                // the timeout for explicit opt-out.
+                if (val.object.get("read_line_timeout_secs")) |tv| {
+                    if (tv == .integer) mcp_cfg.read_line_timeout_secs = @intCast(tv.integer);
+                }
+
                 try mcp_list.append(self.allocator, mcp_cfg);
             }
             self.mcp_servers = try mcp_list.toOwnedSlice(self.allocator);
