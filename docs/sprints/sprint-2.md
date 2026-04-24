@@ -1,7 +1,13 @@
-# Sprint 2 — Revenue Loop — IN PROGRESS
+# Sprint 2 — Revenue Loop — CLOSED
 
 **Branch:** `repair/sprint-2-revenue-loop` (branched off `92ebd59` at Sprint 1 tip)
 **Opened:** 2026-04-23
+**Closed:** 2026-04-23 at `aa251cb` — PR [#10](https://github.com/ProjectNuggets/NULL-ALIS/pull/10) (11/16 items; S2.12–S2.16 carried to dedicated D8 PR).
+**D8 follow-up CLOSED:** 2026-04-23 at `f303153` — PR [#11](https://github.com/ProjectNuggets/NULL-ALIS/pull/11) (S2.12–S2.16 + D11 integration tests).
+**Cross-repo:** zaki-prod #5 `cd54970` (BFF provision + Stripe revocation translator).
+
+Full ship summary, DoD verification, and deferred-item (D5/D6/D7/D9/D10/D12/D13/D14) tracking lives in `CLOSURE_CHECKLIST.md` under the Sprint 2 CLOSED annotation. Self-review findings live in `sprint-2-review.md`. D8 BFF migration guide lives in `d8-secret-vault.md`.
+
 **Target:** can charge users honestly; free tier blocked at entry points; revocation propagates; secret vault gated by confirmation token.
 **Cross-repo surface:** nullalis + zaki-prod (BFF provision response + Stripe webhook revocation) + zaki-infra (no chart change expected).
 

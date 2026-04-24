@@ -75,13 +75,40 @@ Goal: can charge users honestly; free tier blocked at entry points; revocation p
 - [x] **S2.11** Enforce "64 active jobs per user" cap. Cite: P4_ops_truth drift #3. _Shipped `3fe1f79`._
 
 ### Secret vault API (plan.md §3)
-- [ ] **S2.12** `GET /api/v1/users/:id/secrets/:key` → metadata-only response (no plaintext). Cite: plan.md §3. _Carried → D8._
-- [ ] **S2.13** `POST /api/v1/users/:id/secrets/:key/prepare` → issue confirmation token. Cite: plan.md §3. _Carried → D8._
-- [ ] **S2.14** `PUT /api/v1/users/:id/secrets/:key` → requires valid confirmation token. Cite: plan.md §3. _Carried → D8._
-- [ ] **S2.15** `DELETE /api/v1/users/:id/secrets/:key` → requires valid confirmation token. Cite: plan.md §3. _Carried → D8._
-- [ ] **S2.16** Audit trail — new `zaki_bot.secret_mutations` table, row per attempt. Cite: plan.md §3 + plan-v02 §6. _Carried → D8._
+- [x] **S2.12** `GET /api/v1/users/:id/secrets/:key` → metadata-only response (no plaintext). Cite: plan.md §3. _Shipped via D8 `e5fad87`._
+- [x] **S2.13** `POST /api/v1/users/:id/secrets/:key/prepare` → issue confirmation token. Cite: plan.md §3. _Shipped via D8 `e5fad87` (TokenStore `277ec7d` + mount `e457faa`)._
+- [x] **S2.14** `PUT /api/v1/users/:id/secrets/:key` → requires valid confirmation token. Cite: plan.md §3. _Shipped via D8 `e5fad87`._
+- [x] **S2.15** `DELETE /api/v1/users/:id/secrets/:key` → requires valid confirmation token. Cite: plan.md §3. _Shipped via D8 `e5fad87`._
+- [x] **S2.16** Audit trail — new `zaki_bot.secret_mutations` table, row per attempt. Cite: plan.md §3 + plan-v02 §6. _Shipped via D8 `946d325` + `e5fad87`._
 
 **Sprint 2 DoD:** free-tier user hits chat stream → 402. Pro-tier user passes. Stripe cancel webhook → nullalis session revoked within 5s. CostTracker writing JSONL. Secret PUT without prepare token → 401.
+
+**Sprint 2 — CLOSED 2026-04-23 at `aa251cb`** (PR [#10](https://github.com/ProjectNuggets/NULL-ALIS/pull/10)), with S2.12–S2.16 landing in dedicated D8 PR **CLOSED 2026-04-23 at `f303153`** (PR [#11](https://github.com/ProjectNuggets/NULL-ALIS/pull/11)).
+
+Ship:
+- Entitlement propagation spine: `Entitlement` type + `RuntimeTurnContext.entitlement`; default in-memory resolver (`useDefaultResolver` + `installEntitlement`); `/provision` parses + installs `plan_tier` / `status` / `period_end_unix`; `/internal/entitlements/revoke` control endpoint; self-review dupe-before-put fix `60664bc`.
+- 4 enforcement chokepoints live: chat-stream entry (402 `entitlement_required`), tool preflight, scheduler dispatch, integration calls (structurally covered by preflight).
+- Session weight budget + `UsageRuntime.recordWeight`; cost classes A/B/C on `ToolMetadata`.
+- Idempotency-Key dedupe (soft-mode on `/provision`).
+- 64 active-jobs cap per tier enforced.
+- D8: gated vault API (`gateway/secret_vault.zig` + `TokenStore`) replaces legacy plaintext GET; two-phase mutation handshake; `zaki_bot.secret_mutations` audit table + recorders + list endpoint; full BFF migration guide `docs/sprints/d8-secret-vault.md`.
+- D11: HTTP envelope tests `dfcace8` + 5 DB integration tests (`bc0f3f0`, `ae482fa`, `c14b2e9`, `17ae688`, `b2af768`) cover happy-path, missing-token, mismatched-action, fabricated-token, audit-scoping.
+- Cross-repo: zaki-prod BFF provision forwards the 3 entitlement fields + Stripe webhook translator to `/internal/entitlements/revoke` (merged zaki-prod #5 `cd54970`).
+
+DoD verification:
+- `zig build test -Dengines=all` green at each commit.
+- D11 proves: happy-path roundtrip passes; `PUT` without token → 401 `token_required`; mismatched-action token preserved for legitimate call; fabricated-token `DELETE` → 401 `token_invalid`; audit scoped to requested key.
+- D14 pre-existing scheduler test failures recorded (unrelated to Sprint 2 / D8 surface).
+
+Deferred-but-tracked (D items):
+- **D5** CostTracker full JSONL persistence (S2.8 session-scoped weight cap shipped; true calendar-monthly persistence queued).
+- **D6** Idempotency-Key strict-mode flip (after zaki-prod confirms every mutating call attaches key).
+- **D7** Idempotency-Key on `POST /api/v1/users/:id/attachments` (needs handler-signature refactor).
+- **D9** Sprint-2 self-review MEDIUM finding (tracked in `docs/sprints/sprint-2-review.md`).
+- **D10** Sprint-2 self-review LOW finding (tracked in `docs/sprints/sprint-2-review.md`).
+- **D12** Frontend `SecretsVaultSheet.tsx` still reads `response.value` on GET — undefined post-D8; BFF migration guide shipped, frontend audit queued.
+- **D13** Secret vault monitoring: wire `lane_metrics.recordSecretMutation{ok,fail}` counters (audit rows exist; metrics counters do not yet).
+- **D14** 2 pre-existing scheduler test failures documented; not Sprint 2 / D8 regression.
 
 ---
 
