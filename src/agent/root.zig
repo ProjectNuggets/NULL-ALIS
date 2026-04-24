@@ -3629,12 +3629,23 @@ pub const Agent = struct {
             self.freeResponseFields(&response);
         }
 
-        // ── Graceful degradation: tool iterations exhausted ──────────
-        // Instead of returning an error, ask the LLM to summarize what it
-        // has accomplished so far and return that as the final response.
-        const exhausted_event = ObserverEvent{ .tool_iterations_exhausted = .{ .iterations = self.max_tool_iterations } };
-        self.observer.recordEvent(&exhausted_event);
-        log.warn("Tool iterations exhausted ({d}/{d}), requesting summary", .{ self.max_tool_iterations, self.max_tool_iterations });
+        // ── Graceful degradation: tool iterations exhausted OR loop detected ──
+        //
+        // S5.8 — two distinct exit causes land in the same fallback path.
+        // The observer event + the log + the user-visible return prefix
+        // (below) now differentiate them so operators can tell "model ran
+        // out of iterations" from "loop guard tripped early on a repeated
+        // tool pattern". Both paths still go through the summary-request
+        // flow — the divergence is only in the reported reason.
+        if (loop_detected) {
+            const loop_event = ObserverEvent{ .loop_detected = .{ .iteration = turn_tool_iterations, .iterations_cap = self.max_tool_iterations } };
+            self.observer.recordEvent(&loop_event);
+            log.warn("Tool loop detected at iteration {d}/{d} — requesting summary", .{ turn_tool_iterations, self.max_tool_iterations });
+        } else {
+            const exhausted_event = ObserverEvent{ .tool_iterations_exhausted = .{ .iterations = self.max_tool_iterations } };
+            self.observer.recordEvent(&exhausted_event);
+            log.warn("Tool iterations exhausted ({d}/{d}), requesting summary", .{ self.max_tool_iterations, self.max_tool_iterations });
+        }
 
         // Append a pseudo-user message forcing a text-only summary
         try self.history.append(self.allocator, .{
@@ -3644,9 +3655,19 @@ pub const Agent = struct {
                 "so far and what remains to be done. Respond in the same language the user used."),
         });
 
-        // Build messages for the summary call
+        // Build messages for the summary call.
+        //
+        // S5.8 — return-prefix distinguishes loop-detected from iterations-
+        // exhausted to match the observer event emitted above. Users see
+        // "[Tool loop detected at N/N]" vs "[Tool iteration limit: N/N]"
+        // and can report accurately which failure mode fired. `{d}/{d}` in
+        // the loop-detected prefix shows the iteration the loop tripped at
+        // vs the cap, whereas the exhausted prefix uses cap/cap.
         const summary_messages = self.buildMessageSlice() catch {
-            const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            const fallback = if (loop_detected)
+                try std.fmt.allocPrint(self.allocator, "[Tool loop detected at {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ turn_tool_iterations, self.max_tool_iterations })
+            else
+                try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;
@@ -3667,7 +3688,10 @@ pub const Agent = struct {
             self.model_name,
             self.temperature,
         ) catch {
-            const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            const fallback = if (loop_detected)
+                try std.fmt.allocPrint(self.allocator, "[Tool loop detected at {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ turn_tool_iterations, self.max_tool_iterations })
+            else
+                try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;
@@ -3675,7 +3699,10 @@ pub const Agent = struct {
         defer self.freeResponseFields(&summary_response);
 
         const summary_text = summary_response.contentOrEmpty();
-        const prefixed = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, summary_text });
+        const prefixed = if (loop_detected)
+            try std.fmt.allocPrint(self.allocator, "[Tool loop detected at {d}/{d}]\n\n{s}", .{ turn_tool_iterations, self.max_tool_iterations, summary_text })
+        else
+            try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, summary_text });
         errdefer self.allocator.free(prefixed);
 
         // Store in history (dupe the raw summary, not the prefixed version)
@@ -3696,7 +3723,11 @@ pub const Agent = struct {
         const total_turn_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - turn_start_ms));
         const first_token_ms_i64: i64 = if (turn_first_token_ms) |value| @intCast(value) else -1;
         const first_token_upper_bound_ms_i64: i64 = if (turn_first_token_upper_bound_ms) |value| @intCast(value) else -1;
-        log.info("turn.profile kind=tool_exhausted llm_calls={d} retries={d} tool_iterations={d} tool_calls={d} first_token_ms={d} first_token_upper_bound_ms={d} memory_enrich_ms={d} pre_compaction_ms={d} autosave_ms=0 outbox_ms=0 cache_put_ms=0 post_reply_maintenance_ms=0 total_turn_ms={d}", .{
+        // S5.8 — turn.profile kind distinguishes the two exit causes so
+        // operator dashboards can aggregate separately.
+        const profile_kind: []const u8 = if (loop_detected) "tool_loop_detected" else "tool_exhausted";
+        log.info("turn.profile kind={s} llm_calls={d} retries={d} tool_iterations={d} tool_calls={d} first_token_ms={d} first_token_upper_bound_ms={d} memory_enrich_ms={d} pre_compaction_ms={d} autosave_ms=0 outbox_ms=0 cache_put_ms=0 post_reply_maintenance_ms=0 total_turn_ms={d}", .{
+            profile_kind,
             turn_llm_calls + 1, // include final summary call
             turn_retry_attempts,
             turn_tool_iterations,
