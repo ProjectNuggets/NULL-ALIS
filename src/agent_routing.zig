@@ -186,6 +186,26 @@ pub fn buildMainSessionKey(allocator: std.mem.Allocator, agent_id: []const u8) !
 }
 
 /// Append `:thread:{threadId}` to a base session key.
+///
+/// **Sprint 8 (S8.2) — dual-formatter design, NOT a legacy duplicate of
+/// `session/root.zig::userThreadSessionKey`.** This formatter operates on
+/// the CHANNEL-ROUTED session-key family produced by `resolveRoute(...)`:
+/// `agent:{agent_id}:{channel}:{kind}:{id}` — the shape inbound messages
+/// from Telegram / Discord / Slack / etc. carry through `daemon.zig`.
+///
+/// The user-cell-direct family (`agent:zaki-bot:user:{user_id}:{lane}`)
+/// is built by `session/root.zig::userThreadSessionKey(buf, user_id,
+/// conversation_id)`. The two families are not interchangeable:
+///   - Channel-routed keys reflect the inbound's binding/peer/guild and
+///     are the canonical identity for routing replies BACK to the channel.
+///   - User-cell keys reflect the canonical multi-tenant user identity
+///     and are the canonical identity for HTTP/SSE turn loops.
+///
+/// `daemon.zig:1709` (the only production caller of THIS formatter) is
+/// correct in using channel-routed because it's appending a thread suffix
+/// to a route returned by `resolveRoute(...)`. Do NOT migrate that caller
+/// to the user-cell formatter — it would produce a key shape inbound
+/// reply paths can't decode.
 pub fn buildThreadSessionKey(allocator: std.mem.Allocator, base_key: []const u8, thread_id: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}:thread:{s}", .{ base_key, thread_id });
 }

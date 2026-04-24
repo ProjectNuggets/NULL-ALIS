@@ -27,6 +27,25 @@ pub fn userMainSessionKey(buf: []u8, user_id: []const u8) []const u8 {
         "agent:zaki-bot:user:unknown:main";
 }
 
+/// Build a thread-lane session key in the **user-cell-direct family**:
+/// `agent:zaki-bot:user:{user_id}:thread:{conversation_id}`.
+///
+/// **Sprint 8 (S8.2) — coexists deliberately with `agent_routing.zig::
+/// buildThreadSessionKey(allocator, base_key, thread_id)`. Neither is
+/// legacy.** This formatter is the canonical user-cell identity used by
+/// HTTP/SSE turn loops, scheduler dispatch, the GDPR purge orchestrator
+/// (S7.1), and every internal API caller that already knows the
+/// multi-tenant user_id.
+///
+/// The channel-routed family (`agent:{agent_id}:{channel}:{kind}:{id}:
+/// thread:{thread_id}`) is built by `agent_routing.buildThreadSessionKey`
+/// and serves inbound message routing from external channels (Telegram /
+/// Discord / Slack / etc.) where the user_id may not yet be bound. The
+/// two families are not interchangeable — picking the wrong one breaks
+/// reply-path resolution.
+///
+/// Use this formatter when you have a `user_id` in hand. Use the agent-
+/// routing one when you have a `route.session_key` from `resolveRoute()`.
 pub fn userThreadSessionKey(buf: []u8, user_id: []const u8, conversation_id: []const u8) []const u8 {
     return identity.formatSessionKey(buf, user_id, .thread, conversation_id) catch
         "agent:zaki-bot:user:unknown:thread";

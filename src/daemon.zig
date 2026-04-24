@@ -1706,6 +1706,12 @@ fn resolveInboundRouteSessionKeyWithMetadata(
     allocator.free(route.main_session_key);
 
     if (meta.thread_id) |thread_id| {
+        // S8.2 — channel-routed family is correct here. `route.session_key`
+        // is `agent:{agent_id}:{channel}:{kind}:{id}` from resolveRoute();
+        // we append `:thread:{id}` so reply-path resolution can decode it.
+        // Do NOT swap to `session/root.userThreadSessionKey` — that emits
+        // the user-cell family, which loses the channel/account/peer
+        // context the Telegram/Discord/etc. listeners use to route back.
         const threaded = agent_routing.buildThreadSessionKey(allocator, route.session_key, thread_id) catch return route.session_key;
         allocator.free(route.session_key);
         return threaded;
