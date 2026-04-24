@@ -48,6 +48,7 @@ pub const bootstrap = @import("bootstrap/root.zig");
 // Phase 3: Networking
 pub const gateway = @import("gateway.zig");
 pub const gateway_run_events = @import("gateway_run_events.zig");
+pub const gateway_secret_vault = @import("gateway/secret_vault.zig");
 pub const controller = @import("controller.zig");
 pub const cell_spec = @import("cell_spec.zig");
 pub const cell_k8s_api = @import("cell_k8s_api.zig");

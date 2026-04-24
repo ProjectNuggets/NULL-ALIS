@@ -92,6 +92,34 @@ pub const UserOwnershipLeaseSnapshot = struct {
     }
 };
 
+// D8 (secret vault) — types hoisted to module scope so both the
+// postgres-backed ManagerImpl and the no-postgres stub Manager can
+// reference them uniformly.
+
+pub const SecretMetadata = struct {
+    created_at_unix: i64,
+    updated_at_unix: i64,
+};
+
+pub const SecretMutationRecord = struct {
+    id: []const u8,
+    key: []const u8,
+    action: []const u8,
+    actor: ?[]const u8,
+    outcome: []const u8,
+    detail: ?[]const u8,
+    at_unix: i64,
+
+    pub fn deinit(self: *const SecretMutationRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.key);
+        allocator.free(self.action);
+        if (self.actor) |a| allocator.free(a);
+        allocator.free(self.outcome);
+        if (self.detail) |d| allocator.free(d);
+    }
+};
+
 pub const TaskSnapshot = struct {
     id: []u8,
     session_id: ?[]u8,
@@ -173,6 +201,27 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     }
     pub fn listSecretKeys(_: *@This(), allocator: std.mem.Allocator, _: i64) ![][]const u8 {
         return allocator.alloc([]const u8, 0);
+    }
+    // D8 — no-postgres stubs. The gated secret vault requires the DB
+    // backend for audit integrity; callers see 503 from the gateway
+    // handler when `state.zaki_state` is null, but these stubs still
+    // need to exist so comptime method lookup resolves on the
+    // non-postgres Manager variant.
+    pub fn getSecretMetadata(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?SecretMetadata {
+        return null;
+    }
+    pub fn recordSecretMutation(_: *@This(), _: i64, _: []const u8, _: []const u8, _: ?[]const u8, _: []const u8, _: ?[]const u8) !void {
+        return error.PostgresNotEnabled;
+    }
+    pub fn listSecretMutations(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]SecretMutationRecord {
+        return allocator.alloc(SecretMutationRecord, 0);
+    }
+    // Test-only helper: see ManagerImpl.dropSchemaForTests. Stub variant
+    // exists so comptime method lookup resolves on the non-postgres
+    // Manager; callers guard on build_options.enable_postgres and never
+    // reach this branch in practice.
+    pub fn dropSchemaForTests(_: *@This()) !void {
+        return error.PostgresNotEnabled;
     }
     pub fn listUserSessions(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]SessionInfo {
         return allocator.alloc(SessionInfo, 0);
@@ -513,6 +562,22 @@ const ManagerImpl = struct {
         return self.schema_raw_buf[0..self.schema_raw_len];
     }
 
+    /// Test-only helper: `DROP SCHEMA IF EXISTS <self.schema> CASCADE`.
+    /// Used by cross-module integration tests that provision a
+    /// throwaway schema (e.g. gateway.zig D11 vault route tests) and
+    /// need to drop it on teardown without re-importing pg_helpers in
+    /// the caller. The schema name is validated + quoted before the
+    /// DDL runs, matching every other DDL path in this module.
+    pub fn dropSchemaForTests(self: *Self) !void {
+        try pg_helpers.validateIdentifier(self.schemaRaw());
+        const schema_q = try pg_helpers.quoteIdentifier(self.allocator, self.schemaRaw());
+        defer self.allocator.free(schema_q);
+        const drop_sql = try std.fmt.allocPrint(self.allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer self.allocator.free(drop_sql);
+        const result = try self.exec(drop_sql);
+        c.PQclear(result);
+    }
+
     fn applySessionSettingsToConn(self: *Self, conn: *c.PGconn) !void {
         if (self.statement_timeout_ms > 0) {
             var buf: [64]u8 = undefined;
@@ -706,6 +771,21 @@ const ManagerImpl = struct {
             \\    PRIMARY KEY (user_id, key)
             \\)
             ,
+            // D8 (S2.16) — audit trail for every secret mutation. One
+            // row per attempt (success or failure). Operators can
+            // see "who did what when" without ever seeing plaintext.
+            \\CREATE TABLE IF NOT EXISTS {schema}.secret_mutations (
+            \\    id TEXT PRIMARY KEY DEFAULT encode(gen_random_bytes(16), 'hex'),
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    key TEXT NOT NULL,
+            \\    action TEXT NOT NULL,
+            \\    actor TEXT,
+            \\    outcome TEXT NOT NULL,
+            \\    detail TEXT,
+            \\    at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_secret_mutations_user_at ON {schema}.secret_mutations(user_id, at DESC)",
             \\CREATE TABLE IF NOT EXISTS {schema}.sessions (
             \\    id TEXT PRIMARY KEY,
             \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
@@ -1177,6 +1257,163 @@ const ManagerImpl = struct {
             initialized += 1;
         }
         return keys;
+    }
+
+    // ── D8 (secret vault) ──────────────────────────────────────────────
+    //
+    // Metadata-only read (S2.12). Never touches ciphertext — returns
+    // `created_at` + `updated_at` as unix-seconds so the client can
+    // show "last rotated 3 days ago" without decryption ever running.
+
+    pub fn getSecretMetadata(self: *Self, allocator: std.mem.Allocator, user_id: i64, key: []const u8) !?SecretMetadata {
+        const q = try self.buildQuery(
+            "SELECT EXTRACT(EPOCH FROM created_at)::bigint, EXTRACT(EPOCH FROM updated_at)::bigint " ++
+                "FROM {schema}.user_secrets WHERE user_id = $1 AND key = $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, key_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+
+        const created_raw = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(created_raw);
+        const updated_raw = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(updated_raw);
+
+        const created_at = std.fmt.parseInt(i64, created_raw, 10) catch return error.InvalidTimestamp;
+        const updated_at = std.fmt.parseInt(i64, updated_raw, 10) catch return error.InvalidTimestamp;
+        return .{ .created_at_unix = created_at, .updated_at_unix = updated_at };
+    }
+
+    /// Record a secret mutation for audit (S2.16). Always writes — the
+    /// handler records both successful and failed attempts so operators
+    /// can diagnose token-replay attempts, wrong-action calls, etc.
+    pub fn recordSecretMutation(
+        self: *Self,
+        user_id: i64,
+        key: []const u8,
+        action: []const u8,
+        actor: ?[]const u8,
+        outcome: []const u8,
+        detail: ?[]const u8,
+    ) !void {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.secret_mutations (user_id, key, action, actor, outcome, detail) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const key_z = try self.allocator.dupeZ(u8, key);
+        defer self.allocator.free(key_z);
+        const action_z = try self.allocator.dupeZ(u8, action);
+        defer self.allocator.free(action_z);
+        const actor_z: ?[*:0]const u8 = if (actor) |a| blk: {
+            const z = try self.allocator.dupeZ(u8, a);
+            break :blk z.ptr;
+        } else null;
+        defer if (actor_z) |ptr| self.allocator.free(std.mem.span(ptr));
+        const outcome_z = try self.allocator.dupeZ(u8, outcome);
+        defer self.allocator.free(outcome_z);
+        const detail_z: ?[*:0]const u8 = if (detail) |d| blk: {
+            const z = try self.allocator.dupeZ(u8, d);
+            break :blk z.ptr;
+        } else null;
+        defer if (detail_z) |ptr| self.allocator.free(std.mem.span(ptr));
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, key_z, action_z, actor_z, outcome_z, detail_z };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(key.len),
+            @intCast(action.len),
+            if (actor) |a| @intCast(a.len) else 0,
+            @intCast(outcome.len),
+            if (detail) |d| @intCast(d.len) else 0,
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    pub fn listSecretMutations(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        limit: u32,
+    ) ![]SecretMutationRecord {
+        const clamped_limit: u32 = @min(@max(@as(u32, 1), limit), 100);
+        const q = try self.buildQuery(
+            "SELECT id, key, action, actor, outcome, detail, EXTRACT(EPOCH FROM at)::bigint " ++
+                "FROM {schema}.secret_mutations WHERE user_id = $1 ORDER BY at DESC LIMIT $2",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var limit_buf: [16]u8 = undefined;
+        const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{clamped_limit});
+        const params = [_]?[*:0]const u8{ user_s.ptr, limit_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(limit_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const nrows: usize = @intCast(@max(0, c.PQntuples(result)));
+        if (nrows == 0) return allocator.alloc(SecretMutationRecord, 0);
+
+        const rows = try allocator.alloc(SecretMutationRecord, nrows);
+        var initialized: usize = 0;
+        errdefer {
+            for (rows[0..initialized]) |r| r.deinit(allocator);
+            allocator.free(rows);
+        }
+        for (0..nrows) |i| {
+            const id = try dupeResultValue(allocator, result, @intCast(i), 0);
+            errdefer allocator.free(id);
+            const key = try dupeResultValue(allocator, result, @intCast(i), 1);
+            errdefer allocator.free(key);
+            const action = try dupeResultValue(allocator, result, @intCast(i), 2);
+            errdefer allocator.free(action);
+
+            const actor: ?[]const u8 = if (c.PQgetisnull(result, @intCast(i), 3) == 1)
+                null
+            else blk: {
+                const a = try dupeResultValue(allocator, result, @intCast(i), 3);
+                break :blk a;
+            };
+            errdefer if (actor) |a| allocator.free(a);
+
+            const outcome = try dupeResultValue(allocator, result, @intCast(i), 4);
+            errdefer allocator.free(outcome);
+
+            const detail: ?[]const u8 = if (c.PQgetisnull(result, @intCast(i), 5) == 1)
+                null
+            else blk: {
+                const d = try dupeResultValue(allocator, result, @intCast(i), 5);
+                break :blk d;
+            };
+            errdefer if (detail) |d| allocator.free(d);
+
+            const at_raw = try dupeResultValue(allocator, result, @intCast(i), 6);
+            defer allocator.free(at_raw);
+            const at_unix = std.fmt.parseInt(i64, at_raw, 10) catch return error.InvalidTimestamp;
+
+            rows[i] = .{
+                .id = id,
+                .key = key,
+                .action = action,
+                .actor = actor,
+                .outcome = outcome,
+                .detail = detail,
+                .at_unix = at_unix,
+            };
+            initialized += 1;
+        }
+        return rows;
     }
 
     pub fn replaceJobsJson(self: *Self, user_id: i64, session_id: []const u8, json: []const u8) !void {
