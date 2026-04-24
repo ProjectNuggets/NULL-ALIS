@@ -15355,6 +15355,62 @@ test "vault route [D11] — PUT with delete-action token returns token_action_mi
     try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"outcome\":\"ok\"") != null);
 }
 
+test "vault route [D11] — DELETE with fabricated hex token returns token_invalid and audits rejected_token_invalid" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_d11_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tenant_root);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    defer state.zaki_state = null;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    state.zaki_state = &mgr;
+
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    // DELETE with a well-formed-looking but never-issued token. The
+    // token is 64 hex chars (matches TOKEN_HEX_LEN) so parse-layer
+    // rejection can't short-circuit; the store's .not_found branch
+    // is what must catch it.
+    const fabricated: []const u8 = "00000000000000000000000000000000000000000000000000000000feedcafe";
+    try std.testing.expectEqual(@as(usize, secret_vault.TOKEN_HEX_LEN), fabricated.len);
+
+    const del_body = try std.fmt.allocPrint(req_allocator, "{{\"confirmation_token\":\"{s}\"}}", .{fabricated});
+    const del_raw = try std.fmt.allocPrint(req_allocator, "DELETE /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ del_body.len, del_body });
+    const del_resp = handleApiRoute(allocator, req_allocator, del_raw, "DELETE", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("401 Unauthorized", del_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, del_resp.body, "token_invalid") != null);
+    // Must not leak the fabricated token back in the error body.
+    try std.testing.expect(std.mem.indexOf(u8, del_resp.body, "feedcafe") == null);
+
+    // Audit trail must carry the rejection with action=delete.
+    const audit_raw = "GET /api/v1/users/42/secrets/TEST_KEY/audit HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const audit_resp = handleApiRoute(allocator, req_allocator, audit_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY/audit", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", audit_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"action\":\"delete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"outcome\":\"rejected_token_invalid\"") != null);
+}
+
 test "handleApiRoute accepts POST alias for telegram disconnect" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
