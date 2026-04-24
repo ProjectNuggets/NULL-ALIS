@@ -15411,6 +15411,88 @@ test "vault route [D11] — DELETE with fabricated hex token returns token_inval
     try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"outcome\":\"rejected_token_invalid\"") != null);
 }
 
+test "vault route [D11] — GET /secrets/:key/audit scopes mutations to the requested key only" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_d11_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tenant_root);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    defer state.zaki_state = null;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    state.zaki_state = &mgr;
+
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    // Helper closure: install one secret under `key` via full prepare+PUT.
+    // Each install produces one ok audit row for that key.
+    const keys = [_][]const u8{ "KEY_ALPHA", "KEY_BETA", "KEY_GAMMA" };
+    for (keys) |key| {
+        const prep_body = "{\"action\":\"put\"}";
+        const prep_raw = try std.fmt.allocPrint(req_allocator, "POST /api/v1/users/42/secrets/{s}/prepare HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ key, prep_body.len, prep_body });
+        const prep_path = try std.fmt.allocPrint(req_allocator, "/api/v1/users/42/secrets/{s}/prepare", .{key});
+        const prep_resp = handleApiRoute(allocator, req_allocator, prep_raw, "POST", prep_path, &state, null, null);
+        try std.testing.expectEqualStrings("200 OK", prep_resp.status);
+        const prep_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prep_resp.body, .{});
+        defer prep_parsed.deinit();
+        const token = prep_parsed.value.object.get("token").?.string;
+
+        const put_body = try std.fmt.allocPrint(req_allocator, "{{\"value\":\"v_{s}\",\"confirmation_token\":\"{s}\"}}", .{ key, token });
+        const put_raw = try std.fmt.allocPrint(req_allocator, "PUT /api/v1/users/42/secrets/{s} HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ key, put_body.len, put_body });
+        const put_path = try std.fmt.allocPrint(req_allocator, "/api/v1/users/42/secrets/{s}", .{key});
+        const put_resp = handleApiRoute(allocator, req_allocator, put_raw, "PUT", put_path, &state, null, null);
+        try std.testing.expectEqualStrings("200 OK", put_resp.status);
+    }
+
+    // GET /secrets/KEY_ALPHA/audit → body is the top-level envelope
+    // scoped to KEY_ALPHA. The implementation writes one
+    // {"key":"KEY_ALPHA","mutations":[...]} envelope and server-side
+    // filters records by `r.key == secret_key` before serializing —
+    // so the substrings KEY_BETA and KEY_GAMMA must not appear
+    // anywhere in the response body.
+    const audit_raw = "GET /api/v1/users/42/secrets/KEY_ALPHA/audit HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const audit_resp = handleApiRoute(allocator, req_allocator, audit_raw, "GET", "/api/v1/users/42/secrets/KEY_ALPHA/audit", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", audit_resp.status);
+
+    // Positive: envelope carries KEY_ALPHA and at least one put/ok entry.
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"key\":\"KEY_ALPHA\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"action\":\"put\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"outcome\":\"ok\"") != null);
+
+    // Negative (the point of the test): neither other key appears.
+    // If the filter regresses (e.g. a refactor drops the r.key ==
+    // secret_key check), these assertions trip and catch the leak.
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "KEY_BETA") == null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "KEY_GAMMA") == null);
+
+    // Cross-check: the plaintext values from all three installs
+    // must not be present either — audit records never carry the
+    // secret value, just outcome metadata.
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_ALPHA") == null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_BETA") == null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_GAMMA") == null);
+}
+
 test "handleApiRoute accepts POST alias for telegram disconnect" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
