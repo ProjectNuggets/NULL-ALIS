@@ -8809,8 +8809,20 @@ fn handleApiChatEventsSseConnection(
                     return true;
                 };
                 req_allocator.free(frame);
-                subscriber.markDelivered(state.allocator, event.id) catch {};
-                sm.deleteCompletionEvent(event.id) catch {};
+                // S4.12 / S4.13 — chat/events delivery silent catches closed.
+                // markDelivered failure → subscriber's watermark stays behind →
+                // user gets the same event again on reconnect (duplicate reply).
+                // deleteCompletionEvent failure → row stays in the table, same
+                // event re-delivers across reconnects AND the table grows
+                // unbounded. Both now log with event + session keys; neither
+                // is fatal to the current SSE connection (delivery already
+                // happened), so we continue the loop.
+                subscriber.markDelivered(state.allocator, event.id) catch |err|
+                    log.warn("chat.events.markDelivered_failed session={s} event_id={s} err={s}", .{ session_key, event.id, @errorName(err) });
+                sm.deleteCompletionEvent(event.id) catch |err| {
+                    lane_metrics.recordCompletionEventDeleteFailure();
+                    log.warn("chat.events.deleteCompletionEvent_failed session={s} event_id={s} err={s}", .{ session_key, event.id, @errorName(err) });
+                };
             },
         }
     }
