@@ -84,8 +84,10 @@ pub const user_settings = @import("user_settings.zig");
 pub const agent_routing = @import("agent_routing.zig");
 
 // Phase 5: Integrations (hardware + peripherals removed in V1 convergence — not a second-brain surface)
+// S6.1 — rag.zig was a datasheet-RAG module (hardware-adjacent, no consumers
+// since V1 convergence stripped the hardware surface). Deleted with the
+// hardware CLI in this sprint; re-export removed.
 pub const integrations = @import("integrations.zig");
-pub const rag = @import("rag.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const voice = @import("voice.zig");
 pub const zaki_state = @import("zaki_state.zig");
