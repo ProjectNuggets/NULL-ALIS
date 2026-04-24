@@ -196,11 +196,36 @@ fn getEnvVarOwned(allocator: Allocator, key: []const u8) !?[]u8 {
 }
 
 // Rebrand chokepoint: read NULLALIS_* primary, fall back to legacy NULLCLAW_*.
-// Deprecate fallbacks one wave at a time per Sprint 8 W5.3.
+// Sprint 8 (S8.3) — sunset deadline lives here. After 2026-05-15, the
+// NULLCLAW_* fallback branches in the three *WithFallback helpers below
+// (and the matching path in `observability.zig::OtelObserver.fromEnv`)
+// should be deleted. The once-per-process banner gives operators
+// running with stale env files a hard, visible signal during boot.
+
+/// One-shot deprecation banner fires the first time any NULLCLAW_*
+/// fallback is consumed in this process. Acquires under cmpxchg so the
+/// banner is logged exactly once even if multiple env reads race.
+var deprecation_banner_fired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+const NULLCLAW_SUNSET_DATE: []const u8 = "2026-05-15";
+
+fn fireDeprecationBannerOnce() void {
+    if (deprecation_banner_fired.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+        std.log.warn(
+            "DEPRECATION: NULLCLAW_* environment variables are read via fallback shims " ++
+                "and will be REMOVED after {s}. Migrate every NULLCLAW_FOO to NULLALIS_FOO " ++
+                "in your env files / k8s manifests / sealed-secrets. This banner fires once " ++
+                "per process; the per-variable warning identifies which keys you're still using.",
+            .{NULLCLAW_SUNSET_DATE},
+        );
+    }
+}
+
 fn getEnvVarOwnedWithFallback(allocator: Allocator, primary: []const u8, fallback: []const u8) !?[]u8 {
     if (try getEnvVarOwned(allocator, primary)) |value| return value;
     if (try getEnvVarOwned(allocator, fallback)) |value| {
-        std.log.warn("env {s} is deprecated; use {s}", .{ fallback, primary });
+        fireDeprecationBannerOnce();
+        std.log.warn("env {s} is deprecated; use {s} (remove after {s})", .{ fallback, primary, NULLCLAW_SUNSET_DATE });
         return value;
     }
     return null;
@@ -221,7 +246,8 @@ fn readEnvBoolIfSet(allocator: Allocator, key: []const u8) ?bool {
 fn readEnvBoolWithFallback(allocator: Allocator, primary: []const u8, fallback: []const u8, default_value: bool) bool {
     if (readEnvBoolIfSet(allocator, primary)) |v| return v;
     if (readEnvBoolIfSet(allocator, fallback)) |v| {
-        std.log.warn("env {s} is deprecated; use {s}", .{ fallback, primary });
+        fireDeprecationBannerOnce();
+        std.log.warn("env {s} is deprecated; use {s} (remove after {s})", .{ fallback, primary, NULLCLAW_SUNSET_DATE });
         return v;
     }
     return default_value;
@@ -242,7 +268,8 @@ fn readEnvF64IfSet(allocator: Allocator, key: []const u8) ?f64 {
 fn readEnvF64WithFallback(allocator: Allocator, primary: []const u8, fallback: []const u8, default_value: f64) f64 {
     if (readEnvF64IfSet(allocator, primary)) |v| return v;
     if (readEnvF64IfSet(allocator, fallback)) |v| {
-        std.log.warn("env {s} is deprecated; use {s}", .{ fallback, primary });
+        fireDeprecationBannerOnce();
+        std.log.warn("env {s} is deprecated; use {s} (remove after {s})", .{ fallback, primary, NULLCLAW_SUNSET_DATE });
         return v;
     }
     return default_value;

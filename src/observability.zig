@@ -548,7 +548,11 @@ pub const OtelObserver = struct {
             }
             if (std.posix.getenv("NULLCLAW_OTEL_ENDPOINT")) |ep| {
                 if (ep.len > 0) {
-                    std.log.warn("env NULLCLAW_OTEL_ENDPOINT is deprecated; use NULLALIS_OTEL_ENDPOINT", .{});
+                    // S8.3 — sunset 2026-05-15. Mirror the deadline format
+                    // used by sentry_runtime's *WithFallback helpers so
+                    // every NULLCLAW_* legacy-read warning surfaces the
+                    // same date string for grep-friendly migration audits.
+                    std.log.warn("env NULLCLAW_OTEL_ENDPOINT is deprecated; use NULLALIS_OTEL_ENDPOINT (remove after 2026-05-15)", .{});
                     break :blk ep;
                 }
             }
