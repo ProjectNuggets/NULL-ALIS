@@ -507,6 +507,26 @@ pub const Agent = struct {
     /// Used to refresh the prompt clock without rebuilding every turn.
     system_prompt_time_bucket_min: i64 = -1,
 
+    /// S5.7 — memoized Config load. Populated on first use by
+    /// `cachedConfigForCaps()`. Config is effectively immutable during an
+    /// Agent's lifetime (no hot-reload path exists), so reading config.json
+    /// on every turn is pure waste — a 50-message burst today does 50 file
+    /// reads + JSON parses. `cached_config_loaded` disambiguates "never
+    /// attempted" from "attempted and failed" so a transient filesystem
+    /// hiccup at first use doesn't re-spin the load every turn afterwards.
+    ///
+    /// **Invariant (MED-1 review fix):** once `cached_config_loaded` flips
+    /// to true AND `cached_config` is non-null, neither field may be
+    /// reassigned for the remaining lifetime of this Agent. `cachedConfig
+    /// ForCaps` returns a `*const Config` into the optional payload inside
+    /// this field — any reassignment would silently dangle that pointer on
+    /// any caller that holds it. If a future hot-reload path is needed,
+    /// land it as an explicit `invalidateConfigCache()` method that
+    /// simultaneously clears all outstanding pointer users, not a bare
+    /// field write.
+    cached_config: ?Config = null,
+    cached_config_loaded: bool = false,
+
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
 
@@ -665,8 +685,28 @@ pub const Agent = struct {
         return .inherit;
     }
 
+    /// S5.7 — return a pointer into the memoized Config. First call loads
+    /// from disk and caches; subsequent calls return the cached value (or
+    /// null if the initial load failed, which we remember via
+    /// `cached_config_loaded`). The pointer is valid until `deinit`.
+    pub fn cachedConfigForCaps(self: *Agent) ?*const Config {
+        if (!self.cached_config_loaded) {
+            self.cached_config_loaded = true;
+            if (Config.load(self.allocator)) |loaded| {
+                self.cached_config = loaded;
+            } else |err| {
+                // First-load failure: leave cache empty but mark loaded so we
+                // don't retry every turn. Operator can restart the agent to
+                // force a reload.
+                log.warn("config.load_failed_for_caps err={s} — caps will render without config context", .{@errorName(err)});
+            }
+        }
+        return if (self.cached_config) |*cfg| cfg else null;
+    }
+
     pub fn deinit(self: *Agent) void {
         self.clearCurrentTurnProviderOverride();
+        if (self.cached_config) |*cfg| cfg.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -2350,9 +2390,10 @@ pub const Agent = struct {
         );
 
         {
-            var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
-            defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
-            const cfg_for_caps_ptr: ?*const Config = if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded else null;
+            // S5.7 — memoized Config fetch. Replaces a per-turn
+            // `Config.load` + JSON parse + deinit triad. The cached_config
+            // lives on the Agent until deinit; see `cachedConfigForCaps`.
+            const cfg_for_caps_ptr: ?*const Config = self.cachedConfigForCaps();
 
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
@@ -2770,7 +2811,7 @@ pub const Agent = struct {
                     self.temperature,
                     streamCallbackWithTiming,
                     @ptrCast(&stream_timing_ctx.?),
-                ) catch |err| {
+                ) catch |err| retry_stream_blk: {
                     log.warn("llm.call failed provider={s} model={s} error={s}", .{
                         self.provider.getName(),
                         self.model_name,
@@ -2786,6 +2827,76 @@ pub const Agent = struct {
                         .run_id = self.current_run_id,
                     } };
                     self.observer.recordEvent(&fail_event);
+
+                    // S5.3 — streaming context-exhaustion recovery parity.
+                    // The blocking path (provider.chat below) already force-
+                    // compresses history and re-issues the call once on
+                    // ContextLengthExceeded. Long streamed sessions previously
+                    // returned the raw error where the blocking counterpart
+                    // would have healed. Mirror that behavior here: on
+                    // context-exhausted + sufficient history, forceCompress
+                    // once, rebuild the messages slice from the compacted
+                    // history, and re-issue streamChat exactly once. On retry
+                    // failure, propagate as before.
+                    const err_name = @errorName(err);
+                    if (providers.reliable.isContextExhausted(err_name) and
+                        self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
+                        blk: {
+                            const history_before = self.history.items.len;
+                            if (!self.forceCompressHistory()) break :blk false;
+                            self.recordForceCompression(history_before, self.history.items.len);
+                            break :blk true;
+                        })
+                    {
+                        self.context_was_compacted = true;
+                        self.context_force_compressed = true;
+                        log.info("turn.stage stage=stream_context_recovery iteration={d} — force-compressed and retrying stream", .{iteration});
+
+                        // Rebuild messages after compaction — the arena is
+                        // still live for this iteration, so buildProviderMessages
+                        // reuses it without leaking.
+                        const retry_messages = self.buildProviderMessages(arena) catch |build_err| return build_err;
+                        const retry_result = self.provider.streamChat(
+                            self.allocator,
+                            .{
+                                .messages = retry_messages,
+                                .model = effective_model,
+                                .temperature = self.temperature,
+                                .max_tokens = self.max_tokens,
+                                .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
+                                .timeout_secs = self.message_timeout_secs,
+                                .reasoning_effort = self.reasoning_effort,
+                            },
+                            effective_model,
+                            self.temperature,
+                            streamCallbackWithTiming,
+                            @ptrCast(&stream_timing_ctx.?),
+                        ) catch |retry_err| {
+                            log.warn("llm.call retry failed after stream context-recovery provider={s} model={s} error={s}", .{
+                                self.provider.getName(),
+                                self.model_name,
+                                @errorName(retry_err),
+                            });
+                            return retry_err;
+                        };
+                        // MED-2 review fix: emit the paired `llm_response
+                        // success=true` event for the retry so dashboards
+                        // aggregating llm.response outcomes see the recovery.
+                        // Without this, the observer stream carried only the
+                        // fail_event above — retry success was invisible.
+                        const retry_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
+                        const retry_success_event = ObserverEvent{ .llm_response = .{
+                            .provider = self.provider.getName(),
+                            .model = self.model_name,
+                            .duration_ms = retry_duration,
+                            .success = true,
+                            .error_message = null,
+                            .run_id = self.current_run_id,
+                        } };
+                        self.observer.recordEvent(&retry_success_event);
+                        break :retry_stream_blk retry_result;
+                    }
+
                     return err;
                 };
                 saw_stream_first_token = stream_timing_ctx.?.first_token_recorded;
@@ -3649,12 +3760,23 @@ pub const Agent = struct {
             self.freeResponseFields(&response);
         }
 
-        // ── Graceful degradation: tool iterations exhausted ──────────
-        // Instead of returning an error, ask the LLM to summarize what it
-        // has accomplished so far and return that as the final response.
-        const exhausted_event = ObserverEvent{ .tool_iterations_exhausted = .{ .iterations = self.max_tool_iterations } };
-        self.observer.recordEvent(&exhausted_event);
-        log.warn("Tool iterations exhausted ({d}/{d}), requesting summary", .{ self.max_tool_iterations, self.max_tool_iterations });
+        // ── Graceful degradation: tool iterations exhausted OR loop detected ──
+        //
+        // S5.8 — two distinct exit causes land in the same fallback path.
+        // The observer event + the log + the user-visible return prefix
+        // (below) now differentiate them so operators can tell "model ran
+        // out of iterations" from "loop guard tripped early on a repeated
+        // tool pattern". Both paths still go through the summary-request
+        // flow — the divergence is only in the reported reason.
+        if (loop_detected) {
+            const loop_event = ObserverEvent{ .loop_detected = .{ .iteration = turn_tool_iterations, .iterations_cap = self.max_tool_iterations } };
+            self.observer.recordEvent(&loop_event);
+            log.warn("Tool loop detected at iteration {d}/{d} — requesting summary", .{ turn_tool_iterations, self.max_tool_iterations });
+        } else {
+            const exhausted_event = ObserverEvent{ .tool_iterations_exhausted = .{ .iterations = self.max_tool_iterations } };
+            self.observer.recordEvent(&exhausted_event);
+            log.warn("Tool iterations exhausted ({d}/{d}), requesting summary", .{ self.max_tool_iterations, self.max_tool_iterations });
+        }
 
         // Append a pseudo-user message forcing a text-only summary
         try self.history.append(self.allocator, .{
@@ -3664,9 +3786,19 @@ pub const Agent = struct {
                 "so far and what remains to be done. Respond in the same language the user used."),
         });
 
-        // Build messages for the summary call
+        // Build messages for the summary call.
+        //
+        // S5.8 — return-prefix distinguishes loop-detected from iterations-
+        // exhausted to match the observer event emitted above. Users see
+        // "[Tool loop detected at N/N]" vs "[Tool iteration limit: N/N]"
+        // and can report accurately which failure mode fired. `{d}/{d}` in
+        // the loop-detected prefix shows the iteration the loop tripped at
+        // vs the cap, whereas the exhausted prefix uses cap/cap.
         const summary_messages = self.buildMessageSlice() catch {
-            const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            const fallback = if (loop_detected)
+                try std.fmt.allocPrint(self.allocator, "[Tool loop detected at {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ turn_tool_iterations, self.max_tool_iterations })
+            else
+                try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;
@@ -3687,7 +3819,10 @@ pub const Agent = struct {
             self.model_name,
             self.temperature,
         ) catch {
-            const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            const fallback = if (loop_detected)
+                try std.fmt.allocPrint(self.allocator, "[Tool loop detected at {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ turn_tool_iterations, self.max_tool_iterations })
+            else
+                try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;
@@ -3695,7 +3830,10 @@ pub const Agent = struct {
         defer self.freeResponseFields(&summary_response);
 
         const summary_text = summary_response.contentOrEmpty();
-        const prefixed = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, summary_text });
+        const prefixed = if (loop_detected)
+            try std.fmt.allocPrint(self.allocator, "[Tool loop detected at {d}/{d}]\n\n{s}", .{ turn_tool_iterations, self.max_tool_iterations, summary_text })
+        else
+            try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, summary_text });
         errdefer self.allocator.free(prefixed);
 
         // Store in history (dupe the raw summary, not the prefixed version)
@@ -3716,7 +3854,11 @@ pub const Agent = struct {
         const total_turn_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - turn_start_ms));
         const first_token_ms_i64: i64 = if (turn_first_token_ms) |value| @intCast(value) else -1;
         const first_token_upper_bound_ms_i64: i64 = if (turn_first_token_upper_bound_ms) |value| @intCast(value) else -1;
-        log.info("turn.profile kind=tool_exhausted llm_calls={d} retries={d} tool_iterations={d} tool_calls={d} first_token_ms={d} first_token_upper_bound_ms={d} memory_enrich_ms={d} pre_compaction_ms={d} autosave_ms=0 outbox_ms=0 cache_put_ms=0 post_reply_maintenance_ms=0 total_turn_ms={d}", .{
+        // S5.8 — turn.profile kind distinguishes the two exit causes so
+        // operator dashboards can aggregate separately.
+        const profile_kind: []const u8 = if (loop_detected) "tool_loop_detected" else "tool_exhausted";
+        log.info("turn.profile kind={s} llm_calls={d} retries={d} tool_iterations={d} tool_calls={d} first_token_ms={d} first_token_upper_bound_ms={d} memory_enrich_ms={d} pre_compaction_ms={d} autosave_ms=0 outbox_ms=0 cache_put_ms=0 post_reply_maintenance_ms=0 total_turn_ms={d}", .{
+            profile_kind,
             turn_llm_calls + 1, // include final summary call
             turn_retry_attempts,
             turn_tool_iterations,

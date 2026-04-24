@@ -57,6 +57,13 @@ pub const ObserverEvent = union(enum) {
         run_id: ?[]const u8 = null,
     },
     tool_iterations_exhausted: struct { iterations: u32 },
+    /// S5.8 — loop-detected exit is distinct from iterations-exhausted.
+    /// Exhausted = the model used N iterations without finishing.
+    /// Loop detected = the model called the same tools repeatedly and
+    /// the loop-guard tripped early. Operators need to tell these apart:
+    /// "exhausted" may mean "give it more iterations", "loop_detected"
+    /// means "prompt/tool contract is steering the model in circles".
+    loop_detected: struct { iteration: u32, iterations_cap: u32 },
     turn_cancelled: struct { reason: []const u8, iteration: u32 },
     turn_stage: struct {
         stage: []const u8,
@@ -200,6 +207,7 @@ pub const LogObserver = struct {
             .tool_call_start => |e| std.log.info("tool.start tool={s}", .{e.tool}),
             .tool_call => |e| std.log.info("tool.call tool={s} duration_ms={d} success={}", .{ e.tool, e.duration_ms, e.success }),
             .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
+            .loop_detected => |e| std.log.info("tool.loop_detected iteration={d} cap={d}", .{ e.iteration, e.iterations_cap }),
             .turn_cancelled => |e| std.log.info("turn.cancelled reason={s} iteration={d}", .{ e.reason, e.iteration }),
             .turn_stage => |e| {
                 if (e.iteration) |iteration| {
@@ -419,6 +427,7 @@ pub const FileObserver = struct {
             .tool_call_start => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call_start\",\"tool\":\"{s}\"}}", .{e.tool}) catch return,
             .tool_call => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call\",\"tool\":\"{s}\",\"duration_ms\":{d},\"success\":{}}}", .{ e.tool, e.duration_ms, e.success }) catch return,
             .tool_iterations_exhausted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_iterations_exhausted\",\"iterations\":{d}}}", .{e.iterations}) catch return,
+            .loop_detected => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"loop_detected\",\"iteration\":{d},\"iterations_cap\":{d}}}", .{ e.iteration, e.iterations_cap }) catch return,
             .turn_cancelled => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_cancelled\",\"reason\":\"{s}\",\"iteration\":{d}}}", .{ e.reason, e.iteration }) catch return,
             .turn_stage => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_stage\",\"stage\":\"{s}\"}}", .{e.stage}) catch return,
             .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
@@ -670,6 +679,16 @@ pub const OtelObserver = struct {
                 const iter_str = std.fmt.bufPrint(&iter_buf, "{d}", .{e.iterations}) catch "0";
                 self.addSpan("tool.iterations_exhausted", now, now, &.{
                     .{ .key = "iterations", .value = iter_str },
+                });
+            },
+            .loop_detected => |e| {
+                var iter_buf: [20]u8 = undefined;
+                const iter_str = std.fmt.bufPrint(&iter_buf, "{d}", .{e.iteration}) catch "0";
+                var cap_buf: [20]u8 = undefined;
+                const cap_str = std.fmt.bufPrint(&cap_buf, "{d}", .{e.iterations_cap}) catch "0";
+                self.addSpan("tool.loop_detected", now, now, &.{
+                    .{ .key = "iteration", .value = iter_str },
+                    .{ .key = "cap", .value = cap_str },
                 });
             },
             .turn_cancelled => |e| {

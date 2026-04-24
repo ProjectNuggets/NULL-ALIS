@@ -863,7 +863,19 @@ pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]Sk
         }
     }
 
+    // S5.5 — sort by name for byte-stable prompt prefix. POSIX directory-
+    // iteration order is filesystem-dependent (ext4 can change it across
+    // mount remaps; tmpfs differs from it; container layer diffs in CI
+    // vs prod). Without an explicit sort, the Skills section of the
+    // system prompt could shuffle between the local dev run and the
+    // container deploy — cache miss with no visible cause.
+    std.mem.sort(Skill, skills_list.items, {}, skillLessThanByName);
+
     return try skills_list.toOwnedSlice(allocator);
+}
+
+fn skillLessThanByName(_: void, a: Skill, b: Skill) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
 }
 
 /// Load skills from two sources: built-in and workspace.
@@ -911,6 +923,13 @@ pub fn listSkillsMerged(allocator: std.mem.Allocator, builtin_dir: []const u8, w
     for (merged.items) |*s| {
         checkRequirements(allocator, s);
     }
+
+    // S5.5 — sort merged output by name. Both inputs are now sorted (see
+    // listSkills), but the merge above appends non-overridden builtins
+    // first, then all workspace skills — the concatenation is not
+    // necessarily alphabetical. Explicit sort ensures the Skills section
+    // renders byte-stably regardless of builtin/workspace split.
+    std.mem.sort(Skill, merged.items, {}, skillLessThanByName);
 
     return try merged.toOwnedSlice(allocator);
 }
@@ -1576,6 +1595,45 @@ test "listSkills discovers skills in subdirectories" {
     }
     try std.testing.expect(found_alpha);
     try std.testing.expect(found_beta);
+}
+
+test "listSkills returns skills sorted by name regardless of on-disk order [S5.5]" {
+    // S5.5 — byte-stability invariant test for the skills surface.
+    // Directory iteration order is filesystem-dependent; a skills dir
+    // populated in reverse alphabetical order (zulu, mike, alpha) must
+    // still render the Skills section of the system prompt with alpha
+    // first. Without the sort, the prompt's byte layout drifts between
+    // filesystems (tmpfs vs ext4 vs container layer), breaking provider
+    // KV cache on every turn.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const names = [_][]const u8{ "zulu", "mike", "alpha" };
+    for (names) |name| {
+        const sub = try std.fs.path.join(allocator, &.{ "skills", name });
+        defer allocator.free(sub);
+        try tmp.dir.makePath(sub);
+
+        const rel = try std.fs.path.join(allocator, &.{ "skills", name, "skill.json" });
+        defer allocator.free(rel);
+        const f = try tmp.dir.createFile(rel, .{});
+        defer f.close();
+        const json = try std.fmt.allocPrint(allocator, "{{\"name\": \"{s}\", \"version\": \"1.0.0\", \"description\": \"d\", \"author\": \"a\"}}", .{name});
+        defer allocator.free(json);
+        try f.writeAll(json);
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const skills = try listSkills(allocator, base);
+    defer freeSkills(allocator, skills);
+
+    try std.testing.expectEqual(@as(usize, 3), skills.len);
+    try std.testing.expectEqualStrings("alpha", skills[0].name);
+    try std.testing.expectEqualStrings("mike", skills[1].name);
+    try std.testing.expectEqualStrings("zulu", skills[2].name);
 }
 
 test "listSkills skips directories without valid manifest" {
