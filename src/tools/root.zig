@@ -10,7 +10,10 @@ const bus = @import("../bus.zig");
 const memory_mod = @import("../memory/root.zig");
 const zaki_state = @import("../zaki_state.zig");
 const observability = @import("../observability.zig");
+const entitlement_mod = @import("../entitlement.zig");
 const Memory = memory_mod.Memory;
+
+pub const Entitlement = entitlement_mod.Entitlement;
 
 // ── JSON arg extraction helpers ─────────────────────────────────
 // Used by all tool implementations to extract typed fields from
@@ -239,57 +242,76 @@ pub fn assertToolInterface(comptime T: type) void {
 // skill_registry) are classified conservatively here; finer arg-aware policy
 // lives in `toolBlockedForCurrentTurn` and future approval layers.
 // Unknown/MCP/dynamic tools fall back to `ToolMetadata.conservative`.
+// cost_class billing classification per plan-v02 §4.4 (S2.9).
+//   .a = cheap (local read, status, memory op, schedule metadata op)
+//   .b = medium (external HTTP, small payload, light compute) — DEFAULT
+//   .c = expensive (image gen, voice synth, subagent spawn, full browser,
+//        arbitrary outbound HTTP, Composio execute with potentially large
+//        third-party payloads)
+// Intent is nominal — concrete $ translation lives on the entitlement side.
 const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     // Read-only, safe in plan/review/background
     .{
         .name = runtime_info.RuntimeInfoTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         .name = file_read.FileReadTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         .name = memory_recall.MemoryRecallTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         .name = memory_list.MemoryListTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         .name = memory_timeline.MemoryTimelineTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         .name = transcript_read.TranscriptReadTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
+        // Paid search provider (Brave/Serper/etc.) — medium cost per call.
         .name = web_search.WebSearchTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .b,
     },
     .{
+        // External HTTP fetch with up to 1MB response — medium cost.
         .name = web_fetch.WebFetchTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .medium,
+        .cost_class = .b,
     },
     .{
         .name = task_list.TaskListTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         .name = task_get.TaskGetTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
 
     // Read-only, NOT background_safe (side channels, hardware, or sensitive output)
@@ -297,81 +319,100 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .name = image.ImageInfoTool.tool_name,
         .flags = .{ .read_only = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     // image_generate: side-effectful (writes to external API, returns URL).
     // Not read_only, not background_safe (user-initiated action), low risk.
+    // Together FLUX costs $0.003+ per call — expensive tier.
     .{
         .name = image_generate.ImageGenerateTool.tool_name,
         .flags = .{ .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .c,
     },
     .{
         .name = cron_list.CronListTool.tool_name,
         .flags = .{ .read_only = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         .name = cron_runs.CronRunsTool.tool_name,
         .flags = .{ .read_only = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         // Read-only, but medium risk because it can expose screen contents.
+        // Local capture — cheap tier.
         .name = screenshot.ScreenshotTool.tool_name,
         .flags = .{ .read_only = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
 
     // Mutating / side-effecting — never allowed in plan/review, never background_safe
     .{
+        // Local shell — medium cost on average (long-running commands vary).
         .name = shell.ShellTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .critical,
+        .cost_class = .b,
     },
     .{
         .name = file_write.FileWriteTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
     .{
         .name = file_edit.FileEditTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
     .{
         .name = file_append.FileAppendTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
     .{
         // Action-dependent: some git subcommands are read-only, but the tool
         // as a whole can mutate the working tree and remotes. Conservative.
+        // Network ops (push/fetch) make this medium cost.
         .name = git.GitTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .high,
+        .cost_class = .b,
     },
     .{
         .name = memory_store.MemoryStoreTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         .name = memory_edit.MemoryEditTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         .name = memory_forget.MemoryForgetTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         // Topic-scoped bulk purge of agent-generated artifacts. Mutating;
         // medium risk because an ill-chosen topic could delete more than
         // intended (heuristic protects against overly-short topics).
+        // Local DB scan + delete — medium cost depending on scope.
         .name = memory_purge_topic.MemoryPurgeTopicTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .b,
     },
     .{
         // Schedule has read-only actions (list/get/runs) but the tool as a
@@ -379,80 +420,102 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .name = schedule.ScheduleTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
     .{
+        // Spawns a full subagent turn — potentially many LLM calls + tools.
         .name = delegate.DelegateTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .high,
+        .cost_class = .c,
     },
     .{
+        // Spawns a long-running task — same reasoning as delegate.
         .name = spawn.SpawnTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .high,
+        .cost_class = .c,
     },
     .{
+        // External channel send — medium (Telegram/Slack/WhatsApp APIs).
         .name = message.MessageTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .b,
     },
     .{
         .name = pushover.PushoverTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .b,
     },
     .{
         .name = cron_add.CronAddTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
     .{
         .name = cron_remove.CronRemoveTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
     .{
         .name = cron_update.CronUpdateTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
     .{
+        // Ad-hoc job run triggers agent_runner — potentially heavy.
         .name = cron_run.CronRunTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .c,
     },
     .{
-        // Arbitrary outbound HTTP — treat as mutating network side-effect.
+        // Arbitrary outbound HTTP — unknown payload size. Treat as expensive.
         .name = http_request.HttpRequestTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .high,
+        .cost_class = .c,
     },
     .{
+        // Full browser session — heavy.
         .name = browser.BrowserTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .c,
     },
     .{
+        // Local open URL — cheap.
         .name = browser_open.BrowserOpenTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
     .{
         // Composio is action-dependent: list/get are read-only but execute
         // can mutate third-party state. Conservative here; background policy
         // handles the read-only execute whitelist for proactive turns.
+        // Third-party API calls, large payloads possible — expensive tier.
         .name = composio.ComposioTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .high,
+        .cost_class = .c,
     },
     .{
         .name = skill_registry.SkillRegistryTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
     .{
         .name = task_stop.TaskStopTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
+        .cost_class = .a,
     },
 
     // Self-control & self-inspection — read-only, allowed in every mode
@@ -463,11 +526,13 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .name = set_execution_mode.SetExecutionModeTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = false },
         .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         .name = context_snapshot.ContextSnapshotTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
+        .cost_class = .a,
     },
 };
 
@@ -965,6 +1030,13 @@ pub const RuntimeTurnContext = struct {
     session_key: ?[]const u8 = null,
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    /// Per-session billing + capability state. Default construction gives
+    /// "pro active unlimited" so existing tests + un-plumbed call paths
+    /// keep working. S2.1 (BFF provision response extension) installs the
+    /// real Entitlement when a user session starts; S2.7 revocation
+    /// webhook can swap it mid-session. S2.3-S2.6 enforcement sites read
+    /// this field in preflight. See `src/entitlement.zig` for the type.
+    entitlement: Entitlement = .{},
 };
 
 pub const ToolTenantContext = struct {

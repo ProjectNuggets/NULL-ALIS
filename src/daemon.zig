@@ -31,6 +31,7 @@ const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
 const json_util = @import("json_util.zig");
 const tools_mod = @import("tools/root.zig");
+const entitlement_mod = @import("entitlement.zig");
 const runtime_resolver = @import("delivery/runtime_resolver.zig");
 const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
 const channel_identity_key = @import("channel_identity_key.zig");
@@ -1066,6 +1067,49 @@ fn runCronAgentTurnWithBus(
     defer runtime.deinit();
 
     const turn_origin: tools_mod.TurnOrigin = resolveCronTurnOrigin(job);
+
+    // S2.5: Enforcement chokepoint 3 — scheduler job dispatch.
+    // A canceled/expired user or a free-tier user with proactive disabled
+    // must not have background turns burning compute. Resolved via the
+    // pluggable entitlement resolver (S2.1 will populate it; until then
+    // null means "use default pro/active" and this gate is a no-op).
+    {
+        const entitlement = if (scheduler.context_user_id) |uid|
+            entitlement_mod.resolveUserEntitlement(uid) orelse entitlement_mod.Entitlement{}
+        else
+            entitlement_mod.Entitlement{};
+        const now_unix = std.time.timestamp();
+        if (!entitlement.canAct(now_unix)) {
+            log.info("cron.skipped reason=entitlement_inactive user={s} status={s} job_id={s}", .{
+                scheduler.context_user_id orelse "-",
+                entitlement.status.toSlice(),
+                job.id,
+            });
+            return allocator.dupe(u8, "");
+        }
+        const effective_tier = entitlement.effectiveTier(now_unix);
+        const limits = entitlement_mod.Entitlement.limitsFor(effective_tier);
+        const is_proactive = switch (turn_origin) {
+            .heartbeat, .scheduler, .proactive, .wake => true,
+            .user => false,
+        };
+        if (is_proactive and !limits.proactive_enabled) {
+            log.info("cron.skipped reason=entitlement_proactive_disabled user={s} tier={s} job_id={s}", .{
+                scheduler.context_user_id orelse "-",
+                effective_tier.toSlice(),
+                job.id,
+            });
+            return allocator.dupe(u8, "");
+        }
+        // Full propagation of entitlement onto RuntimeTurnContext for the
+        // downstream tool-preflight gate (S2.4) is tracked as part of S2.1
+        // — session.processMessageWithContext sets the RuntimeTurnContext
+        // and that's where the entitlement field needs to flow in. Until
+        // then, cron-originated turns skip S2.4's per-tool entitlement
+        // check and rely on this dispatch-level gate plus the existing
+        // background-origin policy.
+    }
+
     const lane_resolution = resolveCronSessionLaneWithMetrics(job, turn_origin);
 
     var session_buf: [256]u8 = undefined;
@@ -1452,8 +1496,18 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         before_tick.deinit(allocator);
     }
 
-    // Initial load from disk (ignore errors — start empty if file missing/corrupt)
-    cron.loadJobs(&scheduler) catch {};
+    // Initial load from disk. Use the strict policy so a transient boot-time
+    // read/parse error is surfaced loudly rather than silently starting with
+    // an empty scheduler that would then let the reload self-heal path
+    // overwrite cron.json with the empty state (permanent data loss).
+    // FileNotFound is legitimate (fresh install) and is swallowed inside
+    // loadJobsStrict. Any other error leaves loaded_from_disk=false, which
+    // the reload-self-heal branch in cron.zig refuses to overwrite.
+    cron.loadJobsStrict(&scheduler) catch |err| {
+        log.err("scheduler boot-load failed; starting with empty in-memory jobs and refusing to overwrite cron.json until a successful load: {s}", .{@errorName(err)});
+        state.markError("scheduler", @errorName(err));
+        health.markComponentError("scheduler", @errorName(err));
+    };
 
     state.markRunning("scheduler");
     health.markComponentOk("scheduler");

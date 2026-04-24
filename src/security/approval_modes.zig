@@ -44,18 +44,39 @@ pub const ApprovalPolicy = enum {
     }
 };
 
+// ── Provenance ──────────────────────────────────────────────────────
+//
+// The enum below is intended to attach provenance to an ApprovalDecision
+// so observability can distinguish "auto-approved by policy" from "user
+// explicitly OK'd" from (future) "user OK'd for the whole run — skip
+// re-prompt." The prior shipped version carried a `session_cache` variant
+// for that last case, but no code ever populated or consulted it: there
+// was no /approve verb to set it and preflightToolPolicy never looked it
+// up. P4_tools + P2_subagent_delegate + P3_relations all independently
+// flagged the declaration as inert (S1.9).
+//
+// For Swiss-watch discipline the right move is to delete the pretend-
+// feature and re-add it with full wiring when we build run-scoped
+// approvals. A future implementation needs:
+//   1. New verb: `/approve <id> allow-run` (commands.zig)
+//   2. Session/run-scoped cache keyed by (tool_name, canonical arg hash)
+//      with an explicit lifetime (clear on run end, on `/new`, on policy
+//      change, on Agent.deinit)
+//   3. preflightToolPolicy consults the cache before setPendingToolApproval
+//   4. A new DecisionSource variant emitted on cache-hit approval
+//   5. End-to-end test asserting the same tool+args second call bypasses
+//      the approval gate only when the prior call used allow-run.
+// See CLOSURE_CHECKLIST.md Sprint 4+ or Wave M for revival.
 pub const DecisionSource = enum {
     auto_policy,
     user_approve,
     user_deny,
-    session_cache,
 
     pub fn toSlice(self: DecisionSource) []const u8 {
         return switch (self) {
             .auto_policy => "auto_policy",
             .user_approve => "user_approve",
             .user_deny => "user_deny",
-            .session_cache => "session_cache",
         };
     }
 };
@@ -119,5 +140,6 @@ test "ApprovalPolicy toSlice returns correct strings" {
 
 test "DecisionSource toSlice returns correct strings" {
     try std.testing.expectEqualStrings("auto_policy", DecisionSource.auto_policy.toSlice());
-    try std.testing.expectEqualStrings("session_cache", DecisionSource.session_cache.toSlice());
+    try std.testing.expectEqualStrings("user_approve", DecisionSource.user_approve.toSlice());
+    try std.testing.expectEqualStrings("user_deny", DecisionSource.user_deny.toSlice());
 }

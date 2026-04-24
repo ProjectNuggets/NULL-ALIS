@@ -457,6 +457,15 @@ pub const CronScheduler = struct {
     agent_runner: ?AgentRunnerFn = null,
     agent_runner_ctx: ?*anyopaque = null,
 
+    /// Set true once this scheduler's in-memory jobs have been confirmed to
+    /// reflect a successful read from the persistent store (either via
+    /// strict-policy load of a non-empty valid file, or a FileNotFound on a
+    /// genuinely fresh install). When false, in-memory state is NOT a safe
+    /// source for self-heal writes — doing so on a corrupted-but-present
+    /// cron.json would overwrite user-owned scheduled jobs with the empty
+    /// post-boot state. See S1.6 / P2_scheduler ugly-truth #1.
+    loaded_from_disk: bool = false,
+
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
             .jobs = .empty,
@@ -1018,7 +1027,12 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
     defer scheduler.allocator.free(path);
 
     const content = std.fs.cwd().readFileAlloc(scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return,
+        // No file = fresh install. Mark as loaded_from_disk so self-heal save
+        // on next tick will happily create the file.
+        error.FileNotFound => {
+            scheduler.loaded_from_disk = true;
+            return;
+        },
         else => switch (policy) {
             .best_effort => return,
             .strict => return err,
@@ -1050,6 +1064,11 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .strict => return err,
         };
     }
+
+    // Reached only after the file was present, parsed cleanly, and every
+    // entry was walked. From here the in-memory jobs list is a faithful
+    // mirror of what's on disk — safe source for later self-heal writes.
+    scheduler.loaded_from_disk = true;
 }
 
 fn appendJobFromJsonObjectWithPolicy(scheduler: *CronScheduler, obj: std.json.ObjectMap, policy: LoadPolicy) !void {
@@ -1901,14 +1920,26 @@ pub fn reloadJobs(scheduler: *CronScheduler) !void {
     }
     loadJobsStrict(&loaded) catch |err| {
         if (isRecoverableCronStoreError(err)) {
-            // Heal malformed/truncated cron.json by persisting current in-memory jobs.
-            // This prevents endless reload warnings after upgrades or interrupted writes.
-            try saveJobs(scheduler);
-            return;
+            // Heal malformed/truncated cron.json by persisting current in-memory
+            // jobs — but ONLY if the outer scheduler's in-memory state is itself
+            // a safe source (i.e. we have at some point successfully loaded
+            // from disk). Otherwise a transient boot-time parse failure would
+            // cause us to overwrite the corrupted file with the post-boot EMPTY
+            // scheduler, losing every scheduled job permanently. See S1.6 /
+            // P2_scheduler ugly-truth #1.
+            if (scheduler.loaded_from_disk) {
+                try saveJobs(scheduler);
+                return;
+            }
+            log.err("cron store recoverable-parse error on scheduler that never loaded from disk; refusing to overwrite cron.json with empty state: {s}", .{@errorName(err)});
+            return err;
         }
         return err;
     };
+    // Swapping takes `loaded`'s loaded_from_disk snapshot implicitly via the
+    // outer scheduler already having it set on a successful prior pass.
     std.mem.swap(std.ArrayListUnmanaged(CronJob), &scheduler.jobs, &loaded.jobs);
+    if (loaded.loaded_from_disk) scheduler.loaded_from_disk = true;
 }
 
 fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {

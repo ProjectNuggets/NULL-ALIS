@@ -44,11 +44,51 @@ pub const RiskLevel = enum {
     }
 };
 
+/// Billing cost class per plan-v02 §4.4 — metering input for entitlement
+/// enforcement + CostTracker. Distinct from RiskLevel (approval) because
+/// some risky tools are cheap (e.g. shell rm vs. list_files — both low/med
+/// cost, both high risk) and some safe tools are expensive (e.g. web_search
+/// against a paid provider, large composio payload).
+///
+/// Mapping intent:
+///   .a = cheap — local reads, status, runtime_info, memory_* ops, schedule_* ops
+///   .b = medium — web search, composio list/read small payload, http_fetch small
+///   .c = expensive — large integration payloads, heavy model calls,
+///                    image generation, voice synthesis, full-repo shell ops
+///
+/// Unknown / MCP / dynamic tools default to .b (conservative mid-tier) to
+/// avoid accidentally billing as cheap or blocking as expensive when the
+/// real profile is unknown.
+pub const CostClass = enum {
+    a,
+    b,
+    c,
+
+    pub fn toSlice(self: CostClass) []const u8 {
+        return switch (self) {
+            .a => "a",
+            .b => "b",
+            .c => "c",
+        };
+    }
+
+    /// Nominal weight for aggregating per-turn cost counters.
+    /// Concrete $ translation lives on the entitlement side.
+    pub fn weight(self: CostClass) u32 {
+        return switch (self) {
+            .a => 1,
+            .b => 5,
+            .c => 25,
+        };
+    }
+};
+
 /// Structured metadata for a single tool, resolved at compile time or runtime.
 pub const ToolMetadata = struct {
     name: []const u8,
     flags: ToolFlags = .{},
     risk_level: RiskLevel = .low,
+    cost_class: CostClass = .b,
     approval_hint: []const u8 = "",
 
     /// Create a conservative metadata entry for an unknown tool name.
@@ -58,6 +98,7 @@ pub const ToolMetadata = struct {
             .name = name,
             .flags = .{ .mutating = true },
             .risk_level = .high,
+            .cost_class = .b,
             .approval_hint = "Unknown tool — conservative policy applied",
         };
     }
@@ -150,4 +191,26 @@ test "lookupMetadata returns null for unknown" {
 test "RiskLevel toSlice returns correct strings" {
     try std.testing.expectEqualStrings("low", RiskLevel.low.toSlice());
     try std.testing.expectEqualStrings("critical", RiskLevel.critical.toSlice());
+}
+
+test "CostClass defaults to .b" {
+    const m = ToolMetadata{ .name = "x" };
+    try std.testing.expectEqual(CostClass.b, m.cost_class);
+}
+
+test "CostClass conservative default is .b (mid-tier for unknown)" {
+    const m = ToolMetadata.conservative("unknown");
+    try std.testing.expectEqual(CostClass.b, m.cost_class);
+}
+
+test "CostClass weights reflect nominal ratios" {
+    try std.testing.expectEqual(@as(u32, 1), CostClass.a.weight());
+    try std.testing.expectEqual(@as(u32, 5), CostClass.b.weight());
+    try std.testing.expectEqual(@as(u32, 25), CostClass.c.weight());
+}
+
+test "CostClass toSlice" {
+    try std.testing.expectEqualStrings("a", CostClass.a.toSlice());
+    try std.testing.expectEqualStrings("b", CostClass.b.toSlice());
+    try std.testing.expectEqualStrings("c", CostClass.c.toSlice());
 }
