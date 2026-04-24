@@ -439,24 +439,85 @@ pub const ComposioTool = struct {
         return self.runCurl(allocator, argv_buf[0..argc]);
     }
 
-    /// Run curl as a child process and return stdout on success, stderr on failure.
+    /// Run curl as a child process with S7.14 exponential-backoff retry on
+    /// HTTP 429 (Composio rate-limit). Up to 3 total attempts with 1s / 2s
+    /// delays between them. 429 detection looks for the substring `"429"` +
+    /// any of {`rate`, `Too Many`, `ratelimit`} in the body — Composio's
+    /// error JSON uses a few different shapes depending on endpoint. Other
+    /// HTTP failures (401, 500, etc.) return on the first attempt; retries
+    /// only fire for the specific backoff-appropriate case.
     fn runCurl(_: *ComposioTool, allocator: std.mem.Allocator, argv: []const []const u8) !ToolResult {
         const proc = @import("process_util.zig");
-        const result = try proc.run(allocator, argv, .{});
-        defer allocator.free(result.stderr);
-        if (result.success) {
-            if (result.stdout.len > 0) return ToolResult{ .success = true, .output = result.stdout };
-            allocator.free(result.stdout);
-            return ToolResult{ .success = true, .output = try allocator.dupe(u8, "(empty response)") };
+        const MAX_ATTEMPTS: u8 = 3;
+        var attempt: u8 = 0;
+        while (attempt < MAX_ATTEMPTS) : (attempt += 1) {
+            if (attempt > 0) {
+                // Exponential backoff: 1s, 2s. Wall-clock sleep because
+                // curl already ran to completion — no event loop to yield to.
+                const delay_ns: u64 = (@as(u64, 1) << @intCast(attempt - 1)) * std.time.ns_per_s;
+                std.Thread.sleep(delay_ns);
+            }
+
+            const result = try proc.run(allocator, argv, .{});
+            if (result.success) {
+                defer allocator.free(result.stderr);
+                if (result.stdout.len == 0) {
+                    allocator.free(result.stdout);
+                    return ToolResult{ .success = true, .output = try allocator.dupe(u8, "(empty response)") };
+                }
+                // Inspect body for 429 marker. Only retry if we have budget.
+                if (attempt + 1 < MAX_ATTEMPTS and looksLikeRateLimit(result.stdout)) {
+                    allocator.free(result.stdout);
+                    continue;
+                }
+                return ToolResult{ .success = true, .output = result.stdout };
+            }
+            // Non-success process exit: return on the LAST attempt; otherwise
+            // try again (curl exit 28 on timeout can be transient).
+            defer allocator.free(result.stdout);
+            if (attempt + 1 < MAX_ATTEMPTS) {
+                allocator.free(result.stderr);
+                continue;
+            }
+            defer allocator.free(result.stderr);
+            if (result.exit_code != null) {
+                const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "curl failed with non-zero exit code");
+                return ToolResult{ .success = false, .output = "", .error_msg = err_out };
+            }
+            return ToolResult{ .success = false, .output = "", .error_msg = "curl terminated by signal" };
         }
-        defer allocator.free(result.stdout);
-        if (result.exit_code != null) {
-            const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "curl failed with non-zero exit code");
-            return ToolResult{ .success = false, .output = "", .error_msg = err_out };
-        }
-        return ToolResult{ .success = false, .output = "", .error_msg = "curl terminated by signal" };
+        // Unreachable — loop returns or breaks; guard against future edits
+        // that add a continue without a terminal return.
+        return ToolResult{ .success = false, .output = "", .error_msg = "composio retry exhausted" };
     }
 };
+
+/// Heuristic rate-limit detector: look for "429" + a rate-related token
+/// in the response body. Composio returns rate-limit errors in several
+/// shapes (`{"code":429,...}`, `{"status":"rate_limited",...}`, plain
+/// "Too Many Requests") so a multi-needle scan is more robust than an
+/// exact-shape parse for a retry decision.
+fn looksLikeRateLimit(body: []const u8) bool {
+    const has_429 = std.mem.indexOf(u8, body, "429") != null;
+    if (!has_429) return false;
+    if (std.mem.indexOf(u8, body, "rate") != null) return true;
+    if (std.mem.indexOf(u8, body, "Rate") != null) return true;
+    if (std.mem.indexOf(u8, body, "Too Many") != null) return true;
+    if (std.mem.indexOf(u8, body, "too_many") != null) return true;
+    return false;
+}
+
+test "looksLikeRateLimit detects common 429 shapes" {
+    try std.testing.expect(looksLikeRateLimit("{\"code\":429,\"message\":\"rate limited\"}"));
+    try std.testing.expect(looksLikeRateLimit("{\"status\":429,\"error\":\"Too Many Requests\"}"));
+    try std.testing.expect(looksLikeRateLimit("HTTP 429 rate_limited"));
+    try std.testing.expect(!looksLikeRateLimit("{\"code\":200,\"data\":[]}"));
+    try std.testing.expect(!looksLikeRateLimit("{\"code\":500,\"message\":\"internal error\"}"));
+    // 429 in content without rate context isn't enough to retry — avoids
+    // false positives on payloads that happen to contain "429" in a token
+    // like an action ID or phone number.
+    try std.testing.expect(!looksLikeRateLimit("{\"phone\":\"+14295550000\"}"));
+}
 
 // ── Helper functions ────────────────────────────────────────────────
 
