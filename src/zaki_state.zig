@@ -216,6 +216,13 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listSecretMutations(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]SecretMutationRecord {
         return allocator.alloc(SecretMutationRecord, 0);
     }
+    // Test-only helper: see ManagerImpl.dropSchemaForTests. Stub variant
+    // exists so comptime method lookup resolves on the non-postgres
+    // Manager; callers guard on build_options.enable_postgres and never
+    // reach this branch in practice.
+    pub fn dropSchemaForTests(_: *@This()) !void {
+        return error.PostgresNotEnabled;
+    }
     pub fn listUserSessions(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]SessionInfo {
         return allocator.alloc(SessionInfo, 0);
     }
@@ -553,6 +560,22 @@ const ManagerImpl = struct {
 
     fn schemaRaw(self: *const Self) []const u8 {
         return self.schema_raw_buf[0..self.schema_raw_len];
+    }
+
+    /// Test-only helper: `DROP SCHEMA IF EXISTS <self.schema> CASCADE`.
+    /// Used by cross-module integration tests that provision a
+    /// throwaway schema (e.g. gateway.zig D11 vault route tests) and
+    /// need to drop it on teardown without re-importing pg_helpers in
+    /// the caller. The schema name is validated + quoted before the
+    /// DDL runs, matching every other DDL path in this module.
+    pub fn dropSchemaForTests(self: *Self) !void {
+        try pg_helpers.validateIdentifier(self.schemaRaw());
+        const schema_q = try pg_helpers.quoteIdentifier(self.allocator, self.schemaRaw());
+        defer self.allocator.free(schema_q);
+        const drop_sql = try std.fmt.allocPrint(self.allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer self.allocator.free(drop_sql);
+        const result = try self.exec(drop_sql);
+        c.PQclear(result);
     }
 
     fn applySessionSettingsToConn(self: *Self, conn: *c.PGconn) !void {

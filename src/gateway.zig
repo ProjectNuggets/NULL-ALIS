@@ -15087,6 +15087,119 @@ test "vault route — PUT legacy body without confirmation_token is not an accid
     try std.testing.expect(!std.mem.eql(u8, response.status, "200 OK"));
 }
 
+// ── D8 vault route full-DB integration tests (D11) ─────────────────
+//
+// Complete the D11 residual tracked in docs/sprints/d8-secret-vault.md.
+// The HTTP-envelope tests above lock in route parsing + no-backend 503;
+// these exercise the same handler with a live postgres-backed
+// ManagerImpl wired onto GatewayState so ConsumeResult.ok, real audit
+// rows, and metadata roundtrips all run end-to-end.
+//
+// Fixture strategy: each test provisions its own throwaway schema
+// (nullalis_d11_test_<microtime>) and drops before migrate + on
+// teardown. Skips cleanly if postgres isn't compiled in
+// (-Dengines lacks postgres) or NULLCLAW_POSTGRES_TEST_URL is unset,
+// so the non-postgres -Dengines=base CI path stays green.
+
+test "vault route [D11] — full happy-path roundtrip (prepare → put → get metadata → prepare delete → delete → 404)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_d11_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    // `Manager.init` auto-migrates against `schema` above. The
+    // microtimestamp name guarantees a fresh namespace per run;
+    // teardown drops it so the fixture database doesn't accumulate
+    // per-run schemas over time.
+    defer mgr.dropSchemaForTests() catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tenant_root);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    // GatewayState.deinit() destroys `state.zaki_state` via `allocator.destroy`
+    // — but our `mgr` is a stack local owned by this test. Clearing the
+    // field BEFORE state.deinit() runs keeps the test's ownership intact.
+    defer state.zaki_state = null;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    state.zaki_state = &mgr;
+
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    // ── Step 1: POST /prepare {"action":"put"} → 200, extract token.
+    const prepare_body = "{\"action\":\"put\"}";
+    const prepare_raw = try std.fmt.allocPrint(req_allocator, "POST /api/v1/users/42/secrets/TEST_KEY/prepare HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ prepare_body.len, prepare_body });
+    const prepare_resp = handleApiRoute(allocator, req_allocator, prepare_raw, "POST", "/api/v1/users/42/secrets/TEST_KEY/prepare", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", prepare_resp.status);
+    const prepare_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prepare_resp.body, .{});
+    defer prepare_parsed.deinit();
+    const put_token = prepare_parsed.value.object.get("token").?.string;
+    try std.testing.expectEqual(@as(usize, secret_vault.TOKEN_HEX_LEN), put_token.len);
+    try std.testing.expectEqualStrings("put", prepare_parsed.value.object.get("action").?.string);
+
+    // ── Step 2: PUT with token → 200 {"status":"updated"}.
+    const put_body = try std.fmt.allocPrint(req_allocator, "{{\"value\":\"sk_live_xyz\",\"confirmation_token\":\"{s}\"}}", .{put_token});
+    const put_raw = try std.fmt.allocPrint(req_allocator, "PUT /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ put_body.len, put_body });
+    const put_resp = handleApiRoute(allocator, req_allocator, put_raw, "PUT", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", put_resp.status);
+    try std.testing.expectEqualStrings("{\"status\":\"updated\"}", put_resp.body);
+
+    // ── Step 3: GET metadata → 200, has created_at_unix + updated_at_unix,
+    // MUST NOT leak the plaintext or even the literal "value" field name.
+    const get_raw = "GET /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const get_resp = handleApiRoute(allocator, req_allocator, get_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", get_resp.status);
+    const get_parsed = try std.json.parseFromSlice(std.json.Value, allocator, get_resp.body, .{});
+    defer get_parsed.deinit();
+    try std.testing.expect(get_parsed.value.object.get("created_at_unix") != null);
+    try std.testing.expect(get_parsed.value.object.get("updated_at_unix") != null);
+    try std.testing.expectEqual(@as(?std.json.Value, null), get_parsed.value.object.get("value"));
+    // Core anti-leak invariant: the plaintext never appears anywhere in
+    // the GET response body, nor does the literal "value" field name —
+    // the whole point of the metadata-only contract is that a compromised
+    // GET path can't exfiltrate the secret.
+    try std.testing.expect(std.mem.indexOf(u8, get_resp.body, "sk_live_xyz") == null);
+    try std.testing.expect(std.mem.indexOf(u8, get_resp.body, "value") == null);
+
+    // ── Step 4: POST /prepare {"action":"delete"} → 200, extract delete token.
+    const prep_del_body = "{\"action\":\"delete\"}";
+    const prep_del_raw = try std.fmt.allocPrint(req_allocator, "POST /api/v1/users/42/secrets/TEST_KEY/prepare HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ prep_del_body.len, prep_del_body });
+    const prep_del_resp = handleApiRoute(allocator, req_allocator, prep_del_raw, "POST", "/api/v1/users/42/secrets/TEST_KEY/prepare", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", prep_del_resp.status);
+    const prep_del_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prep_del_resp.body, .{});
+    defer prep_del_parsed.deinit();
+    const delete_token = prep_del_parsed.value.object.get("token").?.string;
+    try std.testing.expectEqualStrings("delete", prep_del_parsed.value.object.get("action").?.string);
+
+    // ── Step 5: DELETE with delete token → 200 {"status":"deleted"}.
+    const del_body = try std.fmt.allocPrint(req_allocator, "{{\"confirmation_token\":\"{s}\"}}", .{delete_token});
+    const del_raw = try std.fmt.allocPrint(req_allocator, "DELETE /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ del_body.len, del_body });
+    const del_resp = handleApiRoute(allocator, req_allocator, del_raw, "DELETE", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", del_resp.status);
+    try std.testing.expectEqualStrings("{\"status\":\"deleted\"}", del_resp.body);
+
+    // ── Step 6: GET → 404 {"error":"secret_not_found"}.
+    const get_after_raw = "GET /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const get_after_resp = handleApiRoute(allocator, req_allocator, get_after_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("404 Not Found", get_after_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_after_resp.body, "secret_not_found") != null);
+}
+
 test "handleApiRoute accepts POST alias for telegram disconnect" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
