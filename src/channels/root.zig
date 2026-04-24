@@ -13,7 +13,6 @@
 //!   - iMessage (AppleScript + SQLite on macOS)
 //!   - Email (IMAP/SMTP)
 //!   - Lark/Feishu (HTTP callback)
-//!   - DingTalk (WebSocket stream mode)
 
 const std = @import("std");
 
@@ -112,19 +111,24 @@ pub const Channel = struct {
 // Channel Sub-modules
 // ════════════════════════════════════════════════════════════════════════════
 
-// V1 convergence channel disposition (2026-04-18):
+// V1 convergence channel disposition (2026-04-18, refined Sprint 8 — 2026-04-24):
 //   KEEP (active or potential product value): cli, telegram, discord, slack,
 //                                              whatsapp, email, maixcam.
 //   DELETE-ELIGIBLE (no personal-second-brain future): signal, imessage,
 //                                                       matrix, mattermost, irc,
-//                                                       line, lark, dingtalk,
-//                                                       onebot, qq.
+//                                                       line, lark, onebot, qq.
+//   DELETED (Sprint 8 — S8.4+S8.6, 2026-04-24): dingtalk. Was 121 LoC,
+//   0 tests, comment admitted incomplete Stream Mode WebSocket. No tests,
+//   no roadmap signal, no demand. If DingTalk ever becomes a requirement,
+//   the pattern is well-understood from the other 17 channels — recreating
+//   from scratch costs less than maintaining a dead stub.
 // The delete-eligible channels are currently flag-gated off in the V1 default
 // (-Dchannels=cli,telegram,discord,slack,whatsapp,email,maixcam) but the code
 // is still present because removing them requires a dedicated refactor pass
 // across channel_loop.zig, channel_manager.zig, channel_adapters.zig,
-// channel_catalog.zig, config.zig, config_types.zig, and build.zig (~89
-// reference sites). Tracked as a standalone follow-up package.
+// channel_catalog.zig, config.zig, config_types.zig, and build.zig.
+// Tracked as a standalone follow-up package; Sprint 8 elected to take only
+// the dingtalk stub because it had zero tests and no working code.
 pub const cli = @import("cli.zig");
 pub const telegram = @import("telegram.zig");
 pub const discord = @import("discord.zig");
@@ -136,7 +140,7 @@ pub const irc = @import("irc.zig");
 pub const imessage = @import("imessage.zig");
 pub const email = @import("email.zig");
 pub const lark = @import("lark.zig");
-pub const dingtalk = @import("dingtalk.zig");
+// dingtalk: deleted Sprint 8 (S8.4+S8.6, 2026-04-24).
 pub const line = @import("line.zig");
 pub const onebot = @import("onebot.zig");
 pub const qq = @import("qq.zig");

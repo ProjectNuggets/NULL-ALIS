@@ -35,7 +35,7 @@ const ChannelSelection = struct {
     enable_channel_imessage: bool = false,
     enable_channel_email: bool = false,
     enable_channel_lark: bool = false,
-    enable_channel_dingtalk: bool = false,
+    // enable_channel_dingtalk: deleted Sprint 8 (S8.4+S8.6, 2026-04-24).
     enable_channel_line: bool = false,
     enable_channel_onebot: bool = false,
     enable_channel_qq: bool = false,
@@ -54,7 +54,6 @@ const ChannelSelection = struct {
         self.enable_channel_imessage = true;
         self.enable_channel_email = true;
         self.enable_channel_lark = true;
-        self.enable_channel_dingtalk = true;
         self.enable_channel_line = true;
         self.enable_channel_onebot = true;
         self.enable_channel_qq = true;
@@ -125,8 +124,6 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_email = true;
         } else if (std.mem.eql(u8, token, "lark")) {
             selection.enable_channel_lark = true;
-        } else if (std.mem.eql(u8, token, "dingtalk")) {
-            selection.enable_channel_dingtalk = true;
         } else if (std.mem.eql(u8, token, "line")) {
             selection.enable_channel_line = true;
         } else if (std.mem.eql(u8, token, "onebot")) {
@@ -283,7 +280,7 @@ pub fn build(b: *std.Build) void {
     const channels_raw = b.option(
         []const u8,
         "channels",
-        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal (default: cli,telegram under -Dv1=true; all under -Dv1=false)",
+        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|line|onebot|qq|maixcam|signal (default: cli,telegram under -Dv1=true; all under -Dv1=false)",
     );
     const channels = if (channels_raw) |raw| blk: {
         const parsed = parseChannelsOption(raw) catch {
@@ -325,7 +322,6 @@ pub fn build(b: *std.Build) void {
     const enable_channel_imessage = channels.enable_channel_imessage;
     const enable_channel_email = channels.enable_channel_email;
     const enable_channel_lark = channels.enable_channel_lark;
-    const enable_channel_dingtalk = channels.enable_channel_dingtalk;
     const enable_channel_line = channels.enable_channel_line;
     const enable_channel_onebot = channels.enable_channel_onebot;
     const enable_channel_qq = channels.enable_channel_qq;
@@ -375,7 +371,6 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_imessage", enable_channel_imessage);
     build_options.addOption(bool, "enable_channel_email", enable_channel_email);
     build_options.addOption(bool, "enable_channel_lark", enable_channel_lark);
-    build_options.addOption(bool, "enable_channel_dingtalk", enable_channel_dingtalk);
     build_options.addOption(bool, "enable_channel_line", enable_channel_line);
     build_options.addOption(bool, "enable_channel_onebot", enable_channel_onebot);
     build_options.addOption(bool, "enable_channel_qq", enable_channel_qq);

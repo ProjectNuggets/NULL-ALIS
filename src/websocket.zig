@@ -1,5 +1,5 @@
 //! Generic RFC 6455 WebSocket client over TLS.
-//! Used by Discord, Lark, DingTalk, QQ gateway channels.
+//! Used by Discord, Lark, QQ gateway channels.
 //! All connections are TLS-only (wss://).
 
 const std = @import("std");

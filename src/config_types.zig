@@ -508,12 +508,8 @@ pub const LarkConfig = struct {
     port: ?u16 = null,
 };
 
-pub const DingTalkConfig = struct {
-    account_id: []const u8 = "default",
-    client_id: []const u8,
-    client_secret: []const u8,
-    allow_from: []const []const u8 = &.{},
-};
+// DingTalkConfig: deleted Sprint 8 (S8.4+S8.6, 2026-04-24) alongside
+// channels/dingtalk.zig — was a 121-LoC stub with 0 tests.
 
 pub const SignalConfig = struct {
     account_id: []const u8 = "default",
@@ -594,7 +590,6 @@ pub const ChannelsConfig = struct {
     whatsapp: []const WhatsAppConfig = &.{},
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
-    dingtalk: []const DingTalkConfig = &.{},
     signal: []const SignalConfig = &.{},
     email: []const EmailConfig = &.{},
     line: []const LineConfig = &.{},
@@ -646,9 +641,6 @@ pub const ChannelsConfig = struct {
     }
     pub fn larkPrimary(self: *const ChannelsConfig) ?LarkConfig {
         return primaryAccount(LarkConfig, self.lark);
-    }
-    pub fn dingtalkPrimary(self: *const ChannelsConfig) ?DingTalkConfig {
-        return primaryAccount(DingTalkConfig, self.dingtalk);
     }
     pub fn emailPrimary(self: *const ChannelsConfig) ?EmailConfig {
         return primaryAccount(EmailConfig, self.email);
