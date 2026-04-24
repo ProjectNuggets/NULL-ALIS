@@ -15200,6 +15200,68 @@ test "vault route [D11] — full happy-path roundtrip (prepare → put → get m
     try std.testing.expect(std.mem.indexOf(u8, get_after_resp.body, "secret_not_found") != null);
 }
 
+test "vault route [D11] — PUT without confirmation token returns 401 and writes rejected_no_token audit row" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_d11_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tenant_root);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    defer state.zaki_state = null;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    state.zaki_state = &mgr;
+
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    // PUT with a body that omits confirmation_token (but supplies a
+    // plausible value) → handler must reject before touching storage.
+    const put_body = "{\"value\":\"sk_live_abc\"}";
+    const put_raw = try std.fmt.allocPrint(req_allocator, "PUT /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ put_body.len, put_body });
+    const put_resp = handleApiRoute(allocator, req_allocator, put_raw, "PUT", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("401 Unauthorized", put_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, put_resp.body, "confirmation_token_required") != null);
+
+    // The plaintext must never have hit the wire log either — reject-on-no-token
+    // should not surface the submitted value back in the error body.
+    try std.testing.expect(std.mem.indexOf(u8, put_resp.body, "sk_live_abc") == null);
+
+    // GET must still return 404 — the rejected PUT never reached storage.
+    const get_raw = "GET /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const get_resp = handleApiRoute(allocator, req_allocator, get_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("404 Not Found", get_resp.status);
+
+    // Audit trail must contain the rejection — confirms the reject
+    // branch recorded the attempt even though no state changed. The
+    // audit endpoint filters to the requested key + is bounded at 25
+    // rows, so a single rejected_no_token entry should be the only
+    // mutation for TEST_KEY.
+    const audit_raw = "GET /api/v1/users/42/secrets/TEST_KEY/audit HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const audit_resp = handleApiRoute(allocator, req_allocator, audit_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY/audit", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", audit_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"action\":\"put\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"outcome\":\"rejected_no_token\"") != null);
+}
+
 test "handleApiRoute accepts POST alias for telegram disconnect" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
