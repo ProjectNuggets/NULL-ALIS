@@ -1181,6 +1181,14 @@ pub const McpServerConfig = struct {
     command: []const u8,
     args: []const []const u8 = &.{},
     env: []const McpEnvEntry = &.{},
+    /// S7.11 — max seconds to wait for a single newline-terminated response
+    /// line from the MCP server's stdout. Applied per `readLine` call, not
+    /// per tool invocation — a hung server (no bytes, no EOF) is detected
+    /// within this bound regardless of which RPC is in flight.
+    /// Default 30s matches the longest realistic "slow MCP tool" budget
+    /// without forcing every deployment to set the key. Zero disables the
+    /// timeout (blocking behavior, same as pre-S7.11 semantics).
+    read_line_timeout_secs: u32 = 30,
 
     pub const McpEnvEntry = struct {
         key: []const u8,

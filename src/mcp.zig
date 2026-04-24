@@ -188,7 +188,39 @@ pub const McpServer = struct {
         errdefer line_buf.deinit(allocator);
         var byte: [1]u8 = undefined;
         const stdout = self.child.?.stdout orelse return error.NoStdout;
+
+        // S7.11 — bounded wait for the next readable byte. A hung MCP server
+        // (child process alive, no stdout, no EOF) would otherwise block
+        // this thread indefinitely. Compute a monotonic deadline once;
+        // each iteration polls with the remaining budget. `timeout_secs == 0`
+        // disables the timeout (pre-S7.11 blocking behavior preserved for
+        // deployments that explicitly opt out). Windows path currently
+        // falls through to the blocking read — `std.posix.poll` isn't
+        // portable there; tracked as a follow-up. Prod target is Linux.
+        const timeout_secs: u64 = self.config.read_line_timeout_secs;
+        const use_timeout = timeout_secs > 0 and @import("builtin").os.tag != .windows;
+        const deadline_ns: i128 = if (use_timeout)
+            std.time.nanoTimestamp() + @as(i128, @intCast(timeout_secs)) * std.time.ns_per_s
+        else
+            0;
+
         while (true) {
+            if (use_timeout) {
+                const remaining_ns = deadline_ns - std.time.nanoTimestamp();
+                if (remaining_ns <= 0) return error.ReadTimeout;
+                const remaining_ms: i32 = @intCast(@min(@as(i128, std.math.maxInt(i32)), @divTrunc(remaining_ns, std.time.ns_per_ms)));
+                var pfd = [_]std.posix.pollfd{.{
+                    .fd = stdout.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = std.posix.poll(&pfd, remaining_ms) catch return error.ReadFailed;
+                if (ready == 0) return error.ReadTimeout;
+                // POLLHUP / POLLERR without POLLIN: peer closed, no more data.
+                if ((pfd[0].revents & std.posix.POLL.IN) == 0) {
+                    return error.EndOfStream;
+                }
+            }
             const n = stdout.read(&byte) catch return error.ReadFailed;
             if (n == 0) return error.EndOfStream;
             if (byte[0] == '\n') break;
