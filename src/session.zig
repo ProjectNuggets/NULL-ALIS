@@ -678,9 +678,16 @@ pub const SessionManager = struct {
                 // Clear stale auto-saved memories
                 store.clearAutoSaved(session_key) catch {};
             } else if (!std.mem.startsWith(u8, trimmed, "/")) {
-                // Persist user + assistant messages (skip slash commands)
-                store.saveMessage(session_key, "user", content) catch {};
-                store.saveMessage(session_key, "assistant", response) catch {};
+                // Persist user + assistant messages (skip slash commands).
+                // S4.4 — durable-write silent catch closed. `messages` table
+                // rows are the cold-tier transcript (cold-memory-auditability
+                // directive). Dropping a saveMessage silently means the turn
+                // completed but the history it claims to have persisted is
+                // incomplete; /history export would under-report.
+                store.saveMessage(session_key, "user", content) catch |err|
+                    log.warn("session.saveMessage_user_failed session={s} err={s}", .{ session_key, @errorName(err) });
+                store.saveMessage(session_key, "assistant", response) catch |err|
+                    log.warn("session.saveMessage_assistant_failed session={s} err={s}", .{ session_key, @errorName(err) });
             }
         }
         const persist_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - persist_start_ms));
@@ -712,7 +719,10 @@ pub const SessionManager = struct {
         session.last_active = std.time.timestamp();
 
         if (self.session_store) |store| {
-            store.saveMessage(session_key, "assistant", content) catch {};
+            // S4.5 — durable-write silent catch closed. Second saveMessage
+            // site in `appendAssistantMessage`; same rationale as S4.4.
+            store.saveMessage(session_key, "assistant", content) catch |err|
+                log.warn("session.appendAssistantMessage_failed session={s} err={s}", .{ session_key, @errorName(err) });
         }
     }
 
