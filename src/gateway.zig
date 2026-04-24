@@ -29,6 +29,7 @@ const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
 const session_mod = @import("session.zig");
+const gdpr_mod = @import("gdpr.zig");
 const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
 const mcp_mod = @import("mcp.zig");
@@ -10510,6 +10511,103 @@ fn handleSessionApprove(
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
+// ── GDPR data purge handler (Sprint 7B — S7.6) ─────────────────────
+//
+// DELETE /api/v1/users/:user_id/data
+// Body: {"confirm":"PURGE-USER-<user_id>"}
+//
+// Precondition: the X-Internal-Token check at handleApiRoute entry
+// already succeeded. Body-level `confirm` gate is the second layer,
+// binding the destructive intent to the exact path user_id so a
+// mis-routed curl (wrong path) fails before touching any storage.
+fn handleGdprDataPurge(
+    allocator: std.mem.Allocator,
+    raw_request: []const u8,
+    scoped_user_id: []const u8,
+    state: *GatewayState,
+    effective_session_mgr: ?*session_mod.SessionManager,
+) RouteResponse {
+    const numeric_user_id = parseNumericUserId(scoped_user_id) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+
+    const body = extractBody(raw_request) orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_body\",\"detail\":\"expected {\\\"confirm\\\":\\\"PURGE-USER-<user_id>\\\"}\"}" };
+    };
+    const confirm = jsonStringField(body, "confirm") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_confirm\",\"detail\":\"expected {\\\"confirm\\\":\\\"PURGE-USER-<user_id>\\\"}\"}" };
+    };
+    const expected = std.fmt.allocPrint(allocator, "PURGE-USER-{s}", .{scoped_user_id}) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"confirm_build_failed\"}" };
+    };
+    defer allocator.free(expected);
+    if (!std.mem.eql(u8, confirm, expected)) {
+        return .{ .status = "401 Unauthorized", .body = "{\"error\":\"confirm_mismatch\",\"detail\":\"confirm must exactly equal PURGE-USER-<user_id> where <user_id> matches the URL path\"}" };
+    }
+
+    // Resolve vector store from the tenant runtime if available.
+    // Holding the mutex briefly is fine: purgeUser itself does not need
+    // the mutex — we just borrow the VectorStore handle, which is
+    // retained by the runtime until the runtime is destroyed.
+    var vector_store_opt: ?memory_mod.VectorStore = null;
+    {
+        state.tenant_runtime_mutex.lock();
+        defer state.tenant_runtime_mutex.unlock();
+        if (state.tenant_runtimes.get(scoped_user_id)) |runtime| {
+            if (runtime.mem_rt) |*rt| {
+                vector_store_opt = rt._vector_store;
+            }
+        }
+    }
+
+    // Build a /data/users root path we can point purgeUser at for the
+    // filesystem step. We use the gateway's configured tenant_data_root
+    // rather than user_ctx.user_root directly so a path-traversal attempt
+    // via user_id cannot escape the tenant tree (parseNumericUserId above
+    // already constrains user_id to digits, belt-and-suspenders).
+    var report = gdpr_mod.purgeUser(.{
+        .allocator = allocator,
+        .zaki_state = state.zaki_state,
+        .vector_store = vector_store_opt,
+        .session_manager = effective_session_mgr,
+        .users_root = state.tenant_data_root,
+    }, numeric_user_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"purge_failed\"}" };
+    };
+    defer report.deinit(allocator);
+
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    defer resp.deinit(allocator);
+    const w = resp.writer(allocator);
+    w.print(
+        "{{\"status\":\"{s}\",\"sessions_evicted\":{d},\"sessions_skipped_active\":{d},\"pg_user_row_deleted\":{s},\"vector_rows_removed\":{d},\"filesystem_removed\":{s},\"errors\":[",
+        .{
+            if (report.fullySucceeded()) "ok" else "partial",
+            report.sessions_evicted,
+            report.sessions_skipped_active,
+            if (report.pg_user_row_deleted) "true" else "false",
+            report.vector_rows_removed,
+            if (report.filesystem_removed) "true" else "false",
+        },
+    ) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    var first = true;
+    for (report.errors.items) |e| {
+        if (!first) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        first = false;
+        w.writeAll("\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        jsonEscapeInto(w, e) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+        w.writeAll("\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    }
+    w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+
+    // Partial success still returns 200 with the body marking which
+    // surfaces didn't fully purge. Full failure (allocator OOM etc.)
+    // returned 500 above. 207 Multi-Status would be more RFC-accurate
+    // but is non-standard in our gateway router.
+    return .{ .body = resp.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+}
+
 fn handleApiRoute(
     root_allocator: std.mem.Allocator,
     req_allocator: std.mem.Allocator,
@@ -11873,6 +11971,31 @@ fn handleApiRoute(
     if (std.mem.startsWith(u8, parsed.subpath, "sessions/")) {
         const rest = parsed.subpath["sessions/".len..];
         return handleSessionAction(req_allocator, method, scoped_user_id, rest, effective_session_mgr, raw_request);
+    }
+
+    // ── GDPR data purge (Sprint 7B — S7.6) ──────────────────────────────
+    // DELETE /api/v1/users/:id/data removes every trace of the user
+    // across postgres, pgvector, filesystem, and the session cache.
+    //
+    // Defense in depth:
+    //  1. `X-Internal-Token` header (enforced at handleApiRoute entry).
+    //  2. Body must include `{"confirm":"PURGE-USER-<id>"}` where `<id>`
+    //     matches the path user_id — so a mis-routed operator request
+    //     (wrong user in URL) fails the body check and purges nothing.
+    //  3. DELETE verb only; any other method returns 405.
+    //
+    // Not 2-phase token (like the secret vault): this endpoint is for
+    // operators holding the internal service token, not for frontend
+    // users. Adding a prepare step would only slow the operator without
+    // raising the effective security bar — they already hold the
+    // single credential that gates every other /api/v1/* call. If this
+    // surface is ever exposed to end-users, upgrade to the secret-vault
+    // prepare/consume pattern (see D26 in the deferred register).
+    if (std.mem.eql(u8, parsed.subpath, "data")) {
+        if (!std.mem.eql(u8, method, "DELETE")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\",\"detail\":\"use DELETE to purge user data\"}" };
+        }
+        return handleGdprDataPurge(req_allocator, raw_request, scoped_user_id, state, effective_session_mgr);
     }
 
     // ── Task query endpoints (WP2.2) ────────────────────────────────────
@@ -15753,6 +15876,135 @@ test "vault route [D11] — GET /secrets/:key/audit scopes mutations to the requ
     try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_ALPHA") == null);
     try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_BETA") == null);
     try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_GAMMA") == null);
+}
+
+// ── Sprint 7B — DELETE /api/v1/users/:id/data GDPR purge route ─────
+
+test "gdpr purge route — DELETE without body returns 400 missing_body" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "DELETE /api/v1/users/1/data HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: 0\r\n\r\n";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "DELETE",
+        "/api/v1/users/1/data",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "missing_body") != null);
+}
+
+test "gdpr purge route — DELETE with mismatched confirm string returns 401 confirm_mismatch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    // Body confirm refers to user_id=999 but path targets user_id=1.
+    // This is the anti-mis-routing check: the magic string binds
+    // destructive intent to the URL path id.
+    const body = "{\"confirm\":\"PURGE-USER-999\"}";
+    const raw = try std.fmt.allocPrint(req_arena.allocator(), "DELETE /api/v1/users/1/data HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "DELETE",
+        "/api/v1/users/1/data",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("401 Unauthorized", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "confirm_mismatch") != null);
+}
+
+test "gdpr purge route — DELETE without X-Internal-Token returns 401 unauthorized" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    // Omitted X-Internal-Token header — the first-layer check fires
+    // before any body parsing, so the network credential is never
+    // optional even with a well-formed confirm body.
+    const body = "{\"confirm\":\"PURGE-USER-1\"}";
+    const raw = try std.fmt.allocPrint(req_arena.allocator(), "DELETE /api/v1/users/1/data HTTP/1.1\r\nHost: localhost\r\nX-Zaki-User-Id: 1\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "DELETE",
+        "/api/v1/users/1/data",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("401 Unauthorized", response.status);
+}
+
+test "gdpr purge route — non-DELETE method returns 405" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "GET /api/v1/users/1/data HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "GET",
+        "/api/v1/users/1/data",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("405 Method Not Allowed", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "use DELETE to purge") != null);
 }
 
 test "handleApiRoute accepts POST alias for telegram disconnect" {
