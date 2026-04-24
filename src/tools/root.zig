@@ -555,20 +555,50 @@ pub fn defaultMetadataRegistry() []const metadata.ToolMetadata {
 /// Read `NULLALIS_ENABLE_MULTIAGENT` from the process env. Returns true
 /// only for exact value "1" (allows whitespace trim). Mirrors the gate at
 /// `buildDefaultTools` so metadata stays in lockstep with registration.
+///
+/// Post-review fix (MED-3 from sprint-4-5-6-review): cache the result
+/// in a module-scoped atomic so the answer is determined once per
+/// process. Without the cache the registry reader and the runtime-tool
+/// registration reader could in principle disagree if third-party code
+/// inside the process called `setenv()` between them. Nullalis doesn't
+/// setenv today, but the drift would be invisible and hard to debug —
+/// first-reader-wins is cheap insurance.
+///
+/// Encoding: 0 = unread (first caller populates), 1 = false, 2 = true.
+/// Acquire-release ordering keeps the string-read visible before the
+/// cache transitions out of 0.
+var multiagent_env_cache: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+
 fn multiagentEnabledEnv() bool {
-    // std.process.getEnvVarOwned requires an allocator; page-backed arena is
-    // overkill for an 0-or-1 check. Use the C-level getenv via std.c on
-    // POSIX and Windows env helpers otherwise — both return a non-owned
-    // pointer we can read without freeing. For portability we still accept
-    // a modest GPA cost in the non-matching cases.
-    const builtin = @import("builtin");
-    _ = builtin;
+    const cached = multiagent_env_cache.load(.acquire);
+    if (cached != 0) return cached == 2;
+
+    // First caller performs the actual env read. 16-byte FBA is enough for
+    // realistic values ("0" / "1" / "true" / "false"); longer values fall
+    // through to `catch return false` which is semantically correct (fail
+    // closed on multiagent when we can't confirm the enable flag).
     var fba_buf: [16]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
     const allocator = fba.allocator();
-    const raw = std.process.getEnvVarOwned(allocator, "NULLALIS_ENABLE_MULTIAGENT") catch return false;
-    defer allocator.free(raw);
-    return std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "1");
+    const enabled = blk: {
+        const raw = std.process.getEnvVarOwned(allocator, "NULLALIS_ENABLE_MULTIAGENT") catch break :blk false;
+        defer allocator.free(raw);
+        break :blk std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "1");
+    };
+
+    // Racy first-write is fine: two first-readers would write the same
+    // value (env didn't change between their reads). compareAndSwap from
+    // 0 ensures we don't clobber an answer that somebody else may have
+    // already stored + read.
+    _ = multiagent_env_cache.cmpxchgStrong(0, if (enabled) 2 else 1, .release, .monotonic);
+    return enabled;
+}
+
+/// Test helper — clear the multiagent env cache. Only call from tests
+/// that deliberately want to re-read the env. Production code should
+/// never invalidate this cache.
+pub fn resetMultiagentEnvCacheForTest() void {
+    multiagent_env_cache.store(0, .release);
 }
 
 /// Core metadata slice — `DEFAULT_TOOL_METADATA` minus delegate + spawn.
