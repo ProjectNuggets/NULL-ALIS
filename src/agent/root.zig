@@ -2476,7 +2476,15 @@ pub const Agent = struct {
                         if (self.mem_rt) |rt| {
                             _ = rt.syncVectorAfterStore(self.allocator, key, user_message);
                         }
-                    } else |_| {}
+                    } else |err| {
+                        // S4.1 — durable-write silent catch closed. Previously
+                        // `else |_| {}` ate the error. Autosave is the cold
+                        // transcript tier (per the cold-memory-auditability
+                        // directive); losing it without a log is a data-integrity
+                        // hole invisible to operators. Log + continue (turn
+                        // completes; autosave is best-effort, not blocking).
+                        log.warn("autosave.user_failed key={s} err={s}", .{ key, @errorName(err) });
+                    }
                 }
             }
         }
@@ -2532,7 +2540,12 @@ pub const Agent = struct {
                         const key = learning.factKey(self.allocator, fc) catch null;
                         if (key) |k| {
                             defer self.allocator.free(k);
-                            _ = mem.store(k, fc, .core, self.memory_session_id) catch {};
+                            // S4.2 — durable-write silent catch closed. Learning
+                            // facts are the behavioral-correction corpus; losing
+                            // one silently means the agent doesn't learn from a
+                            // user correction it thought it saved.
+                            _ = mem.store(k, fc, .core, self.memory_session_id) catch |err|
+                                log.warn("learning.fact_store_failed key={s} err={s}", .{ k, @errorName(err) });
                             log.info("learning.signal_detected signals={d} key={s}", .{ signals.len, k });
                         }
                     }
@@ -3274,7 +3287,14 @@ pub const Agent = struct {
                                 if (self.mem_rt) |rt| {
                                     _ = rt.syncVectorAfterStore(self.allocator, key, visible_reply);
                                 }
-                            } else |_| {}
+                            } else |err| {
+                                // S4.3 — durable-write silent catch closed. Assistant
+                                // autosave is the cold-transcript tier for the agent's
+                                // own replies. Losing one silently means the visible
+                                // reply reached the user but was never recorded; /memory
+                                // list would omit it without trace.
+                                log.warn("autosave.assistant_failed key={s} err={s}", .{ key, @errorName(err) });
+                            }
                         }
                     }
                 }
