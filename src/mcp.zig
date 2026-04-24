@@ -33,6 +33,11 @@ pub const McpServer = struct {
     config: McpServerConfig,
     child: ?std.process.Child,
     next_id: u32,
+    /// S7.12 — background thread draining the child's stderr pipe.
+    /// Spawned by `connect`, joined by `deinit`. If we don't drain,
+    /// a chatty MCP server fills the pipe buffer (~64 KiB on Linux)
+    /// and blocks on write, which stalls the MCP turn.
+    stderr_drain_thread: ?std.Thread = null,
 
     pub fn init(allocator: Allocator, config: McpServerConfig) McpServer {
         return .{
@@ -41,6 +46,7 @@ pub const McpServer = struct {
             .config = config,
             .child = null,
             .next_id = 1,
+            .stderr_drain_thread = null,
         };
     }
 
@@ -84,6 +90,16 @@ pub const McpServer = struct {
 
         try child.spawn();
         self.child = child;
+
+        // S7.12 — spawn stderr drain thread. The OS pipe buffer is bounded
+        // (~64 KiB on Linux). If nobody reads stderr, a log-heavy MCP
+        // server blocks on its next stderr write, which stalls every
+        // request through this MCP instance. The drain thread reads lines
+        // until EOF and forwards them via log.warn with the server name
+        // prefix so operators see what the child is complaining about.
+        if (self.child.?.stderr) |_| {
+            self.stderr_drain_thread = std.Thread.spawn(.{}, drainStderr, .{self}) catch null;
+        }
 
         // Send initialize request
         const init_params = try std.fmt.allocPrint(
@@ -144,6 +160,58 @@ pub const McpServer = struct {
             _ = child.wait() catch {};
         }
         self.child = null;
+        // S7.12 — drain thread must be joined AFTER kill+wait so the read
+        // loop sees EOF on the closed stderr pipe and exits cleanly. Not
+        // joining leaks a thread handle per MCP deinit.
+        if (self.stderr_drain_thread) |t| {
+            t.join();
+            self.stderr_drain_thread = null;
+        }
+    }
+
+    /// S7.12 — background reader for the child's stderr pipe. Reads
+    /// line-by-line (bounded by `STDERR_LINE_MAX` to avoid runaway
+    /// allocation on binary output); forwards each line at warn level
+    /// with the server name. Returns on EOF, read error, or the parent
+    /// closing the pipe via `child.wait()`.
+    fn drainStderr(self: *McpServer) void {
+        const STDERR_LINE_MAX: usize = 4096;
+        const stderr = (self.child orelse return).stderr orelse return;
+        var line_buf: [STDERR_LINE_MAX]u8 = undefined;
+        var line_len: usize = 0;
+        var byte: [1]u8 = undefined;
+        while (true) {
+            const n = stderr.read(&byte) catch return;
+            if (n == 0) {
+                // EOF — flush any partial line and exit.
+                if (line_len > 0) {
+                    std.log.scoped(.mcp).warn("[{s}] {s}", .{ self.name, line_buf[0..line_len] });
+                }
+                return;
+            }
+            if (byte[0] == '\n') {
+                if (line_len > 0) {
+                    std.log.scoped(.mcp).warn("[{s}] {s}", .{ self.name, line_buf[0..line_len] });
+                }
+                line_len = 0;
+                continue;
+            }
+            if (byte[0] == '\r') continue;
+            if (line_len < STDERR_LINE_MAX) {
+                line_buf[line_len] = byte[0];
+                line_len += 1;
+            } else {
+                // Line too long — log what we have + drop the rest until newline.
+                std.log.scoped(.mcp).warn("[{s}] {s}...(truncated)", .{ self.name, line_buf[0..line_len] });
+                line_len = 0;
+                // Skip ahead until we hit a newline or EOF
+                while (true) {
+                    const m = stderr.read(&byte) catch return;
+                    if (m == 0) return;
+                    if (byte[0] == '\n') break;
+                }
+            }
+        }
     }
 
     // ── Internal I/O ────────────────────────────────────────────
