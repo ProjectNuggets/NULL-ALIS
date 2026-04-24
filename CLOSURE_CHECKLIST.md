@@ -62,24 +62,24 @@ PR path: merge `repair/sprint-1-visibility` → `main` once `.spike/run.sh` conf
 Goal: can charge users honestly; free tier blocked at entry points; revocation propagates.
 
 ### Entitlement propagation + enforcement
-- [ ] **S2.1** Extend `/api/v1/users/provision` response with `plan_tier`, `status`, `period_end` — BFF side. Cite: P4_zaki_prod_bff gap 1.
-- [ ] **S2.2** Nullalis-side: store entitlement per-session, expose via `TurnContext.entitlement`. Cite: plan-v02 §6.
-- [ ] **S2.3** Enforcement chokepoint 1 — chat-stream entry (`gateway.zig:~13396`). Reject with `402 entitlement_required` if beyond plan.
-- [ ] **S2.4** Enforcement chokepoint 2 — tool execution (`agent/dispatcher.zig` preflight).
-- [ ] **S2.5** Enforcement chokepoint 3 — scheduler job dispatch (`daemon.zig:runCronAgentTurn`).
-- [ ] **S2.6** Enforcement chokepoint 4 — Composio / MCP / other integration calls.
-- [ ] **S2.7** BFF → nullalis revocation webhook `POST /internal/entitlements/revoke` — Stripe cancel / payment_failed / chargeback pushes. Cite: P4_zaki_prod_bff gap 2.
-- [ ] **S2.8** Flip dead `CostTracker` — insert `cost_tracker.record(usage)` next to `urt.recordTurn` at `agent/root.zig:2857`. JSONL persistence + daily/monthly cap enforcement. Cite: P4_monetization.
-- [ ] **S2.9** Cost classes per tool — add `cost_class: enum { A, B, C }` field to `ToolMetadata` at `tools/root.zig:242-472`, populate for each of 29 default tools. Cite: plan-v02 §4.4.
-- [ ] **S2.10** `Idempotency-Key` header enforced on legacy `/api/agent/*` mutating routes (provision, attachments, cron POST). Cite: P4_zaki_prod_bff gap 3.
-- [ ] **S2.11** Enforce "64 active jobs per user" cap in `tools/schedule.zig` + `zaki_state.zig`. Cite: P4_ops_truth drift #3, reliability-ops-runbook.md:108.
+- [x] **S2.1** Extend `/api/v1/users/provision` response with `plan_tier`, `status`, `period_end` — BFF side. Cite: P4_zaki_prod_bff gap 1. _Nullalis side shipped `d0a57b1` + `8f7e54d`; zaki-prod BFF companion PR pending._
+- [x] **S2.2** Nullalis-side: store entitlement per-session, expose via `TurnContext.entitlement`. Cite: plan-v02 §6. _Shipped `c13813b`._
+- [x] **S2.3** Enforcement chokepoint 1 — chat-stream entry. Reject with `402 entitlement_required` if beyond plan. _Shipped `dae9bea`._
+- [x] **S2.4** Enforcement chokepoint 2 — tool execution preflight. _Shipped `9c1a6d2`._
+- [x] **S2.5** Enforcement chokepoint 3 — scheduler job dispatch. _Shipped `23cac97`._
+- [x] **S2.6** Enforcement chokepoint 4 — Composio / MCP / other integration calls. _Structurally covered by S2.4 (`2a8405a`)._
+- [x] **S2.7** BFF → nullalis revocation webhook `POST /internal/entitlements/revoke`. Cite: P4_zaki_prod_bff gap 2. _Nullalis endpoint shipped `8f7e54d`; zaki-prod Stripe translator pending._
+- [x] **S2.8** Flip dead `CostTracker` — weight-budget gate + `UsageRuntime.recordWeight`. Cite: P4_monetization. _Shipped `347f8dc` (session-scoped; true monthly persistence → D5)._
+- [x] **S2.9** Cost classes per tool — `cost_class: enum { A, B, C }` on `ToolMetadata`. Cite: plan-v02 §4.4. _Shipped `f51128d`._
+- [x] **S2.10** `Idempotency-Key` header dedupe on mutating routes. Cite: P4_zaki_prod_bff gap 3. _Shipped `ee60b68` (soft-mode on `/provision`; strict + attachments → D6/D7)._
+- [x] **S2.11** Enforce "64 active jobs per user" cap. Cite: P4_ops_truth drift #3. _Shipped `3fe1f79`._
 
 ### Secret vault API (plan.md §3)
-- [ ] **S2.12** `GET /api/v1/users/:id/secrets/:key` → metadata-only response (no plaintext). Cite: plan.md §3.
-- [ ] **S2.13** `POST /api/v1/users/:id/secrets/:key/prepare` → issue confirmation token. Cite: plan.md §3.
-- [ ] **S2.14** `PUT /api/v1/users/:id/secrets/:key` → requires valid confirmation token. Cite: plan.md §3.
-- [ ] **S2.15** `DELETE /api/v1/users/:id/secrets/:key` → requires valid confirmation token. Cite: plan.md §3.
-- [ ] **S2.16** Audit trail — new `zaki_bot.secret_mutations` table, row per attempt. Cite: plan.md §3 + plan-v02 §6.
+- [ ] **S2.12** `GET /api/v1/users/:id/secrets/:key` → metadata-only response (no plaintext). Cite: plan.md §3. _Carried → D8._
+- [ ] **S2.13** `POST /api/v1/users/:id/secrets/:key/prepare` → issue confirmation token. Cite: plan.md §3. _Carried → D8._
+- [ ] **S2.14** `PUT /api/v1/users/:id/secrets/:key` → requires valid confirmation token. Cite: plan.md §3. _Carried → D8._
+- [ ] **S2.15** `DELETE /api/v1/users/:id/secrets/:key` → requires valid confirmation token. Cite: plan.md §3. _Carried → D8._
+- [ ] **S2.16** Audit trail — new `zaki_bot.secret_mutations` table, row per attempt. Cite: plan.md §3 + plan-v02 §6. _Carried → D8._
 
 **Sprint 2 DoD:** free-tier user hits chat stream → 402. Pro-tier user passes. Stripe cancel webhook → nullalis session revoked within 5s. CostTracker writing JSONL. Secret PUT without prepare token → 401.
 

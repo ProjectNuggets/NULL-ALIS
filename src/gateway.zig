@@ -74,6 +74,7 @@ const run_trace_store_mod = @import("run_trace_store.zig");
 const gateway_run_events = @import("gateway_run_events.zig");
 const channel_health_mod = @import("channel_health.zig");
 const security_review_mod = @import("security_review.zig");
+const entitlement_mod = @import("entitlement.zig");
 const log = std.log.scoped(.gateway);
 
 /// Maximum request body size (10MB) — sized for file attachments (images as
@@ -2672,6 +2673,45 @@ pub fn extractHeader(raw: []const u8, name: []const u8) ?[]const u8 {
         pos += line_end + 2;
     }
     return null;
+}
+
+/// Parse the `Idempotency-Key` header value, or null when the header is
+/// absent. Thin wrapper over `extractHeader` exported so mutating-route
+/// handlers can consult dedupe state without re-reading headers manually.
+pub fn extractIdempotencyKey(raw_request: []const u8) ?[]const u8 {
+    return extractHeader(raw_request, "Idempotency-Key");
+}
+
+pub const IdempotencyCheck = enum {
+    /// No `Idempotency-Key` header present. Soft-mode: proceed without
+    /// dedupe so existing clients that never learned about the header
+    /// continue to work. Strict enforcement turns on once the zaki-prod
+    /// BFF is confirmed to always send the header (tracked as D6).
+    none,
+    /// Key present and newly recorded in the store. Caller proceeds
+    /// with its normal handler flow.
+    new,
+    /// Key matches a prior request within the store's TTL window. The
+    /// caller should return a dedupe-acknowledgement response instead
+    /// of re-running the handler — preserves at-most-once semantics.
+    duplicate,
+    /// Key present but invalid (empty or absurdly long). Treated as a
+    /// client bug, not a server error; caller should 400.
+    invalid,
+};
+
+/// Consult the gateway-wide `IdempotencyStore` for a request's
+/// `Idempotency-Key`. Length cap (1..=256) matches Stripe's convention
+/// and is tight enough that a short malicious key cannot waste store
+/// memory. See `IdempotencyStore` for the TTL sweep logic.
+pub fn checkIdempotency(
+    state: *GatewayState,
+    allocator: std.mem.Allocator,
+    raw_request: []const u8,
+) IdempotencyCheck {
+    const key = extractIdempotencyKey(raw_request) orelse return .none;
+    if (key.len == 0 or key.len > 256) return .invalid;
+    return if (state.idempotency.recordIfNew(allocator, key)) .new else .duplicate;
 }
 
 /// Extract the bearer token from an Authorization header value.
@@ -8997,6 +9037,29 @@ fn handleApiChatStreamSseConnection(
         return true;
     }
 
+    // ── S2.3 entitlement chokepoint 1: chat-stream entry ──────────────
+    // Reject with 402 Payment Required when the caller's effective tier
+    // is inactive (canceled past period_end, expired, past_due). The
+    // resolver is populated by S2.1's provision-response path and S2.7's
+    // Stripe revocation webhook; until those land the resolver returns
+    // null, which we treat as the default `.pro/.active` fallback so
+    // nothing breaks mid-sprint. See plan-v02 §6 and
+    // docs/sprints/sprint-2.md for the enforcement chokepoint matrix.
+    {
+        const ent = entitlement_mod.resolveUserEntitlement(user_id) orelse entitlement_mod.Entitlement{};
+        const now_unix = std.time.timestamp();
+        if (!ent.canAct(now_unix)) {
+            sendSseErrorResponse(
+                stream,
+                req_allocator,
+                "402 Payment Required",
+                "entitlement_inactive",
+                "subscription inactive — update billing to continue",
+            );
+            return true;
+        }
+    }
+
     var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
         sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "invalid_user", "invalid user");
         return true;
@@ -10429,6 +10492,20 @@ fn handleApiRoute(
                 .body = "{\"error\":\"chat_stream_requires_streaming_path\"}",
             };
         }
+        // ── S2.3 entitlement chokepoint 1 (non-streaming fallback) ────
+        // Mirrors the SSE path at handleApiChatStreamSseConnection.
+        // Legacy clients that land on the non-streaming path must still
+        // hit the 402 when their tier is inactive.
+        {
+            const ent = entitlement_mod.resolveUserEntitlement(user_id) orelse entitlement_mod.Entitlement{};
+            const now_unix = std.time.timestamp();
+            if (!ent.canAct(now_unix)) {
+                return .{
+                    .status = "402 Payment Required",
+                    .body = "{\"error\":\"entitlement_inactive\",\"message\":\"subscription inactive — update billing to continue\"}",
+                };
+            }
+        }
         var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
         };
@@ -10622,6 +10699,16 @@ fn handleApiRoute(
         if (!std.mem.eql(u8, method, "POST")) {
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         }
+        // S2.10 — Idempotency-Key dedupe on a high-value mutating route.
+        // Duplicate POSTs from a retrying BFF or mobile client used to
+        // re-run the provisioning pipeline (user_cell ensure, state
+        // allocation, scaffold) end-to-end. With a key attached, the
+        // second call short-circuits to an at-most-once ack.
+        switch (checkIdempotency(state, req_allocator, raw_request)) {
+            .duplicate => return .{ .status = "200 OK", .body = "{\"status\":\"duplicate\",\"detail\":\"already provisioned within idempotency window\"}" },
+            .invalid => return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_idempotency_key\",\"detail\":\"Idempotency-Key must be 1..=256 bytes\"}" },
+            .none, .new => {},
+        }
         const body = extractBody(raw_request);
         const body_user_id = if (body) |b| jsonStringField(b, "user_id") else null;
         const user_id = resolveGatewayRequestUserId(state, extractZakiUserId(raw_request), body_user_id, false) catch |err| {
@@ -10669,6 +10756,27 @@ fn handleApiRoute(
         };
         scaffoldUserWorkspace(req_allocator, &user_ctx);
         prep_guard.release();
+
+        // S2.1 — install entitlement from BFF-provided billing fields.
+        // The BFF now attaches `plan_tier`, `status`, and
+        // `period_end_unix` to its provision request. We parse them
+        // best-effort and update the in-memory resolver store; absent
+        // fields collapse to `fromProvision`'s defaults (tier=free
+        // when missing, status=expired when missing). The updated
+        // entry is visible to the next chat-stream / tool-preflight /
+        // scheduler-tick via the default resolver armed at startup.
+        if (body) |b| {
+            const bft_tier = jsonStringField(b, "plan_tier");
+            const bft_status = jsonStringField(b, "status");
+            const bft_period_end = jsonIntField(b, "period_end_unix");
+            if (bft_tier != null or bft_status != null or bft_period_end != null) {
+                const ent = entitlement_mod.Entitlement.fromProvision(bft_tier, bft_status, bft_period_end);
+                entitlement_mod.installEntitlement(user_id, ent) catch |err| {
+                    log.warn("entitlement.install_failed user={s} err={s}", .{ user_id, @errorName(err) });
+                };
+            }
+        }
+
         return .{ .body = "{\"status\":\"provisioned\"}" };
     }
 
@@ -13372,7 +13480,7 @@ fn handleAcceptedConnection(
     defer _ = state.in_flight_requests.fetchSub(1, .acq_rel);
 
     // Simple routing — control endpoints + descriptor-driven channel webhooks + ZAKI API.
-    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, cell_resolve, cell_ensure, cell_status, cell_drain, drain, undrain, shutdown };
+    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, cell_resolve, cell_ensure, cell_status, cell_drain, drain, undrain, shutdown, entitlements_revoke };
     const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
         .{ "/health", .health },
         .{ "/ready", .ready },
@@ -13389,6 +13497,7 @@ fn handleAcceptedConnection(
         .{ "/internal/drain", .drain },
         .{ "/internal/undrain", .undrain },
         .{ "/internal/shutdown", .shutdown },
+        .{ "/internal/entitlements/revoke", .entitlements_revoke },
     });
     const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
     const is_chat_stream_path = std.mem.eql(u8, base_path, "/api/v1/chat/stream");
@@ -13830,6 +13939,47 @@ fn handleAcceptedConnection(
                 response_body = "{\"status\":\"shutdown_requested\"}";
             }
         },
+        // S2.7 — Stripe webhook revocation sink. zaki-prod's Stripe
+        // handler translates `customer.subscription.deleted`,
+        // `customer.subscription.updated` (status transitions),
+        // `invoice.payment_failed`, and `charge.dispute.created` into
+        // POSTs here. We parse the minimal billing tuple and update
+        // the in-memory entitlement store; the next turn's preflight
+        // (S2.4) / scheduler tick (S2.5) / chat-stream entry (S2.3)
+        // reads the fresh value and blocks appropriately.
+        .entitlements_revoke => {
+            if (!std.mem.eql(u8, method_str, "POST")) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (!validateInternalServiceToken(raw, state)) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                const body_opt = extractBody(raw);
+                const body = body_opt orelse "";
+                const user_id = jsonStringField(body, "user_id");
+                if (user_id == null) {
+                    response_status = "400 Bad Request";
+                    response_body = "{\"error\":\"missing user_id\"}";
+                } else {
+                    const plan_tier = jsonStringField(body, "plan_tier");
+                    const status_raw = jsonStringField(body, "status");
+                    const period_end = jsonIntField(body, "period_end_unix");
+                    const ent = entitlement_mod.Entitlement.fromProvision(plan_tier, status_raw, period_end);
+                    if (entitlement_mod.installEntitlement(user_id.?, ent)) {
+                        log.info("entitlement.revoke user={s} tier={s} status={s}", .{
+                            user_id.?,
+                            ent.tier.toSlice(),
+                            ent.status.toSlice(),
+                        });
+                        response_body = "{\"status\":\"ok\"}";
+                    } else |_| {
+                        response_status = "500 Internal Server Error";
+                        response_body = "{\"error\":\"entitlement_store_unavailable\"}";
+                    }
+                }
+            }
+        },
     } else {
         response_status = "404 Not Found";
         response_body = "{\"error\":\"not found\"}";
@@ -13996,6 +14146,14 @@ pub fn runWithRole(
 
     var state = GatewayState.init(allocator);
     defer state.deinit();
+    // S2.1 — arm the default entitlement resolver so the structural
+    // gates wired in S2.3/S2.4/S2.5 actually consult a real store when
+    // the BFF calls `/api/v1/users/provision` or Stripe pokes
+    // `/internal/entitlements/revoke`. Before this call the resolver
+    // is `null` and every gate falls back to the default
+    // `Entitlement{}` (pro/active/unlimited) — the "nothing breaks
+    // until S2.1 lights up" invariant that Sprint 2 relied on.
+    entitlement_mod.useDefaultResolver(allocator);
     state.role = role;
     state.controller_url = controller_url;
     if (advertise_url) |value| {
@@ -14447,6 +14605,17 @@ test "idempotency store allows different keys" {
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "b"));
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "c"));
     try std.testing.expect(!store.recordIfNew(std.testing.allocator, "a"));
+}
+
+test "extractIdempotencyKey reads the header case-insensitively (S2.10)" {
+    const raw1 = "POST /x HTTP/1.1\r\nIdempotency-Key: abc-123\r\nHost: h\r\n\r\n";
+    try std.testing.expectEqualStrings("abc-123", extractIdempotencyKey(raw1).?);
+
+    const raw2 = "POST /x HTTP/1.1\r\nidempotency-key: lower-case\r\nHost: h\r\n\r\n";
+    try std.testing.expectEqualStrings("lower-case", extractIdempotencyKey(raw2).?);
+
+    const raw3 = "POST /x HTTP/1.1\r\nHost: h\r\n\r\n";
+    try std.testing.expect(extractIdempotencyKey(raw3) == null);
 }
 
 test "gateway module compiles" {

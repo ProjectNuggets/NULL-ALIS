@@ -16,6 +16,7 @@ const ChatResponse = providers.ChatResponse;
 const ToolSpec = providers.ToolSpec;
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
+const entitlement_mod = @import("../entitlement.zig");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const capabilities_mod = @import("../capabilities.zig");
@@ -1207,6 +1208,12 @@ pub const Agent = struct {
         background_origin,
         approval_required,
         approval_denied,
+        /// Blocked because the user's entitlement does not cover this tool
+        /// (expired subscription, free tier calling an expensive class-C
+        /// tool, or integration tool called with integrations disabled).
+        /// Gateway surfaces this as HTTP 402 when it reaches chat-stream
+        /// (S2.3); per-tool blocks reach the LLM as a normal tool error.
+        entitlement_required,
     };
 
     /// Outcome of the approval policy gate resolved from tool metadata + autonomy.
@@ -1609,6 +1616,100 @@ pub const Agent = struct {
                 } };
             }
         }
+        // Entitlement gate (S2.4). Runs BEFORE the approval gate so a free
+        // user hitting an expensive tool sees a clean "upgrade required"
+        // instead of an approval prompt that would never enable the call.
+        // approval_bypass_active bypasses entitlement too: an already-approved
+        // pending-tool execution was already gated on the original call, so
+        // re-checking entitlement on execution would double-charge the user
+        // in subtle ways if their tier was mid-change.
+        if (!self.approval_bypass_active) {
+            const rt_turn_ctx = tools_mod.getTurnContext();
+            const ent = rt_turn_ctx.entitlement;
+            const now_unix = std.time.timestamp();
+
+            // Gate 1: billing status must permit any paid action. Expired /
+            // canceled-past-period-end collapses to blocking all non-read-only
+            // tools. Read-only tools stay allowed so the user can still
+            // review and delete their data (GDPR grace).
+            if (!ent.canAct(now_unix) and !meta.flags.read_only) {
+                return .{ .blocked = .{
+                    .name = call.name,
+                    .tool_call_id = call.tool_call_id,
+                    .output = "Subscription expired — reactivate to use paid features. Read-only tools remain available.",
+                    .source = .entitlement_required,
+                    .reason = "entitlement_inactive",
+                    .mode = self.execution_mode,
+                    .risk_level = meta.risk_level,
+                    .metadata = meta,
+                } };
+            }
+
+            const effective_tier = ent.effectiveTier(now_unix);
+            const limits = entitlement_mod.Entitlement.limitsFor(effective_tier);
+
+            // Gate 2: class-C (expensive) tools are gated out of the free tier.
+            // Users get a clear upgrade prompt rather than a vague rate-limit.
+            if (meta.cost_class == .c and effective_tier == .free) {
+                return .{ .blocked = .{
+                    .name = call.name,
+                    .tool_call_id = call.tool_call_id,
+                    .output = "This tool is part of the Pro tier. Upgrade to unlock image generation, browser automation, integrations, and subagent delegation.",
+                    .source = .entitlement_required,
+                    .reason = "entitlement_tier_gate",
+                    .mode = self.execution_mode,
+                    .risk_level = meta.risk_level,
+                    .metadata = meta,
+                } };
+            }
+
+            // Gate 3: integration tools gated by the explicit feature flag.
+            // Distinct from the cost-class gate so enterprise contracts can
+            // selectively enable integrations without opening every class-C
+            // tool. Enumerated here rather than via a tool_metadata flag
+            // because "integration" is a product-boundary concept, not a
+            // security-or-cost attribute.
+            const is_integration = std.mem.eql(u8, meta.name, "composio") or
+                std.mem.eql(u8, meta.name, "mcp");
+            if (is_integration and !limits.integrations_enabled) {
+                return .{ .blocked = .{
+                    .name = call.name,
+                    .tool_call_id = call.tool_call_id,
+                    .output = "Integrations (Gmail, Calendar, Drive, etc.) are a Pro tier feature. Upgrade to connect your accounts.",
+                    .source = .entitlement_required,
+                    .reason = "entitlement_integrations_disabled",
+                    .mode = self.execution_mode,
+                    .risk_level = meta.risk_level,
+                    .metadata = meta,
+                } };
+            }
+
+            // Gate 4 (S2.8): cumulative tool-weight budget. maxInt means
+            // "unlimited" (enterprise) — skip the check entirely. Otherwise
+            // ask: if this tool runs, does the session's accumulated weight
+            // exceed the tier's budget? Conservatively session-scoped here
+            // rather than calendar-monthly; true monthly persistence lands
+            // with D5 (CostTracker full wire-up). Session-scoping still
+            // bounds single-session abuse — a free user cannot run 100
+            // class-C tools in a single session and stay under budget=500.
+            if (limits.monthly_weight_budget != std.math.maxInt(u64)) {
+                const candidate: u64 = @intCast(meta.cost_class.weight());
+                const accumulated: u64 = if (self.usage_rt) |urt| urt.sessionWeight() else 0;
+                if (accumulated +| candidate > limits.monthly_weight_budget) {
+                    return .{ .blocked = .{
+                        .name = call.name,
+                        .tool_call_id = call.tool_call_id,
+                        .output = "Usage budget reached for this billing period. Upgrade your plan or wait until next reset.",
+                        .source = .entitlement_required,
+                        .reason = "entitlement_weight_budget",
+                        .mode = self.execution_mode,
+                        .risk_level = meta.risk_level,
+                        .metadata = meta,
+                    } };
+                }
+            }
+        }
+
         // Generic approval gate (WP1.4). Only applies when a SecurityPolicy is
         // configured and bypass is not active for an already-approved call.
         if (!self.approval_bypass_active) {
@@ -3622,6 +3723,19 @@ pub const Agent = struct {
     fn executeToolUnchecked(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
         for (self.tools) |t| {
             if (std.mem.eql(u8, t.name(), call.name)) {
+                // Record this dispatch against the session weight budget
+                // (S2.8). Fires here rather than in preflightToolPolicy
+                // because preflight is also used for dry-run approval
+                // checks — we want weight charged only when the tool is
+                // actually about to execute. Preflight-Gate-4 reads
+                // sessionWeight() on the NEXT dispatch, so this increment
+                // is visible to the next tool in the same turn or any
+                // subsequent turn of the same session.
+                if (self.usage_rt) |urt| {
+                    const meta = self.metadataForToolCall(call);
+                    urt.recordWeight(@intCast(meta.cost_class.weight()));
+                }
+
                 // Parse arguments JSON to ObjectMap ONCE
                 const parsed = std.json.parseFromSlice(
                     std.json.Value,

@@ -87,6 +87,14 @@ pub const UsageRuntime = struct {
     session_output_tokens: u64,
     session_total_tokens: u64,
     session_cost_usd: f64,
+    /// Accumulated tool-weight for the lifetime of this session. Each
+    /// tool dispatch contributes `tool_metadata.CostClass.weight()` — 1
+    /// for class-A (cheap), 5 for class-B (moderate), 25 for class-C
+    /// (expensive). Used by the S2.8 weight-budget gate in
+    /// `preflightToolPolicy` to cap abusive sessions within a single
+    /// connection. Session-scoped (NOT truly monthly) until per-user
+    /// JSONL persistence lands via D5 (CostTracker full wire-up).
+    session_weight_total: u64,
     next_turn_index: u32,
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
@@ -98,6 +106,7 @@ pub const UsageRuntime = struct {
             .session_output_tokens = 0,
             .session_total_tokens = 0,
             .session_cost_usd = 0.0,
+            .session_weight_total = 0,
             .next_turn_index = 0,
             .allocator = allocator,
             .mutex = .{},
@@ -172,6 +181,25 @@ pub const UsageRuntime = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.next_turn_index;
+    }
+
+    /// Accumulate tool-weight for this session (S2.8). Called by
+    /// `executeToolUnchecked` after a successful preflight so the
+    /// weight-budget gate in `preflightToolPolicy` sees this tool's
+    /// contribution on subsequent dispatches. Saturating so the counter
+    /// cannot wrap.
+    pub fn recordWeight(self: *UsageRuntime, weight: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.session_weight_total +|= weight;
+    }
+
+    /// Current session-accumulated tool-weight. Zero at session start,
+    /// monotonically non-decreasing for the session lifetime.
+    pub fn sessionWeight(self: *UsageRuntime) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.session_weight_total;
     }
 
     /// Returns a snapshot of the most recent turn. The `model` field is a
@@ -310,6 +338,28 @@ test "UsageRuntime.turnCount returns number of recorded turns" {
     try std.testing.expectEqual(@as(u32, 1), rt.turnCount());
     rt.recordTurn("m", 10, 5, 0.0, 10);
     try std.testing.expectEqual(@as(u32, 2), rt.turnCount());
+}
+
+test "UsageRuntime.recordWeight accumulates session tool weight (S2.8)" {
+    const allocator = std.testing.allocator;
+    var rt = UsageRuntime.init(allocator);
+    defer rt.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), rt.sessionWeight());
+    rt.recordWeight(1); // class-A
+    rt.recordWeight(5); // class-B
+    rt.recordWeight(25); // class-C
+    try std.testing.expectEqual(@as(u64, 31), rt.sessionWeight());
+}
+
+test "UsageRuntime.recordWeight saturates at u64 max instead of wrapping" {
+    const allocator = std.testing.allocator;
+    var rt = UsageRuntime.init(allocator);
+    defer rt.deinit();
+
+    rt.recordWeight(std.math.maxInt(u64) - 5);
+    rt.recordWeight(10); // would overflow; expect saturation
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), rt.sessionWeight());
 }
 
 test "UsageRuntime.lastTurnCopy returns owned most-recent snapshot" {
