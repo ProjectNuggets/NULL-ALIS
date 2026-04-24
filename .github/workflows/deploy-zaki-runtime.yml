@@ -1,9 +1,38 @@
 name: Build and Publish Nullalis Image
 
+# S3.4 — three-stage gate: build → smoke → promote-latest.
+#
+# Before this change every main push unconditionally tagged the new image
+# as :latest, which is what zaki-infra ArgoCD chases in non-SHA-pinned
+# overlays. A broken build landing on main could therefore roll into prod
+# before anyone noticed.
+#
+# Stages:
+#   1. build-and-publish — always publishes sha-<sha> and <sha> (immutable).
+#                          These are safe: no consumer follows them by name
+#                          unless we pin to them explicitly.
+#   2. smoke             — pulls the linux/amd64 sha image and runs
+#                          `nullalis version` to prove the binary links +
+#                          launches on the target runtime. Fails closed.
+#   3. promote-latest    — only on main, only after smoke green, gated on
+#                          `production-image-promotion` GitHub environment
+#                          (required reviewer). Re-tags the sha image as
+#                          :latest without rebuilding.
+#
+# Manual rollback (if a bad :latest slips past): run this workflow via
+# workflow_dispatch with `rollback_to_sha` input → promote-latest step
+# re-tags that SHA as :latest without running smoke again (trusting the
+# operator's chosen-SHA judgment). Smoke + build are skipped on rollback.
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      rollback_to_sha:
+        description: "If set, re-tag this SHA's image as :latest (skips build+smoke). Leave blank for normal build."
+        required: false
+        type: string
 
 env:
   IMAGE_REPO: ghcr.io/projectnuggets/null-alis
@@ -14,10 +43,15 @@ concurrency:
 
 jobs:
   build-and-publish:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.rollback_to_sha == '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      sha_tag: ${{ steps.image.outputs.sha_tag }}
+      raw_tag: ${{ steps.image.outputs.raw_tag }}
+      resolved_sha: ${{ steps.image.outputs.resolved_sha }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,17 +75,17 @@ jobs:
           raw_tag="${IMAGE_REPO}:${GITHUB_SHA}"
           echo "sha_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
           echo "raw_tag=${raw_tag}" >> "$GITHUB_OUTPUT"
+          echo "resolved_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          # Immutable tags only — :latest promotion now lives in the
+          # promote-latest job and is gated on smoke + environment.
           {
             echo "tags<<EOF"
             echo "${sha_tag}"
             echo "${raw_tag}"
-            if [ "${GITHUB_REF_NAME}" = "main" ]; then
-              echo "${IMAGE_REPO}:latest"
-            fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push Nullalis image
+      - name: Build and push Nullalis image (immutable tags only)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -64,6 +98,147 @@ jobs:
 
       - name: Publish summary
         run: |
-          echo "Published image: ${{ steps.image.outputs.sha_tag }}"
-          echo "Immutable alias: ${{ steps.image.outputs.raw_tag }}"
-          echo "Production promotion is owned by zaki-infra."
+          echo "Published immutable tags:"
+          echo "  ${{ steps.image.outputs.sha_tag }}"
+          echo "  ${{ steps.image.outputs.raw_tag }}"
+          echo ""
+          echo "These are safe — only pinned consumers follow them."
+          echo ":latest promotion is gated on smoke-test + manual approval"
+          echo "via the production-image-promotion environment."
+
+  smoke:
+    # S3.4 — functional smoke on the just-built image.
+    # Pulls sha tag on linux/amd64, runs `nullalis version`, asserts exit 0
+    # and non-empty stdout. Cheap (~15 s) but proves the binary links,
+    # parses args, and exits cleanly on the deploy target arch.
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    steps:
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull sha image (linux/amd64)
+        run: docker pull --platform linux/amd64 "${{ needs.build-and-publish.outputs.sha_tag }}"
+
+      - name: Smoke — `nullalis version`
+        # ENTRYPOINT is `nullalis` so we pass `version` as the CMD override.
+        # `--rm` strips the container afterwards; stdout capture lets us
+        # fail on empty output.
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm --platform linux/amd64 \
+            --entrypoint nullalis \
+            "${{ needs.build-and-publish.outputs.sha_tag }}" version)"
+          echo "nullalis version → ${out}"
+          if [ -z "${out}" ]; then
+            echo "::error::smoke failed — empty output from 'nullalis version'"
+            exit 1
+          fi
+
+      - name: Smoke — `nullalis help` exits cleanly with subcommand list
+        # Second smoke: `help` exercises the top-level command dispatch and
+        # prints the command table. Verified locally: exits 0, non-empty
+        # stdout, lists `gateway` among the subcommands. Cheap proxy for
+        # "binary launches, linker resolved, dispatch wired" without
+        # needing postgres or config. (Note: `gateway --help` exits 1 on
+        # the unknown-option path — that's why we smoke `help`, not
+        # subcommand help.)
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm --platform linux/amd64 \
+            --entrypoint nullalis \
+            "${{ needs.build-and-publish.outputs.sha_tag }}" help)"
+          echo "${out}" | head -5
+          if ! echo "${out}" | grep -q "gateway"; then
+            echo "::error::smoke failed — 'help' did not list 'gateway' subcommand"
+            exit 1
+          fi
+          echo "help dispatch OK"
+
+      - name: Smoke summary
+        run: |
+          echo "Smoke PASSED on ${{ needs.build-and-publish.outputs.sha_tag }}"
+          echo "Ready for :latest promotion (pending environment approval)."
+
+  promote-latest:
+    # S3.4 — manual-approval gate + explicit rollback path.
+    # Runs on:
+    #   (a) main push, after smoke passed, OR
+    #   (b) workflow_dispatch with rollback_to_sha set (skips build+smoke).
+    # Uses the `production-image-promotion` environment which carries the
+    # required-reviewer rule; push of :latest is blocked until a reviewer
+    # approves in the Actions UI.
+    needs: smoke
+    if: |
+      always() &&
+      (
+        (github.event_name == 'push' && github.ref_name == 'main' && needs.smoke.result == 'success')
+        ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_to_sha != '')
+      )
+    runs-on: ubuntu-latest
+    environment: production-image-promotion
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve promotion source
+        id: promote
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.rollback_to_sha }}" ]; then
+            src_sha="${{ github.event.inputs.rollback_to_sha }}"
+            mode="rollback"
+          else
+            src_sha="${{ needs.build-and-publish.outputs.resolved_sha }}"
+            mode="forward"
+          fi
+          src_tag="${IMAGE_REPO}:sha-${src_sha}"
+          echo "src_sha=${src_sha}" >> "$GITHUB_OUTPUT"
+          echo "src_tag=${src_tag}" >> "$GITHUB_OUTPUT"
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+          echo "Promotion mode: ${mode}"
+          echo "Source: ${src_tag}"
+          echo "Target: ${IMAGE_REPO}:latest"
+
+      - name: Promote :latest (multi-arch re-tag, no rebuild)
+        # `docker buildx imagetools create` copies a manifest list without
+        # pulling + rebuilding, preserving the multi-arch index we pushed
+        # from build-and-publish.
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${IMAGE_REPO}:latest" \
+            "${{ steps.promote.outputs.src_tag }}"
+          echo "${IMAGE_REPO}:latest → now points at ${{ steps.promote.outputs.src_sha }}"
+
+      - name: Promotion summary
+        run: |
+          {
+            echo "## Nullalis :latest promoted"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Mode | ${{ steps.promote.outputs.mode }} |"
+            echo "| SHA  | ${{ steps.promote.outputs.src_sha }} |"
+            echo "| Source tag | ${{ steps.promote.outputs.src_tag }} |"
+            echo "| Target tag | ${IMAGE_REPO}:latest |"
+            echo ""
+            echo "### Rollback"
+            echo "Run this workflow via workflow_dispatch with"
+            echo "\`rollback_to_sha=<previous-good-sha>\` to re-point :latest."
+            echo "Build + smoke are skipped; the previously-pushed SHA image"
+            echo "is re-tagged without rebuild."
+          } >> "$GITHUB_STEP_SUMMARY"
