@@ -22,6 +22,12 @@ jobs:
       - name: Install Postgres headers/libs
         run: sudo apt-get update && sudo apt-get install -y libpq-dev
 
+      - name: Run tests (canonical production engines)
+        # S3.3 — release.yml canonical-profile must run tests before build.
+        # Same engine/channel set as the build step and as ci.yml canonical-production-profile,
+        # so a green tag push proves the shipped binary is exercised by the test suite.
+        run: zig build test --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram
+
       - name: Build ReleaseSmall (canonical production engines)
         run: zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dchannels=cli,telegram
 
