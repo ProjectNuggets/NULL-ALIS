@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const appendJsonEscaped = @import("../util.zig").appendJsonEscaped;
 const root = @import("root.zig");
 const observability = @import("../observability.zig");
@@ -113,15 +114,45 @@ pub const ComposioTool = struct {
     fn listActions(self: *ComposioTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const app = root.getString(args, "app");
 
+        // S7.15 — 60s TTL cache on the `list` action result. The API is
+        // slow (multi-second) and returns a stable catalog on 60s
+        // windows in practice; caching cuts both latency and API cost
+        // for the repeated "what can I do in Gmail?" pattern. Cache key
+        // is the (app-filter, v3-or-v2-shape) pair; the lookup strips
+        // the v3/v2 distinction because we always try v3 first and a
+        // successful v3 response makes v2 moot.
+        //
+        // Gated on `!builtin.is_test` because the cache is module-
+        // scoped and existing tests that exercise listActions against
+        // the live API would leak their heap-allocated cache entries
+        // past the test-allocator's lifetime. The cache is a pure
+        // production optimization; bypassing it in tests costs nothing
+        // there and guarantees clean shutdown.
+        const cache_key = app orelse "__all__";
+        if (!builtin.is_test) {
+            if (list_cache.get(allocator, cache_key)) |cached| {
+                return ToolResult{ .success = true, .output = cached };
+            }
+        }
+
         // Try v3 first, fall back to v2
         const v3_result = try self.listActionsV3(allocator, app);
-        if (v3_result.success) return v3_result;
+        if (v3_result.success) {
+            if (!builtin.is_test) {
+                list_cache.put(allocator, cache_key, v3_result.output) catch {};
+            }
+            return v3_result;
+        }
 
         // Free v3 error resources before fallback
         if (v3_result.error_msg) |e| allocator.free(e);
         if (v3_result.output.len > 0) allocator.free(v3_result.output);
 
-        return self.listActionsV2(allocator, app);
+        const v2_result = try self.listActionsV2(allocator, app);
+        if (v2_result.success and !builtin.is_test) {
+            list_cache.put(allocator, cache_key, v2_result.output) catch {};
+        }
+        return v2_result;
     }
 
     // ── v3 execute action ──────────────────────────────────────────
@@ -491,6 +522,141 @@ pub const ComposioTool = struct {
         return ToolResult{ .success = false, .output = "", .error_msg = "composio retry exhausted" };
     }
 };
+
+// S7.15 — 60s TTL cache for Composio `list` action results.
+//
+// Small fixed-slot cache (16 entries; 1 per app-filter). Entries are
+// keyed by the app name (or `"__all__"` for the no-filter case). Both
+// key and value are heap-allocated and freed on eviction. Thread-safe
+// via a single mutex. Reset helper provided for tests.
+const LIST_CACHE_TTL_MS: i64 = 60_000;
+const LIST_CACHE_SLOTS: usize = 16;
+
+const ListCacheEntry = struct {
+    key: ?[]u8 = null,
+    value: ?[]u8 = null,
+    expires_at_ms: i64 = 0,
+};
+
+const ListCache = struct {
+    mutex: std.Thread.Mutex = .{},
+    entries: [LIST_CACHE_SLOTS]ListCacheEntry = [_]ListCacheEntry{.{}} ** LIST_CACHE_SLOTS,
+
+    /// Return a fresh heap copy of the cached value for `key`, or null
+    /// if absent/expired. Caller owns the returned slice.
+    fn get(self: *ListCache, allocator: std.mem.Allocator, key: []const u8) ?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        for (&self.entries) |*entry| {
+            const ek = entry.key orelse continue;
+            if (!std.mem.eql(u8, ek, key)) continue;
+            if (now > entry.expires_at_ms) return null;
+            const v = entry.value orelse return null;
+            return allocator.dupe(u8, v) catch null;
+        }
+        return null;
+    }
+
+    /// Store `value` under `key` with the module TTL. Takes ownership
+    /// of nothing — both `key` and `value` are copied. On collision or
+    /// expiry the oldest entry gets evicted (simple LRU approximated
+    /// by expires_at_ms comparison).
+    fn put(self: *ListCache, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        const new_expiry = now + LIST_CACHE_TTL_MS;
+
+        // First pass: update existing entry or fill an empty slot.
+        for (&self.entries) |*entry| {
+            if (entry.key) |ek| {
+                if (std.mem.eql(u8, ek, key)) {
+                    if (entry.value) |v| allocator.free(v);
+                    entry.value = try allocator.dupe(u8, value);
+                    entry.expires_at_ms = new_expiry;
+                    return;
+                }
+            } else {
+                entry.key = try allocator.dupe(u8, key);
+                errdefer {
+                    allocator.free(entry.key.?);
+                    entry.key = null;
+                }
+                entry.value = try allocator.dupe(u8, value);
+                entry.expires_at_ms = new_expiry;
+                return;
+            }
+        }
+
+        // All slots full — evict the entry with the earliest expiry.
+        var victim_idx: usize = 0;
+        var victim_expiry: i64 = self.entries[0].expires_at_ms;
+        for (self.entries, 0..) |entry, i| {
+            if (entry.expires_at_ms < victim_expiry) {
+                victim_expiry = entry.expires_at_ms;
+                victim_idx = i;
+            }
+        }
+        const victim = &self.entries[victim_idx];
+        if (victim.key) |k| allocator.free(k);
+        if (victim.value) |v| allocator.free(v);
+        victim.key = try allocator.dupe(u8, key);
+        errdefer {
+            allocator.free(victim.key.?);
+            victim.key = null;
+        }
+        victim.value = try allocator.dupe(u8, value);
+        victim.expires_at_ms = new_expiry;
+    }
+
+    /// Reset helper — clears all entries + frees their backing
+    /// allocations. Test-only.
+    pub fn resetForTest(self: *ListCache, allocator: std.mem.Allocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (entry.key) |k| allocator.free(k);
+            if (entry.value) |v| allocator.free(v);
+            entry.key = null;
+            entry.value = null;
+            entry.expires_at_ms = 0;
+        }
+    }
+};
+
+var list_cache: ListCache = .{};
+
+test "ListCache put + get roundtrip" {
+    const allocator = std.testing.allocator;
+    defer list_cache.resetForTest(allocator);
+    list_cache.resetForTest(allocator);
+
+    try list_cache.put(allocator, "gmail", "action-list-1");
+    const got = list_cache.get(allocator, "gmail") orelse return error.CacheMissUnexpected;
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings("action-list-1", got);
+}
+
+test "ListCache miss on unknown key" {
+    const allocator = std.testing.allocator;
+    defer list_cache.resetForTest(allocator);
+    list_cache.resetForTest(allocator);
+
+    try std.testing.expect(list_cache.get(allocator, "nonexistent") == null);
+}
+
+test "ListCache update existing key frees old value" {
+    const allocator = std.testing.allocator;
+    defer list_cache.resetForTest(allocator);
+    list_cache.resetForTest(allocator);
+
+    try list_cache.put(allocator, "notion", "v1-payload");
+    try list_cache.put(allocator, "notion", "v2-payload");
+    const got = list_cache.get(allocator, "notion") orelse return error.CacheMissUnexpected;
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings("v2-payload", got);
+}
 
 /// Heuristic rate-limit detector: look for "429" + a rate-related token
 /// in the response body. Composio returns rate-limit errors in several
