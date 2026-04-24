@@ -1,8 +1,18 @@
 //! Voice-first agent mode — cross-channel audio support and voice-specific narration.
 //!
-//! Composes existing STT (WhisperTranscriber) and TTS (synthesizeTextToTempAudio) into
-//! a unified pipeline with channel capability resolution. VoiceMode is orchestration
-//! metadata, not a processing engine — actual audio processing uses voice.zig functions.
+//! **Metadata-only module (S6.7).** This file declares capability descriptors,
+//! channel-to-capability maps, and narration mode selectors. It does NOT process
+//! audio, spawn processes, or hold runtime state. Actual STT/TTS work lives in
+//! `voice.zig` (WhisperTranscriber + synthesizeTextToTempAudio).
+//!
+//! Read this file to answer: "does channel X advertise audio input/output, and
+//! what narration mode should that imply?" — and nothing else.
+//!
+//! ⚠️ Capability flags advertise intent, not working wire paths. Today only
+//! Telegram has a functioning audio-send path; `voice_mode.zig` declaring
+//! discord/whatsapp/slack as TTS-capable is a historical aspiration (tracked
+//! as W4.5 / Sprint 7 — wire or revoke). Don't lean on this module for a
+//! runtime check; call into `voice.zig` to find out if a send actually works.
 
 const std = @import("std");
 const voice = @import("voice.zig");
