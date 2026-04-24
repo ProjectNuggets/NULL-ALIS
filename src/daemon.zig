@@ -474,7 +474,15 @@ fn deliveryOutcomeThread(allocator: std.mem.Allocator, config: *const Config, st
                 const user_id = outcome.user_id orelse continue;
                 const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch continue;
                 if (state_mgr_opt) |mgr| {
-                    mgr.deleteCompletionEvent(numeric_user_id, event_id) catch {};
+                    // S4.6 — durable-write silent catch closed. Missing to delete
+                    // a delivered completion_event row causes duplicate delivery
+                    // on reconnect AND unbounded growth of the completion_events
+                    // table. Log + counter so operators see the pattern without
+                    // relying on error-level log filters.
+                    mgr.deleteCompletionEvent(numeric_user_id, event_id) catch |err| {
+                        lane_metrics.recordCompletionEventDeleteFailure();
+                        log.warn("completion_event.delete_failed user_id={d} event_id={s} err={s}", .{ numeric_user_id, event_id, @errorName(err) });
+                    };
                 }
                 continue;
             }
@@ -960,8 +968,17 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
         const now_s = std.time.timestamp();
         if (now_s - last_flush_s >= STATUS_FLUSH_SECONDS or now_s < last_flush_s) {
             last_flush_s = now_s;
-            writeStateFile(allocator, state_path, state) catch {};
-            health.markComponentOk("heartbeat");
+            // S4.7 — heartbeat state-file silent catch closed. Parity with
+            // the startup-path log at :2034. Before: a failing write left
+            // the component marked healthy when it wasn't. After: mark as
+            // error + log on failure, skip the ok-mark; next successful
+            // flush re-marks healthy via the markComponentOk branch.
+            if (writeStateFile(allocator, state_path, state)) |_| {
+                health.markComponentOk("heartbeat");
+            } else |err| {
+                health.markComponentError("heartbeat", @errorName(err));
+                log.warn("heartbeat.state_flush_failed path={s} err={s}", .{ state_path, @errorName(err) });
+            }
         }
 
         var wake_processed: usize = 0;
