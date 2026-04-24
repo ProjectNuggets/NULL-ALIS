@@ -5,35 +5,46 @@ Scope: entire repository.
 
 ## 1) Project Snapshot (Read First)
 
-nullALIS is a Zig-first autonomous AI assistant runtime optimized for:
+nullALIS is a Zig-first autonomous AI assistant runtime deployed at chatzaki.com. Optimized for:
 
-- minimal binary size (target: < 1 MB ReleaseSmall)
-- minimal memory footprint (target: < 5 MB peak RSS)
-- zero dependencies beyond libc and optional SQLite
-- full feature parity with ZeroClaw (Rust reference implementation)
+- minimal binary size (target: < 30 MB ReleaseSmall with engines + channels baked in; < 1 MB legacy target predated the Sprint 2 entitlement + secret-vault + telemetry surfaces)
+- minimal memory footprint (target: < 50 MB peak RSS during tests)
+- zero external dependencies beyond libc, optional SQLite, optional libpq (for the postgres engine)
 
 Core architecture is **vtable-driven** and modular. All extension work is done by implementing
 vtable structs and registering them in factory functions.
 
 Key extension points:
 
-- `src/providers/root.zig` (`Provider`) — AI model providers
-- `src/channels/root.zig` (`Channel`) — messaging channels
-- `src/tools/root.zig` (`Tool`) — tool execution surface
-- `src/memory/root.zig` (`Memory`) — memory backends
-- `src/observability.zig` (`Observer`) — observability hooks
+- `src/providers/root.zig` (`Provider`) — AI model providers (Together, Groq, Anthropic, OpenAI, compatible)
+- `src/channels/root.zig` (`Channel`) — messaging channels (Telegram, Signal, Slack, Discord, WhatsApp, Line, Lark, etc.)
+- `src/tools/root.zig` (`Tool`) — tool execution surface (~40 default tools + MCP)
+- `src/memory/root.zig` (`Memory`) — memory backends (markdown, sqlite, postgres, lucid, redis, lancedb)
+- `src/observability.zig` (`Observer`) — observability hooks (NoopObserver, LogObserver, FileObserver, OtelObserver, SentryObserver)
 - `src/runtime.zig` (`RuntimeAdapter`) — execution environments
-- `src/peripherals.zig` (`Peripheral`) — hardware boards (Arduino, STM32, RPi)
 
-Current scale: **151 source files, ~96K lines of code, 3,371 tests**.
+Entitlement + secret-vault + cost-class surfaces (Sprint 2 / D8):
+
+- `src/entitlement.zig` — per-session entitlement store; 4 enforcement chokepoints (chat-stream / tool preflight / scheduler dispatch / integration calls)
+- `src/gateway/secret_vault.zig` — two-phase mutation handshake with audit trail
+- `src/tools/metadata.zig` — cost classes A/B/C on `ToolMetadata`; weight-budget gate in preflight
+
+Current scale (2026-04-24, post-Sprint-6): **260 source files, ~214K Zig LoC (excluding vendored sqlite), 5,597 tests**.
 
 Build and test:
 
 ```bash
-zig build                           # dev build
-zig build -Doptimize=ReleaseSmall  # release build
-zig build test --summary all        # run all tests
+zig build                                                       # dev build
+zig build -Doptimize=ReleaseSmall                               # release build
+zig build test --summary all                                    # run all tests
+zig build test -Dengines=base,sqlite,postgres -Dchannels=cli,telegram   # canonical production profile
 ```
+
+Where to look when something breaks:
+
+- **Sprint board / deferred register** — `CLOSURE_CHECKLIST.md` (16-sprint Swiss-watch plan) + `docs/deferred-register.md` (every deferred item D1–D24 with status).
+- **Per-sprint close-outs** — `docs/sprints/sprint-N.md` + `docs/sprints/sprint-N-review.md` for self-review findings.
+- **Internals x-ray** — `.claude/projects/-Users-nova-Desktop-nullalis/memory/internals/` — file-cited P1 / P2 / P3 / P4 maps. Read the relevant P-file before touching a subsystem. Stale since baseline `87cb435`; files with Sprint 1–6 drift are tracked in the `project_nullalis_internals.md` index.
 
 ## 2) Deep Architecture Observations (Why This Protocol Exists)
 
