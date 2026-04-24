@@ -162,6 +162,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (mem_rt) |*rt| {
         tools_mod.bindMemoryRuntime(tools, rt);
     }
+    // S7.10 — audit memory for shell command logging. Pre-S7.10 this was
+    // only wired in `channel_loop.zig:435` (Signal/DM lanes), so shell
+    // commands executed via the CLI agent silently bypassed the audit
+    // trail. bindAuditMemory is a no-op when the memory handle is null
+    // or the tool set has no shell tool.
+    if (mem_opt) |mem_for_audit| {
+        tools_mod.bindAuditMemory(tools, mem_for_audit, null);
+    }
     // iter27: transcript_read SessionStore binding
     tools_mod.bindSessionStore(tools, if (mem_rt) |rt| rt.session_store else null);
     // N1: image_generate Together key (CLI path)
