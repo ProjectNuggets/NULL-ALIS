@@ -28,6 +28,7 @@ pub const config_mutator = @import("config_mutator.zig");
 pub const service = @import("service.zig");
 pub const daemon = @import("daemon.zig");
 pub const sentry_runtime = @import("sentry_runtime.zig");
+pub const entitlement = @import("entitlement.zig");
 pub const channel_loop = @import("channel_loop.zig");
 pub const channel_manager = @import("channel_manager.zig");
 pub const channel_catalog = @import("channel_catalog.zig");
@@ -47,6 +48,7 @@ pub const bootstrap = @import("bootstrap/root.zig");
 // Phase 3: Networking
 pub const gateway = @import("gateway.zig");
 pub const gateway_run_events = @import("gateway_run_events.zig");
+pub const gateway_secret_vault = @import("gateway/secret_vault.zig");
 pub const controller = @import("controller.zig");
 pub const cell_spec = @import("cell_spec.zig");
 pub const cell_k8s_api = @import("cell_k8s_api.zig");

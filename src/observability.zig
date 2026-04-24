@@ -524,6 +524,32 @@ pub const OtelObserver = struct {
         };
     }
 
+    /// Construct from env. Returns a configured observer only when
+    /// NULLALIS_OTEL_ENDPOINT is set to a non-empty value (legacy
+    /// NULLCLAW_OTEL_ENDPOINT honored with a deprecation note per the
+    /// rebrand chokepoint). Returns null otherwise — callers should
+    /// fall back to a NoopObserver in that slot so the composition
+    /// site doesn't have to rewire slot counts per-deployment.
+    /// getenv returns borrowed slices, so no allocation happens at
+    /// boot; the spans list is allocated lazily on first event.
+    pub fn fromEnv(allocator: std.mem.Allocator) ?OtelObserver {
+        const endpoint = blk: {
+            if (std.posix.getenv("NULLALIS_OTEL_ENDPOINT")) |ep| {
+                if (ep.len > 0) break :blk ep;
+            }
+            if (std.posix.getenv("NULLCLAW_OTEL_ENDPOINT")) |ep| {
+                if (ep.len > 0) {
+                    std.log.warn("env NULLCLAW_OTEL_ENDPOINT is deprecated; use NULLALIS_OTEL_ENDPOINT", .{});
+                    break :blk ep;
+                }
+            }
+            return null;
+        };
+        const service_name = std.posix.getenv("NULLALIS_OTEL_SERVICE_NAME") orelse
+            std.posix.getenv("NULLCLAW_OTEL_SERVICE_NAME");
+        return init(allocator, endpoint, service_name);
+    }
+
     pub fn observer(self: *OtelObserver) Observer {
         return .{
             .ptr = @ptrCast(self),

@@ -25,6 +25,21 @@ const zaki_dual_memory = @import("memory/engines/zaki_dual.zig");
 const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
+const sentry_runtime = @import("sentry_runtime.zig");
+
+/// Placeholder body emitted when a turn returned an empty reply (tool-only
+/// turn — the model called spawn/delegate or a silent tool and produced no
+/// post-tool assistant text). Prior shipped versions emitted the literal
+/// "received" here, which users read as the actual reply and closed the
+/// session — missing the real subagent output that arrived on a later SSE
+/// frame. See project_subagent_received_bug.md for the full diagnosis and
+/// P2_subagent_delegate.md for the architectural TurnOutcome refactor that
+/// replaces this string path entirely (tracked separately).
+///
+/// The interim honest text makes the absence of a reply explicit so the
+/// user knows to wait for follow-up content rather than treating the
+/// fabricated string as the answer.
+pub const EMPTY_TURN_PLACEHOLDER = "[tools ran, no direct reply this turn — results may arrive on a follow-up.]";
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const agent_routing = @import("agent_routing.zig");
@@ -59,6 +74,8 @@ const run_trace_store_mod = @import("run_trace_store.zig");
 const gateway_run_events = @import("gateway_run_events.zig");
 const channel_health_mod = @import("channel_health.zig");
 const security_review_mod = @import("security_review.zig");
+const entitlement_mod = @import("entitlement.zig");
+const secret_vault = @import("gateway/secret_vault.zig");
 const log = std.log.scoped(.gateway);
 
 /// Maximum request body size (10MB) — sized for file attachments (images as
@@ -762,6 +779,11 @@ pub const GatewayState = struct {
     pinned_user_id_owned: bool = false,
     rate_limiter: GatewayRateLimiter,
     idempotency: IdempotencyStore,
+    /// Two-phase mutation tokens for the secret vault API (D8). Issued
+    /// by `POST /api/v1/users/:id/secrets/:key/prepare`; consumed by
+    /// subsequent PUT/DELETE on the same key. In-memory, 5-min TTL,
+    /// single-use. See `src/gateway/secret_vault.zig`.
+    secret_tokens: secret_vault.TokenStore,
     whatsapp_verify_token: []const u8,
     whatsapp_app_secret: []const u8,
     whatsapp_access_token: []const u8,
@@ -871,6 +893,7 @@ pub const GatewayState = struct {
             .allocator = allocator,
             .rate_limiter = GatewayRateLimiter.init(10, 30),
             .idempotency = IdempotencyStore.init(300),
+            .secret_tokens = secret_vault.TokenStore.init(allocator, secret_vault.DEFAULT_TTL_SECS),
             .whatsapp_verify_token = verify_token,
             .whatsapp_app_secret = "",
             .whatsapp_access_token = "",
@@ -889,6 +912,7 @@ pub const GatewayState = struct {
         }
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
+        self.secret_tokens.deinit();
         self.user_preparation_gate.deinit();
         self.tenant_runtime_mutex.lock();
         defer self.tenant_runtime_mutex.unlock();
@@ -1074,7 +1098,9 @@ const TenantRuntime = struct {
     trace_store: *run_trace_store_mod.RunTraceStore,
     log_obs: *observability.LogObserver,
     metrics_obs: LifecycleMetricsObserver,
-    observer_slots: [3]Observer,
+    otel_obs: ?*observability.OtelObserver = null,
+    noop_obs: observability.NoopObserver = .{},
+    observer_slots: [5]Observer,
     observer_multi: observability.MultiObserver,
     session_mgr: session_mod.SessionManager,
     last_used_s: std.atomic.Value(i64),
@@ -1322,10 +1348,19 @@ const TenantRuntime = struct {
         );
         runtime.trace_store = trace_store;
 
+        if (observability.OtelObserver.fromEnv(allocator)) |otel_init| {
+            const otel_ptr = allocator.create(observability.OtelObserver) catch null;
+            if (otel_ptr) |p| {
+                p.* = otel_init;
+                runtime.otel_obs = p;
+            }
+        }
         runtime.observer_slots = .{
             runtime.log_obs.observer(),
             runtime.metrics_obs.observer(),
             runtime.trace_store.observer(),
+            sentry_runtime.globalOrFallback().observer(),
+            if (runtime.otel_obs) |otel| otel.observer() else runtime.noop_obs.observer(),
         };
         runtime.observer_multi = .{ .observers = runtime.observer_slots[0..] };
 
@@ -1543,6 +1578,10 @@ const TenantRuntime = struct {
         self.allocator.destroy(self.task_ledger);
         self.provider_bundle.deinit();
         self.allocator.destroy(self.log_obs);
+        if (self.otel_obs) |otel| {
+            otel.deinit();
+            self.allocator.destroy(otel);
+        }
         self.allocator.free(self.workspace_path);
         self.allocator.free(self.user_id);
         self.allocator.destroy(self);
@@ -2642,6 +2681,45 @@ pub fn extractHeader(raw: []const u8, name: []const u8) ?[]const u8 {
         pos += line_end + 2;
     }
     return null;
+}
+
+/// Parse the `Idempotency-Key` header value, or null when the header is
+/// absent. Thin wrapper over `extractHeader` exported so mutating-route
+/// handlers can consult dedupe state without re-reading headers manually.
+pub fn extractIdempotencyKey(raw_request: []const u8) ?[]const u8 {
+    return extractHeader(raw_request, "Idempotency-Key");
+}
+
+pub const IdempotencyCheck = enum {
+    /// No `Idempotency-Key` header present. Soft-mode: proceed without
+    /// dedupe so existing clients that never learned about the header
+    /// continue to work. Strict enforcement turns on once the zaki-prod
+    /// BFF is confirmed to always send the header (tracked as D6).
+    none,
+    /// Key present and newly recorded in the store. Caller proceeds
+    /// with its normal handler flow.
+    new,
+    /// Key matches a prior request within the store's TTL window. The
+    /// caller should return a dedupe-acknowledgement response instead
+    /// of re-running the handler — preserves at-most-once semantics.
+    duplicate,
+    /// Key present but invalid (empty or absurdly long). Treated as a
+    /// client bug, not a server error; caller should 400.
+    invalid,
+};
+
+/// Consult the gateway-wide `IdempotencyStore` for a request's
+/// `Idempotency-Key`. Length cap (1..=256) matches Stripe's convention
+/// and is tight enough that a short malicious key cannot waste store
+/// memory. See `IdempotencyStore` for the TTL sweep logic.
+pub fn checkIdempotency(
+    state: *GatewayState,
+    allocator: std.mem.Allocator,
+    raw_request: []const u8,
+) IdempotencyCheck {
+    const key = extractIdempotencyKey(raw_request) orelse return .none;
+    if (key.len == 0 or key.len > 256) return .invalid;
+    return if (state.idempotency.recordIfNew(allocator, key)) .new else .duplicate;
 }
 
 /// Extract the bearer token from an Authorization header value.
@@ -8967,6 +9045,29 @@ fn handleApiChatStreamSseConnection(
         return true;
     }
 
+    // ── S2.3 entitlement chokepoint 1: chat-stream entry ──────────────
+    // Reject with 402 Payment Required when the caller's effective tier
+    // is inactive (canceled past period_end, expired, past_due). The
+    // resolver is populated by S2.1's provision-response path and S2.7's
+    // Stripe revocation webhook; until those land the resolver returns
+    // null, which we treat as the default `.pro/.active` fallback so
+    // nothing breaks mid-sprint. See plan-v02 §6 and
+    // docs/sprints/sprint-2.md for the enforcement chokepoint matrix.
+    {
+        const ent = entitlement_mod.resolveUserEntitlement(user_id) orelse entitlement_mod.Entitlement{};
+        const now_unix = std.time.timestamp();
+        if (!ent.canAct(now_unix)) {
+            sendSseErrorResponse(
+                stream,
+                req_allocator,
+                "402 Payment Required",
+                "entitlement_inactive",
+                "subscription inactive — update billing to continue",
+            );
+            return true;
+        }
+    }
+
     var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
         sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "invalid_user", "invalid user");
         return true;
@@ -9181,7 +9282,7 @@ fn handleApiChatStreamSseConnection(
     const payload_text = if (reply.len > 0)
         reply
     else
-        "received";
+        EMPTY_TURN_PLACEHOLDER;
 
     // Determine if live streaming actually delivered tokens. If the provider
     // does not support streaming, live_seq stays 0 and we must fall back to
@@ -10399,6 +10500,20 @@ fn handleApiRoute(
                 .body = "{\"error\":\"chat_stream_requires_streaming_path\"}",
             };
         }
+        // ── S2.3 entitlement chokepoint 1 (non-streaming fallback) ────
+        // Mirrors the SSE path at handleApiChatStreamSseConnection.
+        // Legacy clients that land on the non-streaming path must still
+        // hit the 402 when their tier is inactive.
+        {
+            const ent = entitlement_mod.resolveUserEntitlement(user_id) orelse entitlement_mod.Entitlement{};
+            const now_unix = std.time.timestamp();
+            if (!ent.canAct(now_unix)) {
+                return .{
+                    .status = "402 Payment Required",
+                    .body = "{\"error\":\"entitlement_inactive\",\"message\":\"subscription inactive — update billing to continue\"}",
+                };
+            }
+        }
         var user_ctx = resolveUserContext(req_allocator, state, user_id) catch {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
         };
@@ -10559,7 +10674,7 @@ fn handleApiRoute(
         const payload_text = if (reply.len > 0)
             req_allocator.dupe(u8, reply) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" }
         else
-            req_allocator.dupe(u8, "received") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" };
+            req_allocator.dupe(u8, EMPTY_TURN_PLACEHOLDER) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to build completion payload\"}" };
         defer req_allocator.free(payload_text);
         const sse_start_ms = std.time.milliTimestamp();
         const sse = sseBufferedChatPayload(req_allocator, status_frame, progress_observer_impl.frames.items, payload_text, session_key) catch {
@@ -10591,6 +10706,16 @@ fn handleApiRoute(
     if (std.mem.eql(u8, base_path, "/api/v1/users/provision")) {
         if (!std.mem.eql(u8, method, "POST")) {
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        }
+        // S2.10 — Idempotency-Key dedupe on a high-value mutating route.
+        // Duplicate POSTs from a retrying BFF or mobile client used to
+        // re-run the provisioning pipeline (user_cell ensure, state
+        // allocation, scaffold) end-to-end. With a key attached, the
+        // second call short-circuits to an at-most-once ack.
+        switch (checkIdempotency(state, req_allocator, raw_request)) {
+            .duplicate => return .{ .status = "200 OK", .body = "{\"status\":\"duplicate\",\"detail\":\"already provisioned within idempotency window\"}" },
+            .invalid => return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_idempotency_key\",\"detail\":\"Idempotency-Key must be 1..=256 bytes\"}" },
+            .none, .new => {},
         }
         const body = extractBody(raw_request);
         const body_user_id = if (body) |b| jsonStringField(b, "user_id") else null;
@@ -10639,6 +10764,27 @@ fn handleApiRoute(
         };
         scaffoldUserWorkspace(req_allocator, &user_ctx);
         prep_guard.release();
+
+        // S2.1 — install entitlement from BFF-provided billing fields.
+        // The BFF now attaches `plan_tier`, `status`, and
+        // `period_end_unix` to its provision request. We parse them
+        // best-effort and update the in-memory resolver store; absent
+        // fields collapse to `fromProvision`'s defaults (tier=free
+        // when missing, status=expired when missing). The updated
+        // entry is visible to the next chat-stream / tool-preflight /
+        // scheduler-tick via the default resolver armed at startup.
+        if (body) |b| {
+            const bft_tier = jsonStringField(b, "plan_tier");
+            const bft_status = jsonStringField(b, "status");
+            const bft_period_end = jsonIntField(b, "period_end_unix");
+            if (bft_tier != null or bft_status != null or bft_period_end != null) {
+                const ent = entitlement_mod.Entitlement.fromProvision(bft_tier, bft_status, bft_period_end);
+                entitlement_mod.installEntitlement(user_id, ent) catch |err| {
+                    log.warn("entitlement.install_failed user={s} err={s}", .{ user_id, @errorName(err) });
+                };
+            }
+        }
+
         return .{ .body = "{\"status\":\"provisioned\"}" };
     }
 
@@ -11062,84 +11208,247 @@ fn handleApiRoute(
     }
 
     if (std.mem.startsWith(u8, parsed.subpath, "secrets/")) {
-        const secret_key = parsed.subpath["secrets/".len..];
-        const secret_path = resolveSecretPath(req_allocator, user_ctx.secrets_dir, secret_key) catch {
-            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid secret key\"}" };
-        };
-        defer req_allocator.free(secret_path);
+        // D8 (S2.12–S2.16) — hard replacement of the legacy
+        // secrets/<key> surface. The old GET returned plaintext
+        // (plan.md §3 explicit vulnerability); the old PUT/DELETE
+        // mutated without confirmation. The new surface is
+        // metadata-only + two-phase mutation gated by the
+        // ConfirmationTokenStore (src/gateway/secret_vault.zig).
+        // BFF callers that depended on the legacy GET-plaintext
+        // behavior MUST migrate to caching the value at PUT time;
+        // nullalis no longer reveals secrets post-save.
+        //
+        // Routes dispatched here:
+        //   GET    secrets/<key>          → metadata (S2.12)
+        //   POST   secrets/<key>/prepare  → confirmation token (S2.13)
+        //   PUT    secrets/<key>          → write (S2.14, token required)
+        //   DELETE secrets/<key>          → delete (S2.15, token required)
+        //   GET    secrets/<key>/audit    → recent mutations (S2.16)
+        const rest = parsed.subpath["secrets/".len..];
+        const prepare_suffix = "/prepare";
+        const audit_suffix = "/audit";
 
-        if (std.mem.eql(u8, method, "GET")) {
-            var owned_secret: ?[]u8 = null;
-            defer if (owned_secret) |v| req_allocator.free(v);
-            const value_text: []const u8 = if (state.zaki_state) |mgr| blk: {
-                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                const secret_value = mgr.getSecret(req_allocator, user_id, secret_key) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
-                };
-                if (secret_value) |v| {
-                    owned_secret = v;
-                    break :blk v;
-                }
-                break :blk "";
-            } else blk: {
-                break :blk readFileOrDefault(req_allocator, secret_path, "") catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read failed\"}" };
-                };
+        const Route = union(enum) {
+            prepare: []const u8, // inner is the secret key
+            audit: []const u8,
+            key_only: []const u8,
+        };
+
+        const route: Route = blk: {
+            if (std.mem.endsWith(u8, rest, prepare_suffix) and rest.len > prepare_suffix.len) {
+                break :blk .{ .prepare = rest[0 .. rest.len - prepare_suffix.len] };
+            }
+            if (std.mem.endsWith(u8, rest, audit_suffix) and rest.len > audit_suffix.len) {
+                break :blk .{ .audit = rest[0 .. rest.len - audit_suffix.len] };
+            }
+            break :blk .{ .key_only = rest };
+        };
+
+        const secret_key: []const u8 = switch (route) {
+            .prepare => |k| k,
+            .audit => |k| k,
+            .key_only => |k| k,
+        };
+        if (!isValidIdentifier(secret_key)) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_secret_key\"}" };
+        }
+
+        const mgr = state.zaki_state orelse {
+            // Gated API requires DB-backed audit. File-only backends
+            // can't satisfy the mutation audit contract; rather than
+            // falling back silently we 503 so operators notice.
+            return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"secret_vault_requires_state_backend\"}" };
+        };
+        const user_id_numeric = parseNumericUserId(scoped_user_id) catch {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+        };
+        const actor_id = extractZakiUserId(raw_request);
+
+        // S2.13 — POST secrets/<key>/prepare
+        if (route == .prepare) {
+            if (!std.mem.eql(u8, method, "POST")) {
+                return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            }
+            const body = extractBody(raw_request) orelse return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"missing_body\",\"detail\":\"expected {\\\"action\\\":\\\"put\\\"|\\\"delete\\\"}\"}",
             };
-            if (value_text.len == 0) return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" };
+            const action_str = jsonStringField(body, "action") orelse return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"missing_action\",\"detail\":\"expected \\\"put\\\" or \\\"delete\\\"\"}",
+            };
+            const action = secret_vault.SecretAction.fromSlice(action_str) orelse {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_action\",\"detail\":\"must be \\\"put\\\" or \\\"delete\\\"\"}" };
+            };
+
+            var token_buf: [secret_vault.TOKEN_HEX_LEN]u8 = undefined;
+            const token = state.secret_tokens.prepare(scoped_user_id, secret_key, action, &token_buf) catch {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, action.toSlice(), actor_id, "prepare_failed", null) catch {};
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"token_prepare_failed\"}" };
+            };
+
+            mgr.recordSecretMutation(user_id_numeric, secret_key, action.toSlice(), actor_id, "prepare_issued", null) catch {};
+
+            const ttl = state.secret_tokens.ttl_secs;
+            const expires_at = std.time.timestamp() + ttl;
             var resp: std.ArrayListUnmanaged(u8) = .empty;
             defer resp.deinit(req_allocator);
             const w = resp.writer(req_allocator);
-            w.print("{{\"key\":\"{s}\",\"value\":\"", .{secret_key}) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
-            jsonEscapeInto(w, value_text) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
-            w.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            w.print("{{\"token\":\"{s}\",\"expires_at_unix\":{d},\"action\":\"{s}\"}}", .{ token, expires_at, action.toSlice() }) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            };
             return .{ .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"response build failed\"}" };
         }
+
+        // S2.16 — GET secrets/<key>/audit
+        if (route == .audit) {
+            if (!std.mem.eql(u8, method, "GET")) {
+                return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            }
+            const records = mgr.listSecretMutations(req_allocator, user_id_numeric, 25) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"audit_read_failed\"}" };
+            };
+            defer {
+                for (records) |r| r.deinit(req_allocator);
+                req_allocator.free(records);
+            }
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            defer resp.deinit(req_allocator);
+            const w = resp.writer(req_allocator);
+            w.print("{{\"key\":\"{s}\",\"mutations\":[", .{secret_key}) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            };
+            var first: bool = true;
+            for (records) |r| {
+                // Filter to the requested key only — the DB query pulls ALL
+                // recent mutations for the user; the audit endpoint scopes
+                // to one key. (Alternative would be a key-filtered query,
+                // but the current list is capped at 100 rows total — cheap
+                // to filter in memory.)
+                if (!std.mem.eql(u8, r.key, secret_key)) continue;
+                if (!first) w.writeAll(",") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                first = false;
+                w.writeAll("{\"id\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, r.id) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\",\"action\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, r.action) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\",\"outcome\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                jsonEscapeInto(w, r.outcome) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                w.writeAll("\",\"actor\":") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                if (r.actor) |a| {
+                    w.writeAll("\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                    jsonEscapeInto(w, a) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                    w.writeAll("\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                } else {
+                    w.writeAll("null") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+                }
+                w.print(",\"at_unix\":{d}}}", .{r.at_unix}) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            }
+            w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"response build failed\"}" };
+        }
+
+        // route == .key_only — GET metadata / PUT / DELETE
+        if (std.mem.eql(u8, method, "GET")) {
+            // S2.12 — metadata only, NEVER reveal plaintext.
+            const meta = mgr.getSecretMetadata(req_allocator, user_id_numeric, secret_key) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"metadata_read_failed\"}" };
+            } orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"secret_not_found\"}" };
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            defer resp.deinit(req_allocator);
+            const w = resp.writer(req_allocator);
+            w.print("{{\"key\":\"{s}\",\"created_at_unix\":{d},\"updated_at_unix\":{d}}}", .{
+                secret_key,
+                meta.created_at_unix,
+                meta.updated_at_unix,
+            }) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"response build failed\"}" };
+        }
+
         if (std.mem.eql(u8, method, "PUT")) {
-            const body = extractBody(raw_request) orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
-            const value = jsonStringField(body, "value") orelse body;
+            // S2.14 — write requires a prior prepare token for action=put.
+            const body = extractBody(raw_request) orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_body\"}" };
+            const token = jsonStringField(body, "confirmation_token") orelse {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_no_token", null) catch {};
+                return .{ .status = "401 Unauthorized", .body = "{\"error\":\"confirmation_token_required\",\"detail\":\"call POST /secrets/<key>/prepare first\"}" };
+            };
+            const value = jsonStringField(body, "value") orelse {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_no_value", null) catch {};
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_value\"}" };
+            };
+
+            switch (state.secret_tokens.consume(token, scoped_user_id, secret_key, .put)) {
+                .ok => {},
+                .not_found => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_token_invalid", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_invalid\"}" };
+                },
+                .expired => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_token_expired", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_expired\"}" };
+                },
+                .mismatch => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_action_mismatch", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_action_mismatch\"}" };
+                },
+            }
+
             if (std.mem.eql(u8, secret_key, "telegram_bot_token")) {
                 const normalized = normalizeTelegramBotToken(value);
                 if (!isLikelyTelegramBotToken(normalized)) {
-                    return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid telegram bot token\"}" };
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "rejected_invalid_format", "telegram_bot_token") catch {};
+                    return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_telegram_bot_token\"}" };
                 }
             }
-            if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                const write_value = if (std.mem.eql(u8, secret_key, "telegram_bot_token"))
-                    normalizeTelegramBotToken(value)
-                else
-                    value;
-                mgr.putSecret(user_id, secret_key, write_value) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-                };
-            } else {
-                const write_value = if (std.mem.eql(u8, secret_key, "telegram_bot_token"))
-                    normalizeTelegramBotToken(value)
-                else
-                    value;
-                writeFile(secret_path, write_value) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
-                };
-            }
+            const write_value = if (std.mem.eql(u8, secret_key, "telegram_bot_token"))
+                normalizeTelegramBotToken(value)
+            else
+                value;
+            mgr.putSecret(user_id_numeric, secret_key, write_value) catch {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "write_failed", null) catch {};
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write_failed\"}" };
+            };
+            mgr.recordSecretMutation(user_id_numeric, secret_key, "put", actor_id, "ok", null) catch {};
             return .{ .body = "{\"status\":\"updated\"}" };
         }
+
         if (std.mem.eql(u8, method, "DELETE")) {
-            if (state.zaki_state) |mgr| {
-                const user_id = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
-                const deleted = mgr.deleteSecret(user_id, secret_key) catch {
-                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete failed\"}" };
-                };
-                if (!deleted) return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" };
-            } else {
-                std.fs.deleteFileAbsolute(secret_path) catch |err| switch (err) {
-                    error.FileNotFound => return .{ .status = "404 Not Found", .body = "{\"error\":\"secret not found\"}" },
-                    else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete failed\"}" },
-                };
+            // S2.15 — delete requires a prior prepare token for action=delete.
+            const body = extractBody(raw_request) orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_body\",\"detail\":\"expected {\\\"confirmation_token\\\":\\\"...\\\"}\"}" };
+            const token = jsonStringField(body, "confirmation_token") orelse {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "rejected_no_token", null) catch {};
+                return .{ .status = "401 Unauthorized", .body = "{\"error\":\"confirmation_token_required\"}" };
+            };
+
+            switch (state.secret_tokens.consume(token, scoped_user_id, secret_key, .delete)) {
+                .ok => {},
+                .not_found => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "rejected_token_invalid", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_invalid\"}" };
+                },
+                .expired => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "rejected_token_expired", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_expired\"}" };
+                },
+                .mismatch => {
+                    mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "rejected_action_mismatch", null) catch {};
+                    return .{ .status = "401 Unauthorized", .body = "{\"error\":\"token_action_mismatch\"}" };
+                },
             }
+
+            const deleted = mgr.deleteSecret(user_id_numeric, secret_key) catch {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "write_failed", null) catch {};
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"delete_failed\"}" };
+            };
+            if (!deleted) {
+                mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "not_found", null) catch {};
+                return .{ .status = "404 Not Found", .body = "{\"error\":\"secret_not_found\"}" };
+            }
+            mgr.recordSecretMutation(user_id_numeric, secret_key, "delete", actor_id, "ok", null) catch {};
             return .{ .body = "{\"status\":\"deleted\"}" };
         }
-        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
     }
 
     if (parseUserChannelBindingsSubpath(parsed.subpath)) |bindings_path| {
@@ -13342,7 +13651,7 @@ fn handleAcceptedConnection(
     defer _ = state.in_flight_requests.fetchSub(1, .acq_rel);
 
     // Simple routing — control endpoints + descriptor-driven channel webhooks + ZAKI API.
-    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, cell_resolve, cell_ensure, cell_status, cell_drain, drain, undrain, shutdown };
+    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, cell_resolve, cell_ensure, cell_status, cell_drain, drain, undrain, shutdown, entitlements_revoke };
     const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
         .{ "/health", .health },
         .{ "/ready", .ready },
@@ -13359,6 +13668,7 @@ fn handleAcceptedConnection(
         .{ "/internal/drain", .drain },
         .{ "/internal/undrain", .undrain },
         .{ "/internal/shutdown", .shutdown },
+        .{ "/internal/entitlements/revoke", .entitlements_revoke },
     });
     const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
     const is_chat_stream_path = std.mem.eql(u8, base_path, "/api/v1/chat/stream");
@@ -13800,6 +14110,47 @@ fn handleAcceptedConnection(
                 response_body = "{\"status\":\"shutdown_requested\"}";
             }
         },
+        // S2.7 — Stripe webhook revocation sink. zaki-prod's Stripe
+        // handler translates `customer.subscription.deleted`,
+        // `customer.subscription.updated` (status transitions),
+        // `invoice.payment_failed`, and `charge.dispute.created` into
+        // POSTs here. We parse the minimal billing tuple and update
+        // the in-memory entitlement store; the next turn's preflight
+        // (S2.4) / scheduler tick (S2.5) / chat-stream entry (S2.3)
+        // reads the fresh value and blocks appropriately.
+        .entitlements_revoke => {
+            if (!std.mem.eql(u8, method_str, "POST")) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (!validateInternalServiceToken(raw, state)) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                const body_opt = extractBody(raw);
+                const body = body_opt orelse "";
+                const user_id = jsonStringField(body, "user_id");
+                if (user_id == null) {
+                    response_status = "400 Bad Request";
+                    response_body = "{\"error\":\"missing user_id\"}";
+                } else {
+                    const plan_tier = jsonStringField(body, "plan_tier");
+                    const status_raw = jsonStringField(body, "status");
+                    const period_end = jsonIntField(body, "period_end_unix");
+                    const ent = entitlement_mod.Entitlement.fromProvision(plan_tier, status_raw, period_end);
+                    if (entitlement_mod.installEntitlement(user_id.?, ent)) {
+                        log.info("entitlement.revoke user={s} tier={s} status={s}", .{
+                            user_id.?,
+                            ent.tier.toSlice(),
+                            ent.status.toSlice(),
+                        });
+                        response_body = "{\"status\":\"ok\"}";
+                    } else |_| {
+                        response_status = "500 Internal Server Error";
+                        response_body = "{\"error\":\"entitlement_store_unavailable\"}";
+                    }
+                }
+            }
+        },
     } else {
         response_status = "404 Not Found";
         response_body = "{\"error\":\"not found\"}";
@@ -13966,6 +14317,14 @@ pub fn runWithRole(
 
     var state = GatewayState.init(allocator);
     defer state.deinit();
+    // S2.1 — arm the default entitlement resolver so the structural
+    // gates wired in S2.3/S2.4/S2.5 actually consult a real store when
+    // the BFF calls `/api/v1/users/provision` or Stripe pokes
+    // `/internal/entitlements/revoke`. Before this call the resolver
+    // is `null` and every gate falls back to the default
+    // `Entitlement{}` (pro/active/unlimited) — the "nothing breaks
+    // until S2.1 lights up" invariant that Sprint 2 relied on.
+    entitlement_mod.useDefaultResolver(allocator);
     state.role = role;
     state.controller_url = controller_url;
     if (advertise_url) |value| {
@@ -14007,7 +14366,10 @@ pub fn runWithRole(
     var standalone_usage_rt: ?usage_runtime_mod.UsageRuntime = null;
     var log_obs_gateway = observability.LogObserver{};
     var metrics_obs_gateway = LifecycleMetricsObserver{ .metrics = &state.lifecycle_metrics };
-    var gateway_observer_slots: [2]Observer = undefined;
+    var noop_obs_gateway = observability.NoopObserver{};
+    var otel_obs_gateway_opt: ?observability.OtelObserver = observability.OtelObserver.fromEnv(allocator);
+    defer if (otel_obs_gateway_opt) |*otel| otel.deinit();
+    var gateway_observer_slots: [4]Observer = undefined;
     var gateway_observer_multi = observability.MultiObserver{ .observers = &.{} };
     const needs_local_agent = gatewayRoleNeedsLocalAgent(role, event_bus != null);
 
@@ -14153,6 +14515,8 @@ pub fn runWithRole(
                 gateway_observer_slots = .{
                     log_obs_gateway.observer(),
                     metrics_obs_gateway.observer(),
+                    sentry_runtime.globalOrFallback().observer(),
+                    if (otel_obs_gateway_opt) |*otel| otel.observer() else noop_obs_gateway.observer(),
                 };
                 gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
 
@@ -14412,6 +14776,17 @@ test "idempotency store allows different keys" {
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "b"));
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "c"));
     try std.testing.expect(!store.recordIfNew(std.testing.allocator, "a"));
+}
+
+test "extractIdempotencyKey reads the header case-insensitively (S2.10)" {
+    const raw1 = "POST /x HTTP/1.1\r\nIdempotency-Key: abc-123\r\nHost: h\r\n\r\n";
+    try std.testing.expectEqualStrings("abc-123", extractIdempotencyKey(raw1).?);
+
+    const raw2 = "POST /x HTTP/1.1\r\nidempotency-key: lower-case\r\nHost: h\r\n\r\n";
+    try std.testing.expectEqualStrings("lower-case", extractIdempotencyKey(raw2).?);
+
+    const raw3 = "POST /x HTTP/1.1\r\nHost: h\r\n\r\n";
+    try std.testing.expect(extractIdempotencyKey(raw3) == null);
 }
 
 test "gateway module compiles" {
@@ -14742,6 +15117,584 @@ test "GatewayState init has empty verify token" {
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
     try std.testing.expectEqualStrings("", state.whatsapp_verify_token);
+}
+
+// ── D8 vault route HTTP envelope tests (D11 partial) ───────────────
+// Full DB-backed integration tests require a postgres fixture and are
+// tracked as the residual D11 follow-up. These tests lock in the
+// pre-DB contract: route parsing (prepare/audit/key-only), secret-key
+// validation, and the no-backend 503 safety net. Every path the
+// handler can reach WITHOUT touching zaki_state is covered here.
+
+test "vault route — GET /secrets/:key without backend returns 503 (S2.12)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "GET /api/v1/users/1/secrets/STRIPE_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "GET",
+        "/api/v1/users/1/secrets/STRIPE_KEY",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "secret_vault_requires_state_backend") != null);
+}
+
+test "vault route — POST /secrets/:key/prepare reaches prepare branch (S2.13)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    // Without a DB backend this 503s, which is fine — the test's purpose
+    // is to confirm the route parser recognizes `/prepare` as its own
+    // branch (not a key literally named "STRIPE_KEY/prepare").
+    const raw = "POST /api/v1/users/1/secrets/STRIPE_KEY/prepare HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: 16\r\n\r\n{\"action\":\"put\"}";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "POST",
+        "/api/v1/users/1/secrets/STRIPE_KEY/prepare",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "secret_vault_requires_state_backend") != null);
+}
+
+test "vault route — GET /secrets/:key/audit reaches audit branch (S2.16)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "GET /api/v1/users/1/secrets/STRIPE_KEY/audit HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "GET",
+        "/api/v1/users/1/secrets/STRIPE_KEY/audit",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", response.status);
+}
+
+test "vault route — rejects invalid secret key with 400" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    // "secrets/" with no following segment fails parseUserPath's
+    // subpath check (it requires a following slash), so we use
+    // a clearly invalid key character instead. The `$` in the key
+    // makes isValidIdentifier reject BEFORE the DB check, proving
+    // the validator gate is ordered correctly.
+    const raw = "GET /api/v1/users/1/secrets/bad$key HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "GET",
+        "/api/v1/users/1/secrets/bad$key",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "invalid_secret_key") != null);
+}
+
+test "vault route — PUT legacy body without confirmation_token is not an accidental bypass" {
+    // Regression guard for the breaking-change migration: a BFF caller
+    // that hasn't migrated yet and sends the OLD-shape body
+    // {"value":"..."} without confirmation_token must NOT succeed.
+    // Without a DB backend the handler 503s, which is the CORRECT
+    // safety outcome — legacy callers fail closed, not open.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "PUT /api/v1/users/1/secrets/LEGACY_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: 19\r\n\r\n{\"value\":\"leaky\"}";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "PUT",
+        "/api/v1/users/1/secrets/LEGACY_KEY",
+        &state,
+        null,
+        null,
+    );
+    // 503 is acceptable (no backend); the critical invariant is that
+    // we did NOT return 200. The OLD surface would have happily PUT
+    // the value to the filesystem fallback — the new surface closes
+    // that path regardless of token presence.
+    try std.testing.expect(!std.mem.eql(u8, response.status, "200 OK"));
+}
+
+// ── D8 vault route full-DB integration tests (D11) ─────────────────
+//
+// Complete the D11 residual tracked in docs/sprints/d8-secret-vault.md.
+// The HTTP-envelope tests above lock in route parsing + no-backend 503;
+// these exercise the same handler with a live postgres-backed
+// ManagerImpl wired onto GatewayState so ConsumeResult.ok, real audit
+// rows, and metadata roundtrips all run end-to-end.
+//
+// Fixture strategy: each test provisions its own throwaway schema
+// (nullalis_d11_test_<microtime>) and drops before migrate + on
+// teardown. Skips cleanly if postgres isn't compiled in
+// (-Dengines lacks postgres) or NULLCLAW_POSTGRES_TEST_URL is unset,
+// so the non-postgres -Dengines=base CI path stays green.
+
+test "vault route [D11] — full happy-path roundtrip (prepare → put → get metadata → prepare delete → delete → 404)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_d11_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    // `Manager.init` auto-migrates against `schema` above. The
+    // microtimestamp name guarantees a fresh namespace per run;
+    // teardown drops it so the fixture database doesn't accumulate
+    // per-run schemas over time.
+    defer mgr.dropSchemaForTests() catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tenant_root);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    // GatewayState.deinit() destroys `state.zaki_state` via `allocator.destroy`
+    // — but our `mgr` is a stack local owned by this test. Clearing the
+    // field BEFORE state.deinit() runs keeps the test's ownership intact.
+    defer state.zaki_state = null;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    state.zaki_state = &mgr;
+
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    // ── Step 1: POST /prepare {"action":"put"} → 200, extract token.
+    const prepare_body = "{\"action\":\"put\"}";
+    const prepare_raw = try std.fmt.allocPrint(req_allocator, "POST /api/v1/users/42/secrets/TEST_KEY/prepare HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ prepare_body.len, prepare_body });
+    const prepare_resp = handleApiRoute(allocator, req_allocator, prepare_raw, "POST", "/api/v1/users/42/secrets/TEST_KEY/prepare", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", prepare_resp.status);
+    const prepare_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prepare_resp.body, .{});
+    defer prepare_parsed.deinit();
+    const put_token = prepare_parsed.value.object.get("token").?.string;
+    try std.testing.expectEqual(@as(usize, secret_vault.TOKEN_HEX_LEN), put_token.len);
+    try std.testing.expectEqualStrings("put", prepare_parsed.value.object.get("action").?.string);
+
+    // ── Step 2: PUT with token → 200 {"status":"updated"}.
+    const put_body = try std.fmt.allocPrint(req_allocator, "{{\"value\":\"sk_live_xyz\",\"confirmation_token\":\"{s}\"}}", .{put_token});
+    const put_raw = try std.fmt.allocPrint(req_allocator, "PUT /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ put_body.len, put_body });
+    const put_resp = handleApiRoute(allocator, req_allocator, put_raw, "PUT", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", put_resp.status);
+    try std.testing.expectEqualStrings("{\"status\":\"updated\"}", put_resp.body);
+
+    // ── Step 3: GET metadata → 200, has created_at_unix + updated_at_unix,
+    // MUST NOT leak the plaintext or even the literal "value" field name.
+    const get_raw = "GET /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const get_resp = handleApiRoute(allocator, req_allocator, get_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", get_resp.status);
+    const get_parsed = try std.json.parseFromSlice(std.json.Value, allocator, get_resp.body, .{});
+    defer get_parsed.deinit();
+    try std.testing.expect(get_parsed.value.object.get("created_at_unix") != null);
+    try std.testing.expect(get_parsed.value.object.get("updated_at_unix") != null);
+    try std.testing.expectEqual(@as(?std.json.Value, null), get_parsed.value.object.get("value"));
+    // Core anti-leak invariant: the plaintext never appears anywhere in
+    // the GET response body, nor does the literal "value" field name —
+    // the whole point of the metadata-only contract is that a compromised
+    // GET path can't exfiltrate the secret.
+    try std.testing.expect(std.mem.indexOf(u8, get_resp.body, "sk_live_xyz") == null);
+    try std.testing.expect(std.mem.indexOf(u8, get_resp.body, "value") == null);
+
+    // ── Step 4: POST /prepare {"action":"delete"} → 200, extract delete token.
+    const prep_del_body = "{\"action\":\"delete\"}";
+    const prep_del_raw = try std.fmt.allocPrint(req_allocator, "POST /api/v1/users/42/secrets/TEST_KEY/prepare HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ prep_del_body.len, prep_del_body });
+    const prep_del_resp = handleApiRoute(allocator, req_allocator, prep_del_raw, "POST", "/api/v1/users/42/secrets/TEST_KEY/prepare", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", prep_del_resp.status);
+    const prep_del_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prep_del_resp.body, .{});
+    defer prep_del_parsed.deinit();
+    const delete_token = prep_del_parsed.value.object.get("token").?.string;
+    try std.testing.expectEqualStrings("delete", prep_del_parsed.value.object.get("action").?.string);
+
+    // ── Step 5: DELETE with delete token → 200 {"status":"deleted"}.
+    const del_body = try std.fmt.allocPrint(req_allocator, "{{\"confirmation_token\":\"{s}\"}}", .{delete_token});
+    const del_raw = try std.fmt.allocPrint(req_allocator, "DELETE /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ del_body.len, del_body });
+    const del_resp = handleApiRoute(allocator, req_allocator, del_raw, "DELETE", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", del_resp.status);
+    try std.testing.expectEqualStrings("{\"status\":\"deleted\"}", del_resp.body);
+
+    // ── Step 6: GET → 404 {"error":"secret_not_found"}.
+    const get_after_raw = "GET /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const get_after_resp = handleApiRoute(allocator, req_allocator, get_after_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("404 Not Found", get_after_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_after_resp.body, "secret_not_found") != null);
+}
+
+test "vault route [D11] — PUT without confirmation token returns 401 and writes rejected_no_token audit row" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_d11_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tenant_root);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    defer state.zaki_state = null;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    state.zaki_state = &mgr;
+
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    // PUT with a body that omits confirmation_token (but supplies a
+    // plausible value) → handler must reject before touching storage.
+    const put_body = "{\"value\":\"sk_live_abc\"}";
+    const put_raw = try std.fmt.allocPrint(req_allocator, "PUT /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ put_body.len, put_body });
+    const put_resp = handleApiRoute(allocator, req_allocator, put_raw, "PUT", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("401 Unauthorized", put_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, put_resp.body, "confirmation_token_required") != null);
+
+    // The plaintext must never have hit the wire log either — reject-on-no-token
+    // should not surface the submitted value back in the error body.
+    try std.testing.expect(std.mem.indexOf(u8, put_resp.body, "sk_live_abc") == null);
+
+    // GET must still return 404 — the rejected PUT never reached storage.
+    const get_raw = "GET /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const get_resp = handleApiRoute(allocator, req_allocator, get_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("404 Not Found", get_resp.status);
+
+    // Audit trail must contain the rejection — confirms the reject
+    // branch recorded the attempt even though no state changed. The
+    // audit endpoint filters to the requested key + is bounded at 25
+    // rows, so a single rejected_no_token entry should be the only
+    // mutation for TEST_KEY.
+    const audit_raw = "GET /api/v1/users/42/secrets/TEST_KEY/audit HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const audit_resp = handleApiRoute(allocator, req_allocator, audit_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY/audit", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", audit_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"action\":\"put\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"outcome\":\"rejected_no_token\"") != null);
+}
+
+test "vault route [D11] — PUT with delete-action token returns token_action_mismatch; token survives for legitimate DELETE" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_d11_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tenant_root);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    defer state.zaki_state = null;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    state.zaki_state = &mgr;
+
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    // ── Preamble: install a secret so the eventual DELETE returns 200.
+    const prep_put_body = "{\"action\":\"put\"}";
+    const prep_put_raw = try std.fmt.allocPrint(req_allocator, "POST /api/v1/users/42/secrets/TEST_KEY/prepare HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ prep_put_body.len, prep_put_body });
+    const prep_put_resp = handleApiRoute(allocator, req_allocator, prep_put_raw, "POST", "/api/v1/users/42/secrets/TEST_KEY/prepare", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", prep_put_resp.status);
+    const prep_put_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prep_put_resp.body, .{});
+    defer prep_put_parsed.deinit();
+    const put_token = prep_put_parsed.value.object.get("token").?.string;
+
+    const install_body = try std.fmt.allocPrint(req_allocator, "{{\"value\":\"sk_live_mmm\",\"confirmation_token\":\"{s}\"}}", .{put_token});
+    const install_raw = try std.fmt.allocPrint(req_allocator, "PUT /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ install_body.len, install_body });
+    const install_resp = handleApiRoute(allocator, req_allocator, install_raw, "PUT", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", install_resp.status);
+
+    // ── Step 1: prepare a DELETE token (token_A). This is the token
+    // we'll misuse in a PUT, then spend correctly on DELETE.
+    const prep_del_body = "{\"action\":\"delete\"}";
+    const prep_del_raw = try std.fmt.allocPrint(req_allocator, "POST /api/v1/users/42/secrets/TEST_KEY/prepare HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ prep_del_body.len, prep_del_body });
+    const prep_del_resp = handleApiRoute(allocator, req_allocator, prep_del_raw, "POST", "/api/v1/users/42/secrets/TEST_KEY/prepare", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", prep_del_resp.status);
+    const prep_del_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prep_del_resp.body, .{});
+    defer prep_del_parsed.deinit();
+    const token_a = prep_del_parsed.value.object.get("token").?.string;
+    try std.testing.expectEqualStrings("delete", prep_del_parsed.value.object.get("action").?.string);
+
+    // ── Step 2: PUT with token_A → 401 token_action_mismatch. The
+    // token was minted for delete, so the handler must reject without
+    // consuming it — the "mismatch preserves entry" guarantee in
+    // secret_vault.zig is what makes the single-use delete still safe.
+    const mismatch_body = try std.fmt.allocPrint(req_allocator, "{{\"value\":\"sk_live_nnn\",\"confirmation_token\":\"{s}\"}}", .{token_a});
+    const mismatch_raw = try std.fmt.allocPrint(req_allocator, "PUT /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ mismatch_body.len, mismatch_body });
+    const mismatch_resp = handleApiRoute(allocator, req_allocator, mismatch_raw, "PUT", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("401 Unauthorized", mismatch_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch_resp.body, "token_action_mismatch") != null);
+
+    // ── Step 3: DELETE with token_A → 200. Critical guarantee: the
+    // failed PUT did NOT consume token_A. If mismatch had dropped the
+    // entry, this call would come back as token_invalid, and the
+    // legitimate holder of a delete token could be locked out by any
+    // party who submitted a wrong-action call first. Test this is
+    // actually true against the wired gateway handler.
+    const del_body = try std.fmt.allocPrint(req_allocator, "{{\"confirmation_token\":\"{s}\"}}", .{token_a});
+    const del_raw = try std.fmt.allocPrint(req_allocator, "DELETE /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ del_body.len, del_body });
+    const del_resp = handleApiRoute(allocator, req_allocator, del_raw, "DELETE", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", del_resp.status);
+    try std.testing.expectEqualStrings("{\"status\":\"deleted\"}", del_resp.body);
+
+    // ── Step 4: audit trail shows both the rejection and the
+    // successful delete. Order is newest-first per listSecretMutations,
+    // but we only assert presence — that the rejected_action_mismatch
+    // entry landed for action=put AND an ok entry landed for
+    // action=delete.
+    const audit_raw = "GET /api/v1/users/42/secrets/TEST_KEY/audit HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const audit_resp = handleApiRoute(allocator, req_allocator, audit_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY/audit", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", audit_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"outcome\":\"rejected_action_mismatch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"action\":\"delete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"outcome\":\"ok\"") != null);
+}
+
+test "vault route [D11] — DELETE with fabricated hex token returns token_invalid and audits rejected_token_invalid" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_d11_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tenant_root);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    defer state.zaki_state = null;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    state.zaki_state = &mgr;
+
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    // DELETE with a well-formed-looking but never-issued token. The
+    // token is 64 hex chars (matches TOKEN_HEX_LEN) so parse-layer
+    // rejection can't short-circuit; the store's .not_found branch
+    // is what must catch it.
+    const fabricated: []const u8 = "00000000000000000000000000000000000000000000000000000000feedcafe";
+    try std.testing.expectEqual(@as(usize, secret_vault.TOKEN_HEX_LEN), fabricated.len);
+
+    const del_body = try std.fmt.allocPrint(req_allocator, "{{\"confirmation_token\":\"{s}\"}}", .{fabricated});
+    const del_raw = try std.fmt.allocPrint(req_allocator, "DELETE /api/v1/users/42/secrets/TEST_KEY HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ del_body.len, del_body });
+    const del_resp = handleApiRoute(allocator, req_allocator, del_raw, "DELETE", "/api/v1/users/42/secrets/TEST_KEY", &state, null, null);
+    try std.testing.expectEqualStrings("401 Unauthorized", del_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, del_resp.body, "token_invalid") != null);
+    // Must not leak the fabricated token back in the error body.
+    try std.testing.expect(std.mem.indexOf(u8, del_resp.body, "feedcafe") == null);
+
+    // Audit trail must carry the rejection with action=delete.
+    const audit_raw = "GET /api/v1/users/42/secrets/TEST_KEY/audit HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const audit_resp = handleApiRoute(allocator, req_allocator, audit_raw, "GET", "/api/v1/users/42/secrets/TEST_KEY/audit", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", audit_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"action\":\"delete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"outcome\":\"rejected_token_invalid\"") != null);
+}
+
+test "vault route [D11] — GET /secrets/:key/audit scopes mutations to the requested key only" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_d11_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tenant_root);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    defer state.zaki_state = null;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    state.zaki_state = &mgr;
+
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    // Helper closure: install one secret under `key` via full prepare+PUT.
+    // Each install produces one ok audit row for that key.
+    const keys = [_][]const u8{ "KEY_ALPHA", "KEY_BETA", "KEY_GAMMA" };
+    for (keys) |key| {
+        const prep_body = "{\"action\":\"put\"}";
+        const prep_raw = try std.fmt.allocPrint(req_allocator, "POST /api/v1/users/42/secrets/{s}/prepare HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ key, prep_body.len, prep_body });
+        const prep_path = try std.fmt.allocPrint(req_allocator, "/api/v1/users/42/secrets/{s}/prepare", .{key});
+        const prep_resp = handleApiRoute(allocator, req_allocator, prep_raw, "POST", prep_path, &state, null, null);
+        try std.testing.expectEqualStrings("200 OK", prep_resp.status);
+        const prep_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prep_resp.body, .{});
+        defer prep_parsed.deinit();
+        const token = prep_parsed.value.object.get("token").?.string;
+
+        const put_body = try std.fmt.allocPrint(req_allocator, "{{\"value\":\"v_{s}\",\"confirmation_token\":\"{s}\"}}", .{ key, token });
+        const put_raw = try std.fmt.allocPrint(req_allocator, "PUT /api/v1/users/42/secrets/{s} HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ key, put_body.len, put_body });
+        const put_path = try std.fmt.allocPrint(req_allocator, "/api/v1/users/42/secrets/{s}", .{key});
+        const put_resp = handleApiRoute(allocator, req_allocator, put_raw, "PUT", put_path, &state, null, null);
+        try std.testing.expectEqualStrings("200 OK", put_resp.status);
+    }
+
+    // GET /secrets/KEY_ALPHA/audit → body is the top-level envelope
+    // scoped to KEY_ALPHA. The implementation writes one
+    // {"key":"KEY_ALPHA","mutations":[...]} envelope and server-side
+    // filters records by `r.key == secret_key` before serializing —
+    // so the substrings KEY_BETA and KEY_GAMMA must not appear
+    // anywhere in the response body.
+    const audit_raw = "GET /api/v1/users/42/secrets/KEY_ALPHA/audit HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\n\r\n";
+    const audit_resp = handleApiRoute(allocator, req_allocator, audit_raw, "GET", "/api/v1/users/42/secrets/KEY_ALPHA/audit", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", audit_resp.status);
+
+    // Positive: envelope carries KEY_ALPHA and at least one put/ok entry.
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"key\":\"KEY_ALPHA\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"action\":\"put\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "\"outcome\":\"ok\"") != null);
+
+    // Negative (the point of the test): neither other key appears.
+    // If the filter regresses (e.g. a refactor drops the r.key ==
+    // secret_key check), these assertions trip and catch the leak.
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "KEY_BETA") == null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "KEY_GAMMA") == null);
+
+    // Cross-check: the plaintext values from all three installs
+    // must not be present either — audit records never carry the
+    // secret value, just outcome metadata.
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_ALPHA") == null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_BETA") == null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_GAMMA") == null);
 }
 
 test "handleApiRoute accepts POST alias for telegram disconnect" {
