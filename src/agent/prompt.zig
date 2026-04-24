@@ -1371,6 +1371,44 @@ test "buildStableSystemPrompt excludes datetime and conversation context" {
     try std.testing.expect(std.mem.indexOf(u8, stable, "## Runtime") != null);
 }
 
+test "buildStableSystemPrompt is byte-stable across back-to-back calls with identical inputs" {
+    // S5.6 — byte-equality invariant under test. Context v2 promises that the
+    // stable system-prompt prefix is byte-identical across turns when
+    // workspace files, tool catalog, persona, and skills are unchanged. That
+    // invariant is what every cache-capable provider backend relies on
+    // (Anthropic `cache_control: ephemeral`, Together/vLLM byte-prefix KV
+    // cache, OpenAI automatic prefix cache). Without this test a future
+    // unsorted iteration (directory, HashMap, etc.) could silently drift the
+    // prefix and invalidate cache on every turn with no user-visible signal.
+    //
+    // This test deliberately runs the call twice inline so if drift is
+    // introduced by a stateful builder (e.g. a module-level counter), the
+    // test catches it on the first run rather than waiting for a rebuild.
+    const allocator = std.testing.allocator;
+
+    const ctx: PromptContext = .{
+        .workspace_dir = "/tmp/nonexistent-byte-eq",
+        .model_name = "test-model",
+        .tools = &.{},
+    };
+
+    const first = try buildStableSystemPrompt(allocator, ctx);
+    defer allocator.free(first);
+
+    const second = try buildStableSystemPrompt(allocator, ctx);
+    defer allocator.free(second);
+
+    try std.testing.expectEqualStrings(first, second);
+
+    // Third call for paranoia — any per-call mutation of shared state would
+    // show up here even if first and second happened to land identically due
+    // to allocator/layout coincidence.
+    const third = try buildStableSystemPrompt(allocator, ctx);
+    defer allocator.free(third);
+
+    try std.testing.expectEqualStrings(first, third);
+}
+
 test "buildVolatileSystemPrompt includes datetime and optional memory slot" {
     const allocator = std.testing.allocator;
     const volatile_out = try buildVolatileSystemPrompt(allocator, .{
