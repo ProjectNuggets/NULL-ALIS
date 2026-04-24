@@ -514,6 +514,16 @@ pub const Agent = struct {
     /// reads + JSON parses. `cached_config_loaded` disambiguates "never
     /// attempted" from "attempted and failed" so a transient filesystem
     /// hiccup at first use doesn't re-spin the load every turn afterwards.
+    ///
+    /// **Invariant (MED-1 review fix):** once `cached_config_loaded` flips
+    /// to true AND `cached_config` is non-null, neither field may be
+    /// reassigned for the remaining lifetime of this Agent. `cachedConfig
+    /// ForCaps` returns a `*const Config` into the optional payload inside
+    /// this field — any reassignment would silently dangle that pointer on
+    /// any caller that holds it. If a future hot-reload path is needed,
+    /// land it as an explicit `invalidateConfigCache()` method that
+    /// simultaneously clears all outstanding pointer users, not a bare
+    /// field write.
     cached_config: ?Config = null,
     cached_config_loaded: bool = false,
 
@@ -2833,7 +2843,7 @@ pub const Agent = struct {
                         // still live for this iteration, so buildProviderMessages
                         // reuses it without leaking.
                         const retry_messages = self.buildProviderMessages(arena) catch |build_err| return build_err;
-                        break :retry_stream_blk self.provider.streamChat(
+                        const retry_result = self.provider.streamChat(
                             self.allocator,
                             .{
                                 .messages = retry_messages,
@@ -2856,6 +2866,22 @@ pub const Agent = struct {
                             });
                             return retry_err;
                         };
+                        // MED-2 review fix: emit the paired `llm_response
+                        // success=true` event for the retry so dashboards
+                        // aggregating llm.response outcomes see the recovery.
+                        // Without this, the observer stream carried only the
+                        // fail_event above — retry success was invisible.
+                        const retry_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
+                        const retry_success_event = ObserverEvent{ .llm_response = .{
+                            .provider = self.provider.getName(),
+                            .model = self.model_name,
+                            .duration_ms = retry_duration,
+                            .success = true,
+                            .error_message = null,
+                            .run_id = self.current_run_id,
+                        } };
+                        self.observer.recordEvent(&retry_success_event);
+                        break :retry_stream_blk retry_result;
                     }
 
                     return err;
