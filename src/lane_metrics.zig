@@ -48,6 +48,7 @@ pub fn snapshotBackgroundMainReroutes(allocator: std.mem.Allocator) !BackgroundM
 
 pub fn resetForTest() void {
     background_main_reroutes_total.store(0, .monotonic);
+    completion_event_delete_failures_total.store(0, .monotonic);
     metrics_mutex.lock();
     defer metrics_mutex.unlock();
     background_main_reroutes_last_job_id_len = 0;
@@ -64,4 +65,30 @@ test "recordBackgroundMainReroute increments total and stores last job id" {
     try std.testing.expectEqual(@as(u64, 2), snap.total);
     try std.testing.expect(snap.last_job_id != null);
     try std.testing.expectEqualStrings("job-2", snap.last_job_id.?);
+}
+
+// ─── Completion-event delete failures (S4.6) ─────────────────────────
+// Failure to delete a completion_event row after successful delivery
+// causes two visible problems: duplicate delivery on reconnect, and
+// unbounded growth of the completion_events table. Silent-catching
+// hides both; this counter lets operators see the count in a health
+// snapshot even when error-level logs are filtered.
+
+var completion_event_delete_failures_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+pub fn recordCompletionEventDeleteFailure() void {
+    _ = completion_event_delete_failures_total.fetchAdd(1, .monotonic);
+}
+
+pub fn completionEventDeleteFailuresTotal() u64 {
+    return completion_event_delete_failures_total.load(.monotonic);
+}
+
+test "recordCompletionEventDeleteFailure increments total monotonically" {
+    resetForTest();
+    try std.testing.expectEqual(@as(u64, 0), completionEventDeleteFailuresTotal());
+    recordCompletionEventDeleteFailure();
+    recordCompletionEventDeleteFailure();
+    recordCompletionEventDeleteFailure();
+    try std.testing.expectEqual(@as(u64, 3), completionEventDeleteFailuresTotal());
 }
