@@ -90,6 +90,38 @@ pub const MessageTool = struct {
                 return ToolResult.fail("No channel specified and no default channel set"));
         const channel = std.mem.trim(u8, channel_raw, " \t\r\n");
         if (channel.len == 0) return ToolResult.fail("Channel must not be empty");
+
+        // S7.8 — channel-locality enforcement. If the tool is running inside
+        // a turn whose inbound channel is known AND the model passed an
+        // explicit `channel` arg that differs, require an explicit
+        // `allow_channel_override=true` opt-in. Prevents the model from
+        // silently replying on a random channel because it misread context.
+        // Background-origin turns are exempt — they don't have an inbound
+        // channel to pin to.
+        if (!is_background_origin) {
+            if (msg_turn_ctx.channel) |inbound_channel| {
+                const explicit_channel_arg = root.getString(args, "channel");
+                if (explicit_channel_arg) |explicit| {
+                    const explicit_trimmed = std.mem.trim(u8, explicit, " \t\r\n");
+                    if (!std.ascii.eqlIgnoreCase(explicit_trimmed, inbound_channel)) {
+                        const allow_override = blk: {
+                            if (args.get("allow_channel_override")) |v| {
+                                if (v == .bool) break :blk v.bool;
+                            }
+                            break :blk false;
+                        };
+                        if (!allow_override) {
+                            const msg = try std.fmt.allocPrint(
+                                allocator,
+                                "Channel-locality violation: inbound was '{s}', tool tried to send on '{s}'. Pass allow_channel_override=true to bypass.",
+                                .{ inbound_channel, explicit_trimmed },
+                            );
+                            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                        }
+                    }
+                }
+            }
+        }
         const is_telegram_channel = std.ascii.eqlIgnoreCase(channel, "telegram");
 
         var account_id = root.getString(args, "account_id") orelse msg_turn_ctx.account_id;
@@ -377,6 +409,55 @@ test "MessageTool execute with empty content fails" {
     try testing.expectEqualStrings("'content' must not be empty", result.error_msg.?);
 }
 
+test "MessageTool S7.8 rejects cross-channel send without allow_channel_override" {
+    // S7.8 — if the inbound channel is telegram and the model passes
+    // `channel=slack`, the tool must reject with a channel-locality
+    // violation error unless `allow_channel_override=true` is also set.
+    resetTestTurnContext();
+    defer resetTestTurnContext();
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
+    mt.setContext("telegram", "chat42");
+    const parsed = try root.parseTestArgs("{\"content\":\"hi\",\"channel\":\"slack\",\"chat_id\":\"s1\"}");
+    defer parsed.deinit();
+    const result = try mt.execute(testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |e| testing.allocator.free(e);
+    try testing.expect(!result.success);
+    const err = result.error_msg orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, err, "Channel-locality violation") != null);
+    try testing.expect(std.mem.indexOf(u8, err, "telegram") != null);
+    try testing.expect(std.mem.indexOf(u8, err, "slack") != null);
+}
+
+test "MessageTool S7.8 accepts same-channel explicit arg (no override needed)" {
+    // Passing `channel=telegram` when inbound IS telegram is a no-op
+    // equality check; must NOT trigger the locality violation.
+    resetTestTurnContext();
+    defer resetTestTurnContext();
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
+    mt.setContext("telegram", "chat42");
+    const parsed = try root.parseTestArgs("{\"content\":\"ok\",\"channel\":\"telegram\",\"chat_id\":\"chat42\"}");
+    defer parsed.deinit();
+    const result = try mt.execute(testing.allocator, parsed.value.object);
+    defer {
+        if (result.error_msg) |e| testing.allocator.free(e);
+        if (result.output.len > 0) testing.allocator.free(result.output);
+    }
+    // Drain any queued outbound so the bus doesn't leak on scope exit.
+    if (event_bus.consumeOutbound()) |m| {
+        var mm = m;
+        mm.deinit(testing.allocator);
+    }
+    // Either succeeds (normal path) or fails on downstream reasons —
+    // but the failure must NOT be the channel-locality one.
+    if (result.error_msg) |e| {
+        try testing.expect(std.mem.indexOf(u8, e, "Channel-locality violation") == null);
+    }
+}
+
 test "telegramApiResponseOk accepts ok true payload" {
     try testing.expect(MessageTool.telegramApiResponseOk(testing.allocator, "{\"ok\":true,\"result\":{}}"));
 }
@@ -405,14 +486,18 @@ test "MessageTool execute without channel uses default" {
     msg.deinit(testing.allocator);
 }
 
-test "MessageTool execute with explicit channel overrides default" {
+test "MessageTool execute with explicit channel overrides default (requires allow_channel_override post-S7.8)" {
+    // S7.8 — cross-channel routing now requires an explicit
+    // `allow_channel_override=true` opt-in. This test preserves the
+    // pre-S7.8 assertion ("explicit channel arg routes there") under
+    // the new opt-in shape.
     resetTestTurnContext();
     defer resetTestTurnContext();
     var event_bus = bus.Bus.init();
     defer event_bus.close();
     var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
     mt.setContext("telegram", "chat42");
-    const parsed = try root.parseTestArgs("{\"content\":\"hi\",\"channel\":\"discord\",\"chat_id\":\"room1\"}");
+    const parsed = try root.parseTestArgs("{\"content\":\"hi\",\"channel\":\"discord\",\"chat_id\":\"room1\",\"allow_channel_override\":true}");
     defer parsed.deinit();
     const result = try mt.execute(testing.allocator, parsed.value.object);
     try testing.expect(result.success);
