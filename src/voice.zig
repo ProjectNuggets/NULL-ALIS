@@ -17,16 +17,27 @@ const log = std.log.scoped(.voice);
 /// Emit a system_notice via the optional observer when a multimodal path
 /// fails. Binding rule: no silent fallback. Callers that have an observer
 /// handle pass it; callers that don't pass null and the notice is dropped
-/// at this level (the existing std.log warnings still fire).
-fn emitMultimodalFailureNotice(
-    obs: ?*observability.Observer,
+/// Emit a system_notice frame so the user sees "voice step degraded"
+/// as chrome while the text channel continues unaffected. Neutral
+/// between STT (inbound transcription) and TTS (outbound synthesis)
+/// paths — the caller-supplied `detail` string carries the direction-
+/// specific context. `std.log` warnings at the call site still fire
+/// at this level.
+///
+/// S7.7 — now public so the TTS call site in agent/root.zig can
+/// surface synthesis failures with the same observer-event shape STT
+/// already used. Previously the TTS path only log.warn'd and
+/// returned null, which silently dropped audio to text with no user-
+/// visible signal that something degraded.
+pub fn emitMultimodalFailureNotice(
+    obs: ?*const observability.Observer,
     detail: []const u8,
 ) void {
     const observer = obs orelse return;
     const event = observability.ObserverEvent{ .system_notice = .{
         .kind = "multimodal_failure",
         .severity = "warning",
-        .message = "Voice/transcription step failed. Text channel unaffected; the message may have arrived without audio transcript.",
+        .message = "Audio pipeline step failed. Text delivery unaffected.",
         .detail = detail,
     } };
     observer.recordEvent(&event);

@@ -931,6 +931,15 @@ pub const Agent = struct {
             .{},
         ) catch |err| {
             log.warn("tts audio synth failed: provider={s} reason={s}", .{ provider_name, @errorName(err) });
+            // S7.7 — TTS failure-notice parity with STT. Previously the
+            // return-null path dropped audio to text silently; STT has
+            // emitted a `system_notice` via `emitMultimodalFailureNotice`
+            // since its initial wiring. Now both directions surface the
+            // same operator-visible frame so "audio channel degraded"
+            // chrome fires consistently.
+            var detail_buf: [128]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buf, "tts synth failed: provider={s} reason={s}", .{ provider_name, @errorName(err) }) catch "tts synth failed";
+            voice_mod.emitMultimodalFailureNotice(&self.observer, detail);
             return null;
         };
         defer allocator.free(synthesized_path);
