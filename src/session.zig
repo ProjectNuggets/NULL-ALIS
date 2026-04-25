@@ -900,6 +900,119 @@ pub const SessionManager = struct {
         }
         return try result.toOwnedSlice(allocator);
     }
+
+    /// S7.3 — Per-user session cache eviction for GDPR purge.
+    ///
+    /// Mirrors the 3-phase pattern in `evictIdle` (collect → destroy →
+    /// remove) but filters by `user_id` and ignores idle/TTL state.
+    /// Sessions whose `mutex` is locked (turn in progress) or whose
+    /// `active_refs != 0` are counted in `active_skipped` and left in
+    /// the map — the orchestrator's caller should retry after the
+    /// in-flight turn settles, or accept the skip if the corresponding
+    /// user row has already been deleted (the next turn will error
+    /// naturally). Checkpointing is skipped on purpose: we're about to
+    /// delete every trace of this user, so persisting state to the
+    /// tenant store would immediately be undone.
+    pub const EvictUserResult = struct {
+        evicted: usize,
+        active_skipped: usize,
+    };
+
+    pub fn evictUserSessions(self: *SessionManager, user_id: []const u8) EvictUserResult {
+        const session_identity = @import("session/identity.zig");
+
+        // Phase 1: collect owned sessions whose mutex we can take.
+        var candidates: std.ArrayListUnmanaged(*Session) = .{};
+        defer candidates.deinit(self.allocator);
+        var active_skipped: usize = 0;
+
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            var it = self.sessions.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (!session_identity.isOwnedBy(key, user_id)) continue;
+                const session = entry.value_ptr.*;
+                if (session.active_refs != 0) {
+                    active_skipped += 1;
+                    continue;
+                }
+                if (!session.mutex.tryLock()) {
+                    active_skipped += 1;
+                    continue;
+                }
+                candidates.append(self.allocator, session) catch {
+                    session.mutex.unlock();
+                    continue;
+                };
+            }
+        }
+
+        // Phase 2: release session mutexes before Phase 3 acquires the
+        // manager mutex (avoids any risk of lock-order inversion).
+        // No checkpoint here: the tenant row is about to be deleted.
+        var to_remove: std.ArrayListUnmanaged([]const u8) = .{};
+        defer to_remove.deinit(self.allocator);
+        for (candidates.items) |session| {
+            to_remove.append(self.allocator, session.session_key) catch {
+                session.mutex.unlock();
+                continue;
+            };
+            session.mutex.unlock();
+        }
+
+        // Phase 3: drop from map and free.
+        //
+        // Sprint 7B post-review fix (M1, 2026-04-25): between Phase 2
+        // unlocking session.mutex and Phase 3 acquiring manager.mutex,
+        // a racing `getOrCreate` can take the manager mutex first, find
+        // the session still in the map, and bump `active_refs`. Without
+        // a re-check here, Phase 3 would `fetchRemove` + `deinit` a
+        // session that another thread holds a live pointer into → UAF.
+        //
+        // The recheck is cheap (one field load under the manager mutex)
+        // and lets the racing turn proceed naturally: the session stays
+        // in the map until the turn's normal idle eviction. It's fine
+        // for GDPR semantics — the pg cascade running next will yank
+        // the user's rows out from under that turn, which will then
+        // error cleanly on its next memory write. Better one half-
+        // completed turn than a UAF.
+        var evicted: usize = 0;
+        var raced_skipped: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (to_remove.items) |key| {
+                if (self.sessions.fetchRemove(key)) |kv| {
+                    const session = kv.value;
+                    if (session.active_refs != 0) {
+                        // A racer entered between Phase 2 and Phase 3.
+                        // Re-insert and skip — caller can retry.
+                        self.sessions.put(self.allocator, session.session_key, session) catch {
+                            // Re-insert failed (OOM). The pointer is
+                            // now leaked from the map but still alive;
+                            // a later `evictIdle` or shutdown flush
+                            // will clean it up. Worse than a clean
+                            // re-insert, but vastly better than UAF.
+                            log.warn("session.evict_user_phase3_reinsert_failed user_id={s} key={s}", .{ user_id, key });
+                        };
+                        raced_skipped += 1;
+                        continue;
+                    }
+                    session.deinit(self.allocator);
+                    self.allocator.destroy(session);
+                    evicted += 1;
+                }
+            }
+        }
+        const total_skipped = active_skipped + raced_skipped;
+        if (total_skipped > 0) {
+            log.warn("session.evict_user_skipped user_id={s} evicted={d} active_skipped={d} raced_skipped={d}", .{ user_id, evicted, active_skipped, raced_skipped });
+        }
+        return .{ .evicted = evicted, .active_skipped = total_skipped };
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2643,6 +2756,57 @@ test "listUserSessions returns only sessions for requesting user" {
     for (infos) |info| {
         try testing.expect(std.mem.startsWith(u8, info.session_key, "agent:zaki-bot:user:7:"));
     }
+}
+
+test "evictUserSessions removes only sessions for the targeted user" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("agent:zaki-bot:user:42:main");
+    _ = try sm.getOrCreate("agent:zaki-bot:user:42:thread:t1");
+    _ = try sm.getOrCreate("agent:zaki-bot:user:99:main");
+
+    const result = sm.evictUserSessions("42");
+    try testing.expectEqual(@as(usize, 2), result.evicted);
+    try testing.expectEqual(@as(usize, 0), result.active_skipped);
+
+    // User 99's session remains untouched.
+    try testing.expectEqual(@as(usize, 0), sm.countUserSessions("42"));
+    try testing.expectEqual(@as(usize, 1), sm.countUserSessions("99"));
+}
+
+test "evictUserSessions on absent user returns zero" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("agent:zaki-bot:user:7:main");
+
+    const result = sm.evictUserSessions("nonexistent");
+    try testing.expectEqual(@as(usize, 0), result.evicted);
+    try testing.expectEqual(@as(usize, 0), result.active_skipped);
+    try testing.expectEqual(@as(usize, 1), sm.countUserSessions("7"));
+}
+
+test "evictUserSessions counts active_refs as skipped" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:zaki-bot:user:55:main");
+    // Simulate an in-flight turn holding a session reference.
+    session.active_refs = 1;
+    defer session.active_refs = 0;
+
+    const result = sm.evictUserSessions("55");
+    try testing.expectEqual(@as(usize, 0), result.evicted);
+    try testing.expectEqual(@as(usize, 1), result.active_skipped);
+    // Session remains in the map (still reachable for the in-flight turn).
+    try testing.expectEqual(@as(usize, 1), sm.countUserSessions("55"));
 }
 
 test "getOrCreate enforces MAX_SESSIONS_PER_USER per user" {

@@ -751,6 +751,55 @@ pub const PgvectorVectorStore = struct {
         }
     }
 
+    /// S7.2 — bulk delete every embedding for `user_id`. Called by the
+    /// GDPR purgeUser orchestrator. Returns rows removed via PQcmdTuples.
+    /// `memory_vectors` has no FK to `users`; pgvector is a separate schema
+    /// from the zaki_state tables, so the pg cascade on `users` row delete
+    /// does NOT reach these rows. That is why this explicit bulk path
+    /// exists — without it, GDPR purge would leave orphaned embeddings.
+    fn implDeleteAllForUser(ptr: *anyopaque, user_id: i64) anyerror!usize {
+        if (!build_options.enable_postgres) return error.PgNotEnabled;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+
+        var lease = try self.acquireQueryLease();
+        var conn_healthy = true;
+        defer self.releaseConn(&lease, conn_healthy);
+        const conn = lease.conn;
+
+        var user_buf: [32]u8 = undefined;
+        const user_str = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        const sql_plain = try std.fmt.allocPrint(
+            alloc,
+            "DELETE FROM {s} WHERE user_id = $1::bigint",
+            .{self.qualified_table_name},
+        );
+        defer alloc.free(sql_plain);
+        const sql = try alloc.dupeZ(u8, sql_plain);
+        defer alloc.free(sql);
+
+        const params = [_][*c]const u8{user_str.ptr};
+        const result = c.PQexecParams(conn, sql.ptr, 1, null, &params, null, null, 0) orelse {
+            conn_healthy = false;
+            return error.PgQueryFailed;
+        };
+        defer c.PQclear(result);
+
+        const status = c.PQresultStatus(result);
+        if (status != c.PGRES_COMMAND_OK) {
+            if (c.PQstatus(conn) != c.CONNECTION_OK) conn_healthy = false;
+            log.warn("pgvector delete_all_for_user failed table={s} user_id={d}: {s}", .{ self.table_name, user_id, pqErrorMessage(conn, result) });
+            return error.PgQueryFailed;
+        }
+
+        const tuples_raw = c.PQcmdTuples(result);
+        if (tuples_raw == null) return 0;
+        const tuples_slice: []const u8 = std.mem.span(tuples_raw);
+        if (tuples_slice.len == 0) return 0;
+        return std.fmt.parseInt(usize, tuples_slice, 10) catch 0;
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         if (!build_options.enable_postgres) return error.PgNotEnabled;
         const self: *Self = @ptrCast(@alignCast(ptr));
@@ -873,6 +922,7 @@ pub const PgvectorVectorStore = struct {
         .upsert = &implUpsert,
         .search = &implSearch,
         .delete = &implDelete,
+        .delete_all_for_user = &implDeleteAllForUser,
         .count = &implCount,
         .health_check = &implHealthCheck,
         .deinit = &implDeinit,

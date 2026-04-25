@@ -245,6 +245,21 @@ pub const QdrantVectorStore = struct {
         return alloc.dupe(u8, buf.items);
     }
 
+    /// S7.2 — payload for a bulk-by-user delete. Filter-only (no key clause)
+    /// so every point whose `user_id` payload equals `user_id` is removed.
+    fn buildDeleteAllForUserPayload(alloc: Allocator, user_id: i64) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(alloc);
+
+        try buf.appendSlice(alloc, "{\"filter\":{\"must\":[{\"key\":\"user_id\",\"match\":{\"value\":");
+        var user_buf: [32]u8 = undefined;
+        const user_str = std.fmt.bufPrint(&user_buf, "{d}", .{user_id}) catch return error.FormatError;
+        try buf.appendSlice(alloc, user_str);
+        try buf.appendSlice(alloc, "}}]}}");
+
+        return alloc.dupe(u8, buf.items);
+    }
+
     // ── Response parsers ──────────────────────────────────────────
 
     fn parseSearchResults(alloc: Allocator, body: []const u8) ![]VectorResult {
@@ -382,6 +397,27 @@ pub const QdrantVectorStore = struct {
         if (resp.status != .ok) return error.QdrantApiError;
     }
 
+    /// S7.2 — bulk delete every point whose payload `user_id` matches.
+    /// Qdrant's `/points/delete` with a filter-only body deletes in-place;
+    /// it doesn't return a count, so we return 0 rather than lie about
+    /// rows removed. The orchestrator relies on count() for verification.
+    fn implDeleteAllForUser(ptr: *anyopaque, user_id: i64) anyerror!usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+
+        const url = try self.buildUrl(alloc, "/points/delete?wait=true");
+        defer alloc.free(url);
+
+        const payload = try buildDeleteAllForUserPayload(alloc, user_id);
+        defer alloc.free(payload);
+
+        const resp = try self.doRequest(alloc, url, .POST, payload);
+        defer alloc.free(resp.body);
+
+        if (resp.status != .ok) return error.QdrantApiError;
+        return 0;
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const alloc = self.allocator;
@@ -471,6 +507,7 @@ pub const QdrantVectorStore = struct {
         .upsert = &implUpsert,
         .search = &implSearch,
         .delete = &implDelete,
+        .delete_all_for_user = &implDeleteAllForUser,
         .count = &implCount,
         .health_check = &implHealthCheck,
         .deinit = &implDeinit,
@@ -613,6 +650,26 @@ test "buildSearchPayload generates valid JSON" {
     const must = root.get("filter").?.object.get("must").?.array;
     try std.testing.expectEqual(@as(usize, 1), must.items.len);
     try std.testing.expectEqual(@as(i64, 11), must.items[0].object.get("match").?.object.get("value").?.integer);
+}
+
+test "S7.2 buildDeleteAllForUserPayload emits filter-only by user_id" {
+    const alloc = std.testing.allocator;
+    const payload = try QdrantVectorStore.buildDeleteAllForUserPayload(alloc, 42);
+    defer alloc.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+
+    const filter = parsed.value.object.get("filter").?.object;
+    const must = filter.get("must").?.array;
+    try std.testing.expectEqual(@as(usize, 1), must.items.len);
+
+    const cond = must.items[0].object;
+    try std.testing.expectEqualStrings("user_id", cond.get("key").?.string);
+    try std.testing.expectEqual(@as(i64, 42), cond.get("match").?.object.get("value").?.integer);
+
+    // No "key" clause — the whole user is being purged, not a single row.
+    try std.testing.expect(parsed.value.object.get("points") == null);
 }
 
 test "buildDeletePayload generates valid JSON" {
