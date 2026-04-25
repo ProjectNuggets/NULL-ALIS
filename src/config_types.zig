@@ -12,14 +12,9 @@ pub const DEFAULT_MODEL_MAX_TOKENS: u32 = 8192;
 /// Re-exported from security/policy.zig — single source of truth (with methods).
 pub const AutonomyLevel = @import("security/policy.zig").AutonomyLevel;
 
-// ── Hardware Transport ──────────────────────────────────────────
-
-pub const HardwareTransport = enum {
-    none,
-    native,
-    serial,
-    probe,
-};
+// HardwareTransport enum removed D19 (2026-04-25) — V1 stripped the
+// hardware surface; no consumers, no runtime registration, no callers
+// outside the now-deleted HardwareConfig struct.
 
 // ── Sandbox Backend ─────────────────────────────────────────────
 
@@ -1099,16 +1094,9 @@ pub const PeripheralsConfig = struct {
     boards: []const PeripheralBoardConfig = &.{},
 };
 
-// ── Hardware config ─────────────────────────────────────────────
-
-pub const HardwareConfig = struct {
-    enabled: bool = false,
-    transport: HardwareTransport = .none,
-    serial_port: ?[]const u8 = null,
-    baud_rate: u32 = 115200,
-    probe_target: ?[]const u8 = null,
-    workspace_datasheets: bool = false,
-};
+// HardwareConfig struct removed D19 (2026-04-25) alongside
+// HardwareTransport. Restore from git history at the D19 commit if
+// a future fork ever reintroduces embedded-device support.
 
 // ── Security sub-configs ────────────────────────────────────────
 

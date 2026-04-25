@@ -789,7 +789,10 @@ pub fn allTools(
         screenshot_enabled: bool = false,
         composio_api_key: ?[]const u8 = null,
         browser_open_domains: ?[]const []const u8 = null,
-        hardware_boards: ?[]const []const u8 = null,
+        // hardware_boards: removed D19 (2026-04-25) — V1 stripped the
+        // hardware surface. The legacy-caller stub at line 1035 went
+        // with it; restore from git history if a fork ever reintroduces
+        // embedded-device support.
         mcp_tools: ?[]const Tool = null,
         agents: ?[]const @import("../config.zig").NamedAgentConfig = null,
         fallback_api_key: ?[]const u8 = null,
@@ -1032,11 +1035,9 @@ pub fn allTools(
         try list.append(allocator, bot.tool());
     }
 
-    // Hardware/IoT tools removed in V1 convergence — nullalis is a
-    // second-brain runtime, not an embedded-device runtime. If `opts.hardware_boards`
-    // is set by legacy callers it is now ignored; kept in the options struct
-    // for ABI stability across the one-release transition window.
-    _ = opts.hardware_boards;
+    // Hardware/IoT tools fully removed D19 (2026-04-25). Was kept as
+    // a one-release transition stub; that window has elapsed. The
+    // hardware_boards field is now gone from the options struct too.
 
     // Task management tools (Phase 2: REQ-006)
     if (opts.task_delivery) |delivery| {

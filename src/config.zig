@@ -6,7 +6,7 @@ pub const config_parse = @import("config_parse.zig");
 // ── Re-export all types so downstream `@import("config.zig").Foo` still works ──
 
 pub const AutonomyLevel = config_types.AutonomyLevel;
-pub const HardwareTransport = config_types.HardwareTransport;
+// HardwareTransport: removed D19 (2026-04-25) — V1 stripped the hardware surface.
 pub const SandboxBackend = config_types.SandboxBackend;
 pub const DiagnosticsConfig = config_types.DiagnosticsConfig;
 pub const AutonomyConfig = config_types.AutonomyConfig;
@@ -66,7 +66,7 @@ pub const IdentityConfig = config_types.IdentityConfig;
 pub const CostConfig = config_types.CostConfig;
 pub const PeripheralBoardConfig = config_types.PeripheralBoardConfig;
 pub const PeripheralsConfig = config_types.PeripheralsConfig;
-pub const HardwareConfig = config_types.HardwareConfig;
+// HardwareConfig: removed D19 (2026-04-25) alongside HardwareTransport.
 pub const SandboxConfig = config_types.SandboxConfig;
 pub const ResourceLimitsConfig = config_types.ResourceLimitsConfig;
 pub const AuditConfig = config_types.AuditConfig;
@@ -136,7 +136,7 @@ pub const Config = struct {
     identity: IdentityConfig = .{},
     cost: CostConfig = .{},
     peripherals: PeripheralsConfig = .{},
-    hardware: HardwareConfig = .{},
+    // hardware: HardwareConfig field removed D19 (2026-04-25).
     security: SecurityConfig = .{},
     tools: ToolsConfig = .{},
     session: SessionConfig = .{},
@@ -890,7 +890,8 @@ pub const Config = struct {
         }
         try w.print("\n  }},\n", .{});
 
-        try w.print("  \"hardware\": {f},\n", .{std.json.fmt(self.hardware, .{})});
+        // "hardware" serialization removed D19 (2026-04-25) alongside the
+        // HardwareConfig struct itself.
         try w.print("  \"session\": {f}\n", .{std.json.fmt(self.session, .{})});
 
         try w.print("}}\n", .{});
@@ -1554,9 +1555,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.peripherals.enabled = true;
     cfg.peripherals.datasheet_dir = "/tmp/ds";
 
-    cfg.hardware.serial_port = "/dev/tty.usbmodem1";
-    cfg.hardware.probe_target = "stm32f401cc";
-    cfg.hardware.workspace_datasheets = true;
+    // hardware.* fixture writes removed D19 (2026-04-25).
 
     cfg.session.dm_scope = .per_peer;
     cfg.session.idle_minutes = 45;
@@ -1618,7 +1617,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(@as(u8, 70), loaded.cost.warn_at_percent);
     try std.testing.expectEqual(config_types.SandboxBackend.firejail, loaded.security.sandbox.backend);
     try std.testing.expect(loaded.peripherals.enabled);
-    try std.testing.expectEqualStrings("/dev/tty.usbmodem1", loaded.hardware.serial_port.?);
+    // hardware.* roundtrip assertion removed D19 (2026-04-25).
     try std.testing.expectEqual(config_types.DmScope.per_peer, loaded.session.dm_scope);
     try std.testing.expectEqual(@as(usize, 1), loaded.session.identity_links.len);
 }
@@ -1975,19 +1974,8 @@ test "json parse identity section" {
     allocator.free(cfg.identity.aieos_path.?);
 }
 
-test "json parse hardware section" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"hardware": {"enabled": true, "transport": "serial", "serial_port": "/dev/ttyACM0", "baud_rate": 9600}}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-    try std.testing.expect(cfg.hardware.enabled);
-    try std.testing.expectEqual(HardwareTransport.serial, cfg.hardware.transport);
-    try std.testing.expectEqualStrings("/dev/ttyACM0", cfg.hardware.serial_port.?);
-    try std.testing.expectEqual(@as(u32, 9600), cfg.hardware.baud_rate);
-    allocator.free(cfg.hardware.serial_port.?);
-}
+// "json parse hardware section" test removed D19 (2026-04-25)
+// alongside HardwareConfig + the parser branch in config_parse.zig.
 
 test "json parse security section" {
     const allocator = std.testing.allocator;
