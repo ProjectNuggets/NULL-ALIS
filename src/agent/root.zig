@@ -16,6 +16,7 @@ const ChatResponse = providers.ChatResponse;
 const ToolSpec = providers.ToolSpec;
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
+const result_cache_mod = @import("../tools/result_cache.zig");
 const entitlement_mod = @import("../entitlement.zig");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
@@ -1958,9 +1959,40 @@ pub const Agent = struct {
                 .workspace_dir = self.workspace_dir,
             });
 
+            // **D1.14** — generalized tool-result cache.
+            // For tools flagged `cacheable`, check the global cache
+            // before executing. Hit → synthesize ToolExecutionResult
+            // from cached output, skip the dispatch. Miss → execute,
+            // then put successful results into the cache with the
+            // metadata's TTL. Mutating tools are statically prevented
+            // from being cacheable via ToolFlags.validate.
+            const cache_meta = self.metadataForToolCall(call);
+            var cache_hit_used: bool = false;
             const tool_timer = std.time.milliTimestamp();
-            const result = self.executeTool(tool_allocator, call);
+            const result = blk: {
+                if (cache_meta.flags.cacheable) {
+                    if (result_cache_mod.global.get(tool_allocator, call.name, call.arguments_json)) |hit| {
+                        cache_hit_used = true;
+                        break :blk dispatcher.ToolExecutionResult{
+                            .name = try tool_allocator.dupe(u8, call.name),
+                            .output = hit.output,
+                            .success = hit.success,
+                            .tool_call_id = if (call.tool_call_id) |id| try tool_allocator.dupe(u8, id) else null,
+                        };
+                    }
+                }
+                break :blk self.executeTool(tool_allocator, call);
+            };
             const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
+
+            // **D1.14** — store successful results in the cache on
+            // miss + cacheable. Failures are NOT cached (a transient
+            // 500 from web_search shouldn't pollute future calls).
+            if (!cache_hit_used and cache_meta.flags.cacheable and result.success and cache_meta.cache_ttl_secs > 0) {
+                result_cache_mod.global.put(call.name, call.arguments_json, result.output, result.success, cache_meta.cache_ttl_secs) catch |err| {
+                    log.warn("D1.14.cache_put_failed tool={s} err={s}", .{ call.name, @errorName(err) });
+                };
+            }
 
             const tool_event = ObserverEvent{ .tool_call = .{
                 .tool = call.name,
@@ -1969,7 +2001,7 @@ pub const Agent = struct {
                 .tool_use_id = tool_use_id,
                 .output_preview = result.output,
                 .output_truncated = result.output.len > 256,
-                .result_summary = if (result.success) "completed" else "failed",
+                .result_summary = if (cache_hit_used) "cache_hit" else if (result.success) "completed" else "failed",
                 .command = command,
                 .files = files,
                 .run_id = self.current_run_id,
@@ -2414,6 +2446,23 @@ pub const Agent = struct {
         var turn_compaction_ms: u64 = 0;
         var turn_first_token_ms: ?u64 = null;
         var turn_first_token_upper_bound_ms: ?u64 = null;
+
+        // **D1.7** — accumulator for task_ids spawned during this turn
+        // (via the `spawn` tool — `delegate` is synchronous and inlines
+        // its result, so no task_id to track). Populated by parsing the
+        // spawn tool's result string ("Subagent 'X' spawned with
+        // task_id=N state=queued ...") after each tool execution. Owned
+        // by the turn body until ownership transfers to the returned
+        // TurnOutcome at exit; freed by `spawned_task_ids_cleanup`
+        // defer if no transfer happens (e.g. error path).
+        var spawned_task_ids_acc: std.ArrayListUnmanaged([]const u8) = .empty;
+        var spawned_task_ids_transferred: bool = false;
+        defer {
+            if (!spawned_task_ids_transferred) {
+                for (spawned_task_ids_acc.items) |id| self.allocator.free(id);
+                spawned_task_ids_acc.deinit(self.allocator);
+            }
+        }
 
         // ── Adaptive exit: repeated-call detector ─────────────────────────
         // Tracks the FNV-1a hash of the last 3 tool call sets (name+args). If
@@ -3556,9 +3605,13 @@ pub const Agent = struct {
                 // ran in prior iterations (turn_tool_calls_total > 0) AND
                 // the final text is empty. Must fire BEFORE turn_complete
                 // so SSE consumers see them in causal order.
+                // D1.7: now includes spawned_task_ids — the actual numeric
+                // IDs the spawn tool emitted, not just a count. Borrowed
+                // view; event handlers don't take ownership.
                 if (final_text.len == 0 and turn_tool_calls_total > 0) {
                     const tool_only_event = ObserverEvent{ .tool_only_turn = .{
                         .tool_calls_executed = turn_tool_calls_total,
+                        .spawned_task_ids = spawned_task_ids_acc.items,
                         .iterations_used = turn_tool_iterations,
                         .run_id = self.current_run_id,
                     } };
@@ -3766,18 +3819,82 @@ pub const Agent = struct {
                         ctx.flushValidatedReply(audio_reply);
                     }
                     self.allocator.free(final_text);
+                    spawned_task_ids_transferred = true;
+                    const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
                     return TurnOutcome{
                         .text = audio_reply,
+                        .tool_only_turn = false,
+                        .spawned_task_ids = ids,
                         .iterations_used = turn_tool_iterations,
                     };
                 }
                 if (stream_timing_ctx) |*ctx| {
                     ctx.flushValidatedReply(final_text);
                 }
+                spawned_task_ids_transferred = true;
+                const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
                 return TurnOutcome{
                     .text = final_text,
+                    .tool_only_turn = (final_text.len == 0 and turn_tool_calls_total > 0),
+                    .spawned_task_ids = ids,
                     .iterations_used = turn_tool_iterations,
                 };
+            }
+
+            // ── Adaptive exit: repeated-call detector ─────────────────────
+            //
+            // **D1.10** — moved BEFORE the assistant-history append +
+            // tool execution. Pre-D1.10 this fired AFTER the assistant
+            // append + history write + tool execution: the iteration
+            // did all the wasted work and exited via the next
+            // iteration's top-of-loop check. Per
+            // P2_agent_turn_loop.md ugly truth #6 the work was waste.
+            //
+            // The Anthropic-compat concern (assistant tool_use without
+            // paired tool_result errors the provider) is addressed by
+            // EXITING BEFORE the assistant message is appended at
+            // all — so history stays clean for the exhausted-iter
+            // summary call. The model's looped response is dropped
+            // from the conversation transcript; the summary prompt
+            // ("SYSTEM: You have reached the maximum number of tool
+            // iterations…") provides sufficient context for the
+            // wrap-up call to succeed.
+            //
+            // Hash this iteration's tool call set. If the same hash
+            // has appeared in every slot of the ring buffer
+            // (LOOP_WINDOW consecutive iterations), we're looping —
+            // free response, break.
+            var h = std.hash.Fnv1a_64.init();
+            for (parsed_calls) |call| {
+                h.update(call.name);
+                h.update("\x00");
+                h.update(call.arguments_json);
+                h.update("\x01");
+            }
+            const call_set_hash = h.final();
+            recent_call_hashes[recent_call_idx % LOOP_WINDOW] = call_set_hash;
+            recent_call_idx += 1;
+            if (recent_call_idx >= LOOP_WINDOW) {
+                var all_same = true;
+                for (recent_call_hashes) |hv| {
+                    if (hv != call_set_hash) {
+                        all_same = false;
+                        break;
+                    }
+                }
+                if (all_same) {
+                    loop_detected = true;
+                    log.warn("agent.loop_detected iteration={d} hash={x} — same tool_call set repeated {d}x, EARLY EXIT (D1.10)", .{
+                        iteration,
+                        call_set_hash,
+                        LOOP_WINDOW,
+                    });
+                    self.freeResponseFields(&response);
+                    // assistant_history_content / parsed_calls / parsed_text
+                    // get freed by the iteration-body defer (the
+                    // free_* flags were set during parsing earlier).
+                    break;
+                }
             }
 
             // There are tool calls — print intermediary text.
@@ -3806,39 +3923,6 @@ pub const Agent = struct {
                 .content = assistant_content,
             });
 
-            // ── Adaptive exit: repeated-call detector ─────────────────────
-            // Hash this iteration's tool call set. If the same hash has
-            // appeared in every slot of the ring buffer (LOOP_WINDOW
-            // consecutive iterations), we're looping — set loop_detected so
-            // the outer loop can exit cleanly after this iteration completes.
-            var h = std.hash.Fnv1a_64.init();
-            for (parsed_calls) |call| {
-                h.update(call.name);
-                h.update("\x00");
-                h.update(call.arguments_json);
-                h.update("\x01");
-            }
-            const call_set_hash = h.final();
-            recent_call_hashes[recent_call_idx % LOOP_WINDOW] = call_set_hash;
-            recent_call_idx += 1;
-            if (recent_call_idx >= LOOP_WINDOW) {
-                var all_same = true;
-                for (recent_call_hashes) |hv| {
-                    if (hv != call_set_hash) {
-                        all_same = false;
-                        break;
-                    }
-                }
-                if (all_same) {
-                    loop_detected = true;
-                    log.warn("agent.loop_detected iteration={d} hash={x} — same tool_call set repeated {d}x, will exit after this iteration", .{
-                        iteration,
-                        call_set_hash,
-                        LOOP_WINDOW,
-                    });
-                }
-            }
-
             // Execute tool calls (serial by default, optional parallel dispatcher)
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
             defer results_buf.deinit(self.allocator);
@@ -3857,6 +3941,36 @@ pub const Agent = struct {
                 if (used_parallel_dispatch) "parallel" else "serial",
                 parsed_calls.len,
             });
+
+            // **D1.7** — capture spawned task_ids from any `spawn` tool
+            // calls in this iteration's results. Spawn's result format
+            // is "Subagent '<label>' spawned with task_id=<N> state=
+            // queued. ..." (`src/tools/spawn.zig:62-66`). We parse the
+            // numeric task_id and accumulate it for the TurnOutcome.
+            // `delegate` is intentionally excluded — it runs synchronously
+            // and inlines its result, so there's no async task to track.
+            // `schedule` similarly creates a cron entry, not a subagent
+            // task — its IDs would belong in a separate channel if ever
+            // needed.
+            for (results_buf.items, 0..) |result, idx| {
+                if (idx >= parsed_calls.len) break;
+                if (!std.mem.eql(u8, parsed_calls[idx].name, "spawn")) continue;
+                if (!result.success) continue;
+                const marker = "task_id=";
+                const start = std.mem.indexOf(u8, result.output, marker) orelse continue;
+                const num_start = start + marker.len;
+                var num_end = num_start;
+                while (num_end < result.output.len and std.ascii.isDigit(result.output[num_end])) num_end += 1;
+                if (num_end == num_start) continue;
+                const task_id_str = self.allocator.dupe(u8, result.output[num_start..num_end]) catch |err| {
+                    log.warn("D1.7.spawn_task_id_capture_failed err={s}", .{@errorName(err)});
+                    continue;
+                };
+                spawned_task_ids_acc.append(self.allocator, task_id_str) catch |err| {
+                    log.warn("D1.7.spawn_task_id_append_failed err={s}", .{@errorName(err)});
+                    self.allocator.free(task_id_str);
+                };
+            }
 
             if (self.pending_tool_approval) |pending| {
                 try self.appendPendingApprovalToolHistory(arena, results_buf.items);
@@ -3879,8 +3993,11 @@ pub const Agent = struct {
                 });
 
                 self.freeResponseFields(&response);
+                spawned_task_ids_transferred = true;
+                const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
                 return TurnOutcome{
                     .text = approval_text,
+                    .spawned_task_ids = ids,
                     .iterations_used = turn_tool_iterations,
                 };
             }
@@ -4016,8 +4133,11 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
+            spawned_task_ids_transferred = true;
+            const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
             return TurnOutcome{
                 .text = fallback,
+                .spawned_task_ids = ids,
                 .iterations_used = turn_tool_iterations,
                 .loop_detected = loop_detected,
             };
@@ -4064,8 +4184,11 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
+            spawned_task_ids_transferred = true;
+            const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
             return TurnOutcome{
                 .text = fallback,
+                .spawned_task_ids = ids,
                 .iterations_used = turn_tool_iterations,
                 .loop_detected = loop_detected,
             };
@@ -4113,8 +4236,11 @@ pub const Agent = struct {
             total_turn_ms,
         });
 
+        spawned_task_ids_transferred = true;
+        const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
         return TurnOutcome{
             .text = prefixed,
+            .spawned_task_ids = ids,
             .iterations_used = turn_tool_iterations,
             .loop_detected = loop_detected,
         };

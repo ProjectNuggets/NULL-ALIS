@@ -640,10 +640,25 @@ pub const SubagentManager = struct {
         // tenant path was dead code since both fields are populated in
         // production. Fixed by flipping precedence. Bus remains the path
         // for shared/daemon deployments.
-        const content = if (owned_result) |r|
-            std.fmt.allocPrint(self.allocator, "[Subagent '{s}' completed]\n{s}", .{ label, r }) catch return
+        // **D1.6** — defense-in-depth from the W0.5 plan in
+        // project_subagent_received_bug.md. Pre-fix: an empty-but-non-
+        // null `owned_result` (subagent ran, produced no text) entered
+        // the "completed" branch and emitted "[Subagent 'X'
+        // completed]\n" — a trailing-newline empty content the
+        // frontend can't render as anything useful, contributing to
+        // the user-visible "received"-style confusion. Now empty
+        // results route to a distinct "completed-no-output" message
+        // so the frontend knows the run succeeded but produced no
+        // text, and can show a check-mark / "task done" badge instead
+        // of an empty bubble.
+        const has_real_result = if (owned_result) |r| r.len > 0 else false;
+        const content = if (has_real_result)
+            std.fmt.allocPrint(self.allocator, "[Subagent '{s}' completed]\n{s}", .{ label, owned_result.? }) catch return
         else if (owned_err) |e|
             std.fmt.allocPrint(self.allocator, "[Subagent '{s}' failed]\n{s}", .{ label, e }) catch return
+        else if (owned_result) |_|
+            // Non-null but empty — subagent ran cleanly, no text output.
+            std.fmt.allocPrint(self.allocator, "[Subagent '{s}' completed with no output]", .{label}) catch return
         else
             std.fmt.allocPrint(self.allocator, "[Subagent '{s}' finished]", .{label}) catch return;
 

@@ -1120,6 +1120,14 @@ pub const MemoryRuntime = struct {
     _allocator: std.mem.Allocator,
     _search_enabled: bool = true,
 
+    /// **D1.15** — atomic flag set when `warmupSession` finishes
+    /// pre-fetching for the current session. Hot-path callers can
+    /// use this as a hint (e.g. "warmup not done — return degraded
+    /// result fast and let the next turn benefit from a hot cache").
+    /// Not gating today; presence here is the contract for D1.15
+    /// follow-up commits to wire the spawn-on-session-boot pattern.
+    _warmup_complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     // P5: rollout policy
     _rollout_policy: rollout.RolloutPolicy = .{ .mode = .on, .canary_percent = 0, .shadow_percent = 0 },
 
@@ -1140,6 +1148,64 @@ pub const MemoryRuntime = struct {
 
     fn effectiveEngineTopK(limit: usize) u32 {
         return @intCast(@min(limit, @as(usize, std.math.maxInt(u32))));
+    }
+
+    /// **D1.15** — pre-warm retrieval-engine + embedding caches +
+    /// vector store for `session_id`. Targets the 900ms variance flagged
+    /// in `project_agent_turn_audit_followups.md` finding #1: first
+    /// `memory_enrich` after session restore takes ~1044ms (cold);
+    /// subsequent turns hit warm caches and finish in ~111ms.
+    ///
+    /// The warmup runs a small set of canned queries that exercise the
+    /// hot path — semantic recall touches the embedding cache + vector
+    /// store + RRF index. After warmup completes,
+    /// `_warmup_complete.store(true)` flips the flag; hot-path callers
+    /// that observe it can skip degraded-fallback paths.
+    ///
+    /// Designed to run in a background thread spawned at session boot
+    /// (the spawn wiring lands in a follow-up commit). Calling on the
+    /// hot path is safe but redundant — the second call is a no-op
+    /// once `_warmup_complete` is true.
+    ///
+    /// **Cost:** ~1 semantic search worth of work, single-shot per
+    /// session. The amortized win is the elimination of the cold-
+    /// start penalty on the user's first turn after restore.
+    pub fn warmupSession(self: *MemoryRuntime, session_id: ?[]const u8) void {
+        if (self._warmup_complete.load(.acquire)) return;
+        if (!self._search_enabled or self._engine == null) {
+            // No engine to warm — mark complete so callers don't
+            // spin waiting for a no-op.
+            self._warmup_complete.store(true, .release);
+            return;
+        }
+
+        // Canned queries that exercise the hot path. Kept short and
+        // generic; the goal is to populate the embedding cache + RRF
+        // ranking state, not to retrieve specific facts. Real
+        // user-relevant pre-fetch (e.g. "what was this user asking
+        // about last session") would need session-context awareness
+        // and is a follow-up if the lean version proves insufficient.
+        const seeds = [_][]const u8{ "context", "preferences", "recent" };
+
+        var arena = std.heap.ArenaAllocator.init(self._allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        for (seeds) |seed| {
+            const candidates = self.search(a, seed, 4, session_id) catch continue;
+            // Discard results — only the side-effect of populating
+            // the engine's caches matters here.
+            _ = candidates;
+        }
+
+        self._warmup_complete.store(true, .release);
+    }
+
+    /// **D1.15** — observability hook for callers that want to know
+    /// whether warmup has completed. Hot path can render a "warming
+    /// up" badge or prefer degraded-fast results during the gap.
+    pub fn warmupComplete(self: *const MemoryRuntime) bool {
+        return self._warmup_complete.load(.acquire);
     }
 
     /// High-level search: uses rollout policy to decide keyword-only vs hybrid.
