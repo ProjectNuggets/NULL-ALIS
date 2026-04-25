@@ -122,25 +122,24 @@ pub const ComposioTool = struct {
         // the v3/v2 distinction because we always try v3 first and a
         // successful v3 response makes v2 moot.
         //
-        // Gated on `!builtin.is_test` because the cache is module-
-        // scoped and existing tests that exercise listActions against
-        // the live API would leak their heap-allocated cache entries
-        // past the test-allocator's lifetime. The cache is a pure
-        // production optimization; bypassing it in tests costs nothing
-        // there and guarantees clean shutdown.
+        // Lifetime: the cache holds copies in its own long-lived
+        // `storage_allocator` (page_allocator), independent of the
+        // per-turn `allocator` passed in here. `get` returns a fresh
+        // copy in the caller's allocator so the turn owns the returned
+        // bytes; `put` copies into the cache's storage so the caller's
+        // bytes can be freed at end-of-turn. This crossing of allocator
+        // boundaries is the whole point — without it, an entry written
+        // by one turn becomes a dangling pointer after that turn's
+        // arena dies (the original PR #19 bug).
         const cache_key = app orelse "__all__";
-        if (!builtin.is_test) {
-            if (list_cache.get(allocator, cache_key)) |cached| {
-                return ToolResult{ .success = true, .output = cached };
-            }
+        if (list_cache.get(allocator, cache_key)) |cached| {
+            return ToolResult{ .success = true, .output = cached };
         }
 
         // Try v3 first, fall back to v2
         const v3_result = try self.listActionsV3(allocator, app);
         if (v3_result.success) {
-            if (!builtin.is_test) {
-                list_cache.put(allocator, cache_key, v3_result.output) catch {};
-            }
+            list_cache.put(cache_key, v3_result.output) catch {};
             return v3_result;
         }
 
@@ -149,8 +148,8 @@ pub const ComposioTool = struct {
         if (v3_result.output.len > 0) allocator.free(v3_result.output);
 
         const v2_result = try self.listActionsV2(allocator, app);
-        if (v2_result.success and !builtin.is_test) {
-            list_cache.put(allocator, cache_key, v2_result.output) catch {};
+        if (v2_result.success) {
+            list_cache.put(cache_key, v2_result.output) catch {};
         }
         return v2_result;
     }
@@ -526,9 +525,25 @@ pub const ComposioTool = struct {
 // S7.15 — 60s TTL cache for Composio `list` action results.
 //
 // Small fixed-slot cache (16 entries; 1 per app-filter). Entries are
-// keyed by the app name (or `"__all__"` for the no-filter case). Both
-// key and value are heap-allocated and freed on eviction. Thread-safe
-// via a single mutex. Reset helper provided for tests.
+// keyed by the app name (or `"__all__"` for the no-filter case).
+//
+// Lifetime model (the bug fix from PR #19):
+//   * `storage_allocator` is module-owned and long-lived. It backs every
+//     stored key/value. We default it to `std.heap.page_allocator` so
+//     the cache is safe before any explicit install — the daemon never
+//     has to remember to wire it. The cache holds at most
+//     `LIST_CACHE_SLOTS` entries, each bounded by the API response
+//     size, so page_allocator's lack of a free-list is fine here.
+//   * Per-turn allocators are NEVER stored. `put` copies inputs into
+//     `storage_allocator`; `get` copies the cached value into the
+//     caller's allocator so the returned slice rides the turn lifetime.
+//   * The earlier design stored slices allocated by the per-turn
+//     allocator that called `put`. When that turn's arena died, those
+//     slices became dangling pointers — and the next turn's
+//     `mem.eql` walk over `entry.key` aborted the gateway. See the
+//     "survives caller allocator death" regression test below.
+//
+// Thread-safe via a single mutex. Reset helper provided for tests.
 const LIST_CACHE_TTL_MS: i64 = 60_000;
 const LIST_CACHE_SLOTS: usize = 16;
 
@@ -541,10 +556,18 @@ const ListCacheEntry = struct {
 const ListCache = struct {
     mutex: std.Thread.Mutex = .{},
     entries: [LIST_CACHE_SLOTS]ListCacheEntry = [_]ListCacheEntry{.{}} ** LIST_CACHE_SLOTS,
+    /// Long-lived backing allocator for every stored key/value. Must
+    /// outlive every per-turn allocator that calls `put` or `get`.
+    /// Defaulted to page_allocator so production paths never need an
+    /// init step. Tests swap it via `setStorageAllocatorForTest` so
+    /// the std.testing.allocator leak detector can verify cleanup.
+    storage_allocator: std.mem.Allocator = std.heap.page_allocator,
 
-    /// Return a fresh heap copy of the cached value for `key`, or null
-    /// if absent/expired. Caller owns the returned slice.
-    fn get(self: *ListCache, allocator: std.mem.Allocator, key: []const u8) ?[]u8 {
+    /// Return a fresh copy of the cached value for `key`, allocated in
+    /// `caller_allocator` so the caller (a per-turn allocator) owns
+    /// the returned bytes and can free them at end-of-turn. Returns
+    /// null on miss or expiry.
+    fn get(self: *ListCache, caller_allocator: std.mem.Allocator, key: []const u8) ?[]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
         const now = std.time.milliTimestamp();
@@ -553,37 +576,39 @@ const ListCache = struct {
             if (!std.mem.eql(u8, ek, key)) continue;
             if (now > entry.expires_at_ms) return null;
             const v = entry.value orelse return null;
-            return allocator.dupe(u8, v) catch null;
+            return caller_allocator.dupe(u8, v) catch null;
         }
         return null;
     }
 
-    /// Store `value` under `key` with the module TTL. Takes ownership
-    /// of nothing — both `key` and `value` are copied. On collision or
-    /// expiry the oldest entry gets evicted (simple LRU approximated
-    /// by expires_at_ms comparison).
-    fn put(self: *ListCache, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    /// Store `value` under `key` with the module TTL. Both inputs are
+    /// copied into `self.storage_allocator`; the caller may free its
+    /// own copies as soon as this returns. On collision the existing
+    /// entry is updated; otherwise the first empty slot is filled, or
+    /// the entry with the earliest expiry is evicted.
+    fn put(self: *ListCache, key: []const u8, value: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const now = std.time.milliTimestamp();
         const new_expiry = now + LIST_CACHE_TTL_MS;
+        const a = self.storage_allocator;
 
         // First pass: update existing entry or fill an empty slot.
         for (&self.entries) |*entry| {
             if (entry.key) |ek| {
                 if (std.mem.eql(u8, ek, key)) {
-                    if (entry.value) |v| allocator.free(v);
-                    entry.value = try allocator.dupe(u8, value);
+                    if (entry.value) |v| a.free(v);
+                    entry.value = try a.dupe(u8, value);
                     entry.expires_at_ms = new_expiry;
                     return;
                 }
             } else {
-                entry.key = try allocator.dupe(u8, key);
+                entry.key = try a.dupe(u8, key);
                 errdefer {
-                    allocator.free(entry.key.?);
+                    a.free(entry.key.?);
                     entry.key = null;
                 }
-                entry.value = try allocator.dupe(u8, value);
+                entry.value = try a.dupe(u8, value);
                 entry.expires_at_ms = new_expiry;
                 return;
             }
@@ -599,63 +624,117 @@ const ListCache = struct {
             }
         }
         const victim = &self.entries[victim_idx];
-        if (victim.key) |k| allocator.free(k);
-        if (victim.value) |v| allocator.free(v);
-        victim.key = try allocator.dupe(u8, key);
+        if (victim.key) |k| a.free(k);
+        if (victim.value) |v| a.free(v);
+        victim.key = try a.dupe(u8, key);
         errdefer {
-            allocator.free(victim.key.?);
+            a.free(victim.key.?);
             victim.key = null;
         }
-        victim.value = try allocator.dupe(u8, value);
+        victim.value = try a.dupe(u8, value);
         victim.expires_at_ms = new_expiry;
     }
 
-    /// Reset helper — clears all entries + frees their backing
-    /// allocations. Test-only.
-    pub fn resetForTest(self: *ListCache, allocator: std.mem.Allocator) void {
+    /// Reset helper — clears all entries and frees their backing
+    /// allocations through `self.storage_allocator`. Test-only.
+    pub fn resetForTest(self: *ListCache) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        const a = self.storage_allocator;
         for (&self.entries) |*entry| {
-            if (entry.key) |k| allocator.free(k);
-            if (entry.value) |v| allocator.free(v);
+            if (entry.key) |k| a.free(k);
+            if (entry.value) |v| a.free(v);
             entry.key = null;
             entry.value = null;
             entry.expires_at_ms = 0;
         }
+    }
+
+    /// Test-only: install a different storage allocator (typically
+    /// `std.testing.allocator`) so the leak detector can verify the
+    /// cache frees everything on `resetForTest`. Caller must reset the
+    /// cache before swapping allocators — entries allocated through
+    /// the previous allocator cannot be freed through the new one.
+    pub fn setStorageAllocatorForTest(self: *ListCache, allocator: std.mem.Allocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.storage_allocator = allocator;
     }
 };
 
 var list_cache: ListCache = .{};
 
 test "ListCache put + get roundtrip" {
-    const allocator = std.testing.allocator;
-    defer list_cache.resetForTest(allocator);
-    list_cache.resetForTest(allocator);
+    list_cache.resetForTest();
+    list_cache.setStorageAllocatorForTest(std.testing.allocator);
+    defer {
+        list_cache.resetForTest();
+        list_cache.setStorageAllocatorForTest(std.heap.page_allocator);
+    }
 
-    try list_cache.put(allocator, "gmail", "action-list-1");
-    const got = list_cache.get(allocator, "gmail") orelse return error.CacheMissUnexpected;
-    defer allocator.free(got);
+    try list_cache.put("gmail", "action-list-1");
+    const got = list_cache.get(std.testing.allocator, "gmail") orelse return error.CacheMissUnexpected;
+    defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("action-list-1", got);
 }
 
 test "ListCache miss on unknown key" {
-    const allocator = std.testing.allocator;
-    defer list_cache.resetForTest(allocator);
-    list_cache.resetForTest(allocator);
+    list_cache.resetForTest();
+    list_cache.setStorageAllocatorForTest(std.testing.allocator);
+    defer {
+        list_cache.resetForTest();
+        list_cache.setStorageAllocatorForTest(std.heap.page_allocator);
+    }
 
-    try std.testing.expect(list_cache.get(allocator, "nonexistent") == null);
+    try std.testing.expect(list_cache.get(std.testing.allocator, "nonexistent") == null);
 }
 
 test "ListCache update existing key frees old value" {
-    const allocator = std.testing.allocator;
-    defer list_cache.resetForTest(allocator);
-    list_cache.resetForTest(allocator);
+    list_cache.resetForTest();
+    list_cache.setStorageAllocatorForTest(std.testing.allocator);
+    defer {
+        list_cache.resetForTest();
+        list_cache.setStorageAllocatorForTest(std.heap.page_allocator);
+    }
 
-    try list_cache.put(allocator, "notion", "v1-payload");
-    try list_cache.put(allocator, "notion", "v2-payload");
-    const got = list_cache.get(allocator, "notion") orelse return error.CacheMissUnexpected;
-    defer allocator.free(got);
+    try list_cache.put("notion", "v1-payload");
+    try list_cache.put("notion", "v2-payload");
+    const got = list_cache.get(std.testing.allocator, "notion") orelse return error.CacheMissUnexpected;
+    defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("v2-payload", got);
+}
+
+test "ListCache survives caller allocator death (PR #19 regression)" {
+    // Reproduces the bug: a per-turn allocator puts into the cache,
+    // dies, and a later turn reads back. Pre-fix, the cache stored
+    // slices in the dying allocator and the second `mem.eql` aborted
+    // the gateway.
+    list_cache.resetForTest();
+    list_cache.setStorageAllocatorForTest(std.testing.allocator);
+    defer {
+        list_cache.resetForTest();
+        list_cache.setStorageAllocatorForTest(std.heap.page_allocator);
+    }
+
+    // Turn A: dupe key/value through a short-lived arena, put into
+    // the cache, then tear the arena down. The cache must have its
+    // own copies — not pointers into the freed arena.
+    {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const turn_alloc = arena.allocator();
+        const key = try turn_alloc.dupe(u8, "gmail");
+        const value = try turn_alloc.dupe(u8, "action-list-payload");
+        try list_cache.put(key, value);
+        // arena.deinit() at scope exit invalidates `key` and `value`.
+    }
+
+    // Turn B: read back through a different allocator. Pre-fix this
+    // either returned garbage or aborted; post-fix it returns clean.
+    const got = list_cache.get(std.testing.allocator, "gmail") orelse
+        return error.CacheMissUnexpected;
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("action-list-payload", got);
 }
 
 /// Heuristic rate-limit detector: look for "429" + a rate-related token
