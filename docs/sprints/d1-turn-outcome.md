@@ -55,6 +55,31 @@ This sprint is **the agent's intelligence sprint**. The goal is not just D1 the 
 | D1.14 | **Tool result caching, generalized.** The composio `ListCache` pattern (long-lived storage_allocator, TTL, key-by-args-hash) generalized into `src/tools/result_cache.zig`. Opt-in per tool via `ToolMetadata.flags.cacheable + cache_ttl_secs`. | Tool calls that are deterministic+expensive (memory_recall with same query, web_search with same q) return cached. Cuts latency + cost. | New module mirroring composio's pattern. Wire 2-3 tools as initial subscribers. Cache invalidation: TTL only, no manual invalidation in v1. |
 | D1.15 | **Memory background warmup on session restore.** The audit followup memo flagged the 900ms `memory_enrich` variance: cold cache on first turn after session restore. Pre-warm common queries (semantic recall on the most-recent topic, RRF index hydration) in a background thread when session boot completes. Hot path returns degraded-but-fast on the first turn while warmup completes. | Closes `project_agent_turn_audit_followups.md` finding #1. ~900ms saved on first-turn-after-restore. | New `memory.warmupSession` called from session boot. Background thread. Hot path checks `warmup_complete` flag and chooses fresh-vs-stale. |
 
+### Sprint close-out (2026-04-25)
+
+**All 14 items addressed across two PRs:**
+
+- **PR #36** (sprint/d1-turn-outcome) — Phase 1 + most of Phase 3 + D1.13 verification: D1.1, D1.2, D1.3, D1.4, D1.8, D1.9, D1.11, D1.12, D1.13✓
+- **PR #TBD** (sprint/d1-followups) — Remaining items: D1.6, D1.7, D1.10, D1.14, D1.15
+- **zaki-prod PR #8** (feat/d1.5-tool-only-turn-sse) — D1.5 cross-repo
+
+**Status of each item:**
+- ✅ D1.1 TurnOutcome struct
+- ✅ D1.2 turnOutcome() returns TurnOutcome, turn() wraps
+- ✅ D1.3 Session stores TurnOutcome
+- ✅ D1.4 tool_only_turn ObserverEvent + emit
+- ✅ D1.5 zaki-prod consumes tool_only_turn SSE
+- ✅ D1.6 subagent empty-result distinction
+- ✅ D1.7 TurnOutcome.spawned_task_ids capture
+- ✅ D1.8 mem.list O(N) → counter O(1)
+- ✅ D1.9 500ms blocking sleep removed
+- ✅ D1.10 loop_detected immediate exit
+- ✅ D1.11 post-turn maintenance events
+- ✅ D1.12 vision-fallback in exhausted summary
+- ✅ D1.13 (verified pre-shipped)
+- ✅ D1.14 generalized tool-result cache (serial dispatcher integrated; parallel + per-tool subscribers in follow-ups)
+- ✅ D1.15 memory warmupSession + flag (auto-spawn-on-boot in follow-up)
+
 ### Deferred from this sprint (tracked for D-N successors)
 
 | Future ID | Item | Why deferred from D1 |
