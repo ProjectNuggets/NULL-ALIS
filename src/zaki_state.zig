@@ -3083,17 +3083,28 @@ fn decodeMemoryEntry(allocator: std.mem.Allocator, result: *c.PGresult, row: c_i
     const session_text = try dupeResultValue(allocator, result, row, 5);
     errdefer allocator.free(session_text);
 
+    const sid: ?[]u8 = if (session_text.len == 0) blk: {
+        allocator.free(session_text);
+        break :blk null;
+    } else session_text;
+
+    // S8.1 — populate `lane` from session_id when present (matches the
+    // sqlite engine wiring at `memory/engines/sqlite.zig`). Borrowed
+    // string-literal pointer; no alloc/free coupling. Without this, all
+    // postgres-backed retrievals would land at `lane = "unknown"` and
+    // the same-lane ranking heuristic in the agent layer would no-op
+    // for production deployments. Post-S8.1 review fix (M-LANE).
+    const lane: []const u8 = if (sid) |s| memory_root.laneFromSessionId(s) else "unknown";
+
     return .{
         .id = try dupeResultValue(allocator, result, row, 0),
         .key = try dupeResultValue(allocator, result, row, 1),
         .content = try dupeResultValue(allocator, result, row, 2),
         .category = try memoryTypeToCategory(allocator, mem_type),
         .timestamp = try dupeResultValue(allocator, result, row, 4),
-        .session_id = if (session_text.len == 0) blk: {
-            allocator.free(session_text);
-            break :blk null;
-        } else session_text,
+        .session_id = sid,
         .score = null,
+        .lane = lane,
     };
 }
 

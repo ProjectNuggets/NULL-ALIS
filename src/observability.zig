@@ -1,4 +1,5 @@
 const std = @import("std");
+const env_rebrand = @import("env_rebrand.zig");
 
 /// Semantic frame types for user-facing narration events.
 pub const NarrationFrameType = enum {
@@ -548,18 +549,35 @@ pub const OtelObserver = struct {
             }
             if (std.posix.getenv("NULLCLAW_OTEL_ENDPOINT")) |ep| {
                 if (ep.len > 0) {
-                    // S8.3 — sunset 2026-05-15. Mirror the deadline format
-                    // used by sentry_runtime's *WithFallback helpers so
-                    // every NULLCLAW_* legacy-read warning surfaces the
+                    // S8.3 — sunset date sourced from `env_rebrand.SUNSET_DATE`
+                    // so every NULLCLAW_* legacy-read warning surfaces the
                     // same date string for grep-friendly migration audits.
-                    std.log.warn("env NULLCLAW_OTEL_ENDPOINT is deprecated; use NULLALIS_OTEL_ENDPOINT (remove after 2026-05-15)", .{});
+                    // S8.3 post-review fix (M-BANNER): also fire the
+                    // shared once-per-process banner so operators with
+                    // only NULLCLAW_OTEL_* set (no Sentry creds) still
+                    // see the cross-cutting deprecation signal.
+                    env_rebrand.fireBannerOnce();
+                    std.log.warn("env NULLCLAW_OTEL_ENDPOINT is deprecated; use NULLALIS_OTEL_ENDPOINT (remove after {s})", .{env_rebrand.SUNSET_DATE});
                     break :blk ep;
                 }
             }
             return null;
         };
-        const service_name = std.posix.getenv("NULLALIS_OTEL_SERVICE_NAME") orelse
-            std.posix.getenv("NULLCLAW_OTEL_SERVICE_NAME");
+        // S8.3 post-review fix (M-BANNER): the legacy
+        // NULLCLAW_OTEL_SERVICE_NAME read used to be silent — no
+        // warning, no banner. Operators using only that variable would
+        // never know it was deprecated. Now we resolve primary/fallback
+        // explicitly and emit the same dated warning + shared banner
+        // when only the legacy name is present.
+        const service_name = blk: {
+            if (std.posix.getenv("NULLALIS_OTEL_SERVICE_NAME")) |sn| break :blk sn;
+            if (std.posix.getenv("NULLCLAW_OTEL_SERVICE_NAME")) |sn| {
+                env_rebrand.fireBannerOnce();
+                std.log.warn("env NULLCLAW_OTEL_SERVICE_NAME is deprecated; use NULLALIS_OTEL_SERVICE_NAME (remove after {s})", .{env_rebrand.SUNSET_DATE});
+                break :blk sn;
+            }
+            break :blk null;
+        };
         return init(allocator, endpoint, service_name);
     }
 

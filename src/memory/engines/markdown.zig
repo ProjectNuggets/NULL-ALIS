@@ -339,6 +339,9 @@ pub const MarkdownMemory = struct {
         else
             null;
         errdefer if (session_id) |sid| allocator.free(sid);
+        // S8.1 — populate lane from session_id when present (post-S8.1
+        // review fix M-LANE; mirrors sqlite + postgres engines).
+        const lane: []const u8 = if (session_id) |s| root.laneFromSessionId(s) else "unknown";
         return MemoryEntry{
             .id = id,
             .key = key,
@@ -347,6 +350,7 @@ pub const MarkdownMemory = struct {
             .timestamp = timestamp,
             .session_id = session_id,
             .score = entry.score,
+            .lane = lane,
         };
     }
 

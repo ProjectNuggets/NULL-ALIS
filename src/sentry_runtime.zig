@@ -2,6 +2,7 @@ const std = @import("std");
 const sentry = @import("sentry-zig");
 const version = @import("version.zig");
 const observability = @import("observability.zig");
+const env_rebrand = @import("env_rebrand.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -202,23 +203,18 @@ fn getEnvVarOwned(allocator: Allocator, key: []const u8) !?[]u8 {
 // should be deleted. The once-per-process banner gives operators
 // running with stale env files a hard, visible signal during boot.
 
-/// One-shot deprecation banner fires the first time any NULLCLAW_*
-/// fallback is consumed in this process. Acquires under cmpxchg so the
-/// banner is logged exactly once even if multiple env reads race.
-var deprecation_banner_fired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+/// Re-export of the canonical sunset date from `env_rebrand.zig` so
+/// existing call sites in this file (and any external consumers that
+/// previously imported `sentry_runtime.NULLCLAW_SUNSET_DATE`) keep
+/// working without a churn rename. Single source of truth lives in
+/// `env_rebrand.SUNSET_DATE`.
+pub const NULLCLAW_SUNSET_DATE: []const u8 = env_rebrand.SUNSET_DATE;
 
-const NULLCLAW_SUNSET_DATE: []const u8 = "2026-05-15";
-
+/// Thin alias — banner state and once-firing semantics live in
+/// `env_rebrand.zig` so `observability.zig` and any future module
+/// with its own NULLCLAW_* fallback path share the same atomic flag.
 fn fireDeprecationBannerOnce() void {
-    if (deprecation_banner_fired.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
-        std.log.warn(
-            "DEPRECATION: NULLCLAW_* environment variables are read via fallback shims " ++
-                "and will be REMOVED after {s}. Migrate every NULLCLAW_FOO to NULLALIS_FOO " ++
-                "in your env files / k8s manifests / sealed-secrets. This banner fires once " ++
-                "per process; the per-variable warning identifies which keys you're still using.",
-            .{NULLCLAW_SUNSET_DATE},
-        );
-    }
+    env_rebrand.fireBannerOnce();
 }
 
 fn getEnvVarOwnedWithFallback(allocator: Allocator, primary: []const u8, fallback: []const u8) !?[]u8 {

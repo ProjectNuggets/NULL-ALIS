@@ -273,6 +273,9 @@ pub const InMemoryLruMemory = struct {
         errdefer allocator.free(dup_ts);
         const dup_sid = if (e.session_id) |sid| try allocator.dupe(u8, sid) else null;
 
+        // S8.1 — populate lane from session_id when present (post-S8.1
+        // review fix M-LANE; mirrors sqlite + postgres + markdown).
+        const lane: []const u8 = if (dup_sid) |s| root.laneFromSessionId(s) else "unknown";
         return MemoryEntry{
             .id = id,
             .key = dup_key,
@@ -281,6 +284,7 @@ pub const InMemoryLruMemory = struct {
             .timestamp = dup_ts,
             .session_id = dup_sid,
             .score = null,
+            .lane = lane,
         };
     }
 
