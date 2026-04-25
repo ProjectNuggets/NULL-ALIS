@@ -571,6 +571,77 @@ pub const Agent = struct {
         }
     };
 
+    /// Result of a single agent turn. Returned by `turn()` to give
+    /// callers (gateway, session manager, BFF, frontend) structured
+    /// visibility into what happened, instead of just a bare reply
+    /// string.
+    ///
+    /// **Why this struct exists (D1):** the historical `turn()` return
+    /// was `![]const u8` — just the assistant text. Tool-only turns
+    /// (where the model emits spawn/delegate calls but no post-tool
+    /// assistant text) were invisible to the gateway, which then
+    /// fabricated a literal `"received"` placeholder (`gateway.zig:9184`
+    /// + `:10562`). Sprint 1's S1.10 (`963fc92`) replaced the literal
+    /// with `EMPTY_TURN_PLACEHOLDER` as a min fix; this struct is the
+    /// real fix, letting the gateway render structured tool-only-turn
+    /// SSE frames (`spawned_task_ids`, `tool_calls_executed`) instead
+    /// of any placeholder at all.
+    ///
+    /// **Ownership:** `text` is heap-allocated in the agent's
+    /// allocator and transfers to the caller — caller must free via
+    /// `deinit(allocator)` or by handing it to a consumer that frees.
+    /// The `tool_calls_executed` and `spawned_task_ids` slices are
+    /// also owned and freed by `deinit`. Use `justText` for the most
+    /// common case (text-only reply); use `deinit` exactly once.
+    pub const TurnOutcome = struct {
+        /// The assistant text reply. Empty string for tool-only turns.
+        /// Heap-allocated in the agent's allocator.
+        text: []const u8,
+        /// Convenience flag: true when the model produced tool/spawn
+        /// calls but no post-tool text. Equivalent to
+        /// `text.len == 0 and (tool_calls_executed.len > 0 or
+        /// spawned_task_ids.len > 0)` but pre-computed so callers
+        /// don't have to recompute.
+        tool_only_turn: bool = false,
+        /// Names of tools that executed this turn (in execution
+        /// order). Empty slice means no tools fired. Each slice is
+        /// owned and freed by `deinit`.
+        tool_calls_executed: []const []const u8 = &.{},
+        /// IDs of subagent tasks spawned this turn (via `spawn` or
+        /// `delegate` tool). Empty slice means none. These tasks
+        /// complete asynchronously; the bus delivers their results on
+        /// separate SSE frames. Each slice is owned and freed by
+        /// `deinit`.
+        spawned_task_ids: []const []const u8 = &.{},
+        /// Tool-loop iterations consumed this turn. Useful for
+        /// observability dashboards distinguishing healthy 1-2-iter
+        /// turns from near-exhaustion 24-iter turns.
+        iterations_used: u32 = 0,
+        /// True when the turn exited via the loop-detector early-out
+        /// (same tool-call signature repeated past threshold). Lets
+        /// the gateway show a different status badge than plain
+        /// iteration-exhaustion.
+        loop_detected: bool = false,
+
+        /// Convenience constructor for the most common case: text-only
+        /// reply with no tools and no spawns. The slice is taken as-is
+        /// and the caller transfers ownership to the outcome.
+        pub fn justText(text: []const u8) TurnOutcome {
+            return .{ .text = text };
+        }
+
+        /// Free all owned memory. Caller must call this exactly once
+        /// on the returned outcome. After this, every field's slice
+        /// is invalid.
+        pub fn deinit(self: *const TurnOutcome, allocator: std.mem.Allocator) void {
+            allocator.free(self.text);
+            for (self.tool_calls_executed) |name| allocator.free(name);
+            allocator.free(self.tool_calls_executed);
+            for (self.spawned_task_ids) |id| allocator.free(id);
+            allocator.free(self.spawned_task_ids);
+        }
+    };
+
     /// Initialize agent from a loaded Config.
     pub fn fromConfig(
         allocator: std.mem.Allocator,
@@ -10453,4 +10524,71 @@ test "/perm alias returns same class of report as /permissions" {
     try std.testing.expect(std.mem.indexOf(u8, alias_form, "Gate 1 — Execution mode:") != null);
     try std.testing.expect(std.mem.indexOf(u8, alias_form, "Gate 2 — Generic tool approval:") != null);
     try std.testing.expect(std.mem.indexOf(u8, alias_form, "Gate 3 — Legacy shell /exec:") != null);
+}
+
+test "TurnOutcome.justText constructs text-only outcome with empty defaults" {
+    const text = try std.testing.allocator.dupe(u8, "hello");
+    var outcome = Agent.TurnOutcome.justText(text);
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("hello", outcome.text);
+    try std.testing.expect(!outcome.tool_only_turn);
+    try std.testing.expectEqual(@as(usize, 0), outcome.tool_calls_executed.len);
+    try std.testing.expectEqual(@as(usize, 0), outcome.spawned_task_ids.len);
+    try std.testing.expectEqual(@as(u32, 0), outcome.iterations_used);
+    try std.testing.expect(!outcome.loop_detected);
+}
+
+test "TurnOutcome.deinit frees text + tool_calls_executed + spawned_task_ids" {
+    // This test exists to pin the ownership contract. If a future
+    // change adds an owned slice to TurnOutcome but forgets to free
+    // it in deinit, std.testing.allocator's leak detector catches it.
+    const allocator = std.testing.allocator;
+    const text = try allocator.dupe(u8, "tool-only result text");
+
+    const tool_names = try allocator.alloc([]const u8, 2);
+    tool_names[0] = try allocator.dupe(u8, "memory_recall");
+    tool_names[1] = try allocator.dupe(u8, "web_search");
+
+    const task_ids = try allocator.alloc([]const u8, 1);
+    task_ids[0] = try allocator.dupe(u8, "task-42");
+
+    const outcome = Agent.TurnOutcome{
+        .text = text,
+        .tool_only_turn = true,
+        .tool_calls_executed = tool_names,
+        .spawned_task_ids = task_ids,
+        .iterations_used = 3,
+        .loop_detected = false,
+    };
+    outcome.deinit(allocator);
+    // No expect — the assertion is the absence of leaks.
+}
+
+test "TurnOutcome tool_only_turn flag distinguishes empty-text-with-spawns from nothing-happened" {
+    // When the model emits spawn calls but no post-tool text, gateway
+    // needs a signal richer than `text.len == 0` to render the right
+    // UI (today the gateway falls back to EMPTY_TURN_PLACEHOLDER; the
+    // structured tool_only_turn frame from D1.4 will check this flag).
+    const allocator = std.testing.allocator;
+
+    // Case A: text-only, NOT a tool-only turn even though no spawns.
+    var case_a = Agent.TurnOutcome.justText(try allocator.dupe(u8, "ok"));
+    defer case_a.deinit(allocator);
+    try std.testing.expect(!case_a.tool_only_turn);
+
+    // Case B: empty text + spawned task → tool-only turn.
+    const empty_text = try allocator.dupe(u8, "");
+    const tasks = try allocator.alloc([]const u8, 1);
+    tasks[0] = try allocator.dupe(u8, "task-1");
+    const case_b = Agent.TurnOutcome{
+        .text = empty_text,
+        .tool_only_turn = true,
+        .spawned_task_ids = tasks,
+    };
+    defer case_b.deinit(allocator);
+    try std.testing.expect(case_b.tool_only_turn);
+    try std.testing.expectEqualStrings("", case_b.text);
+    try std.testing.expectEqual(@as(usize, 1), case_b.spawned_task_ids.len);
+    try std.testing.expectEqualStrings("task-1", case_b.spawned_task_ids[0]);
 }
