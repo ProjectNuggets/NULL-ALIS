@@ -310,20 +310,47 @@ Goal: W5 ambiguities resolved. Each gets a YES/NO/DEFER with written rationale; 
 
 ---
 
-## Sprint 9 — Supply Chain Full  (~3-5 days)
+## Sprint 9 — Supply Chain Full  (~3-5 days) — **PARKED 2026-04-26**
 
 Goal: can prove what shipped.
 
-- [ ] **S9.1** Branch-protection-as-code on `main` (GitHub ruleset or settings.yml).
-- [ ] **S9.2** `CODEOWNERS` file — even if single-owner today, documents it.
-- [ ] **S9.3** Dependabot or Renovate — at minimum for `build.zig.zon` deps + Dockerfile base image.
-- [ ] **S9.4** SAST — CodeQL (free for public) or Semgrep.
-- [ ] **S9.5** SBOM generation (syft) on every release, published with artifact.
-- [ ] **S9.6** Secret scanning — gitleaks pre-commit + CI.
-- [ ] **S9.7** Container scanning — trivy on built image in CI.
-- [ ] **S9.8** cosign image signing + SLSA level-1+ provenance.
+**Parked-with-rationale (2026-04-26):** every S9 item produces a CI/GitHub
+artifact (CodeQL run, syft SBOM, trivy scan, cosign signature, gitleaks
+block) that requires Actions to actually execute to be valid. Today's
+state — single-owner, no external auditor, GitHub Actions intermittently
+quota-locked, no production paying-customer pressure — makes shipping
+S9 theoretical work: configuration that nothing reads, signatures
+nothing verifies, scans nothing acts on. Until at least ONE of the
+following triggers fires, S9 stays parked:
 
-**Sprint 9 DoD:** release pipeline produces SBOM.spdx + cosign signature. trivy blocks high-severity CVE. gitleaks blocks secret commit.
+  • External audit / customer security questionnaire (most likely first
+    trigger; typical for any B2B sale or compliance posture)
+  • Second committer added to either repo (CODEOWNERS becomes load-bearing)
+  • Public-facing release (cosign signatures + SBOM matter for trust)
+  • Discovered supply-chain CVE in a dep that wasn't caught (forcing
+    function for Dependabot + trivy)
+
+When any trigger fires, unpark in this order: S9.1 + S9.2 (zero-cost
+foundation) → S9.3 (low-cost continuous gain) → S9.6 (gitleaks, prevents
+the next D28-style accidental key commit; lessons from 2026-04-26) →
+S9.4 (CodeQL) → S9.5 + S9.7 + S9.8 (release-pipeline artifacts).
+
+**The 2026-04-26 D28 incident** (Tailscale .key accidentally committed to
+the zaki-prod D28 branch, force-pushed clean within minutes) is the
+strongest **single-shop** argument for S9.6 specifically. Even with one
+operator, gitleaks pre-commit would have blocked that commit locally
+before push. S9.6 may unpark ahead of the others on its own merit.
+
+- [ ] **S9.1** Branch-protection-as-code on `main` (GitHub ruleset or settings.yml). PARKED.
+- [ ] **S9.2** `CODEOWNERS` file — even if single-owner today, documents it. PARKED.
+- [ ] **S9.3** Dependabot or Renovate — at minimum for `build.zig.zon` deps + Dockerfile base image. PARKED.
+- [ ] **S9.4** SAST — CodeQL (free for public) or Semgrep. PARKED.
+- [ ] **S9.5** SBOM generation (syft) on every release, published with artifact. PARKED.
+- [ ] **S9.6** Secret scanning — gitleaks pre-commit + CI. **PARKED but pre-commit-only could ship today** (no CI dep) — lifts before the rest if D28-style incidents recur.
+- [ ] **S9.7** Container scanning — trivy on built image in CI. PARKED.
+- [ ] **S9.8** cosign image signing + SLSA level-1+ provenance. PARKED.
+
+**Sprint 9 DoD (when unparked):** release pipeline produces SBOM.spdx + cosign signature. trivy blocks high-severity CVE. gitleaks blocks secret commit.
 
 ---
 
