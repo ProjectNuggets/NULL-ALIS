@@ -2415,6 +2415,23 @@ pub const Agent = struct {
         var turn_first_token_ms: ?u64 = null;
         var turn_first_token_upper_bound_ms: ?u64 = null;
 
+        // **D1.7** — accumulator for task_ids spawned during this turn
+        // (via the `spawn` tool — `delegate` is synchronous and inlines
+        // its result, so no task_id to track). Populated by parsing the
+        // spawn tool's result string ("Subagent 'X' spawned with
+        // task_id=N state=queued ...") after each tool execution. Owned
+        // by the turn body until ownership transfers to the returned
+        // TurnOutcome at exit; freed by `spawned_task_ids_cleanup`
+        // defer if no transfer happens (e.g. error path).
+        var spawned_task_ids_acc: std.ArrayListUnmanaged([]const u8) = .empty;
+        var spawned_task_ids_transferred: bool = false;
+        defer {
+            if (!spawned_task_ids_transferred) {
+                for (spawned_task_ids_acc.items) |id| self.allocator.free(id);
+                spawned_task_ids_acc.deinit(self.allocator);
+            }
+        }
+
         // ── Adaptive exit: repeated-call detector ─────────────────────────
         // Tracks the FNV-1a hash of the last 3 tool call sets (name+args). If
         // the same hash appears 3 times in a row within a single turn, the
@@ -3556,9 +3573,13 @@ pub const Agent = struct {
                 // ran in prior iterations (turn_tool_calls_total > 0) AND
                 // the final text is empty. Must fire BEFORE turn_complete
                 // so SSE consumers see them in causal order.
+                // D1.7: now includes spawned_task_ids — the actual numeric
+                // IDs the spawn tool emitted, not just a count. Borrowed
+                // view; event handlers don't take ownership.
                 if (final_text.len == 0 and turn_tool_calls_total > 0) {
                     const tool_only_event = ObserverEvent{ .tool_only_turn = .{
                         .tool_calls_executed = turn_tool_calls_total,
+                        .spawned_task_ids = spawned_task_ids_acc.items,
                         .iterations_used = turn_tool_iterations,
                         .run_id = self.current_run_id,
                     } };
@@ -3766,16 +3787,24 @@ pub const Agent = struct {
                         ctx.flushValidatedReply(audio_reply);
                     }
                     self.allocator.free(final_text);
+                    spawned_task_ids_transferred = true;
+                    const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
                     return TurnOutcome{
                         .text = audio_reply,
+                        .tool_only_turn = false,
+                        .spawned_task_ids = ids,
                         .iterations_used = turn_tool_iterations,
                     };
                 }
                 if (stream_timing_ctx) |*ctx| {
                     ctx.flushValidatedReply(final_text);
                 }
+                spawned_task_ids_transferred = true;
+                const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
                 return TurnOutcome{
                     .text = final_text,
+                    .tool_only_turn = (final_text.len == 0 and turn_tool_calls_total > 0),
+                    .spawned_task_ids = ids,
                     .iterations_used = turn_tool_iterations,
                 };
             }
@@ -3858,6 +3887,36 @@ pub const Agent = struct {
                 parsed_calls.len,
             });
 
+            // **D1.7** — capture spawned task_ids from any `spawn` tool
+            // calls in this iteration's results. Spawn's result format
+            // is "Subagent '<label>' spawned with task_id=<N> state=
+            // queued. ..." (`src/tools/spawn.zig:62-66`). We parse the
+            // numeric task_id and accumulate it for the TurnOutcome.
+            // `delegate` is intentionally excluded — it runs synchronously
+            // and inlines its result, so there's no async task to track.
+            // `schedule` similarly creates a cron entry, not a subagent
+            // task — its IDs would belong in a separate channel if ever
+            // needed.
+            for (results_buf.items, 0..) |result, idx| {
+                if (idx >= parsed_calls.len) break;
+                if (!std.mem.eql(u8, parsed_calls[idx].name, "spawn")) continue;
+                if (!result.success) continue;
+                const marker = "task_id=";
+                const start = std.mem.indexOf(u8, result.output, marker) orelse continue;
+                const num_start = start + marker.len;
+                var num_end = num_start;
+                while (num_end < result.output.len and std.ascii.isDigit(result.output[num_end])) num_end += 1;
+                if (num_end == num_start) continue;
+                const task_id_str = self.allocator.dupe(u8, result.output[num_start..num_end]) catch |err| {
+                    log.warn("D1.7.spawn_task_id_capture_failed err={s}", .{@errorName(err)});
+                    continue;
+                };
+                spawned_task_ids_acc.append(self.allocator, task_id_str) catch |err| {
+                    log.warn("D1.7.spawn_task_id_append_failed err={s}", .{@errorName(err)});
+                    self.allocator.free(task_id_str);
+                };
+            }
+
             if (self.pending_tool_approval) |pending| {
                 try self.appendPendingApprovalToolHistory(arena, results_buf.items);
                 const approval_text = try std.fmt.allocPrint(
@@ -3879,8 +3938,11 @@ pub const Agent = struct {
                 });
 
                 self.freeResponseFields(&response);
+                spawned_task_ids_transferred = true;
+                const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
                 return TurnOutcome{
                     .text = approval_text,
+                    .spawned_task_ids = ids,
                     .iterations_used = turn_tool_iterations,
                 };
             }
@@ -4016,8 +4078,11 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
+            spawned_task_ids_transferred = true;
+            const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
             return TurnOutcome{
                 .text = fallback,
+                .spawned_task_ids = ids,
                 .iterations_used = turn_tool_iterations,
                 .loop_detected = loop_detected,
             };
@@ -4064,8 +4129,11 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
+            spawned_task_ids_transferred = true;
+            const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
             return TurnOutcome{
                 .text = fallback,
+                .spawned_task_ids = ids,
                 .iterations_used = turn_tool_iterations,
                 .loop_detected = loop_detected,
             };
@@ -4113,8 +4181,11 @@ pub const Agent = struct {
             total_turn_ms,
         });
 
+        spawned_task_ids_transferred = true;
+        const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
         return TurnOutcome{
             .text = prefixed,
+            .spawned_task_ids = ids,
             .iterations_used = turn_tool_iterations,
             .loop_detected = loop_detected,
         };
