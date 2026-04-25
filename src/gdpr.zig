@@ -171,31 +171,56 @@ pub fn purgeUser(deps: PurgeDeps, user_id: i64) !PurgeReport {
     }
 
     // Step 4: filesystem. Recursively remove `{users_root}/{user_id}`.
+    //
+    // D32 (2026-04-25) — `users_root` MUST be absolute. `std.fs.cwd().
+    // deleteTree` resolves relative paths against the worker CWD, so a
+    // misconfigured `tenant_data_root = "data/users"` (relative) would
+    // silently delete the wrong tree (or nothing — `deleteTree` swallows
+    // top-level FileNotFound). The handler in `gateway.zig` passes
+    // `state.tenant_data_root`, defaulted to `DEFAULT_TENANT_DATA_ROOT
+    // = "/data/users"`. Catch the misconfiguration here rather than
+    // letting the silent-mis-delete play out.
     if (deps.users_root) |root| {
         if (root.len > 0) {
-            const user_dir = std.fmt.allocPrint(
-                deps.allocator,
-                "{s}/{d}",
-                .{ root, user_id },
-            ) catch |err| blk: {
-                log.warn("gdpr.fs_path_alloc_failed user_id={d} err={s}", .{ user_id, @errorName(err) });
-                break :blk null;
-            };
-            if (user_dir) |dir| {
-                defer deps.allocator.free(dir);
-                removeUserDirectoryTree(dir) catch |err| {
-                    log.warn("gdpr.fs_delete_failed user_id={d} dir={s} err={s}", .{ user_id, dir, @errorName(err) });
-                    const msg = std.fmt.allocPrint(
-                        deps.allocator,
-                        "fs_delete_failed:{s}",
-                        .{@errorName(err)},
-                    ) catch null;
-                    if (msg) |m| {
-                        report.errors.append(deps.allocator, m) catch deps.allocator.free(m);
-                    }
-                    return report;
+            if (!std.fs.path.isAbsolute(root)) {
+                log.warn("gdpr.fs_path_not_absolute user_id={d} users_root={s}", .{ user_id, root });
+                const msg = std.fmt.allocPrint(
+                    deps.allocator,
+                    "fs_path_not_absolute:{s}",
+                    .{root},
+                ) catch null;
+                if (msg) |m| {
+                    report.errors.append(deps.allocator, m) catch deps.allocator.free(m);
+                }
+                // Skip step 4 entirely; `filesystem_removed` stays false.
+                // Caller sees the error string and can fix the config
+                // before retrying. Better than half-deleting somewhere
+                // weird relative to the worker CWD.
+            } else {
+                const user_dir = std.fmt.allocPrint(
+                    deps.allocator,
+                    "{s}/{d}",
+                    .{ root, user_id },
+                ) catch |err| blk: {
+                    log.warn("gdpr.fs_path_alloc_failed user_id={d} err={s}", .{ user_id, @errorName(err) });
+                    break :blk null;
                 };
-                report.filesystem_removed = true;
+                if (user_dir) |dir| {
+                    defer deps.allocator.free(dir);
+                    removeUserDirectoryTree(dir) catch |err| {
+                        log.warn("gdpr.fs_delete_failed user_id={d} dir={s} err={s}", .{ user_id, dir, @errorName(err) });
+                        const msg = std.fmt.allocPrint(
+                            deps.allocator,
+                            "fs_delete_failed:{s}",
+                            .{@errorName(err)},
+                        ) catch null;
+                        if (msg) |m| {
+                            report.errors.append(deps.allocator, m) catch deps.allocator.free(m);
+                        }
+                        return report;
+                    };
+                    report.filesystem_removed = true;
+                }
             }
         }
     }
@@ -298,6 +323,47 @@ test "purgeUser with empty users_root skips filesystem step" {
     }, 99);
     defer report.deinit(std.testing.allocator);
     try std.testing.expect(!report.filesystem_removed);
+    try std.testing.expect(report.fullySucceeded());
+}
+
+test "D32 purgeUser rejects relative users_root and records explicit error" {
+    // Defense against a misconfigured `tenant_data_root = "data/users"`
+    // (relative) silently deleting the wrong tree relative to the
+    // worker's CWD. The orchestrator must NOT touch the filesystem
+    // at all when the root isn't absolute, and the error must be
+    // visible in PurgeReport so the operator sees it.
+    var report = try purgeUser(.{
+        .allocator = std.testing.allocator,
+        .users_root = "relative/path/users",
+    }, 42);
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expect(!report.filesystem_removed);
+    try std.testing.expect(!report.fullySucceeded());
+    try std.testing.expectEqual(@as(usize, 1), report.errors.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, report.errors.items[0], "fs_path_not_absolute:"));
+    try std.testing.expect(std.mem.indexOf(u8, report.errors.items[0], "relative/path/users") != null);
+}
+
+test "D32 purgeUser accepts absolute users_root (sanity, regression guard for the new branch)" {
+    // Mirror of the existing absolute-path test but explicitly tagged
+    // as the D32 partner — ensures the absolute-path branch still
+    // succeeds after the relative-path rejection was added.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    // realpathAlloc returns an absolute path on every supported OS.
+    try std.testing.expect(std.fs.path.isAbsolute(root_path));
+
+    var report = try purgeUser(.{
+        .allocator = std.testing.allocator,
+        .users_root = root_path,
+    }, 1234);
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expect(report.filesystem_removed);
     try std.testing.expect(report.fullySucceeded());
 }
 
