@@ -874,13 +874,6 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
                     .from_address = "bot@example.com",
                 },
             },
-            .dingtalk = &[_]@import("config_types.zig").DingTalkConfig{
-                .{
-                    .account_id = "ding-main",
-                    .client_id = "ding-id",
-                    .client_secret = "ding-secret",
-                },
-            },
         },
     };
 
@@ -961,10 +954,6 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         expected_total += config.channels.email.len;
         expected_send_only += config.channels.email.len;
     }
-    if (channel_catalog.isBuildEnabled(.dingtalk)) {
-        expected_total += config.channels.dingtalk.len;
-        expected_send_only += config.channels.dingtalk.len;
-    }
 
     try std.testing.expectEqual(expected_total, mgr.count());
     try std.testing.expectEqual(expected_total, reg.count());
@@ -992,7 +981,6 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     try expectEntryPresence(entries, "irc", "irc-main", channel_catalog.isBuildEnabled(.irc));
     try expectEntryPresence(entries, "imessage", "imain", channel_catalog.isBuildEnabled(.imessage));
     try expectEntryPresence(entries, "email", "email-main", channel_catalog.isBuildEnabled(.email));
-    try expectEntryPresence(entries, "dingtalk", "ding-main", channel_catalog.isBuildEnabled(.dingtalk));
 
     if (channel_catalog.isBuildEnabled(.discord)) {
         const discord_entry = findEntryByNameAccount(entries, "discord", "dc-main") orelse

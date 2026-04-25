@@ -15,7 +15,7 @@
 //!   Control plane    — /health, /ready, /pair, /settings, /metrics,
 //!                      /internal/entitlements/revoke
 //!   Channel inbound  — /webhook, /whatsapp, /telegram, /line, /lark,
-//!                      /slack/events, /dingtalk, /facebook, /viber, /discord
+//!                      /slack/events, /facebook, /viber, /discord
 //!   API v1           — /api/v1/users/:id/{chat/stream, secrets/:key, ...},
 //!                      /api/v1/users/provision, /api/v1/users/:id/attachments
 //!

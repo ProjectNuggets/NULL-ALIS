@@ -94,6 +94,27 @@ one-line reason.
 
 ---
 
+## From Sprint 8 (Design Decisions)
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| D28 | Migrate the ~16 NULLCLAW_CELL_* direct-reads in `src/cell_k8s_api.zig` + the `NULLCLAW_API_KEY` generic fallback in `src/providers/api_key.zig` + the `NULLCLAW_POSTGRES_TEST_URL` test gates in `src/zaki_state.zig` to dual-name (NULLALIS_ primary, NULLCLAW_ fallback) before the 2026-05-15 sunset | S8.3 shipped sunset deadline + once-per-process banner + per-key warn for the SHIM-helper paths in `sentry_runtime.zig` and `observability.zig`. Direct-read sites bypass the shim helpers and need coordinated env-file + k8s-manifest + sealed-secrets migration. Hard deadline forcing function — must close before sunset | Dedicated NULLCLAW-migration PR with k8s manifest companion in zaki-infra | **open — sunset 2026-05-15** |
+| D29 | Vtable-level lane filtering (`VectorStore.searchScopedByLane(user_id, lane, ...)` + Memory.recall lane parameter) if cross-lane noise becomes observable | S8.1 shipped Label (Option B) — entries and candidates carry `lane` field for ranking heuristics. Filter (Option C) was deferred because today's 3-tier retrieval strategy already handles scope via session_id; promoting lane to a vtable parameter would churn ~6-8 files and force every backend impl to reimplement filtering. Activate only if production retrieval shows real cross-lane confusion | Dedicated retrieval refactor PR | **open — conditional, not scheduled** |
+| D30 | Rename `agent_routing.buildThreadSessionKey` → `buildChannelRoutedThreadSessionKey` to remove the name collision with `session/root.userThreadSessionKey` | S8.2 shipped doc-comment cross-references on both formatters and an inline anti-migrate guard at `daemon.zig:1709`. A rename would make the family difference unmistakable but costs ~20 ref-site updates plus test renames. Optional polish; not load-bearing | Dedicated rename PR if the dual-formatter design ever causes a real bug | **open — optional polish** |
+
+---
+
+## From PR #21 / PR #22 code review (post-Sprint-7B / post-Sprint-8 fixes)
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| D31 | Qdrant `deleteAllForUser` count-before-delete: pre-count via filter then delete, so `PurgeReport.vector_rows_removed` reflects actual removal count instead of returning 0 unconditionally | Today Qdrant's `/points/delete` doesn't return a count; we honestly return 0 (regulator-asking-for-proof scenario in M3 of the review). Fix is two HTTP calls instead of one — non-trivial cost on the happy path. Worth doing for audit-trail completeness, not blocking | Qdrant follow-up PR | **open — audit completeness** |
+| D32 | `gdpr.purgeUser` — assert `users_root` is absolute path; reject relative roots with explicit error in `PurgeReport` | Today `std.fs.cwd().deleteTree` resolves relative paths against the worker CWD. A misconfigured `tenant_data_root = "data/users"` (relative) silently deletes the wrong tree. Belt-and-suspenders defense layered on top of `parseNumericUserId`'s digits-only constraint. Cheap to add | Sprint 7B follow-up PR | **open — defensive hardening** |
+| D33 | Cascade integration test: assert `DELETE FROM {schema}.users WHERE user_id = $1` removes rows from each of the 17 FK-cascading tables on a seeded user. Without it, a future migration that adds a per-user table without `ON DELETE CASCADE` silently leaks that table from GDPR purge | S7.5 shipped hermetic orchestrator tests + relies on the schema audit at `zaki_state.zig:743-974` for the cascade claim. A live-pg fixture asserting every table is FK'd to users with cascade would lock the contract structurally rather than relying on the audit memory. Pairs naturally with D25 | Combined live-pg E2E PR (D25 + D33) | **open — schema invariant** |
+| D34 | Banner-once test: assert `env_rebrand.fireBannerOnce` emits exactly one log line under repeated calls + a multi-thread-style stress test. Plus integration test that exercises a `NULLCLAW_*` env-fallback path end-to-end (set env, call `OtelObserver.fromEnv`, observe state transition) | S8.3 ships the atomic flag + cmpxchg pattern that's small enough to trust by inspection; basic state-transition test is in `env_rebrand.zig`. Integration test that captures log output requires log-capture infra (currently absent in this codebase) | Future test infra PR | **open — test coverage** |
+
+---
+
 ## From Sprint 4/5/6 post-hoc self-review
 
 | ID | Shape | Why deferred | Target | Status |
@@ -128,4 +149,4 @@ one-line reason.
 - **Superseding an item:** change `open` → `obsolete` with a one-line reason. Do NOT delete the row.
 - **Reviewing "what's still open":** `grep 'open' docs/deferred-register.md | wc -l` gives the live count.
 
-Last audit: **2026-04-24** at Sprint 7B close — 21 items open, 4 shipped, 0 obsolete.
+Last audit: **2026-04-25** at PR #22 + post-#21 merge — 25 items open (D25-D34 covering Sprints 7-8 + the review-fix follow-ups), 4 shipped, 0 obsolete.

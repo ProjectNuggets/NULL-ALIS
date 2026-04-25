@@ -276,6 +276,14 @@ pub const MemoryEntry = struct {
     timestamp: []const u8,
     session_id: ?[]const u8 = null,
     score: ?f64 = null,
+    /// Sprint 8 (S8.1) — origin lane derived from session_id ("main" |
+    /// "thread" | "task" | "cron" | "direct" | "group" | "channel" |
+    /// "unknown"). Borrowed string-literal pointer from
+    /// `laneFromSessionId(...)`; NOT allocated, NOT freed in deinit().
+    /// Defaults to "unknown" so callers that don't set it remain valid.
+    /// Populated by row readers when session_id is known; downstream
+    /// callers can heuristically downweight cross-lane retrieval results.
+    lane: []const u8 = "unknown",
 
     /// Free all allocated strings owned by this entry.
     pub fn deinit(self: *const MemoryEntry, allocator: std.mem.Allocator) void {
@@ -288,6 +296,7 @@ pub const MemoryEntry = struct {
             .custom => |name| allocator.free(name),
             else => {},
         }
+        // self.lane is a borrowed string literal — do not free.
     }
 };
 
@@ -957,6 +966,15 @@ fn deriveChannelFromSessionId(session_id: []const u8) []const u8 {
     if (std.mem.startsWith(u8, session_id, app_prefix)) return "app";
 
     return deriveExternalChannelFromSessionId(session_id);
+}
+
+/// Sprint 8 (S8.1) — public alias so callers outside this module can
+/// hydrate `MemoryEntry.lane` and `RetrievalCandidate.lane` consistently.
+/// Returns a string literal: "main" | "thread" | "task" | "cron" |
+/// "direct" | "group" | "channel" | "unknown". Never allocates; never
+/// fails. Safe to assign directly to a `[]const u8` field with no free.
+pub fn laneFromSessionId(session_id: []const u8) []const u8 {
+    return deriveLaneFromSessionId(session_id);
 }
 
 fn deriveLaneFromSessionId(session_id: []const u8) []const u8 {
@@ -3117,6 +3135,50 @@ test "deriveMemoryProvenance derives app lane" {
     try std.testing.expectEqualStrings("app", provenance.channel);
     try std.testing.expectEqualStrings("thread", provenance.lane);
     try std.testing.expectEqualStrings("agent:zaki-bot:user:42:thread:conv-2", provenance.session_id.?);
+}
+
+test "S8.1 laneFromSessionId — public alias returns canonical labels" {
+    // User-cell lanes
+    try std.testing.expectEqualStrings("main", laneFromSessionId("agent:zaki-bot:user:42:main"));
+    try std.testing.expectEqualStrings("thread", laneFromSessionId("agent:zaki-bot:user:42:thread:c1"));
+    try std.testing.expectEqualStrings("task", laneFromSessionId("agent:zaki-bot:user:7:task:t-99"));
+    try std.testing.expectEqualStrings("cron", laneFromSessionId("agent:zaki-bot:user:7:cron:job-3"));
+    // Channel-routed lanes
+    try std.testing.expectEqualStrings("direct", laneFromSessionId("agent:bot1:telegram:direct:user42"));
+    try std.testing.expectEqualStrings("group", laneFromSessionId("agent:bot1:telegram:group:1110331014"));
+    // Unknown shapes
+    try std.testing.expectEqualStrings("unknown", laneFromSessionId("not-a-session-key"));
+}
+
+test "S8.1 MemoryEntry.lane defaults to unknown without explicit set" {
+    const e = MemoryEntry{
+        .id = "x",
+        .key = "k",
+        .content = "c",
+        .category = .core,
+        .timestamp = "0",
+    };
+    try std.testing.expectEqualStrings("unknown", e.lane);
+}
+
+test "S8.1 MemoryEntry.lane carries explicit value through deinit-safe path" {
+    // Static-string lane; deinit() must not free it (regression guard for
+    // a future refactor that mistakenly tries to allocator.free(self.lane)).
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "id-1");
+    const key = try allocator.dupe(u8, "k1");
+    const content = try allocator.dupe(u8, "hello");
+    const ts = try allocator.dupe(u8, "1");
+    const e = MemoryEntry{
+        .id = id,
+        .key = key,
+        .content = content,
+        .category = .core,
+        .timestamp = ts,
+        .lane = laneFromSessionId("agent:zaki-bot:user:5:task:t-7"),
+    };
+    try std.testing.expectEqualStrings("task", e.lane);
+    e.deinit(allocator);
 }
 
 test "deriveMemoryProvenance keeps colonful app thread ids as app" {

@@ -87,7 +87,7 @@ const all_integrations_list = [_]IntegrationEntry{
     .{ .name = "WebChat", .description = "Browser-based chat UI", .category = .chat, .status = .coming_soon },
     .{ .name = "Nextcloud Talk", .description = "Self-hosted Nextcloud chat", .category = .chat, .status = .coming_soon },
     .{ .name = "Zalo", .description = "Zalo Bot API", .category = .chat, .status = .coming_soon },
-    .{ .name = "DingTalk", .description = "DingTalk Stream Mode", .category = .chat, .status = .available },
+    // DingTalk: deleted Sprint 8 (S8.4+S8.6, 2026-04-24) alongside channels/dingtalk.zig.
     // AI Models
     .{ .name = "OpenRouter", .description = "200+ models, 1 API key", .category = .ai_model, .status = .available },
     .{ .name = "Anthropic", .description = "Claude 3.5/4 Sonnet & Opus", .category = .ai_model, .status = .available },

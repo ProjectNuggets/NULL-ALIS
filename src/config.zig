@@ -43,7 +43,7 @@ pub const WhatsAppConfig = config_types.WhatsAppConfig;
 pub const IrcConfig = config_types.IrcConfig;
 pub const LarkReceiveMode = config_types.LarkReceiveMode;
 pub const LarkConfig = config_types.LarkConfig;
-pub const DingTalkConfig = config_types.DingTalkConfig;
+// DingTalkConfig: deleted Sprint 8 (S8.4+S8.6, 2026-04-24).
 pub const SignalConfig = config_types.SignalConfig;
 pub const EmailConfig = config_types.EmailConfig;
 pub const LineConfig = config_types.LineConfig;
@@ -2924,25 +2924,8 @@ test "parse lark accounts" {
     allocator.free(cfg.channels.lark);
 }
 
-test "parse dingtalk accounts" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"channels": {"dingtalk": {"accounts": {"main": {"client_id": "cid", "client_secret": "csec", "allow_from": ["u1"]}}}}}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-    try std.testing.expectEqual(@as(usize, 1), cfg.channels.dingtalk.len);
-    const dc = cfg.channels.dingtalk[0];
-    try std.testing.expectEqualStrings("main", dc.account_id);
-    try std.testing.expectEqualStrings("cid", dc.client_id);
-    try std.testing.expectEqualStrings("csec", dc.client_secret);
-    allocator.free(dc.account_id);
-    allocator.free(dc.client_id);
-    allocator.free(dc.client_secret);
-    for (dc.allow_from) |u| allocator.free(u);
-    allocator.free(dc.allow_from);
-    allocator.free(cfg.channels.dingtalk);
-}
+// "parse dingtalk accounts" test deleted Sprint 8 (S8.4+S8.6, 2026-04-24)
+// alongside the channel itself.
 
 test "parse whatsapp accounts" {
     const allocator = std.testing.allocator;
