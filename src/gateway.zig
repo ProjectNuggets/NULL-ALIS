@@ -30,6 +30,7 @@ const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
 const session_mod = @import("session.zig");
 const gdpr_mod = @import("gdpr.zig");
+const env_rebrand = @import("env_rebrand.zig");
 const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
 const mcp_mod = @import("mcp.zig");
@@ -15015,7 +15016,7 @@ test "vault route — PUT legacy body without confirmation_token is not an accid
 test "vault route [D11] — full happy-path roundtrip (prepare → put → get metadata → prepare delete → delete → 404)" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -15114,7 +15115,7 @@ test "vault route [D11] — full happy-path roundtrip (prepare → put → get m
 test "vault route [D11] — PUT without confirmation token returns 401 and writes rejected_no_token audit row" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -15176,7 +15177,7 @@ test "vault route [D11] — PUT without confirmation token returns 401 and write
 test "vault route [D11] — PUT with delete-action token returns token_action_mismatch; token survives for legitimate DELETE" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -15269,7 +15270,7 @@ test "vault route [D11] — PUT with delete-action token returns token_action_mi
 test "vault route [D11] — DELETE with fabricated hex token returns token_invalid and audits rejected_token_invalid" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -15325,7 +15326,7 @@ test "vault route [D11] — DELETE with fabricated hex token returns token_inval
 test "vault route [D11] — GET /secrets/:key/audit scopes mutations to the requested key only" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;

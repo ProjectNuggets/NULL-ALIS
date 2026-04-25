@@ -42,7 +42,8 @@ fn resolveFormatFromEnv() Format {
     if (std.posix.getenv("NULLCLAW_LOG_FORMAT")) |raw| {
         // Can't log.warn here — we're still bootstrapping logging itself.
         // Emit to stderr directly so operators see the deprecation at boot.
-        writeStderrDirect("NULLCLAW_LOG_FORMAT is deprecated; use NULLALIS_LOG_FORMAT\n");
+        // D28 (sunset 2026-05-15): drop the fallback after the date.
+        writeStderrDirect("NULLCLAW_LOG_FORMAT is deprecated; use NULLALIS_LOG_FORMAT (remove after 2026-05-15)\n");
         return parseFormat(raw);
     }
     return .text;

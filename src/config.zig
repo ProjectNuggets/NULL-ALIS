@@ -565,65 +565,73 @@ pub const Config = struct {
         try w.print("  }},\n", .{});
     }
 
-    /// Apply NULLCLAW_* environment variable overrides.
+    /// Apply NULLALIS_* environment variable overrides (with NULLCLAW_*
+    /// fallback through D28 sunset on 2026-05-15).
     pub fn applyEnvOverrides(self: *Config) void {
+        const env_rebrand = @import("env_rebrand.zig");
+
         // Provider
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_PROVIDER")) |prov| {
+        if (env_rebrand.getEnvOwnedWithRebrand(self.allocator, "NULLALIS_PROVIDER", "NULLCLAW_PROVIDER") catch null) |prov| {
             self.default_provider = prov;
-        } else |_| {}
+        }
 
         // Model
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_MODEL")) |model| {
+        if (env_rebrand.getEnvOwnedWithRebrand(self.allocator, "NULLALIS_MODEL", "NULLCLAW_MODEL") catch null) |model| {
             self.default_model = model;
-        } else |_| {}
+        }
 
         // Temperature
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_TEMPERATURE")) |temp_str| {
+        if (env_rebrand.getEnvOwnedWithRebrand(self.allocator, "NULLALIS_TEMPERATURE", "NULLCLAW_TEMPERATURE") catch null) |temp_str| {
             defer self.allocator.free(temp_str);
             if (std.fmt.parseFloat(f64, temp_str)) |temp| {
                 if (temp >= 0.0 and temp <= 2.0) {
                     self.default_temperature = temp;
                 }
             } else |_| {}
-        } else |_| {}
+        }
 
         // Gateway port
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_GATEWAY_PORT")) |port_str| {
+        if (env_rebrand.getEnvOwnedWithRebrand(self.allocator, "NULLALIS_GATEWAY_PORT", "NULLCLAW_GATEWAY_PORT") catch null) |port_str| {
             defer self.allocator.free(port_str);
             if (std.fmt.parseInt(u16, port_str, 10)) |port| {
                 self.gateway.port = port;
             } else |_| {}
-        } else |_| {}
+        }
 
         // Gateway host
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_GATEWAY_HOST")) |host| {
+        if (env_rebrand.getEnvOwnedWithRebrand(self.allocator, "NULLALIS_GATEWAY_HOST", "NULLCLAW_GATEWAY_HOST") catch null) |host| {
             self.gateway.host = host;
-        } else |_| {}
+        }
 
         // Workspace
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_WORKSPACE")) |ws| {
+        if (env_rebrand.getEnvOwnedWithRebrand(self.allocator, "NULLALIS_WORKSPACE", "NULLCLAW_WORKSPACE") catch null) |ws| {
             self.workspace_dir = ws;
-        } else |_| {}
+        }
 
         // Allow public bind
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_ALLOW_PUBLIC_BIND")) |val| {
+        if (env_rebrand.getEnvOwnedWithRebrand(self.allocator, "NULLALIS_ALLOW_PUBLIC_BIND", "NULLCLAW_ALLOW_PUBLIC_BIND") catch null) |val| {
             defer self.allocator.free(val);
             self.gateway.allow_public_bind = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
-        } else |_| {}
+        }
 
+        // Internal service token: NULLALIS_* primary, NULLCLAW_* fallback,
+        // then unprefixed INTERNAL_SERVICE_TOKEN as the legacy 3rd-tier
+        // fallback. Unprefixed names stay alive past sunset (operators may
+        // share env across products); only the NULLCLAW_*-prefixed name
+        // gets the deprecation banner.
         var internal_service_token: ?[]const u8 = null;
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_INTERNAL_SERVICE_TOKEN")) |token| {
+        if (env_rebrand.getEnvOwnedWithRebrand(self.allocator, "NULLALIS_INTERNAL_SERVICE_TOKEN", "NULLCLAW_INTERNAL_SERVICE_TOKEN") catch null) |token| {
             internal_service_token = token;
-        } else |_| {
+        } else {
             if (std.process.getEnvVarOwned(self.allocator, "INTERNAL_SERVICE_TOKEN")) |token| {
                 internal_service_token = token;
             } else |_| {}
         }
 
         var postgres_connection_string: ?[]const u8 = null;
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_POSTGRES_CONNECTION_STRING")) |connection_string| {
+        if (env_rebrand.getEnvOwnedWithRebrand(self.allocator, "NULLALIS_POSTGRES_CONNECTION_STRING", "NULLCLAW_POSTGRES_CONNECTION_STRING") catch null) |connection_string| {
             postgres_connection_string = connection_string;
-        } else |_| {
+        } else {
             if (std.process.getEnvVarOwned(self.allocator, "POSTGRES_CONNECTION_STRING")) |connection_string| {
                 postgres_connection_string = connection_string;
             } else |_| {}
@@ -1002,7 +1010,7 @@ pub const Config = struct {
                 .{},
             ),
             ValidationError.MissingInternalServiceToken => std.debug.print(
-                "Config error: zaki_bot profile requires NULLCLAW_INTERNAL_SERVICE_TOKEN (or INTERNAL_SERVICE_TOKEN).\n",
+                "Config error: zaki_bot profile requires NULLALIS_INTERNAL_SERVICE_TOKEN (or INTERNAL_SERVICE_TOKEN; legacy NULLCLAW_INTERNAL_SERVICE_TOKEN sunsets 2026-05-15).\n",
                 .{},
             ),
             ValidationError.InvalidInternalServiceToken => std.debug.print(
@@ -1014,7 +1022,7 @@ pub const Config = struct {
                 .{},
             ),
             ValidationError.MissingPostgresConnectionString => std.debug.print(
-                "Config error: zaki_bot profile requires NULLCLAW_POSTGRES_CONNECTION_STRING (or POSTGRES_CONNECTION_STRING).\n",
+                "Config error: zaki_bot profile requires NULLALIS_POSTGRES_CONNECTION_STRING (or POSTGRES_CONNECTION_STRING; legacy NULLCLAW_POSTGRES_CONNECTION_STRING sunsets 2026-05-15).\n",
                 .{},
             ),
             ValidationError.InvalidPostgresConnectionString => std.debug.print(

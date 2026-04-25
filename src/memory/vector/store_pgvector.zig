@@ -19,6 +19,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
+const env_rebrand = @import("../../env_rebrand.zig");
 const store_mod = @import("store.zig");
 const VectorStore = store_mod.VectorStore;
 const VectorResult = store_mod.VectorResult;
@@ -1076,7 +1077,7 @@ test "formatVector rejects negative Inf" {
 
 fn initPostgresTestStoreWithPool(allocator: Allocator, pool_max: u32, acquire_timeout_ms: u32) !*PgvectorVectorStore {
     if (!build_options.enable_postgres) return error.SkipZigTest;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var table_buf: [64]u8 = undefined;

@@ -50,6 +50,55 @@ pub fn fireBannerOnce() void {
     }
 }
 
+// ── Generic dual-name env reader (D28, 2026-04-26) ────────────────
+//
+// Every NULLCLAW_* direct-read site in the codebase routes through
+// these two helpers so the deprecation banner + per-key warning + the
+// dual-name lookup behavior all live in one place. Replaces ad-hoc
+// `std.process.getEnvVarOwned(allocator, "NULLCLAW_FOO")` and
+// `std.posix.getenv("NULLCLAW_FOO")` patterns scattered across
+// cell_k8s_api.zig, config.zig, providers/api_key.zig, store_pgvector.zig,
+// session.zig.
+//
+// Lookup order: PRIMARY (NULLALIS_*) first, then FALLBACK (NULLCLAW_*)
+// with banner + warning. The fallback path fires both the cross-cutting
+// once-per-process banner AND a per-key warning so operators can grep
+// logs for exactly which keys they're still setting.
+
+/// Allocator-owned variant — caller frees the returned slice.
+/// Use this when you'd otherwise call `std.process.getEnvVarOwned`.
+pub fn getEnvOwnedWithRebrand(
+    allocator: std.mem.Allocator,
+    primary: []const u8,
+    fallback: []const u8,
+) !?[]u8 {
+    if (std.process.getEnvVarOwned(allocator, primary)) |v| return v
+    else |err| switch (err) {
+        error.EnvironmentVariableNotFound => {},
+        else => return err,
+    }
+    if (std.process.getEnvVarOwned(allocator, fallback)) |v| {
+        fireBannerOnce();
+        std.log.warn("env {s} is deprecated; use {s} (remove after {s})", .{ fallback, primary, SUNSET_DATE });
+        return v;
+    } else |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    }
+}
+
+/// Borrowed-slice variant — returned slice is process-lifetime; do not
+/// free. Use this when you'd otherwise call `std.posix.getenv`.
+pub fn getEnvSliceWithRebrand(primary: []const u8, fallback: []const u8) ?[]const u8 {
+    if (std.posix.getenv(primary)) |v| return v;
+    if (std.posix.getenv(fallback)) |v| {
+        fireBannerOnce();
+        std.log.warn("env {s} is deprecated; use {s} (remove after {s})", .{ fallback, primary, SUNSET_DATE });
+        return v;
+    }
+    return null;
+}
+
 /// Reset hook for tests that want to assert the banner fires exactly
 /// once. Production code MUST NOT call this — it would cause double
 /// banner emission. Gated on `builtin.is_test` to make accidental

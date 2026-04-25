@@ -1,5 +1,6 @@
 const std = @import("std");
 const platform = @import("platform.zig");
+const env_rebrand = @import("env_rebrand.zig");
 const cell_spec = @import("cell_spec.zig");
 
 const SERVICE_ACCOUNT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token";
@@ -94,7 +95,16 @@ pub const Client = struct {
         const trimmed_port = std.mem.trim(u8, service_port, " \t\r\n");
         if (trimmed_port.len == 0) return error.MissingKubernetesServicePort;
 
-        const cell_image = platform.getEnvOrNull(allocator, "NULLCLAW_CELL_IMAGE") orelse return error.MissingCellImage;
+        // D28: NULLALIS_CELL_IMAGE primary, NULLCLAW_CELL_IMAGE fallback (sunset 2026-05-15).
+        const cell_image = blk: {
+            if (platform.getEnvOrNull(allocator, "NULLALIS_CELL_IMAGE")) |v| break :blk v;
+            if (platform.getEnvOrNull(allocator, "NULLCLAW_CELL_IMAGE")) |v| {
+                env_rebrand.fireBannerOnce();
+                std.log.warn("env NULLCLAW_CELL_IMAGE is deprecated; use NULLALIS_CELL_IMAGE (remove after {s})", .{env_rebrand.SUNSET_DATE});
+                break :blk v;
+            }
+            return error.MissingCellImage;
+        };
         errdefer allocator.free(cell_image);
         const trimmed_cell_image = std.mem.trim(u8, cell_image, " \t\r\n");
         if (trimmed_cell_image.len == 0) return error.MissingCellImage;
@@ -186,8 +196,27 @@ pub const Client = struct {
     }
 };
 
-fn readRequiredEnv(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-    const raw = platform.getEnvOrNull(allocator, name) orelse return error.MissingRequiredEnvironment;
+/// D28 dual-name reader (2026-04-26 → 2026-05-15 sunset). `primary` is
+/// the NULLALIS_* canonical name; `fallback` is the legacy NULLCLAW_*
+/// name that fires the deprecation banner + per-key warning when hit.
+/// After the sunset, drop the `fallback` argument and revert to the
+/// single-name form.
+fn readRequiredEnv(
+    allocator: std.mem.Allocator,
+    primary: []const u8,
+    fallback: ?[]const u8,
+) ![]const u8 {
+    const raw_opt = platform.getEnvOrNull(allocator, primary) orelse blk: {
+        if (fallback) |fb| {
+            if (platform.getEnvOrNull(allocator, fb)) |raw| {
+                env_rebrand.fireBannerOnce();
+                std.log.warn("env {s} is deprecated; use {s} (remove after {s})", .{ fb, primary, env_rebrand.SUNSET_DATE });
+                break :blk raw;
+            }
+        }
+        return error.MissingRequiredEnvironment;
+    };
+    const raw = raw_opt;
     errdefer allocator.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return error.MissingRequiredEnvironment;
@@ -211,35 +240,39 @@ fn buildRuntimeConfig(
     errdefer allocator.free(bearer_token);
     const ca_cert_path = try allocator.dupe(u8, SERVICE_ACCOUNT_CA_PATH);
     errdefer allocator.free(ca_cert_path);
-    const controller_url = try readRequiredEnv(allocator, "NULLCLAW_CONTROLLER_URL");
+    // D28 (2026-04-26 → 2026-05-15 sunset): every NULLCLAW_CELL_* read here
+    // is dual-named — NULLALIS_CELL_* primary, NULLCLAW_CELL_* fallback. Operators
+    // get a banner-once + per-key warning when the legacy name fires. Drop the
+    // fallback strings after the sunset; helper signatures already accept ?[]const u8.
+    const controller_url = try readRequiredEnv(allocator, "NULLALIS_CONTROLLER_URL", "NULLCLAW_CONTROLLER_URL");
     errdefer allocator.free(controller_url);
-    const cell_service_account_name = try readOptionalEnvOrDefault(allocator, "NULLCLAW_CELL_SERVICE_ACCOUNT_NAME", "default");
+    const cell_service_account_name = try readOptionalEnvOrDefault(allocator, "NULLALIS_CELL_SERVICE_ACCOUNT_NAME", "NULLCLAW_CELL_SERVICE_ACCOUNT_NAME", "default");
     errdefer allocator.free(cell_service_account_name);
-    const cell_runtime_env_configmap_name = try readRequiredEnv(allocator, "NULLCLAW_CELL_RUNTIME_ENV_CONFIGMAP_NAME");
+    const cell_runtime_env_configmap_name = try readRequiredEnv(allocator, "NULLALIS_CELL_RUNTIME_ENV_CONFIGMAP_NAME", "NULLCLAW_CELL_RUNTIME_ENV_CONFIGMAP_NAME");
     errdefer allocator.free(cell_runtime_env_configmap_name);
-    const cell_secret_name = try readRequiredEnv(allocator, "NULLCLAW_CELL_SECRET_NAME");
+    const cell_secret_name = try readRequiredEnv(allocator, "NULLALIS_CELL_SECRET_NAME", "NULLCLAW_CELL_SECRET_NAME");
     errdefer allocator.free(cell_secret_name);
-    const shared_workspace_claim = try readRequiredEnv(allocator, "NULLCLAW_CELL_SHARED_WORKSPACE_CLAIM");
+    const shared_workspace_claim = try readRequiredEnv(allocator, "NULLALIS_CELL_SHARED_WORKSPACE_CLAIM", "NULLCLAW_CELL_SHARED_WORKSPACE_CLAIM");
     errdefer allocator.free(shared_workspace_claim);
-    const config_subpath = try readRequiredEnv(allocator, "NULLCLAW_CELL_CONFIG_SUBPATH");
+    const config_subpath = try readRequiredEnv(allocator, "NULLALIS_CELL_CONFIG_SUBPATH", "NULLCLAW_CELL_CONFIG_SUBPATH");
     errdefer allocator.free(config_subpath);
-    const workspace_subpath_root = try readOptionalEnvOrDefault(allocator, "NULLCLAW_CELL_WORKSPACE_SUBPATH_ROOT", "users");
+    const workspace_subpath_root = try readOptionalEnvOrDefault(allocator, "NULLALIS_CELL_WORKSPACE_SUBPATH_ROOT", "NULLCLAW_CELL_WORKSPACE_SUBPATH_ROOT", "users");
     errdefer allocator.free(workspace_subpath_root);
-    const workspace_mount_path = try readOptionalEnvOrDefault(allocator, "NULLCLAW_CELL_WORKSPACE_MOUNT_PATH", "/workspace");
+    const workspace_mount_path = try readOptionalEnvOrDefault(allocator, "NULLALIS_CELL_WORKSPACE_MOUNT_PATH", "NULLCLAW_CELL_WORKSPACE_MOUNT_PATH", "/workspace");
     errdefer allocator.free(workspace_mount_path);
-    const config_mount_path = try readOptionalEnvOrDefault(allocator, "NULLCLAW_CELL_CONFIG_MOUNT_PATH", "/etc/nullalis/config.json");
+    const config_mount_path = try readOptionalEnvOrDefault(allocator, "NULLALIS_CELL_CONFIG_MOUNT_PATH", "NULLCLAW_CELL_CONFIG_MOUNT_PATH", "/etc/nullalis/config.json");
     errdefer allocator.free(config_mount_path);
-    const cpu_request = try readOptionalEnvOrDefault(allocator, "NULLCLAW_CELL_CPU_REQUEST", "250m");
+    const cpu_request = try readOptionalEnvOrDefault(allocator, "NULLALIS_CELL_CPU_REQUEST", "NULLCLAW_CELL_CPU_REQUEST", "250m");
     errdefer allocator.free(cpu_request);
-    const cpu_limit = try readOptionalEnvOrDefault(allocator, "NULLCLAW_CELL_CPU_LIMIT", "1000m");
+    const cpu_limit = try readOptionalEnvOrDefault(allocator, "NULLALIS_CELL_CPU_LIMIT", "NULLCLAW_CELL_CPU_LIMIT", "1000m");
     errdefer allocator.free(cpu_limit);
-    const memory_request = try readOptionalEnvOrDefault(allocator, "NULLCLAW_CELL_MEMORY_REQUEST", "512Mi");
+    const memory_request = try readOptionalEnvOrDefault(allocator, "NULLALIS_CELL_MEMORY_REQUEST", "NULLCLAW_CELL_MEMORY_REQUEST", "512Mi");
     errdefer allocator.free(memory_request);
-    const memory_limit = try readOptionalEnvOrDefault(allocator, "NULLCLAW_CELL_MEMORY_LIMIT", "1Gi");
+    const memory_limit = try readOptionalEnvOrDefault(allocator, "NULLALIS_CELL_MEMORY_LIMIT", "NULLCLAW_CELL_MEMORY_LIMIT", "1Gi");
     errdefer allocator.free(memory_limit);
-    const run_as_user = try readOptionalU32EnvOrDefault(allocator, "NULLCLAW_CELL_RUN_AS_USER", 1000);
-    const run_as_group = try readOptionalU32EnvOrDefault(allocator, "NULLCLAW_CELL_RUN_AS_GROUP", 1000);
-    const fs_group = try readOptionalU32EnvOrDefault(allocator, "NULLCLAW_CELL_FS_GROUP", 1000);
+    const run_as_user = try readOptionalU32EnvOrDefault(allocator, "NULLALIS_CELL_RUN_AS_USER", "NULLCLAW_CELL_RUN_AS_USER", 1000);
+    const run_as_group = try readOptionalU32EnvOrDefault(allocator, "NULLALIS_CELL_RUN_AS_GROUP", "NULLCLAW_CELL_RUN_AS_GROUP", 1000);
+    const fs_group = try readOptionalU32EnvOrDefault(allocator, "NULLALIS_CELL_FS_GROUP", "NULLCLAW_CELL_FS_GROUP", 1000);
 
     return .{
         .api_server_url = api_server_url,
@@ -265,12 +298,25 @@ fn buildRuntimeConfig(
     };
 }
 
+/// D28 dual-name reader; same shape as readRequiredEnv but returns the
+/// supplied default when neither primary nor fallback is set.
 fn readOptionalEnvOrDefault(
     allocator: std.mem.Allocator,
-    name: []const u8,
+    primary: []const u8,
+    fallback: ?[]const u8,
     default_value: []const u8,
 ) ![]const u8 {
-    const raw = platform.getEnvOrNull(allocator, name) orelse return allocator.dupe(u8, default_value);
+    const raw_opt = platform.getEnvOrNull(allocator, primary) orelse blk: {
+        if (fallback) |fb| {
+            if (platform.getEnvOrNull(allocator, fb)) |raw| {
+                env_rebrand.fireBannerOnce();
+                std.log.warn("env {s} is deprecated; use {s} (remove after {s})", .{ fb, primary, env_rebrand.SUNSET_DATE });
+                break :blk raw;
+            }
+        }
+        return allocator.dupe(u8, default_value);
+    };
+    const raw = raw_opt;
     errdefer allocator.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) {
@@ -283,12 +329,24 @@ fn readOptionalEnvOrDefault(
     return normalized;
 }
 
+/// D28 dual-name reader for u32 env values. Same banner/warn semantics.
 fn readOptionalU32EnvOrDefault(
     allocator: std.mem.Allocator,
-    name: []const u8,
+    primary: []const u8,
+    fallback: ?[]const u8,
     default_value: u32,
 ) !u32 {
-    const raw = platform.getEnvOrNull(allocator, name) orelse return default_value;
+    const raw_opt = platform.getEnvOrNull(allocator, primary) orelse blk: {
+        if (fallback) |fb| {
+            if (platform.getEnvOrNull(allocator, fb)) |raw| {
+                env_rebrand.fireBannerOnce();
+                std.log.warn("env {s} is deprecated; use {s} (remove after {s})", .{ fb, primary, env_rebrand.SUNSET_DATE });
+                break :blk raw;
+            }
+        }
+        return default_value;
+    };
+    const raw = raw_opt;
     defer allocator.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return default_value;
@@ -365,7 +423,7 @@ fn buildUserCellEntrypointCommand(
         \\  esac
         \\}}
         \\
-        \\POSTGRES_RUNTIME_CONNECTION_STRING="${{NULLCLAW_POSTGRES_CONNECTION_STRING:-${{POSTGRES_CONNECTION_STRING:-}}}}"
+        \\POSTGRES_RUNTIME_CONNECTION_STRING="${{NULLALIS_POSTGRES_CONNECTION_STRING:-${{NULLCLAW_POSTGRES_CONNECTION_STRING:-${{POSTGRES_CONNECTION_STRING:-}}}}}}"
         \\if [ "${{POSTGRES_USE_PGBOUNCER:-false}}" = "true" ]; then
         \\  if [ -n "${{PGBOUNCER_HOST:-}}" ] && [ -n "${{PGBOUNCER_DB_USER:-}}" ] && [ -n "${{PGBOUNCER_DB_PASSWORD:-}}" ] && [ -n "${{PGBOUNCER_DB_NAME:-}}" ]; then
         \\    require_url_userinfo_safe PGBOUNCER_DB_USER "${{PGBOUNCER_DB_USER}}"
@@ -376,6 +434,11 @@ fn buildUserCellEntrypointCommand(
         \\    POSTGRES_RUNTIME_CONNECTION_STRING="${{PGBOUNCER_CONNECTION_STRING}}"
         \\  fi
         \\fi
+        \\# D28 (sunset 2026-05-15): export both NULLALIS_* + NULLCLAW_*
+        \\# names so the cell-pod nullalis (dual-name reader) prefers the
+        \\# canonical NULLALIS_*; legacy callers still find NULLCLAW_*.
+        \\# After sunset, drop the NULLCLAW_* export.
+        \\export NULLALIS_POSTGRES_CONNECTION_STRING="${{POSTGRES_RUNTIME_CONNECTION_STRING}}"
         \\export NULLCLAW_POSTGRES_CONNECTION_STRING="${{POSTGRES_RUNTIME_CONNECTION_STRING}}"
         \\export POSTGRES_CONNECTION_STRING="${{POSTGRES_RUNTIME_CONNECTION_STRING}}"
         \\
@@ -671,7 +734,12 @@ pub fn buildPodManifest(
     defer allocator.free(workspace_prep_command);
 
     try writer.print(
-        "{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"name\":{f},\"namespace\":{f},\"labels\":{{\"app.kubernetes.io/name\":\"nullalis-user-cell\",\"nullalis.ai/cell\":{f},\"app.kubernetes.io/managed-by\":\"nullalis-controller\"}}}},\"spec\":{{\"restartPolicy\":\"Always\",\"serviceAccountName\":{f},\"automountServiceAccountToken\":false,\"securityContext\":{{\"fsGroup\":{d}}},\"initContainers\":[{{\"name\":\"prepare-workspace\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"command\":[\"/bin/sh\",\"-lc\",{f}],\"securityContext\":{{\"runAsUser\":0,\"runAsGroup\":0,\"allowPrivilegeEscalation\":false}},\"volumeMounts\":[{{\"name\":\"shared-workspace\",\"mountPath\":{f}}},{{\"name\":\"tmp\",\"mountPath\":\"/tmp\"}}]}}],\"containers\":[{{\"name\":\"nullalis\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"command\":[\"/bin/sh\",\"-lc\",{f}],\"ports\":[{{\"name\":\"http\",\"containerPort\":{d}}}],\"env\":[{{\"name\":\"NULLALIS_CONFIG_PATH\",\"value\":{f}}},{{\"name\":\"NULLCLAW_WORKSPACE\",\"value\":{f}}},{{\"name\":\"HOME\",\"value\":{f}}},{{\"name\":\"NULLCLAW_ALLOW_PUBLIC_BIND\",\"value\":\"true\"}}",
+        // D28 (sunset 2026-05-15): emit both NULLALIS_* + NULLCLAW_* env
+        // entries on the cell pod so the dual-name reader prefers the
+        // canonical name while legacy callers still find the old name.
+        // After sunset, drop NULLCLAW_WORKSPACE + NULLCLAW_ALLOW_PUBLIC_BIND
+        // + NULLCLAW_INTERNAL_SERVICE_TOKEN (line ~752 below).
+        "{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"name\":{f},\"namespace\":{f},\"labels\":{{\"app.kubernetes.io/name\":\"nullalis-user-cell\",\"nullalis.ai/cell\":{f},\"app.kubernetes.io/managed-by\":\"nullalis-controller\"}}}},\"spec\":{{\"restartPolicy\":\"Always\",\"serviceAccountName\":{f},\"automountServiceAccountToken\":false,\"securityContext\":{{\"fsGroup\":{d}}},\"initContainers\":[{{\"name\":\"prepare-workspace\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"command\":[\"/bin/sh\",\"-lc\",{f}],\"securityContext\":{{\"runAsUser\":0,\"runAsGroup\":0,\"allowPrivilegeEscalation\":false}},\"volumeMounts\":[{{\"name\":\"shared-workspace\",\"mountPath\":{f}}},{{\"name\":\"tmp\",\"mountPath\":\"/tmp\"}}]}}],\"containers\":[{{\"name\":\"nullalis\",\"image\":{f},\"imagePullPolicy\":\"IfNotPresent\",\"command\":[\"/bin/sh\",\"-lc\",{f}],\"ports\":[{{\"name\":\"http\",\"containerPort\":{d}}}],\"env\":[{{\"name\":\"NULLALIS_CONFIG_PATH\",\"value\":{f}}},{{\"name\":\"NULLALIS_WORKSPACE\",\"value\":{f}}},{{\"name\":\"NULLCLAW_WORKSPACE\",\"value\":{f}}},{{\"name\":\"HOME\",\"value\":{f}}},{{\"name\":\"NULLALIS_ALLOW_PUBLIC_BIND\",\"value\":\"true\"}},{{\"name\":\"NULLCLAW_ALLOW_PUBLIC_BIND\",\"value\":\"true\"}}",
         .{
             std.json.fmt(desired.pod_name, .{}),
             std.json.fmt(desired.namespace, .{}),
@@ -686,13 +754,20 @@ pub fn buildPodManifest(
             desired.service_port,
             std.json.fmt(runtime.config_mount_path, .{}),
             std.json.fmt(runtime.workspace_mount_path, .{}),
+            // D28: workspace_mount_path duplicated for the second
+            // {f} slot — emits both NULLALIS_WORKSPACE and
+            // NULLCLAW_WORKSPACE with the same value.
+            std.json.fmt(runtime.workspace_mount_path, .{}),
             std.json.fmt(home_path, .{}),
         },
     );
     if (internal_service_token) |token| {
+        // D28 (sunset 2026-05-15): emit both names so the cell pod's
+        // dual-name reader prefers NULLALIS_*; legacy callers still find
+        // NULLCLAW_*. After sunset, drop the NULLCLAW_* line.
         try writer.print(
-            ",{{\"name\":\"NULLCLAW_INTERNAL_SERVICE_TOKEN\",\"value\":{f}}}",
-            .{std.json.fmt(token, .{})},
+            ",{{\"name\":\"NULLALIS_INTERNAL_SERVICE_TOKEN\",\"value\":{f}}},{{\"name\":\"NULLCLAW_INTERNAL_SERVICE_TOKEN\",\"value\":{f}}}",
+            .{ std.json.fmt(token, .{}), std.json.fmt(token, .{}) },
         );
     }
     try writer.writeAll("],\"envFrom\":[");
@@ -784,7 +859,11 @@ test "buildPodManifest includes controller and advertise args" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "--advertise-url 'http://nullalis-cell-42.nullalis-cells-standard.svc.cluster.local:3000'") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "POSTGRES_RUNTIME_CONNECTION_STRING") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "PGBOUNCER_CONNECTION_STRING") != null);
+    // D28 (sunset 2026-05-15): assert BOTH names present in manifest +
+    // export shell. After sunset, drop the NULLCLAW_* assertions.
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "export NULLALIS_POSTGRES_CONNECTION_STRING") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "export NULLCLAW_POSTGRES_CONNECTION_STRING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"NULLALIS_INTERNAL_SERVICE_TOKEN\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"NULLCLAW_INTERNAL_SERVICE_TOKEN\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"serviceAccountName\":\"nullclaw\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"automountServiceAccountToken\":false") != null);
