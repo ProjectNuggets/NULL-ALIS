@@ -61,7 +61,7 @@ one-line reason.
 
 | ID | Shape | Why deferred | Target | Status |
 |----|-------|--------------|--------|--------|
-| D16 | S4.14 noise-catch classification sweep — 89 sites in `gateway.zig` alone + more across 83 files | Per-site "operator-critical vs noisy-by-design" audit; too large for sprint body | Dedicated follow-up PR | **open** |
+| D16 | S4.14 noise-catch classification sweep — was 89 sites in `gateway.zig` alone + more across 83 files; current 307 sites across 57 files | First-pass landed during the freeze-week debt drain (D16 PR): policy doc at `docs/silent-catches-policy.md` establishes the 3-bucket classification (noisy-by-design / operator-critical / bubble-up); 5 operator-critical workspace-scaffolding sites converted to logged catches; 16 process-cleanup sites tagged as noisy-by-design with a single batch comment. **302 sites remain.** Reframed from "do it all" → "operator-pain-driven sweep using the policy doc as guide" — the right trigger is "we lost a metric, why?" not speculative bug-finding | Operator-pain-triggered, surface-by-surface | **open — first-pass shipped, continued audit on-trigger** |
 
 ---
 
