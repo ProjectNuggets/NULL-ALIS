@@ -542,6 +542,17 @@ pub const Agent = struct {
     /// Tool calls in the last completed turn (for skills auto-extraction).
     last_turn_tool_count: u32 = 0,
 
+    /// **D1.8** — count of `durable_fact/behavior/*` entries this session
+    /// has stored. Replaces the prior pattern (`mem.list` + filter scan
+    /// on EVERY user message that tripped a learning signal — O(N) over
+    /// all session memories per signal-bearing turn). Lazy-initialized
+    /// on first check via a one-time `mem.list` scan; incremented on
+    /// successful `mem.store(durable_fact/behavior/*)`. Bounds-checked
+    /// against `learning.MAX_FACTS_PER_SESSION`. `null` means "not yet
+    /// initialized this session" — first turn that needs the count
+    /// pays the one-time O(N) cost; subsequent turns are O(1).
+    learning_fact_count: ?u32 = null,
+
     /// Per-turn context lifecycle engine — stateless between turns.
     context_engine_state: context_engine.ContextEngine = .{},
 
@@ -2647,9 +2658,15 @@ pub const Agent = struct {
                 const fact_content = learning.extractFactFromMessage(self.allocator, user_message, signals) catch null;
                 defer if (fact_content) |fc| self.allocator.free(fc);
                 if (fact_content) |fc| {
-                    // T-1.5-08: enforce MAX_FACTS_PER_SESSION before storing
-                    const at_limit = blk: {
-                        const entries = mem.list(self.allocator, null, self.memory_session_id) catch break :blk false;
+                    // T-1.5-08 + D1.8: enforce MAX_FACTS_PER_SESSION before
+                    // storing. Pre-D1.8 this scanned the entire session
+                    // memory list on every turn that produced a learning
+                    // signal (O(N) over all memories per check). Now we
+                    // lazy-init `learning_fact_count` once per session via
+                    // the same scan, then maintain it as a counter — O(1)
+                    // on every subsequent check.
+                    if (self.learning_fact_count == null) {
+                        const entries = mem.list(self.allocator, null, self.memory_session_id) catch &.{};
                         defer if (entries.len > 0) {
                             for (entries) |e| {
                                 self.allocator.free(e.key);
@@ -2657,12 +2674,13 @@ pub const Agent = struct {
                             }
                             self.allocator.free(entries);
                         };
-                        var fact_count: usize = 0;
+                        var fact_count: u32 = 0;
                         for (entries) |e| {
                             if (std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) fact_count += 1;
                         }
-                        break :blk fact_count >= learning.MAX_FACTS_PER_SESSION;
-                    };
+                        self.learning_fact_count = fact_count;
+                    }
+                    const at_limit = (self.learning_fact_count.?) >= learning.MAX_FACTS_PER_SESSION;
                     if (at_limit) {
                         log.warn("learning.max_facts_reached session={?s}", .{self.memory_session_id});
                     } else {
@@ -2673,8 +2691,16 @@ pub const Agent = struct {
                             // facts are the behavioral-correction corpus; losing
                             // one silently means the agent doesn't learn from a
                             // user correction it thought it saved.
-                            _ = mem.store(k, fc, .core, self.memory_session_id) catch |err|
+                            if (mem.store(k, fc, .core, self.memory_session_id)) |_| {
+                                // D1.8: only bump counter on confirmed-stored.
+                                // If the store fails, the count must NOT advance
+                                // or we'd silently exceed MAX_FACTS_PER_SESSION
+                                // on subsequent turns when the prior write didn't
+                                // actually land.
+                                if (self.learning_fact_count) |*c| c.* += 1;
+                            } else |err| {
                                 log.warn("learning.fact_store_failed key={s} err={s}", .{ k, @errorName(err) });
+                            }
                             log.info("learning.signal_detected signals={d} key={s}", .{ signals.len, k });
                         }
                     }
