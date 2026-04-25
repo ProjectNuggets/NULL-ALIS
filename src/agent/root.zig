@@ -3110,8 +3110,20 @@ pub const Agent = struct {
 
                     if (self.provider_reliability_active) return err;
 
-                    // Retry once
-                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                    // Retry once. **D1.9** — removed the previous
+                    // `std.Thread.sleep(500ms)` here per
+                    // `P2_agent_turn_loop.md` ugly truth #5: when the
+                    // reliable provider wrapper is ACTIVE (production
+                    // default) it owns all retry/backoff scheduling and
+                    // we returned `err` two lines above before reaching
+                    // here. When the wrapper is INACTIVE (tests, dev)
+                    // the user has explicitly opted out of automated
+                    // retry — a hardcoded magic 500ms blocking the
+                    // session thread with no jitter / backoff
+                    // contributes nothing useful. If a real backoff is
+                    // ever needed on this path, the right move is
+                    // exponential-with-jitter via a shared helper, not
+                    // a magic-number sleep.
                     turn_retry_attempts += 1;
                     turn_llm_calls += 1;
                     break :retry_blk self.provider.chat(
