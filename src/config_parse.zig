@@ -1711,39 +1711,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
-    // Hardware
-    if (root.get("hardware")) |hw| {
-        if (hw == .object) {
-            if (hw.object.get("enabled")) |v| {
-                if (v == .bool) self.hardware.enabled = v.bool;
-            }
-            if (hw.object.get("serial_port")) |v| {
-                if (v == .string) self.hardware.serial_port = try self.allocator.dupe(u8, v.string);
-            }
-            if (hw.object.get("baud_rate")) |v| {
-                if (v == .integer) self.hardware.baud_rate = @intCast(v.integer);
-            }
-            if (hw.object.get("probe_target")) |v| {
-                if (v == .string) self.hardware.probe_target = try self.allocator.dupe(u8, v.string);
-            }
-            if (hw.object.get("workspace_datasheets")) |v| {
-                if (v == .bool) self.hardware.workspace_datasheets = v.bool;
-            }
-            if (hw.object.get("transport")) |v| {
-                if (v == .string) {
-                    if (std.mem.eql(u8, v.string, "none")) {
-                        self.hardware.transport = .none;
-                    } else if (std.mem.eql(u8, v.string, "native")) {
-                        self.hardware.transport = .native;
-                    } else if (std.mem.eql(u8, v.string, "serial")) {
-                        self.hardware.transport = .serial;
-                    } else if (std.mem.eql(u8, v.string, "probe")) {
-                        self.hardware.transport = .probe;
-                    }
-                }
-            }
-        }
-    }
+    // Hardware section parser removed D19 (2026-04-25). Legacy
+    // config files containing a `"hardware": {...}` block are silently
+    // ignored — std.json parsing tolerates unknown root keys, so old
+    // configs still load. The HardwareConfig struct itself is gone
+    // from `config_types.zig`.
 
     // Peripherals
     if (root.get("peripherals")) |per| {

@@ -142,7 +142,7 @@ const operator_owned_top_level_config_keys = [_][]const u8{
     "identity",
     "cost",
     "peripherals",
-    "hardware",
+    // "hardware" removed D19 (2026-04-25) — surface fully stripped.
     "security",
     "tools",
     "session",

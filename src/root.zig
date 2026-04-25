@@ -2,8 +2,12 @@
 //!
 //! Module hierarchy mirrors ZeroClaw's Rust architecture:
 //!   agent, channels, config, cron, daemon, doctor, gateway,
-//!   hardware, health, heartbeat, memory, observability,
-//!   onboard, providers, security, skills, tools
+//!   health, heartbeat, memory, observability, onboard,
+//!   providers, security, skills, tools
+//!
+//! (Hardware module dropped from this list D19 / 2026-04-25 along
+//! with the rest of the hardware surface — V1 is a second-brain
+//! runtime, not an embedded-device runtime.)
 
 // Shared utilities
 pub const json_util = @import("json_util.zig");
@@ -85,10 +89,15 @@ pub const user_settings = @import("user_settings.zig");
 // Phase 4e: Agent Routing
 pub const agent_routing = @import("agent_routing.zig");
 
-// Phase 5: Integrations (hardware + peripherals removed in V1 convergence — not a second-brain surface)
-// S6.1 — rag.zig was a datasheet-RAG module (hardware-adjacent, no consumers
-// since V1 convergence stripped the hardware surface). Deleted with the
-// hardware CLI in this sprint; re-export removed.
+// Phase 5: Integrations.
+// V1 convergence history (kept as a tombstone trail so future maintainers
+// understand the absences):
+//   • S6.1 — rag.zig (datasheet-RAG, hardware-adjacent) deleted; no consumers.
+//   • D19  — hardware CLI command + `HardwareConfig` struct + parser branch +
+//     status display + capabilities entries + tools/root.zig boards stub
+//     all removed (2026-04-25). The "hardware" command surface is gone.
+//   • Peripherals struct still present but inert; revisit if a fork ever
+//     reintroduces embedded-device support.
 pub const integrations = @import("integrations.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const voice = @import("voice.zig");

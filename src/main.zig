@@ -42,7 +42,6 @@ const Command = enum {
     cron,
     channel,
     skills,
-    hardware,
     migrate,
     memory,
     capabilities,
@@ -68,7 +67,6 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "cron", .cron },
         .{ "channel", .channel },
         .{ "skills", .skills },
-        .{ "hardware", .hardware },
         .{ "migrate", .migrate },
         .{ "memory", .memory },
         .{ "capabilities", .capabilities },
@@ -402,7 +400,6 @@ fn runMain(allocator: std.mem.Allocator) !void {
         .cron => try runCron(allocator, sub_args),
         .channel => try runChannel(allocator, sub_args),
         .skills => try runSkills(allocator, sub_args),
-        .hardware => try runHardware(allocator, sub_args),
         .migrate => try runMigrate(allocator, sub_args),
         .memory => try runMemory(allocator, sub_args),
         .capabilities => try runCapabilities(allocator, sub_args),
@@ -1388,23 +1385,12 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     }
 }
 
-// ── Hardware ─────────────────────────────────────────────────────
-
-fn runHardware(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    _ = allocator;
-    _ = sub_args;
-    // Hardware/IoT CLI was removed in V1 convergence. Nullalis is a
-    // second-brain runtime; embedded-device discovery is out of scope.
-    // Keeping the dispatch stub so the `nullalis hardware` command surface
-    // returns a clear message for one release cycle rather than a parse
-    // error. Remove the dispatch entirely in the next cleanup pass.
-    std.debug.print(
-        "The `nullalis hardware` command was removed in V1 convergence.\n" ++
-            "Nullalis is a second-brain runtime; hardware/IoT discovery is not supported.\n",
-        .{},
-    );
-    std.process.exit(2);
-}
+// Hardware CLI surface — fully removed (D19, 2026-04-25). The
+// deprecation stub previously here printed a removed-in-V1 notice
+// for one release cycle; that cycle has elapsed. Hardware/IoT
+// discovery is out of scope for the second-brain runtime. If a
+// future fork wants embedded-device support, restore from git
+// history at the D19 commit.
 
 // ── Migrate ──────────────────────────────────────────────────────
 
@@ -3618,7 +3604,6 @@ fn printUsage() void {
         \\  cron        Manage scheduled tasks
         \\  channel     Manage channels (Telegram, Discord, Slack, ...)
         \\  skills      Manage skills
-        \\  hardware    Discover and manage hardware
         \\  migrate     Migrate data from other agent runtimes
         \\  memory      Inspect and maintain memory subsystem
         \\  capabilities Show runtime capabilities manifest
@@ -3640,7 +3625,6 @@ fn printUsage() void {
         \\  cron <list|add|once|remove|pause|resume> [ARGS] [--backend auto|file|postgres] [--user-id ID]
         \\  channel <list|start|status|add|remove> [ARGS]
         \\  skills <list|search|install|remove> [ARGS]
-        \\  hardware <discover|introspect|info> [ARGS]
         \\  migrate openclaw [--dry-run] [--source PATH]
         \\  migrate tenant-config [--dry-run] [--user-id ID]
         \\  memory <stats|count|reindex|search|get|list|drain-outbox|forget> [ARGS]

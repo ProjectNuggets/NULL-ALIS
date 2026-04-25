@@ -45,10 +45,9 @@ const optional_tool_names = [_][]const u8{
     "composio",
     "browser_open",
     "message",
-    "hardware_board_info",
-    "hardware_memory",
-    "i2c",
-    "spi",
+    // hardware_board_info, hardware_memory, i2c, spi: removed D19
+    // (2026-04-25). Hardware/IoT tool surface stripped in V1
+    // convergence; no consumers, no runtime registration.
 };
 
 const ChannelMode = enum {
@@ -84,11 +83,8 @@ fn optionalToolEnabledByConfig(cfg: *const Config, name: []const u8) bool {
     if (std.mem.eql(u8, name, "browser_open")) return cfg.browser.allowed_domains.len > 0;
     // message depends on event_bus wiring at runtime, not config alone.
     if (std.mem.eql(u8, name, "message")) return false;
-    // Hardware tools depend on runtime board discovery/wiring, not config flag alone.
-    if (std.mem.eql(u8, name, "hardware_board_info")) return false;
-    if (std.mem.eql(u8, name, "hardware_memory")) return false;
-    if (std.mem.eql(u8, name, "i2c")) return false;
-    if (std.mem.eql(u8, name, "spi")) return false;
+    // hardware_board_info / hardware_memory / i2c / spi gates removed
+    // D19 (2026-04-25) alongside the hardware tool surface itself.
     return false;
 }
 

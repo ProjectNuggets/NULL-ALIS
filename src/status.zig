@@ -205,10 +205,11 @@ pub fn runWithUser(allocator: std.mem.Allocator, user_id: ?[]const u8) !void {
         if (cfg.cost.enabled) "tracking enabled" else "disabled",
     });
 
-    // Hardware
-    try w.print("Hardware:    {s}\n", .{
-        if (cfg.hardware.enabled) "enabled" else "disabled",
-    });
+    // Hardware section removed Sprint-debt-D19 (2026-04-25) — V1
+    // convergence stripped the hardware surface; reading
+    // `cfg.hardware.enabled` here would dangle once `HardwareConfig`
+    // is removed from `config_types.zig`. Status display loses one
+    // line; nothing operationally consumed it.
 
     // Peripherals
     try w.print("Peripherals: {s} ({d} boards)\n", .{
