@@ -3963,18 +3963,38 @@ pub const Agent = struct {
         };
         defer self.allocator.free(summary_messages);
 
+        // **D1.12** — honor vision-fallback consistency for the
+        // exhausted-iter summary call. P2_agent_turn_loop.md ugly
+        // truth #10: this site previously hardcoded `self.model_name`
+        // even when the per-iteration provider calls had been routed
+        // to `self.vision_fallback_model` because the messages
+        // contained images. The summary inherits the same message
+        // history (with image parts intact), so we must inherit the
+        // same model selection or risk the non-vision main model
+        // failing on the image content. Pre-D1.12, an exhausted-iter
+        // turn that had been running on vision-fallback would summarize
+        // via the wrong model — likely hallucinating or erroring.
+        const summary_model: []const u8 = blk: {
+            if (self.vision_fallback_model.len > 0 and hasImageContentParts(summary_messages) and
+                !std.mem.eql(u8, self.model_name, self.vision_fallback_model))
+            {
+                break :blk self.vision_fallback_model;
+            }
+            break :blk self.model_name;
+        };
+
         var summary_response = self.provider.chat(
             self.allocator,
             .{
                 .messages = summary_messages,
-                .model = self.model_name,
+                .model = summary_model,
                 .temperature = self.temperature,
                 .max_tokens = self.max_tokens,
                 .tools = null, // force text-only
                 .timeout_secs = self.message_timeout_secs,
                 .reasoning_effort = self.reasoning_effort,
             },
-            self.model_name,
+            summary_model,
             self.temperature,
         ) catch {
             const fallback = if (loop_detected)
