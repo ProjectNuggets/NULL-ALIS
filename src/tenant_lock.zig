@@ -49,7 +49,15 @@ var owner_id_cache_len: usize = 0;
 var owner_id_cache_ready: bool = false;
 
 pub fn resolveOwnerId(allocator: std.mem.Allocator) ![]u8 {
-    if (try readTrimmedEnvVar(allocator, "NULLCLAW_OWNER_ID")) |value| return value;
+    // D28 (sunset 2026-05-15) — NULLALIS_OWNER_ID primary, NULLCLAW_OWNER_ID
+    // fallback. After sunset, drop the legacy branch.
+    if (try readTrimmedEnvVar(allocator, "NULLALIS_OWNER_ID")) |value| return value;
+    if (try readTrimmedEnvVar(allocator, "NULLCLAW_OWNER_ID")) |value| {
+        const env_rebrand = @import("env_rebrand.zig");
+        env_rebrand.fireBannerOnce();
+        std.log.warn("env NULLCLAW_OWNER_ID is deprecated; use NULLALIS_OWNER_ID (remove after {s})", .{env_rebrand.SUNSET_DATE});
+        return value;
+    }
     if (try readTrimmedEnvVar(allocator, "HOSTNAME")) |value| return value;
 
     owner_id_mutex.lock();

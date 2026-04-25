@@ -10,6 +10,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const config_types = @import("config_types.zig");
+const env_rebrand = @import("env_rebrand.zig");
 const memory_root = @import("memory/root.zig");
 const cron_mod = @import("cron.zig");
 const security_secrets = @import("security/secrets.zig");
@@ -3267,7 +3268,7 @@ test "canIgnoreMigrateError tolerates tasks add primary key race" {
 }
 
 fn initPostgresTestManagerWithPool(allocator: std.mem.Allocator, pool_max: u32, lock_timeout_ms: u32) !ManagerImpl {
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -3298,7 +3299,7 @@ fn initPostgresTestManagerWithPool(allocator: std.mem.Allocator, pool_max: u32, 
 test "postgres claimed job one-shot completion preserves run history and disables job in management view" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -3372,7 +3373,7 @@ test "postgres claimed job one-shot completion preserves run history and disable
 test "postgres claimed recurring job reschedules and records run" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -3477,7 +3478,7 @@ test "postgres claimed recurring job reschedules and records run" {
 test "postgres getJobsJson includes disabled jobs for management views" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -3517,7 +3518,7 @@ test "postgres getJobsJson includes disabled jobs for management views" {
 test "postgres replaceJobsJson scopes stored job ids per user while preserving raw ids" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -3574,7 +3575,7 @@ test "postgres replaceJobsJson scopes stored job ids per user while preserving r
 test "postgres memory upsert recall list and forget stay user-scoped" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -3628,7 +3629,7 @@ test "postgres memory upsert recall list and forget stay user-scoped" {
 test "postgres channel identity bindings upsert resolve list delete and backfill candidates" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
@@ -3737,7 +3738,7 @@ test "postgres channel identity bindings upsert resolve list delete and backfill
 test "postgres ownership lease snapshot returns null and active lease values" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const test_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;

@@ -38,12 +38,22 @@ pub fn resolveApiKey(
         } else |_| {}
     }
 
-    // 3. Generic fallbacks
-    const fallbacks = [_][]const u8{ "NULLCLAW_API_KEY", "API_KEY" };
+    // 3. Generic fallbacks. Iteration order matters: NULLALIS_API_KEY
+    // primary; NULLCLAW_API_KEY legacy (D28 — sunset 2026-05-15) fires
+    // the deprecation banner + per-key warning when hit; API_KEY
+    // unprefixed survives the sunset because operators may share env
+    // across products and we shouldn't presume their conventions.
+    const env_rebrand = @import("../env_rebrand.zig");
+    const fallbacks = [_][]const u8{ "NULLALIS_API_KEY", "NULLCLAW_API_KEY", "API_KEY" };
     for (fallbacks) |env_var| {
         if (std.process.getEnvVarOwned(allocator, env_var)) |value| {
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             if (trimmed.len > 0) {
+                // Only the legacy NULLCLAW_-prefixed name fires the banner.
+                if (std.mem.eql(u8, env_var, "NULLCLAW_API_KEY")) {
+                    env_rebrand.fireBannerOnce();
+                    std.log.warn("env NULLCLAW_API_KEY is deprecated; use NULLALIS_API_KEY (remove after {s})", .{env_rebrand.SUNSET_DATE});
+                }
                 if (trimmed.ptr != value.ptr or trimmed.len != value.len) {
                     const duped = try allocator.dupe(u8, trimmed);
                     allocator.free(value);

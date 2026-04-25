@@ -831,8 +831,13 @@ pub const CronScheduler = struct {
                                 const user_root = self.context_user_root orelse "";
                                 break :blk std.fmt.allocPrint(
                                     self.allocator,
-                                    "NULLCLAW_USER_ID=\"{s}\" NULLCLAW_USER_ROOT=\"{s}\" cd \"{s}\" && {s}",
-                                    .{ user_id, user_root, workspace, job.command },
+                                    // D28 (sunset 2026-05-15): emit both NULLALIS_* and NULLCLAW_*
+                                    // for the cron-spawned shell so the dual-name reader prefers
+                                    // canonical NULLALIS_*; legacy callers in user-supplied
+                                    // commands still find NULLCLAW_*. Drop the NULLCLAW_* pair
+                                    // after the sunset.
+                                    "NULLALIS_USER_ID=\"{s}\" NULLALIS_USER_ROOT=\"{s}\" NULLCLAW_USER_ID=\"{s}\" NULLCLAW_USER_ROOT=\"{s}\" cd \"{s}\" && {s}",
+                                    .{ user_id, user_root, user_id, user_root, workspace, job.command },
                                 ) catch null;
                             }
                             break :blk std.fmt.allocPrint(

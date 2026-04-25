@@ -998,7 +998,14 @@ pub const TenantConfig = struct {
 };
 
 pub const StateSecretsStoreConfig = struct {
-    master_key_env: []const u8 = "NULLCLAW_STATE_MASTER_KEY",
+    /// Default env-var name to read the master key from. Operators can
+    /// override this in config to point at any env var they like.
+    /// D28 (sunset 2026-05-15): default name flipped from
+    /// NULLCLAW_STATE_MASTER_KEY → NULLALIS_STATE_MASTER_KEY. Existing
+    /// configs that explicitly set `master_key_env: "NULLCLAW_STATE_MASTER_KEY"`
+    /// keep working — the field is operator-controlled. The DEFAULT
+    /// changes; nothing else.
+    master_key_env: []const u8 = "NULLALIS_STATE_MASTER_KEY",
     aead_algorithm: []const u8 = "chacha20poly1305",
 };
 

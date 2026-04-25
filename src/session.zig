@@ -11,6 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const env_rebrand = @import("env_rebrand.zig");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
@@ -2031,7 +2032,7 @@ test "concurrent processMessage with sqlite memory does not panic" {
 test "postgres session restore under concurrent getOrCreate same and mixed keys does not panic" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
 
-    const test_url = std.process.getEnvVarOwned(testing.allocator, "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(testing.allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
     defer testing.allocator.free(test_url);
 
     var schema_buf: [96]u8 = undefined;
