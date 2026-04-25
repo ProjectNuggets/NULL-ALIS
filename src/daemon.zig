@@ -1712,7 +1712,7 @@ fn resolveInboundRouteSessionKeyWithMetadata(
         // Do NOT swap to `session/root.userThreadSessionKey` — that emits
         // the user-cell family, which loses the channel/account/peer
         // context the Telegram/Discord/etc. listeners use to route back.
-        const threaded = agent_routing.buildThreadSessionKey(allocator, route.session_key, thread_id) catch return route.session_key;
+        const threaded = agent_routing.buildChannelRoutedThreadSessionKey(allocator, route.session_key, thread_id) catch return route.session_key;
         allocator.free(route.session_key);
         return threaded;
     }

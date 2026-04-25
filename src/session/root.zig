@@ -31,17 +31,23 @@ pub fn userMainSessionKey(buf: []u8, user_id: []const u8) []const u8 {
 /// `agent:zaki-bot:user:{user_id}:thread:{conversation_id}`.
 ///
 /// **Sprint 8 (S8.2) — coexists deliberately with `agent_routing.zig::
-/// buildThreadSessionKey(allocator, base_key, thread_id)`. Neither is
-/// legacy.** This formatter is the canonical user-cell identity used by
-/// HTTP/SSE turn loops, scheduler dispatch, the GDPR purge orchestrator
-/// (S7.1), and every internal API caller that already knows the
-/// multi-tenant user_id.
+/// buildChannelRoutedThreadSessionKey(allocator, base_key, thread_id)`.
+/// Neither is legacy.** This formatter is the canonical user-cell
+/// identity used by HTTP/SSE turn loops, scheduler dispatch, the GDPR
+/// purge orchestrator (S7.1), and every internal API caller that
+/// already knows the multi-tenant user_id.
+///
+/// (D30 rename, 2026-04-25 — the channel-routed sibling was renamed
+/// from `buildThreadSessionKey` to `buildChannelRoutedThreadSessionKey`
+/// to make the family difference unmistakable. A deprecated alias
+/// keeps external callers building until the 2026-05-15 sunset.)
 ///
 /// The channel-routed family (`agent:{agent_id}:{channel}:{kind}:{id}:
-/// thread:{thread_id}`) is built by `agent_routing.buildThreadSessionKey`
-/// and serves inbound message routing from external channels (Telegram /
-/// Discord / Slack / etc.) where the user_id may not yet be bound. The
-/// two families are not interchangeable — picking the wrong one breaks
+/// thread:{thread_id}`) is built by
+/// `agent_routing.buildChannelRoutedThreadSessionKey` and serves
+/// inbound message routing from external channels (Telegram / Discord
+/// / Slack / etc.) where the user_id may not yet be bound. The two
+/// families are not interchangeable — picking the wrong one breaks
 /// reply-path resolution.
 ///
 /// Use this formatter when you have a `user_id` in hand. Use the agent-
