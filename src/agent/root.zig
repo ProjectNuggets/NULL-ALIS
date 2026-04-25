@@ -3593,20 +3593,38 @@ pub const Agent = struct {
                         // Use .user role (not .system) because Anthropic/Gemini drop
                         // mid-history system messages. The "SYSTEM:" prefix ensures
                         // the model treats it as an instruction, not user input.
-                        try self.history.append(self.allocator, .{
-                            .role = .user,
-                            .content = try self.allocator.dupe(u8, "SYSTEM: Review the recent conversation. If any user preferences, " ++
-                                "important decisions, or reusable procedures should be remembered " ++
-                                "long-term, save them now using the memory tool. Only save what " ++
-                                "has lasting relevance beyond this session."),
-                        });
-                        log.info("turn.stage stage=memory_nudge turns_elapsed=10", .{});
-                        const nudge_event = ObserverEvent{ .turn_stage = .{
-                            .stage = "post_turn_memory_nudge",
-                            .iteration = iteration,
-                            .run_id = self.current_run_id,
-                        } };
-                        self.observer.recordEvent(&nudge_event);
+                        // **D1.11 self-review fix** — DO NOT propagate
+                        // append failure here. Pre-D1.11 these writes
+                        // happened AFTER turn_complete and any failure
+                        // was silent (per ugly truth #11). Post-D1.11
+                        // they happen BEFORE turn_complete; if we let
+                        // the error propagate we'd skip turn_complete
+                        // entirely — a worse regression than the
+                        // silent-mutation bug we were fixing. Log on
+                        // failure (Sprint 4 policy) and continue.
+                        const nudge_content = self.allocator.dupe(u8, "SYSTEM: Review the recent conversation. If any user preferences, " ++
+                            "important decisions, or reusable procedures should be remembered " ++
+                            "long-term, save them now using the memory tool. Only save what " ++
+                            "has lasting relevance beyond this session.") catch |err| blk: {
+                            log.warn("post_turn_memory_nudge.dupe_failed err={s}", .{@errorName(err)});
+                            break :blk null;
+                        };
+                        if (nudge_content) |content| {
+                            self.history.append(self.allocator, .{
+                                .role = .user,
+                                .content = content,
+                            }) catch |err| {
+                                log.warn("post_turn_memory_nudge.append_failed err={s}", .{@errorName(err)});
+                                self.allocator.free(content);
+                            };
+                            log.info("turn.stage stage=memory_nudge turns_elapsed=10", .{});
+                            const nudge_event = ObserverEvent{ .turn_stage = .{
+                                .stage = "post_turn_memory_nudge",
+                                .iteration = iteration,
+                                .run_id = self.current_run_id,
+                            } };
+                            self.observer.recordEvent(&nudge_event);
+                        }
                     }
                 }
 
@@ -3618,22 +3636,34 @@ pub const Agent = struct {
                 if (turn_tool_calls_total >= 5 and self.workspace_dir.len > 0 and
                     self.last_turn_tool_count < 5)
                 {
-                    try self.history.append(self.allocator, .{
-                        .role = .user,
-                        .content = try self.allocator.dupe(u8, "SYSTEM: You just completed a multi-step task with multiple tool " ++
-                            "calls. If this procedure could be useful in the future, consider " ++
-                            "saving it as a reusable skill file (SKILL.md) in the workspace. " ++
-                            "Only do this if the procedure is genuinely reusable — not for " ++
-                            "one-off tasks."),
-                    });
-                    log.info("turn.stage stage=skills_extraction_prompt tool_calls={d}", .{turn_tool_calls_total});
-                    const skills_event = ObserverEvent{ .turn_stage = .{
-                        .stage = "post_turn_skills_extraction_prompt",
-                        .iteration = iteration,
-                        .count = turn_tool_calls_total,
-                        .run_id = self.current_run_id,
-                    } };
-                    self.observer.recordEvent(&skills_event);
+                    // **D1.11 self-review fix** — same rationale as the
+                    // memory_nudge block above: never let an append
+                    // failure here skip turn_complete.
+                    const skills_content = self.allocator.dupe(u8, "SYSTEM: You just completed a multi-step task with multiple tool " ++
+                        "calls. If this procedure could be useful in the future, consider " ++
+                        "saving it as a reusable skill file (SKILL.md) in the workspace. " ++
+                        "Only do this if the procedure is genuinely reusable — not for " ++
+                        "one-off tasks.") catch |err| blk: {
+                        log.warn("post_turn_skills_extraction.dupe_failed err={s}", .{@errorName(err)});
+                        break :blk null;
+                    };
+                    if (skills_content) |content| {
+                        self.history.append(self.allocator, .{
+                            .role = .user,
+                            .content = content,
+                        }) catch |err| {
+                            log.warn("post_turn_skills_extraction.append_failed err={s}", .{@errorName(err)});
+                            self.allocator.free(content);
+                        };
+                        log.info("turn.stage stage=skills_extraction_prompt tool_calls={d}", .{turn_tool_calls_total});
+                        const skills_event = ObserverEvent{ .turn_stage = .{
+                            .stage = "post_turn_skills_extraction_prompt",
+                            .iteration = iteration,
+                            .count = turn_tool_calls_total,
+                            .run_id = self.current_run_id,
+                        } };
+                        self.observer.recordEvent(&skills_event);
+                    }
                 }
 
                 // **D1.11** — turn_complete now fires LAST, after all
@@ -3641,6 +3671,8 @@ pub const Agent = struct {
                 // visible turn_stage events. Pre-D1.11 turn_complete
                 // fired before the maintenance writes so dashboards
                 // saw "turn done" while history was still mutating.
+                // Maintenance write failures are logged but do NOT skip
+                // turn_complete — see the inline catch handlers above.
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
 
