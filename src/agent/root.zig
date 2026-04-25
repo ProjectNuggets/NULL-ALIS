@@ -2358,7 +2358,15 @@ pub const Agent = struct {
 
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
-    pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+    ///
+    /// **D1.2:** Returns a `TurnOutcome` struct (text + tool_calls_executed +
+    /// spawned_task_ids + iterations_used + loop_detected) instead of bare
+    /// `[]const u8`. The legacy `turn()` wrapper at the bottom of this method
+    /// preserves the old signature for callers that only need the text.
+    /// New callers (gateway, session manager — D1.3, D1.4) should use
+    /// `turnOutcome` directly so the structured tool-only-turn SSE frame
+    /// can carry real metadata instead of fabricating `EMPTY_TURN_PLACEHOLDER`.
+    pub fn turnOutcome(self: *Agent, user_message: []const u8) !TurnOutcome {
         const turn_start_ms = std.time.milliTimestamp();
         self.cancellation_token.reset(); // Clear stale cancellation from previous turn
 
@@ -2409,7 +2417,7 @@ pub const Agent = struct {
 
         // Handle slash commands before sending to LLM (saves tokens)
         if (try self.handleSlashCommand(user_message)) |response| {
-            return response;
+            return TurnOutcome.justText(response);
         }
 
         self.context_was_compacted = false;
@@ -2719,7 +2727,7 @@ pub const Agent = struct {
                     self.last_turn_context.cache_hit = true;
                     const complete_event = ObserverEvent{ .turn_complete = {} };
                     self.observer.recordEvent(&complete_event);
-                    return cached_hit.response;
+                    return TurnOutcome.justText(cached_hit.response);
                 }
             }
         }
@@ -2750,7 +2758,7 @@ pub const Agent = struct {
                 self.last_turn_context.cache_hit = true;
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
-                return cached_response;
+                return TurnOutcome.justText(cached_response);
             }
         }
 
@@ -2810,7 +2818,10 @@ pub const Agent = struct {
                 self.observer.recordEvent(&cancel_event);
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
-                return try self.allocator.dupe(u8, "[Cancelled]");
+                return TurnOutcome{
+                    .text = try self.allocator.dupe(u8, "[Cancelled]"),
+                    .iterations_used = iteration,
+                };
             }
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
@@ -3640,12 +3651,18 @@ pub const Agent = struct {
                         ctx.flushValidatedReply(audio_reply);
                     }
                     self.allocator.free(final_text);
-                    return audio_reply;
+                    return TurnOutcome{
+                        .text = audio_reply,
+                        .iterations_used = turn_tool_iterations,
+                    };
                 }
                 if (stream_timing_ctx) |*ctx| {
                     ctx.flushValidatedReply(final_text);
                 }
-                return final_text;
+                return TurnOutcome{
+                    .text = final_text,
+                    .iterations_used = turn_tool_iterations,
+                };
             }
 
             // There are tool calls — print intermediary text.
@@ -3747,7 +3764,10 @@ pub const Agent = struct {
                 });
 
                 self.freeResponseFields(&response);
-                return approval_text;
+                return TurnOutcome{
+                    .text = approval_text,
+                    .iterations_used = turn_tool_iterations,
+                };
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
@@ -3881,7 +3901,11 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
-            return fallback;
+            return TurnOutcome{
+                .text = fallback,
+                .iterations_used = turn_tool_iterations,
+                .loop_detected = loop_detected,
+            };
         };
         defer self.allocator.free(summary_messages);
 
@@ -3905,7 +3929,11 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
-            return fallback;
+            return TurnOutcome{
+                .text = fallback,
+                .iterations_used = turn_tool_iterations,
+                .loop_detected = loop_detected,
+            };
         };
         defer self.freeResponseFields(&summary_response);
 
@@ -3950,7 +3978,27 @@ pub const Agent = struct {
             total_turn_ms,
         });
 
-        return prefixed;
+        return TurnOutcome{
+            .text = prefixed,
+            .iterations_used = turn_tool_iterations,
+            .loop_detected = loop_detected,
+        };
+    }
+
+    /// **D1.2 backward-compatible wrapper.** Calls `turnOutcome` and
+    /// extracts just the text. Existing callers (CLI, tests, legacy
+    /// session paths) continue to work unchanged. New callers
+    /// (gateway, session manager) should use `turnOutcome` directly
+    /// to access spawned_task_ids, tool_calls_executed, iterations_used,
+    /// and loop_detected — D1.3 + D1.4 migrate them.
+    ///
+    /// Cost: one extra `dupe(text)` so the wrapper can call
+    /// `outcome.deinit` safely without invalidating the returned slice.
+    /// New callers avoid this by reading `outcome.text` directly.
+    pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+        var outcome = try self.turnOutcome(user_message);
+        defer outcome.deinit(self.allocator);
+        return try self.allocator.dupe(u8, outcome.text);
     }
 
     /// Execute a tool by name lookup.
