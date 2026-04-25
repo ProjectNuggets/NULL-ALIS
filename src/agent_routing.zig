@@ -185,7 +185,13 @@ pub fn buildMainSessionKey(allocator: std.mem.Allocator, agent_id: []const u8) !
     return std.fmt.allocPrint(allocator, "agent:{s}:main", .{norm_agent});
 }
 
-/// Append `:thread:{threadId}` to a base session key.
+/// Append `:thread:{threadId}` to a CHANNEL-ROUTED base session key.
+///
+/// D30 rename (2026-04-25): formerly `buildThreadSessionKey`. The
+/// short name collided semantically with `session/root.zig::
+/// userThreadSessionKey` even though they serve different families
+/// (channel-routed vs user-cell). The new name makes the family
+/// difference unmistakable at every call site.
 ///
 /// **Sprint 8 (S8.2) — dual-formatter design, NOT a legacy duplicate of
 /// `session/root.zig::userThreadSessionKey`.** This formatter operates on
@@ -201,14 +207,21 @@ pub fn buildMainSessionKey(allocator: std.mem.Allocator, agent_id: []const u8) !
 ///   - User-cell keys reflect the canonical multi-tenant user identity
 ///     and are the canonical identity for HTTP/SSE turn loops.
 ///
-/// `daemon.zig:1709` (the only production caller of THIS formatter) is
+/// `daemon.zig:1715` (the only production caller of THIS formatter) is
 /// correct in using channel-routed because it's appending a thread suffix
 /// to a route returned by `resolveRoute(...)`. Do NOT migrate that caller
 /// to the user-cell formatter — it would produce a key shape inbound
 /// reply paths can't decode.
-pub fn buildThreadSessionKey(allocator: std.mem.Allocator, base_key: []const u8, thread_id: []const u8) ![]u8 {
+pub fn buildChannelRoutedThreadSessionKey(allocator: std.mem.Allocator, base_key: []const u8, thread_id: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}:thread:{s}", .{ base_key, thread_id });
 }
+
+/// Deprecated alias for `buildChannelRoutedThreadSessionKey`. Kept as
+/// a thin shim so any caller in zaki-prod or downstream tooling that
+/// imports nullalis as a library doesn't break on the rename. Schedule
+/// for removal at the same cadence as the NULLCLAW_ sunset (2026-05-15)
+/// — by then any external caller has had time to migrate.
+pub const buildThreadSessionKey = buildChannelRoutedThreadSessionKey;
 
 /// Strip `:thread:{threadId}` suffix to get the parent session key.
 /// Returns null if the key doesn't contain a thread suffix.
@@ -958,11 +971,22 @@ test "buildMainSessionKey" {
     try std.testing.expectEqualStrings("agent:my-bot:main", key);
 }
 
-test "buildThreadSessionKey" {
+test "buildChannelRoutedThreadSessionKey" {
     const allocator = std.testing.allocator;
-    const key = try buildThreadSessionKey(allocator, "agent:bot1:discord:direct:user42", "thread99");
+    const key = try buildChannelRoutedThreadSessionKey(allocator, "agent:bot1:discord:direct:user42", "thread99");
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:discord:direct:user42:thread:thread99", key);
+}
+
+test "D30 buildThreadSessionKey deprecated alias still works" {
+    // Regression guard: external callers (zaki-prod, downstream
+    // tooling) may still use the pre-rename name. The alias keeps
+    // them building until the 2026-05-15 sunset cleanup deletes it
+    // alongside the NULLCLAW_ migration.
+    const allocator = std.testing.allocator;
+    const key = try buildThreadSessionKey(allocator, "agent:bot1:slack:channel:C1", "thread7");
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:bot1:slack:channel:C1:thread:thread7", key);
 }
 
 test "resolveThreadParentSessionKey — has thread suffix" {
@@ -1424,10 +1448,10 @@ test "normalizeId — truncates at 64 chars" {
 
 // ── Thread session key parity tests ─────────────────────────────────────
 
-test "buildThreadSessionKey — topic suffix for telegram groups" {
+test "buildChannelRoutedThreadSessionKey — topic suffix for telegram groups" {
     const allocator = std.testing.allocator;
     const base = "agent:main:telegram:group:1";
-    const key = try buildThreadSessionKey(allocator, base, "55");
+    const key = try buildChannelRoutedThreadSessionKey(allocator, base, "55");
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:main:telegram:group:1:thread:55", key);
 }
