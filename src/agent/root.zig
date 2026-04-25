@@ -542,6 +542,17 @@ pub const Agent = struct {
     /// Tool calls in the last completed turn (for skills auto-extraction).
     last_turn_tool_count: u32 = 0,
 
+    /// **D1.8** — count of `durable_fact/behavior/*` entries this session
+    /// has stored. Replaces the prior pattern (`mem.list` + filter scan
+    /// on EVERY user message that tripped a learning signal — O(N) over
+    /// all session memories per signal-bearing turn). Lazy-initialized
+    /// on first check via a one-time `mem.list` scan; incremented on
+    /// successful `mem.store(durable_fact/behavior/*)`. Bounds-checked
+    /// against `learning.MAX_FACTS_PER_SESSION`. `null` means "not yet
+    /// initialized this session" — first turn that needs the count
+    /// pays the one-time O(N) cost; subsequent turns are O(1).
+    learning_fact_count: ?u32 = null,
+
     /// Per-turn context lifecycle engine — stateless between turns.
     context_engine_state: context_engine.ContextEngine = .{},
 
@@ -568,6 +579,77 @@ pub const Agent = struct {
 
         fn toChatMessage(self: *const OwnedMessage) ChatMessage {
             return .{ .role = self.role, .content = self.content };
+        }
+    };
+
+    /// Result of a single agent turn. Returned by `turn()` to give
+    /// callers (gateway, session manager, BFF, frontend) structured
+    /// visibility into what happened, instead of just a bare reply
+    /// string.
+    ///
+    /// **Why this struct exists (D1):** the historical `turn()` return
+    /// was `![]const u8` — just the assistant text. Tool-only turns
+    /// (where the model emits spawn/delegate calls but no post-tool
+    /// assistant text) were invisible to the gateway, which then
+    /// fabricated a literal `"received"` placeholder (`gateway.zig:9184`
+    /// + `:10562`). Sprint 1's S1.10 (`963fc92`) replaced the literal
+    /// with `EMPTY_TURN_PLACEHOLDER` as a min fix; this struct is the
+    /// real fix, letting the gateway render structured tool-only-turn
+    /// SSE frames (`spawned_task_ids`, `tool_calls_executed`) instead
+    /// of any placeholder at all.
+    ///
+    /// **Ownership:** `text` is heap-allocated in the agent's
+    /// allocator and transfers to the caller — caller must free via
+    /// `deinit(allocator)` or by handing it to a consumer that frees.
+    /// The `tool_calls_executed` and `spawned_task_ids` slices are
+    /// also owned and freed by `deinit`. Use `justText` for the most
+    /// common case (text-only reply); use `deinit` exactly once.
+    pub const TurnOutcome = struct {
+        /// The assistant text reply. Empty string for tool-only turns.
+        /// Heap-allocated in the agent's allocator.
+        text: []const u8,
+        /// Convenience flag: true when the model produced tool/spawn
+        /// calls but no post-tool text. Equivalent to
+        /// `text.len == 0 and (tool_calls_executed.len > 0 or
+        /// spawned_task_ids.len > 0)` but pre-computed so callers
+        /// don't have to recompute.
+        tool_only_turn: bool = false,
+        /// Names of tools that executed this turn (in execution
+        /// order). Empty slice means no tools fired. Each slice is
+        /// owned and freed by `deinit`.
+        tool_calls_executed: []const []const u8 = &.{},
+        /// IDs of subagent tasks spawned this turn (via `spawn` or
+        /// `delegate` tool). Empty slice means none. These tasks
+        /// complete asynchronously; the bus delivers their results on
+        /// separate SSE frames. Each slice is owned and freed by
+        /// `deinit`.
+        spawned_task_ids: []const []const u8 = &.{},
+        /// Tool-loop iterations consumed this turn. Useful for
+        /// observability dashboards distinguishing healthy 1-2-iter
+        /// turns from near-exhaustion 24-iter turns.
+        iterations_used: u32 = 0,
+        /// True when the turn exited via the loop-detector early-out
+        /// (same tool-call signature repeated past threshold). Lets
+        /// the gateway show a different status badge than plain
+        /// iteration-exhaustion.
+        loop_detected: bool = false,
+
+        /// Convenience constructor for the most common case: text-only
+        /// reply with no tools and no spawns. The slice is taken as-is
+        /// and the caller transfers ownership to the outcome.
+        pub fn justText(text: []const u8) TurnOutcome {
+            return .{ .text = text };
+        }
+
+        /// Free all owned memory. Caller must call this exactly once
+        /// on the returned outcome. After this, every field's slice
+        /// is invalid.
+        pub fn deinit(self: *const TurnOutcome, allocator: std.mem.Allocator) void {
+            allocator.free(self.text);
+            for (self.tool_calls_executed) |name| allocator.free(name);
+            allocator.free(self.tool_calls_executed);
+            for (self.spawned_task_ids) |id| allocator.free(id);
+            allocator.free(self.spawned_task_ids);
         }
     };
 
@@ -2287,7 +2369,15 @@ pub const Agent = struct {
 
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
-    pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+    ///
+    /// **D1.2:** Returns a `TurnOutcome` struct (text + tool_calls_executed +
+    /// spawned_task_ids + iterations_used + loop_detected) instead of bare
+    /// `[]const u8`. The legacy `turn()` wrapper at the bottom of this method
+    /// preserves the old signature for callers that only need the text.
+    /// New callers (gateway, session manager — D1.3, D1.4) should use
+    /// `turnOutcome` directly so the structured tool-only-turn SSE frame
+    /// can carry real metadata instead of fabricating `EMPTY_TURN_PLACEHOLDER`.
+    pub fn turnOutcome(self: *Agent, user_message: []const u8) !TurnOutcome {
         const turn_start_ms = std.time.milliTimestamp();
         self.cancellation_token.reset(); // Clear stale cancellation from previous turn
 
@@ -2338,7 +2428,7 @@ pub const Agent = struct {
 
         // Handle slash commands before sending to LLM (saves tokens)
         if (try self.handleSlashCommand(user_message)) |response| {
-            return response;
+            return TurnOutcome.justText(response);
         }
 
         self.context_was_compacted = false;
@@ -2568,9 +2658,15 @@ pub const Agent = struct {
                 const fact_content = learning.extractFactFromMessage(self.allocator, user_message, signals) catch null;
                 defer if (fact_content) |fc| self.allocator.free(fc);
                 if (fact_content) |fc| {
-                    // T-1.5-08: enforce MAX_FACTS_PER_SESSION before storing
-                    const at_limit = blk: {
-                        const entries = mem.list(self.allocator, null, self.memory_session_id) catch break :blk false;
+                    // T-1.5-08 + D1.8: enforce MAX_FACTS_PER_SESSION before
+                    // storing. Pre-D1.8 this scanned the entire session
+                    // memory list on every turn that produced a learning
+                    // signal (O(N) over all memories per check). Now we
+                    // lazy-init `learning_fact_count` once per session via
+                    // the same scan, then maintain it as a counter — O(1)
+                    // on every subsequent check.
+                    if (self.learning_fact_count == null) {
+                        const entries = mem.list(self.allocator, null, self.memory_session_id) catch &.{};
                         defer if (entries.len > 0) {
                             for (entries) |e| {
                                 self.allocator.free(e.key);
@@ -2578,12 +2674,13 @@ pub const Agent = struct {
                             }
                             self.allocator.free(entries);
                         };
-                        var fact_count: usize = 0;
+                        var fact_count: u32 = 0;
                         for (entries) |e| {
                             if (std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) fact_count += 1;
                         }
-                        break :blk fact_count >= learning.MAX_FACTS_PER_SESSION;
-                    };
+                        self.learning_fact_count = fact_count;
+                    }
+                    const at_limit = (self.learning_fact_count.?) >= learning.MAX_FACTS_PER_SESSION;
                     if (at_limit) {
                         log.warn("learning.max_facts_reached session={?s}", .{self.memory_session_id});
                     } else {
@@ -2594,8 +2691,16 @@ pub const Agent = struct {
                             // facts are the behavioral-correction corpus; losing
                             // one silently means the agent doesn't learn from a
                             // user correction it thought it saved.
-                            _ = mem.store(k, fc, .core, self.memory_session_id) catch |err|
+                            if (mem.store(k, fc, .core, self.memory_session_id)) |_| {
+                                // D1.8: only bump counter on confirmed-stored.
+                                // If the store fails, the count must NOT advance
+                                // or we'd silently exceed MAX_FACTS_PER_SESSION
+                                // on subsequent turns when the prior write didn't
+                                // actually land.
+                                if (self.learning_fact_count) |*c| c.* += 1;
+                            } else |err| {
                                 log.warn("learning.fact_store_failed key={s} err={s}", .{ k, @errorName(err) });
+                            }
                             log.info("learning.signal_detected signals={d} key={s}", .{ signals.len, k });
                         }
                     }
@@ -2648,7 +2753,7 @@ pub const Agent = struct {
                     self.last_turn_context.cache_hit = true;
                     const complete_event = ObserverEvent{ .turn_complete = {} };
                     self.observer.recordEvent(&complete_event);
-                    return cached_hit.response;
+                    return TurnOutcome.justText(cached_hit.response);
                 }
             }
         }
@@ -2679,7 +2784,7 @@ pub const Agent = struct {
                 self.last_turn_context.cache_hit = true;
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
-                return cached_response;
+                return TurnOutcome.justText(cached_response);
             }
         }
 
@@ -2739,7 +2844,10 @@ pub const Agent = struct {
                 self.observer.recordEvent(&cancel_event);
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
-                return try self.allocator.dupe(u8, "[Cancelled]");
+                return TurnOutcome{
+                    .text = try self.allocator.dupe(u8, "[Cancelled]"),
+                    .iterations_used = iteration,
+                };
             }
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
@@ -3002,8 +3110,20 @@ pub const Agent = struct {
 
                     if (self.provider_reliability_active) return err;
 
-                    // Retry once
-                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                    // Retry once. **D1.9** — removed the previous
+                    // `std.Thread.sleep(500ms)` here per
+                    // `P2_agent_turn_loop.md` ugly truth #5: when the
+                    // reliable provider wrapper is ACTIVE (production
+                    // default) it owns all retry/backoff scheduling and
+                    // we returned `err` two lines above before reaching
+                    // here. When the wrapper is INACTIVE (tests, dev)
+                    // the user has explicitly opted out of automated
+                    // retry — a hardcoded magic 500ms blocking the
+                    // session thread with no jitter / backoff
+                    // contributes nothing useful. If a real backoff is
+                    // ever needed on this path, the right move is
+                    // exponential-with-jitter via a shared helper, not
+                    // a magic-number sleep.
                     turn_retry_attempts += 1;
                     turn_llm_calls += 1;
                     break :retry_blk self.provider.chat(
@@ -3429,10 +3549,34 @@ pub const Agent = struct {
                 const outbox_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - outbox_start_ms));
                 log.info("turn.stage stage=drain_outbox iteration={d} duration_ms={d}", .{ iteration, outbox_duration_ms });
 
-                const complete_event = ObserverEvent{ .turn_complete = {} };
-                self.observer.recordEvent(&complete_event);
+                // D1.4 — when the model produced tool/spawn calls but no
+                // post-tool assistant text, emit a structured tool_only_turn
+                // event so the gateway can render a real frame instead of
+                // falling back to EMPTY_TURN_PLACEHOLDER. Detection: tools
+                // ran in prior iterations (turn_tool_calls_total > 0) AND
+                // the final text is empty. Must fire BEFORE turn_complete
+                // so SSE consumers see them in causal order.
+                if (final_text.len == 0 and turn_tool_calls_total > 0) {
+                    const tool_only_event = ObserverEvent{ .tool_only_turn = .{
+                        .tool_calls_executed = turn_tool_calls_total,
+                        .iterations_used = turn_tool_iterations,
+                        .run_id = self.current_run_id,
+                    } };
+                    self.observer.recordEvent(&tool_only_event);
+                }
 
                 // ── Hermes-inspired post-turn maintenance ──
+                //
+                // **D1.11** — these history writes (memory_nudge,
+                // skills_extraction) used to live AFTER turn_complete was
+                // emitted. P2_agent_turn_loop.md ugly truth #11:
+                // "the added messages sit in history for the next turn
+                // but never generate a visible event for this turn."
+                // Moved before turn_complete + each gets its own
+                // turn_stage event so observers (dashboards, SSE
+                // consumers, debug tooling) can see when these prompts
+                // are injected — previously they appeared as silent
+                // history mutations on the next turn.
 
                 // Track tool usage for skills extraction
                 self.last_turn_tool_count = turn_tool_calls_total;
@@ -3449,14 +3593,38 @@ pub const Agent = struct {
                         // Use .user role (not .system) because Anthropic/Gemini drop
                         // mid-history system messages. The "SYSTEM:" prefix ensures
                         // the model treats it as an instruction, not user input.
-                        try self.history.append(self.allocator, .{
-                            .role = .user,
-                            .content = try self.allocator.dupe(u8, "SYSTEM: Review the recent conversation. If any user preferences, " ++
-                                "important decisions, or reusable procedures should be remembered " ++
-                                "long-term, save them now using the memory tool. Only save what " ++
-                                "has lasting relevance beyond this session."),
-                        });
-                        log.info("turn.stage stage=memory_nudge turns_elapsed=10", .{});
+                        // **D1.11 self-review fix** — DO NOT propagate
+                        // append failure here. Pre-D1.11 these writes
+                        // happened AFTER turn_complete and any failure
+                        // was silent (per ugly truth #11). Post-D1.11
+                        // they happen BEFORE turn_complete; if we let
+                        // the error propagate we'd skip turn_complete
+                        // entirely — a worse regression than the
+                        // silent-mutation bug we were fixing. Log on
+                        // failure (Sprint 4 policy) and continue.
+                        const nudge_content = self.allocator.dupe(u8, "SYSTEM: Review the recent conversation. If any user preferences, " ++
+                            "important decisions, or reusable procedures should be remembered " ++
+                            "long-term, save them now using the memory tool. Only save what " ++
+                            "has lasting relevance beyond this session.") catch |err| blk: {
+                            log.warn("post_turn_memory_nudge.dupe_failed err={s}", .{@errorName(err)});
+                            break :blk null;
+                        };
+                        if (nudge_content) |content| {
+                            self.history.append(self.allocator, .{
+                                .role = .user,
+                                .content = content,
+                            }) catch |err| {
+                                log.warn("post_turn_memory_nudge.append_failed err={s}", .{@errorName(err)});
+                                self.allocator.free(content);
+                            };
+                            log.info("turn.stage stage=memory_nudge turns_elapsed=10", .{});
+                            const nudge_event = ObserverEvent{ .turn_stage = .{
+                                .stage = "post_turn_memory_nudge",
+                                .iteration = iteration,
+                                .run_id = self.current_run_id,
+                            } };
+                            self.observer.recordEvent(&nudge_event);
+                        }
                     }
                 }
 
@@ -3468,16 +3636,45 @@ pub const Agent = struct {
                 if (turn_tool_calls_total >= 5 and self.workspace_dir.len > 0 and
                     self.last_turn_tool_count < 5)
                 {
-                    try self.history.append(self.allocator, .{
-                        .role = .user,
-                        .content = try self.allocator.dupe(u8, "SYSTEM: You just completed a multi-step task with multiple tool " ++
-                            "calls. If this procedure could be useful in the future, consider " ++
-                            "saving it as a reusable skill file (SKILL.md) in the workspace. " ++
-                            "Only do this if the procedure is genuinely reusable — not for " ++
-                            "one-off tasks."),
-                    });
-                    log.info("turn.stage stage=skills_extraction_prompt tool_calls={d}", .{turn_tool_calls_total});
+                    // **D1.11 self-review fix** — same rationale as the
+                    // memory_nudge block above: never let an append
+                    // failure here skip turn_complete.
+                    const skills_content = self.allocator.dupe(u8, "SYSTEM: You just completed a multi-step task with multiple tool " ++
+                        "calls. If this procedure could be useful in the future, consider " ++
+                        "saving it as a reusable skill file (SKILL.md) in the workspace. " ++
+                        "Only do this if the procedure is genuinely reusable — not for " ++
+                        "one-off tasks.") catch |err| blk: {
+                        log.warn("post_turn_skills_extraction.dupe_failed err={s}", .{@errorName(err)});
+                        break :blk null;
+                    };
+                    if (skills_content) |content| {
+                        self.history.append(self.allocator, .{
+                            .role = .user,
+                            .content = content,
+                        }) catch |err| {
+                            log.warn("post_turn_skills_extraction.append_failed err={s}", .{@errorName(err)});
+                            self.allocator.free(content);
+                        };
+                        log.info("turn.stage stage=skills_extraction_prompt tool_calls={d}", .{turn_tool_calls_total});
+                        const skills_event = ObserverEvent{ .turn_stage = .{
+                            .stage = "post_turn_skills_extraction_prompt",
+                            .iteration = iteration,
+                            .count = turn_tool_calls_total,
+                            .run_id = self.current_run_id,
+                        } };
+                        self.observer.recordEvent(&skills_event);
+                    }
                 }
+
+                // **D1.11** — turn_complete now fires LAST, after all
+                // post-turn maintenance writes have been recorded as
+                // visible turn_stage events. Pre-D1.11 turn_complete
+                // fired before the maintenance writes so dashboards
+                // saw "turn done" while history was still mutating.
+                // Maintenance write failures are logged but do NOT skip
+                // turn_complete — see the inline catch handlers above.
+                const complete_event = ObserverEvent{ .turn_complete = {} };
+                self.observer.recordEvent(&complete_event);
 
                 // Fire turn_end hooks
                 hooks_mod.runHooks(self.allocator, self.hooks, .turn_end, .{
@@ -3569,12 +3766,18 @@ pub const Agent = struct {
                         ctx.flushValidatedReply(audio_reply);
                     }
                     self.allocator.free(final_text);
-                    return audio_reply;
+                    return TurnOutcome{
+                        .text = audio_reply,
+                        .iterations_used = turn_tool_iterations,
+                    };
                 }
                 if (stream_timing_ctx) |*ctx| {
                     ctx.flushValidatedReply(final_text);
                 }
-                return final_text;
+                return TurnOutcome{
+                    .text = final_text,
+                    .iterations_used = turn_tool_iterations,
+                };
             }
 
             // There are tool calls — print intermediary text.
@@ -3676,7 +3879,10 @@ pub const Agent = struct {
                 });
 
                 self.freeResponseFields(&response);
-                return approval_text;
+                return TurnOutcome{
+                    .text = approval_text,
+                    .iterations_used = turn_tool_iterations,
+                };
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
@@ -3810,22 +4016,46 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
-            return fallback;
+            return TurnOutcome{
+                .text = fallback,
+                .iterations_used = turn_tool_iterations,
+                .loop_detected = loop_detected,
+            };
         };
         defer self.allocator.free(summary_messages);
+
+        // **D1.12** — honor vision-fallback consistency for the
+        // exhausted-iter summary call. P2_agent_turn_loop.md ugly
+        // truth #10: this site previously hardcoded `self.model_name`
+        // even when the per-iteration provider calls had been routed
+        // to `self.vision_fallback_model` because the messages
+        // contained images. The summary inherits the same message
+        // history (with image parts intact), so we must inherit the
+        // same model selection or risk the non-vision main model
+        // failing on the image content. Pre-D1.12, an exhausted-iter
+        // turn that had been running on vision-fallback would summarize
+        // via the wrong model — likely hallucinating or erroring.
+        const summary_model: []const u8 = blk: {
+            if (self.vision_fallback_model.len > 0 and hasImageContentParts(summary_messages) and
+                !std.mem.eql(u8, self.model_name, self.vision_fallback_model))
+            {
+                break :blk self.vision_fallback_model;
+            }
+            break :blk self.model_name;
+        };
 
         var summary_response = self.provider.chat(
             self.allocator,
             .{
                 .messages = summary_messages,
-                .model = self.model_name,
+                .model = summary_model,
                 .temperature = self.temperature,
                 .max_tokens = self.max_tokens,
                 .tools = null, // force text-only
                 .timeout_secs = self.message_timeout_secs,
                 .reasoning_effort = self.reasoning_effort,
             },
-            self.model_name,
+            summary_model,
             self.temperature,
         ) catch {
             const fallback = if (loop_detected)
@@ -3834,7 +4064,11 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
-            return fallback;
+            return TurnOutcome{
+                .text = fallback,
+                .iterations_used = turn_tool_iterations,
+                .loop_detected = loop_detected,
+            };
         };
         defer self.freeResponseFields(&summary_response);
 
@@ -3879,7 +4113,27 @@ pub const Agent = struct {
             total_turn_ms,
         });
 
-        return prefixed;
+        return TurnOutcome{
+            .text = prefixed,
+            .iterations_used = turn_tool_iterations,
+            .loop_detected = loop_detected,
+        };
+    }
+
+    /// **D1.2 backward-compatible wrapper.** Calls `turnOutcome` and
+    /// extracts just the text. Existing callers (CLI, tests, legacy
+    /// session paths) continue to work unchanged. New callers
+    /// (gateway, session manager) should use `turnOutcome` directly
+    /// to access spawned_task_ids, tool_calls_executed, iterations_used,
+    /// and loop_detected — D1.3 + D1.4 migrate them.
+    ///
+    /// Cost: one extra `dupe(text)` so the wrapper can call
+    /// `outcome.deinit` safely without invalidating the returned slice.
+    /// New callers avoid this by reading `outcome.text` directly.
+    pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+        var outcome = try self.turnOutcome(user_message);
+        defer outcome.deinit(self.allocator);
+        return try self.allocator.dupe(u8, outcome.text);
     }
 
     /// Execute a tool by name lookup.
@@ -10453,4 +10707,71 @@ test "/perm alias returns same class of report as /permissions" {
     try std.testing.expect(std.mem.indexOf(u8, alias_form, "Gate 1 — Execution mode:") != null);
     try std.testing.expect(std.mem.indexOf(u8, alias_form, "Gate 2 — Generic tool approval:") != null);
     try std.testing.expect(std.mem.indexOf(u8, alias_form, "Gate 3 — Legacy shell /exec:") != null);
+}
+
+test "TurnOutcome.justText constructs text-only outcome with empty defaults" {
+    const text = try std.testing.allocator.dupe(u8, "hello");
+    var outcome = Agent.TurnOutcome.justText(text);
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("hello", outcome.text);
+    try std.testing.expect(!outcome.tool_only_turn);
+    try std.testing.expectEqual(@as(usize, 0), outcome.tool_calls_executed.len);
+    try std.testing.expectEqual(@as(usize, 0), outcome.spawned_task_ids.len);
+    try std.testing.expectEqual(@as(u32, 0), outcome.iterations_used);
+    try std.testing.expect(!outcome.loop_detected);
+}
+
+test "TurnOutcome.deinit frees text + tool_calls_executed + spawned_task_ids" {
+    // This test exists to pin the ownership contract. If a future
+    // change adds an owned slice to TurnOutcome but forgets to free
+    // it in deinit, std.testing.allocator's leak detector catches it.
+    const allocator = std.testing.allocator;
+    const text = try allocator.dupe(u8, "tool-only result text");
+
+    const tool_names = try allocator.alloc([]const u8, 2);
+    tool_names[0] = try allocator.dupe(u8, "memory_recall");
+    tool_names[1] = try allocator.dupe(u8, "web_search");
+
+    const task_ids = try allocator.alloc([]const u8, 1);
+    task_ids[0] = try allocator.dupe(u8, "task-42");
+
+    const outcome = Agent.TurnOutcome{
+        .text = text,
+        .tool_only_turn = true,
+        .tool_calls_executed = tool_names,
+        .spawned_task_ids = task_ids,
+        .iterations_used = 3,
+        .loop_detected = false,
+    };
+    outcome.deinit(allocator);
+    // No expect — the assertion is the absence of leaks.
+}
+
+test "TurnOutcome tool_only_turn flag distinguishes empty-text-with-spawns from nothing-happened" {
+    // When the model emits spawn calls but no post-tool text, gateway
+    // needs a signal richer than `text.len == 0` to render the right
+    // UI (today the gateway falls back to EMPTY_TURN_PLACEHOLDER; the
+    // structured tool_only_turn frame from D1.4 will check this flag).
+    const allocator = std.testing.allocator;
+
+    // Case A: text-only, NOT a tool-only turn even though no spawns.
+    var case_a = Agent.TurnOutcome.justText(try allocator.dupe(u8, "ok"));
+    defer case_a.deinit(allocator);
+    try std.testing.expect(!case_a.tool_only_turn);
+
+    // Case B: empty text + spawned task → tool-only turn.
+    const empty_text = try allocator.dupe(u8, "");
+    const tasks = try allocator.alloc([]const u8, 1);
+    tasks[0] = try allocator.dupe(u8, "task-1");
+    const case_b = Agent.TurnOutcome{
+        .text = empty_text,
+        .tool_only_turn = true,
+        .spawned_task_ids = tasks,
+    };
+    defer case_b.deinit(allocator);
+    try std.testing.expect(case_b.tool_only_turn);
+    try std.testing.expectEqualStrings("", case_b.text);
+    try std.testing.expectEqual(@as(usize, 1), case_b.spawned_task_ids.len);
+    try std.testing.expectEqualStrings("task-1", case_b.spawned_task_ids[0]);
 }

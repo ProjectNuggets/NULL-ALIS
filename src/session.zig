@@ -71,13 +71,33 @@ pub const Session = struct {
     queue_drop_oldest_before_sequence: u64 = 0,
     queue_summarize_pending_count: u32 = 0,
 
+    /// D1.3: outcome of the most recently completed turn. Owned by
+    /// Session — replaced (and previous freed) on each new turn,
+    /// freed on `deinit`. Gateway reads via `lastTurnOutcome` getter
+    /// to render structured tool-only-turn SSE frames (D1.4) and
+    /// expose spawned_task_ids + tool_calls_executed to the BFF.
+    /// Allocated through `agent.allocator` (the agent owns its memory
+    /// and the outcome rides that lifetime).
+    last_turn_outcome: ?Agent.TurnOutcome = null,
+
     pub fn deinit(self: *Session, allocator: Allocator) void {
+        if (self.last_turn_outcome) |*outcome| outcome.deinit(self.agent.allocator);
         self.agent.deinit();
         allocator.free(self.session_key);
         if (self.origin_channel) |value| allocator.free(value);
         if (self.origin_lane) |value| allocator.free(value);
         if (self.origin_chat_id) |value| allocator.free(value);
         if (self.origin_account_id) |value| allocator.free(value);
+    }
+
+    /// D1.3 getter for the most recently completed turn's outcome.
+    /// Returns null if no turn has run on this session yet. The
+    /// outcome remains owned by the session — caller borrows the
+    /// pointer; do not deinit. Pointer is invalidated when the next
+    /// turn replaces the outcome or when the session is deinit'd.
+    pub fn lastTurnOutcome(self: *const Session) ?*const Agent.TurnOutcome {
+        if (self.last_turn_outcome) |*outcome| return outcome;
+        return null;
     }
 };
 
@@ -667,7 +687,19 @@ pub const SessionManager = struct {
         }
 
         const agent_start_ms = std.time.milliTimestamp();
-        const response = try (&session.agent).turn(effective_content);
+        // D1.3: call turnOutcome (not the legacy `turn` wrapper) so we
+        // capture the structured metadata (tool_calls_executed,
+        // spawned_task_ids, iterations_used, loop_detected). Store the
+        // outcome on the Session — gateway/BFF read it via
+        // `Session.lastTurnOutcome()` to render structured tool-only-turn
+        // SSE frames (D1.4) instead of fabricating EMPTY_TURN_PLACEHOLDER.
+        // We dupe the text out so the existing return-type contract
+        // (caller frees with agent.allocator) is preserved; the outcome
+        // itself is owned by the Session and freed on next turn or deinit.
+        const outcome = try (&session.agent).turnOutcome(effective_content);
+        if (session.last_turn_outcome) |*prev| prev.deinit(session.agent.allocator);
+        session.last_turn_outcome = outcome;
+        const response = try session.agent.allocator.dupe(u8, outcome.text);
         const agent_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - agent_start_ms));
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
