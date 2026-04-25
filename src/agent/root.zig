@@ -3809,6 +3809,62 @@ pub const Agent = struct {
                 };
             }
 
+            // ── Adaptive exit: repeated-call detector ─────────────────────
+            //
+            // **D1.10** — moved BEFORE the assistant-history append +
+            // tool execution. Pre-D1.10 this fired AFTER the assistant
+            // append + history write + tool execution: the iteration
+            // did all the wasted work and exited via the next
+            // iteration's top-of-loop check. Per
+            // P2_agent_turn_loop.md ugly truth #6 the work was waste.
+            //
+            // The Anthropic-compat concern (assistant tool_use without
+            // paired tool_result errors the provider) is addressed by
+            // EXITING BEFORE the assistant message is appended at
+            // all — so history stays clean for the exhausted-iter
+            // summary call. The model's looped response is dropped
+            // from the conversation transcript; the summary prompt
+            // ("SYSTEM: You have reached the maximum number of tool
+            // iterations…") provides sufficient context for the
+            // wrap-up call to succeed.
+            //
+            // Hash this iteration's tool call set. If the same hash
+            // has appeared in every slot of the ring buffer
+            // (LOOP_WINDOW consecutive iterations), we're looping —
+            // free response, break.
+            var h = std.hash.Fnv1a_64.init();
+            for (parsed_calls) |call| {
+                h.update(call.name);
+                h.update("\x00");
+                h.update(call.arguments_json);
+                h.update("\x01");
+            }
+            const call_set_hash = h.final();
+            recent_call_hashes[recent_call_idx % LOOP_WINDOW] = call_set_hash;
+            recent_call_idx += 1;
+            if (recent_call_idx >= LOOP_WINDOW) {
+                var all_same = true;
+                for (recent_call_hashes) |hv| {
+                    if (hv != call_set_hash) {
+                        all_same = false;
+                        break;
+                    }
+                }
+                if (all_same) {
+                    loop_detected = true;
+                    log.warn("agent.loop_detected iteration={d} hash={x} — same tool_call set repeated {d}x, EARLY EXIT (D1.10)", .{
+                        iteration,
+                        call_set_hash,
+                        LOOP_WINDOW,
+                    });
+                    self.freeResponseFields(&response);
+                    // assistant_history_content / parsed_calls / parsed_text
+                    // get freed by the iteration-body defer (the
+                    // free_* flags were set during parsing earlier).
+                    break;
+                }
+            }
+
             // There are tool calls — print intermediary text.
             // In tests, stdout is used by Zig's test runner protocol (`--listen`),
             // so avoid writing arbitrary text that can corrupt the control channel.
@@ -3834,39 +3890,6 @@ pub const Agent = struct {
                 .role = .assistant,
                 .content = assistant_content,
             });
-
-            // ── Adaptive exit: repeated-call detector ─────────────────────
-            // Hash this iteration's tool call set. If the same hash has
-            // appeared in every slot of the ring buffer (LOOP_WINDOW
-            // consecutive iterations), we're looping — set loop_detected so
-            // the outer loop can exit cleanly after this iteration completes.
-            var h = std.hash.Fnv1a_64.init();
-            for (parsed_calls) |call| {
-                h.update(call.name);
-                h.update("\x00");
-                h.update(call.arguments_json);
-                h.update("\x01");
-            }
-            const call_set_hash = h.final();
-            recent_call_hashes[recent_call_idx % LOOP_WINDOW] = call_set_hash;
-            recent_call_idx += 1;
-            if (recent_call_idx >= LOOP_WINDOW) {
-                var all_same = true;
-                for (recent_call_hashes) |hv| {
-                    if (hv != call_set_hash) {
-                        all_same = false;
-                        break;
-                    }
-                }
-                if (all_same) {
-                    loop_detected = true;
-                    log.warn("agent.loop_detected iteration={d} hash={x} — same tool_call set repeated {d}x, will exit after this iteration", .{
-                        iteration,
-                        call_set_hash,
-                        LOOP_WINDOW,
-                    });
-                }
-            }
 
             // Execute tool calls (serial by default, optional parallel dispatcher)
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
