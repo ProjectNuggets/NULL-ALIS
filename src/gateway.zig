@@ -10516,10 +10516,28 @@ fn handleSessionApprove(
 // DELETE /api/v1/users/:user_id/data
 // Body: {"confirm":"PURGE-USER-<user_id>"}
 //
-// Precondition: the X-Internal-Token check at handleApiRoute entry
-// already succeeded. Body-level `confirm` gate is the second layer,
-// binding the destructive intent to the exact path user_id so a
-// mis-routed curl (wrong path) fails before touching any storage.
+// Preconditions enforced by the surrounding handleApiRoute pipeline:
+//   1. X-Internal-Token validated at handleApiRoute entry.
+//   2. user_id resolved from path via parseUserPath + resolveGatewayPathUserId.
+//   3. user_ctx provisioned + workspace dirs ensured.
+//   4. **needs_write_lock fires for this route** — DELETE on subpath
+//      "data" passes the `!GET and !raw_config_write_attempt` test, so
+//      `maybeAcquireTenantOwnershipLock` runs before this handler. The
+//      lock is held for the full purge duration via the deferred
+//      `user_write_lock.deinit()` at the end of handleApiRoute.
+//
+// Why the lock matters here (Sprint 7B post-review check, 2026-04-25):
+// without it, the gateway worker's maintenance loop or a concurrent
+// config-write from another worker could invalidate `tenant_runtime`
+// (and the borrowed `effective_session_mgr` / `vector_store` pointers
+// we hand to `gdpr.purgeUser`) mid-orchestration → use-after-free.
+// The ownership lock ensures the runtime stays alive for the duration
+// of the purge. If a future refactor adjusts handleApiRoute's
+// needs_write_lock predicate, this handler must grow its own lock.
+//
+// Body-level `confirm` gate is layer 2 of defense, binding destructive
+// intent to the exact path user_id so a mis-routed curl (wrong path)
+// fails before touching any storage.
 fn handleGdprDataPurge(
     allocator: std.mem.Allocator,
     raw_request: []const u8,

@@ -964,24 +964,54 @@ pub const SessionManager = struct {
         }
 
         // Phase 3: drop from map and free.
+        //
+        // Sprint 7B post-review fix (M1, 2026-04-25): between Phase 2
+        // unlocking session.mutex and Phase 3 acquiring manager.mutex,
+        // a racing `getOrCreate` can take the manager mutex first, find
+        // the session still in the map, and bump `active_refs`. Without
+        // a re-check here, Phase 3 would `fetchRemove` + `deinit` a
+        // session that another thread holds a live pointer into → UAF.
+        //
+        // The recheck is cheap (one field load under the manager mutex)
+        // and lets the racing turn proceed naturally: the session stays
+        // in the map until the turn's normal idle eviction. It's fine
+        // for GDPR semantics — the pg cascade running next will yank
+        // the user's rows out from under that turn, which will then
+        // error cleanly on its next memory write. Better one half-
+        // completed turn than a UAF.
         var evicted: usize = 0;
+        var raced_skipped: usize = 0;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
             for (to_remove.items) |key| {
                 if (self.sessions.fetchRemove(key)) |kv| {
                     const session = kv.value;
+                    if (session.active_refs != 0) {
+                        // A racer entered between Phase 2 and Phase 3.
+                        // Re-insert and skip — caller can retry.
+                        self.sessions.put(self.allocator, session.session_key, session) catch {
+                            // Re-insert failed (OOM). The pointer is
+                            // now leaked from the map but still alive;
+                            // a later `evictIdle` or shutdown flush
+                            // will clean it up. Worse than a clean
+                            // re-insert, but vastly better than UAF.
+                            log.warn("session.evict_user_phase3_reinsert_failed user_id={s} key={s}", .{ user_id, key });
+                        };
+                        raced_skipped += 1;
+                        continue;
+                    }
                     session.deinit(self.allocator);
                     self.allocator.destroy(session);
                     evicted += 1;
                 }
             }
         }
-
-        if (active_skipped > 0) {
-            log.warn("session.evict_user_skipped user_id={s} evicted={d} active_skipped={d}", .{ user_id, evicted, active_skipped });
+        const total_skipped = active_skipped + raced_skipped;
+        if (total_skipped > 0) {
+            log.warn("session.evict_user_skipped user_id={s} evicted={d} active_skipped={d} raced_skipped={d}", .{ user_id, evicted, active_skipped, raced_skipped });
         }
-        return .{ .evicted = evicted, .active_skipped = active_skipped };
+        return .{ .evicted = evicted, .active_skipped = total_skipped };
     }
 };
 
