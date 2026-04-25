@@ -80,6 +80,31 @@ pub const ObserverEvent = union(enum) {
         run_id: ?[]const u8 = null,
     },
     turn_complete: void,
+    /// **D1.4** — emitted just before `turn_complete` when the model
+    /// produced tool/spawn calls but no post-tool assistant text. Lets
+    /// the gateway/BFF render a structured frame (e.g. "[2 tools ran;
+    /// subagent results may arrive on a follow-up]") instead of falling
+    /// back to the historical fabricated EMPTY_TURN_PLACEHOLDER for the
+    /// reply text.
+    ///
+    /// `tool_calls_executed` is the count of tool calls fired across
+    /// all tool-loop iterations of this turn (equivalent to the
+    /// pre-existing `turn_tool_calls_total` counter — exposed here for
+    /// SSE consumers without a separate event lookup).
+    /// `spawned_task_ids` lists IDs of `spawn`/`delegate` tool calls
+    /// whose results will arrive on a separate bus frame later. Empty
+    /// slice means none / not yet tracked (D1.4b will populate this
+    /// once the executor records the full list per turn). Each id is
+    /// an unowned borrow into the agent's lifetime.
+    /// `iterations_used` is the tool-loop iteration count (same as
+    /// `tool_iterations_exhausted.iterations` would carry, but for the
+    /// happy path).
+    tool_only_turn: struct {
+        tool_calls_executed: u32,
+        spawned_task_ids: []const []const u8 = &.{},
+        iterations_used: u32,
+        run_id: ?[]const u8 = null,
+    },
     channel_message: struct { channel: []const u8, direction: []const u8 },
     heartbeat_tick: void,
     err: struct { component: []const u8, message: []const u8 },
@@ -234,6 +259,7 @@ pub const LogObserver = struct {
                 }
             },
             .turn_complete => std.log.info("turn.complete", .{}),
+            .tool_only_turn => |e| std.log.info("turn.tool_only tool_calls={d} iterations={d} spawned_tasks={d}", .{ e.tool_calls_executed, e.iterations_used, e.spawned_task_ids.len }),
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
             .err => |e| std.log.info("error component={s} message={s}", .{ e.component, e.message }),
@@ -432,6 +458,7 @@ pub const FileObserver = struct {
             .turn_cancelled => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_cancelled\",\"reason\":\"{s}\",\"iteration\":{d}}}", .{ e.reason, e.iteration }) catch return,
             .turn_stage => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_stage\",\"stage\":\"{s}\"}}", .{e.stage}) catch return,
             .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
+            .tool_only_turn => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_only_turn\",\"tool_calls_executed\":{d},\"iterations_used\":{d},\"spawned_task_ids_count\":{d}}}", .{ e.tool_calls_executed, e.iterations_used, e.spawned_task_ids.len }) catch return,
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":\"{s}\",\"direction\":\"{s}\"}}", .{ e.channel, e.direction }) catch return,
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
             .err => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"error\",\"component\":\"{s}\",\"message\":\"{s}\"}}", .{ e.component, e.message }) catch return,
@@ -728,6 +755,19 @@ pub const OtelObserver = struct {
             },
             .turn_complete => {
                 self.addSpan("turn.complete", now, now, &.{});
+            },
+            .tool_only_turn => |e| {
+                var calls_buf: [16]u8 = undefined;
+                var iter_buf: [16]u8 = undefined;
+                var spawned_buf: [16]u8 = undefined;
+                const calls_str = std.fmt.bufPrint(&calls_buf, "{d}", .{e.tool_calls_executed}) catch "?";
+                const iter_str = std.fmt.bufPrint(&iter_buf, "{d}", .{e.iterations_used}) catch "?";
+                const spawned_str = std.fmt.bufPrint(&spawned_buf, "{d}", .{e.spawned_task_ids.len}) catch "?";
+                self.addSpan("turn.tool_only", now, now, &.{
+                    .{ .key = "tool_calls_executed", .value = calls_str },
+                    .{ .key = "iterations_used", .value = iter_str },
+                    .{ .key = "spawned_task_ids_count", .value = spawned_str },
+                });
             },
             .channel_message => |e| {
                 self.addSpan("channel.message", now, now, &.{

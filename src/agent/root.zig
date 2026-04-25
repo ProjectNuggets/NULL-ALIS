@@ -3511,6 +3511,22 @@ pub const Agent = struct {
                 const outbox_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - outbox_start_ms));
                 log.info("turn.stage stage=drain_outbox iteration={d} duration_ms={d}", .{ iteration, outbox_duration_ms });
 
+                // D1.4 — when the model produced tool/spawn calls but no
+                // post-tool assistant text, emit a structured tool_only_turn
+                // event so the gateway can render a real frame instead of
+                // falling back to EMPTY_TURN_PLACEHOLDER. Detection: tools
+                // ran in prior iterations (turn_tool_calls_total > 0) AND
+                // the final text is empty. Must fire BEFORE turn_complete
+                // so SSE consumers see them in causal order.
+                if (final_text.len == 0 and turn_tool_calls_total > 0) {
+                    const tool_only_event = ObserverEvent{ .tool_only_turn = .{
+                        .tool_calls_executed = turn_tool_calls_total,
+                        .iterations_used = turn_tool_iterations,
+                        .run_id = self.current_run_id,
+                    } };
+                    self.observer.recordEvent(&tool_only_event);
+                }
+
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
 
