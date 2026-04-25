@@ -2382,6 +2382,14 @@ fn sendStreamingProxyResponseHeader(stream: anytype, status: []const u8, content
     try stream.writeAll(header);
 }
 
+// D16 (2026-04-25) — silent-catch policy bucket 1 (noisy-by-design):
+// every `_ = child.kill() catch {};` and `_ = child.wait() catch {};`
+// in this function (16 sites across the error-recovery branches) is
+// intentional. The child is being torn down on an error path; the
+// only failure modes are "process already dead" or "OS reaped it
+// first" — operators don't need a log line per teardown attempt.
+// See `docs/silent-catches-policy.md` § Noisy-by-design for the
+// general convention.
 fn brokerProxyChatStreamSseConnection(
     allocator: std.mem.Allocator,
     stream: anytype,
@@ -3074,11 +3082,21 @@ fn ensureUserProvisioned(state: *GatewayState, ctx: *const UserContext) !void {
         const user_id = try parseNumericUserId(ctx.user_id);
         try mgr.provisionUser(user_id, ctx.workspace_path);
     } else {
-        ensureFileWithDefault(ctx.memory_db_path, "") catch {};
-        ensureFileWithDefault(ctx.config_path, "{}\n") catch {};
-        ensureFileWithDefault(ctx.cron_path, "[]\n") catch {};
-        ensureFileWithDefault(ctx.heartbeat_path, "{}\n") catch {};
-        ensureFileWithDefault(ctx.channel_state_path, "{}\n") catch {};
+        // D16 (2026-04-25) — silent-catch policy bucket 2 (operator-
+        // critical). These five files MUST exist for the file-backed
+        // tenant code path to function; missing files surface minutes
+        // later as confusing nulls in chat/state/cron/heartbeat reads.
+        // See `docs/silent-catches-policy.md`.
+        ensureFileWithDefault(ctx.memory_db_path, "") catch |err|
+            log.warn("workspace.scaffold_failed user_id={s} kind=memory_db path={s} err={s}", .{ ctx.user_id, ctx.memory_db_path, @errorName(err) });
+        ensureFileWithDefault(ctx.config_path, "{}\n") catch |err|
+            log.warn("workspace.scaffold_failed user_id={s} kind=config path={s} err={s}", .{ ctx.user_id, ctx.config_path, @errorName(err) });
+        ensureFileWithDefault(ctx.cron_path, "[]\n") catch |err|
+            log.warn("workspace.scaffold_failed user_id={s} kind=cron path={s} err={s}", .{ ctx.user_id, ctx.cron_path, @errorName(err) });
+        ensureFileWithDefault(ctx.heartbeat_path, "{}\n") catch |err|
+            log.warn("workspace.scaffold_failed user_id={s} kind=heartbeat path={s} err={s}", .{ ctx.user_id, ctx.heartbeat_path, @errorName(err) });
+        ensureFileWithDefault(ctx.channel_state_path, "{}\n") catch |err|
+            log.warn("workspace.scaffold_failed user_id={s} kind=channel_state path={s} err={s}", .{ ctx.user_id, ctx.channel_state_path, @errorName(err) });
     }
 }
 
@@ -3154,7 +3172,12 @@ fn isIdentityUserNotFound(err: anyerror) bool {
 
 fn scaffoldUserWorkspace(allocator: std.mem.Allocator, ctx: *const UserContext) void {
     const project_ctx = onboard.zakiBotProjectContext();
-    onboard.scaffoldWorkspace(allocator, ctx.workspace_path, &project_ctx) catch {};
+    // D16 (2026-04-25) — silent-catch policy bucket 2. Workspace
+    // scaffolding failure leaves the user without project markdown +
+    // README; downstream tools that expect those files surface
+    // confusing not-found errors. Log so operators can correlate.
+    onboard.scaffoldWorkspace(allocator, ctx.workspace_path, &project_ctx) catch |err|
+        log.warn("workspace.scaffold_workspace_failed user_id={s} workspace={s} err={s}", .{ ctx.user_id, ctx.workspace_path, @errorName(err) });
 }
 
 fn makeAbsolutePath(path: []const u8) !void {
