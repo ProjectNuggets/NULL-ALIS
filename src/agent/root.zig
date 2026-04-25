@@ -3565,10 +3565,18 @@ pub const Agent = struct {
                     self.observer.recordEvent(&tool_only_event);
                 }
 
-                const complete_event = ObserverEvent{ .turn_complete = {} };
-                self.observer.recordEvent(&complete_event);
-
                 // ── Hermes-inspired post-turn maintenance ──
+                //
+                // **D1.11** — these history writes (memory_nudge,
+                // skills_extraction) used to live AFTER turn_complete was
+                // emitted. P2_agent_turn_loop.md ugly truth #11:
+                // "the added messages sit in history for the next turn
+                // but never generate a visible event for this turn."
+                // Moved before turn_complete + each gets its own
+                // turn_stage event so observers (dashboards, SSE
+                // consumers, debug tooling) can see when these prompts
+                // are injected — previously they appeared as silent
+                // history mutations on the next turn.
 
                 // Track tool usage for skills extraction
                 self.last_turn_tool_count = turn_tool_calls_total;
@@ -3593,6 +3601,12 @@ pub const Agent = struct {
                                 "has lasting relevance beyond this session."),
                         });
                         log.info("turn.stage stage=memory_nudge turns_elapsed=10", .{});
+                        const nudge_event = ObserverEvent{ .turn_stage = .{
+                            .stage = "post_turn_memory_nudge",
+                            .iteration = iteration,
+                            .run_id = self.current_run_id,
+                        } };
+                        self.observer.recordEvent(&nudge_event);
                     }
                 }
 
@@ -3613,7 +3627,22 @@ pub const Agent = struct {
                             "one-off tasks."),
                     });
                     log.info("turn.stage stage=skills_extraction_prompt tool_calls={d}", .{turn_tool_calls_total});
+                    const skills_event = ObserverEvent{ .turn_stage = .{
+                        .stage = "post_turn_skills_extraction_prompt",
+                        .iteration = iteration,
+                        .count = turn_tool_calls_total,
+                        .run_id = self.current_run_id,
+                    } };
+                    self.observer.recordEvent(&skills_event);
                 }
+
+                // **D1.11** — turn_complete now fires LAST, after all
+                // post-turn maintenance writes have been recorded as
+                // visible turn_stage events. Pre-D1.11 turn_complete
+                // fired before the maintenance writes so dashboards
+                // saw "turn done" while history was still mutating.
+                const complete_event = ObserverEvent{ .turn_complete = {} };
+                self.observer.recordEvent(&complete_event);
 
                 // Fire turn_end hooks
                 hooks_mod.runHooks(self.allocator, self.hooks, .turn_end, .{
