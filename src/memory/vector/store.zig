@@ -51,6 +51,10 @@ pub const VectorStore = struct {
         upsert: *const fn (ptr: *anyopaque, scope_user_id: ?i64, key: []const u8, embedding: []const f32) anyerror!void,
         search: *const fn (ptr: *anyopaque, alloc: Allocator, scope_user_id: ?i64, query_embedding: []const f32, limit: u32) anyerror![]VectorResult,
         delete: *const fn (ptr: *anyopaque, scope_user_id: ?i64, key: []const u8) anyerror!void,
+        /// S7.2 — bulk delete every embedding scoped to `user_id`. Used by
+        /// the GDPR purgeUser orchestrator (`src/gdpr.zig`). Returns the
+        /// number of rows removed for accounting.
+        delete_all_for_user: *const fn (ptr: *anyopaque, user_id: i64) anyerror!usize,
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         health_check: *const fn (ptr: *anyopaque, alloc: Allocator) anyerror!HealthStatus,
         deinit: *const fn (ptr: *anyopaque) void,
@@ -78,6 +82,12 @@ pub const VectorStore = struct {
 
     pub fn deleteScoped(self: VectorStore, scope_user_id: ?i64, key: []const u8) !void {
         return self.vtable.delete(self.ptr, scope_user_id, key);
+    }
+
+    /// S7.2 — bulk delete every embedding owned by `user_id`.
+    /// Returns the count of rows removed.
+    pub fn deleteAllForUser(self: VectorStore, user_id: i64) !usize {
+        return self.vtable.delete_all_for_user(self.ptr, user_id);
     }
 
     pub fn count(self: VectorStore) !usize {
@@ -273,6 +283,28 @@ pub const SqliteSharedVectorStore = struct {
         if (rc != c.SQLITE_DONE) return error.StepFailed;
     }
 
+    /// S7.2 — bulk delete every embedding for `user_id`. Called by the
+    /// GDPR purgeUser orchestrator. Returns rows removed via
+    /// sqlite3_changes (post-step, before finalize).
+    fn implDeleteAllForUser(ptr: *anyopaque, user_id: i64) anyerror!usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.ensureSchema();
+
+        const sql = "DELETE FROM memory_embeddings WHERE user_id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_int64(stmt, 1, user_id);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+        const changed = c.sqlite3_changes(self.db);
+        return if (changed < 0) 0 else @intCast(changed);
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
         try self.ensureSchema();
@@ -347,6 +379,7 @@ pub const SqliteSharedVectorStore = struct {
         .upsert = &implUpsert,
         .search = &implSearch,
         .delete = &implDelete,
+        .delete_all_for_user = &implDeleteAllForUser,
         .count = &implCount,
         .health_check = &implHealthCheck,
         .deinit = &implDeinit,
@@ -423,6 +456,7 @@ pub const SqliteSidecarVectorStore = struct {
         .upsert = SqliteSharedVectorStore.vtable_instance.upsert,
         .search = SqliteSharedVectorStore.vtable_instance.search,
         .delete = SqliteSharedVectorStore.vtable_instance.delete,
+        .delete_all_for_user = SqliteSharedVectorStore.vtable_instance.delete_all_for_user,
         .count = SqliteSharedVectorStore.vtable_instance.count,
         .health_check = SqliteSharedVectorStore.vtable_instance.health_check,
         .deinit = &implDeinit,
@@ -509,6 +543,46 @@ test "scoped search isolates user results" {
     defer freeVectorResults(std.testing.allocator, user_two_results);
     try std.testing.expectEqual(@as(usize, 1), user_two_results.len);
     try std.testing.expectEqualStrings("shared_key", user_two_results[0].key);
+}
+
+test "S7.2 deleteAllForUser bulk-removes every row for the target user" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var vs = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer vs.deinit();
+
+    const s = vs.store();
+    // Seed 3 rows for user 1, 2 for user 2.
+    try s.upsertScoped(1, "k1", &[_]f32{ 1.0, 0.0 });
+    try s.upsertScoped(1, "k2", &[_]f32{ 0.0, 1.0 });
+    try s.upsertScoped(1, "k3", &[_]f32{ 1.0, 1.0 });
+    try s.upsertScoped(2, "k1", &[_]f32{ 0.5, 0.5 });
+    try s.upsertScoped(2, "k2", &[_]f32{ 0.2, 0.8 });
+    try std.testing.expectEqual(@as(usize, 5), try s.count());
+
+    const removed = try s.deleteAllForUser(1);
+    try std.testing.expectEqual(@as(usize, 3), removed);
+    try std.testing.expectEqual(@as(usize, 2), try s.count());
+
+    // User 2's rows survived.
+    const u2_results = try s.searchScoped(std.testing.allocator, 2, &[_]f32{ 0.5, 0.5 }, 5);
+    defer freeVectorResults(std.testing.allocator, u2_results);
+    try std.testing.expectEqual(@as(usize, 2), u2_results.len);
+}
+
+test "S7.2 deleteAllForUser on absent user is a no-op" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var vs = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer vs.deinit();
+
+    const s = vs.store();
+    try s.upsertScoped(1, "k1", &[_]f32{ 1.0, 0.0 });
+    const removed = try s.deleteAllForUser(999);
+    try std.testing.expectEqual(@as(usize, 0), removed);
+    try std.testing.expectEqual(@as(usize, 1), try s.count());
 }
 
 test "scoped delete only removes matching user key" {
