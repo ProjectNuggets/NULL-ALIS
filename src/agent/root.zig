@@ -16,6 +16,7 @@ const ChatResponse = providers.ChatResponse;
 const ToolSpec = providers.ToolSpec;
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
+const result_cache_mod = @import("../tools/result_cache.zig");
 const entitlement_mod = @import("../entitlement.zig");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
@@ -1958,9 +1959,40 @@ pub const Agent = struct {
                 .workspace_dir = self.workspace_dir,
             });
 
+            // **D1.14** — generalized tool-result cache.
+            // For tools flagged `cacheable`, check the global cache
+            // before executing. Hit → synthesize ToolExecutionResult
+            // from cached output, skip the dispatch. Miss → execute,
+            // then put successful results into the cache with the
+            // metadata's TTL. Mutating tools are statically prevented
+            // from being cacheable via ToolFlags.validate.
+            const cache_meta = self.metadataForToolCall(call);
+            var cache_hit_used: bool = false;
             const tool_timer = std.time.milliTimestamp();
-            const result = self.executeTool(tool_allocator, call);
+            const result = blk: {
+                if (cache_meta.flags.cacheable) {
+                    if (result_cache_mod.global.get(tool_allocator, call.name, call.arguments_json)) |hit| {
+                        cache_hit_used = true;
+                        break :blk dispatcher.ToolExecutionResult{
+                            .name = try tool_allocator.dupe(u8, call.name),
+                            .output = hit.output,
+                            .success = hit.success,
+                            .tool_call_id = if (call.tool_call_id) |id| try tool_allocator.dupe(u8, id) else null,
+                        };
+                    }
+                }
+                break :blk self.executeTool(tool_allocator, call);
+            };
             const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
+
+            // **D1.14** — store successful results in the cache on
+            // miss + cacheable. Failures are NOT cached (a transient
+            // 500 from web_search shouldn't pollute future calls).
+            if (!cache_hit_used and cache_meta.flags.cacheable and result.success and cache_meta.cache_ttl_secs > 0) {
+                result_cache_mod.global.put(call.name, call.arguments_json, result.output, result.success, cache_meta.cache_ttl_secs) catch |err| {
+                    log.warn("D1.14.cache_put_failed tool={s} err={s}", .{ call.name, @errorName(err) });
+                };
+            }
 
             const tool_event = ObserverEvent{ .tool_call = .{
                 .tool = call.name,
@@ -1969,7 +2001,7 @@ pub const Agent = struct {
                 .tool_use_id = tool_use_id,
                 .output_preview = result.output,
                 .output_truncated = result.output.len > 256,
-                .result_summary = if (result.success) "completed" else "failed",
+                .result_summary = if (cache_hit_used) "cache_hit" else if (result.success) "completed" else "failed",
                 .command = command,
                 .files = files,
                 .run_id = self.current_run_id,

@@ -20,10 +20,22 @@ pub const ToolFlags = packed struct {
     background_safe: bool = false,
     operator_only: bool = false,
     concurrency_safe: bool = false,
+    /// **D1.14** — opts a tool into the generalized
+    /// `tools/result_cache.zig` cache. When true, the dispatcher
+    /// checks the cache for a matching `(tool_name, args_json)` hit
+    /// before executing, and on success stores the result with the
+    /// metadata's `cache_ttl_secs` TTL. Use only for deterministic +
+    /// expensive calls (web_search, memory_recall, composio list).
+    /// Mutating tools must NEVER set this — caching a write is a
+    /// data-loss bug, not a performance win.
+    cacheable: bool = false,
 
     /// Validate that flags are not contradictory.
     pub fn validate(self: ToolFlags) error{ContradictoryFlags}!void {
         if (self.read_only and self.mutating) return error.ContradictoryFlags;
+        // D1.14 — caching a mutating tool is wrong; subsequent calls
+        // would return stale results that miss prior writes.
+        if (self.cacheable and self.mutating) return error.ContradictoryFlags;
     }
 };
 
@@ -90,6 +102,13 @@ pub const ToolMetadata = struct {
     risk_level: RiskLevel = .low,
     cost_class: CostClass = .b,
     approval_hint: []const u8 = "",
+    /// **D1.14** — TTL in seconds for cached results when
+    /// `flags.cacheable` is true. Ignored when not cacheable. Pick
+    /// based on staleness tolerance: 60s for catalog-style queries
+    /// (composio list), 300s for memory_recall on stable corpora,
+    /// 30s for web_search where fresh results matter. 0 disables
+    /// caching effectively (entry expires immediately).
+    cache_ttl_secs: u32 = 0,
 
     /// Create a conservative metadata entry for an unknown tool name.
     /// Used as fallback when `lookupMetadata()` returns null.

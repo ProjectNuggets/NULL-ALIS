@@ -78,6 +78,10 @@ pub const browser = @import("browser.zig");
 pub const image = @import("image.zig");
 pub const image_generate = @import("image_generate.zig");
 pub const composio = @import("composio.zig");
+/// **D1.14** generalized tool-result cache. Tools opt in via
+/// `ToolMetadata.flags.cacheable + cache_ttl_secs`. Module is
+/// imported here so its 6 unit tests run with the rest of the suite.
+pub const result_cache = @import("result_cache.zig");
 pub const skill_registry = @import("skill_registry.zig");
 pub const runtime_info = @import("runtime_info.zig");
 pub const screenshot = @import("screenshot.zig");
