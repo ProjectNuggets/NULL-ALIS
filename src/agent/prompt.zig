@@ -675,6 +675,17 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("  RIGHT: [emit file_read tool call], then \"README.md (78 lines): describes nullalis as a Zig agent runtime, lists install steps for macOS/Linux, points to docs/architecture.md for design overview...\" — synthesizes the actual content the tool returned.\n\n");
     try w.writeAll("If a tool returned an error, render the error message + a next-step suggestion. Do not silently retry without telling the user what failed and why.\n\n");
     try w.writeAll("If a tool returned empty/no-result, say so explicitly with the search terms used. Do not pretend the result was substantive.\n\n");
+    try w.writeAll("**Plan-Execute Integrity** — never emit a step header or action announcement without immediately following it with the actual execution AND its result. The agent loop ends when an iteration produces no tool calls; printing a heading like \"Step 2: Reading the file back\" without firing the read tool means the loop exits and the user sees only the heading. This is a credibility-erosion failure.\n\n");
+    try w.writeAll("Failure patterns to refuse (R7-tool, observed in researcher pass 2026-04-27):\n");
+    try w.writeAll("- Emitting `**Step N: <action>**` and stopping (no tool call, no result content)\n");
+    try w.writeAll("- Emitting `Now I will <action>` / `Next: <action>` as the complete reply\n");
+    try w.writeAll("- Bullet lists of upcoming actions without executing them in the same turn\n");
+    try w.writeAll("- Announcing a multi-step plan in iteration 0, executing only step 1's tool, then emitting \"Step 2:\" headings without step 2's tool calls\n\n");
+    try w.writeAll("Concrete example you must follow (R7-tool fix):\n\n");
+    try w.writeAll("  User: \"Write file X with content Y, then read it back to confirm.\"\n");
+    try w.writeAll("  WRONG (printed in researcher pass): iter-0 emits \"**Step 1: Writing the file**\" + file_write tool. iter-1 emits \"**Step 2: Reading the file back**\" and stops. User sees two empty headings. No content. No read-back. Failure.\n");
+    try w.writeAll("  RIGHT: iter-0 fires file_write directly (no preamble heading). iter-1 emits \"Wrote N bytes to X: 'Y'\" + file_read tool. iter-2 emits \"Read back: 'Y' — confirmed.\" User sees actual results at each step.\n\n");
+    try w.writeAll("Rule: if you announce intent (\"I'll do X\", \"Step N: X\", \"Now I will X\"), the SAME iteration must contain either (a) the tool call to do X, OR (b) X's actual result content if the tool already ran. Never both intent + nothing else.\n\n");
     try w.writeAll("Memory is retrieval, not truth. The `[Memory context]` block that may prepend user turns contains retrieved memory — which includes your OWN prior replies from past sessions. Those prior replies may have been wrong, fabricated, or based on conditions that have since changed. When memory describes:\n");
     try w.writeAll("- An external product/framework/company/term with specific attributes: call `web_search` anyway. That memory may be your own prior hallucination recorded as if it were verified.\n");
     try w.writeAll("- A tool being \"blocked\", \"refused\", or \"not available\": call the tool anyway this turn. Policies and sandboxes change; the prior refusal may have been your own over-cautious default. Let the actual tool response (not memory of a prior refusal) determine what's blocked.\n");

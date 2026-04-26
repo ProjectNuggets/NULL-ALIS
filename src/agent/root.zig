@@ -1311,9 +1311,25 @@ pub const Agent = struct {
     }
 
     const reflection_prompt_execute =
-        "Reflect on the tool results above and decide your next steps. " ++
-        "**Render the actual result content in your reply** — quote file contents, show command output, surface recalled memory entries, cite search findings. The user does NOT see the <tool_result> blocks above; they see only your reply. A bare acknowledgment like '✅ done' or '✅ FILE WRITE: SUCCESS' without surfacing what the tool actually returned is a failure mode — the user has a log of tool results and will detect the mismatch. See the Response Protocol's Tool Result Synthesis rule for per-tool minimums. " ++
-        "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
+        "**This is your reply to the user. Not a planning document. Not a step-by-step outline. The actual reply.**\n\n" ++
+        "**STEP 1 (mandatory): Surface what the tool above just returned.** Quote file contents, show command output, list recalled memory entries with their actual keys + content, cite search findings inline with URLs, confirm the byte count + path that was written. The user CANNOT see the `<tool_result>` block above — they see only your text. If you don't render it, it didn't happen for them.\n\n" ++
+        "**STEP 2 (only after Step 1): Decide if more tools are needed for the user's full request.** If yes, fire the next tool — do NOT print a heading like 'Step 2: Reading the file' without immediately firing the read tool. **Empty step headers ('Step N:', 'Now I will...', 'Next:') without the actual execution AND result are equivalent to fabricating progress.** If no more tools needed, conclude with the actual answer (not a plan to answer).\n\n" ++
+        "Concrete examples:\n" ++
+        "  WRONG (R7-tool — the rough edge from prompt-7 testing 2026-04-27):\n" ++
+        "    iter 0 emits: '**Step 1: Writing the file**' + file_write tool call → tool succeeds\n" ++
+        "    iter 1 emits: '**Step 2: Reading the file back**' (and stops — no file_read tool, no content)\n" ++
+        "    User sees: two empty headings. No file content. No confirmation. Failure.\n\n" ++
+        "  RIGHT:\n" ++
+        "    iter 0 emits: file_write tool call (no preamble headings yet)\n" ++
+        "    iter 1 emits: 'Wrote 24 bytes to research_test.txt: \"researcher pass at 01:32\"' + file_read tool call\n" ++
+        "    iter 2 emits: 'Read back: \"researcher pass at 01:32\" — confirmed.'\n" ++
+        "    User sees: actual results at every step. Trust contract preserved.\n\n" ++
+        "Failure modes to refuse:\n" ++
+        "  - 'Step N: <action>' with no execution OR result in the same iteration\n" ++
+        "  - '✅ done' / '✅ SUCCESS' with no rendered result content\n" ++
+        "  - 'I'll do X' / 'Now I will Y' as a complete reply without doing X/Y\n" ++
+        "  - Bullet lists of actions you're about to take without executing them\n\n" ++
+        "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation, surface the actual error message from the tool, and choose a different available tool or ask the user for permission/config change. " ++
         "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up. " ++
         "If a tool reports queued/async delivery, state it as queued (not confirmed delivered) unless a later tool confirms delivery.";
     const reflection_prompt_plan =
