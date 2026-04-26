@@ -1120,13 +1120,21 @@ pub const MemoryRuntime = struct {
     _allocator: std.mem.Allocator,
     _search_enabled: bool = true,
 
-    /// **D1.15** — atomic flag set when `warmupSession` finishes
-    /// pre-fetching for the current session. Hot-path callers can
-    /// use this as a hint (e.g. "warmup not done — return degraded
-    /// result fast and let the next turn benefit from a hot cache").
-    /// Not gating today; presence here is the contract for D1.15
-    /// follow-up commits to wire the spawn-on-session-boot pattern.
-    _warmup_complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// **D1.15 finding 3 fix (2026-04-26):** per-session warmup
+    /// tracking. Pre-fix this was a single `atomic.Value(bool)`
+    /// flag that flipped true on first `warmupSession` success,
+    /// then short-circuited forever — but the runtime is shared
+    /// across sessions (gateway.zig:1304, gateway.zig:1493), so
+    /// later sessions would read "warm=true" without any
+    /// session-specific warmup having run. The function takes a
+    /// `session_id` parameter; the state must be keyed by it.
+    ///
+    /// `_warmup_mutex` protects `_warmed_sessions`. Every key in
+    /// the map is owned by `_allocator` (duped on insert, freed on
+    /// deinit). The map's empty initialization means the cost on
+    /// runtimes that never warm is zero memory.
+    _warmup_mutex: std.Thread.Mutex = .{},
+    _warmed_sessions: std.StringHashMapUnmanaged(void) = .{},
 
     // P5: rollout policy
     _rollout_policy: rollout.RolloutPolicy = .{ .mode = .on, .canary_percent = 0, .shadow_percent = 0 },
@@ -1158,24 +1166,37 @@ pub const MemoryRuntime = struct {
     ///
     /// The warmup runs a small set of canned queries that exercise the
     /// hot path — semantic recall touches the embedding cache + vector
-    /// store + RRF index. After warmup completes,
-    /// `_warmup_complete.store(true)` flips the flag; hot-path callers
-    /// that observe it can skip degraded-fallback paths.
+    /// store + RRF index. After warmup completes for a session,
+    /// `_warmed_sessions` records the session_id so subsequent calls
+    /// for the same session short-circuit; other sessions still need
+    /// their own warmup pass.
+    ///
+    /// **D1.15 finding 3 fix (2026-04-26):** state is now per-session
+    /// (was a single global atomic bool — would short-circuit later
+    /// sessions on the shared runtime even though they hadn't warmed).
     ///
     /// Designed to run in a background thread spawned at session boot
     /// (the spawn wiring lands in a follow-up commit). Calling on the
-    /// hot path is safe but redundant — the second call is a no-op
-    /// once `_warmup_complete` is true.
+    /// hot path is safe but redundant — the second call for the same
+    /// session is a no-op.
     ///
     /// **Cost:** ~1 semantic search worth of work, single-shot per
     /// session. The amortized win is the elimination of the cold-
     /// start penalty on the user's first turn after restore.
     pub fn warmupSession(self: *MemoryRuntime, session_id: ?[]const u8) void {
-        if (self._warmup_complete.load(.acquire)) return;
+        const key = session_id orelse "__no_session__";
+
+        // Fast-path: check whether this session is already warm.
+        {
+            self._warmup_mutex.lock();
+            defer self._warmup_mutex.unlock();
+            if (self._warmed_sessions.contains(key)) return;
+        }
+
         if (!self._search_enabled or self._engine == null) {
-            // No engine to warm — mark complete so callers don't
-            // spin waiting for a no-op.
-            self._warmup_complete.store(true, .release);
+            // No engine to warm — mark this session as "warm enough"
+            // so callers don't spin waiting for a no-op.
+            self.markSessionWarmed(key);
             return;
         }
 
@@ -1198,14 +1219,43 @@ pub const MemoryRuntime = struct {
             _ = candidates;
         }
 
-        self._warmup_complete.store(true, .release);
+        self.markSessionWarmed(key);
     }
 
     /// **D1.15** — observability hook for callers that want to know
-    /// whether warmup has completed. Hot path can render a "warming
-    /// up" badge or prefer degraded-fast results during the gap.
-    pub fn warmupComplete(self: *const MemoryRuntime) bool {
-        return self._warmup_complete.load(.acquire);
+    /// whether warmup has completed for a specific session. Hot path
+    /// can render a "warming up" badge or prefer degraded-fast
+    /// results during the gap.
+    pub fn warmupComplete(self: *MemoryRuntime, session_id: ?[]const u8) bool {
+        const key = session_id orelse "__no_session__";
+        self._warmup_mutex.lock();
+        defer self._warmup_mutex.unlock();
+        return self._warmed_sessions.contains(key);
+    }
+
+    /// Internal: record `key` in the warmed-sessions set. Allocator
+    /// failures are logged but not propagated — failing to record
+    /// "warmed" just means the next warmupSession call repeats the
+    /// pre-fetch (idempotent at the cost of redundant work). Worse
+    /// than blocking the user's request.
+    fn markSessionWarmed(self: *MemoryRuntime, key: []const u8) void {
+        self._warmup_mutex.lock();
+        defer self._warmup_mutex.unlock();
+        // Re-check under lock in case another thread raced us.
+        if (self._warmed_sessions.contains(key)) return;
+        const owned_key = self._allocator.dupe(u8, key) catch return;
+        self._warmed_sessions.put(self._allocator, owned_key, {}) catch {
+            self._allocator.free(owned_key);
+        };
+    }
+
+    /// Internal: free all keys + the map. Called from `MemoryRuntime.deinit`.
+    fn deinitWarmupSessions(self: *MemoryRuntime) void {
+        self._warmup_mutex.lock();
+        defer self._warmup_mutex.unlock();
+        var it = self._warmed_sessions.keyIterator();
+        while (it.next()) |k_ptr| self._allocator.free(k_ptr.*);
+        self._warmed_sessions.deinit(self._allocator);
     }
 
     /// High-level search: uses rollout policy to decide keyword-only vs hybrid.
@@ -1495,6 +1545,10 @@ pub const MemoryRuntime = struct {
         // Must happen while embedding provider, vector store, and circuit breaker
         // are still alive (drainOutbox uses all three).
         _ = self.drainOutbox(self._allocator);
+
+        // **D1.15 finding 3 fix (2026-04-26):** free per-session
+        // warmup tracking. Owned keys + the map.
+        self.deinitWarmupSessions();
 
         // Engine first: it holds references to P3 components (vector store,
         // embedding provider, circuit breaker) — must deinit before them.
