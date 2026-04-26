@@ -419,16 +419,16 @@ Goal: operator can see, not just the app.
 
 Goal: things not solved by editing files.
 
-- [ ] **S14.1** STRIDE threat model against P3 relations diagrams — document at `docs/threat-model.md`.
-- [ ] **S14.2** EU AI Act risk classification — determine if we're a "general purpose AI" provider, plan disclosures + content-provenance per Article 50.
-- [ ] **S14.3** Provider DPA / BAA posture — Together, Groq, Moonshot, Composio. Sign or document absence.
-- [ ] **S14.4** Zig allocator-discipline audit — focused human read across agent/root.zig, gateway.zig, daemon.zig. Arena vs GPA mixing, cross-allocator frees. Cannot be subagent-ed.
-- [ ] **S14.5** Thread-safety audit — 11-thread daemon supervisor + scheduler + event_bus + heartbeat_wake. Races on shared state.
-- [ ] **S14.6** Zig 0.14 → 0.15+ upgrade plan — track upstream, isolate deprecated stdlib calls, test ahead of release.
-- [ ] **S14.7** Bus factor mitigation — the internals x-ray IS the onboarding doc; document release process, who can merge, who can deploy. Single-person today; document it.
-- [ ] **S14.8** On-call rotation (even of one) — weekly windows, explicit "no coverage" periods communicated.
-- [ ] **S14.9** Pentest engagement — schedule for post-Sprint-11 (security hardened first).
-- [ ] **S14.10** License audit — all zon deps + Dockerfile base images + k8s images. No GPL/AGPL surprises.
+- [ ] **S14.1** STRIDE threat model against P3 relations diagrams — document at `docs/threat-model.md`. **Parked-with-reason** in `docs/sprints/sprint-14.md` — trigger: collab session with Nova.
+- [ ] **S14.2** EU AI Act risk classification. **Parked-with-reason** in `docs/sprints/sprint-14.md` — trigger: EU paying-user signup OR external counsel.
+- [x] **S14.3** Provider DPA / BAA posture — shipped at `docs/audits/s14.3-provider-dpa-baa.md`. 8 providers inventoried; operator-action checklist for Together/Composio/Sentry DPA submissions.
+- [x] **S14.4** Allocator-discipline audit — shipped at `docs/audits/s14.4-allocator-audit.md`. 0 HIGH/MED/LOW findings; 1 INFO note on D1.7 spawned_task_ids accumulator. Allocator discipline sound across agent/root.zig, gateway.zig, daemon.zig.
+- [x] **S14.5** Thread-safety audit — shipped at `docs/audits/s14.5-thread-safety-audit.md`. 1 HIGH (D1.3 Session.last_turn_outcome — fixed in same PR), 2 MED (deferred per sprint-14.md), 2 LOW.
+- [x] **S14.6** Zig 0.14 → 0.15+ upgrade plan — shipped at `docs/audits/s14.6-zig-upgrade-plan.md`. SSOT pinning verified; upgrade triggers + checklists documented.
+- [ ] **S14.7** Bus factor mitigation. **Parked-with-reason** in `docs/sprints/sprint-14.md` — trigger: Nova drafts process; I template `docs/release-process.md`.
+- [ ] **S14.8** On-call rotation. **Parked-with-reason** — trigger: first paying customer with uptime expectations.
+- [ ] **S14.9** Pentest engagement. **Parked-with-reason** — trigger: Sprint 11 (Security Hardening) completion.
+- [x] **S14.10** License audit — shipped at `docs/audits/s14.10-license-audit.md`. zon deps + Dockerfile inventoried; no GPL/AGPL contamination in runtime; one follow-up `S14.10.1` for nullclaw/sentry-zig LICENSE verification.
 
 **Sprint 14 DoD:** each item has a written status (done / in progress / parked with reason) in `docs/out-of-code-status.md`.
 

@@ -91,13 +91,67 @@ pub const Session = struct {
     }
 
     /// D1.3 getter for the most recently completed turn's outcome.
-    /// Returns null if no turn has run on this session yet. The
-    /// outcome remains owned by the session — caller borrows the
-    /// pointer; do not deinit. Pointer is invalidated when the next
-    /// turn replaces the outcome or when the session is deinit'd.
-    pub fn lastTurnOutcome(self: *const Session) ?*const Agent.TurnOutcome {
-        if (self.last_turn_outcome) |*outcome| return outcome;
-        return null;
+    /// Returns a freshly-allocated deep copy of the most recently
+    /// completed turn's outcome, or null if no turn has run yet.
+    /// **Caller owns the returned outcome and must call `deinit` on it.**
+    ///
+    /// **S14.5 thread-safety fix (2026-04-26):** pre-fix this was
+    /// `*const Session` returning a borrowed pointer to
+    /// `self.last_turn_outcome`, with no mutex acquisition. Two
+    /// threads racing read+write of the field could UAF/double-free
+    /// (audit HIGH-1 from `docs/audits/s14.5-thread-safety-audit.md`).
+    /// Now the function:
+    ///   - takes `*Session` (mutable receiver — signals it's not
+    ///     const-safe across threads)
+    ///   - acquires `session.mutex` internally
+    ///   - deep-copies the outcome under lock
+    ///   - returns the copy with caller-owned ownership
+    /// The copy lifetime is now independent of when the next turn
+    /// replaces the outcome on this session.
+    pub fn lastTurnOutcome(self: *Session, allocator: std.mem.Allocator) !?Agent.TurnOutcome {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const src = self.last_turn_outcome orelse return null;
+
+        // Deep copy: text + each owned slice in tool_calls_executed
+        // and spawned_task_ids must be allocated through the caller's
+        // allocator so they outlive the session-side copy.
+        const text_copy = try allocator.dupe(u8, src.text);
+        errdefer allocator.free(text_copy);
+
+        const tools_copy = try allocator.alloc([]const u8, src.tool_calls_executed.len);
+        errdefer {
+            for (tools_copy[0..0]) |_| {} // no-op; cleanup tracker below
+            allocator.free(tools_copy);
+        }
+        var tools_filled: usize = 0;
+        errdefer {
+            for (tools_copy[0..tools_filled]) |s| allocator.free(s);
+        }
+        for (src.tool_calls_executed, 0..) |s, i| {
+            tools_copy[i] = try allocator.dupe(u8, s);
+            tools_filled = i + 1;
+        }
+
+        const tasks_copy = try allocator.alloc([]const u8, src.spawned_task_ids.len);
+        errdefer allocator.free(tasks_copy);
+        var tasks_filled: usize = 0;
+        errdefer {
+            for (tasks_copy[0..tasks_filled]) |s| allocator.free(s);
+        }
+        for (src.spawned_task_ids, 0..) |s, i| {
+            tasks_copy[i] = try allocator.dupe(u8, s);
+            tasks_filled = i + 1;
+        }
+
+        return Agent.TurnOutcome{
+            .text = text_copy,
+            .tool_only_turn = src.tool_only_turn,
+            .tool_calls_executed = tools_copy,
+            .spawned_task_ids = tasks_copy,
+            .iterations_used = src.iterations_used,
+            .loop_detected = src.loop_detected,
+        };
     }
 };
 
