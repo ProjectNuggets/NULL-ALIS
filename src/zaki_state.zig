@@ -984,6 +984,25 @@ const ManagerImpl = struct {
             "ALTER TABLE {schema}.tasks ADD COLUMN IF NOT EXISTS request_session_id TEXT REFERENCES {schema}.sessions(id) ON DELETE SET NULL",
             "ALTER TABLE {schema}.tasks DROP CONSTRAINT IF EXISTS tasks_pkey",
             "ALTER TABLE {schema}.tasks ADD PRIMARY KEY (user_id, id)",
+
+            // S10.2 — bootstrap the schema_migrations tracker table +
+            // record the legacy initial schema as version 1. The new
+            // framework module at `src/migrations.zig` (S10.1) is the
+            // path for future migrations 0002+. For 0001 we don't
+            // re-run the full DDL via the framework because the
+            // legacy loop above already did it (idempotently); we
+            // just record it as applied so future migrations land
+            // through the framework with full version-tracking
+            // semantics. ON CONFLICT DO NOTHING makes this safe to
+            // re-run on every boot during the legacy-loop transition
+            // period.
+            \\CREATE TABLE IF NOT EXISTS {schema}.schema_migrations (
+            \\    version INTEGER PRIMARY KEY,
+            \\    name TEXT NOT NULL,
+            \\    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            \\)
+            ,
+            "INSERT INTO {schema}.schema_migrations (version, name) VALUES (1, '0001_initial_schema') ON CONFLICT (version) DO NOTHING",
         };
 
         for (statements) |template| {
