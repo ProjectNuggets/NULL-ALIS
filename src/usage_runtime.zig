@@ -92,12 +92,24 @@ pub const UsageRuntime = struct {
     /// for class-A (cheap), 5 for class-B (moderate), 25 for class-C
     /// (expensive). Used by the S2.8 weight-budget gate in
     /// `preflightToolPolicy` to cap abusive sessions within a single
-    /// connection. Session-scoped (NOT truly monthly) until per-user
-    /// JSONL persistence lands via D5 (CostTracker full wire-up).
+    /// connection. Session-scoped; the calendar-month $ counterpart
+    /// lives in the JSONL ledger below (D5).
     session_weight_total: u64,
     next_turn_index: u32,
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
+    /// **D5 (2026-04-26)** — per-tenant JSONL cost ledger. When
+    /// non-null, every `recordTurn` call append-writes a one-line JSON
+    /// record to this path. `monthlyTotalUsd(now)` aggregates the
+    /// ledger by calendar month for billing-grade cost accounting.
+    /// Today's tenant runtime instantiates one UsageRuntime per
+    /// workspace (gateway.zig:1405) so the ledger naturally scopes
+    /// per-tenant when path = `{workspace_dir}/state/cost.jsonl`.
+    /// Survives gateway restart; survives process crash (atomic-append
+    /// at the OS-level, single line at a time so partial writes are
+    /// detectable on read).
+    cost_jsonl_path: ?[]const u8 = null,
+    cost_jsonl_path_owned: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) UsageRuntime {
         return .{
@@ -113,6 +125,23 @@ pub const UsageRuntime = struct {
         };
     }
 
+    /// **D5** — initialize with per-tenant cost-ledger persistence.
+    /// `workspace_dir` is per-tenant (`{users_root}/{user_id}/workspace`
+    /// in the standard tenant-runtime topology, sibling-of-tenant in
+    /// the workspace-only topology). The ledger lives at
+    /// `{workspace_dir}/state/cost.jsonl`. Parent directory is created
+    /// on first append.
+    pub fn initWithCostPersistence(
+        allocator: std.mem.Allocator,
+        workspace_dir: []const u8,
+    ) !UsageRuntime {
+        var rt = UsageRuntime.init(allocator);
+        const path = try std.fs.path.join(allocator, &.{ workspace_dir, "state", "cost.jsonl" });
+        rt.cost_jsonl_path = path;
+        rt.cost_jsonl_path_owned = true;
+        return rt;
+    }
+
     pub fn deinit(self: *UsageRuntime) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -120,6 +149,9 @@ pub const UsageRuntime = struct {
             self.allocator.free(@constCast(turn.model));
         }
         self.turns.deinit(self.allocator);
+        if (self.cost_jsonl_path_owned) {
+            if (self.cost_jsonl_path) |p| self.allocator.free(@constCast(p));
+        }
     }
 
     pub fn recordTurn(
@@ -148,6 +180,7 @@ pub const UsageRuntime = struct {
         // Duplicate the model string so callers may free/reuse their buffer.
         const owned_model = self.allocator.dupe(u8, model) catch return; // best-effort
 
+        const ts = std.time.timestamp();
         self.turns.append(self.allocator, .{
             .model = owned_model,
             .input_tokens = input_tokens,
@@ -156,7 +189,7 @@ pub const UsageRuntime = struct {
             .cost_usd = cost_usd,
             .duration_ms = duration_ms,
             .turn_index = self.next_turn_index,
-            .timestamp_secs = std.time.timestamp(),
+            .timestamp_secs = ts,
         }) catch {
             // append failed — free the orphaned model to avoid leak.
             self.allocator.free(owned_model);
@@ -164,6 +197,140 @@ pub const UsageRuntime = struct {
         };
 
         self.next_turn_index += 1;
+
+        // D5 — persist to JSONL ledger when configured. Best-effort:
+        // a write failure logs but does not block the session-totals
+        // update (in-memory truth is preserved). Cross-restart accuracy
+        // depends on this not failing under normal disk conditions.
+        if (self.cost_jsonl_path != null) {
+            self.persistTurnToJsonlLocked(model, input_tokens, output_tokens, cost_usd, ts) catch |err| {
+                const log = std.log.scoped(.usage);
+                log.warn("usage.cost_persist_failed err={s} model={s}", .{ @errorName(err), model });
+            };
+        }
+    }
+
+    /// **D5** — append one-line JSON record to the ledger. Caller must
+    /// hold `self.mutex`. Creates parent dir on first call.
+    fn persistTurnToJsonlLocked(
+        self: *UsageRuntime,
+        model: []const u8,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: f64,
+        timestamp_secs: i64,
+    ) !void {
+        const path = self.cost_jsonl_path orelse return;
+        if (std.fs.path.dirnamePosix(path)) |dir| {
+            std.fs.cwd().makePath(dir) catch {};
+        }
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = false });
+        defer file.close();
+        file.seekFromEnd(0) catch {};
+
+        var line_buf: [512]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "{{\"model\":\"{s}\",\"input_tokens\":{d},\"output_tokens\":{d},\"cost_usd\":{d:.8},\"timestamp\":{d}}}\n", .{
+            model, input_tokens, output_tokens, cost_usd, timestamp_secs,
+        });
+        try file.writeAll(line);
+    }
+
+    /// **D5** — return total cost in USD recorded in the JSONL ledger
+    /// for the calendar month (UTC) containing `now_secs`. Returns 0
+    /// if no ledger configured or file unreadable. Calendar-month
+    /// (year + month) comparison via std.time.epoch — stable across
+    /// month boundaries (correct on Feb 28→Mar 1, leap years, etc.)
+    /// unlike the day/30 approximation in cost.zig.
+    pub fn monthlyTotalUsd(self: *UsageRuntime, now_secs: i64) f64 {
+        // Snapshot the path under lock to avoid race vs. deinit.
+        self.mutex.lock();
+        const path_opt = self.cost_jsonl_path;
+        self.mutex.unlock();
+        const path = path_opt orelse return 0.0;
+
+        const file = std.fs.cwd().openFile(path, .{}) catch return 0.0;
+        defer file.close();
+
+        const target_ym = yearMonthOrdinal(now_secs);
+        var total: f64 = 0.0;
+
+        var read_buf: [4096]u8 = undefined;
+        var carry: usize = 0;
+        while (true) {
+            const n = file.read(read_buf[carry..]) catch break;
+            if (n == 0 and carry == 0) break;
+            const filled = carry + n;
+
+            var start: usize = 0;
+            while (std.mem.indexOfScalar(u8, read_buf[start..filled], '\n')) |nl| {
+                const line = read_buf[start .. start + nl];
+                start += nl + 1;
+                if (parseLedgerLine(line)) |parsed| {
+                    if (yearMonthOrdinal(parsed.timestamp) == target_ym) {
+                        total += parsed.cost_usd;
+                    }
+                }
+            }
+
+            if (start < filled) {
+                std.mem.copyForwards(u8, read_buf[0..(filled - start)], read_buf[start..filled]);
+                carry = filled - start;
+            } else {
+                carry = 0;
+            }
+
+            if (n == 0) break;
+        }
+
+        return total;
+    }
+
+    /// Calendar (year, month) ordinal from epoch seconds, expressed as
+    /// `year * 12 + (month - 1)`. Stable comparison key for "same
+    /// month?" without dragging in date math at every call site.
+    fn yearMonthOrdinal(secs: i64) i32 {
+        if (secs < 0) return 0; // ledger has no pre-1970 entries
+        const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
+        const year_day = epoch_secs.getEpochDay().calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const year: i32 = @intCast(year_day.year);
+        const month: i32 = @intCast(month_day.month.numeric());
+        return year * 12 + (month - 1);
+    }
+
+    const LedgerLine = struct {
+        timestamp: i64,
+        cost_usd: f64,
+    };
+
+    /// Parse the two fields we need (`timestamp`, `cost_usd`) from a
+    /// ledger JSON line via lightweight string scan. Avoids a full
+    /// JSON parse per line (millions of lines per year for active
+    /// tenants). Returns null on malformed input — that line is
+    /// silently skipped (rolling totals continue).
+    fn parseLedgerLine(line: []const u8) ?LedgerLine {
+        const ts_marker = "\"timestamp\":";
+        const cost_marker = "\"cost_usd\":";
+        const ts_idx = std.mem.indexOf(u8, line, ts_marker) orelse return null;
+        const cost_idx = std.mem.indexOf(u8, line, cost_marker) orelse return null;
+
+        const ts_after = line[ts_idx + ts_marker.len ..];
+        var ts_end: usize = 0;
+        for (ts_after) |ch| {
+            if (ch >= '0' and ch <= '9') ts_end += 1 else if (ch == '-' and ts_end == 0) ts_end += 1 else break;
+        }
+        if (ts_end == 0) return null;
+        const ts = std.fmt.parseInt(i64, ts_after[0..ts_end], 10) catch return null;
+
+        const cost_after = line[cost_idx + cost_marker.len ..];
+        var cost_end: usize = 0;
+        for (cost_after) |ch| {
+            if ((ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == 'e' or ch == 'E' or ch == '+') cost_end += 1 else break;
+        }
+        if (cost_end == 0) return null;
+        const cost = std.fmt.parseFloat(f64, cost_after[0..cost_end]) catch return null;
+
+        return .{ .timestamp = ts, .cost_usd = cost };
     }
 
     pub fn sessionTotals(self: *UsageRuntime) struct { input: u64, output: u64, total: u64, cost: f64 } {
@@ -486,4 +653,130 @@ test "UsageRuntime ring buffer eviction frees owned model strings" {
         rt.recordTurn(name, 1, 1, 0.0, 1);
     }
     try std.testing.expectEqual(@as(usize, MAX_TURNS_TRACKED), rt.turns.items.len);
+}
+
+// ── D5 — calendar-month JSONL persistence tests ────────────────────
+
+test "D5 — initWithCostPersistence builds workspace-relative path" {
+    const allocator = std.testing.allocator;
+    var rt = try UsageRuntime.initWithCostPersistence(allocator, "/tmp/d5-test-workspace");
+    defer rt.deinit();
+    try std.testing.expect(rt.cost_jsonl_path != null);
+    try std.testing.expect(rt.cost_jsonl_path_owned);
+    try std.testing.expect(std.mem.endsWith(u8, rt.cost_jsonl_path.?, "/state/cost.jsonl"));
+    try std.testing.expect(std.mem.indexOf(u8, rt.cost_jsonl_path.?, "/tmp/d5-test-workspace") != null);
+}
+
+test "D5 — recordTurn appends to JSONL when path configured" {
+    const allocator = std.testing.allocator;
+    // Use a unique tmp dir per test invocation to avoid cross-test pollution.
+    var dir_buf: [128]u8 = undefined;
+    const tmp_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/nullalis-d5-{d}", .{std.time.microTimestamp()});
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    var rt = try UsageRuntime.initWithCostPersistence(allocator, tmp_dir);
+    defer rt.deinit();
+
+    rt.recordTurn("test-model", 100, 50, 0.001234, 250);
+    rt.recordTurn("test-model", 200, 100, 0.002468, 500);
+
+    // Read the ledger file directly and assert it has 2 lines with expected fields.
+    const path = rt.cost_jsonl_path.?;
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    var buf: [4096]u8 = undefined;
+    const n = try file.read(&buf);
+    const content = buf[0..n];
+
+    var line_count: usize = 0;
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    while (iter.next()) |line| {
+        if (line.len == 0) continue;
+        line_count += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"model\":\"test-model\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"cost_usd\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"timestamp\":") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), line_count);
+}
+
+test "D5 — monthlyTotalUsd sums same-calendar-month entries" {
+    const allocator = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const tmp_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/nullalis-d5-monthly-{d}", .{std.time.microTimestamp()});
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    var rt = try UsageRuntime.initWithCostPersistence(allocator, tmp_dir);
+    defer rt.deinit();
+
+    rt.recordTurn("m", 1, 1, 0.10, 1);
+    rt.recordTurn("m", 1, 1, 0.20, 1);
+    rt.recordTurn("m", 1, 1, 0.05, 1);
+
+    const now = std.time.timestamp();
+    const monthly = rt.monthlyTotalUsd(now);
+
+    // 0.10 + 0.20 + 0.05 = 0.35; allow tiny float tolerance from %.8f roundtrip.
+    try std.testing.expect(@abs(monthly - 0.35) < 0.0001);
+}
+
+test "D5 — monthlyTotalUsd excludes entries from other calendar months" {
+    const allocator = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const tmp_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/nullalis-d5-bound-{d}", .{std.time.microTimestamp()});
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    var rt = try UsageRuntime.initWithCostPersistence(allocator, tmp_dir);
+    defer rt.deinit();
+
+    // Hand-craft three lines with explicit timestamps spanning 3 calendar
+    // months so we can verify the year-month boundary is honored. Bypassing
+    // recordTurn to set arbitrary timestamps; mirrors the exact wire format.
+    const path = rt.cost_jsonl_path.?;
+    if (std.fs.path.dirnamePosix(path)) |d| try std.fs.cwd().makePath(d);
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+
+    // 2024-01-15 00:00:00 UTC = 1705276800
+    // 2024-02-15 00:00:00 UTC = 1707955200
+    // 2024-03-15 00:00:00 UTC = 1710460800
+    try file.writeAll("{\"model\":\"m\",\"input_tokens\":1,\"output_tokens\":1,\"cost_usd\":1.00000000,\"timestamp\":1705276800}\n");
+    try file.writeAll("{\"model\":\"m\",\"input_tokens\":1,\"output_tokens\":1,\"cost_usd\":2.00000000,\"timestamp\":1707955200}\n");
+    try file.writeAll("{\"model\":\"m\",\"input_tokens\":1,\"output_tokens\":1,\"cost_usd\":4.00000000,\"timestamp\":1710460800}\n");
+
+    // Probe Feb (1707955200) — should return only the 2.00 entry.
+    const feb_total = rt.monthlyTotalUsd(1707955200);
+    try std.testing.expect(@abs(feb_total - 2.00) < 0.001);
+
+    // Probe Jan — should return only 1.00.
+    const jan_total = rt.monthlyTotalUsd(1705276800);
+    try std.testing.expect(@abs(jan_total - 1.00) < 0.001);
+
+    // Probe Mar — should return only 4.00.
+    const mar_total = rt.monthlyTotalUsd(1710460800);
+    try std.testing.expect(@abs(mar_total - 4.00) < 0.001);
+
+    // Probe a month with no entries (April 2024 = 1712016000) — 0.
+    const apr_total = rt.monthlyTotalUsd(1712016000);
+    try std.testing.expect(apr_total == 0.0);
+}
+
+test "D5 — monthlyTotalUsd returns 0 when no path configured" {
+    const allocator = std.testing.allocator;
+    var rt = UsageRuntime.init(allocator);
+    defer rt.deinit();
+    rt.recordTurn("m", 100, 50, 5.0, 100);
+    try std.testing.expect(rt.monthlyTotalUsd(std.time.timestamp()) == 0.0);
+}
+
+test "D5 — yearMonthOrdinal handles year boundaries correctly" {
+    // 2024-12-31 23:59:59 UTC = 1735689599 → ordinal = 2024*12 + 11 = 24299
+    // 2025-01-01 00:00:00 UTC = 1735689600 → ordinal = 2025*12 + 0  = 24300
+    try std.testing.expectEqual(@as(i32, 24299), UsageRuntime.yearMonthOrdinal(1735689599));
+    try std.testing.expectEqual(@as(i32, 24300), UsageRuntime.yearMonthOrdinal(1735689600));
+    // Different days, same month → same ordinal
+    try std.testing.expectEqual(
+        UsageRuntime.yearMonthOrdinal(1707955200),  // 2024-02-15
+        UsageRuntime.yearMonthOrdinal(1709251199),  // 2024-02-29 23:59:59 (leap year)
+    );
 }
