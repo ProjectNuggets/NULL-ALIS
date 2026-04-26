@@ -195,8 +195,8 @@ Current tool surfaces:
 - `memory_list`
 
 Important nuance:
-- cold transcripts are stored and kept forever
-- they are vector-synced
+- cold transcripts are stored and kept forever (postgres `messages` table)
+- **NOT vector-synced today** — `session.zig::saveMessage` writes to the row store but does NOT call `MemoryRuntime.syncVectorAfterStore`. Vector sync today fires only for memories (`memory_store`, `memory_edit`, `timeline_index/current`). Doc previously claimed otherwise; corrected as part of S15.4 (sprint-15) to match code-truth. Tracked as future work — if/when transcripts need semantic recall, syncVectorAfterStore should be added to the saveMessage path with a session-scoped vector_key like `transcript/<session_id>/<message_id>` so existing memory recall can surface them.
 - by default they are still filtered as internal records in normal recall/list flows
 - `memory_list(include_internal=true)` can inspect them today
 
