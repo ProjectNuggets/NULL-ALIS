@@ -22,12 +22,14 @@ pub const ToolFlags = packed struct {
     concurrency_safe: bool = false,
     /// **D1.14** — opts a tool into the generalized
     /// `tools/result_cache.zig` cache. When true, the dispatcher
-    /// checks the cache for a matching `(tool_name, args_json)` hit
-    /// before executing, and on success stores the result with the
-    /// metadata's `cache_ttl_secs` TTL. Use only for deterministic +
-    /// expensive calls (web_search, memory_recall, composio list).
-    /// Mutating tools must NEVER set this — caching a write is a
-    /// data-loss bug, not a performance win.
+    /// checks the cache for a matching `(tool_name, args_json,
+    /// scope)` hit before executing, and on success stores the
+    /// result with the metadata's `cache_ttl_secs` TTL + the
+    /// metadata's `cache_scope` for cross-session safety. Use only
+    /// for deterministic + expensive calls (web_search,
+    /// memory_recall, composio list). Mutating tools must NEVER set
+    /// this — caching a write is a data-loss bug, not a performance
+    /// win.
     cacheable: bool = false,
 
     /// Validate that flags are not contradictory.
@@ -95,6 +97,45 @@ pub const CostClass = enum {
     }
 };
 
+/// **D1.14 — cache scope** (cross-session safety).
+///
+/// Determines what context the dispatcher folds into the cache key
+/// alongside `(tool_name, args_json)`. The default is most-restrictive
+/// — `.session` — so opting a tool into the cache CANNOT accidentally
+/// leak results across users / sessions / tenants. A tool that
+/// genuinely returns the same answer regardless of caller (e.g. a
+/// pure web fetch with no auth) can opt up to `.global` to share
+/// hits across the whole process.
+///
+/// Examples:
+///   - `memory_recall`: `.session` — different sessions have
+///     different memories; never cross-key
+///   - `composio` list (per-tenant API key): `.tenant` — same answer
+///     for any session of the same tenant, but different per tenant
+///   - `web_search` (no auth, no personalization): `.global`
+pub const CacheScope = enum {
+    /// Key includes tenant_user_id + session_id. Most-restrictive
+    /// default. Safe for any session-stateful tool.
+    session,
+    /// Key includes tenant_user_id only (sessions of the same tenant
+    /// share). For per-tenant API key tools where the answer depends
+    /// on tenant identity but not on session.
+    tenant,
+    /// Key is just `(tool_name, args_json)`. Cross-session +
+    /// cross-tenant sharing. Use ONLY for tools that genuinely
+    /// return the same answer regardless of caller (no auth, no
+    /// personalization).
+    global,
+
+    pub fn toSlice(self: CacheScope) []const u8 {
+        return switch (self) {
+            .session => "session",
+            .tenant => "tenant",
+            .global => "global",
+        };
+    }
+};
+
 /// Structured metadata for a single tool, resolved at compile time or runtime.
 pub const ToolMetadata = struct {
     name: []const u8,
@@ -109,6 +150,13 @@ pub const ToolMetadata = struct {
     /// 30s for web_search where fresh results matter. 0 disables
     /// caching effectively (entry expires immediately).
     cache_ttl_secs: u32 = 0,
+    /// **D1.14 cross-session safety** — what context the dispatcher
+    /// folds into the cache key alongside `(tool_name, args_json)`.
+    /// Default `.session` is the most-restrictive (cache hits never
+    /// cross sessions / users / tenants). See `CacheScope` doc for
+    /// when to opt up to `.tenant` or `.global`. Ignored when
+    /// `flags.cacheable` is false.
+    cache_scope: CacheScope = .session,
 
     /// Create a conservative metadata entry for an unknown tool name.
     /// Used as fallback when `lookupMetadata()` returns null.
