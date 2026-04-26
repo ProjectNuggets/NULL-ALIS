@@ -3844,8 +3844,17 @@ pub const Agent = struct {
                         ctx.flushValidatedReply(audio_reply);
                     }
                     self.allocator.free(final_text);
-                    spawned_task_ids_transferred = true;
+                    // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+                    // toOwnedSlice succeeds, not before. On success the
+                    // accumulator items[] is empty (toOwnedSlice transferred
+                    // ownership); on failure items[] still owns the duped
+                    // task_id strings — we MUST leave transferred=false so
+                    // the defer cleanup frees them. Pre-fix the
+                    // `transferred = true` line ran before the catch, so
+                    // an OOM at toOwnedSlice would skip cleanup AND return
+                    // empty IDs — leaking every duped string.
                     const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+                    spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
                     return TurnOutcome{
                         .text = audio_reply,
                         .tool_only_turn = false,
@@ -3856,8 +3865,11 @@ pub const Agent = struct {
                 if (stream_timing_ctx) |*ctx| {
                     ctx.flushValidatedReply(final_text);
                 }
-                spawned_task_ids_transferred = true;
+                // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+                // toOwnedSlice succeeds. See the longer comment at the audio_reply
+                // path. Pre-fix would leak duped task_id strings on OOM.
                 const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+                spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
                 return TurnOutcome{
                     .text = final_text,
                     .tool_only_turn = (final_text.len == 0 and turn_tool_calls_total > 0),
@@ -4018,8 +4030,11 @@ pub const Agent = struct {
                 });
 
                 self.freeResponseFields(&response);
-                spawned_task_ids_transferred = true;
+                // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+                // toOwnedSlice succeeds. See the longer comment at the audio_reply
+                // path. Pre-fix would leak duped task_id strings on OOM.
                 const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+                spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
                 return TurnOutcome{
                     .text = approval_text,
                     .spawned_task_ids = ids,
@@ -4158,8 +4173,10 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
-            spawned_task_ids_transferred = true;
+            // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+            // toOwnedSlice succeeds. See longer comment at the audio_reply path.
             const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+            spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
             return TurnOutcome{
                 .text = fallback,
                 .spawned_task_ids = ids,
@@ -4209,8 +4226,10 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
-            spawned_task_ids_transferred = true;
+            // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+            // toOwnedSlice succeeds. See longer comment at the audio_reply path.
             const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+            spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
             return TurnOutcome{
                 .text = fallback,
                 .spawned_task_ids = ids,
@@ -4261,8 +4280,10 @@ pub const Agent = struct {
             total_turn_ms,
         });
 
-        spawned_task_ids_transferred = true;
+        // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+        // toOwnedSlice succeeds. See longer comment at the audio_reply path.
         const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+        spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
         return TurnOutcome{
             .text = prefixed,
             .spawned_task_ids = ids,
