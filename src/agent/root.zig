@@ -1966,12 +1966,37 @@ pub const Agent = struct {
             // then put successful results into the cache with the
             // metadata's TTL. Mutating tools are statically prevented
             // from being cacheable via ToolFlags.validate.
+            //
+            // **D1.14 cross-session-safety fix (2026-04-26):** the
+            // cache key now includes a scope string built from
+            // metadata.cache_scope + agent context. Default scope
+            // `.session` folds in tenant_user_id + memory_session_id
+            // so a session-scoped tool (memory_recall) cannot leak
+            // results across sessions. Pre-fix the key was just
+            // (tool_name, args_json) — would have leaked on first
+            // opt-in. Caught in self-review before any tool was
+            // flagged cacheable; no live data exposure.
             const cache_meta = self.metadataForToolCall(call);
+            var cache_scope_buf: [256]u8 = undefined;
+            const cache_scope: []const u8 = blk_scope: {
+                if (!cache_meta.flags.cacheable) break :blk_scope "";
+                const tenant_ctx = tools_mod.getTenantContext();
+                break :blk_scope switch (cache_meta.cache_scope) {
+                    .global => "global",
+                    .tenant => std.fmt.bufPrint(&cache_scope_buf, "tenant:{s}", .{
+                        tenant_ctx.user_id orelse "anon",
+                    }) catch "tenant:overflow",
+                    .session => std.fmt.bufPrint(&cache_scope_buf, "session:{s}:{s}", .{
+                        tenant_ctx.user_id orelse "anon",
+                        self.memory_session_id orelse "default",
+                    }) catch "session:overflow",
+                };
+            };
             var cache_hit_used: bool = false;
             const tool_timer = std.time.milliTimestamp();
             const result = blk: {
                 if (cache_meta.flags.cacheable) {
-                    if (result_cache_mod.global.get(tool_allocator, call.name, call.arguments_json)) |hit| {
+                    if (result_cache_mod.global.get(tool_allocator, cache_scope, call.name, call.arguments_json)) |hit| {
                         cache_hit_used = true;
                         break :blk dispatcher.ToolExecutionResult{
                             .name = try tool_allocator.dupe(u8, call.name),
@@ -1989,7 +2014,7 @@ pub const Agent = struct {
             // miss + cacheable. Failures are NOT cached (a transient
             // 500 from web_search shouldn't pollute future calls).
             if (!cache_hit_used and cache_meta.flags.cacheable and result.success and cache_meta.cache_ttl_secs > 0) {
-                result_cache_mod.global.put(call.name, call.arguments_json, result.output, result.success, cache_meta.cache_ttl_secs) catch |err| {
+                result_cache_mod.global.put(cache_scope, call.name, call.arguments_json, result.output, result.success, cache_meta.cache_ttl_secs) catch |err| {
                     log.warn("D1.14.cache_put_failed tool={s} err={s}", .{ call.name, @errorName(err) });
                 };
             }
@@ -3819,8 +3844,17 @@ pub const Agent = struct {
                         ctx.flushValidatedReply(audio_reply);
                     }
                     self.allocator.free(final_text);
-                    spawned_task_ids_transferred = true;
+                    // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+                    // toOwnedSlice succeeds, not before. On success the
+                    // accumulator items[] is empty (toOwnedSlice transferred
+                    // ownership); on failure items[] still owns the duped
+                    // task_id strings — we MUST leave transferred=false so
+                    // the defer cleanup frees them. Pre-fix the
+                    // `transferred = true` line ran before the catch, so
+                    // an OOM at toOwnedSlice would skip cleanup AND return
+                    // empty IDs — leaking every duped string.
                     const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+                    spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
                     return TurnOutcome{
                         .text = audio_reply,
                         .tool_only_turn = false,
@@ -3831,8 +3865,11 @@ pub const Agent = struct {
                 if (stream_timing_ctx) |*ctx| {
                     ctx.flushValidatedReply(final_text);
                 }
-                spawned_task_ids_transferred = true;
+                // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+                // toOwnedSlice succeeds. See the longer comment at the audio_reply
+                // path. Pre-fix would leak duped task_id strings on OOM.
                 const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+                spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
                 return TurnOutcome{
                     .text = final_text,
                     .tool_only_turn = (final_text.len == 0 and turn_tool_calls_total > 0),
@@ -3993,8 +4030,11 @@ pub const Agent = struct {
                 });
 
                 self.freeResponseFields(&response);
-                spawned_task_ids_transferred = true;
+                // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+                // toOwnedSlice succeeds. See the longer comment at the audio_reply
+                // path. Pre-fix would leak duped task_id strings on OOM.
                 const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+                spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
                 return TurnOutcome{
                     .text = approval_text,
                     .spawned_task_ids = ids,
@@ -4133,8 +4173,10 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
-            spawned_task_ids_transferred = true;
+            // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+            // toOwnedSlice succeeds. See longer comment at the audio_reply path.
             const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+            spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
             return TurnOutcome{
                 .text = fallback,
                 .spawned_task_ids = ids,
@@ -4184,8 +4226,10 @@ pub const Agent = struct {
                 try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
-            spawned_task_ids_transferred = true;
+            // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+            // toOwnedSlice succeeds. See longer comment at the audio_reply path.
             const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+            spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
             return TurnOutcome{
                 .text = fallback,
                 .spawned_task_ids = ids,
@@ -4236,8 +4280,10 @@ pub const Agent = struct {
             total_turn_ms,
         });
 
-        spawned_task_ids_transferred = true;
+        // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
+        // toOwnedSlice succeeds. See longer comment at the audio_reply path.
         const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
+        spawned_task_ids_transferred = (spawned_task_ids_acc.items.len == 0);
         return TurnOutcome{
             .text = prefixed,
             .spawned_task_ids = ids,

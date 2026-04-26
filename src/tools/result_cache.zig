@@ -15,10 +15,17 @@
 //!     caller's allocator so the returned slice rides the turn
 //!     lifetime.
 //!
-//! **Key shape:** `tool_name + "\x00" + args_json_hash_hex`. Args are
-//! hashed via Wyhash for collision resistance + bounded key length
-//! (the raw args JSON could be arbitrarily large; the hash is 16 hex
-//! chars).
+//! **Key shape (D1.14 cross-session-safety fix 2026-04-26):** the key
+//! folds in a `scope` string built by the dispatcher from
+//! `ToolMetadata.cache_scope` + agent context (tenant_user_id,
+//! session_id). Default scope is `.session` — most-restrictive — so
+//! opt-in CANNOT accidentally leak results across users / sessions /
+//! tenants. Scope-aware key shape:
+//!     `scope + "\x00" + tool_name + "\x00" + wyhash64_hex(args_json)`
+//! Pre-fix the key was `tool_name + "\x00" + wyhash64_hex(args_json)`,
+//! which would have leaked session-scoped tools (memory_recall,
+//! anything tenant-keyed) across sessions on first opt-in. Caught by
+//! self-review before any tool was flagged cacheable.
 //!
 //! **Eviction:** simple "earliest expiry wins" — the entry with the
 //! oldest `expires_at_ms` is evicted when all 128 slots are full.
@@ -54,19 +61,25 @@ pub const ToolResultCache = struct {
     /// init step. Tests swap via `setStorageAllocatorForTest`.
     storage_allocator: std.mem.Allocator = std.heap.page_allocator,
 
-    /// Build the composite cache key for `(tool_name, args_json)`.
-    /// Caller owns the returned slice. Fixed-length (tool_name + null
-    /// separator + 16 hex chars of Wyhash-64).
-    pub fn buildKey(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) ![]u8 {
+    /// **D1.14 cross-session-safety fix.** Build the composite cache
+    /// key for `(scope, tool_name, args_json)`. The `scope` parameter
+    /// is a caller-built string (typically `"session:<tenant>:<sid>"`,
+    /// `"tenant:<id>"`, or `"global"`) derived from
+    /// `ToolMetadata.cache_scope` + agent context. Pre-fix the key
+    /// excluded scope, which would have leaked session-scoped tools
+    /// across sessions on first opt-in.
+    /// Caller owns the returned slice. Length =
+    /// `scope.len + 1 + tool_name.len + 1 + 16 hex chars of Wyhash-64`.
+    pub fn buildKey(allocator: std.mem.Allocator, scope: []const u8, tool_name: []const u8, args_json: []const u8) ![]u8 {
         const hash = std.hash.Wyhash.hash(0, args_json);
-        return std.fmt.allocPrint(allocator, "{s}\x00{x:0>16}", .{ tool_name, hash });
+        return std.fmt.allocPrint(allocator, "{s}\x00{s}\x00{x:0>16}", .{ scope, tool_name, hash });
     }
 
-    /// Return a fresh copy of the cached output for `(tool_name,
-    /// args_json)`, or null on miss/expiry. Caller owns the returned
-    /// slice and must free with `caller_allocator`.
-    pub fn get(self: *ToolResultCache, caller_allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) ?Hit {
-        const key = buildKey(caller_allocator, tool_name, args_json) catch return null;
+    /// Return a fresh copy of the cached output for `(scope,
+    /// tool_name, args_json)`, or null on miss/expiry. Caller owns
+    /// the returned slice and must free with `caller_allocator`.
+    pub fn get(self: *ToolResultCache, caller_allocator: std.mem.Allocator, scope: []const u8, tool_name: []const u8, args_json: []const u8) ?Hit {
+        const key = buildKey(caller_allocator, scope, tool_name, args_json) catch return null;
         defer caller_allocator.free(key);
 
         self.mutex.lock();
@@ -83,15 +96,15 @@ pub const ToolResultCache = struct {
         return null;
     }
 
-    /// Store `output` for `(tool_name, args_json)` with `ttl_secs`
-    /// time-to-live. Both inputs are copied into `self.storage_allocator`;
-    /// the caller may free its own copies as soon as this returns.
-    /// On collision the existing entry is updated; otherwise the
-    /// first empty slot is filled, or the entry with the earliest
-    /// expiry is evicted.
-    pub fn put(self: *ToolResultCache, tool_name: []const u8, args_json: []const u8, output: []const u8, success: bool, ttl_secs: u32) !void {
+    /// Store `output` for `(scope, tool_name, args_json)` with
+    /// `ttl_secs` time-to-live. Inputs are copied into
+    /// `self.storage_allocator`; the caller may free its own copies as
+    /// soon as this returns. On collision the existing entry is
+    /// updated; otherwise the first empty slot is filled, or the
+    /// entry with the earliest expiry is evicted.
+    pub fn put(self: *ToolResultCache, scope: []const u8, tool_name: []const u8, args_json: []const u8, output: []const u8, success: bool, ttl_secs: u32) !void {
         const a = self.storage_allocator;
-        const key = try buildKey(a, tool_name, args_json);
+        const key = try buildKey(a, scope, tool_name, args_json);
         // On any failure beyond this point, free the key.
         errdefer a.free(key);
 
@@ -179,7 +192,7 @@ pub const ToolResultCache = struct {
 /// single cache to maximize hit rate across sessions / channels.
 pub var global: ToolResultCache = .{};
 
-test "ToolResultCache put + get roundtrip" {
+test "ToolResultCache put + get roundtrip (scoped)" {
     global.resetForTest();
     global.setStorageAllocatorForTest(std.testing.allocator);
     defer {
@@ -187,8 +200,8 @@ test "ToolResultCache put + get roundtrip" {
         global.setStorageAllocatorForTest(std.heap.page_allocator);
     }
 
-    try global.put("web_search", "{\"q\":\"zig\"}", "result-1", true, 60);
-    const hit = global.get(std.testing.allocator, "web_search", "{\"q\":\"zig\"}") orelse return error.CacheMissUnexpected;
+    try global.put("global", "web_search", "{\"q\":\"zig\"}", "result-1", true, 60);
+    const hit = global.get(std.testing.allocator, "global", "web_search", "{\"q\":\"zig\"}") orelse return error.CacheMissUnexpected;
     defer std.testing.allocator.free(hit.output);
     try std.testing.expectEqualStrings("result-1", hit.output);
     try std.testing.expect(hit.success);
@@ -202,8 +215,8 @@ test "ToolResultCache miss on different args" {
         global.setStorageAllocatorForTest(std.heap.page_allocator);
     }
 
-    try global.put("web_search", "{\"q\":\"zig\"}", "result-1", true, 60);
-    try std.testing.expect(global.get(std.testing.allocator, "web_search", "{\"q\":\"rust\"}") == null);
+    try global.put("global", "web_search", "{\"q\":\"zig\"}", "result-1", true, 60);
+    try std.testing.expect(global.get(std.testing.allocator, "global", "web_search", "{\"q\":\"rust\"}") == null);
 }
 
 test "ToolResultCache miss on different tool name" {
@@ -214,13 +227,11 @@ test "ToolResultCache miss on different tool name" {
         global.setStorageAllocatorForTest(std.heap.page_allocator);
     }
 
-    try global.put("web_search", "{\"q\":\"zig\"}", "result-1", true, 60);
-    try std.testing.expect(global.get(std.testing.allocator, "memory_recall", "{\"q\":\"zig\"}") == null);
+    try global.put("global", "web_search", "{\"q\":\"zig\"}", "result-1", true, 60);
+    try std.testing.expect(global.get(std.testing.allocator, "global", "memory_recall", "{\"q\":\"zig\"}") == null);
 }
 
 test "ToolResultCache survives caller allocator death (D1.14 lifetime contract)" {
-    // Same regression-class as PR #32's composio fix. A short-lived
-    // arena puts into the cache; arena dies; later get must still work.
     global.resetForTest();
     global.setStorageAllocatorForTest(std.testing.allocator);
     defer {
@@ -232,15 +243,14 @@ test "ToolResultCache survives caller allocator death (D1.14 lifetime contract)"
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
+        const scope = try arena_alloc.dupe(u8, "global");
         const tool_name = try arena_alloc.dupe(u8, "web_search");
         const args = try arena_alloc.dupe(u8, "{\"q\":\"zig\"}");
         const output = try arena_alloc.dupe(u8, "from-arena-output");
-        try global.put(tool_name, args, output, true, 60);
-        // arena.deinit() frees tool_name/args/output. Cache must
-        // have its own copies.
+        try global.put(scope, tool_name, args, output, true, 60);
     }
 
-    const hit = global.get(std.testing.allocator, "web_search", "{\"q\":\"zig\"}") orelse return error.CacheMissUnexpected;
+    const hit = global.get(std.testing.allocator, "global", "web_search", "{\"q\":\"zig\"}") orelse return error.CacheMissUnexpected;
     defer std.testing.allocator.free(hit.output);
     try std.testing.expectEqualStrings("from-arena-output", hit.output);
 }
@@ -253,9 +263,9 @@ test "ToolResultCache update existing key replaces value" {
         global.setStorageAllocatorForTest(std.heap.page_allocator);
     }
 
-    try global.put("web_search", "{\"q\":\"zig\"}", "v1", true, 60);
-    try global.put("web_search", "{\"q\":\"zig\"}", "v2", true, 60);
-    const hit = global.get(std.testing.allocator, "web_search", "{\"q\":\"zig\"}") orelse return error.CacheMissUnexpected;
+    try global.put("global", "web_search", "{\"q\":\"zig\"}", "v1", true, 60);
+    try global.put("global", "web_search", "{\"q\":\"zig\"}", "v2", true, 60);
+    const hit = global.get(std.testing.allocator, "global", "web_search", "{\"q\":\"zig\"}") orelse return error.CacheMissUnexpected;
     defer std.testing.allocator.free(hit.output);
     try std.testing.expectEqualStrings("v2", hit.output);
 }
@@ -268,9 +278,40 @@ test "ToolResultCache expired entry returns null" {
         global.setStorageAllocatorForTest(std.heap.page_allocator);
     }
 
-    // ttl_secs=0 means "expires this millisecond" — sleep 5ms to
-    // ensure now > expires_at_ms when we check.
-    try global.put("web_search", "{\"q\":\"zig\"}", "result-1", true, 0);
+    try global.put("global", "web_search", "{\"q\":\"zig\"}", "result-1", true, 0);
     std.Thread.sleep(5 * std.time.ns_per_ms);
-    try std.testing.expect(global.get(std.testing.allocator, "web_search", "{\"q\":\"zig\"}") == null);
+    try std.testing.expect(global.get(std.testing.allocator, "global", "web_search", "{\"q\":\"zig\"}") == null);
+}
+
+test "ToolResultCache cross-session isolation regression (D1.14 finding 1 fix)" {
+    // **HIGH severity self-review finding 2026-04-26:** pre-fix the
+    // cache key was just (tool_name, args_json) — a session-scoped
+    // tool like memory_recall would have leaked results across
+    // sessions on first opt-in. This test pins the fix: the same
+    // (tool_name, args_json) under two DIFFERENT scopes must NOT
+    // hit each other.
+    global.resetForTest();
+    global.setStorageAllocatorForTest(std.testing.allocator);
+    defer {
+        global.resetForTest();
+        global.setStorageAllocatorForTest(std.heap.page_allocator);
+    }
+
+    // Session A puts a memory_recall result.
+    try global.put("session:tenant42:sess-aaa", "memory_recall", "{\"q\":\"my preferences\"}", "session-A-memories", true, 60);
+
+    // Session B with same query under a different scope must miss.
+    try std.testing.expect(global.get(std.testing.allocator, "session:tenant42:sess-bbb", "memory_recall", "{\"q\":\"my preferences\"}") == null);
+
+    // Different tenant entirely also misses.
+    try std.testing.expect(global.get(std.testing.allocator, "session:tenant99:sess-aaa", "memory_recall", "{\"q\":\"my preferences\"}") == null);
+
+    // Tenant-scope hit on the same tenant + same query also misses
+    // a session-scope put — different scope strings, different keys.
+    try std.testing.expect(global.get(std.testing.allocator, "tenant:tenant42", "memory_recall", "{\"q\":\"my preferences\"}") == null);
+
+    // Original session A still gets its hit.
+    const hit = global.get(std.testing.allocator, "session:tenant42:sess-aaa", "memory_recall", "{\"q\":\"my preferences\"}") orelse return error.CacheMissUnexpected;
+    defer std.testing.allocator.free(hit.output);
+    try std.testing.expectEqualStrings("session-A-memories", hit.output);
 }
