@@ -81,6 +81,13 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
     .{ .name = "qwen", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
     .{ .name = "dashscope", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
+    // **S15.3 — cosmetic catalog entries.** Qianfan / Baidu use a
+    // 2-step OAuth handshake (POST /oauth/2.0/token → access_token →
+    // include in subsequent calls). The current `compatible.zig`
+    // path uses Bearer-token auth with the API key as the token —
+    // it WILL NOT WORK against api.baidu.cn without a custom auth
+    // adapter. Listed here for catalog completeness; production use
+    // requires implementing the OAuth flow first.
     .{ .name = "qianfan", .url = "https://aip.baidubce.com", .display = "Qianfan" },
     .{ .name = "baidu", .url = "https://aip.baidubce.com", .display = "Qianfan" },
     .{ .name = "doubao", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
@@ -124,6 +131,14 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "qwen-portal", .url = "https://portal.qwen.ai/v1", .display = "Qwen Portal" },
 
     // ── Infrastructure & Cloud ────────────────────────────────────────────
+    // **S15.3 — cosmetic catalog entries.** Amazon Bedrock requires
+    // AWS SigV4 request signing (compute HMAC over canonical
+    // request, attach Authorization header derived from access key +
+    // secret + session token + region + service). The current
+    // `compatible.zig` path uses simple Bearer-token auth and WILL
+    // NOT WORK against bedrock-runtime.amazonaws.com without a
+    // custom auth adapter. Listed here for catalog completeness;
+    // production use requires SigV4 implementation first.
     .{ .name = "bedrock", .url = "https://bedrock-runtime.us-east-1.amazonaws.com", .display = "Amazon Bedrock" },
     .{ .name = "aws-bedrock", .url = "https://bedrock-runtime.us-east-1.amazonaws.com", .display = "Amazon Bedrock" },
     .{ .name = "cloudflare", .url = "https://gateway.ai.cloudflare.com/v1", .display = "Cloudflare AI Gateway" },
@@ -137,6 +152,15 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "ovh", .url = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", .display = "OVHcloud" },
 
     // ── Local Servers ─────────────────────────────────────────────────────
+    //
+    // **S15.3 — local-development-only.** These entries hardcode
+    // `http://localhost:<port>/v1` URLs intended for developers
+    // running a model server on their workstation alongside
+    // nullalis. They WILL NOT WORK in cell-pod / k8s production
+    // deployments (cell pods can't reach the operator's machine).
+    // For self-hosted production, override the URL via the env-var
+    // override path (NULLALIS_<PROVIDER>_BASE_URL) or set up your
+    // own service entry on the cluster.
     .{ .name = "lmstudio", .url = "http://localhost:1234/v1", .display = "LM Studio" },
     .{ .name = "lm-studio", .url = "http://localhost:1234/v1", .display = "LM Studio" },
     .{ .name = "vllm", .url = "http://localhost:8000/v1", .display = "vLLM" },
