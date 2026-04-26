@@ -1312,6 +1312,7 @@ pub const Agent = struct {
 
     const reflection_prompt_execute =
         "Reflect on the tool results above and decide your next steps. " ++
+        "**Render the actual result content in your reply** — quote file contents, show command output, surface recalled memory entries, cite search findings. The user does NOT see the <tool_result> blocks above; they see only your reply. A bare acknowledgment like '✅ done' or '✅ FILE WRITE: SUCCESS' without surfacing what the tool actually returned is a failure mode — the user has a log of tool results and will detect the mismatch. See the Response Protocol's Tool Result Synthesis rule for per-tool minimums. " ++
         "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
         "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up. " ++
         "If a tool reports queued/async delivery, state it as queued (not confirmed delivered) unless a later tool confirms delivery.";
