@@ -373,13 +373,15 @@ Goal: schema change is a process; data is recoverable.
 
 Goal: defense in depth.
 
-- [ ] **S11.1** NetworkPolicy between services — default-deny, explicit allow per flow. `cluster/networkpolicies/`. Cite: P4_zaki_infra_ops Q2.
-- [ ] **S11.2** mTLS between services — linkerd or istio service mesh; or mTLS in app layer if sidecar overhead rejected. Cite: P4_zaki_infra_ops Q2.
-- [ ] **S11.3** Sealed-secrets or external-secrets-operator — replace plain k8s Secrets. Cite: P4_zaki_infra_ops Q1.
-- [ ] **S11.4** Documented scheduled secret rotation — at least for provider API keys (Together / Groq / Moonshot / Composio). Quarterly. Cite: P4_zaki_infra_ops Q1.
-- [ ] **S11.5** cert-manager OR document explicit Cloudflare-only decision with risk acceptance. Cite: P4_zaki_infra_ops Q3.
+- [ ] **S11.1** NetworkPolicy between services — default-deny, explicit allow per flow. `cluster/networkpolicies/`. Cite: P4_zaki_infra_ops Q2. **Parked-with-reason** in `docs/sprints/sprint-11.md` — trigger: pentest finding OR pod-compromise drill.
+- [ ] **S11.2** mTLS between services — linkerd or istio service mesh; or mTLS in app layer if sidecar overhead rejected. Cite: P4_zaki_infra_ops Q2. **Parked-with-reason** — trigger: cell-pod flip OR added BFF replica.
+- [ ] **S11.3** Sealed-secrets or external-secrets-operator — replace plain k8s Secrets. Cite: P4_zaki_infra_ops Q1. **Parked-with-reason** — trigger: second committer OR audit requirement.
+- [ ] **S11.4** Documented scheduled secret rotation — at least for provider API keys (Together / Groq / Moonshot / Composio). Quarterly. Cite: P4_zaki_infra_ops Q1. **Parked-with-reason** — trigger: first quarter after S11.3.
+- [ ] **S11.5** cert-manager OR document explicit Cloudflare-only decision with risk acceptance. Cite: P4_zaki_infra_ops Q3. **Parked-with-reason** — trigger: custom domain OR mTLS rollout (S11.2).
 
 **Sprint 11 DoD:** `kubectl exec pod_a -- curl pod_b:unlisted_port` denied. etcd has no plaintext secret contents.
+
+**Sprint 11 — PARKED operator-pending 2026-04-26** — see `docs/sprints/sprint-11.md`. Every item is zaki-infra k8s manifest work; nullalis-side has no code change to ship. Real execution at unpark trigger; this repo's accounting closed.
 
 ---
 
@@ -387,15 +389,17 @@ Goal: defense in depth.
 
 Goal: no SPOFs that kill the service for paying users.
 
-- [ ] **S12.1** Nullalis replicas > 1 after cell-pod flip — staged canary, watch for state races. Cite: P4_zaki_infra_ops Q5.
-- [ ] **S12.2** NFS data-SPOF mitigation — plan: either dual NFS droplet in different AZ with rsync, or migrate to DO Managed Storage (block), or DO Spaces + cache. Decision + impl. Cite: P4_zaki_infra_ops top-gap.
-- [ ] **S12.3** RTO/RPO targets documented + tested (e.g. RTO ≤ 15 min, RPO ≤ 5 min). Cite: P4_zaki_infra_ops Q15.
-- [ ] **S12.4** Multi-region DR plan on paper (runbook), even if not implemented yet. Cite: P4_zaki_infra_ops Q15.
-- [ ] **S12.5** `ResourceQuota` + `PriorityClass` per namespace. Cite: P4_zaki_infra_ops Q6.
-- [ ] **S12.6** ArgoCD `AppProject` scoping — bound repo, cluster, namespace per app. Cite: P4_zaki_infra_ops Q11.
-- [ ] **S12.7** `PodDisruptionBudget` for every service that has > 1 replica (zaki-api, zaki-web, zaki-website, pgbouncer, nullalis-post-S12.1). Cite: P4_zaki_infra_ops Q8.
+- [ ] **S12.1** Nullalis replicas > 1 after cell-pod flip — staged canary, watch for state races. Cite: P4_zaki_infra_ops Q5. **Parked-with-reason** in `docs/sprints/sprint-12.md` — trigger: cell-pod architecture flip (currently deferred per Nova directive) AND first paying user with uptime expectations.
+- [ ] **S12.2** NFS data-SPOF mitigation — plan: either dual NFS droplet in different AZ with rsync, or migrate to DO Managed Storage (block), or DO Spaces + cache. Decision + impl. Cite: P4_zaki_infra_ops top-gap. **Parked-with-reason** — trigger: NFS hardware failure simulation OR first paying user.
+- [ ] **S12.3** RTO/RPO targets documented + tested (e.g. RTO ≤ 15 min, RPO ≤ 5 min). Cite: P4_zaki_infra_ops Q15. **Parked-with-reason** — trigger: customer SLA conversation OR first paying user.
+- [ ] **S12.4** Multi-region DR plan on paper (runbook), even if not implemented yet. Cite: P4_zaki_infra_ops Q15. **Parked-with-reason** — trigger: customer compliance questionnaire OR EU-region paying user.
+- [ ] **S12.5** `ResourceQuota` + `PriorityClass` per namespace. Cite: P4_zaki_infra_ops Q6. **Parked-with-reason** — trigger: multi-tenant cell-pod flip OR resource-exhaustion incident.
+- [ ] **S12.6** ArgoCD `AppProject` scoping — bound repo, cluster, namespace per app. Cite: P4_zaki_infra_ops Q11. **Parked-with-reason** — trigger: second cluster OR audit requirement.
+- [ ] **S12.7** `PodDisruptionBudget` for every service that has > 1 replica (zaki-api, zaki-web, zaki-website, pgbouncer, nullalis-post-S12.1). Cite: P4_zaki_infra_ops Q8. **Parked-with-reason** — trigger: after S12.1 ships AND first node-drain incident.
 
 **Sprint 12 DoD:** simulated node drain doesn't kill service. RTO clocked ≤ target on restore drill.
+
+**Sprint 12 — PARKED operator-pending 2026-04-26** — see `docs/sprints/sprint-12.md`. Keystone item S12.1 blocks on cell-pod flip (deferred per Nova directive). All items zaki-infra-side. Real execution at unpark; this repo's accounting closed.
 
 ---
 
@@ -403,15 +407,17 @@ Goal: no SPOFs that kill the service for paying users.
 
 Goal: operator can see, not just the app.
 
-- [ ] **S13.1** Prometheus deployed in cluster (via kube-prometheus-stack Helm). Cite: P4_zaki_infra_ops Q12.
-- [ ] **S13.2** Loki deployed for log aggregation. Cite: P4_zaki_infra_ops Q12.
-- [ ] **S13.3** OTel collector deployed; wire nullalis `OtelObserver` OTLP endpoint to it. Cite: P4_telemetry + P4_zaki_infra_ops Q12.
-- [ ] **S13.4** AlertManager rules — at least: gateway down, daemon not running, postgres unreachable, disk > 85%, error rate > threshold, 5xx spike, OOMKilled. Cite: P4_zaki_infra_ops Q13.
-- [ ] **S13.5** Alert routing — PagerDuty / Slack / email depending on severity. Cite: P4_zaki_infra_ops Q13.
-- [ ] **S13.6** Grafana dashboards — gateway, nullalis runtime, daemon, postgres, per-tenant. Check in dashboard JSON to zaki-infra. Cite: P4_zaki_infra_ops Q12.
-- [ ] **S13.7** Incident runbook per SPOF — what to do at 3am for each failure mode. Cite: P4_zaki_infra_ops Q14.
+- [ ] **S13.1** Prometheus deployed in cluster (via kube-prometheus-stack Helm). Cite: P4_zaki_infra_ops Q12. **Parked-with-reason** in `docs/sprints/sprint-13.md` — trigger: per-tenant token-burn visualization need OR first metric-replay incident.
+- [ ] **S13.2** Loki deployed for log aggregation. Cite: P4_zaki_infra_ops Q12. **Parked-with-reason** — trigger: cross-pod grep need OR multi-pod log correlation incident.
+- [ ] **S13.3** OTel collector deployed; wire nullalis `OtelObserver` OTLP endpoint to it. Cite: P4_telemetry + P4_zaki_infra_ops Q12. **Parked-with-reason** — trigger: distributed tracing need across gateway → daemon → tools. **Note: nullalis-side OtelObserver already shipped via S1.5; just point at a collector.**
+- [ ] **S13.4** AlertManager rules — at least: gateway down, daemon not running, postgres unreachable, disk > 85%, error rate > threshold, 5xx spike, OOMKilled. Cite: P4_zaki_infra_ops Q13. **Parked-with-reason** — trigger: after S13.1 + first paging-worthy incident OR pre-launch readiness.
+- [ ] **S13.5** Alert routing — PagerDuty / Slack / email depending on severity. Cite: P4_zaki_infra_ops Q13. **Parked-with-reason** — trigger: after S13.4 + on-call rotation defined (S14.8).
+- [ ] **S13.6** Grafana dashboards — gateway, nullalis runtime, daemon, postgres, per-tenant. Check in dashboard JSON to zaki-infra. Cite: P4_zaki_infra_ops Q12. **Parked-with-reason** — trigger: after S13.1 + first multi-tenant traffic.
+- [ ] **S13.7** Incident runbook per SPOF — what to do at 3am for each failure mode. Cite: P4_zaki_infra_ops Q14. **Parked-with-reason** — trigger: first on-call rotation OR pre-launch.
 
 **Sprint 13 DoD:** forced test failure pages to Slack. Grafana shows per-tenant token burn.
+
+**Sprint 13 — PARKED operator-pending 2026-04-26** — see `docs/sprints/sprint-13.md`. nullalis-side observability spine already shipped (Sentry S1.1-S1.5, JSON logs, OtelObserver, distinct ObserverEvent variants D1.4 + S5.8). S13 is "stand up the receivers" — pure zaki-infra ops work. Real execution at unpark; this repo's accounting closed.
 
 ---
 
@@ -438,16 +444,18 @@ Goal: things not solved by editing files.
 
 Goal: close items surfaced on final pressure-test.
 
-- [ ] **S16.1** Load test harness — k6 or vegeta scripts for gateway chat-stream, webhook inbound, scheduler tick. Target: documented pass at 100 concurrent users, 500, 1000. Commit results to `.spike/load/`.
-- [ ] **S16.2** SLO definitions — publish `docs/SLO.md`: uptime target, p50 / p95 / p99 latency targets, error budget math. Tie to AlertManager thresholds (S13.4).
-- [ ] **S16.3** Public status page — deploy statuspage.io or Cachet; wire to AlertManager. Embed on chatzaki.com.
-- [ ] **S16.4** Transactional email — Resend or SendGrid. Billing receipt on Stripe webhook (BFF side), welcome email on signup, password reset.
-- [ ] **S16.5** Legal docs — Terms of Service, Privacy Policy, Acceptable Use Policy live at chatzaki.com/legal/*. Consent checkbox on signup, re-consent on material changes.
-- [ ] **S16.6** Dependency SHA pinning — `build.zig.zon` entries for sqlite3 and sentry_zig use hash + URL, not moving ref. Document update cadence.
-- [ ] **S16.7** Frontend audit — spawn a mapper pass on zaki-web React side: error boundaries, a11y (WCAG AA minimum), SSR/hydration, offline/reconnect UX, accessibility on forms, keyboard nav.
-- [ ] **S16.8** Typ custom-patches inventory — pull the running `:latest` image, diff vs upstream AnythingLLM, document every patch in `zaki-infra/charts/typ/PATCHES.md`. Then rebuild on pinned SHA. Only then flip S3.7.
+- [ ] **S16.1** Load test harness — k6 or vegeta scripts for gateway chat-stream, webhook inbound, scheduler tick. Target: documented pass at 100 concurrent users, 500, 1000. Commit results to `.spike/load/`. **Operator-pending** in `docs/sprints/sprint-16.md` — trigger: first paying customer projection OR pre-launch.
+- [ ] **S16.2** SLO definitions — publish `docs/SLO.md`: uptime target, p50 / p95 / p99 latency targets, error budget math. Tie to AlertManager thresholds (S13.4). **Operator-pending** — trigger: customer SLA conversation OR pre-launch.
+- [ ] **S16.3** Public status page — deploy statuspage.io or Cachet; wire to AlertManager. Embed on chatzaki.com. **Operator-pending** — trigger: first paying customer OR pre-launch.
+- [ ] **S16.4** Transactional email — Resend or SendGrid. Billing receipt on Stripe webhook (BFF side), welcome email on signup, password reset. **Operator-pending — cross-repo zaki-prod** — trigger: first Stripe billing event OR signup-flow completion.
+- [ ] **S16.5** Legal docs — Terms of Service, Privacy Policy, Acceptable Use Policy live at chatzaki.com/legal/*. Consent checkbox on signup, re-consent on material changes. **Operator-pending — needs lawyer** — trigger: any paying user OR EU user OR external launch.
+- [x] **S16.6** Dependency SHA pinning — `build.zig.zon` entries for sqlite3 and sentry_zig use hash + URL, not moving ref. Document update cadence. **Structurally shipped via S14.10** (`docs/audits/s14.10-license-audit.md`) — both deps hash-pinned via Zig native `.hash`; supply chain hash mismatch fails build. Update cadence: review on every Zig minor bump.
+- [ ] **S16.7** Frontend audit — spawn a mapper pass on zaki-web React side: error boundaries, a11y (WCAG AA minimum), SSR/hydration, offline/reconnect UX, accessibility on forms, keyboard nav. **Operator-pending — cross-repo zaki-prod** — trigger: pre-launch OR a11y compliance requirement.
+- [ ] **S16.8** Typ custom-patches inventory — pull the running `:latest` image, diff vs upstream AnythingLLM, document every patch in `zaki-infra/charts/typ/PATCHES.md`. Then rebuild on pinned SHA. Only then flip S3.7. **Operator-pending — cross-repo zaki-infra** — trigger: typ image SHA-pinning per S3.7 OR upstream AnythingLLM bump.
 
 **Sprint 16 DoD:** load-test numbers in .spike/load/README.md. SLO.md published. status page green. billing receipt arrives on test subscription. TOS/Privacy consented on signup. 2 zon deps SHA-pinned. zaki-web audit doc at internals/P5_zaki_web.md. typ PATCHES.md committed.
+
+**Sprint 16 — MIXED status 2026-04-26** — see `docs/sprints/sprint-16.md`. S16.6 structurally shipped via S14.10 audit. S16.1/S16.2 are nullalis-doable solo (deferred for Nova prioritization). S16.3/S16.4/S16.5/S16.7/S16.8 are operator/cross-repo/lawyer work. This repo's accounting closed; per-item triggers documented.
 
 ---
 
