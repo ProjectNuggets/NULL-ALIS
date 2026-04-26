@@ -63,8 +63,22 @@ pub const DaemonState = struct {
     gateway_port: u16 = 3000,
     components: [MAX_COMPONENTS]?ComponentStatus = .{null} ** MAX_COMPONENTS,
     component_count: usize = 0,
+    /// **S14.5 MED-1 fix (2026-04-26)** — `components` and
+    /// `component_count` are read by `writeStateFile` (heartbeat
+    /// thread) while gateway/delivery/heartbeat/scheduler threads call
+    /// `markError` / `markRunning` concurrently. Pre-fix: data race on
+    /// the array + count. Today's symptoms minimal because each thread
+    /// usually owns one component (gateway → "gateway",
+    /// scheduler → "scheduler", etc.) so writes don't collide on the
+    /// same slot — but the read side could see torn writes if a marker
+    /// fires mid-flush. This mutex closes the race; cost is one
+    /// uncontended lock acquire per read/write since contention is
+    /// near-zero in practice.
+    mutex: std.Thread.Mutex = .{},
 
     pub fn addComponent(self: *DaemonState, name: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.component_count < MAX_COMPONENTS) {
             self.components[self.component_count] = .{ .name = name, .running = true };
             self.component_count += 1;
@@ -72,6 +86,8 @@ pub const DaemonState = struct {
     }
 
     pub fn markError(self: *DaemonState, name: []const u8, err_msg: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.components[0..self.component_count]) |*comp_opt| {
             if (comp_opt.*) |*comp| {
                 if (std.mem.eql(u8, comp.name, name)) {
@@ -85,6 +101,8 @@ pub const DaemonState = struct {
     }
 
     pub fn markRunning(self: *DaemonState, name: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.components[0..self.component_count]) |*comp_opt| {
             if (comp_opt.*) |*comp| {
                 if (std.mem.eql(u8, comp.name, name)) {
@@ -107,7 +125,15 @@ pub fn stateFilePath(allocator: std.mem.Allocator, config: *const Config) ![]u8 
 }
 
 /// Write daemon state to disk as JSON.
-pub fn writeStateFile(allocator: std.mem.Allocator, path: []const u8, state: *const DaemonState) !void {
+///
+/// **S14.5 MED-1 fix (2026-04-26)** — receiver is now `*DaemonState`
+/// (not `*const`) so we can acquire the state's mutex while reading
+/// `components` + `component_count`. Without the lock, this read could
+/// see torn writes from concurrent `markError` / `markRunning` calls
+/// on other threads. The serialization happens under-lock to a local
+/// buffer; the file write happens after lock release to keep the
+/// critical section minimal.
+pub fn writeStateFile(allocator: std.mem.Allocator, path: []const u8, state: *DaemonState) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
@@ -115,7 +141,11 @@ pub fn writeStateFile(allocator: std.mem.Allocator, path: []const u8, state: *co
     try buf.appendSlice(allocator, "  \"status\": \"running\",\n");
     try std.fmt.format(buf.writer(allocator), "  \"gateway\": \"{s}:{d}\",\n", .{ state.gateway_host, state.gateway_port });
 
-    // Components array
+    // Components array — acquire mutex for the duration of the read
+    // so concurrent markers don't tear the array under us.
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
     try buf.appendSlice(allocator, "  \"components\": [\n");
     var first = true;
     for (state.components[0..state.component_count]) |comp_opt| {

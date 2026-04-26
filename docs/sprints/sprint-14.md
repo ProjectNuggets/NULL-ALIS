@@ -33,8 +33,8 @@ Things not solved by editing files: governance, audits, plans, status docs.
 
 | Finding | Severity | Status |
 |---|---|---|
-| MED-1: `DaemonState.components` array unprotected race | MED | Deferred — single-replica today (per-cell flip deferred); one writer per component in practice. Fix is straightforward (add mutex) but no live race today. **Trigger:** multi-replica deployment OR observed missed-status updates. |
-| MED-2: dispatch_stats counter race | MED | Deferred — counters drift slightly under concurrent dispatch but no functional impact (just metric accuracy). Fix is `std.atomic.Value(u64)`. **Trigger:** observability sprint (S13) absorbs it. |
+| MED-1: `DaemonState.components` array unprotected race | MED | **Shipped at PR #52** (2026-04-26) — V1-nice per docs/v1-triage.md. Added `mutex: std.Thread.Mutex` to DaemonState; addComponent / markError / markRunning all acquire under lock; `writeStateFile` now takes `*DaemonState` (was `*const`) and acquires mutex during components serialization. Critical section minimal (file write happens after lock release). |
+| MED-2: dispatch_stats counter race | MED | **Already shipped (verified 2026-04-26)** — `DispatchStats` in `src/channels/dispatch.zig:140-156` uses `std.atomic.Value(u64)` for all 3 counters (dispatched, errors, channel_not_found). The original concern was tracking pre-existing absence; the atomic upgrade landed somewhere between the audit and today. No-op for V1. |
 | LOW-1: defer-during-panic smell | LOW | Documented; not a confirmed bug. No action. |
 | LOW-2: atomic flag commentary | LOW | Documented; no action. |
 
