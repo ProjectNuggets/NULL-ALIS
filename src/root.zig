@@ -23,6 +23,11 @@ pub const util = @import("util.zig");
 pub const platform = @import("platform.zig");
 pub const version = @import("version.zig");
 pub const state = @import("state.zig");
+/// **S10.1** versioned schema-migrations framework. Replaces the
+/// boot-time `for (statements) |s| exec(s)` pattern in
+/// `zaki_state.zig::migrate`. See `src/migrations.zig` header for
+/// the full design rationale + how to add a new migration.
+pub const migrations = @import("migrations.zig");
 pub const status = @import("status.zig");
 pub const onboard = @import("onboard.zig");
 pub const doctor = @import("doctor.zig");
