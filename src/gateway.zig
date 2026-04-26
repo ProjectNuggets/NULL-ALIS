@@ -1401,10 +1401,20 @@ const TenantRuntime = struct {
         task_delivery.* = .{ .ledger = task_ledger, .observer = runtime.observer_multi.observer() };
         runtime.task_delivery = task_delivery;
 
-        // Usage runtime (Phase 2: REQ-015)
+        // Usage runtime (Phase 2: REQ-015 + D5 cost ledger).
+        // D5 (2026-04-26): wire calendar-month JSONL persistence using
+        // the tenant's workspace_dir. Ledger lives at
+        // `{workspace_dir}/state/cost.jsonl` and survives gateway
+        // restart. Falls back to in-memory-only if path init fails
+        // (workspace dir unwriteable, OOM on join, etc.) — session
+        // tracking still works, billing accuracy degrades to
+        // session-scoped only.
         const usage_rt = try allocator.create(usage_runtime_mod.UsageRuntime);
         errdefer allocator.destroy(usage_rt);
-        usage_rt.* = usage_runtime_mod.UsageRuntime.init(allocator);
+        usage_rt.* = usage_runtime_mod.UsageRuntime.initWithCostPersistence(
+            allocator,
+            runtime.config.workspace_dir,
+        ) catch usage_runtime_mod.UsageRuntime.init(allocator);
         runtime.usage_rt = usage_rt;
 
         const builtin_tools = tools_mod.allTools(allocator, runtime.config.workspace_dir, .{
