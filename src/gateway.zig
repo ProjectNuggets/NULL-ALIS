@@ -2985,6 +2985,112 @@ fn validateInternalServiceToken(raw: []const u8, state: *const GatewayState) boo
     );
 }
 
+/// **D9 (2026-04-26)** — extracted from `.entitlements_revoke` switch
+/// arm so the route logic is unit-testable without spinning up a real
+/// HTTP listener. The switch arm calls this function and assigns the
+/// returned status + body to its response variables; the function
+/// itself takes only what it needs (raw request bytes + token policy +
+/// method) so tests don't need a full GatewayState.
+///
+/// The actual entitlement-store mutation (`installEntitlement`) is
+/// called here directly — it's a thin wrapper over a global store and
+/// already has its own tests in `entitlement.zig`. Tests below use
+/// unique user_ids per case to avoid cross-test pollution of the
+/// global store within a single test process.
+pub const EntitlementsRevokeResponse = struct {
+    status: []const u8,
+    body: []const u8,
+};
+
+pub fn handleEntitlementsRevokeRequest(
+    raw: []const u8,
+    internal_service_tokens: []const []const u8,
+    auth_required: bool,
+    method_str: []const u8,
+) EntitlementsRevokeResponse {
+    if (!std.mem.eql(u8, method_str, "POST")) {
+        return .{
+            .status = "405 Method Not Allowed",
+            .body = "{\"error\":\"method not allowed\"}",
+        };
+    }
+    if (!validateInternalServiceTokenWithPolicy(raw, internal_service_tokens, auth_required)) {
+        return .{
+            .status = "401 Unauthorized",
+            .body = "{\"error\":\"unauthorized\"}",
+        };
+    }
+    const body_opt = extractBody(raw);
+    const body = body_opt orelse "";
+    const user_id = jsonStringField(body, "user_id");
+    if (user_id == null) {
+        return .{
+            .status = "400 Bad Request",
+            .body = "{\"error\":\"missing user_id\"}",
+        };
+    }
+    const plan_tier = jsonStringField(body, "plan_tier");
+    const status_raw = jsonStringField(body, "status");
+    const period_end = jsonIntField(body, "period_end_unix");
+    const ent = entitlement_mod.Entitlement.fromProvision(plan_tier, status_raw, period_end);
+    if (entitlement_mod.installEntitlement(user_id.?, ent)) {
+        log.info("entitlement.revoke user={s} tier={s} status={s}", .{
+            user_id.?,
+            ent.tier.toSlice(),
+            ent.status.toSlice(),
+        });
+        return .{
+            .status = "200 OK",
+            .body = "{\"status\":\"ok\"}",
+        };
+    } else |_| {
+        return .{
+            .status = "500 Internal Server Error",
+            .body = "{\"error\":\"entitlement_store_unavailable\"}",
+        };
+    }
+}
+
+test "D9 — entitlements_revoke rejects non-POST method" {
+    const raw = "GET /internal/entitlements/revoke HTTP/1.1\r\nX-Internal-Token: tok\r\n\r\n";
+    const tokens = [_][]const u8{"tok"};
+    const r = handleEntitlementsRevokeRequest(raw, &tokens, true, "GET");
+    try std.testing.expectEqualStrings("405 Method Not Allowed", r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "method not allowed") != null);
+}
+
+test "D9 — entitlements_revoke rejects missing token when auth required" {
+    const raw = "POST /internal/entitlements/revoke HTTP/1.1\r\n\r\n{\"user_id\":\"d9_test_no_tok\"}";
+    const tokens = [_][]const u8{"expected-tok"};
+    const r = handleEntitlementsRevokeRequest(raw, &tokens, true, "POST");
+    try std.testing.expectEqualStrings("401 Unauthorized", r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "unauthorized") != null);
+}
+
+test "D9 — entitlements_revoke rejects missing user_id" {
+    const raw = "POST /internal/entitlements/revoke HTTP/1.1\r\nX-Internal-Token: tok\r\n\r\n{\"plan_tier\":\"pro\"}";
+    const tokens = [_][]const u8{"tok"};
+    const r = handleEntitlementsRevokeRequest(raw, &tokens, true, "POST");
+    try std.testing.expectEqualStrings("400 Bad Request", r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "missing user_id") != null);
+}
+
+test "D9 — entitlements_revoke happy path installs entitlement" {
+    // Pair useDefaultResolver with resetDefaultStore + clearResolver
+    // so the test cleans up the global state it touched (entitlement
+    // module exposes resetDefaultStore specifically for this pattern;
+    // see entitlement.zig:305-317).
+    entitlement_mod.resetDefaultStore();
+    defer entitlement_mod.resetDefaultStore();
+    entitlement_mod.useDefaultResolver(std.testing.allocator);
+    defer entitlement_mod.clearResolver();
+    const raw = "POST /internal/entitlements/revoke HTTP/1.1\r\nX-Internal-Token: tok\r\nContent-Length: 79\r\n\r\n{\"user_id\":\"d9_test_happy\",\"plan_tier\":\"pro\",\"status\":\"active\",\"period_end_unix\":99999}";
+    const tokens = [_][]const u8{"tok"};
+    const r = handleEntitlementsRevokeRequest(raw, &tokens, true, "POST");
+    try std.testing.expectEqualStrings("200 OK", r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "ok") != null);
+}
+
 fn extractZakiUserId(raw: []const u8) ?[]const u8 {
     const hdr = extractHeader(raw, "X-Zaki-User-Id") orelse return null;
     const user_id = std.mem.trim(u8, hdr, " \t\r\n");
@@ -13837,37 +13943,18 @@ fn handleAcceptedConnection(
         // (S2.4) / scheduler tick (S2.5) / chat-stream entry (S2.3)
         // reads the fresh value and blocks appropriately.
         .entitlements_revoke => {
-            if (!std.mem.eql(u8, method_str, "POST")) {
-                response_status = "405 Method Not Allowed";
-                response_body = "{\"error\":\"method not allowed\"}";
-            } else if (!validateInternalServiceToken(raw, state)) {
-                response_status = "401 Unauthorized";
-                response_body = "{\"error\":\"unauthorized\"}";
-            } else {
-                const body_opt = extractBody(raw);
-                const body = body_opt orelse "";
-                const user_id = jsonStringField(body, "user_id");
-                if (user_id == null) {
-                    response_status = "400 Bad Request";
-                    response_body = "{\"error\":\"missing user_id\"}";
-                } else {
-                    const plan_tier = jsonStringField(body, "plan_tier");
-                    const status_raw = jsonStringField(body, "status");
-                    const period_end = jsonIntField(body, "period_end_unix");
-                    const ent = entitlement_mod.Entitlement.fromProvision(plan_tier, status_raw, period_end);
-                    if (entitlement_mod.installEntitlement(user_id.?, ent)) {
-                        log.info("entitlement.revoke user={s} tier={s} status={s}", .{
-                            user_id.?,
-                            ent.tier.toSlice(),
-                            ent.status.toSlice(),
-                        });
-                        response_body = "{\"status\":\"ok\"}";
-                    } else |_| {
-                        response_status = "500 Internal Server Error";
-                        response_body = "{\"error\":\"entitlement_store_unavailable\"}";
-                    }
-                }
-            }
+            // D9 (2026-04-26) — extracted into testable function. The
+            // switch arm now just composes the route response from the
+            // structured result. See handleEntitlementsRevokeRequest
+            // below + tests in the entitlements_revoke test cluster.
+            const route_response = handleEntitlementsRevokeRequest(
+                raw,
+                state.internal_service_tokens,
+                state.internal_auth_required,
+                method_str,
+            );
+            response_status = route_response.status;
+            response_body = route_response.body;
         },
     } else {
         response_status = "404 Not Found";
