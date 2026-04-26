@@ -76,7 +76,13 @@ pub const SCHEMA_MIGRATIONS_DDL =
 ///       .name = "{NNNN}_descriptive_name",
 ///       .sql = @embedFile("migrations/{NNNN}_descriptive_name.sql"),
 ///   },
-pub const MIGRATIONS = [_]Migration{};
+pub const MIGRATIONS = [_]Migration{
+    .{
+        .version = 1,
+        .name = "0001_initial_schema",
+        .sql = @embedFile("migrations/0001_initial_schema.sql"),
+    },
+};
 
 /// Trait the runner's caller must satisfy: a method that takes a
 /// `{schema}`-templated SQL string + a callback to be invoked for
@@ -347,17 +353,22 @@ test "migrations.runWith failure inside a transactional migration triggers rollb
     try std.testing.expect(!tr.in_tx);
 }
 
-test "migrations.run with empty production MIGRATIONS only runs the tracker DDL" {
+test "migrations.run with production MIGRATIONS executes tracker + each registered migration" {
     var tr = TestRunner{ .allocator = std.testing.allocator };
     defer tr.deinit();
 
     try run(tr.context());
 
-    // S10.1 ships MIGRATIONS = []; only the schema_migrations table
-    // creation should fire. S10.2 will populate MIGRATIONS with the
-    // initial schema and this test will then assert ≥ 2 queries.
-    try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), tr.applied.count());
+    // S10.2 populated MIGRATIONS with 0001_initial_schema. The
+    // tracker DDL fires once, then each registered migration's
+    // body fires. Production MIGRATIONS may grow over time; assert
+    // the lower bound (tracker + at least one migration) rather
+    // than a fixed count so adding 0002+ doesn't break this test.
+    try std.testing.expect(tr.queries.items.len >= 1 + MIGRATIONS.len);
+    try std.testing.expectEqual(@as(usize, MIGRATIONS.len), tr.applied.count());
+    for (MIGRATIONS) |m| {
+        try std.testing.expect(tr.applied.contains(m.version));
+    }
 }
 
 test "MIGRATIONS array is in strict ascending version order with no gaps" {
