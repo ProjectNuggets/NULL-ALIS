@@ -381,3 +381,39 @@ test "MIGRATIONS array is in strict ascending version order with no gaps" {
         prev = m.version;
     }
 }
+
+test "S10.4 — initial schema declares cross-schema FK to public.zaki_users with CASCADE" {
+    // Static contract test: the FK that ties {schema}.users to
+    // public.zaki_users with ON DELETE CASCADE is the load-bearing
+    // structural invariant for GDPR purgeUser cascade behavior
+    // (see S7.5 + project_repair_queue_2026_04_21.md). Any future
+    // migration that drops or alters this FK without preserving
+    // CASCADE semantics breaks user deletion silently — this test
+    // catches such drift at compile-time without needing a live pg.
+    //
+    // The test inspects the embedded 0001 migration SQL directly.
+    // Future migrations that touch the FK must either preserve the
+    // exact phrase below in the cumulative schema state, or update
+    // this test to point at the new authoritative location.
+    const found_0001 = blk: {
+        for (MIGRATIONS) |m| {
+            if (m.version == 1) break :blk m;
+        }
+        return error.Migration0001NotFound;
+    };
+
+    const sql = found_0001.sql;
+    // Required: the constraint name + table reference + cascade.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "users_user_id_fkey") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "REFERENCES public.zaki_users(id)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "ON DELETE CASCADE") != null);
+
+    // Defense: ensure the FK declaration is wrapped in an idempotent
+    // guard (DO block with NOT EXISTS check), so re-running 0001 on
+    // a database where the FK already exists doesn't fail. Pre-S10.2
+    // the legacy loop relied on canIgnoreMigrateError tolerance for
+    // the "constraint already exists" error; the migration-framework
+    // path requires real idempotency.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "DO $$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "WHERE conname = 'users_user_id_fkey'") != null);
+}
