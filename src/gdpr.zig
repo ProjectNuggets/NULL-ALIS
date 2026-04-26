@@ -45,6 +45,7 @@ const log = std.log.scoped(.gdpr);
 const zaki_state_mod = @import("zaki_state.zig");
 const memory_mod = @import("memory/root.zig");
 const session_mod = @import("session.zig");
+const lane_metrics = @import("lane_metrics.zig");
 
 // ── Report ─────────────────────────────────────────────────────────
 
@@ -237,6 +238,27 @@ pub fn purgeUser(deps: PurgeDeps, user_id: i64) !PurgeReport {
             report.errors.items.len,
         },
     );
+
+    // D27 (2026-04-26) — record purge outcome to lane_metrics for the
+    // operator rolling-rate signal. Three-way classification matches
+    // PurgeReport semantics: ok = fullySucceeded, partial = some
+    // surface succeeded but errors recorded, fail = no surface
+    // succeeded. Per-tenant audit trail lives in the report object;
+    // this counter is the cluster-wide health view.
+    if (report.fullySucceeded()) {
+        lane_metrics.recordGdprPurgeOk();
+    } else {
+        const any_success = report.sessions_evicted > 0 or
+            report.pg_user_row_deleted or
+            report.vector_rows_removed > 0 or
+            report.filesystem_removed;
+        if (any_success) {
+            lane_metrics.recordGdprPurgePartial();
+        } else {
+            lane_metrics.recordGdprPurgeFail();
+        }
+    }
+
     return report;
 }
 

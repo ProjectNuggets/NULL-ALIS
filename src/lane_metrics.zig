@@ -49,6 +49,11 @@ pub fn snapshotBackgroundMainReroutes(allocator: std.mem.Allocator) !BackgroundM
 pub fn resetForTest() void {
     background_main_reroutes_total.store(0, .monotonic);
     completion_event_delete_failures_total.store(0, .monotonic);
+    secret_mutations_ok_total.store(0, .monotonic);
+    secret_mutations_fail_total.store(0, .monotonic);
+    gdpr_purge_ok_total.store(0, .monotonic);
+    gdpr_purge_partial_total.store(0, .monotonic);
+    gdpr_purge_fail_total.store(0, .monotonic);
     metrics_mutex.lock();
     defer metrics_mutex.unlock();
     background_main_reroutes_last_job_id_len = 0;
@@ -91,4 +96,132 @@ test "recordCompletionEventDeleteFailure increments total monotonically" {
     recordCompletionEventDeleteFailure();
     recordCompletionEventDeleteFailure();
     try std.testing.expectEqual(@as(u64, 3), completionEventDeleteFailuresTotal());
+}
+
+// ─── Secret-mutation outcomes (D13, 2026-04-26) ──────────────────────
+// D8 (Sprint 2) shipped the `zaki_bot.secret_mutations` audit table.
+// Audit rows give per-tenant forensics ("who tried what when"); these
+// counters give operators the rolling-rate signal ("are mutations
+// failing more than usual right now?") without scanning the table.
+//
+// Wired at the central `zaki_state.Manager.recordSecretMutation` site
+// so every call path (handlePrepare, handleSet, handleDelete, ...)
+// updates the counter without touching each gateway.zig site.
+//
+// Outcome classification: outcome strings starting with "rejected_",
+// "prepare_failed", "consumed_failed", or containing "_failed" → fail;
+// everything else (prepare_issued, consumed) → ok. Conservative —
+// prefer to over-count fails (visible operator signal) than under-count
+// (silent degradation).
+
+var secret_mutations_ok_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var secret_mutations_fail_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+pub fn recordSecretMutationOk() void {
+    _ = secret_mutations_ok_total.fetchAdd(1, .monotonic);
+}
+
+pub fn recordSecretMutationFail() void {
+    _ = secret_mutations_fail_total.fetchAdd(1, .monotonic);
+}
+
+pub fn secretMutationsOkTotal() u64 {
+    return secret_mutations_ok_total.load(.monotonic);
+}
+
+pub fn secretMutationsFailTotal() u64 {
+    return secret_mutations_fail_total.load(.monotonic);
+}
+
+/// Classify a secret-mutation outcome string and increment the matching
+/// counter. Centralizes the ok/fail split so callers don't reimplement
+/// the rule.
+pub fn classifyAndRecordSecretMutation(outcome: []const u8) void {
+    const is_fail = std.mem.startsWith(u8, outcome, "rejected_") or
+        std.mem.startsWith(u8, outcome, "prepare_failed") or
+        std.mem.startsWith(u8, outcome, "consume_failed") or
+        std.mem.indexOf(u8, outcome, "_failed") != null or
+        std.mem.indexOf(u8, outcome, "_invalid") != null;
+    if (is_fail) recordSecretMutationFail() else recordSecretMutationOk();
+}
+
+test "recordSecretMutation ok/fail counters are independent + monotonic" {
+    resetForTest();
+    try std.testing.expectEqual(@as(u64, 0), secretMutationsOkTotal());
+    try std.testing.expectEqual(@as(u64, 0), secretMutationsFailTotal());
+
+    recordSecretMutationOk();
+    recordSecretMutationOk();
+    recordSecretMutationFail();
+
+    try std.testing.expectEqual(@as(u64, 2), secretMutationsOkTotal());
+    try std.testing.expectEqual(@as(u64, 1), secretMutationsFailTotal());
+}
+
+test "classifyAndRecordSecretMutation routes outcomes by string" {
+    resetForTest();
+
+    classifyAndRecordSecretMutation("prepare_issued");
+    classifyAndRecordSecretMutation("consumed");
+    classifyAndRecordSecretMutation("rejected_no_token");
+    classifyAndRecordSecretMutation("prepare_failed");
+    classifyAndRecordSecretMutation("token_invalid");
+    classifyAndRecordSecretMutation("delete_failed");
+
+    try std.testing.expectEqual(@as(u64, 2), secretMutationsOkTotal());
+    try std.testing.expectEqual(@as(u64, 4), secretMutationsFailTotal());
+}
+
+// ─── GDPR purge outcomes (D27, 2026-04-26) ───────────────────────────
+// Sprint 7B shipped the gdpr.purgeUser orchestrator with structured
+// PurgeReport accounting. Audit-trail per-user lives in the report;
+// these counters give operators the rolling-rate signal across all
+// purge requests.
+//
+// Three-way classification matches PurgeReport semantics:
+//   ok      → fullySucceeded (errors.items.len == 0)
+//   partial → some surface succeeded but errors recorded
+//   fail    → no surface succeeded, only errors
+
+var gdpr_purge_ok_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var gdpr_purge_partial_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var gdpr_purge_fail_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+pub fn recordGdprPurgeOk() void {
+    _ = gdpr_purge_ok_total.fetchAdd(1, .monotonic);
+}
+
+pub fn recordGdprPurgePartial() void {
+    _ = gdpr_purge_partial_total.fetchAdd(1, .monotonic);
+}
+
+pub fn recordGdprPurgeFail() void {
+    _ = gdpr_purge_fail_total.fetchAdd(1, .monotonic);
+}
+
+pub fn gdprPurgeOkTotal() u64 {
+    return gdpr_purge_ok_total.load(.monotonic);
+}
+
+pub fn gdprPurgePartialTotal() u64 {
+    return gdpr_purge_partial_total.load(.monotonic);
+}
+
+pub fn gdprPurgeFailTotal() u64 {
+    return gdpr_purge_fail_total.load(.monotonic);
+}
+
+test "recordGdprPurge counters are independent + monotonic" {
+    resetForTest();
+
+    recordGdprPurgeOk();
+    recordGdprPurgeOk();
+    recordGdprPurgeOk();
+    recordGdprPurgePartial();
+    recordGdprPurgeFail();
+    recordGdprPurgeFail();
+
+    try std.testing.expectEqual(@as(u64, 3), gdprPurgeOkTotal());
+    try std.testing.expectEqual(@as(u64, 1), gdprPurgePartialTotal());
+    try std.testing.expectEqual(@as(u64, 2), gdprPurgeFailTotal());
 }

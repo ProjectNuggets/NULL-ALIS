@@ -33,6 +33,7 @@ pub const SessionInfo = struct {
 };
 const pg_helpers = @import("memory/engines/postgres.zig");
 const zaki_session = @import("session/root.zig");
+const lane_metrics = @import("lane_metrics.zig");
 const log = std.log.scoped(.zaki_state);
 
 const c = if (build_options.enable_postgres) @cImport({
@@ -1388,6 +1389,14 @@ const ManagerImpl = struct {
         };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
+
+        // D13 (2026-04-26) — record outcome to lane_metrics for the
+        // operator rolling-rate signal. Audit row above gives the
+        // per-tenant forensic trail; this counter gives the cluster-wide
+        // health view. Centralized here so every gateway call site
+        // (handlePrepare/handleSet/handleDelete) updates the counter
+        // without per-site changes.
+        lane_metrics.classifyAndRecordSecretMutation(outcome);
     }
 
     pub fn listSecretMutations(
