@@ -268,10 +268,17 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .cost_class = .a,
     },
     .{
+        // D1.14c — cacheable. Same session re-asks the same question
+        // (e.g. "what did I do yesterday") frequently in multi-turn
+        // chat. 300s TTL covers continuation without missing fresh
+        // user-stored facts beyond ~5min. Scope = .session because
+        // memory state is per-session — never cross-key.
         .name = memory_recall.MemoryRecallTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true, .cacheable = true },
         .risk_level = .low,
         .cost_class = .a,
+        .cache_ttl_secs = 300,
+        .cache_scope = .session,
     },
     .{
         .name = memory_list.MemoryListTool.tool_name,
@@ -293,10 +300,18 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         // Paid search provider (Brave/Serper/etc.) — medium cost per call.
+        // D1.14c — cacheable. No auth, no personalization → scope =
+        // .global (cross-session sharing safe). 30s TTL — short enough
+        // that fresh-results expectations hold for time-sensitive queries
+        // (news, market data) but long enough that the agent's
+        // multi-turn refinement on the same query (e.g. follow-up
+        // questions about the same topic) hits cache.
         .name = web_search.WebSearchTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true, .cacheable = true },
         .risk_level = .low,
         .cost_class = .b,
+        .cache_ttl_secs = 30,
+        .cache_scope = .global,
     },
     .{
         // External HTTP fetch with up to 1MB response — medium cost.
@@ -737,6 +752,29 @@ pub fn refineMetadata(base: metadata.ToolMetadata, args: JsonObjectMap) metadata
     // this, `schedule list` / `composio list` would lose parallel-dispatch
     // capability when we rely on metadata (see `isParallelSafeToolCall`).
     refined.flags.concurrency_safe = true;
+
+    // D1.14c — per-call cache opt-in for action-dependent tools that
+    // are read-only on this specific dispatch. The base entry stays
+    // cacheable=false (compatible with mutating=true at the registry
+    // level); only the refined entry carries cache flags. Today this
+    // covers composio list/get — per-tenant API key, so scope =
+    // .tenant; catalog-style results, so 60s TTL is safe.
+    //
+    // Other action-dependent tools (schedule list, git status, http
+    // GET, skill_registry list) intentionally do NOT opt in here:
+    //   - schedule list: low-value cache; user expects to see fresh
+    //     scheduled jobs after a write
+    //   - git status: local + fast; no measurable cache win
+    //   - http GET: per-URL responses may include user-specific data;
+    //     blanket caching is risky (cache-key includes URL but not
+    //     auth headers a tenant might pass via args — over-cautious)
+    //   - skill_registry list: local + fast; no measurable cache win
+    if (std.mem.eql(u8, base.name, composio.ComposioTool.tool_name)) {
+        refined.flags.cacheable = true;
+        refined.cache_ttl_secs = 60;
+        refined.cache_scope = .tenant;
+    }
+
     return refined;
 }
 
@@ -2464,6 +2502,50 @@ test "refineMetadata downgrades composio list/get and read-only execute" {
     const connect_parsed = try parseTestArgs("{\"action\":\"connect\",\"app\":\"gmail\"}");
     defer connect_parsed.deinit();
     try std.testing.expect(refineMetadata(base, connect_parsed.value.object).flags.mutating);
+}
+
+// D1.14c regression: verify the cache opt-ins activate correctly
+// across the three flagged tools. web_search + memory_recall opt in
+// at the registry level (read-only base); composio opts in only via
+// refineMetadata (because base is mutating=true). All three must
+// surface cacheable=true + nonzero TTL + correct scope to
+// canonicalMetadataForCall consumers (the cache integration in
+// agent/root.zig).
+test "D1.14c — web_search/memory_recall/composio-list cache flags wired" {
+    const registry = defaultMetadataRegistry();
+
+    // web_search — read-only base, .global scope, 30s TTL
+    const ws = metadata.lookupMetadata("web_search", registry).?;
+    try std.testing.expect(ws.flags.cacheable);
+    try std.testing.expectEqual(@as(u32, 30), ws.cache_ttl_secs);
+    try std.testing.expectEqual(metadata.CacheScope.global, ws.cache_scope);
+
+    // memory_recall — read-only base, .session scope, 300s TTL
+    const mr = metadata.lookupMetadata("memory_recall", registry).?;
+    try std.testing.expect(mr.flags.cacheable);
+    try std.testing.expectEqual(@as(u32, 300), mr.cache_ttl_secs);
+    try std.testing.expectEqual(metadata.CacheScope.session, mr.cache_scope);
+
+    // composio base — mutating, NOT cacheable at base (passes flags.validate)
+    const composio_base = metadata.lookupMetadata("composio", registry).?;
+    try std.testing.expect(!composio_base.flags.cacheable);
+    try std.testing.expect(composio_base.flags.mutating);
+
+    // composio list — refineMetadata adds cacheable=true + .tenant + 60s
+    const list_parsed = try parseTestArgs("{\"action\":\"list\",\"app\":\"gmail\"}");
+    defer list_parsed.deinit();
+    const list_refined = refineMetadata(composio_base, list_parsed.value.object);
+    try std.testing.expect(list_refined.flags.cacheable);
+    try std.testing.expect(!list_refined.flags.mutating);
+    try std.testing.expectEqual(@as(u32, 60), list_refined.cache_ttl_secs);
+    try std.testing.expectEqual(metadata.CacheScope.tenant, list_refined.cache_scope);
+
+    // composio send (mutating) — must NOT be flagged cacheable post-refine
+    const send_parsed = try parseTestArgs("{\"action\":\"execute\",\"tool_slug\":\"gmail-send-email\"}");
+    defer send_parsed.deinit();
+    const send_refined = refineMetadata(composio_base, send_parsed.value.object);
+    try std.testing.expect(!send_refined.flags.cacheable);
+    try std.testing.expect(send_refined.flags.mutating);
 }
 
 test "refineMetadata downgrades skill_registry list/search" {
