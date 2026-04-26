@@ -3454,6 +3454,17 @@ test "postgres claimed recurring job reschedules and records run" {
     defer runtime_scheduler.deinit();
     try runtime_scheduler.setExecutionContext("2", "/tmp/nullalis-zaki-bot-test-user-2", "/tmp/nullalis-zaki-bot-test-user-2/workspace");
     try cron_mod.loadJobFromJsonSlice(&runtime_scheduler, claimed[0].raw_job_json);
+    // D14 fix: the test exercises job_type=.agent which requires an agent
+    // runner; without one, tick() sets last_status="error" and the assertion
+    // below (expectEqualStrings("ok", ...)) fails. Wire a stub runner that
+    // returns a fixed string — the test's intent is "scheduler reschedules
+    // and records run", not "agent execution semantics."
+    const StubRunner = struct {
+        fn run(_: ?*anyopaque, alloc: std.mem.Allocator, _: *const cron_mod.CronScheduler, _: *const cron_mod.CronJob, _: []const u8) ![]const u8 {
+            return alloc.dupe(u8, "ok");
+        }
+    };
+    runtime_scheduler.setAgentRunner(&StubRunner.run, null);
     _ = runtime_scheduler.tick(10, null);
     try std.testing.expectEqual(@as(usize, 1), runtime_scheduler.listJobs().len);
     const updated_json = try cron_mod.jobToJson(allocator, &runtime_scheduler.listJobs()[0]);
@@ -3573,8 +3584,24 @@ test "postgres replaceJobsJson scopes stored job ids per user while preserving r
     const user42_jobs = try mgr.getJobsJson(allocator, 42);
     defer allocator.free(user42_jobs);
 
-    try std.testing.expect(std.mem.indexOf(u8, user2_jobs, "\"id\":\"morning-brief\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, user42_jobs, "\"id\":\"morning-brief\"") != null);
+    // D14 fix: parse + assert structurally instead of substring-matching the
+    // raw text. Postgres's jsonb→text serialization always inserts spaces
+    // after colons (`"id": "morning-brief"` not `"id":"morning-brief"`), so
+    // the prior tight indexOf was format-fragile. Parsing isolates intent
+    // ("the raw id is preserved in the user-facing API output") from
+    // backend formatting whims (Postgres / SQLite / future stores can
+    // differ in whitespace without breaking the test).
+    const user2_parsed = try std.json.parseFromSlice(std.json.Value, allocator, user2_jobs, .{});
+    defer user2_parsed.deinit();
+    try std.testing.expect(user2_parsed.value == .array);
+    try std.testing.expectEqual(@as(usize, 1), user2_parsed.value.array.items.len);
+    try std.testing.expectEqualStrings("morning-brief", user2_parsed.value.array.items[0].object.get("id").?.string);
+
+    const user42_parsed = try std.json.parseFromSlice(std.json.Value, allocator, user42_jobs, .{});
+    defer user42_parsed.deinit();
+    try std.testing.expect(user42_parsed.value == .array);
+    try std.testing.expectEqual(@as(usize, 1), user42_parsed.value.array.items.len);
+    try std.testing.expectEqualStrings("morning-brief", user42_parsed.value.array.items[0].object.get("id").?.string);
 
     const q = try mgr.buildQuery("SELECT id, user_id FROM {schema}.jobs ORDER BY user_id ASC");
     defer allocator.free(q);
