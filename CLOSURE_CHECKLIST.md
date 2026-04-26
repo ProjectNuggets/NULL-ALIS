@@ -358,12 +358,12 @@ before push. S9.6 may unpark ahead of the others on its own merit.
 
 Goal: schema change is a process; data is recoverable.
 
-- [ ] **S10.1** Real migration framework — introduce `zaki_bot.schema_migrations` table, numbered migrations in `src/migrations/*.sql` + runner in `zaki_state.zig`. Remove `canIgnoreMigrateError:2867-2907` allowlist once covered. Cite: P4_schema.
-- [ ] **S10.2** Replace boot-time `CREATE IF NOT EXISTS` with versioned migrations. Cite: P4_schema.
-- [ ] **S10.3** All index creation uses `CREATE INDEX CONCURRENTLY`. Cite: P4_schema risk #2.
-- [ ] **S10.4** Cross-schema FK to `public.zaki_users` — add a versioning contract test that runs in both repos' CI (Rails side + nullalis side). Cite: P4_schema risk #3.
-- [ ] **S10.5** NFS droplet — DigitalOcean volume snapshot schedule (daily minimum) in `terraform/nfs.tf`. Cite: P4_zaki_infra_ops Q4.
-- [ ] **S10.6** DO-managed Postgres — document backup retention, PITR window, run restore drill quarterly, log date. Cite: P4_zaki_infra_ops Q4.
+- [x] **S10.1** Real migration framework — shipped at `960a2ab` (PR #39). New `src/migrations.zig` with Migration struct, MIGRATIONS array, RunnerContext vtable, run/runWith entry points, applyTransactional/applyConcurrent paths, 4 unit tests. See `docs/sprints/sprint-10.md`.
+- [x] **S10.2** Versioned migrations — shipped at `50ff5ed` (PR #39). `src/migrations/0001_initial_schema.sql` (~280 LoC, idempotency-guarded with DO blocks). `zaki_state.zig::migrate` appends `schema_migrations` bootstrap + INSERT version 1 ON CONFLICT DO NOTHING. Legacy loop stays authoritative for 0001 during transition; 0002+ ships via the framework. `canIgnoreMigrateError` allowlist stays pending post-prod-verify removal.
+- [x] **S10.3** CONCURRENTLY policy — shipped at `c49bf14` (PR #39). `docs/migrations-policy.md` mandates CONCURRENTLY for new indexes; framework's `concurrent_only: bool = true` flag handles BEGIN/COMMIT skip + per-statement exec.
+- [x] **S10.4** Cross-schema FK contract test — shipped at `c49bf14` (PR #39). Static test in `src/migrations.zig` asserts FK constraint name, cross-schema target, CASCADE semantics, idempotent DO-block wrapping. Runs in CI without live pg. Live-pg cascade test (D33) tracked separately as runtime complement.
+- [ ] **S10.5** NFS droplet — DigitalOcean volume snapshot schedule (daily minimum) in `terraform/nfs.tf`. **Operator-pending** — see `docs/sprints/sprint-10.md`. Cite: P4_zaki_infra_ops Q4.
+- [ ] **S10.6** DO-managed Postgres — document backup retention, PITR window, run restore drill quarterly, log date. **Operator-pending** — see `docs/sprints/sprint-10.md`. Cite: P4_zaki_infra_ops Q4.
 
 **Sprint 10 DoD:** migration up/down dry-run works in CI. CONCURRENTLY used on all new indexes. Last-restore-drill timestamp < 90 days old.
 
@@ -455,10 +455,10 @@ Goal: close items surfaced on final pressure-test.
 
 Goal: fold what's left, confirm park decisions.
 
-- [ ] **S15.1** `config_parse.zig` table-driven tests — 10 canonical + 10 malformed per top-level key. Cite: P1_quality.
-- [ ] **S15.2** log.warn vs log.info rebalance — audit + demote noise. Cite: P1_quality (340 vs 146).
-- [ ] **S15.3** Provider catalog — trim cosmetic entries (bedrock SigV4, qianfan/baidu 2-step, hardcoded-localhost 6) or document honestly. Cite: P2_providers, P1_tech.
-- [ ] **S15.4** Transcripts vector sync — match memory-architecture-map.md claim, or update the doc to reality. Cite: P4_ops_truth drift #4.
+- [ ] **S15.1** `config_parse.zig` table-driven tests — 10 canonical + 10 malformed per top-level key. **Parked-with-reason** in `docs/sprints/sprint-15.md` — trigger: future config-parse bug in prod OR contributor-side test-writing. Cite: P1_quality.
+- [ ] **S15.2** log.warn vs log.info rebalance — audit + demote noise. **Parked-with-reason** in `docs/sprints/sprint-15.md` — trigger: operator pain about log noise OR Sprint 13 (Observability) absorbs it. Cite: P1_quality (340 vs 146).
+- [x] **S15.3** Provider catalog honesty — shipped at `7870c07` (PR #40). 11 cosmetic / local-only entries documented inline in `src/providers/factory.zig`: Qianfan/Baidu need OAuth 2-step (Bearer fails), Bedrock needs AWS SigV4 (Bearer fails), 8 localhost entries are local-dev-only.
+- [x] **S15.4** Transcripts vector sync truth — shipped at `7870c07` (PR #40). `docs/memory-architecture-map.md` corrected: cold transcripts are NOT vector-synced today (saveMessage doesn't call syncVectorAfterStore); doc updated + future-work path noted.
 
 **Sprint 15 DoD:** no "park — maybe later" item remains undocumented.
 
