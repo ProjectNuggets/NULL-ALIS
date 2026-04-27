@@ -176,6 +176,13 @@ pub const AssistantModePresetAgentConfig = struct {
     model: []const u8 = "",
     /// Provider override for this mode. Empty string = use Config.default_provider.
     provider: []const u8 = "",
+    /// **Q3 (2026-04-27)** — server-side reasoning depth for this mode.
+    /// Valid: "low" / "medium" / "high" / "none" / null. Null falls
+    /// back to Config.reasoning_effort or wire-level default. Together
+    /// with the model override, this is what makes fast/balanced/deep
+    /// behaviorally different — fast=low gets quick latency, deep=high
+    /// gets deeper thinking on complex tasks.
+    reasoning_effort: ?[]const u8 = null,
 };
 
 pub const AssistantModePresetSummarizerConfig = struct {
@@ -213,11 +220,15 @@ pub const ProductPresetsConfig = struct {
             .max_tool_iterations = 20,
             // Kimi K2.5 on Together for both fast and balanced modes.
             // Differentiation comes from agent loop parameters:
-            // Fast:     temp 0.5, 20 iterations,  queue_cap 8,  history 500
-            // Balanced: temp 0.7, 35 iterations, queue_cap 12, history 500
+            // Fast:     temp 0.5, 20 iterations,  queue_cap 8,  reasoning low
+            // Balanced: temp 0.7, 35 iterations, queue_cap 12, reasoning medium
             // Deep uses GLM 5.1 for maximum depth on complex tasks.
             .model = "moonshotai/Kimi-K2.5",
             .provider = "together",
+            // Q3 (2026-04-27): fast = low reasoning effort. Trades thinking
+            // depth for latency. Suits casual chat, quick lookups, single-step
+            // queries that don't need deep reasoning.
+            .reasoning_effort = "low",
         },
         .summarizer = .{
             .enabled = true,
@@ -244,6 +255,11 @@ pub const ProductPresetsConfig = struct {
             // Together primary (org-prefixed ID), OpenRouter fallback.
             .model = "moonshotai/Kimi-K2.5",
             .provider = "together",
+            // Q3 (2026-04-27): balanced = medium reasoning effort. Default
+            // for most users. Matches Together/Moonshot server default for
+            // Kimi when reasoning_effort is unspecified — explicit here so
+            // context_snapshot reports it accurately.
+            .reasoning_effort = "medium",
         },
         .summarizer = .{
             .enabled = true,
@@ -274,6 +290,11 @@ pub const ProductPresetsConfig = struct {
             // ($0.30/$1.20 — strong agent capabilities at lower cost).
             .model = "zai-org/GLM-5.1",
             .provider = "together",
+            // Q3 (2026-04-27): deep = high reasoning effort. Trades latency
+            // for thinking depth. Suits multi-step research, code review,
+            // strategic planning, SWE-Bench-style work where the user
+            // explicitly opted into "give me the best answer, take your time."
+            .reasoning_effort = "high",
         },
         .summarizer = .{
             .enabled = true,
