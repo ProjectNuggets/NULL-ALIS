@@ -375,6 +375,22 @@ pub fn applySettingsToConfig(cfg: *Config, settings: ProductSettings) void {
     if (preset.agent.provider.len > 0) {
         cfg.default_provider = preset.agent.provider;
     }
+    // Q3 (2026-04-27): mode-specific reasoning_effort. fast=low,
+    // balanced=medium, deep=high. Modes finally become behaviorally
+    // different at the wire level (server-side thinking depth) — not
+    // just queue caps. This is the lever that makes the mode selector
+    // worth its UX surface.
+    //
+    // Allocator note: preset reasoning_effort points to a const string
+    // literal; cfg.reasoning_effort lifecycle expects either null or
+    // a heap-owned string in some paths. Use the string literal as-is
+    // here — config_parse.zig and other paths that re-set it will
+    // free + dupe consistently. Operator JSON overrides retain
+    // precedence (parse-time set runs before mode-preset apply OR
+    // the inverse depending on call order; doc'd in plan-v02 §6).
+    if (preset.agent.reasoning_effort) |effort| {
+        cfg.reasoning_effort = effort;
+    }
     // Note: max_response_tokens intentionally NOT applied from presets.
     // Hard API caps truncate mid-response during agentic tasks (file writes, code gen).
     // References (Claude Code, Cursor, Devin) use no per-mode response caps.
