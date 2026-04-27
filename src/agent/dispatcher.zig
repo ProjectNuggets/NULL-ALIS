@@ -383,9 +383,20 @@ pub fn parseXmlToolCalls(
 }
 
 /// Maximum characters per individual tool result output before truncation.
-/// Matches OpenClaw's default (8000 chars). Prevents a single tool result
-/// from consuming most of the context window.
-const MAX_TOOL_RESULT_CHARS: usize = 8000;
+///
+/// **R11 raise (2026-04-27):** bumped from 8000 → 24000 after researcher
+/// pass found 8KB code files (e.g. `lane_metrics.zig` at 8.8KB) being
+/// truncated by ~10% — too aggressive for code review workflows. 24KB
+/// covers ~600 lines of typical Zig source while still leaving plenty
+/// of context budget on Kimi K2.5's 256K window (a single tool result
+/// at the cap is still <0.01% of window; many tool results per turn
+/// stay safely bounded by the per-turn iteration cap).
+///
+/// Original constraint (8K) was matched to OpenClaw's default — chosen
+/// for shorter-context models where any single tool result could fill
+/// the window. We're not in that regime; per-call caps should match
+/// today's window sizes.
+const MAX_TOOL_RESULT_CHARS: usize = 24000;
 
 /// Truncate tool output to fit within the context budget.
 /// Keeps the first and last portions so the LLM sees both the beginning

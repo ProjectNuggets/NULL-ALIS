@@ -126,6 +126,20 @@ one-line reason.
 
 ---
 
+## From LLM researcher pass rounds 1+2 (2026-04-27)
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| R7-tool | Agent emits `**Step N: <action>**` headings without firing the tool or surfacing result content (yesterday's exact rough edge, recurrence) | Round-1 finding; round-2 verified fixed via PR #54 — Plan-Execute Integrity rule + reflection_prompt restructure (STEP 1 = surface tool result, STEP 2 = decide next action) | Closed in-pass | **shipped at `14d1af6`** (PR #54) |
+| R7-stat | Agent fabricated "3,700+ memories stored" in intro reply with no tool call (real total: 9,270) | Round-1 finding; round-2 verified fixed via PR #54 prompt strengthening — agent now fires `memory_list` and quotes `100/9278` verbatim when asked about own state | Closed in-pass | **shipped at `14d1af6`** (PR #54) |
+| R10 | Workspace-path discovery friction — agent ran 6+ shell calls (`find` / `ls` / `pwd`) to locate a file at workspace root | Round-2 finding; PR for cleanup batch | This batch | **shipped** — strengthened `buildWorkspaceSection` with explicit "your working directory is X, all file ops resolve relative; try direct read first, only `find` if not-found" + names R10 anti-pattern by date |
+| R11 | `MAX_TOOL_RESULT_CHARS=8000` truncates 8.8KB code files by ~10% — too aggressive for code review on Kimi's 256K window | Round-2 finding; PR for cleanup batch | This batch | **shipped** — bumped 8000 → 24000 (~600 lines of typical Zig source per result), still <0.01% of Kimi window |
+| R12 | Leaked tool_call XML markers at start of some streaming replies (`l>\nall>\nl>\nool_call>\n`) — likely Kimi K2.5 emits pipe-delimited markers (`<|tool_calls_section_begin|>`, `<|tool_call_begin|>`, etc.) that the `<invoke>`/`<tool_call>` filter doesn't recognize | Cosmetic; agent behavior unaffected. Filter extension to handle Kimi's pipe-format requires careful prefix-matching logic (15-byte hold-back may not be enough for 28-char `<|tool_calls_section_begin|>`). Needs dedicated PR | Filter-extension PR after V1 | **open** — cosmetic, not blocking V1 |
+| R13 | Duplicate iteration emission — same content rendered twice in single reply (observed once in round-2 R2.5 cross-turn coherence test) | Need reproduction. Could be agent loop running an extra iteration, OR streaming dedup gap, OR LLM emitting same content twice. Single observation = insufficient evidence | Reproduce + investigate | **open** — needs more reproductions to root-cause |
+| R9 | Workspace path uses `.nullclaw/data/users/...` prefix — D28 NULLCLAW→NULLALIS work didn't extend to operator config-file `tenant.data_root` | Operator action (Nova): edit `~/.nullalis/config.json` `data_root` from `.nullclaw/data/users` → `.nullalis/data/users` + `mv ~/.nullclaw/data/users ~/.nullalis/data/users`. No code change needed | Operator config + filesystem rename | **open — operator action** |
+
+---
+
 ## Strategic / architectural (not from any specific sprint)
 
 | ID | Shape | Why deferred | Target | Status |
