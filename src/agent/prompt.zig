@@ -544,7 +544,9 @@ fn buildSafetySection(w: anytype) !void {
 
 /// Emit the workspace section.
 fn buildWorkspaceSection(w: anytype, workspace_dir: []const u8) !void {
-    try std.fmt.format(w, "## Workspace\n\nWorking directory: `{s}`\n\n", .{workspace_dir});
+    try std.fmt.format(w, "## Workspace\n\n", .{});
+    try std.fmt.format(w, "**Your working directory is `{s}`.** All `file_read` / `file_write` / `file_edit` / `shell` calls resolve relative to this path. Files placed here by the user (e.g. `report.md`, `data.csv`) are reachable by their bare filename — you do NOT need to `find` or `ls` for them; just `file_read \"report.md\"`.\n\n", .{workspace_dir});
+    try w.writeAll("**Anti-pattern (R10, observed in researcher pass 2026-04-27):** running multiple `find` / `ls` / `pwd` shell calls to locate a file when the user said \"in your workspace\" — that signals the file is at the workspace root. Try the direct read first; if it fails with not-found, THEN search.\n\n");
 }
 
 /// Emit the runtime section.
