@@ -258,14 +258,23 @@ fn curl_stream_fallback(
     argv_buf[argc] = "--fail-with-body";
     argc += 1;
 
+    // R15 fix (2026-04-27): always pass --max-time. Pre-fix: when
+    // timeout_secs == 0 (user opt-out OR uninitialized), curl ran with
+    // no time limit — any Together / OpenRouter / Compatible-provider
+    // hiccup → infinite hang in agent loop, observed at researcher pass
+    // turn 10 (12-turn × 8KB stress). Now: 0 maps to a sensible
+    // upper bound (300s) matching AgentConfig.message_timeout_secs's
+    // own default. This bounds the worst case without breaking
+    // legitimate deep-mode work (90-180s reasoning is normal for
+    // Kimi K2.5 reasoning_effort=high; 300s leaves headroom for
+    // chained tool calls within a single stream).
+    const effective_timeout: u64 = if (timeout_secs > 0) timeout_secs else 300;
     var timeout_buf: [32]u8 = undefined;
-    if (timeout_secs > 0) {
-        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = timeout_str;
-        argc += 1;
-    }
+    const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{effective_timeout}) catch unreachable;
+    argv_buf[argc] = "--max-time";
+    argc += 1;
+    argv_buf[argc] = timeout_str;
+    argc += 1;
 
     argv_buf[argc] = "-X";
     argc += 1;
@@ -836,7 +845,13 @@ fn native_stream(
     };
     defer stream_ctx.deinit();
 
-    const timeout_ms: u32 = if (timeout_secs == 0) 30_000 else @intCast(@min(timeout_secs * 1000, std.math.maxInt(u32)));
+    // R15 fix (2026-04-27): default 30s was TOO SHORT for legitimate
+    // deep-mode reasoning (Kimi K2.5 reasoning_effort=high routinely
+    // takes 60-120s for complex multi-tool workflows; GLM-5.1 deep mode
+    // can take longer). Bumped to 300s default — matches the curl
+    // fallback path and AgentConfig.message_timeout_secs default. If
+    // user explicitly sets a lower timeout via config, that wins.
+    const timeout_ms: u32 = if (timeout_secs == 0) 300_000 else @intCast(@min(timeout_secs * 1000, std.math.maxInt(u32)));
     const status_code = try http_native.stream_body(
         allocator,
         .{
