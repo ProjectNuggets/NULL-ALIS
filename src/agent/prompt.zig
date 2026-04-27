@@ -555,6 +555,16 @@ fn buildRuntimeSection(w: anytype, model_name: []const u8) !void {
         @tagName(builtin.os.tag),
         model_name,
     });
+    // R16 (2026-04-27) — disambiguate two orthogonal reasoning fields the
+    // user may ask about. Without this, the model sees both in
+    // context_snapshot output and infers (wrongly) that one disables the
+    // other. Verified failure mode: agent reported "reasoning is off
+    // because reasoning_mode=off" — but reasoning_mode is the visibility
+    // toggle, not the on/off switch.
+    try w.writeAll("**Reasoning fields disambiguation** — when answering the user about \"thinking\" or \"reasoning,\" two ORTHOGONAL settings exist:\n");
+    try w.writeAll("- `reasoning_mode` (off / on / stream): controls whether the model's REASONING TRACE is surfaced to the user. `off` = trace hidden (the user sees only your final reply); `on` = trace shown alongside reply; `stream` = trace streamed live. Does NOT control whether the model thinks — only whether the thinking is visible.\n");
+    try w.writeAll("- `reasoning_effort` (low / medium / high / none, or `default`): controls server-side THINKING DEPTH. `low` = quick, shallow reasoning; `medium` = standard; `high` = deep, multi-step; `none` = bypass reasoning entirely. The model is always thinking unless `effort=none`.\n");
+    try w.writeAll("Common mistake (forbidden): claiming reasoning is \"disabled\" or \"off\" when `reasoning_mode=off`. Reasoning is happening at whatever effort level is configured; only the trace is hidden. State both honestly: \"trace hidden (mode=off), thinking at <effort>.\"\n\n");
 }
 
 fn buildIdentitySection(
