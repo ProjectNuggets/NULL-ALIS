@@ -125,12 +125,43 @@ pub fn buildRequestBodyWithSystem(allocator: std.mem.Allocator, model: []const u
 
 /// Check if a model name indicates an OpenAI reasoning model
 /// (o1, o3, o4-mini, gpt-5*, codex-mini).
+///
+/// Q2 (2026-04-27): kept narrow for the OpenAI request-shape convention
+/// (these models REJECT `temperature` when reasoning is on, accept only
+/// `max_completion_tokens`). For broader "supports reasoning_effort"
+/// classification, see `isReasoningCapableModel` below — Kimi/Moonshot
+/// support reasoning_effort but accept temperature alongside it.
 pub fn isReasoningModel(model: []const u8) bool {
     return std.mem.startsWith(u8, model, "gpt-5") or
         std.mem.startsWith(u8, model, "o1") or
         std.mem.startsWith(u8, model, "o3") or
         std.mem.startsWith(u8, model, "o4-mini") or
         std.mem.startsWith(u8, model, "codex-mini");
+}
+
+/// **Q2 (2026-04-27)** — broader classifier: any model that accepts the
+/// `reasoning_effort` request field, regardless of whether it follows
+/// OpenAI's strict shape (drop-temperature) or the Kimi/Moonshot shape
+/// (temperature accepted alongside).
+///
+/// Triggers Kimi K2.5/K2.6 + Moonshot variants on Together / OpenRouter
+/// / direct Moonshot API. Per Moonshot + Together docs, these models
+/// expose `reasoning_effort: low|medium|high` and default to `medium`
+/// when unset.
+///
+/// Use this for `reasoning_effort` field emission gating; use the
+/// narrower `isReasoningModel` for OpenAI request-shape gating
+/// (temperature drop, max_completion_tokens swap).
+pub fn isReasoningCapableModel(model: []const u8) bool {
+    if (isReasoningModel(model)) return true;
+    // Strip provider prefix for substring search across nested refs
+    // (`together-ai/moonshotai/kimi-k2.5`, `openrouter/moonshotai/kimi-k2.6`, etc.)
+    const lower_haystack = model;
+    return std.mem.indexOf(u8, lower_haystack, "kimi-k2") != null or
+        std.mem.indexOf(u8, lower_haystack, "kimi-K2") != null or
+        std.mem.indexOf(u8, lower_haystack, "Kimi-K2") != null or
+        std.mem.indexOf(u8, lower_haystack, "moonshot") != null or
+        std.mem.indexOf(u8, lower_haystack, "Moonshot") != null;
 }
 
 /// Append model-specific generation controls to a JSON request body buffer:
@@ -146,8 +177,22 @@ pub fn appendGenerationFields(
     max_tokens: ?u32,
     reasoning_effort: ?[]const u8,
 ) !void {
-    if (!isReasoningModel(model)) {
-        // Non-reasoning model: temperature + max_tokens
+    // Q2 (2026-04-27): three request shapes total —
+    //   (a) Non-reasoning model: temperature + max_tokens
+    //   (b) OpenAI reasoning (o1/o3/gpt-5/codex-mini): max_completion_tokens
+    //       only when effort != "none"; temperature dropped unless explicit
+    //       "none" override; `reasoning_effort` always appended when set
+    //   (c) Kimi/Moonshot reasoning-capable: temperature + max_tokens +
+    //       reasoning_effort (Kimi accepts temperature alongside reasoning,
+    //       unlike OpenAI's o-series strict convention)
+    //
+    // Default for reasoning-capable models when reasoning_effort is null:
+    // emit "medium" — matches Moonshot/Together's documented server
+    // default, and ensures our context_snapshot report (which echoes
+    // config) stays honest with the actual wire request.
+
+    if (!isReasoningModel(model) and !isReasoningCapableModel(model)) {
+        // (a) Non-reasoning model: temperature + max_tokens
         try buf.appendSlice(allocator, ",\"temperature\":");
         var temp_buf: [16]u8 = undefined;
         const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
@@ -162,7 +207,32 @@ pub fn appendGenerationFields(
         return;
     }
 
-    // Reasoning model: temperature only if reasoning_effort == "none"
+    if (isReasoningCapableModel(model) and !isReasoningModel(model)) {
+        // (c) Kimi/Moonshot reasoning-capable: temperature + max_tokens +
+        // reasoning_effort. Kimi accepts temperature alongside reasoning;
+        // do NOT drop it like OpenAI o-series.
+        try buf.appendSlice(allocator, ",\"temperature\":");
+        var temp_buf: [16]u8 = undefined;
+        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
+        try buf.appendSlice(allocator, temp_str);
+
+        if (max_tokens) |max_tok| {
+            try buf.appendSlice(allocator, ",\"max_tokens\":");
+            var max_buf: [16]u8 = undefined;
+            const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tok}) catch return error.FormatError;
+            try buf.appendSlice(allocator, max_str);
+        }
+
+        // Emit reasoning_effort: explicit user value, or default "medium".
+        // Matches Moonshot/Together server default + keeps context_snapshot
+        // report honest (we report what we actually send).
+        const effort = reasoning_effort orelse "medium";
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":");
+        try json_util.appendJsonString(buf, allocator, effort);
+        return;
+    }
+
+    // (b) OpenAI reasoning model: temperature only if reasoning_effort == "none"
     const effort_is_none = if (reasoning_effort) |re| std.mem.eql(u8, re, "none") else false;
     if (effort_is_none) {
         try buf.appendSlice(allocator, ",\"temperature\":");
@@ -171,7 +241,7 @@ pub fn appendGenerationFields(
         try buf.appendSlice(allocator, temp_str);
     }
 
-    // Reasoning model: always use max_completion_tokens instead of max_tokens
+    // OpenAI reasoning model: always use max_completion_tokens instead of max_tokens
     if (max_tokens) |max_tok| {
         try buf.appendSlice(allocator, ",\"max_completion_tokens\":");
         var max_buf: [16]u8 = undefined;
@@ -329,6 +399,71 @@ pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+test "Q2 — isReasoningCapableModel recognizes Kimi K2.5/K2.6 + Moonshot" {
+    // OpenAI reasoning models still match (subset)
+    try std.testing.expect(isReasoningCapableModel("gpt-5"));
+    try std.testing.expect(isReasoningCapableModel("o1-preview"));
+    try std.testing.expect(isReasoningCapableModel("o3-mini"));
+
+    // Kimi variants across provider prefixes
+    try std.testing.expect(isReasoningCapableModel("together/moonshotai/Kimi-K2.5"));
+    try std.testing.expect(isReasoningCapableModel("openrouter/moonshotai/kimi-k2.5"));
+    try std.testing.expect(isReasoningCapableModel("kimi-k2.6"));
+    try std.testing.expect(isReasoningCapableModel("moonshotai/Kimi-K2.6"));
+    try std.testing.expect(isReasoningCapableModel("Moonshot-K2.5"));
+
+    // Non-reasoning models do NOT match
+    try std.testing.expect(!isReasoningCapableModel("gpt-4o"));
+    try std.testing.expect(!isReasoningCapableModel("claude-sonnet-4.6"));
+    try std.testing.expect(!isReasoningCapableModel("mixtral-8x7b-32768"));
+    try std.testing.expect(!isReasoningCapableModel("llama-3.1-70b"));
+}
+
+test "Q2 — appendGenerationFields emits reasoning_effort for Kimi with temperature" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    // Kimi K2.5 + explicit reasoning_effort
+    try appendGenerationFields(&buf, alloc, "moonshotai/Kimi-K2.5", 0.7, 32_768, "high");
+    const out = buf.items;
+
+    // Kimi-shape: BOTH temperature AND max_tokens AND reasoning_effort present
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"temperature\":0.70") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"max_tokens\":32768") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"reasoning_effort\":\"high\"") != null);
+    // Should NOT use OpenAI's max_completion_tokens
+    try std.testing.expect(std.mem.indexOf(u8, out, "max_completion_tokens") == null);
+}
+
+test "Q2 — appendGenerationFields defaults Kimi reasoning_effort to medium when null" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try appendGenerationFields(&buf, alloc, "moonshotai/Kimi-K2.5", 0.7, 32_768, null);
+    const out = buf.items;
+
+    // Default = "medium" (matches Together/Moonshot server default)
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"reasoning_effort\":\"medium\"") != null);
+    // Temperature still emitted (Kimi accepts it alongside reasoning)
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"temperature\":0.70") != null);
+}
+
+test "Q2 — OpenAI o1/o3 path unchanged (drops temperature unless effort=none)" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try appendGenerationFields(&buf, alloc, "o1-preview", 0.7, 32_768, "high");
+    const out = buf.items;
+
+    // OpenAI-shape: max_completion_tokens (NOT max_tokens), no temperature, reasoning_effort
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"max_completion_tokens\":32768") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"temperature\"") == null);
+}
 
 test "convertToolsOpenAI produces valid JSON" {
     const alloc = std.testing.allocator;

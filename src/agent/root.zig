@@ -2401,6 +2401,23 @@ pub const Agent = struct {
         try w.writeAll(agent.verbose_level.toSlice());
         try w.writeAll("\",\"reasoning_mode\":\"");
         try w.writeAll(agent.reasoning_mode.toSlice());
+        // Q2 (2026-04-27): expose reasoning_effort separately from
+        // reasoning_mode. These are orthogonal:
+        //   - reasoning_mode: client-side trace VISIBILITY (off/on/stream)
+        //   - reasoning_effort: server-side thinking DEPTH (low/medium/high/none)
+        // Agent was conflating them when reporting state to user. For
+        // reasoning-capable models (Kimi K2.5/K2.6, Moonshot, OpenAI o-series)
+        // null reasoning_effort means "use the wire-level default" which for
+        // Kimi/Moonshot is "medium" per Together docs (see helpers.zig).
+        // We report the explicit user value if set, else "default" so the
+        // agent can answer truthfully without lying about a config value
+        // that isn't there.
+        try w.writeAll("\",\"reasoning_effort\":\"");
+        if (agent.reasoning_effort) |re| {
+            try w.writeAll(re);
+        } else {
+            try w.writeAll("default");
+        }
         try w.writeAll("\",\"session_key\":");
         if (agent.memory_session_id) |sid| {
             try w.print("\"{s}\"", .{sid});
