@@ -84,26 +84,32 @@ const ModeMapping = struct {
 };
 
 const mode_mappings = [_]ModeMapping{
+    // Q1 (2026-04-27): max_history_messages set to 0 across all modes —
+    // post-iter26 the field is uncapped at runtime; the legacy 40/50/80
+    // values were a snap signal for pre-context-v2 era configs and
+    // visually misleading on audit. Scoring still works (absDiffU32(v, 0)
+    // ranks any non-zero user value lower equally). Compaction is the
+    // sole context governor.
     .{
         .mode = .fast,
         .queue_mode = "latest",
         .queue_cap = 8,
         .queue_drop = "newest",
-        .max_history_messages = 40,
+        .max_history_messages = 0,
     },
     .{
         .mode = .balanced,
         .queue_mode = "serial",
         .queue_cap = 12,
         .queue_drop = "summarize",
-        .max_history_messages = 50,
+        .max_history_messages = 0,
     },
     .{
         .mode = .deep,
         .queue_mode = "serial",
         .queue_cap = 20,
         .queue_drop = "summarize",
-        .max_history_messages = 80,
+        .max_history_messages = 0,
     },
 };
 

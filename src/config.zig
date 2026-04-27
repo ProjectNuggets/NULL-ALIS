@@ -1491,7 +1491,10 @@ test "save roundtrip preserves extended config sections" {
 
     cfg.agent.compact_context = true;
     // max_tool_iterations: NOT set here — mode presets handle this (8/25/500).
-    // max_history_messages: NOT set here — mode presets set 500.
+    // max_history_messages: NOT set here — mode presets set 0 (uncapped).
+    // Q1 (2026-04-27): message-count cap deprecated; compaction is the sole
+    // context governor. Per-mode product_presets all ship 0; user-config
+    // overrides accepted but forced to 0 at parse time (config_parse.zig).
     cfg.agent.parallel_tools = true;
     cfg.agent.parallel_tools_rollout_percent = 100;
     cfg.agent.tool_dispatcher = "parallel";
@@ -1895,7 +1898,9 @@ test "json parse agent section" {
     try cfg.parseJson(json);
     try std.testing.expect(cfg.agent.compact_context);
     try std.testing.expectEqual(@as(u32, 20), cfg.agent.max_tool_iterations);
-    try std.testing.expectEqual(@as(u32, 80), cfg.agent.max_history_messages);
+    // Q1 (2026-04-27): max_history_messages deprecated — JSON value 80 is
+    // accepted then forced to 0 (uncapped). Compaction is the sole governor.
+    try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);
     try std.testing.expect(cfg.agent.parallel_tools);
     try std.testing.expectEqual(@as(u8, 60), cfg.agent.parallel_tools_rollout_percent);
     try std.testing.expectEqualStrings("xml", cfg.agent.tool_dispatcher);
