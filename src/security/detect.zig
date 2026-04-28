@@ -45,7 +45,7 @@ pub fn createSandbox(
             return storage.noop.sandbox();
         },
         .firejail => {
-            storage.firejail = .{ .workspace_dir = workspace_dir };
+            storage.firejail = .{ .workspace_dir = workspace_dir, .allocator = allocator };
             if (storage.firejail.sandbox().isAvailable()) {
                 return storage.firejail.sandbox();
             }
@@ -53,7 +53,7 @@ pub fn createSandbox(
             return storage.noop.sandbox();
         },
         .bubblewrap => {
-            storage.bubblewrap = .{ .workspace_dir = workspace_dir };
+            storage.bubblewrap = .{ .workspace_dir = workspace_dir, .allocator = allocator };
             if (storage.bubblewrap.sandbox().isAvailable()) {
                 return storage.bubblewrap.sandbox();
             }
@@ -89,13 +89,13 @@ fn detectBest(allocator: std.mem.Allocator, workspace_dir: []const u8, storage: 
         }
 
         // Try Firejail second
-        storage.firejail = .{ .workspace_dir = workspace_dir };
+        storage.firejail = .{ .workspace_dir = workspace_dir, .allocator = allocator };
         if (storage.firejail.sandbox().isAvailable()) {
             return storage.firejail.sandbox();
         }
 
         // Try Bubblewrap third
-        storage.bubblewrap = .{ .workspace_dir = workspace_dir };
+        storage.bubblewrap = .{ .workspace_dir = workspace_dir, .allocator = allocator };
         if (storage.bubblewrap.sandbox().isAvailable()) {
             return storage.bubblewrap.sandbox();
         }
@@ -127,10 +127,10 @@ pub fn detectAvailable(allocator: std.mem.Allocator, workspace_dir: []const u8) 
     storage.landlock = .{ .workspace_dir = workspace_dir };
     const ll_avail = storage.landlock.sandbox().isAvailable();
 
-    storage.firejail = .{ .workspace_dir = workspace_dir };
+    storage.firejail = .{ .workspace_dir = workspace_dir, .allocator = allocator };
     const fj_avail = storage.firejail.sandbox().isAvailable();
 
-    storage.bubblewrap = .{ .workspace_dir = workspace_dir };
+    storage.bubblewrap = .{ .workspace_dir = workspace_dir, .allocator = allocator };
     const bw_avail = storage.bubblewrap.sandbox().isAvailable();
 
     storage.docker = createDockerSandbox(allocator, workspace_dir, null);

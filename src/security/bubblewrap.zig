@@ -5,6 +5,11 @@ const Sandbox = @import("sandbox.zig").Sandbox;
 /// Wraps commands with `bwrap` for user-namespace isolation.
 pub const BubblewrapSandbox = struct {
     workspace_dir: []const u8,
+    /// Allocator used by isAvailable() to spawn `bwrap --version`. Optional
+    /// only because SandboxStorage default-initializes the struct before any
+    /// allocator is known (mirrors DockerSandbox.allocator: undefined). Real
+    /// callsites must populate it before calling isAvailable().
+    allocator: ?std.mem.Allocator = null,
 
     pub const sandbox_vtable = Sandbox.VTable{
         .wrapCommand = wrapCommand,
@@ -67,9 +72,27 @@ pub const BubblewrapSandbox = struct {
         return buf[0 .. prefix_len + argv.len];
     }
 
-    fn isAvailable(_: *anyopaque) bool {
+    fn isAvailable(ptr: *anyopaque) bool {
         const builtin = @import("builtin");
-        return comptime (builtin.os.tag == .linux);
+        // OS gate first: bwrap only exists on Linux.
+        if (comptime builtin.os.tag != .linux) return false;
+
+        // Runtime binary probe: spawn `bwrap --version` and check exit 0.
+        // Without this, selecting .bubblewrap on a Linux host where bwrap
+        // is not installed would silently exec-fail at run time instead of
+        // surfacing SandboxUnavailable up front. Matches docker.zig pattern.
+        const self = resolve(ptr);
+        const allocator = self.allocator orelse return false;
+        var child = std.process.Child.init(&.{ "bwrap", "--version" }, allocator);
+        child.stderr_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stdin_behavior = .Ignore;
+        child.spawn() catch return false;
+        const term = child.wait() catch return false;
+        return switch (term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -83,6 +106,16 @@ pub const BubblewrapSandbox = struct {
 
 pub fn createBubblewrapSandbox(workspace_dir: []const u8) BubblewrapSandbox {
     return .{ .workspace_dir = workspace_dir };
+}
+
+/// Construct a BubblewrapSandbox with an allocator wired for the runtime
+/// `bwrap --version` availability probe. Pass null only for tests that
+/// don't exercise isAvailable.
+pub fn createBubblewrapSandboxWithAllocator(
+    workspace_dir: []const u8,
+    allocator: ?std.mem.Allocator,
+) BubblewrapSandbox {
+    return .{ .workspace_dir = workspace_dir, .allocator = allocator };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

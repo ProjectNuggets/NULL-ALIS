@@ -5,6 +5,11 @@ const Sandbox = @import("sandbox.zig").Sandbox;
 /// Wraps commands with `firejail` for user-space sandboxing.
 pub const FirejailSandbox = struct {
     workspace_dir: []const u8,
+    /// Allocator used by isAvailable() to spawn `firejail --version`. Optional
+    /// only because SandboxStorage default-initializes the struct before any
+    /// allocator is known (mirrors DockerSandbox.allocator: undefined). Real
+    /// callsites must populate it before calling isAvailable().
+    allocator: ?std.mem.Allocator = null,
     private_arg_buf: [256]u8 = undefined,
     private_arg_len: usize = 0,
 
@@ -44,11 +49,28 @@ pub const FirejailSandbox = struct {
         return buf[0 .. prefix_len + argv.len];
     }
 
-    fn isAvailable(_: *anyopaque) bool {
-        // Check if firejail binary is reachable — cannot actually spawn in comptime,
-        // so we report true only on Linux where firejail is meaningful.
+    fn isAvailable(ptr: *anyopaque) bool {
         const builtin = @import("builtin");
-        return comptime builtin.os.tag == .linux;
+        // OS gate first: firejail only exists on Linux.
+        if (comptime builtin.os.tag != .linux) return false;
+
+        // Runtime binary probe: spawn `firejail --version` and check exit 0.
+        // Without this check, selecting .firejail on a Linux host where the
+        // binary is not installed would silently exec-fail at run time
+        // instead of surfacing SandboxUnavailable up front. Matches docker.zig
+        // isAvailable pattern.
+        const self = resolve(ptr);
+        const allocator = self.allocator orelse return false;
+        var child = std.process.Child.init(&.{ "firejail", "--version" }, allocator);
+        child.stderr_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stdin_behavior = .Ignore;
+        child.spawn() catch return false;
+        const term = child.wait() catch return false;
+        return switch (term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -61,7 +83,17 @@ pub const FirejailSandbox = struct {
 };
 
 pub fn createFirejailSandbox(workspace_dir: []const u8) FirejailSandbox {
-    var result = FirejailSandbox{ .workspace_dir = workspace_dir };
+    return createFirejailSandboxWithAllocator(workspace_dir, null);
+}
+
+/// Construct a FirejailSandbox with an allocator wired for the runtime
+/// `firejail --version` availability probe. Pass null only for tests that
+/// don't exercise isAvailable.
+pub fn createFirejailSandboxWithAllocator(
+    workspace_dir: []const u8,
+    allocator: ?std.mem.Allocator,
+) FirejailSandbox {
+    var result = FirejailSandbox{ .workspace_dir = workspace_dir, .allocator = allocator };
     const written = std.fmt.bufPrint(&result.private_arg_buf, "--private={s}", .{workspace_dir}) catch {
         // Path too long for buffer; fall back to bare --private
         @memcpy(result.private_arg_buf[0..9], "--private");
