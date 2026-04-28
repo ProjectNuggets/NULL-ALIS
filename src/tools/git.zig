@@ -14,6 +14,9 @@ pub const GitTool = struct {
     allowed_paths: []const []const u8 = &.{},
     sandbox_enabled: bool = false,
     sandbox_backend: config_types.SandboxBackend = .auto,
+    /// See ShellTool.sandbox_fail_open_on_dev — same semantics for git
+    /// operations that exec git through tool_sandbox_v1.
+    sandbox_fail_open_on_dev: bool = false,
 
     pub const tool_name = "git_operations";
     pub const tool_description = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash).";
@@ -214,6 +217,7 @@ pub const GitTool = struct {
                 .backend = self.sandbox_backend,
                 .workspace_dir = self.workspace_dir,
                 .allowed_roots = self.allowed_paths,
+                .fail_open_on_dev = self.sandbox_fail_open_on_dev,
             },
             argv_buf[0 .. arg_count + 1],
             .{ .cwd = git_cwd },

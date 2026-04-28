@@ -9,6 +9,15 @@ pub const SandboxExecConfig = struct {
     backend: config_types.SandboxBackend = .auto,
     workspace_dir: []const u8 = ".",
     allowed_roots: []const []const u8 = &.{},
+    /// When `enabled = true` but the resolved sandbox is `noop` (no real
+    /// backend available on the host), control behavior:
+    /// - `false` (default, production-safe): return error.SandboxUnavailable.
+    ///   Shell tool refuses. Forces operators to fix the missing-backend
+    ///   condition rather than silently shipping unsandboxed shell to users.
+    /// - `true` (dev-friendly): log.warn + return argv unchanged. Shell tool
+    ///   runs the command without isolation. The warn is the audit trail
+    ///   that operators can grep for.
+    fail_open_on_dev: bool = false,
 };
 
 pub const MAX_WRAPPED_ARGV: usize = 160;
@@ -115,7 +124,13 @@ pub fn resolve_sandboxed_argv(
         exec_cfg.workspace_dir,
         &sandbox_storage,
     );
-    if (std.mem.eql(u8, sandbox.name(), "none")) return error.SandboxUnavailable;
+    if (std.mem.eql(u8, sandbox.name(), "none")) {
+        if (exec_cfg.fail_open_on_dev) {
+            log.warn("sandbox: no real backend available, falling through unsandboxed (fail_open_on_dev=true). This is acceptable on dev hosts; on production hosts install bwrap/firejail/docker and set fail_open_on_dev=false.", .{});
+            return argv;
+        }
+        return error.SandboxUnavailable;
+    }
 
     return sandbox.wrapCommand(argv, wrapped_buf) catch |err| switch (err) {
         error.BufferTooSmall => error.SandboxArgvTooLong,

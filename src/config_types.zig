@@ -1139,8 +1139,32 @@ pub const PeripheralsConfig = struct {
 // ── Security sub-configs ────────────────────────────────────────
 
 pub const SandboxConfig = struct {
+    /// Tristate sandbox preference:
+    /// - `null` (default): AUTO. Enable sandbox when a real backend is
+    ///   available on the host (probed once at boot via detectAvailable);
+    ///   if no real backend is available, behavior depends on
+    ///   `fail_open_on_dev` below.
+    /// - `true`: REQUIRED. Always attempt to sandbox. If no real backend
+    ///   is available at runtime, surface SandboxUnavailable to the caller
+    ///   (shell tool refuses).
+    /// - `false`: OFF. Never attempt to sandbox. Shell tool runs commands
+    ///   under the host process directly. Use only in single-tenant pod
+    ///   deployments where the pod itself provides isolation.
     enabled: ?bool = null,
     backend: SandboxBackend = .auto,
+    /// When `enabled` resolves to true (explicit or auto) but the host has
+    /// no real sandbox backend available (no bwrap, no firejail, no docker),
+    /// this flag controls behavior:
+    /// - `false` (default, production-safe): fail-closed. Shell tool refuses.
+    ///   Use this on production hosts so accidental missing-bwrap deploys
+    ///   surface immediately rather than silently shipping unsandboxed
+    ///   shell to paying users.
+    /// - `true` (dev-friendly): fall through with a `log.warn`. Shell tool
+    ///   runs unsandboxed but operators see a warning in logs. Use this on
+    ///   dev machines where you accept reduced isolation in exchange for
+    ///   not requiring bwrap/docker installation.
+    /// Mirrors Hermes's `fail_open_on_dev` pattern.
+    fail_open_on_dev: bool = false,
     firejail_args: []const []const u8 = &.{},
 };
 

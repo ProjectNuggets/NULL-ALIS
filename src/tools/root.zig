@@ -858,8 +858,62 @@ pub fn allTools(
 
     // Core tools with workspace_dir + allowed_paths + tools_config limits
     const tc = opts.tools_config;
-    const sandbox_enabled = if (opts.config) |cfg| cfg.security.sandbox.enabled orelse false else false;
-    const sandbox_backend = if (opts.config) |cfg| cfg.security.sandbox.backend else @import("../config_types.zig").SandboxBackend.auto;
+
+    // Sandbox auto-mode resolution (2026-04-28 sandbox-finish ACE).
+    //
+    // Resolution rules:
+    // - sandbox.enabled = true  → strict: try sandbox; SandboxUnavailable on miss
+    // - sandbox.enabled = false → never sandbox
+    // - sandbox.enabled = null (default) → AUTO: probe ONCE here, enable iff
+    //   a real backend (firejail/bwrap/docker — landlock excluded since it
+    //   fail-closes until syscall layer ships) is available on this host.
+    // - sandbox.fail_open_on_dev = true → if enabled resolves to true but
+    //   the runtime sandbox path returns noop, log.warn and pass through
+    //   instead of refusing. Production-safe default is false.
+    //
+    // Critical perf note: prior code passed `.auto` through to every shell
+    // call, which made tool_sandbox_v1.resolve_sandboxed_argv invoke
+    // detectBest per-call → 30-500ms `--version` spawn per shell tool
+    // invocation. We now resolve `.auto` to a concrete backend ONCE here
+    // and store the concrete value in the ShellTool/GitTool struct.
+    const security_root = @import("../security/root.zig");
+    const SandboxBackendT = @import("../config_types.zig").SandboxBackend;
+
+    const sandbox_user_explicit_enabled: ?bool = if (opts.config) |cfg| cfg.security.sandbox.enabled else null;
+    const sandbox_user_backend: SandboxBackendT = if (opts.config) |cfg| cfg.security.sandbox.backend else .auto;
+    const sandbox_fail_open: bool = if (opts.config) |cfg| cfg.security.sandbox.fail_open_on_dev else false;
+
+    // Probe once. Cost is bounded: 1-3 fork+execve+wait sequences (~30ms on
+    // Linux, ~500ms on macOS through Docker Desktop daemon). Acceptable at
+    // tool-factory init; was unacceptable per-shell-call.
+    const avail = security_root.detectAvailable(allocator, workspace_dir);
+    const has_real_backend = avail.firejail or avail.bubblewrap or avail.docker;
+
+    const sandbox_enabled = if (sandbox_user_explicit_enabled) |e| e else has_real_backend;
+
+    // Resolve `.auto` → concrete backend so tool_sandbox_v1 doesn't re-probe
+    // on the hot path.
+    const sandbox_backend: SandboxBackendT = if (sandbox_user_backend == .auto and sandbox_enabled) blk: {
+        if (avail.firejail) break :blk .firejail;
+        if (avail.bubblewrap) break :blk .bubblewrap;
+        if (avail.docker) break :blk .docker;
+        break :blk .auto;
+    } else sandbox_user_backend;
+
+    // Startup log line so operators see what was selected. Once per agent
+    // init.
+    std.log.scoped(.sandbox).info(
+        "sandbox: enabled={any} backend={s} fail_open_on_dev={any} workspace={s} avail={{firejail:{any} bubblewrap:{any} docker:{any}}}",
+        .{
+            sandbox_enabled,
+            @tagName(sandbox_backend),
+            sandbox_fail_open,
+            workspace_dir,
+            avail.firejail,
+            avail.bubblewrap,
+            avail.docker,
+        },
+    );
 
     const st = try allocator.create(shell.ShellTool);
     st.* = .{
@@ -870,6 +924,7 @@ pub fn allTools(
         .policy = opts.policy,
         .sandbox_enabled = sandbox_enabled,
         .sandbox_backend = sandbox_backend,
+        .sandbox_fail_open_on_dev = sandbox_fail_open,
     };
     try list.append(allocator, st.tool());
 
@@ -899,6 +954,7 @@ pub fn allTools(
         .allowed_paths = opts.allowed_paths,
         .sandbox_enabled = sandbox_enabled,
         .sandbox_backend = sandbox_backend,
+        .sandbox_fail_open_on_dev = sandbox_fail_open,
     };
     try list.append(allocator, gt.tool());
 

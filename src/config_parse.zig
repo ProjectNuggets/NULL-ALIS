@@ -1743,6 +1743,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (sb.object.get("enabled")) |v| {
                         if (v == .bool) self.security.sandbox.enabled = v.bool;
                     }
+                    if (sb.object.get("fail_open_on_dev")) |v| {
+                        if (v == .bool) self.security.sandbox.fail_open_on_dev = v.bool;
+                    }
                     if (sb.object.get("backend")) |v| {
                         if (v == .string) {
                             if (std.mem.eql(u8, v.string, "auto")) {

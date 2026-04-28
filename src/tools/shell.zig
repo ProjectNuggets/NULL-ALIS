@@ -30,6 +30,10 @@ pub const ShellTool = struct {
     policy: ?*const SecurityPolicy = null,
     sandbox_enabled: bool = false,
     sandbox_backend: config_types.SandboxBackend = .auto,
+    /// When sandbox_enabled=true but no real backend is available at run time
+    /// (host has no bwrap/firejail/docker), fall through unsandboxed with a
+    /// log.warn instead of refusing. Production deploys keep this false.
+    sandbox_fail_open_on_dev: bool = false,
     /// Optional memory store for command audit trail.
     audit_memory: ?memory_mod.Memory = null,
     /// Session ID for scoping audit entries.
@@ -136,6 +140,7 @@ pub const ShellTool = struct {
                 .backend = self.sandbox_backend,
                 .workspace_dir = self.workspace_dir,
                 .allowed_roots = self.allowed_paths,
+                .fail_open_on_dev = self.sandbox_fail_open_on_dev,
             },
             &.{ platform.getShell(), platform.getShellFlag(), command },
             .{
