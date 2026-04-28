@@ -31,7 +31,7 @@ pub const BubblewrapSandbox = struct {
 
     fn wrapCommand(ptr: *anyopaque, argv: []const []const u8, buf: [][]const u8) anyerror![]const []const u8 {
         const self = resolve(ptr);
-        // bwrap --ro-bind /usr /usr --dev /dev --proc /proc --bind /tmp /tmp --bind WORKSPACE /workspace --chdir /workspace --unshare-all --die-with-parent <argv...>
+        // bwrap --ro-bind /usr /usr --dev /dev --proc /proc --tmpfs /tmp --bind WORKSPACE /workspace --chdir /workspace --unshare-all --die-with-parent <argv...>
         //
         // `--chdir /workspace` is critical: the parent process sets cwd to the
         // host-side workspace path (e.g. /Users/.../workspace/<user>) before
@@ -39,6 +39,16 @@ pub const BubblewrapSandbox = struct {
         // only `/workspace` does. Without --chdir, bwrap inherits the parent's
         // cwd and the inner exec fails with ENOENT. Pinning cwd to the bound
         // sandbox path is what lets shell.zig:142 pass effective_cwd unchanged.
+        //
+        // `--tmpfs /tmp` (was `--bind /tmp /tmp`): each sandbox gets a fresh
+        // ephemeral tmpfs at /tmp. Prior `--bind /tmp /tmp` shared the host's
+        // /tmp into every tenant's sandbox, opening a cross-tenant leak —
+        // User A could write `/tmp/foo` and User B's sandbox would see it
+        // bound at the same path. tmpfs eliminates that vector and also
+        // contains tmp-fill DOS attempts to the per-call sandbox lifetime.
+        // Tradeoff: scripts that genuinely expect a persistent /tmp across
+        // shell invocations break — but the agent's own per-turn /tmp use
+        // (mktemp, etc.) still works within a single sandbox lifetime.
         const prefix = [_][]const u8{
             "bwrap",
             "--ro-bind",
@@ -48,8 +58,7 @@ pub const BubblewrapSandbox = struct {
             "/dev",
             "--proc",
             "/proc",
-            "--bind",
-            "/tmp",
+            "--tmpfs",
             "/tmp",
             "--bind",
             self.workspace_dir,
@@ -178,8 +187,47 @@ test "bubblewrap sandbox wrap empty argv" {
 
     // Just the prefix args, no original command
     try std.testing.expectEqualStrings("bwrap", result[0]);
-    // 16 base prefix args + 2 for --chdir /workspace = 18.
-    try std.testing.expect(result.len == 18);
+    // 17 prefix args: bwrap, --ro-bind /usr /usr (4), --dev /dev (2), --proc /proc (2),
+    // --tmpfs /tmp (2), --bind WORKSPACE /workspace (3), --chdir /workspace (2),
+    // --unshare-all, --die-with-parent. Total: 1 + 4 + 2 + 2 + 2 + 3 + 2 + 2 = ...
+    // count: bwrap(1) + --ro-bind /usr /usr (3) + --dev /dev (2) + --proc /proc (2)
+    //      + --tmpfs /tmp (2) + --bind WS /workspace (3) + --chdir /workspace (2)
+    //      + --unshare-all (1) + --die-with-parent (1) = 17.
+    try std.testing.expect(result.len == 17);
+}
+
+test "bubblewrap sandbox uses --tmpfs for /tmp (cross-tenant isolation)" {
+    var bw = createBubblewrapSandbox("/tmp/workspace");
+    const sb = bw.sandbox();
+
+    const argv = [_][]const u8{"ls"};
+    var buf: [32][]const u8 = undefined;
+    const result = try sb.wrapCommand(&argv, &buf);
+
+    // Critical: each sandbox MUST get a fresh ephemeral tmpfs at /tmp, not a
+    // shared host /tmp bind. Without this, User A's `/tmp/foo` is visible to
+    // User B (cross-tenant data leak). Also blocks tmp-fill DOS persisting
+    // beyond the sandbox lifetime.
+    var has_tmpfs = false;
+    var has_tmp_value = false;
+    var has_bind_tmp = false; // must NOT be present
+    for (result, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--tmpfs")) {
+            has_tmpfs = true;
+            if (i + 1 < result.len and std.mem.eql(u8, result[i + 1], "/tmp")) {
+                has_tmp_value = true;
+            }
+        }
+        // Detect the old bug: --bind followed by /tmp /tmp.
+        if (std.mem.eql(u8, arg, "--bind") and i + 2 < result.len and
+            std.mem.eql(u8, result[i + 1], "/tmp") and std.mem.eql(u8, result[i + 2], "/tmp"))
+        {
+            has_bind_tmp = true;
+        }
+    }
+    try std.testing.expect(has_tmpfs);
+    try std.testing.expect(has_tmp_value);
+    try std.testing.expect(!has_bind_tmp);
 }
 
 test "bubblewrap sandbox wrap includes --chdir /workspace" {

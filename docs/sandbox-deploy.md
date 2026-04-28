@@ -111,7 +111,7 @@ Explicit `backend` selection (e.g., `"backend": "bubblewrap"`) skips the priorit
 
    This is the operator's truth check on what was selected. If `enabled=true backend=auto` shows up, the auto-resolve fell through (no real backend) — install one and restart.
 
-2. **Test shell isolation.** Send the agent a shell command like `cat /etc/passwd` (read of a host file outside the workspace). With sandbox active, bwrap binds only `/usr` (read-only), `/dev`, `/proc`, `/tmp`, and `<workspace> → /workspace`. `/etc` is NOT mounted, so the cat fails with ENOENT. Compare with sandbox disabled (succeeds, leaks host data).
+2. **Test shell isolation.** Send the agent a shell command like `cat /etc/passwd` (read of a host file outside the workspace). With sandbox active, bwrap binds only `/usr` (read-only), `/dev`, `/proc`, gives a fresh tmpfs at `/tmp` (per-call ephemeral, not shared with host), and binds `<workspace> → /workspace`. `/etc` is NOT mounted, so the cat fails with ENOENT. Compare with sandbox disabled (succeeds, leaks host data).
 
 3. **Test cross-tenant FS read.** With multi-tenant runtime active, send agent a command like `cat /var/zaki/<other-user-id>/secrets.txt`. Without sandbox: succeeds (process UID matches). With sandbox: fails with ENOENT (path not bound). This is the cross-tenant read vector the sandbox closes.
 
@@ -141,5 +141,6 @@ The boot probe was the latency surprise from blocker 3; it now runs once instead
 - Landlock syscall layer implementation
 - gVisor / CubeSandbox / SmolVM (Firecracker) backends — see `docs/sandbox-activation-plan.md`
 - Per-tenant sandbox-resource caps (cgroup integration)
+- Wrap MCP child processes through `tool_sandbox_v1` (deferred until self-service MCP UI ships post-V1.5; currently MCP servers are operator-curated only)
 
 — ACE shipped 2026-04-28 as part of V1.5 sandbox-finish.
