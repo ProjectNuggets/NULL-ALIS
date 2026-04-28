@@ -9965,6 +9965,7 @@ fn handleSessionAction(
     rest: []const u8,
     session_mgr_opt: ?*session_mod.SessionManager,
     raw_request: []const u8,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
 ) RouteResponse {
     // Parse: {session_key} or {session_key}/{action}
     // Session keys use colons not slashes, so last slash separates key from action.
@@ -10009,7 +10010,7 @@ fn handleSessionAction(
         }
         // DELETE /sessions/{key} — destroy session
         if (std.mem.eql(u8, method, "DELETE")) {
-            return handleSessionDelete(allocator, mgr, session_key);
+            return handleSessionDelete(allocator, mgr, session_key, state_mgr_opt, user_id);
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
@@ -10081,28 +10082,90 @@ fn handleSessionDelete(
     _: std.mem.Allocator,
     mgr: *session_mod.SessionManager,
     session_key: []const u8,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
+    user_id_str: []const u8,
 ) RouteResponse {
-    mgr.mutex.lock();
-    const session = mgr.sessions.get(session_key) orelse {
-        mgr.mutex.unlock();
-        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
-    };
-    // Guard: refuse to delete a session with an active turn (active_refs > 0)
-    // or an active reader (session.mutex held). Prevents use-after-free.
-    if (session.active_refs > 0 or !session.mutex.tryLock()) {
-        mgr.mutex.unlock();
+    // Durable session delete (2026-04-28, Nova directive): pre-fix, this
+    // handler only acted on RAM-live sessions. If a session was evicted
+    // (or never live in this process), DELETE returned 404, and the next
+    // GET /sessions read it back from {schema}.sessions and showed it
+    // again — "ghost" sessions. ALSO: it called persistSessionCheckpoint
+    // on delete, which is backwards (writes to durable store ON
+    // destruction).
+    //
+    // Now: two phases.
+    //   Phase 1 — live evict: if RAM has the session, remove it (no
+    //   checkpoint write — that was the backwards bug). Skip if absent.
+    //   Phase 2 — durable delete: regardless of live presence, call
+    //   state_mgr.deleteSession to purge messages + completion_events +
+    //   autosaved memory + sessions row. This is what makes the UI
+    //   refresh actually stay quiet.
+    // Return success when EITHER phase saw something. 404 only when
+    // both live AND durable found nothing.
+
+    var existed_live: bool = false;
+    var live_in_use: bool = false;
+
+    // Phase 1: live evict (best-effort)
+    {
+        mgr.mutex.lock();
+        if (mgr.sessions.get(session_key)) |session| {
+            // Guard: refuse to evict a session with an active turn
+            // (active_refs > 0) or an active reader (session.mutex held).
+            // Prevents use-after-free. Durable delete is still safe to
+            // attempt below — it doesn't touch live state.
+            if (session.active_refs > 0 or !session.mutex.tryLock()) {
+                live_in_use = true;
+                mgr.mutex.unlock();
+            } else {
+                _ = mgr.sessions.fetchRemove(session_key);
+                mgr.mutex.unlock();
+                // NOTE: NO persistSessionCheckpoint("api_delete") — that
+                // was the bug (write-on-delete). Just teardown.
+                session.mutex.unlock();
+                session.deinit(mgr.allocator);
+                mgr.allocator.destroy(session);
+                existed_live = true;
+            }
+        } else {
+            mgr.mutex.unlock();
+        }
+    }
+
+    // If live session was in-use, refuse — caller can retry later.
+    if (live_in_use) {
         return .{ .status = "409 Conflict", .body = "{\"error\":\"session_in_use\"}" };
     }
-    // Remove from map while holding both locks, then release mgr.mutex.
-    // Once removed, no other handler can find this session, so blocking I/O
-    // (checkpoint) won't stall other session operations.
-    _ = mgr.sessions.fetchRemove(session_key);
-    mgr.mutex.unlock();
-    // Checkpoint + cleanup with only session.mutex held (safe for blocking I/O).
-    session.agent.persistSessionCheckpoint("api_delete");
-    session.mutex.unlock();
-    session.deinit(mgr.allocator);
-    mgr.allocator.destroy(session);
+
+    // Phase 2: durable delete (best-effort; success even if absent)
+    var existed_durable: bool = false;
+    if (state_mgr_opt) |smgr| {
+        const numeric_user_id = std.fmt.parseInt(i64, user_id_str, 10) catch 0;
+        if (numeric_user_id > 0) {
+            // We don't have a row-count signal from deleteSession (would
+            // require widening the API). Treat success as "may have
+            // existed"; combined with live evict, this gives us
+            // 404-only-when-truly-absent semantics without false
+            // positives in the deleted-twice case.
+            smgr.deleteSession(numeric_user_id, session_key) catch |err| {
+                log.warn("session.delete.durable_failed user={s} key={s} err={s}", .{
+                    user_id_str, session_key, @errorName(err),
+                });
+                // Don't fail the whole delete on durable error if we
+                // already evicted live — partial success is preferable
+                // to "delete left state behind."
+                if (!existed_live) {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"durable_delete_failed\"}" };
+                }
+            };
+            existed_durable = true;
+        }
+    }
+
+    if (!existed_live and !existed_durable) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    }
+
     return .{ .body = "{\"status\":\"deleted\"}" };
 }
 
@@ -11613,7 +11676,7 @@ fn handleApiRoute(
     }
     if (std.mem.startsWith(u8, parsed.subpath, "sessions/")) {
         const rest = parsed.subpath["sessions/".len..];
-        return handleSessionAction(req_allocator, method, scoped_user_id, rest, effective_session_mgr, raw_request);
+        return handleSessionAction(req_allocator, method, scoped_user_id, rest, effective_session_mgr, raw_request, state.zaki_state);
     }
 
     // ── GDPR data purge (Sprint 7B — S7.6) ──────────────────────────────
@@ -20416,7 +20479,7 @@ test "handleSessionList rejects non-GET methods" {
 }
 
 test "handleSessionAction rejects empty session key" {
-    const resp = handleSessionAction(std.testing.allocator, "GET", "1", "", null, "");
+    const resp = handleSessionAction(std.testing.allocator, "GET", "1", "", null, "", null);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
 }
 
@@ -20428,6 +20491,7 @@ test "handleSessionAction rejects cross-user session key" {
         "agent:zaki-bot:user:999:main",
         null,
         "",
+        null,
     );
     try std.testing.expectEqualStrings("403 Forbidden", resp.status);
 }
@@ -20981,7 +21045,7 @@ test "handleSessionDelete removes session and returns deleted" {
     _ = try mgr.getOrCreate("agent:zaki-bot:user:10:thread:del");
     try std.testing.expectEqual(@as(usize, 1), mgr.sessionCount());
 
-    const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:10:thread:del");
+    const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:10:thread:del", null, "10");
     try std.testing.expectEqualStrings("200 OK", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"deleted\"") != null);
     try std.testing.expectEqual(@as(usize, 0), mgr.sessionCount());
@@ -20995,7 +21059,7 @@ test "handleSessionDelete returns 409 when session has active refs" {
     const session = try mgr.getOrCreate("agent:zaki-bot:user:10:thread:busy");
     session.active_refs = 1; // Simulate active turn
 
-    const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:10:thread:busy");
+    const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:10:thread:busy", null, "10");
     try std.testing.expectEqualStrings("409 Conflict", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "session_in_use") != null);
     // Session should still exist
@@ -21007,7 +21071,7 @@ test "handleSessionDelete returns 404 for unknown session" {
     var mgr = testCrudSessionManager(std.testing.allocator, &mock);
     defer mgr.deinit();
 
-    const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:ghost");
+    const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:ghost", null, "1");
     try std.testing.expectEqualStrings("404 Not Found", resp.status);
 }
 

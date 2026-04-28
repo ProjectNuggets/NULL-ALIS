@@ -235,6 +235,10 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listUserSessions(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]SessionInfo {
         return allocator.alloc(SessionInfo, 0);
     }
+    /// Stub for non-postgres builds. Real impl in postgres-backed Manager.
+    pub fn deleteSession(_: *@This(), _: i64, _: []const u8) !void {
+        return error.PostgresNotEnabled;
+    }
     pub fn replaceJobsJson(_: *@This(), _: i64, _: []const u8, _: []const u8) !void {
         return error.PostgresNotEnabled;
     }
@@ -1700,6 +1704,83 @@ const ManagerImpl = struct {
         const lengths = [_]c_int{ @intCast(user_s.len), @intCast(session_id.len) };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
+    }
+
+    /// Durable session delete — purges every persistent surface tied to a
+    /// (user_id, session_key) pair. Per Nova directive 2026-04-28: the UI
+    /// session delete was only evicting RAM, then `listUserSessions` would
+    /// re-show the row from the durable store on next refresh. This makes
+    /// "delete" actually delete.
+    ///
+    /// Wraps four DELETEs in a single transaction so it's all-or-nothing:
+    ///   1. messages (per session_id)
+    ///   2. completion_events (per session_id)
+    ///   3. autosaved memory rows (autosave_user_*, autosave_assistant_* with
+    ///      memory_session_id matching)
+    ///   4. sessions row itself (this is the one the UI list reads from)
+    ///
+    /// Idempotent: if zero rows match, returns success — caller can call this
+    /// safely on already-absent sessions.
+    pub fn deleteSession(self: *Self, user_id: i64, session_id: []const u8) !void {
+        // BEGIN transaction
+        const begin_result = try self.exec("BEGIN");
+        c.PQclear(begin_result);
+        errdefer {
+            // On any error in the transaction below, rollback. Best-effort:
+            // if rollback itself fails, postgres will clear on connection
+            // teardown. Cannot use `return` inside defer expression.
+            if (self.exec("ROLLBACK")) |rb| {
+                c.PQclear(rb);
+            } else |_| {}
+        }
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const session_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(session_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, session_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(session_id.len) };
+
+        // 1. Messages
+        {
+            const q = try self.buildQuery("DELETE FROM {schema}.messages WHERE user_id = $1 AND session_id = $2");
+            defer self.allocator.free(q);
+            const r = try self.execParams(q, &params, &lengths);
+            c.PQclear(r);
+        }
+
+        // 2. Completion events
+        {
+            const q = try self.buildQuery("DELETE FROM {schema}.completion_events WHERE user_id = $1 AND session_id = $2");
+            defer self.allocator.free(q);
+            const r = try self.execParams(q, &params, &lengths);
+            c.PQclear(r);
+        }
+
+        // 3. Autosaved session-scoped memory artifacts (mirrors the LIKE
+        //    pattern from clearAutoSavedMemory but scoped to this session)
+        {
+            const q = try self.buildQuery(
+                "DELETE FROM {schema}.memories WHERE user_id = $1 AND memory_session_id = $2 " ++
+                    "AND (key LIKE 'autosave_user_%' OR key LIKE 'autosave_assistant_%')",
+            );
+            defer self.allocator.free(q);
+            const r = try self.execParams(q, &params, &lengths);
+            c.PQclear(r);
+        }
+
+        // 4. Sessions row itself — this is what listUserSessions reads from.
+        //    Without this, the UI would show "ghost" deleted sessions.
+        {
+            const q = try self.buildQuery("DELETE FROM {schema}.sessions WHERE user_id = $1 AND session_key = $2");
+            defer self.allocator.free(q);
+            const r = try self.execParams(q, &params, &lengths);
+            c.PQclear(r);
+        }
+
+        // COMMIT
+        const commit_result = try self.exec("COMMIT");
+        c.PQclear(commit_result);
     }
 
     pub fn saveCompletionEvent(
