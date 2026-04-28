@@ -36,8 +36,17 @@ pub const MemoryRecallTool = struct {
             return ToolResult.fail("Missing 'query' parameter");
         if (query.len == 0) return ToolResult.fail("'query' must not be empty");
 
+        // R18 (2026-04-28, Nova directive): "memory recall should be
+        // unlimited too, make sure the agent can remember at the right
+        // depth, my intuition: let the agent remember what he wants as
+        // much as he wants." Lifted hard cap 100 → 1000. The default
+        // when no limit specified stays 5 (agent's typical use). 1000
+        // is the upper bound to prevent a runaway query from
+        // exhausting memory; in practice, agents asking for >100
+        // results know what they're doing (deep research, full-history
+        // dump, etc.).
         const limit_raw = root.getInt(args, "limit") orelse 5;
-        const limit: usize = if (limit_raw > 0 and limit_raw <= 100) @intCast(limit_raw) else 5;
+        const limit: usize = if (limit_raw > 0 and limit_raw <= 1000) @intCast(limit_raw) else 5;
         const session_id = resolveSessionId(args) catch |err| switch (err) {
             error.InvalidScope => return ToolResult.fail("Invalid 'scope' parameter. Expected 'session' or 'global'."),
             error.InvalidSessionId => return ToolResult.fail("Invalid 'session_id' parameter. Must be non-empty when provided."),

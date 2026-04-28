@@ -670,9 +670,10 @@ test "applySettingsToConfig enables fast summarizer without changing fast preset
 
     // Mode-specific quality fields
     try std.testing.expectEqual(@as(f64, 0.5), cfg.default_temperature);
-    // Fast mode cap: 20 (raised from 8 after field testing — 8 truncated
-    // real multi-step tasks; adaptive loop detector keeps runaways bounded).
-    try std.testing.expectEqual(@as(u32, 20), cfg.agent.max_tool_iterations);
+    // R18 (2026-04-28, Nova directive — remove caps): bumped 20 → 100.
+    // Adaptive loop detector still catches pathological loops; cap is
+    // safety valve only.
+    try std.testing.expectEqual(@as(u32, 100), cfg.agent.max_tool_iterations);
     // max_response_tokens not applied — no hard cap on response length
     try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
     // Per-mode model/provider selection
@@ -697,9 +698,10 @@ test "applySettingsToConfig deep mode applies high-quality settings" {
     });
 
     try std.testing.expectEqual(@as(f64, 0.8), cfg.default_temperature);
-    // Deep mode cap: 100 (lowered from 500). 500 was effectively unbounded;
-    // 100 is a real safety valve with adaptive exits handling stuck loops.
-    try std.testing.expectEqual(@as(u32, 100), cfg.agent.max_tool_iterations);
+    // R18 (2026-04-28, Nova directive — remove caps): bumped 100 → 1000
+    // for deep. SWE-Bench-class autonomous coding loops legitimately run
+    // 200+ iterations; 1000 is "effectively unbounded for legitimate work."
+    try std.testing.expectEqual(@as(u32, 1000), cfg.agent.max_tool_iterations);
     // max_response_tokens not applied — no hard cap
     try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
     try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);

@@ -384,19 +384,23 @@ pub fn parseXmlToolCalls(
 
 /// Maximum characters per individual tool result output before truncation.
 ///
-/// **R11 raise (2026-04-27):** bumped from 8000 → 24000 after researcher
-/// pass found 8KB code files (e.g. `lane_metrics.zig` at 8.8KB) being
-/// truncated by ~10% — too aggressive for code review workflows. 24KB
-/// covers ~600 lines of typical Zig source while still leaving plenty
-/// of context budget on Kimi K2.5's 256K window (a single tool result
-/// at the cap is still <0.01% of window; many tool results per turn
-/// stay safely bounded by the per-turn iteration cap).
+/// **R11 raise (2026-04-27):** 8K → 24K after researcher pass found 8KB
+/// code files truncated.
 ///
-/// Original constraint (8K) was matched to OpenClaw's default — chosen
-/// for shorter-context models where any single tool result could fill
-/// the window. We're not in that regime; per-call caps should match
-/// today's window sizes.
-const MAX_TOOL_RESULT_CHARS: usize = 24000;
+/// **R18 (2026-04-28, Nova directive):** raised to 200K. Per Nova:
+/// "remove caps, why are we capping response — what if it's long?"
+/// On Kimi K2.5's 256K window, 200K per single tool result is the
+/// largest plausible legitimate return (a full source file, large
+/// memory recall, web page fetch). Beyond 200K is almost certainly
+/// noise/garbage — keeping a sanity ceiling here protects the
+/// context window from a single tool flooding it. The agent itself
+/// can still chunk its reads via offset/limit args when working with
+/// genuinely-larger artifacts.
+///
+/// Net effect: typical real-world tool returns (logs, code files,
+/// memory queries, search results) NEVER hit this cap now. Only
+/// pathological cases trigger truncation.
+const MAX_TOOL_RESULT_CHARS: usize = 200000;
 
 /// Truncate tool output to fit within the context budget.
 /// Keeps the first and last portions so the LLM sees both the beginning

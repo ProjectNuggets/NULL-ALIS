@@ -217,12 +217,19 @@ pub const ProductPresetsConfig = struct {
             // Adaptive exit (repeated-call detector) prevents runaways, so a
             // higher cap is safe. Still "fast" perceptually — most single-step
             // queries finish in 1-3 iterations.
-            .max_tool_iterations = 20,
+            // R18 (2026-04-28, Nova directive): "we can't time out
+            // anything, what if the agent needed to work longer."
+            // Bumped 20 → 100 for fast. Adaptive exits (loop_detected
+            // + repeated-call detector) catch pathological loops; the
+            // cap is just a final safety valve. 100 still feels "fast"
+            // perceptually because most fast-mode queries finish in
+            // 1-5 iterations.
+            .max_tool_iterations = 100,
             // Kimi K2.5 on Together for both fast and balanced modes.
             // Differentiation comes from agent loop parameters:
-            // Fast:     temp 0.5, 20 iterations,  queue_cap 8,  reasoning low
-            // Balanced: temp 0.7, 35 iterations, queue_cap 12, reasoning medium
-            // Deep uses GLM 5.1 for maximum depth on complex tasks.
+            // Fast:     temp 0.5, 100 iterations cap,  queue_cap 8,  reasoning low
+            // Balanced: temp 0.7, 200 iterations cap, queue_cap 12, reasoning medium
+            // Deep:     temp 0.8, 1000 iterations cap, queue_cap 20, reasoning high (GLM 5.1)
             .model = "moonshotai/Kimi-K2.5",
             .provider = "together",
             // Q3 (2026-04-27): fast = low reasoning effort. Trades thinking
@@ -246,11 +253,12 @@ pub const ProductPresetsConfig = struct {
             .queue_drop = "summarize",
             .queue_debounce_ms = 0,
             .temperature = 0.7,
-            // Raised 25→35 to match SOTA ranges (Claude Code ~50, OpenHands 30).
-            // Balanced users tackle multi-step research/execution tasks; the
-            // extra headroom covers real workflows without changing perceived
-            // pace (first-token latency is unchanged).
-            .max_tool_iterations = 35,
+            // R18 (2026-04-28, Nova directive): bumped 35 → 200 for
+            // balanced. Adaptive exits catch loops; cap is safety
+            // valve only. Real workflows (research + code +
+            // multi-tool) regularly hit 30-50 iterations on hard
+            // problems; 200 leaves comfortable headroom.
+            .max_tool_iterations = 200,
             // Kimi K2.5: top open-weight intelligence, strong multi-tool.
             // Together primary (org-prefixed ID), OpenRouter fallback.
             .model = "moonshotai/Kimi-K2.5",
@@ -277,13 +285,15 @@ pub const ProductPresetsConfig = struct {
             .queue_drop = "summarize",
             .queue_debounce_ms = 0,
             .temperature = 0.8,
-            // 100 is a real safety valve — previously 500 was effectively
-            // unbounded and masked loop bugs. Deep tasks legitimately need
-            // 30-60 iterations for SWE-Bench-style work; 100 leaves headroom
-            // without letting a pathological loop consume unlimited tokens.
-            // Adaptive exits (repeated-call + no-progress) handle premature
-            // termination for stuck agents, keeping the cap purely a guardrail.
-            .max_tool_iterations = 100,
+            // R18 (2026-04-28, Nova directive): bumped 100 → 1000 for
+            // deep. SWE-Bench-class autonomous coding loops legitimately
+            // run 200+ iterations across an 8-hour autonomous session.
+            // 1000 is "effectively unbounded for legitimate work" while
+            // still being a safety valve against pathological loops.
+            // Adaptive exits (loop_detected, repeated-call, no-progress)
+            // are the real guardrail; this cap exists only to prevent
+            // worst-case runaway.
+            .max_tool_iterations = 1000,
             // GLM 5.1: SOTA SWE-Bench Pro (58.4), 202K context, 65K output,
             // built for 8-hour autonomous execution loops.
             // Together primary. MiniMax M2.7 on Together as model fallback
