@@ -61,7 +61,7 @@ pub const ShellTool = struct {
 
         // Validate command against security policy
         if (self.policy) |pol| {
-            _ = pol.validateCommandExecution(command, false) catch |err| {
+            _ = pol.validateCommandExecution(command, false, self.sandbox_enabled) catch |err| {
                 return switch (err) {
                     error.CommandNotAllowed => ToolResult.fail("Command not allowed by security policy"),
                     error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),

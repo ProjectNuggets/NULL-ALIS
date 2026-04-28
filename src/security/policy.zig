@@ -150,14 +150,37 @@ pub const SecurityPolicy = struct {
     }
 
     /// Validate full command execution policy (allowlist + risk gate).
+    ///
+    /// `sandboxed` (default false): when true, the caller declares the command
+    /// will execute inside a real sandbox (bwrap/firejail/docker with
+    /// `--unshare-all` and per-call tmpfs /tmp). The relaxations applied:
+    ///
+    /// 1. **Allowlist check skipped.** Sandbox bounds escape: any command
+    ///    that would do damage outside the workspace can't reach outside.
+    ///    Network commands (curl/wget/etc.) fail naturally on net-namespace.
+    ///    Privileged commands (sudo/mount/etc.) fail naturally on user-ns.
+    ///
+    /// What is NOT relaxed (still applied even in sandboxed mode):
+    /// - Structural checks (oversized commands, subshell `$()`/backticks/
+    ///   `${}`, process substitution `<()`/`>()`, single-`&` chaining,
+    ///   output redirect `>`, `tee`, `find -exec`, `git config/-c`).
+    /// - High-risk command blocking (rm/dd/mkfs/etc.) — still blocked
+    ///   because clear errors beat "agent ran rm and your workspace is
+    ///   gone with no warning."
+    /// - Medium-risk approval requirement in supervised autonomy mode.
+    ///
+    /// Caller (typically shell.zig) passes `self.sandbox_enabled` here.
     pub fn validateCommandExecution(
         self: *const SecurityPolicy,
         command: []const u8,
         approved: bool,
+        sandboxed: bool,
     ) error{ CommandNotAllowed, HighRiskBlocked, ApprovalRequired }!CommandRiskLevel {
-        if (!self.isCommandAllowed(command)) {
-            return error.CommandNotAllowed;
-        }
+        const allowed = if (sandboxed)
+            self.isCommandAllowedSandboxed(command)
+        else
+            self.isCommandAllowed(command);
+        if (!allowed) return error.CommandNotAllowed;
 
         const risk = self.commandRiskLevel(command);
 
@@ -181,8 +204,19 @@ pub const SecurityPolicy = struct {
         return risk;
     }
 
-    /// Check if a shell command is allowed.
+    /// Check if a shell command is allowed (full policy: structural + allowlist).
     pub fn isCommandAllowed(self: *const SecurityPolicy, command: []const u8) bool {
+        return self.isCommandAllowedImpl(command, true);
+    }
+
+    /// Sandbox-relaxed allowance: structural checks still apply (no subshell,
+    /// no redirect, etc.) but the static command allowlist is skipped. Use
+    /// only when the command will run inside a real sandbox backend.
+    pub fn isCommandAllowedSandboxed(self: *const SecurityPolicy, command: []const u8) bool {
+        return self.isCommandAllowedImpl(command, false);
+    }
+
+    fn isCommandAllowedImpl(self: *const SecurityPolicy, command: []const u8, check_allowlist: bool) bool {
         if (self.autonomy == .read_only) return false;
 
         // Reject oversized commands — never silently truncate
@@ -239,16 +273,22 @@ pub const SecurityPolicy = struct {
 
             has_cmd = true;
 
-            var found = false;
-            for (self.allowed_commands) |allowed| {
-                if (std.mem.eql(u8, allowed, base_cmd)) {
-                    found = true;
-                    break;
+            if (check_allowlist) {
+                var found = false;
+                for (self.allowed_commands) |allowed| {
+                    if (std.mem.eql(u8, allowed, base_cmd)) {
+                        found = true;
+                        break;
+                    }
                 }
+                if (!found) return false;
             }
-            if (!found) return false;
 
-            // Block dangerous arguments for specific commands
+            // Block dangerous arguments for specific commands.
+            // Always applied — sandbox doesn't undo these (e.g. find -exec
+            // would launch subcommands inside the same sandbox, which is
+            // bounded but still surprising; git config can still set
+            // workspace-scoped malicious aliases).
             if (!isArgsSafe(base_cmd, cmd_part)) return false;
         }
 
@@ -718,10 +758,10 @@ test "validate command requires approval for medium risk" {
         .allowed_commands = &allowed,
     };
 
-    const denied = p.validateCommandExecution("touch test.txt", false);
+    const denied = p.validateCommandExecution("touch test.txt", false, false);
     try std.testing.expectError(error.ApprovalRequired, denied);
 
-    const ok = try p.validateCommandExecution("touch test.txt", true);
+    const ok = try p.validateCommandExecution("touch test.txt", true, false);
     try std.testing.expectEqual(CommandRiskLevel.medium, ok);
 }
 
@@ -731,8 +771,105 @@ test "validate command blocks high risk by default" {
         .autonomy = .supervised,
         .allowed_commands = &allowed,
     };
-    const result = p.validateCommandExecution("rm -rf /tmp/test", true);
+    const result = p.validateCommandExecution("rm -rf /tmp/test", true, false);
     try std.testing.expectError(error.HighRiskBlocked, result);
+}
+
+test "sandboxed mode skips allowlist for unknown safe commands" {
+    // Without sandbox: `tar` is not in default_allowed_commands, refused.
+    const p_strict = SecurityPolicy{};
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p_strict.validateCommandExecution("tar -tf archive.tar", false, false),
+    );
+
+    // With sandbox: same `tar` passes — escape is bounded by namespace.
+    const risk = try p_strict.validateCommandExecution("tar -tf archive.tar", false, true);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk);
+}
+
+test "sandboxed mode still blocks structural injection (subshell, redirect)" {
+    const p = SecurityPolicy{};
+    // Subshell expansion blocked even when sandboxed (clarity > convenience):
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("echo $(rm -rf /workspace)", false, true),
+    );
+    // Redirect blocked even when sandboxed:
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("ls > /tmp/out", false, true),
+    );
+    // Backticks blocked:
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("echo `whoami`", false, true),
+    );
+    // Single & background blocked:
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("ls & ls", false, true),
+    );
+}
+
+test "sandboxed mode still blocks high-risk commands (clarity > naturalfail)" {
+    // Even though `rm -rf /` would fail naturally inside the sandbox
+    // (read-only /usr, /workspace bound but no /), we keep blocking
+    // so the agent gets a clear policy error rather than confused exec
+    // failure.
+    const allowed = [_][]const u8{"rm"};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &allowed,
+    };
+    try std.testing.expectError(
+        error.HighRiskBlocked,
+        p.validateCommandExecution("rm -rf /tmp/test", true, true),
+    );
+}
+
+test "sandboxed mode keeps medium-risk approval gate in supervised" {
+    // medium-risk commands (touch, mkdir, mv, etc.) still require approval
+    // in supervised mode even when sandboxed — UX gate, not security.
+    const allowed = [_][]const u8{"touch"};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .allowed_commands = &allowed,
+    };
+    try std.testing.expectError(
+        error.ApprovalRequired,
+        p.validateCommandExecution("touch test.txt", false, true),
+    );
+    // Approved → medium risk returned.
+    const risk = try p.validateCommandExecution("touch test.txt", true, true);
+    try std.testing.expectEqual(CommandRiskLevel.medium, risk);
+}
+
+test "sandboxed mode allows arbitrary scripting languages" {
+    // perl, ruby, bash etc. are not in the default allowlist (rightly so
+    // for non-sandboxed). When sandboxed, they should pass since escape
+    // is bounded.
+    const p = SecurityPolicy{};
+    _ = try p.validateCommandExecution("perl -e 'print 1'", false, true);
+    _ = try p.validateCommandExecution("ruby -e 'puts 1'", false, true);
+    _ = try p.validateCommandExecution("bash script.sh", false, true);
+}
+
+test "sandboxed mode preserves arg-safety checks for find/git" {
+    const p = SecurityPolicy{};
+    // find -exec still blocked — it spawns subcommands inside the sandbox,
+    // which is bounded, but is a sharp edge worth flagging:
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("find . -exec rm {} +", false, true),
+    );
+    // git config still blocked — workspace-scoped malicious aliases hurt
+    // the user later even after the sandbox exits:
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("git config core.editor evil", false, true),
+    );
 }
 
 test "rate tracker starts at zero" {
@@ -906,7 +1043,7 @@ test "rm -rf root detected as high risk" {
 
 test "validate command not allowed returns error" {
     const p = SecurityPolicy{};
-    const result = p.validateCommandExecution("perl exploit.pl", false);
+    const result = p.validateCommandExecution("perl exploit.pl", false, false);
     try std.testing.expectError(error.CommandNotAllowed, result);
 }
 
@@ -917,13 +1054,13 @@ test "validate command full autonomy skips approval" {
         .require_approval_for_medium_risk = true,
         .allowed_commands = &allowed,
     };
-    const risk = try p.validateCommandExecution("touch test.txt", false);
+    const risk = try p.validateCommandExecution("touch test.txt", false, false);
     try std.testing.expectEqual(CommandRiskLevel.medium, risk);
 }
 
 test "validate low risk command passes without approval" {
     const p = SecurityPolicy{};
-    const risk = try p.validateCommandExecution("ls -la", false);
+    const risk = try p.validateCommandExecution("ls -la", false, false);
     try std.testing.expectEqual(CommandRiskLevel.low, risk);
 }
 
@@ -934,7 +1071,7 @@ test "validate high risk not blocked when setting off" {
         .block_high_risk_commands = false,
         .allowed_commands = &allowed,
     };
-    const risk = try p.validateCommandExecution("rm -rf /tmp", false);
+    const risk = try p.validateCommandExecution("rm -rf /tmp", false, false);
     try std.testing.expectEqual(CommandRiskLevel.high, risk);
 }
 
@@ -1175,7 +1312,16 @@ test "validateCommandExecution rejects oversized command" {
     var buf: [MAX_ANALYSIS_LEN + 1]u8 = undefined;
     @memset(&buf, 'A');
     @memcpy(buf[0..3], "ls ");
-    const result = p.validateCommandExecution(&buf, false);
+    const result = p.validateCommandExecution(&buf, false, false);
+    try std.testing.expectError(error.CommandNotAllowed, result);
+}
+
+test "sandboxed mode also rejects oversized command (structural check still applies)" {
+    const p = SecurityPolicy{};
+    var buf: [MAX_ANALYSIS_LEN + 1]u8 = undefined;
+    @memset(&buf, 'A');
+    @memcpy(buf[0..3], "ls ");
+    const result = p.validateCommandExecution(&buf, false, true);
     try std.testing.expectError(error.CommandNotAllowed, result);
 }
 
