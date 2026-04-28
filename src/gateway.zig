@@ -11915,20 +11915,36 @@ fn handleVoiceTranscribe(
 /// Allows: A-Z, a-z, 0-9, dot, dash, underscore, space. Max 200 chars.
 /// Rejects: slashes, backslashes, null bytes, leading dot, empty.
 fn isSafeAttachmentFilename(name: []const u8) bool {
-    if (name.len == 0 or name.len > 200) return false;
-    if (name[0] == '.') return false; // no hidden files, no .env
+    // SwissWatch (2026-04-28, Nova directive — last-mile polish):
+    // relaxed validation. Per Nova: "fix the filename to be better and
+    // allow all, why do we need this gate at all?" The gate exists ONLY
+    // to prevent path-traversal exploits that could escape the
+    // attachments/ directory and write to arbitrary filesystem paths.
+    // Everything else (parens, brackets, accents, emoji, UTF-8) is
+    // legitimate filesystem content and should pass through.
+    //
+    // Pre-fix rejected real-world image filenames like "image (1).png",
+    // "Screenshot [2026].png", "café.jpg" — browser-saved files commonly
+    // hit those chars.
+    //
+    // What stays blocked (path-traversal + system-corruption vectors):
+    //   - empty or > 255 bytes (POSIX filesystem limit on most kernels)
+    //   - leading '.' (hidden files; .env / .ssh / .config exfil bait)
+    //   - any byte < 0x20 (control chars including null, CR, LF, tab)
+    //   - 0x7f (DEL)
+    //   - '/' or '\' (path separator → cross-directory write)
+    //   - ".." anywhere (parent-traversal — even mid-name like
+    //     "a..b/c" breaks the contract)
+    if (name.len == 0 or name.len > 255) return false;
+    if (name[0] == '.') return false; // no hidden files
     for (name) |c| {
-        const ok = (c >= 'A' and c <= 'Z') or
-            (c >= 'a' and c <= 'z') or
-            (c >= '0' and c <= '9') or
-            c == '.' or c == '-' or c == '_' or c == ' ';
-        if (!ok) return false;
+        if (c < 0x20 or c == 0x7f) return false; // control chars
+        if (c == '/' or c == '\\') return false; // path separators
     }
-    // No consecutive dots (prevents ".." traversal via URL decode quirks)
-    var i: usize = 1;
-    while (i < name.len) : (i += 1) {
-        if (name[i] == '.' and name[i - 1] == '.') return false;
-    }
+    // Reject ".." anywhere (path traversal). This covers "../foo",
+    // "foo/../bar" (slash already blocked but be explicit), and
+    // ambiguous cases like "a..b" being interpreted by some tools.
+    if (std.mem.indexOf(u8, name, "..") != null) return false;
     return true;
 }
 
