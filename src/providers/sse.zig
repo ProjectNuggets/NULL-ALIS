@@ -216,6 +216,16 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     return null;
 }
 
+/// **R18+SwissWatch (2026-04-28)** — single source of truth for the
+/// stream timeout default. Used by both the curl fallback and the
+/// native HTTP path. Set generously: 1 hour bounds a TRULY broken
+/// connection while never bounding legitimate agent work (SWE-Bench-
+/// class autonomous loops can run 30+ minutes on a single inference).
+/// Per Nova directive: "we can't time out anything, what if the agent
+/// needed to work longer." User explicit override (any non-zero
+/// `request.timeout_secs`) still wins.
+pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 3600;
+
 /// Run curl in SSE streaming mode and parse output line by line.
 ///
 /// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
@@ -272,7 +282,7 @@ fn curl_stream_fallback(
     // Effectively: this is a "broken connection detector," not a
     // "the agent took too long" cap. If you ever hit 1 hour, something
     // is genuinely wrong upstream — NOT the agent thinking.
-    const effective_timeout: u64 = if (timeout_secs > 0) timeout_secs else 3600;
+    const effective_timeout: u64 = if (timeout_secs > 0) timeout_secs else DEFAULT_STREAM_TIMEOUT_SECS;
     var timeout_buf: [32]u8 = undefined;
     const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{effective_timeout}) catch unreachable;
     argv_buf[argc] = "--max-time";
@@ -854,7 +864,7 @@ fn native_stream(
     // rationale as the curl path above — bound a broken connection,
     // never bound legitimate agent work. SWE-Bench-class autonomous
     // loops can legitimately take 30+ minutes.
-    const timeout_ms: u32 = if (timeout_secs == 0) 3_600_000 else @intCast(@min(timeout_secs * 1000, std.math.maxInt(u32)));
+    const timeout_ms: u32 = if (timeout_secs == 0) @intCast(DEFAULT_STREAM_TIMEOUT_SECS * 1000) else @intCast(@min(timeout_secs * 1000, std.math.maxInt(u32)));
     const status_code = try http_native.stream_body(
         allocator,
         .{
