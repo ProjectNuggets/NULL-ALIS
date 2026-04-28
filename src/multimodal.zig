@@ -203,11 +203,35 @@ pub const DataUriImage = struct {
 /// Read a local image file, validate its size, and detect MIME type.
 /// Returns raw bytes and MIME type. Caller owns the returned `data` slice.
 /// Path is validated against `allowed_dirs` to prevent arbitrary file reads.
+///
+/// Relative-path resolution: relative paths are resolved against
+/// `config.allowed_dirs[*]` BEFORE falling back to process CWD. The agent's
+/// prompt teaches it to reference uploaded attachments via relative paths
+/// like `attachments/<filename>` (PR #69), which is correct relative to the
+/// user's workspace — but the gateway's process CWD is typically the runtime
+/// working dir (e.g. `/data/.nullalis/` on k8s pods), not the workspace.
+/// Resolving against allowed_dirs ensures `attachments/<name>` lands at
+/// `<workspace>/attachments/<name>` where the upload endpoint placed it.
 pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: MultimodalConfig) !ImageData {
     // Resolve to absolute path (realpathAlloc resolves ".." and symlinks)
-    const resolved = if (std.fs.path.isAbsolute(path))
-        std.fs.realpathAlloc(allocator, path) catch return error.PathNotFound
-    else blk: {
+    const resolved = blk: {
+        if (std.fs.path.isAbsolute(path)) {
+            break :blk std.fs.realpathAlloc(allocator, path) catch return error.PathNotFound;
+        }
+        // Try each allowed_dir as a base before falling back to CWD.
+        // First match wins; subsequent allowed_dirs are not tried.
+        for (config.allowed_dirs) |dir| {
+            const trimmed = std.mem.trimRight(u8, dir, "/\\");
+            if (trimmed.len == 0) continue;
+            const candidate = std.fs.path.join(allocator, &.{ trimmed, path }) catch continue;
+            defer allocator.free(candidate);
+            if (std.fs.realpathAlloc(allocator, candidate)) |r| {
+                break :blk r;
+            } else |_| continue;
+        }
+        // Backwards-compat: fall back to CWD-relative resolution. Existing
+        // callers that pass a path already relative to the gateway's CWD
+        // (rare, but possible for tests or operator scripts) keep working.
         break :blk std.fs.cwd().realpathAlloc(allocator, path) catch return error.PathNotFound;
     };
     defer allocator.free(resolved);
@@ -840,6 +864,67 @@ test "readLocalImage rejects when no allowed_dirs" {
 
     const err = readLocalImage(std.testing.allocator, file_path, .{});
     try std.testing.expectError(error.LocalReadNotAllowed, err);
+}
+
+test "readLocalImage resolves relative paths against allowed_dirs (workspace), not CWD" {
+    // Regression for the 2026-04-29 image-upload bug: agent prompt teaches
+    // relative `attachments/<filename>` references; readLocalImage was
+    // resolving against process CWD (gateway working dir on k8s pods),
+    // not against allowed_dirs (the user's workspace). This test pins the
+    // allowed_dirs-first resolution.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makeDir("attachments");
+    const png_bytes = "\x89PNG\x0d\x0a\x1a\x0a";
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "attachments/screenshot.png",
+        .data = png_bytes,
+    });
+    const workspace_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_path);
+
+    // Agent passes the relative path exactly as the prompt teaches it.
+    const relative_ref = "attachments/screenshot.png";
+
+    const allowed_dirs = [_][]const u8{workspace_path};
+    const cfg = MultimodalConfig{
+        .allowed_dirs = &allowed_dirs,
+    };
+
+    const result = try readLocalImage(std.testing.allocator, relative_ref, cfg);
+    defer std.testing.allocator.free(result.data);
+
+    try std.testing.expectEqualStrings("image/png", result.mime_type);
+    try std.testing.expectEqualSlices(u8, png_bytes, result.data);
+}
+
+test "readLocalImage handles filenames with spaces, brackets, accents in allowed_dirs branch" {
+    // Image-upload regression also surfaced via filenames the frontend
+    // produces from "Save As" dialogs (e.g.
+    // "ChatGPT Image Apr 25, 2026, 02:09:45 PM.png" with spaces +
+    // commas + colons-replaced-with-underscores by the upload sanitizer).
+    // PR #69 relaxed isSafeAttachmentFilename to allow these; this test
+    // pins that the multimodal read path also tolerates them.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makeDir("attachments");
+    const fname = "ChatGPT Image Apr 25_ 2026_ 02_09_45 PM.png";
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "attachments/ChatGPT Image Apr 25_ 2026_ 02_09_45 PM.png",
+        .data = "\x89PNG\x0d\x0a\x1a\x0a",
+    });
+    const workspace_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_path);
+
+    const allowed_dirs = [_][]const u8{workspace_path};
+    const cfg = MultimodalConfig{ .allowed_dirs = &allowed_dirs };
+
+    var rel_buf: [256]u8 = undefined;
+    const relative = try std.fmt.bufPrint(&rel_buf, "attachments/{s}", .{fname});
+
+    const result = try readLocalImage(std.testing.allocator, relative, cfg);
+    defer std.testing.allocator.free(result.data);
+    try std.testing.expectEqualStrings("image/png", result.mime_type);
 }
 
 test "prepareMessagesForProvider does not delete nullalis temp image files" {
