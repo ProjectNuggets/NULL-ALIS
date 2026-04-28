@@ -21,8 +21,17 @@ Completed audit deliverables from Sprint 14 (S14.3 DPA posture, S14.4 allocator,
 ### `archive/wave-plans/`
 Pre-V1 wave-based planning artifacts. The wave methodology evolved into the closure-checklist + sprint pattern. Kept for traceability.
 
+### `archive/cross-repo/`
+Sprint-era zaki-prod companion handoff prompts (PRs #9-#11 era). Closed sprints. Reference for "what was the BFF contract back then?"
+
+### `archive/sessions/`
+Self-contained session prompts from the multi-session sprint pattern (Sprint 1 spike runner, D11 DB integration, zaki-prod companion). All sessions completed; PRs merged.
+
+### `archive/releases/`
+Historical release-posture freezes: v0.1 declaration (2026-03-18), v0.1 public posture (2026-03-25), v1.1 next-steps plan. Superseded by V1 ship-readiness criteria + V1 triage.
+
 ### Top-level files in `archive/`
-Older strategy/planning docs from earlier project phases (v0.2, v0.7, plan-v02, etc.). Pre-dates the current v1 push.
+Older strategy/planning docs from earlier project phases (v0.2, v0.7, plan-v02, v1-productization-plan, etc.). Pre-dates or pre-shipped relative to the current v1 baseline.
 
 ## When to consult archive
 
@@ -35,7 +44,7 @@ Older strategy/planning docs from earlier project phases (v0.2, v0.7, plan-v02, 
 - Looking for current state → use `docs/` top-level
 - Looking for active deferred work → use `docs/deferred-register.md`
 - Looking for V1 ship status → use `docs/v1-ship-readiness-criteria.md`
-- Looking for current architecture decisions → use `docs/v1-mode-singleton-decision.md`, etc.
+- Looking for current architecture decisions → use `docs/v1-triage.md` and the various `*-contract.md` files at `docs/` top level
 
 ## What stays at `docs/` top level (not archived)
 
@@ -44,9 +53,8 @@ Living documents — updated as state changes:
 - `deferred-register.md` — open follow-up items with status
 - `v1-ship-readiness-criteria.md` — three-track close gate
 - `v1-triage.md` — V1-must / V1-nice / V1.5-defer per item
-- `v1-mode-singleton-decision.md` — current mode architecture decision
-- `v1-productization-plan.md` — productization roadmap
 - `v1-user-onboarding-flow.md` — onboarding spec
+- `post-compact-handoff-2026-04-28.md` — current pre/post-compact session bridge
 - `slash-commands-spec.md` — slash command catalog + UX spec
 - `SLO.md` — service level objectives
 - `migrations-policy.md` — schema migration policy

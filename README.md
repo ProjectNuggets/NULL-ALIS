@@ -27,12 +27,12 @@ Current verified baseline:
 - Chat SSE contract is stable, with additive `progress` events for live UX (`status/progress/token/done`).
 
 References:
-- [v0.1 public posture (2026-03-25)](docs/releases/v0.1-public-posture-2026-03-25.md)
+- [V1 ship-readiness criteria](docs/v1-ship-readiness-criteria.md)
+- [V1 triage (must / nice / defer)](docs/v1-triage.md)
 - [ZAKI runtime contract](docs/zaki-runtime-contract.md)
 - [ops runbook](docs/reliability-ops-runbook.md)
-- [v0.1 declaration (2026-03-18)](docs/releases/v0.1-declaration-2026-03-18.md)
-- [v1.1 next steps](docs/releases/v1.1-next-steps.md)
-- [historical archive note](docs/archive/historical-archive.md)
+- [SLO targets](docs/SLO.md)
+- [historical releases](docs/archive/releases/) — v0.1 declaration, public posture, v1.1 plan
 
 ## What nullALIS Is
 
@@ -116,9 +116,9 @@ Ops stack:
 - Reference manifests and handoff docs live under `deploy/k8s/zaki-bot/` for local/dev and contract reference.
 
 Current-truth rule:
-1. Read [v0.1 public posture](docs/releases/v0.1-public-posture-2026-03-25.md) first.
+1. Read [V1 ship-readiness criteria](docs/v1-ship-readiness-criteria.md) first.
 2. Use [ZAKI runtime contract](docs/zaki-runtime-contract.md) as the deployment/runtime contract.
-3. Treat `docs/reports/*` and `deploy/k8s/zaki-bot/*` as archive/reference unless a current document says otherwise.
+3. Treat `docs/archive/*` and `deploy/k8s/zaki-bot/*` as historical/reference unless a current document says otherwise.
 
 ## Architecture At a Glance
 
