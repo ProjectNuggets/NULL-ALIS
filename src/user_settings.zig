@@ -343,7 +343,29 @@ pub fn normalizeTenantConfigJson(
 }
 
 pub fn applySettingsToConfig(cfg: *Config, settings: ProductSettings) void {
-    const preset = presetForMode(settings.assistant_mode, cfg.product_presets);
+    // V1 single-mode gate (2026-04-28, Nova directive): regardless of
+    // user's assistant_mode setting (.fast / .balanced / .deep), apply
+    // the BALANCED preset. The fast/deep preset definitions stay in
+    // config_types.zig for future restoration; this gate is a single
+    // line to remove when modes come back.
+    //
+    // Decision rationale (see docs/v1-mode-singleton-decision.md):
+    //   - V1 is a beta product; mode-axis is over-engineering pre-PMF
+    //   - 90% of users live with default; mode picker is friction
+    //   - GLM model swap (deep) loses byte-stable prefix cache benefits
+    //   - Deletion + revert costs > gate-and-keep approach
+    //
+    // Trigger to remove this gate:
+    //   ≥10% of paying users hit max_tool_iterations cap, OR
+    //   ≥10% of paying users explicitly request faster/cheaper mode, OR
+    //   SWE-Bench evaluation shows balanced underperforms vs deep by ≥5pt
+    //
+    // The settings API still accepts .fast / .balanced / .deep (BFF
+    // JSON contract preserved); the field becomes display-only in the
+    // settings UI. zaki-prod hides the dropdown as a separate change.
+    const effective_mode = AssistantMode.balanced;
+    _ = settings.assistant_mode; // intentionally unused — see gate above
+    const preset = presetForMode(effective_mode, cfg.product_presets);
 
     cfg.agent.compact_context = preset.agent.compact_context;
     cfg.agent.max_history_messages = preset.agent.max_history_messages;
@@ -642,15 +664,17 @@ test "resolveSettingsFromConfigJson prefers canonical product settings" {
     try std.testing.expectEqual(@as(u32, 42), settings.session_timeout_minutes);
 }
 
-test "applySettingsToConfig enables fast summarizer without changing fast preset sizing" {
+test "V1 single-mode gate: fast input → balanced preset applied" {
+    // V1 (2026-04-28, Nova directive) — assistant_mode field stays in
+    // settings for BFF JSON contract continuity, but at apply-time
+    // ALL modes resolve to balanced. This test asserts the gate works:
+    // sending .fast no longer applies fast preset values.
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
         .default_model = "test/mock-model",
         .allocator = std.testing.allocator,
     };
-
-    try std.testing.expect(cfg.product_presets.fast.summarizer.enabled);
 
     applySettingsToConfig(&cfg, .{
         .assistant_mode = .fast,
@@ -660,28 +684,27 @@ test "applySettingsToConfig enables fast summarizer without changing fast preset
         .session_timeout_minutes = 30,
     });
 
+    // Balanced preset values applied regardless of .fast input:
     try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
-    try std.testing.expectEqual(@as(u32, 8), cfg.agent.queue_cap);
+    try std.testing.expectEqual(@as(u32, 12), cfg.agent.queue_cap); // balanced (was fast=8)
     try std.testing.expectEqualStrings("summarize", cfg.agent.queue_drop);
     try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);
-    try std.testing.expect(cfg.memory.summarizer.enabled);
-    try std.testing.expectEqual(@as(u32, 3000), cfg.memory.summarizer.window_size_tokens);
-    try std.testing.expectEqual(@as(u32, 300), cfg.memory.summarizer.summary_max_tokens);
-
-    // Mode-specific quality fields
-    try std.testing.expectEqual(@as(f64, 0.5), cfg.default_temperature);
-    // R18 (2026-04-28, Nova directive — remove caps): bumped 20 → 100.
-    // Adaptive loop detector still catches pathological loops; cap is
-    // safety valve only.
-    try std.testing.expectEqual(@as(u32, 100), cfg.agent.max_tool_iterations);
-    // max_response_tokens not applied — no hard cap on response length
+    try std.testing.expectEqual(@as(f64, 0.7), cfg.default_temperature); // balanced (was fast=0.5)
+    try std.testing.expectEqual(@as(u32, 200), cfg.agent.max_tool_iterations); // balanced (was fast=100)
     try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
-    // Per-mode model/provider selection
     try std.testing.expectEqualStrings("moonshotai/Kimi-K2.5", cfg.default_model.?);
     try std.testing.expectEqualStrings("together", cfg.default_provider);
+    // Summarizer values: balanced (was fast=3000/300)
+    try std.testing.expect(cfg.memory.summarizer.enabled);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.memory.summarizer.window_size_tokens);
+    try std.testing.expectEqual(@as(u32, 500), cfg.memory.summarizer.summary_max_tokens);
 }
 
-test "applySettingsToConfig deep mode applies high-quality settings" {
+test "V1 single-mode gate: deep input → balanced preset applied" {
+    // Same gate. Even .deep maps to balanced at runtime. This is the
+    // "preserve the model and prompt cache" win — no GLM swap, no
+    // byte-stable prefix reset. To restore deep mode, remove the
+    // gate at applySettingsToConfig:346.
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
@@ -697,18 +720,15 @@ test "applySettingsToConfig deep mode applies high-quality settings" {
         .session_timeout_minutes = 60,
     });
 
-    try std.testing.expectEqual(@as(f64, 0.8), cfg.default_temperature);
-    // R18 (2026-04-28, Nova directive — remove caps): bumped 100 → 1000
-    // for deep. SWE-Bench-class autonomous coding loops legitimately run
-    // 200+ iterations; 1000 is "effectively unbounded for legitimate work."
-    try std.testing.expectEqual(@as(u32, 1000), cfg.agent.max_tool_iterations);
-    // max_response_tokens not applied — no hard cap
+    // Balanced values, NOT deep:
+    try std.testing.expectEqual(@as(f64, 0.7), cfg.default_temperature); // balanced (was deep=0.8)
+    try std.testing.expectEqual(@as(u32, 200), cfg.agent.max_tool_iterations); // balanced (was deep=1000)
     try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
     try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);
     try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
-    try std.testing.expectEqual(@as(u32, 8000), cfg.memory.summarizer.window_size_tokens);
-    // Per-mode model/provider selection
-    try std.testing.expectEqualStrings("zai-org/GLM-5.1", cfg.default_model.?);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.memory.summarizer.window_size_tokens); // balanced (was deep=8000)
+    // Critical: model stays Kimi (NOT GLM). Preserves prompt cache + bundle stability.
+    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.5", cfg.default_model.?);
     try std.testing.expectEqualStrings("together", cfg.default_provider);
 }
 
