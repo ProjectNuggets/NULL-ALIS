@@ -1716,7 +1716,7 @@ const ManagerImpl = struct {
     ///   1. messages (per session_id)
     ///   2. completion_events (per session_id)
     ///   3. autosaved memory rows (autosave_user_*, autosave_assistant_* with
-    ///      memory_session_id matching)
+    ///      session_id matching)
     ///   4. sessions row itself (this is the one the UI list reads from)
     ///
     /// Idempotent: if zero rows match, returns success — caller can call this
@@ -1761,7 +1761,7 @@ const ManagerImpl = struct {
         //    pattern from clearAutoSavedMemory but scoped to this session)
         {
             const q = try self.buildQuery(
-                "DELETE FROM {schema}.memories WHERE user_id = $1 AND memory_session_id = $2 " ++
+                "DELETE FROM {schema}.memories WHERE user_id = $1 AND session_id = $2 " ++
                     "AND (key LIKE 'autosave_user_%' OR key LIKE 'autosave_assistant_%')",
             );
             defer self.allocator.free(q);
@@ -4218,4 +4218,54 @@ test "postgres_pool_releases_on_exec_error" {
     const after_recovery = mgr.debugPoolSnapshot();
     try std.testing.expectEqual(@as(u32, 0), after_recovery.in_use);
     try std.testing.expect(after_recovery.open_conns <= after_recovery.pool_max);
+}
+
+test "postgres deleteSession removes thread durable state and preserves non-autosave memories" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try initPostgresTestManagerWithPool(allocator, 2, 500);
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const session_id = "agent:zaki-bot:user:2:thread:delete-me";
+
+    try mgr.saveSessionMessage(2, session_id, "user", "hello");
+    const event_id = try mgr.saveCompletionEvent(allocator, 2, session_id, "telegram", "acct-2", "chat-2", "sent");
+    defer allocator.free(event_id);
+    try mgr.upsertMemory(2, "autosave_user_123", "ephemeral", .conversation, session_id);
+    try mgr.upsertMemory(2, "kept_core", "durable", .core, session_id);
+
+    const sessions_before = try mgr.listUserSessions(allocator, 2);
+    defer {
+        for (sessions_before) |info| info.deinit(allocator);
+        allocator.free(sessions_before);
+    }
+    try std.testing.expectEqual(@as(usize, 2), sessions_before.len);
+
+    try mgr.deleteSession(2, session_id);
+
+    const messages_after = try mgr.loadSessionMessages(allocator, 2, session_id);
+    defer memory_root.freeMessages(allocator, messages_after);
+    try std.testing.expectEqual(@as(usize, 0), messages_after.len);
+
+    const events_after = try mgr.loadCompletionEvents(allocator, 2, session_id);
+    defer memory_root.freeCompletionEvents(allocator, events_after);
+    try std.testing.expectEqual(@as(usize, 0), events_after.len);
+
+    const autosave_after = try mgr.getMemory(allocator, 2, "autosave_user_123");
+    try std.testing.expect(autosave_after == null);
+
+    var kept_core_after = (try mgr.getMemory(allocator, 2, "kept_core")).?;
+    defer kept_core_after.deinit(allocator);
+    try std.testing.expectEqualStrings("durable", kept_core_after.content);
+    try std.testing.expect(kept_core_after.session_id == null);
+
+    const sessions_after = try mgr.listUserSessions(allocator, 2);
+    defer {
+        for (sessions_after) |info| info.deinit(allocator);
+        allocator.free(sessions_after);
+    }
+    try std.testing.expectEqual(@as(usize, 1), sessions_after.len);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:2:main", sessions_after[0].session_key);
 }
