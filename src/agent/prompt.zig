@@ -712,21 +712,23 @@ fn buildResponseProtocolSection(w: anytype) !void {
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("## Channel Attachments\n\n");
-    try w.writeAll("**You CAN send images, videos, audio, and files. Two paths, choose by source:**\n\n");
+    try w.writeAll("**You CAN send images, videos, audio, and files to any channel that supports it. The user asks; you deliver.** Two paths, choose by source:\n\n");
     try w.writeAll("**Path 1 — Markers in your reply (for workspace-local files):**\n");
-    try w.writeAll("- On marker-aware channels (Telegram, Signal, Mattermost), emit a marker in your final reply text and the channel handler uploads the file as a real attachment.\n");
+    try w.writeAll("- Emit a marker in your final reply text. Channel handlers that support markers strip them and upload the file as a real attachment using the channel's native API.\n");
     try w.writeAll("- File/document: `[FILE:/absolute/path/to/file.ext]` or `[DOCUMENT:/absolute/path/to/file.ext]`\n");
     try w.writeAll("- Image/video/audio/voice: `[IMAGE:/abs/path]`, `[VIDEO:/abs/path]`, `[AUDIO:/abs/path]`, `[VOICE:/abs/path]`\n");
+    try w.writeAll("- Marker support today: Telegram, Signal, Mattermost (full), Discord/WhatsApp (partial). On channels without marker support yet (Slack, Email, IRC, Matrix, Line, Lark, iMessage, OneBot, QQ), the marker text appears literally in the reply and the user sees the path — workable as a fallback while V1.5 adds native handlers.\n");
     try w.writeAll("- If user gives `~/...`, expand it to the absolute home path before sending.\n\n");
     try w.writeAll("**Path 2 — `message` tool with `image_url` (for public HTTPS URLs):**\n");
-    try w.writeAll("- When you have a public URL (e.g. the URL returned by `image_generate`'s `Download:` line), call the `message` tool with `image_url=\"https://...\"` and Telegram fetches the URL server-side.\n");
-    try w.writeAll("- Use this when the user explicitly asks \"send me the image on telegram\" / \"send to my chat\" — the URL path is direct, no marker emission needed.\n");
-    try w.writeAll("- `content` becomes the photo caption (Telegram caps captions at 1024 chars). Empty content is OK (image-only).\n\n");
+    try w.writeAll("- When you have a public URL (e.g. the `Download:` URL from `image_generate`'s output), call the `message` tool with `image_url=\"https://...\"` and the channel's API fetches the URL server-side.\n");
+    try w.writeAll("- Use this when you have a URL handy and the user says \"send me the image on <channel>\" — direct API call, no marker emission needed.\n");
+    try w.writeAll("- `content` becomes the photo caption when supported (Telegram caps at 1024 chars; other channels vary). Empty content is OK (image-only).\n");
+    try w.writeAll("- Channel coverage today: Telegram via sendPhoto. Other channels' image_url support is V1.5 follow-up — for them, prefer Path 1 markers.\n\n");
     try w.writeAll("**Common flow — generate then deliver:**\n");
-    try w.writeAll("1. Call `image_generate` with the user's prompt → returns markdown + a `Saved:` workspace path + a `Download:` HTTPS URL.\n");
+    try w.writeAll("1. Call `image_generate` with the user's prompt → returns markdown + a `Saved:` workspace path (under `<workspace>/images/`) + a `Download:` HTTPS URL.\n");
     try w.writeAll("2. To render inline in the chat UI: include the markdown in your reply (the UI renders the image).\n");
-    try w.writeAll("3. To deliver as a Telegram attachment: either emit `[IMAGE:<saved-path>]` in your reply (Path 1, multipart upload), or call `message` tool with `image_url=<download-url>` (Path 2, URL passthrough).\n\n");
-    try w.writeAll("**Do NOT claim attachment sending is unavailable.** Both paths are wired; the failure is yours if you say \"I can't send images.\"\n\n");
+    try w.writeAll("3. To deliver to a chat channel: prefer `[IMAGE:<saved-path>]` markers in your reply (Path 1, broadest coverage). Use the `message` tool with `image_url=<download-url>` only when explicitly targeting a channel you know supports it (Telegram today).\n\n");
+    try w.writeAll("**Do NOT claim attachment sending is unavailable.** The capability exists; pick the right path and try. If a path doesn't work on a specific channel, surface the actual failure to the user — don't refuse outright.\n\n");
 }
 
 /// Append available skills with progressive loading.
