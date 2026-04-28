@@ -20239,7 +20239,9 @@ test "tenant preference application uses operator-owned assistant mode presets" 
     });
 
     try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
-    try std.testing.expectEqual(@as(u32, 20), cfg.agent.queue_cap);
+    // V1 single-mode gate (2026-04-28): even with .deep input, balanced
+    // preset values are applied. queue_cap=12 (balanced), not 20 (deep).
+    try std.testing.expectEqual(@as(u32, 12), cfg.agent.queue_cap);
     try std.testing.expectEqualStrings("summarize", cfg.agent.queue_drop);
     try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);
     try std.testing.expectEqualStrings("always", cfg.agent.activation_mode);
@@ -20248,8 +20250,9 @@ test "tenant preference application uses operator-owned assistant mode presets" 
     try std.testing.expect(cfg.agent.tts_audio);
     try std.testing.expectEqual(@as(?u64, 2700), cfg.agent.session_ttl_secs);
     try std.testing.expect(cfg.memory.summarizer.enabled);
-    try std.testing.expectEqual(@as(u32, 8000), cfg.memory.summarizer.window_size_tokens);
-    try std.testing.expectEqual(@as(u32, 700), cfg.memory.summarizer.summary_max_tokens);
+    // V1 single-mode gate: balanced summarizer values, not deep (5000/500 vs 8000/700).
+    try std.testing.expectEqual(@as(u32, 5000), cfg.memory.summarizer.window_size_tokens);
+    try std.testing.expectEqual(@as(u32, 500), cfg.memory.summarizer.summary_max_tokens);
     try std.testing.expect(cfg.memory.summarizer.auto_extract_semantic);
     try std.testing.expect(!cfg.session.cross_channel_shared_main);
 }
