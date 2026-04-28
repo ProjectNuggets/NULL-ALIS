@@ -712,11 +712,21 @@ fn buildResponseProtocolSection(w: anytype) !void {
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("## Channel Attachments\n\n");
-    try w.writeAll("- On marker-aware channels (for example Telegram), you can send real attachments by emitting markers in your final reply.\n");
+    try w.writeAll("**You CAN send images, videos, audio, and files. Two paths, choose by source:**\n\n");
+    try w.writeAll("**Path 1 — Markers in your reply (for workspace-local files):**\n");
+    try w.writeAll("- On marker-aware channels (Telegram, Signal, Mattermost), emit a marker in your final reply text and the channel handler uploads the file as a real attachment.\n");
     try w.writeAll("- File/document: `[FILE:/absolute/path/to/file.ext]` or `[DOCUMENT:/absolute/path/to/file.ext]`\n");
     try w.writeAll("- Image/video/audio/voice: `[IMAGE:/abs/path]`, `[VIDEO:/abs/path]`, `[AUDIO:/abs/path]`, `[VOICE:/abs/path]`\n");
-    try w.writeAll("- If user gives `~/...`, expand it to the absolute home path before sending.\n");
-    try w.writeAll("- Do not claim attachment sending is unavailable when these markers are supported.\n\n");
+    try w.writeAll("- If user gives `~/...`, expand it to the absolute home path before sending.\n\n");
+    try w.writeAll("**Path 2 — `message` tool with `image_url` (for public HTTPS URLs):**\n");
+    try w.writeAll("- When you have a public URL (e.g. the URL returned by `image_generate`'s `Download:` line), call the `message` tool with `image_url=\"https://...\"` and Telegram fetches the URL server-side.\n");
+    try w.writeAll("- Use this when the user explicitly asks \"send me the image on telegram\" / \"send to my chat\" — the URL path is direct, no marker emission needed.\n");
+    try w.writeAll("- `content` becomes the photo caption (Telegram caps captions at 1024 chars). Empty content is OK (image-only).\n\n");
+    try w.writeAll("**Common flow — generate then deliver:**\n");
+    try w.writeAll("1. Call `image_generate` with the user's prompt → returns markdown + a `Saved:` workspace path + a `Download:` HTTPS URL.\n");
+    try w.writeAll("2. To render inline in the chat UI: include the markdown in your reply (the UI renders the image).\n");
+    try w.writeAll("3. To deliver as a Telegram attachment: either emit `[IMAGE:<saved-path>]` in your reply (Path 1, multipart upload), or call `message` tool with `image_url=<download-url>` (Path 2, URL passthrough).\n\n");
+    try w.writeAll("**Do NOT claim attachment sending is unavailable.** Both paths are wired; the failure is yours if you say \"I can't send images.\"\n\n");
 }
 
 /// Append available skills with progressive loading.
@@ -1098,7 +1108,11 @@ test "buildSystemPrompt includes channel attachment marker guidance" {
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Attachments") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[FILE:/absolute/path/to/file.ext]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not claim attachment sending is unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do NOT claim attachment sending is unavailable") != null);
+    // Path 2 (URL via message tool) added 2026-04-29 alongside the
+    // sendPhoto extension. Both paths must remain documented.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "image_url") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "image_generate") != null);
 }
 
 test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {

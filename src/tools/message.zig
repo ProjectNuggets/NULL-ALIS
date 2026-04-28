@@ -21,9 +21,9 @@ pub const MessageTool = struct {
     outbound_allocator: ?std.mem.Allocator = null,
 
     pub const tool_name = "message";
-    pub const tool_description = "Send an explicit outbound message to a channel or the current conversation. Do not treat it as a heartbeat default.";
+    pub const tool_description = "Send an explicit outbound message to a channel or the current conversation. Optionally attach an image by URL (e.g. the URL returned from image_generate). Do not treat as a heartbeat default.";
     pub const tool_params =
-        \\{"type":"object","properties":{"content":{"type":"string","minLength":1,"description":"Message text to send"},"channel":{"type":"string","description":"Target channel (telegram, discord, slack, etc.). Defaults to current."},"account_id":{"type":"string","description":"Target account for multi-account channels. Defaults to current account."},"chat_id":{"type":"string","description":"Target chat/room ID. Defaults to current."}},"required":["content"]}
+        \\{"type":"object","properties":{"content":{"type":"string","description":"Message text. When image_url is set, this becomes the caption (Telegram limits captions to 1024 chars). May be empty when image_url is set."},"image_url":{"type":"string","description":"Optional public HTTPS URL of an image to attach. Telegram fetches it server-side. Use the URL from image_generate's output (the 'Download:' line). Workspace-local file paths are not yet supported here — only public URLs."},"channel":{"type":"string","description":"Target channel (telegram, discord, slack, etc.). Defaults to current."},"account_id":{"type":"string","description":"Target account for multi-account channels. Defaults to current account."},"chat_id":{"type":"string","description":"Target chat/room ID. Defaults to current."}},"required":["content"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -78,8 +78,25 @@ pub const MessageTool = struct {
         const content = root.getString(args, "content") orelse
             return ToolResult.fail("Missing required 'content' parameter");
 
-        if (std.mem.trim(u8, content, " \t\n\r").len == 0)
-            return ToolResult.fail("'content' must not be empty");
+        // Optional image attachment (Telegram sendPhoto / future channel parity).
+        // Only public HTTPS URLs are accepted today — Telegram fetches the URL
+        // server-side. Workspace-local file paths require multipart upload
+        // which is a follow-up.
+        const image_url_raw = root.getString(args, "image_url");
+        const image_url: ?[]const u8 = blk: {
+            if (image_url_raw) |raw| {
+                const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+                if (trimmed.len == 0) break :blk null;
+                if (!std.mem.startsWith(u8, trimmed, "https://")) {
+                    return ToolResult.fail("image_url must be a public HTTPS URL (got non-https)");
+                }
+                break :blk trimmed;
+            }
+            break :blk null;
+        };
+
+        if (image_url == null and std.mem.trim(u8, content, " \t\n\r").len == 0)
+            return ToolResult.fail("'content' must not be empty when image_url is not provided");
 
         const msg_turn_ctx = current_turn_context;
         const runtime_turn_ctx = root.getTurnContext();
@@ -167,18 +184,18 @@ pub const MessageTool = struct {
         // This provides immediate success/failure instead of "queued" semantics,
         // and avoids account mismatch drops in the async dispatcher path.
         if (is_telegram_channel and can_direct_telegram and !is_background_origin) {
-            return send_telegram_direct(allocator, content, account_id, chat_id_opt);
+            return send_telegram_direct(allocator, content, account_id, chat_id_opt, image_url);
         }
         // Background turns should primarily use bus dispatch, but allow a direct
         // fallback when bus wiring is unavailable for this runtime lane.
         if (is_telegram_channel and can_direct_telegram and is_background_origin and self.event_bus == null) {
-            return send_telegram_direct(allocator, content, account_id, chat_id_opt);
+            return send_telegram_direct(allocator, content, account_id, chat_id_opt, image_url);
         }
         if (self.event_bus == null and is_telegram_channel) {
             if (is_background_origin) {
                 return ToolResult.fail("Background Telegram send requires event bus dispatch");
             }
-            return send_telegram_direct(allocator, content, account_id, chat_id_opt);
+            return send_telegram_direct(allocator, content, account_id, chat_id_opt, image_url);
         }
 
         const chat_id = chat_id_opt orelse
@@ -221,7 +238,7 @@ pub const MessageTool = struct {
         event_bus.publishOutbound(msg) catch {
             msg.deinit(outbound_allocator);
             if (is_telegram_channel and can_direct_telegram and is_background_origin) {
-                return send_telegram_direct(allocator, content, account_id, chat_id_opt);
+                return send_telegram_direct(allocator, content, account_id, chat_id_opt, image_url);
             }
             return ToolResult.fail("Bus is closed, cannot send message");
         };
@@ -251,6 +268,7 @@ pub const MessageTool = struct {
         content: []const u8,
         requested_account_id: ?[]const u8,
         requested_chat_id: ?[]const u8,
+        image_url: ?[]const u8,
     ) ToolResult {
         const tenant_ctx = root.getTenantContext();
         const has_postgres_tenant = tenant_ctx.state_mgr != null and tenant_ctx.numeric_user_id != null;
@@ -278,8 +296,17 @@ pub const MessageTool = struct {
         const resolved_chat_id = resolved.target_id orelse
             return ToolResult.fail("Telegram chat is not connected");
 
-        const url = std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{token}) catch
-            return ToolResult.fail("Failed to build Telegram API URL");
+        // Branch on whether an image is attached:
+        // - sendPhoto with `photo` URL + optional `caption` (Telegram fetches the
+        //   URL server-side; caption capped at 1024 chars by Telegram, we
+        //   don't pre-truncate and let API surface the error).
+        // - sendMessage with `text` for text-only.
+        const endpoint = if (image_url != null) "sendPhoto" else "sendMessage";
+        const url = std.fmt.allocPrint(
+            allocator,
+            "https://api.telegram.org/bot{s}/{s}",
+            .{ token, endpoint },
+        ) catch return ToolResult.fail("Failed to build Telegram API URL");
         defer allocator.free(url);
 
         var body: std.ArrayListUnmanaged(u8) = .empty;
@@ -287,9 +314,24 @@ pub const MessageTool = struct {
         body.appendSlice(allocator, "{") catch return ToolResult.fail("Failed to allocate Telegram request");
         json_util.appendJsonKeyValue(&body, allocator, "chat_id", resolved_chat_id) catch
             return ToolResult.fail("Failed to encode Telegram chat_id");
-        body.appendSlice(allocator, ",") catch return ToolResult.fail("Failed to encode Telegram request");
-        json_util.appendJsonKeyValue(&body, allocator, "text", content) catch
-            return ToolResult.fail("Failed to encode Telegram text");
+
+        if (image_url) |img| {
+            body.appendSlice(allocator, ",") catch return ToolResult.fail("Failed to encode Telegram request");
+            json_util.appendJsonKeyValue(&body, allocator, "photo", img) catch
+                return ToolResult.fail("Failed to encode Telegram photo URL");
+            // Caption only when content is non-empty. Telegram tolerates omitted
+            // caption fine; an empty-string caption is also harmless but cleaner
+            // to omit.
+            if (std.mem.trim(u8, content, " \t\n\r").len > 0) {
+                body.appendSlice(allocator, ",") catch return ToolResult.fail("Failed to encode Telegram request");
+                json_util.appendJsonKeyValue(&body, allocator, "caption", content) catch
+                    return ToolResult.fail("Failed to encode Telegram caption");
+            }
+        } else {
+            body.appendSlice(allocator, ",") catch return ToolResult.fail("Failed to encode Telegram request");
+            json_util.appendJsonKeyValue(&body, allocator, "text", content) catch
+                return ToolResult.fail("Failed to encode Telegram text");
+        }
         body.appendSlice(allocator, "}") catch return ToolResult.fail("Failed to finalize Telegram request");
 
         const response = http_util.request_with_mode(allocator, .{ .mode = .curl_only }, .{
@@ -312,17 +354,22 @@ pub const MessageTool = struct {
             return ToolResult.fail("Telegram API rejected message");
         }
 
-        if (std.fmt.allocPrint(
-            allocator,
-            "Message delivered to telegram:{s} ({d} chars)",
-            .{
-                resolved_chat_id,
-                content.len,
-            },
-        )) |msg| {
+        const result_msg = if (image_url != null)
+            std.fmt.allocPrint(
+                allocator,
+                "Photo delivered to telegram:{s} (caption {d} chars)",
+                .{ resolved_chat_id, content.len },
+            )
+        else
+            std.fmt.allocPrint(
+                allocator,
+                "Message delivered to telegram:{s} ({d} chars)",
+                .{ resolved_chat_id, content.len },
+            );
+        if (result_msg) |msg| {
             return ToolResult.ok(msg);
         } else |_| {
-            return ToolResult.ok("Message delivered to telegram");
+            return ToolResult.ok(if (image_url != null) "Photo delivered to telegram" else "Message delivered to telegram");
         }
     }
 
@@ -406,7 +453,46 @@ test "MessageTool execute with empty content fails" {
     defer parsed.deinit();
     const result = try mt.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
-    try testing.expectEqualStrings("'content' must not be empty", result.error_msg.?);
+    try testing.expectEqualStrings("'content' must not be empty when image_url is not provided", result.error_msg.?);
+}
+
+test "MessageTool execute with empty content + image_url accepted (caption-less photo)" {
+    // Regression for the 2026-04-29 image-send addition: empty content is
+    // permitted when image_url is provided (Telegram tolerates a captionless
+    // sendPhoto). The test path deliberately omits chat_id so we land at the
+    // static "No chat_id specified" failure instead of the bus dispatch
+    // (which would allocate a bus.Outbound that the test's drainless bus
+    // can't free without a consumer).
+    resetTestTurnContext();
+    defer resetTestTurnContext();
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
+    const parsed = try root.parseTestArgs(
+        "{\"content\":\"\",\"channel\":\"telegram\",\"image_url\":\"https://example.com/img.png\"}",
+    );
+    defer parsed.deinit();
+    const result = try mt.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    // The failure must NOT be the empty-content gate — that's the regression
+    // we're pinning. Any downstream failure (no chat_id, no tenant) is fine.
+    try testing.expect(result.error_msg != null);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "must not be empty") == null);
+}
+
+test "MessageTool execute rejects non-https image_url" {
+    resetTestTurnContext();
+    defer resetTestTurnContext();
+    var event_bus = bus.Bus.init();
+    defer event_bus.close();
+    var mt = MessageTool{ .event_bus = &event_bus, .outbound_allocator = testing.allocator };
+    const parsed = try root.parseTestArgs(
+        "{\"content\":\"hi\",\"channel\":\"telegram\",\"chat_id\":\"c1\",\"image_url\":\"http://insecure.example.com/x.png\"}",
+    );
+    defer parsed.deinit();
+    const result = try mt.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("image_url must be a public HTTPS URL (got non-https)", result.error_msg.?);
 }
 
 test "MessageTool S7.8 rejects cross-channel send without allow_channel_override" {
