@@ -31,20 +31,14 @@ fn parseAssistantModePresetConfig(
             if (agent_val.object.get("compact_context")) |v| if (v == .bool) {
                 target.agent.compact_context = v.bool;
             };
-            if (agent_val.object.get("max_history_messages")) |v| if (v == .integer and v.integer >= 0) {
-                // Q1 (2026-04-27, Nova directive): trust compaction, not message-count.
-                // Field accepted from JSON for backwards-compat, but forced to 0
-                // (uncapped) at runtime. Compaction (50% of model window trigger,
-                // 3-pass escalation, force_compress emergency) is the sole
-                // context governor. Cap-driven truncation competed with
-                // compaction's principled work and fired before compaction had
-                // a chance to summarize — architectural contradiction removed.
-                if (v.integer != 0) {
-                    const log = std.log.scoped(.config);
-                    log.warn("config.agent.max_history_messages={d} ignored — message-count cap deprecated 2026-04-27; compaction is the sole context governor (Q1 directive)", .{v.integer});
-                }
-                target.agent.max_history_messages = 0;
-            };
+            // SwissWatch (2026-04-28): `max_history_messages` parse path
+            // REMOVED at the JSON boundary. Q1 deprecated the field;
+            // R18+SwissWatch deletes the parse handler. Unknown fields
+            // are silently skipped by Zig's default JSON parser, so old
+            // BFF payloads containing `max_history_messages: N` parse
+            // cleanly with the field ignored. The struct field stays
+            // (default 0; compaction is sole context governor) for
+            // back-compat with internal serializers.
             if (agent_val.object.get("queue_mode")) |v| if (v == .string) {
                 target.agent.queue_mode = try self.allocator.dupe(u8, v.string);
             };
@@ -810,18 +804,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("max_tool_iterations")) |v| {
                 if (v == .integer) self.agent.max_tool_iterations = @intCast(v.integer);
             }
-            if (ag.object.get("max_history_messages")) |v| {
-                // Q1 (2026-04-27): same deprecation as the product_settings
-                // path above — accept-but-force-0. Compaction is the sole
-                // governor. See companion comment in deriveAgentFromProductSettings.
-                if (v == .integer) {
-                    if (v.integer != 0) {
-                        const log = std.log.scoped(.config);
-                        log.warn("config.agent.max_history_messages={d} ignored — message-count cap deprecated 2026-04-27 (Q1 directive)", .{v.integer});
-                    }
-                    self.agent.max_history_messages = 0;
-                }
-            }
+            // SwissWatch (2026-04-28): max_history_messages parse path
+            // REMOVED. See companion comment in
+            // deriveAgentFromProductSettings. Field silently ignored;
+            // struct default (0) is the only runtime value.
             if (ag.object.get("parallel_tools")) |v| {
                 if (v == .bool) self.agent.parallel_tools = v.bool;
             }
