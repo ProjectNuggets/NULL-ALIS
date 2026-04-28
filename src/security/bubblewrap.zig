@@ -26,7 +26,14 @@ pub const BubblewrapSandbox = struct {
 
     fn wrapCommand(ptr: *anyopaque, argv: []const []const u8, buf: [][]const u8) anyerror![]const []const u8 {
         const self = resolve(ptr);
-        // bwrap --ro-bind /usr /usr --dev /dev --proc /proc --bind /tmp /tmp --bind WORKSPACE /workspace --unshare-all --die-with-parent <argv...>
+        // bwrap --ro-bind /usr /usr --dev /dev --proc /proc --bind /tmp /tmp --bind WORKSPACE /workspace --chdir /workspace --unshare-all --die-with-parent <argv...>
+        //
+        // `--chdir /workspace` is critical: the parent process sets cwd to the
+        // host-side workspace path (e.g. /Users/.../workspace/<user>) before
+        // execve. That path does NOT exist inside the new mount namespace —
+        // only `/workspace` does. Without --chdir, bwrap inherits the parent's
+        // cwd and the inner exec fails with ENOENT. Pinning cwd to the bound
+        // sandbox path is what lets shell.zig:142 pass effective_cwd unchanged.
         const prefix = [_][]const u8{
             "bwrap",
             "--ro-bind",
@@ -41,6 +48,8 @@ pub const BubblewrapSandbox = struct {
             "/tmp",
             "--bind",
             self.workspace_dir,
+            "/workspace",
+            "--chdir",
             "/workspace",
             "--unshare-all",
             "--die-with-parent",
@@ -136,7 +145,30 @@ test "bubblewrap sandbox wrap empty argv" {
 
     // Just the prefix args, no original command
     try std.testing.expectEqualStrings("bwrap", result[0]);
-    try std.testing.expect(result.len == 16);
+    // 16 base prefix args + 2 for --chdir /workspace = 18.
+    try std.testing.expect(result.len == 18);
+}
+
+test "bubblewrap sandbox wrap includes --chdir /workspace" {
+    var bw = createBubblewrapSandbox("/tmp/workspace");
+    const sb = bw.sandbox();
+
+    const argv = [_][]const u8{"ls"};
+    var buf: [32][]const u8 = undefined;
+    const result = try sb.wrapCommand(&argv, &buf);
+
+    var has_chdir_flag = false;
+    var has_chdir_value = false;
+    for (result, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--chdir")) {
+            has_chdir_flag = true;
+            if (i + 1 < result.len and std.mem.eql(u8, result[i + 1], "/workspace")) {
+                has_chdir_value = true;
+            }
+        }
+    }
+    try std.testing.expect(has_chdir_flag);
+    try std.testing.expect(has_chdir_value);
 }
 
 test "bubblewrap buffer too small returns error" {
