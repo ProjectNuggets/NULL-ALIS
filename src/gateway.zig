@@ -7327,6 +7327,40 @@ fn internalDiagnosticsPayload(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(&buf, allocator, "sandbox_workspace_validation_last_reason", sandbox_diag.workspace_validation_last_reason);
     try buf.appendSlice(allocator, ",");
+    // Active-state snapshot for UI sandbox-status badge (set at agent init by
+    // tools/root.zig). Frontend reads `sandbox.enabled` + `sandbox.backend`
+    // to render "Shell sandboxed (bwrap)" pill in the chat header.
+    {
+        const sandbox_state = tool_sandbox_v1.currentStateSnapshot();
+        try json_util.appendJsonKey(&buf, allocator, "sandbox");
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKey(&buf, allocator, "initialized");
+        try buf.appendSlice(allocator, if (sandbox_state.initialized) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "enabled");
+        try buf.appendSlice(allocator, if (sandbox_state.enabled) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "backend", @tagName(sandbox_state.backend));
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "fail_open_on_dev");
+        try buf.appendSlice(allocator, if (sandbox_state.fail_open_on_dev) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "has_real_backend");
+        try buf.appendSlice(allocator, if (sandbox_state.has_real_backend) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "available");
+        try buf.appendSlice(allocator, "{");
+        try json_util.appendJsonKey(&buf, allocator, "firejail");
+        try buf.appendSlice(allocator, if (sandbox_state.avail_firejail) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "bubblewrap");
+        try buf.appendSlice(allocator, if (sandbox_state.avail_bubblewrap) "true" else "false");
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKey(&buf, allocator, "docker");
+        try buf.appendSlice(allocator, if (sandbox_state.avail_docker) "true" else "false");
+        try buf.appendSlice(allocator, "}}");
+        try buf.appendSlice(allocator, ",");
+    }
     try json_util.appendJsonKey(&buf, allocator, "chat_stream_require_explicit_session_key");
     try buf.appendSlice(allocator, if (state.require_explicit_chat_stream_session_key) "true" else "false");
     try buf.appendSlice(allocator, ",");
@@ -10037,16 +10071,104 @@ fn handleSessionAction(
         if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         return handleSessionApprove(allocator, mgr, session_key, raw_request);
     }
+    if (std.mem.eql(u8, act, "mode")) {
+        if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        return handleSessionMode(allocator, mgr, session_key, raw_request);
+    }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_session_action\"}" };
 }
 
 fn isSessionAction(s: []const u8) bool {
-    const actions = [_][]const u8{ "compact", "context", "export", "history", "approve" };
+    const actions = [_][]const u8{ "compact", "context", "export", "history", "approve", "mode" };
     for (actions) |a| {
         if (std.mem.eql(u8, s, a)) return true;
     }
     return false;
+}
+
+/// POST /api/v1/users/:id/sessions/:key/mode
+/// Body: {"mode":"plan|execute|review|background"}
+/// Sets the active session's execution mode by routing through the existing
+/// `/mode` slash command (commands.zig is the single truth path). Powers the
+/// in-thread Plan|Execute|Review segmented control in the V1.5 UX.
+fn handleSessionMode(
+    allocator: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+    raw_request: []const u8,
+) RouteResponse {
+    // Extract body. raw_request is the full HTTP request; find the body after
+    // the empty line separator. Same pattern handleSessionApprove uses via
+    // validateApproveInput.
+    const body_marker = "\r\n\r\n";
+    const body = if (std.mem.indexOf(u8, raw_request, body_marker)) |idx|
+        raw_request[idx + body_marker.len ..]
+    else
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
+
+    // Parse the mode field. Keep it tight — we only want one valid string.
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_json\"}" };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_body\"}" };
+    const mode_v = parsed.value.object.get("mode") orelse
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_mode\"}" };
+    if (mode_v != .string) return .{ .status = "400 Bad Request", .body = "{\"error\":\"mode_not_string\"}" };
+    const mode = mode_v.string;
+    // Whitelist matches commands.zig::handleModeCommand acceptance set.
+    const valid_modes = [_][]const u8{ "plan", "execute", "review", "background" };
+    var ok = false;
+    for (valid_modes) |m| {
+        if (std.mem.eql(u8, mode, m)) {
+            ok = true;
+            break;
+        }
+    }
+    if (!ok) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_mode\"}" };
+
+    // Same active_refs pin pattern as handleSessionApprove: prevent eviction
+    // between get and processMessage.
+    mgr.mutex.lock();
+    const session = mgr.sessions.get(session_key) orelse {
+        mgr.mutex.unlock();
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    };
+    session.active_refs += 1;
+    mgr.mutex.unlock();
+
+    // Route through the existing /mode slash command — single truth path.
+    const command = std.fmt.allocPrint(allocator, "/mode {s}", .{mode}) catch {
+        mgr.mutex.lock();
+        if (session.active_refs > 0) session.active_refs -= 1;
+        mgr.mutex.unlock();
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"command_build_failed\"}" };
+    };
+    defer allocator.free(command);
+
+    const result = mgr.processMessage(session_key, command, null) catch {
+        mgr.mutex.lock();
+        if (session.active_refs > 0) session.active_refs -= 1;
+        mgr.mutex.unlock();
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"mode_change_failed\"}" };
+    };
+
+    mgr.mutex.lock();
+    if (session.active_refs > 0) session.active_refs -= 1;
+    mgr.mutex.unlock();
+
+    defer allocator.free(result);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"mode\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    jsonEscapeInto(w, mode) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll("\",\"message\":\"") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    jsonEscapeInto(w, result) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll("\"}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
 fn handleSessionGet(
@@ -10214,11 +10336,23 @@ fn handleSessionContext(
     defer out.deinit(allocator);
     const w = out.writer(allocator);
     const agent = &session.agent;
-    w.print("{{\"history_len\":{d},\"tokens_used\":{d},\"max_history\":{d},\"token_limit\":{d}}}", .{
+    const tokens_used = agent.tokensUsed();
+    // Normalized 0-100 pressure for the in-thread context-state badge in the
+    // V1.5 UX. Frontend buckets into normal/warning/near_limit per its own
+    // thresholds (recommended: 0-50 normal, 51-75 warning, >75 near_limit).
+    // Clamped at 100 so a stale token_limit field can't produce >100 values.
+    const pressure_percent: u8 = blk: {
+        if (agent.token_limit == 0) break :blk 0;
+        const pct = @divTrunc(tokens_used * 100, agent.token_limit);
+        if (pct > 100) break :blk 100;
+        break :blk @intCast(pct);
+    };
+    w.print("{{\"history_len\":{d},\"tokens_used\":{d},\"max_history\":{d},\"token_limit\":{d},\"context_pressure_percent\":{d}}}", .{
         agent.historyLen(),
-        agent.tokensUsed(),
+        tokens_used,
         agent.max_history_messages,
         agent.token_limit,
+        pressure_percent,
     }) catch return response_build_err;
     return finalizeJsonBuf(allocator, &out);
 }

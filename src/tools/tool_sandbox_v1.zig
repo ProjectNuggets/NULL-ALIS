@@ -82,6 +82,41 @@ pub fn diagnosticsSnapshot() SandboxDiagnosticsSnapshot {
     };
 }
 
+// ── Active-state snapshot (for /api/v1/status sandbox UI badge) ──
+//
+// Single process-global snapshot of the resolved sandbox state. Populated
+// once at agent init (tools/root.zig:detectBest path) and read by the
+// gateway status handler so the frontend can render a "Shell sandboxed
+// (bwrap)" badge without re-probing the host on every status call.
+
+pub const SandboxStateSnapshot = struct {
+    enabled: bool = false,
+    backend: config_types.SandboxBackend = .auto,
+    fail_open_on_dev: bool = false,
+    has_real_backend: bool = false,
+    avail_firejail: bool = false,
+    avail_bubblewrap: bool = false,
+    avail_docker: bool = false,
+    initialized: bool = false,
+};
+
+var state_snapshot_mutex = std.Thread.Mutex{};
+var state_snapshot: SandboxStateSnapshot = .{};
+
+pub fn setStateSnapshot(snap: SandboxStateSnapshot) void {
+    state_snapshot_mutex.lock();
+    defer state_snapshot_mutex.unlock();
+    var copy = snap;
+    copy.initialized = true;
+    state_snapshot = copy;
+}
+
+pub fn currentStateSnapshot() SandboxStateSnapshot {
+    state_snapshot_mutex.lock();
+    defer state_snapshot_mutex.unlock();
+    return state_snapshot;
+}
+
 fn recordWorkspaceValidationFailure(reason: WorkspaceValidationReason) void {
     _ = workspace_validation_failed_total.fetchAdd(1, .monotonic);
     _ = workspace_fallback_none_total.fetchAdd(1, .monotonic);

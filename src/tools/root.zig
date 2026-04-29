@@ -915,6 +915,20 @@ pub fn allTools(
         },
     );
 
+    // Publish the resolved sandbox state for the gateway /api/v1/status
+    // endpoint to surface as a UI badge. Process-global snapshot — multiple
+    // agents in the same process all see the same host backends, so the
+    // last-write-wins is fine (they should all write identical values).
+    @import("tool_sandbox_v1.zig").setStateSnapshot(.{
+        .enabled = sandbox_enabled,
+        .backend = sandbox_backend,
+        .fail_open_on_dev = sandbox_fail_open,
+        .has_real_backend = has_real_backend,
+        .avail_firejail = avail.firejail,
+        .avail_bubblewrap = avail.bubblewrap,
+        .avail_docker = avail.docker,
+    });
+
     const st = try allocator.create(shell.ShellTool);
     st.* = .{
         .workspace_dir = workspace_dir,
