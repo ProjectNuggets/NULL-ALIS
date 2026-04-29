@@ -63,6 +63,7 @@ pub const SqliteMemory = struct {
         try self_.configurePragmas();
         try self_.migrate();
         try self_.migrateSessionId();
+        try self_.migrateValidTo();
         return self_;
     }
 
@@ -108,6 +109,10 @@ pub const SqliteMemory = struct {
     fn migrate(self: *Self) !void {
         const sql =
             \\-- Core memories table
+            \\-- V1.5 day-2: `valid_to` is unix-epoch seconds when entry stops
+            \\-- being valid; NULL means always-valid. V1.5 always writes NULL;
+            \\-- V1.6 correction classifier populates it. Retrieval filters
+            \\-- `(valid_to IS NULL OR valid_to > unixepoch())`.
             \\CREATE TABLE IF NOT EXISTS memories (
             \\  id         TEXT PRIMARY KEY,
             \\  key        TEXT NOT NULL UNIQUE,
@@ -115,11 +120,13 @@ pub const SqliteMemory = struct {
             \\  category   TEXT NOT NULL DEFAULT 'core',
             \\  session_id TEXT,
             \\  created_at TEXT NOT NULL,
-            \\  updated_at TEXT NOT NULL
+            \\  updated_at TEXT NOT NULL,
+            \\  valid_to   INTEGER
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             \\CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
             \\CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
+            \\CREATE INDEX IF NOT EXISTS idx_memories_valid_to ON memories(valid_to) WHERE valid_to IS NOT NULL;
             \\
             \\-- FTS5 full-text search (BM25 scoring)
             \\CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -233,6 +240,45 @@ pub const SqliteMemory = struct {
         }
     }
 
+    /// V1.5 day-2 migration — add `valid_to` column to existing databases
+    /// that lack it. Same shape as `migrateSessionId` (idempotent ALTER,
+    /// "duplicate column name" treated as no-op). Sqlite ALTER TABLE doesn't
+    /// support `IF NOT EXISTS` for columns; the duplicate-name catch is
+    /// the documented idiom.
+    pub fn migrateValidTo(self: *Self) !void {
+        var err_msg: [*c]u8 = null;
+        const rc = c.sqlite3_exec(
+            self.db,
+            "ALTER TABLE memories ADD COLUMN valid_to INTEGER;",
+            null,
+            null,
+            &err_msg,
+        );
+        if (rc != c.SQLITE_OK) {
+            var ignore_error = false;
+            if (err_msg) |msg| {
+                const msg_text = std.mem.span(msg);
+                ignore_error = std.mem.indexOf(u8, msg_text, "duplicate column name") != null;
+            }
+            if (!ignore_error) {
+                self.logExecFailure("valid_to migration", "ALTER TABLE memories ADD COLUMN valid_to INTEGER", rc, err_msg);
+            }
+            if (err_msg) |msg| c.sqlite3_free(msg);
+        }
+        var err_msg2: [*c]u8 = null;
+        const rc2 = c.sqlite3_exec(
+            self.db,
+            "CREATE INDEX IF NOT EXISTS idx_memories_valid_to ON memories(valid_to) WHERE valid_to IS NOT NULL;",
+            null,
+            null,
+            &err_msg2,
+        );
+        if (rc2 != c.SQLITE_OK) {
+            self.logExecFailure("valid_to migration", "CREATE INDEX IF NOT EXISTS idx_memories_valid_to", rc2, err_msg2);
+            if (err_msg2) |msg| c.sqlite3_free(msg);
+        }
+    }
+
     // ── Memory trait implementation ────────────────────────────────
 
     fn implName(_: *anyopaque) []const u8 {
@@ -301,7 +347,8 @@ pub const SqliteMemory = struct {
         self_.mutex.lock();
         defer self_.mutex.unlock();
 
-        const sql = "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1";
+        // V1.5 day-2 — valid_to filter: superseded entries hidden.
+        const sql = "SELECT id, key, content, category, created_at, session_id, valid_to FROM memories WHERE key = ?1 AND (valid_to IS NULL OR valid_to > unixepoch())";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -329,8 +376,9 @@ pub const SqliteMemory = struct {
 
         if (category) |cat| {
             const cat_str = cat.toString();
-            const sql = "SELECT id, key, content, category, created_at, session_id FROM memories " ++
-                "WHERE category = ?1 ORDER BY updated_at DESC";
+            // V1.5 day-2 — valid_to filter applied uniformly across list paths.
+            const sql = "SELECT id, key, content, category, created_at, session_id, valid_to FROM memories " ++
+                "WHERE category = ?1 AND (valid_to IS NULL OR valid_to > unixepoch()) ORDER BY updated_at DESC";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -352,7 +400,7 @@ pub const SqliteMemory = struct {
                 } else break;
             }
         } else {
-            const sql = "SELECT id, key, content, category, created_at, session_id FROM memories ORDER BY updated_at DESC";
+            const sql = "SELECT id, key, content, category, created_at, session_id, valid_to FROM memories WHERE (valid_to IS NULL OR valid_to > unixepoch()) ORDER BY updated_at DESC";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -739,18 +787,23 @@ pub const SqliteMemory = struct {
 
         if (fts_query.items.len == 0) return allocator.alloc(MemoryEntry, 0);
 
+        // V1.5 day-2 — FTS recall returns: id(0), key(1), content(2),
+        // category(3), created_at(4), score(5), session_id(6), valid_to(7).
+        // The valid_to filter (`m.valid_to IS NULL OR m.valid_to > unixepoch()`)
+        // is appended to every WHERE clause so superseded memories never
+        // surface from FTS search.
         const sql_unscoped =
-            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id " ++
+            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id, m.valid_to " ++
             "FROM memories_fts f " ++
             "JOIN memories m ON m.rowid = f.rowid " ++
-            "WHERE memories_fts MATCH ?1 " ++
+            "WHERE memories_fts MATCH ?1 AND (m.valid_to IS NULL OR m.valid_to > unixepoch()) " ++
             "ORDER BY score " ++
             "LIMIT ?2";
         const sql_scoped =
-            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id " ++
+            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id, m.valid_to " ++
             "FROM memories_fts f " ++
             "JOIN memories m ON m.rowid = f.rowid " ++
-            "WHERE memories_fts MATCH ?1 AND m.session_id = ?2 " ++
+            "WHERE memories_fts MATCH ?1 AND m.session_id = ?2 AND (m.valid_to IS NULL OR m.valid_to > unixepoch()) " ++
             "ORDER BY score " ++
             "LIMIT ?3";
         const sql = if (session_id != null) sql_scoped else sql_unscoped;
@@ -804,7 +857,11 @@ pub const SqliteMemory = struct {
         var sql_buf: std.ArrayList(u8) = .empty;
         defer sql_buf.deinit(allocator);
 
-        try sql_buf.appendSlice(allocator, "SELECT id, key, content, category, created_at, session_id FROM memories WHERE ");
+        // V1.5 day-2 — likeSearch follows the non-FTS column shape: id(0),
+        // key(1), content(2), category(3), created_at(4), session_id(5),
+        // valid_to(6). The valid_to filter is appended after the keyword
+        // OR-group so superseded entries never surface from LIKE search.
+        try sql_buf.appendSlice(allocator, "SELECT id, key, content, category, created_at, session_id, valid_to FROM memories WHERE (");
 
         for (keywords.items, 0..) |_, i| {
             if (i > 0) try sql_buf.appendSlice(allocator, " OR ");
@@ -814,6 +871,8 @@ pub const SqliteMemory = struct {
             try appendInt(&sql_buf, allocator, i * 2 + 2);
             try sql_buf.appendSlice(allocator, " ESCAPE '\\')");
         }
+
+        try sql_buf.appendSlice(allocator, ") AND (valid_to IS NULL OR valid_to > unixepoch())");
 
         const session_param_index: ?usize = if (session_id != null) keywords.items.len * 2 + 1 else null;
         const limit_param_index: usize = if (session_param_index != null)
@@ -874,10 +933,20 @@ pub const SqliteMemory = struct {
     // ── Utility functions ──────────────────────────────────────────
 
     fn readEntryFromRow(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator) !MemoryEntry {
-        return readEntryFromRowWithSessionCol(stmt, allocator, 5);
+        // V1.5 day-2 — non-FTS queries lay out columns: id(0), key(1),
+        // content(2), category(3), created_at(4), session_id(5), valid_to(6).
+        return readEntryFromRowWithCols(stmt, allocator, 5, 6);
     }
 
     fn readEntryFromRowWithSessionCol(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator, session_col: c_int) !MemoryEntry {
+        // V1.5 day-2 — FTS queries lay out: id(0), key(1), content(2),
+        // category(3), created_at(4), score(5), session_id(6), valid_to(7).
+        // The legacy session_col arg is preserved; valid_to defaults to
+        // session_col + 1, matching the FTS recall pattern.
+        return readEntryFromRowWithCols(stmt, allocator, session_col, session_col + 1);
+    }
+
+    fn readEntryFromRowWithCols(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator, session_col: c_int, valid_to_col: c_int) !MemoryEntry {
         const id = try dupeColumnText(stmt, 0, allocator);
         errdefer allocator.free(id);
         const key = try dupeColumnText(stmt, 1, allocator);
@@ -912,6 +981,16 @@ pub const SqliteMemory = struct {
         // null the entry was stored unscoped, so lane stays "unknown".
         const lane: []const u8 = if (sid) |s| root.laneFromSessionId(s) else "unknown";
 
+        // V1.5 day-2 — read `valid_to` from `valid_to_col`. SQLite returns
+        // 0 for NULL on column_int64; check sqlite3_column_type to
+        // distinguish. This is the only nullable BIGINT in our schema, so
+        // the explicit type check is worth it.
+        const valid_to: ?i64 = blk: {
+            const col_type = c.sqlite3_column_type(stmt, valid_to_col);
+            if (col_type == c.SQLITE_NULL) break :blk null;
+            break :blk c.sqlite3_column_int64(stmt, valid_to_col);
+        };
+
         return MemoryEntry{
             .id = id,
             .key = key,
@@ -921,6 +1000,7 @@ pub const SqliteMemory = struct {
             .session_id = sid,
             .score = null,
             .lane = lane,
+            .valid_to = valid_to,
         };
     }
 
@@ -2166,4 +2246,148 @@ test "sqlite clearMessages does not affect other sessions" {
     const s2_msgs = try mem.loadMessages(std.testing.allocator, "s2");
     defer root.freeMessages(std.testing.allocator, s2_msgs);
     try std.testing.expectEqual(@as(usize, 1), s2_msgs.len);
+}
+
+// ── V1.5 day-2 bi-temporal tests ────────────────────────────────────────
+//
+// Graphiti pattern: every memory entry carries a nullable `valid_to` (unix
+// epoch seconds). NULL means always-valid (V1.5 default — every write).
+// V1.6's correction classifier and the user-facing MemoryViewer surface
+// populate this with `now()` to invalidate a fact, leaving the row in place
+// as audit evidence. Retrieval filters `valid_to IS NULL OR valid_to >
+// now()` so superseded memories never reach the agent.
+//
+// V1.5 has no public setter for valid_to (always-null path). These tests
+// reach down to sqlite3_exec to simulate what the V1.6 correction
+// classifier will eventually call. They prove the read-side filter works
+// end-to-end across get / list / recall paths.
+
+fn testSetValidTo(mem: *SqliteMemory, key: []const u8, valid_to_unix: i64) !void {
+    var sql_buf: [256]u8 = undefined;
+    const sql = try std.fmt.bufPrintZ(&sql_buf, "UPDATE memories SET valid_to = {d} WHERE key = '{s}'", .{ valid_to_unix, key });
+    var err_msg: [*c]u8 = null;
+    const rc = c.sqlite3_exec(mem.db, sql.ptr, null, null, &err_msg);
+    if (err_msg) |msg| c.sqlite3_free(msg);
+    if (rc != c.SQLITE_OK) return error.UpdateFailed;
+}
+
+test "sqlite valid_to default null on store" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("user_lang", "Prefers Zig", .core, null);
+    const entry = try m.get(std.testing.allocator, "user_lang");
+    try std.testing.expect(entry != null);
+    defer entry.?.deinit(std.testing.allocator);
+
+    // V1.5 default — every write leaves valid_to null.
+    try std.testing.expect(entry.?.valid_to == null);
+}
+
+test "sqlite valid_to past hides entry from get" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("stale", "outdated fact", .core, null);
+    // 2026-01-01 — definitely in the past at test time (current date 2026-04-29 +).
+    try testSetValidTo(&mem, "stale", 1735689600);
+
+    const entry = try m.get(std.testing.allocator, "stale");
+    try std.testing.expect(entry == null);
+}
+
+test "sqlite valid_to future keeps entry visible" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("future_fact", "valid for a while", .core, null);
+    // 2030-01-01 — far future.
+    try testSetValidTo(&mem, "future_fact", 1893456000);
+
+    const entry = try m.get(std.testing.allocator, "future_fact");
+    try std.testing.expect(entry != null);
+    defer entry.?.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("valid for a while", entry.?.content);
+    try std.testing.expectEqual(@as(?i64, 1893456000), entry.?.valid_to);
+}
+
+test "sqlite valid_to past hides entry from list" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("a", "alive entry", .core, null);
+    try m.store("b", "expired entry", .core, null);
+    try testSetValidTo(&mem, "b", 1735689600);
+
+    const entries = try m.list(std.testing.allocator, null, null);
+    defer root.freeEntries(std.testing.allocator, entries);
+
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("a", entries[0].key);
+}
+
+test "sqlite valid_to past hides entry from recall" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("a", "the alpha keyword lives", .core, null);
+    try m.store("b", "another alpha keyword expired", .core, null);
+    try testSetValidTo(&mem, "b", 1735689600);
+
+    const results = try m.recall(std.testing.allocator, "alpha", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("a", results[0].key);
+}
+
+test "sqlite valid_to roundtrip null + value via list" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "always valid", .core, null);
+    try m.store("k2", "valid into 2030", .core, null);
+    try testSetValidTo(&mem, "k2", 1893456000);
+
+    const entries = try m.list(std.testing.allocator, null, null);
+    defer root.freeEntries(std.testing.allocator, entries);
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    var saw_null = false;
+    var saw_future = false;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.key, "k1")) {
+            try std.testing.expect(e.valid_to == null);
+            saw_null = true;
+        } else if (std.mem.eql(u8, e.key, "k2")) {
+            try std.testing.expectEqual(@as(?i64, 1893456000), e.valid_to);
+            saw_future = true;
+        }
+    }
+    try std.testing.expect(saw_null);
+    try std.testing.expect(saw_future);
+}
+
+test "sqlite migrateValidTo idempotent on repeated boot" {
+    // Init runs migrateValidTo once. Calling it again must not fail —
+    // sqlite ALTER TABLE for a duplicate column is treated as no-op.
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    try mem.migrateValidTo();
+    try mem.migrateValidTo();
+
+    // Sanity: a fresh write still works.
+    const m = mem.memory();
+    try m.store("after_remigrate", "still works", .core, null);
+    const entry = try m.get(std.testing.allocator, "after_remigrate");
+    try std.testing.expect(entry != null);
+    defer entry.?.deinit(std.testing.allocator);
+    try std.testing.expect(entry.?.valid_to == null);
 }

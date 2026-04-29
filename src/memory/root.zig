@@ -285,6 +285,19 @@ pub const MemoryEntry = struct {
     /// callers can heuristically downweight cross-lane retrieval results.
     lane: []const u8 = "unknown",
 
+    /// V1.5 day-2 (Graphiti bi-temporal pattern) — point in time when
+    /// this memory entry stops being valid. `null` means "always valid"
+    /// (the V1.5 default — every write leaves this null). V1.6's
+    /// correction classifier and the user-facing MemoryViewer correction
+    /// surface populate this with `extract(epoch from now())::bigint`
+    /// when a fact is invalidated, leaving the row in place as audit
+    /// evidence. Retrieval paths filter `valid_to IS NULL OR valid_to >
+    /// now()` so superseded memories never reach the agent. Stored as
+    /// BIGINT (unix epoch seconds) in postgres / sqlite backends; carried
+    /// through every engine even when the engine has no SQL surface
+    /// (markdown/redis/lru/none — they pass the field through unchanged).
+    valid_to: ?i64 = null,
+
     /// Free all allocated strings owned by this entry.
     pub fn deinit(self: *const MemoryEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -297,6 +310,7 @@ pub const MemoryEntry = struct {
             else => {},
         }
         // self.lane is a borrowed string literal — do not free.
+        // self.valid_to is a value-type optional integer — nothing to free.
     }
 };
 

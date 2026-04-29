@@ -147,6 +147,12 @@ const PostgresMemoryImpl = struct {
             .q_list_sid = undefined,
         };
 
+        // V1.5 day-2 — valid_to is column 6 in every memory-read query.
+        // INSERT leaves valid_to unset (defaults to NULL); V1.5 always-null.
+        // Read paths filter `(valid_to IS NULL OR valid_to > now)` so superseded
+        // entries never reach the agent.
+        const valid_filter = "(valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint)";
+
         // Build query templates
         self_.q_store = try buildQuery(allocator, "INSERT INTO {schema}.{table} (id, key, content, category, session_id, created_at, updated_at) " ++
             "VALUES ($1, $2, $3, $4, $5, $6, $7) " ++
@@ -154,19 +160,19 @@ const PostgresMemoryImpl = struct {
             "session_id = EXCLUDED.session_id, updated_at = EXCLUDED.updated_at", schema_q, table_q);
         errdefer allocator.free(self_.q_store);
 
-        self_.q_get = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE key = $1", schema_q, table_q);
+        self_.q_get = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, valid_to FROM {schema}.{table} WHERE key = $1 AND " ++ valid_filter, schema_q, table_q);
         errdefer allocator.free(self_.q_get);
 
-        self_.q_list_cat = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE category = $1 ORDER BY updated_at DESC", schema_q, table_q);
+        self_.q_list_cat = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, valid_to FROM {schema}.{table} WHERE category = $1 AND " ++ valid_filter ++ " ORDER BY updated_at DESC", schema_q, table_q);
         errdefer allocator.free(self_.q_list_cat);
 
-        self_.q_list_all = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} ORDER BY updated_at DESC", schema_q, table_q);
+        self_.q_list_all = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, valid_to FROM {schema}.{table} WHERE " ++ valid_filter ++ " ORDER BY updated_at DESC", schema_q, table_q);
         errdefer allocator.free(self_.q_list_all);
 
-        self_.q_recall = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, " ++
+        self_.q_recall = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, valid_to, " ++
             "CASE WHEN key ILIKE $1 THEN 2.0 ELSE 0.0 END + " ++
             "CASE WHEN content ILIKE $1 THEN 1.0 ELSE 0.0 END AS score " ++
-            "FROM {schema}.{table} WHERE key ILIKE $1 OR content ILIKE $1 " ++
+            "FROM {schema}.{table} WHERE (key ILIKE $1 OR content ILIKE $1) AND " ++ valid_filter ++ " " ++
             "ORDER BY score DESC LIMIT $2", schema_q, table_q);
         errdefer allocator.free(self_.q_recall);
 
@@ -191,17 +197,17 @@ const PostgresMemoryImpl = struct {
         self_.q_clear_auto_sid = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key LIKE 'autosave_%' AND session_id = $1", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_auto_sid);
 
-        self_.q_recall_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, " ++
+        self_.q_recall_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, valid_to, " ++
             "CASE WHEN key ILIKE $1 THEN 2.0 ELSE 0.0 END + " ++
             "CASE WHEN content ILIKE $1 THEN 1.0 ELSE 0.0 END AS score " ++
-            "FROM {schema}.{table} WHERE (key ILIKE $1 OR content ILIKE $1) AND session_id = $3 " ++
+            "FROM {schema}.{table} WHERE (key ILIKE $1 OR content ILIKE $1) AND session_id = $3 AND " ++ valid_filter ++ " " ++
             "ORDER BY score DESC LIMIT $2", schema_q, table_q);
         errdefer allocator.free(self_.q_recall_sid);
 
-        self_.q_list_cat_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE category = $1 AND session_id = $2 ORDER BY updated_at DESC", schema_q, table_q);
+        self_.q_list_cat_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, valid_to FROM {schema}.{table} WHERE category = $1 AND session_id = $2 AND " ++ valid_filter ++ " ORDER BY updated_at DESC", schema_q, table_q);
         errdefer allocator.free(self_.q_list_cat_sid);
 
-        self_.q_list_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE session_id = $1 ORDER BY updated_at DESC", schema_q, table_q);
+        self_.q_list_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, valid_to FROM {schema}.{table} WHERE session_id = $1 AND " ++ valid_filter ++ " ORDER BY updated_at DESC", schema_q, table_q);
         errdefer allocator.free(self_.q_list_sid);
 
         // Run migrations
@@ -237,6 +243,8 @@ const PostgresMemoryImpl = struct {
     fn migrate(self: *Self, raw_table: []const u8) !void {
         // raw_table is pre-validated (alphanumeric + underscore only) so safe for index names.
         // Index names must NOT use quoted identifiers, so we use raw_table directly.
+        // V1.5 day-2 — `valid_to` column added via ALTER TABLE IF NOT EXISTS so existing
+        // installations upgrade in place. Partial index keeps non-null rows fast.
         const ddl_plain = try std.fmt.allocPrint(self.allocator,
             \\CREATE TABLE IF NOT EXISTS {s}.{s} (
             \\    id TEXT PRIMARY KEY,
@@ -245,11 +253,14 @@ const PostgresMemoryImpl = struct {
             \\    category TEXT NOT NULL DEFAULT 'core',
             \\    session_id TEXT,
             \\    created_at TEXT NOT NULL,
-            \\    updated_at TEXT NOT NULL
+            \\    updated_at TEXT NOT NULL,
+            \\    valid_to BIGINT
             \\);
+            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS valid_to BIGINT;
             \\CREATE INDEX IF NOT EXISTS idx_{s}_category ON {s}.{s}(category);
             \\CREATE INDEX IF NOT EXISTS idx_{s}_key ON {s}.{s}(key);
             \\CREATE INDEX IF NOT EXISTS idx_{s}_session ON {s}.{s}(session_id);
+            \\CREATE INDEX IF NOT EXISTS idx_{s}_valid_to ON {s}.{s}(valid_to) WHERE valid_to IS NOT NULL;
             \\CREATE TABLE IF NOT EXISTS {s}.messages (
             \\    id SERIAL PRIMARY KEY,
             \\    session_id TEXT NOT NULL,
@@ -259,11 +270,14 @@ const PostgresMemoryImpl = struct {
             \\);
         , .{
             self.schema_q, self.table_q,
+            self.schema_q, self.table_q,
             raw_table,     self.schema_q,
             self.table_q,  raw_table,
             self.schema_q, self.table_q,
             raw_table,     self.schema_q,
-            self.table_q,  self.schema_q,
+            self.table_q,  raw_table,
+            self.schema_q, self.table_q,
+            self.schema_q,
         });
         defer self.allocator.free(ddl_plain);
         const ddl = try self.allocator.dupeZ(u8, ddl_plain);
@@ -318,7 +332,8 @@ const PostgresMemoryImpl = struct {
     }
 
     fn readEntryFromResult(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int) !MemoryEntry {
-        // Columns: id(0), key(1), content(2), category(3), updated_at(4), session_id(5)
+        // Columns: id(0), key(1), content(2), category(3), updated_at(4), session_id(5), valid_to(6)
+        // V1.5 day-2 — recall queries add `score` at column 7 (read separately).
         const id = try dupeResultValue(allocator, result, row, 0);
         errdefer allocator.free(id);
         const key = try dupeResultValue(allocator, result, row, 1);
@@ -340,6 +355,16 @@ const PostgresMemoryImpl = struct {
         errdefer allocator.free(timestamp);
         const session_id = try dupeResultValueOpt(allocator, result, row, 5);
 
+        // V1.5 day-2 — column 6 is `valid_to` (BIGINT, nullable). PG returns
+        // empty string when NULL via dupeResultValue; treat empty + parse-
+        // failure as null.
+        const valid_to_text = try dupeResultValue(allocator, result, row, 6);
+        defer allocator.free(valid_to_text);
+        const valid_to: ?i64 = if (valid_to_text.len == 0)
+            null
+        else
+            std.fmt.parseInt(i64, valid_to_text, 10) catch null;
+
         return .{
             .id = id,
             .key = key,
@@ -347,6 +372,7 @@ const PostgresMemoryImpl = struct {
             .category = category,
             .timestamp = timestamp,
             .session_id = session_id,
+            .valid_to = valid_to,
         };
     }
 
@@ -442,10 +468,13 @@ const PostgresMemoryImpl = struct {
         var row: c_int = 0;
         while (row < nrows) : (row += 1) {
             var entry = try readEntryFromResult(allocator, result, row);
-            // Read score from column 6
-            if (c.PQgetisnull(result, row, 6) == 0) {
-                const score_str = c.PQgetvalue(result, row, 6);
-                const score_slice: []const u8 = score_str[0..@intCast(c.PQgetlength(result, row, 6))];
+            // V1.5 day-2 — score column shifted from 6 → 7 because valid_to
+            // now occupies column 6. Recall SELECTs in this engine put
+            // score last: id, key, content, category, updated_at,
+            // session_id, valid_to, score.
+            if (c.PQgetisnull(result, row, 7) == 0) {
+                const score_str = c.PQgetvalue(result, row, 7);
+                const score_slice: []const u8 = score_str[0..@intCast(c.PQgetlength(result, row, 7))];
                 entry.score = std.fmt.parseFloat(f64, score_slice) catch null;
             }
             try entries.append(allocator, entry);
