@@ -182,6 +182,24 @@ pub const TokenUsage = struct {
     prompt_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     total_tokens: u32 = 0,
+    /// Subset of prompt_tokens that was served from a provider-side prompt
+    /// cache (zero when the response doesn't surface it). Populated from:
+    /// - OpenAI/Together OpenAI-compat: usage.prompt_tokens_details.cached_tokens
+    /// - Together flat shape (some models): usage.cached_tokens (top-level)
+    /// - OpenRouter: usage.cached_tokens
+    /// - Anthropic: usage.cache_read_input_tokens
+    /// As of 2026-04-30, Together's V4-Pro response does NOT include this
+    /// field — either prefix-caching isn't enabled for V4-Pro yet (model
+    /// is 6 days old) or Together doesn't surface it. Field stays zero
+    /// silently in that case; will populate automatically when Together
+    /// adds the surface.
+    cached_prompt_tokens: u32 = 0,
+    /// Tokens spent on the model's internal reasoning/thinking phase
+    /// (separate from completion_tokens which is the user-visible reply).
+    /// Together's V4-Pro emits `usage.reasoning_tokens`. Useful for cost
+    /// attribution: reasoning_effort=high may inflate this without changing
+    /// completion length. Zero on models that don't expose it.
+    reasoning_tokens: u32 = 0,
 };
 
 /// An LLM response that may contain text, tool calls, or both.

@@ -59,6 +59,14 @@ const MODEL_TABLE = [_]ModelEntry{
     .{ .key = "deepseek-v3.2", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     .{ .key = "deepseek-chat", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     .{ .key = "deepseek-reasoner", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
+    // V4 family (released 2026-04-24). Context window verified from Together's
+    // /v1/models endpoint 2026-04-30: V4-Pro=512000 on Together (DeepSeek's
+    // native API advertises 1M but the Together-hosted instance is capped
+    // at 512K — using the 1M figure would cause 400s at scale). max_output
+    // 32_768 is conservative-safe; V4 reasoning_effort=high may emit longer
+    // chains-of-thought but stays under cap on Together's deployment.
+    .{ .key = "deepseek-v4-pro", .caps = .{ .context_window = 512_000, .max_output = 32_768 } },
+    .{ .key = "deepseek-v4-flash", .caps = .{ .context_window = 512_000, .max_output = 32_768 } },
     // Zhipu / GLM
     .{ .key = "glm-5.1", .caps = .{ .context_window = 202_000, .max_output = 65_536 } },
     .{ .key = "glm-5.1-air", .caps = .{ .context_window = 202_000, .max_output = 32_768 } },
@@ -175,6 +183,13 @@ fn inferFromPattern(model_id: []const u8) ?ModelCapabilities {
         startsWithIgnoreCase(model_id, "o1") or
         startsWithIgnoreCase(model_id, "o3"))
         return .{ .context_window = 128_000, .max_output = 8_192 };
+
+    // V4 family detected ANYWHERE in the model id (catches the org-prefixed
+    // form `deepseek-ai/DeepSeek-V4-Pro` that the generic `deepseek-`
+    // startsWith match below would otherwise misroute to 128K). Critical:
+    // this must precede the generic deepseek- match.
+    if (std.ascii.indexOfIgnoreCase(model_id, "deepseek-v4") != null)
+        return .{ .context_window = 512_000, .max_output = 32_768 };
 
     if (startsWithIgnoreCase(model_id, "deepseek-"))
         return .{ .context_window = 128_000, .max_output = 8_192 };
@@ -317,6 +332,27 @@ test "resolveMaxTokens falls back to global default" {
 
 test "resolveContextTokens falls back to global default" {
     try std.testing.expectEqual(DEFAULT_CONTEXT_WINDOW, resolveContextTokens(null, "unknown-provider/unknown-model"));
+}
+
+test "Mode-swap 2026-04-29 — DeepSeek V4 family resolves to 512K context, not 128K fallback" {
+    // The org-prefixed form Together uses must NOT fall through to the
+    // generic `deepseek-` match (which returns 128K and would silently
+    // under-utilize the model's 512K window).
+    const v4_pro = lookupCapabilities("deepseek-ai/DeepSeek-V4-Pro").?;
+    try std.testing.expectEqual(@as(u64, 512_000), v4_pro.context_window);
+    try std.testing.expectEqual(@as(u32, 32_768), v4_pro.max_output);
+
+    // Provider-prefixed nesting (together-ai/deepseek-ai/...) also resolves.
+    const v4_pro_nested = lookupCapabilities("together-ai/deepseek-ai/DeepSeek-V4-Pro").?;
+    try std.testing.expectEqual(@as(u64, 512_000), v4_pro_nested.context_window);
+
+    // V4-Flash same shape.
+    const v4_flash = lookupCapabilities("deepseek-ai/DeepSeek-V4-Flash").?;
+    try std.testing.expectEqual(@as(u64, 512_000), v4_flash.context_window);
+
+    // Older DeepSeek versions deliberately stay at 128K (unchanged).
+    const v3 = lookupCapabilities("deepseek-ai/DeepSeek-V3.1").?;
+    try std.testing.expectEqual(@as(u64, 128_000), v3.context_window);
 }
 
 test "kimi-coding provider has large output ceiling" {

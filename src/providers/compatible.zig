@@ -427,6 +427,31 @@ pub const OpenAiCompatibleProvider = struct {
                         if (usage_obj.object.get("total_tokens")) |v| {
                             if (v == .integer) usage.total_tokens = @intCast(v.integer);
                         }
+                        // Reasoning tokens (Together V4-Pro and similar reasoning
+                        // models emit this at the top level of usage). Tracking
+                        // as separate field so cost attribution can distinguish
+                        // visible-reply tokens from internal-thinking tokens.
+                        if (usage_obj.object.get("reasoning_tokens")) |v| {
+                            if (v == .integer) usage.reasoning_tokens = @intCast(v.integer);
+                        }
+                        // Cached prompt tokens — two shapes seen in the wild:
+                        //   1. Top-level `cached_tokens` (Together legacy, some
+                        //      OpenRouter responses).
+                        //   2. Nested `prompt_tokens_details.cached_tokens`
+                        //      (OpenAI canonical, Together OpenAI-compat path).
+                        // Both populate the same field; first non-zero wins.
+                        if (usage_obj.object.get("cached_tokens")) |v| {
+                            if (v == .integer) usage.cached_prompt_tokens = @intCast(v.integer);
+                        }
+                        if (usage.cached_prompt_tokens == 0) {
+                            if (usage_obj.object.get("prompt_tokens_details")) |details| {
+                                if (details == .object) {
+                                    if (details.object.get("cached_tokens")) |v| {
+                                        if (v == .integer) usage.cached_prompt_tokens = @intCast(v.integer);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
