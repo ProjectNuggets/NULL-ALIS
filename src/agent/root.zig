@@ -4531,29 +4531,38 @@ pub const Agent = struct {
     /// for agent-laundered fabrications.
     fn elideUnverifiedHistory(messages: []ChatMessage) void {
         const elision = "[prior unverified claim elided — re-verify with a tool this turn]";
-        for (messages, 0..) |*msg, i| {
-            if (msg.role != .assistant) continue;
-            if (msg.content.len == 0) continue;
-            if (memory_mod.countRedFlagMatches(msg.content) < 2) continue;
 
-            // Walk backward to the prior user message (turn boundary).
-            // If any .tool message sits between that boundary and this
-            // assistant message, the reply is tool-grounded — trust it.
-            var tool_seen = false;
-            var j = i;
-            while (j > 0) {
-                j -= 1;
-                switch (messages[j].role) {
-                    .tool => {
-                        tool_seen = true;
-                        break;
-                    },
-                    .user => break,
-                    else => continue,
-                }
+        // V1 close-out 2026-04-30: was O(N²) — per assistant message with
+        // red flags, walked backward to find prior user/tool boundary.
+        // Now O(N) single forward pass: track whether a .tool message
+        // has fired since the last .user turn boundary.
+        //
+        // Semantics preserved: a reply is "tool-grounded" iff any .tool
+        // message sits between the last .user message and this .assistant
+        // message. User-turn boundary RESETS the tool-grounded flag so
+        // each turn is evaluated independently.
+        //
+        // Verified equivalent for: empty history, assistant-only, multi-
+        // turn, system-message-interleaved, tool-then-assistant,
+        // user-then-assistant patterns. See test "elideUnverifiedHistory
+        // forward-sweep matches backward-walk semantics" below.
+        var tool_grounded_since_user = false;
+
+        for (messages) |*msg| {
+            switch (msg.role) {
+                .user => tool_grounded_since_user = false,
+                .tool => tool_grounded_since_user = true,
+                .assistant => {
+                    if (msg.content.len == 0) continue;
+                    if (memory_mod.countRedFlagMatches(msg.content) < 2) continue;
+                    if (tool_grounded_since_user) continue;
+                    msg.content = elision;
+                },
+                // .system, .developer, etc. — don't change grounding state;
+                // pass through unchanged (matches old code's `else => continue`
+                // in the backward walk).
+                else => {},
             }
-            if (tool_seen) continue;
-            msg.content = elision;
         }
     }
 

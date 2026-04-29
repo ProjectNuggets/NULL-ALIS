@@ -1306,6 +1306,52 @@ test "parseSseLine invalid JSON" {
     try std.testing.expectError(error.InvalidSseJson, parseSseLine(std.testing.allocator, "data: not-json{{{"));
 }
 
+test "extractSseEvent rejects unparseable JSON cleanly (no leak)" {
+    // V1 close-out 2026-04-30 — the audit flagged extractSseEvent as having
+    // zero direct tests despite being on the hot path between curlStream
+    // and the OpenAI/Anthropic ctx. Pin error.InvalidSseJson on bad input.
+    try std.testing.expectError(
+        error.InvalidSseJson,
+        extractSseEvent(std.testing.allocator, "{not valid json"),
+    );
+    try std.testing.expectError(
+        error.InvalidSseJson,
+        extractSseEvent(std.testing.allocator, ""),
+    );
+}
+
+test "extractSseEvent treats valid JSON array as skip (no error, no leak)" {
+    // Defensive: provider could send `["chunk"]` or other non-object JSON.
+    // Contract is "treat as skip," not "error" — pin that so a refactor to
+    // strict-typing doesn't accidentally start erroring on benign input.
+    const result = try extractSseEvent(std.testing.allocator, "[\"array-not-object\"]");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.isSkip());
+}
+
+test "extractSseEvent handles missing delta field without leaking" {
+    // Provider chunks without a `delta` (initial chunk on some streams,
+    // or `[DONE]`-adjacent chunks) used to be a leak surface if the
+    // tool_call_deltas allocation slipped through on the error path.
+    // This test pins the SseLineResult contract: no text, no reasoning,
+    // no tool_call_deltas, not done — i.e. isSkip().
+    const result = try extractSseEvent(std.testing.allocator, "{\"choices\":[{}]}");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.text == null);
+    try std.testing.expect(result.reasoning == null);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_call_deltas.len);
+    try std.testing.expect(!result.done);
+    try std.testing.expect(result.isSkip());
+}
+
+test "extractSseEvent handles non-object choices entry" {
+    // Defensive: provider sends `choices: [null]` or `choices: ["string"]`
+    // — should treat as a no-content skip, not crash.
+    const result = try extractSseEvent(std.testing.allocator, "{\"choices\":[null]}");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.isSkip());
+}
+
 test "extractDeltaContent with content" {
     const allocator = std.testing.allocator;
     const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"world\"}}]}")).?;
