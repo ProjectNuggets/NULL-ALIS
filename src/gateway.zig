@@ -10806,6 +10806,31 @@ const BRAIN_MAX_MAX_NODES: u32 = 2000;
 const BRAIN_SEMANTIC_THRESHOLD: f32 = 0.7;
 const BRAIN_SESSION_EDGE_CAP_PER_SESSION: usize = 50;
 const BRAIN_SUMMARY_CHARS: usize = 200;
+
+/// V1.5 day-2 review fix — round a length down to the last full UTF-8
+/// codepoint boundary at or before `max`. Without this, the `summary`
+/// field of `/brain/graph` and `/brain/timeline` responses would split
+/// mid-codepoint for Arabic / Chinese / emoji content (any byte
+/// sequence where the 200th byte falls inside a multi-byte codepoint),
+/// producing invalid UTF-8 in the JSON body. Frontend `JSON.parse()`
+/// would throw on the response.
+///
+/// Algorithm: walk back from `max` while the byte at that position is
+/// a UTF-8 continuation byte (0b10xxxxxx). UTF-8 is self-synchronizing
+/// so the lead byte we land on is the start of a codepoint; truncating
+/// just before it gives a valid UTF-8 prefix.
+///
+/// When `content.len <= max` the input is already short enough; return
+/// `content.len`. When `max == 0` return 0.
+fn brainTruncateUtf8Boundary(content: []const u8, max: usize) usize {
+    if (content.len <= max) return content.len;
+    if (max == 0) return 0;
+    var len = max;
+    // UTF-8 continuation bytes start with 0b10. Walk back until we land
+    // on a non-continuation byte (lead byte or ASCII).
+    while (len > 0 and (content[len] & 0b1100_0000) == 0b1000_0000) : (len -= 1) {}
+    return len;
+}
 const BRAIN_SEMANTIC_MAX_PAIRS: u32 = 5000;
 
 const BrainNode = struct {
@@ -10896,7 +10921,20 @@ fn buildBrainSessionEdges(
         }
     }
 
-    return edges.toOwnedSlice(allocator);
+    // V1.5 day-2 review fix: deterministic edge ordering. The hashmap
+    // iteration above is non-deterministic across runs, so the order
+    // edges land in the slice depends on hashmap iteration. Sort by
+    // (source, target) so the same input → same output bytes — needed
+    // for response caching, ETags, deterministic test comparisons.
+    const final = try edges.toOwnedSlice(allocator);
+    std.mem.sort(BrainSessionEdge, final, {}, struct {
+        fn lt(_: void, a: BrainSessionEdge, b: BrainSessionEdge) bool {
+            const src_cmp = std.mem.order(u8, a.source, b.source);
+            if (src_cmp != .eq) return src_cmp == .lt;
+            return std.mem.order(u8, a.target, b.target) == .lt;
+        }
+    }.lt);
+    return final;
 }
 
 /// Scan memory content for `memory:<key>` references. When the target
@@ -11027,7 +11065,10 @@ fn handleBrainGraph(
     for (filtered_indices.items[0..node_count], 0..) |entry_idx, i| {
         const entry = all_entries[entry_idx];
         const ts = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0;
-        const summary_len = @min(entry.content.len, BRAIN_SUMMARY_CHARS);
+        // V1.5 day-2 review fix: UTF-8-safe summary truncation. Naive
+        // byte slice could split a codepoint for non-English content
+        // (Arabic/Chinese/emoji) and produce invalid JSON.
+        const summary_len = brainTruncateUtf8Boundary(entry.content, BRAIN_SUMMARY_CHARS);
         nodes[i] = .{
             .key = entry.key,
             .kind = entry.category.toString(),
@@ -11328,7 +11369,8 @@ fn handleBrainTimeline(
     for (entries, 0..) |entry, i| {
         if (i > 0) w.writeAll(",") catch return response_build_err;
         const ts = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0;
-        const summary_len = @min(entry.content.len, BRAIN_TIMELINE_SUMMARY_CHARS);
+        // V1.5 day-2 review fix: UTF-8-safe truncation (see graph handler).
+        const summary_len = brainTruncateUtf8Boundary(entry.content, BRAIN_TIMELINE_SUMMARY_CHARS);
         const summary = entry.content[0..summary_len];
         w.writeAll("{\"id\":\"") catch return response_build_err;
         jsonEscapeInto(w, entry.id) catch return response_build_err;
@@ -22792,4 +22834,80 @@ test "handleBrainTimeline rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainTimeline(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/timeline", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+// ── /brain review-fix tests ──────────────────────────────────────
+
+test "brain: brainTruncateUtf8Boundary preserves ASCII unchanged" {
+    const ascii = "the quick brown fox jumps over the lazy dog";
+    try std.testing.expectEqual(ascii.len, brainTruncateUtf8Boundary(ascii, 100));
+    try std.testing.expectEqual(@as(usize, 9), brainTruncateUtf8Boundary(ascii, 9));
+}
+
+test "brain: brainTruncateUtf8Boundary handles short input" {
+    try std.testing.expectEqual(@as(usize, 0), brainTruncateUtf8Boundary("", 100));
+    try std.testing.expectEqual(@as(usize, 0), brainTruncateUtf8Boundary("anything", 0));
+    try std.testing.expectEqual(@as(usize, 5), brainTruncateUtf8Boundary("hello", 100));
+}
+
+test "brain: brainTruncateUtf8Boundary rounds back from mid-codepoint (Arabic)" {
+    // "السلام" is 6 chars but each Arabic letter is 2 bytes in UTF-8.
+    // Total: 12 bytes. Truncating at 5 bytes would split the 3rd char.
+    const arabic = "السلام عليكم";
+    // Calculate where each codepoint starts. Truncating at 5 must not
+    // leave a partial codepoint — should round back to 4 (after the 2nd
+    // letter).
+    const result = brainTruncateUtf8Boundary(arabic, 5);
+    try std.testing.expectEqual(@as(usize, 4), result);
+    // Verify the resulting slice is valid UTF-8.
+    try std.testing.expect(std.unicode.utf8ValidateSlice(arabic[0..result]));
+}
+
+test "brain: brainTruncateUtf8Boundary preserves emoji boundaries" {
+    // "👨‍👩‍👧" is a family emoji — multi-byte sequence. Truncating
+    // mid-sequence must round back to a valid boundary.
+    const family = "🎉hello👨‍👩‍👧world";
+    // At byte 5 (mid-emoji), we should round back.
+    const result = brainTruncateUtf8Boundary(family, 5);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(family[0..result]));
+}
+
+test "brain: buildBrainSessionEdges produces deterministic edge order" {
+    // Same input → same output bytes across runs. The hashmap iteration
+    // for grouping by session_id is non-deterministic, so we must sort
+    // by (source, target) before returning. Two sessions with edges in
+    // hashmap-arbitrary order should always serialize identically.
+    const nodes = [_]BrainNode{
+        .{ .key = "z_lastkey", .kind = "core", .session_id = "session_z", .created_at = 100, .summary = "", .valid_to = null },
+        .{ .key = "a_firstkey", .kind = "core", .session_id = "session_a", .created_at = 100, .summary = "", .valid_to = null },
+        .{ .key = "z_lastkey2", .kind = "core", .session_id = "session_z", .created_at = 200, .summary = "", .valid_to = null },
+        .{ .key = "a_firstkey2", .kind = "core", .session_id = "session_a", .created_at = 200, .summary = "", .valid_to = null },
+    };
+    // Run multiple times; output must be identical each time.
+    var prev: ?[]BrainSessionEdge = null;
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const edges = try buildBrainSessionEdges(std.testing.allocator, &nodes);
+        defer std.testing.allocator.free(edges);
+        if (prev) |p| {
+            try std.testing.expectEqual(p.len, edges.len);
+            for (p, edges) |old, new| {
+                try std.testing.expectEqualStrings(old.source, new.source);
+                try std.testing.expectEqualStrings(old.target, new.target);
+            }
+            std.testing.allocator.free(prev.?);
+        }
+        // Save a copy for next iteration's comparison.
+        const saved = try std.testing.allocator.alloc(BrainSessionEdge, edges.len);
+        @memcpy(saved, edges);
+        prev = saved;
+    }
+    if (prev) |p| std.testing.allocator.free(p);
+
+    // Also verify the canonical sort: a_firstkey edges before z_lastkey edges.
+    const edges = try buildBrainSessionEdges(std.testing.allocator, &nodes);
+    defer std.testing.allocator.free(edges);
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+    try std.testing.expectEqualStrings("a_firstkey", edges[0].source);
+    try std.testing.expectEqualStrings("z_lastkey", edges[1].source);
 }
