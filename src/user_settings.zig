@@ -705,7 +705,8 @@ test "applySettingsToConfig deep input applies deep preset" {
     try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);
     try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
     try std.testing.expectEqual(@as(u32, 8000), cfg.memory.summarizer.window_size_tokens);
-    try std.testing.expectEqualStrings("zai-org/GLM-5.1", cfg.default_model.?);
+    // Mode-swap 2026-04-29: deep moved from GLM-5.1 → DeepSeek V4-Pro.
+    try std.testing.expectEqualStrings("deepseek-ai/DeepSeek-V4-Pro", cfg.default_model.?);
     try std.testing.expectEqualStrings("together", cfg.default_provider);
 }
 

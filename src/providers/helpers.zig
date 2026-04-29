@@ -155,13 +155,21 @@ pub fn isReasoningModel(model: []const u8) bool {
 pub fn isReasoningCapableModel(model: []const u8) bool {
     if (isReasoningModel(model)) return true;
     // Strip provider prefix for substring search across nested refs
-    // (`together-ai/moonshotai/kimi-k2.5`, `openrouter/moonshotai/kimi-k2.6`, etc.)
+    // (`together-ai/moonshotai/kimi-k2.5`, `openrouter/moonshotai/kimi-k2.6`,
+    //  `together-ai/deepseek-ai/DeepSeek-V4-Pro`, etc.)
     const lower_haystack = model;
     return std.mem.indexOf(u8, lower_haystack, "kimi-k2") != null or
         std.mem.indexOf(u8, lower_haystack, "kimi-K2") != null or
         std.mem.indexOf(u8, lower_haystack, "Kimi-K2") != null or
         std.mem.indexOf(u8, lower_haystack, "moonshot") != null or
-        std.mem.indexOf(u8, lower_haystack, "Moonshot") != null;
+        std.mem.indexOf(u8, lower_haystack, "Moonshot") != null or
+        // DeepSeek V4 (2026-04-29 swap): both V4-Pro and V4-Flash accept
+        // reasoning_effort with normal temperature semantics — same shape
+        // as Kimi. NOT in isReasoningModel because they don't drop
+        // temperature like the OpenAI o-series does.
+        std.mem.indexOf(u8, lower_haystack, "DeepSeek-V4") != null or
+        std.mem.indexOf(u8, lower_haystack, "deepseek-v4") != null or
+        std.mem.indexOf(u8, lower_haystack, "DeepSeek-v4") != null;
 }
 
 /// Append model-specific generation controls to a JSON request body buffer:
@@ -418,6 +426,20 @@ test "Q2 — isReasoningCapableModel recognizes Kimi K2.5/K2.6 + Moonshot" {
     try std.testing.expect(!isReasoningCapableModel("claude-sonnet-4.6"));
     try std.testing.expect(!isReasoningCapableModel("mixtral-8x7b-32768"));
     try std.testing.expect(!isReasoningCapableModel("llama-3.1-70b"));
+}
+
+test "Mode-swap 2026-04-29 — isReasoningCapableModel recognizes DeepSeek V4 family" {
+    // V4-Pro on Together (canonical balanced + deep model after swap)
+    try std.testing.expect(isReasoningCapableModel("deepseek-ai/DeepSeek-V4-Pro"));
+    try std.testing.expect(isReasoningCapableModel("together-ai/deepseek-ai/DeepSeek-V4-Pro"));
+    try std.testing.expect(isReasoningCapableModel("openrouter/deepseek/deepseek-v4-pro"));
+    // V4-Flash (future fast-mode candidate)
+    try std.testing.expect(isReasoningCapableModel("deepseek-ai/DeepSeek-V4-Flash"));
+    // Older DeepSeek versions (R1, V3.x) deliberately NOT matched here —
+    // they have different reasoning shapes; if needed they get explicit
+    // entries when added to a preset.
+    try std.testing.expect(!isReasoningCapableModel("deepseek-ai/DeepSeek-V3.1"));
+    try std.testing.expect(!isReasoningCapableModel("deepseek-ai/DeepSeek-V3.2"));
 }
 
 test "Q2 — appendGenerationFields emits reasoning_effort for Kimi with temperature" {

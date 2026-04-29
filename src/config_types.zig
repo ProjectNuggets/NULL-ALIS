@@ -225,11 +225,15 @@ pub const ProductPresetsConfig = struct {
             // perceptually because most fast-mode queries finish in
             // 1-5 iterations.
             .max_tool_iterations = 100,
-            // Kimi K2.5 on Together for both fast and balanced modes.
-            // Differentiation comes from agent loop parameters:
-            // Fast:     temp 0.5, 100 iterations cap,  queue_cap 8,  reasoning low
-            // Balanced: temp 0.7, 200 iterations cap, queue_cap 12, reasoning medium
-            // Deep:     temp 0.8, 1000 iterations cap, queue_cap 20, reasoning high (GLM 5.1)
+            // Per-mode model assignment (2026-04-29 — Nova directive after
+            // V4-Pro audit + research):
+            //   Fast:     Kimi K2.5      (cheap, byte-stable prefix, 100 iter cap, queue 8, reasoning low)
+            //   Balanced: DeepSeek V4-Pro (1M ctx, agentic-tuned, 200 iter cap, queue 12, reasoning medium)
+            //   Deep:     DeepSeek V4-Pro (same model + reasoning high — cache-shared with balanced; SWE-bench 80.6, Codeforces 3206)
+            // Why this layout: byte-stable prefix preserved on fast (Kimi
+            // tokenizer unchanged); single new model integration (V4-Pro);
+            // balanced↔deep switch keeps prompt cache warm (same model);
+            // V4-Pro on Together — same provider, no routing complications.
             .model = "moonshotai/Kimi-K2.5",
             .provider = "together",
             // Q3 (2026-04-27): fast = low reasoning effort. Trades thinking
@@ -259,14 +263,20 @@ pub const ProductPresetsConfig = struct {
             // multi-tool) regularly hit 30-50 iterations on hard
             // problems; 200 leaves comfortable headroom.
             .max_tool_iterations = 200,
-            // Kimi K2.5: top open-weight intelligence, strong multi-tool.
-            // Together primary (org-prefixed ID), OpenRouter fallback.
-            .model = "moonshotai/Kimi-K2.5",
+            // DeepSeek V4-Pro on Together (2026-04-29 swap from Kimi K2.5).
+            // Released 2026-04-24. AA Intelligence Index 87, SWE-bench 80.6,
+            // Codeforces 3206. 1M context. Pricing: $0.435/M input, $3.48/M
+            // output ($0.145 promo input through 2026-05-05). Same OpenAI-
+            // compatible request shape as Kimi (temperature + max_tokens +
+            // reasoning_effort all emitted). reasoning_content streams via
+            // delta.reasoning_content (already wired in providers/sse.zig:123
+            // and providers/compatible.zig:434).
+            .model = "deepseek-ai/DeepSeek-V4-Pro",
             .provider = "together",
             // Q3 (2026-04-27): balanced = medium reasoning effort. Default
-            // for most users. Matches Together/Moonshot server default for
-            // Kimi when reasoning_effort is unspecified — explicit here so
-            // context_snapshot reports it accurately.
+            // for most users. V4-Pro accepts reasoning_effort field per
+            // DeepSeek API docs — emitted via providers/helpers.zig
+            // isReasoningCapableModel detection.
             .reasoning_effort = "medium",
         },
         .summarizer = .{
@@ -294,11 +304,15 @@ pub const ProductPresetsConfig = struct {
             // are the real guardrail; this cap exists only to prevent
             // worst-case runaway.
             .max_tool_iterations = 1000,
-            // GLM 5.1: SOTA SWE-Bench Pro (58.4), 202K context, 65K output,
-            // built for 8-hour autonomous execution loops.
-            // Together primary. MiniMax M2.7 on Together as model fallback
-            // ($0.30/$1.20 — strong agent capabilities at lower cost).
-            .model = "zai-org/GLM-5.1",
+            // DeepSeek V4-Pro on Together (2026-04-29 swap from GLM-5.1).
+            // Same model as balanced — caches share when user switches mode
+            // mid-session. With reasoning_effort=high, V4-Pro produces
+            // measurably better multi-step planning, code synthesis, and
+            // SWE-bench-class autonomous loops than the audited Kimi K2.5
+            // baseline (which had muddled reasoning summaries) or the prior
+            // GLM-5.1 deep config (older, less capable on agent tasks).
+            // OpenRouter fallback exists if Together ever rate-limits.
+            .model = "deepseek-ai/DeepSeek-V4-Pro",
             .provider = "together",
             // Q3 (2026-04-27): deep = high reasoning effort. Trades latency
             // for thinking depth. Suits multi-step research, code review,
