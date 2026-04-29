@@ -191,3 +191,99 @@ Hand it to Claude design. Ask for:
 When designs land, hand them to Codex (or the frontend agent) with a tight PR scope per surface — same review pattern that worked for Queues A + B.
 
 — signed by the backend, ready when the frontend lands.
+
+---
+
+## Addendum — `/brain/graph` response contract (V1.5 day-2 task 2B)
+
+**Endpoint:** `GET /api/v1/users/{user_id}/brain/graph`
+
+**Authentication:** mirrors `/sessions` pattern — internal token + tenant scope. Same auth headers as other `/api/v1/users/{id}/*` endpoints.
+
+**Query parameters (all optional):**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `since` | unix epoch seconds (int) | unbounded | Lower bound on `created_at` — filters out memories created before this timestamp |
+| `max_nodes` | int (1–2000) | 500 | Cap on number of nodes returned. Trimming uses recency (newest first). |
+| `node_kinds` | CSV string | all | Filter by memory category — e.g. `core,daily`. Defaults to all categories. |
+
+**Response shape (locked contract — design to this):**
+
+```json
+{
+  "nodes": [
+    {
+      "id": "user_lang",
+      "kind": "core",
+      "created_at": 1714521600,
+      "session_id": "agent:zaki-bot:user:42:main",
+      "summary": "Prefers Zig as primary language; uses NeoVim editor...",
+      "valid_to": null
+    },
+    {
+      "id": "summary_latest/agent:zaki-bot:user:42:thread:abc",
+      "kind": "conversation",
+      "created_at": 1714530000,
+      "session_id": "agent:zaki-bot:user:42:thread:abc",
+      "summary": "Discussed bi-temporal schema design...",
+      "valid_to": 1714600000
+    }
+  ],
+  "edges": [
+    { "type": "session",   "source": "user_lang", "target": "user_editor" },
+    { "type": "semantic",  "source": "user_lang", "target": "user_topic", "weight": 0.84 },
+    { "type": "reference", "source": "summary_a", "target": "user_lang" }
+  ],
+  "trimmed": false,
+  "total_skipped": 0,
+  "total_nodes_in_corpus": 247,
+  "semantic_degraded": false
+}
+```
+
+**Field semantics for the designer:**
+
+- **`nodes[].id`** — opaque memory key. Always unique. Use as React key + as edge endpoint identifier.
+- **`nodes[].kind`** — one of `core | daily | conversation | <custom>`. Drives node color/icon. `core` = evergreen facts (preferences, identity); `daily` = transient notes; `conversation` = dialogue artifacts.
+- **`nodes[].created_at`** — unix seconds. Use for timeline ordering + age-fade visual.
+- **`nodes[].session_id`** — null for global memories (e.g. cross-session preferences); otherwise the session this memory belongs to. Drives session-grouping UI (clustering, sidebar filter).
+- **`nodes[].summary`** — first 200 chars of memory content. Render as tooltip / hover card. Don't trust the length; truncate if needed for layout.
+- **`nodes[].valid_to`** — `null` for currently-valid (V1.5 default — every node). When V1.6 ships the correction classifier, superseded nodes will have a unix timestamp here. **Designer should reserve a "deprecated" visual treatment** (faded color, strikethrough, "superseded" badge) — V1.5 won't trigger it, but the wireframe should show it ready for V1.6.
+
+**Edge semantics:**
+
+| Edge type | Direction | Weight | Visual suggestion |
+|---|---|---|---|
+| `session` | undirected (chain) | n/a | Subtle gray line, slightly thinner. Indicates "these came from the same conversation." |
+| `semantic` | undirected | `weight ∈ [0.7, 1.0]` cosine similarity | Stronger color/thickness as weight rises. The "real" connections — what the agent considers meaningfully related. |
+| `reference` | directed (source → target) | n/a | Arrow head on target. Indicates "this memory cites that one" (compose-memory in V1.6 will create these naturally). |
+
+**Status flags:**
+
+- **`trimmed`** — when `true`, the corpus exceeded `max_nodes`; only the most-recent `max_nodes` are returned. Show "Showing N of M" badge.
+- **`total_skipped`** — `total_nodes_in_corpus - node_count`. Use for the badge above.
+- **`total_nodes_in_corpus`** — full count after `since` + `node_kinds` filter, before the `max_nodes` cap.
+- **`semantic_degraded`** — `true` when pgvector is unavailable (circuit breaker open, no embeddings configured, or query failed). When true, the graph still ships session + reference edges; design should show a subtle banner: "Semantic connections temporarily unavailable — showing structural links only."
+
+**Guarantees the backend gives the frontend:**
+
+1. **No dangling edges** — every edge's `source` AND `target` are in the returned `nodes[]` array. Frontend can render edges directly without lookup-validation.
+2. **Bi-temporal correctness** — superseded memories (V1.6 corrections) are filtered server-side. The frontend never sees expired entries on the current view; the `valid_to` field on returned nodes is for transparency UI ("this fact will expire on…").
+3. **Tenant isolation** — graph is strictly scoped to `user_id` from the path. No cross-tenant leakage.
+
+**Empty-state shape:** when the user has zero memories, `nodes` is `[]`, `edges` is `[]`, `total_nodes_in_corpus` is 0. Design an empty-state component for first-time users with onboarding hint ("Your memory will populate as you talk to ZAKI").
+
+**Recommended client cadence:** poll on `/brain` page open + on user-driven refresh button + after any session-end event (since new memories may have been written). Don't poll continuously — graph generation cost scales with memory corpus.
+
+---
+
+## Addendum — `/brain/timeline` (V1.5 day-2 task 3 — coming next)
+
+**Stub for now — full contract lands when task 3 ships.** Design hint:
+
+- Endpoint: `GET /api/v1/users/{user_id}/brain/timeline?cursor=<opaque>&limit=50&from=<unix>&to=<unix>&session_filter=<csv>`
+- Returns chronological list of memory entries with cursor pagination (stable across writes).
+- Designer should plan a vertical timeline view (newest at top) with collapse-by-day grouping. The cursor is opaque; client just re-passes whatever `next_cursor` returned.
+
+Full response contract lands when task 3 ships. — backend

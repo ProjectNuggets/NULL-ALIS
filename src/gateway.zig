@@ -10747,6 +10747,428 @@ fn handleSessionApprove(
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
+// ── /brain/graph — V1.5 day-2 task 2B ──────────────────────────────
+//
+// GET /api/v1/users/:user_id/brain/graph
+//
+// Returns a navigable memory graph for the user: nodes (memory entries)
+// + edges (session, semantic, reference). Powers the frontend `/brain`
+// page that lets users SEE and trust their memory.
+//
+// Edge types:
+//   • session   — chain pattern within a session (memory_a → memory_b
+//                 ordered by created_at). Cap 50 edges per session.
+//   • semantic  — pgvector cosine similarity > 0.7. Single SQL query
+//                 via VectorStore.pairwiseSimilarities (task 2A).
+//                 Falls back gracefully when pgvector unavailable
+//                 (`semantic_degraded: true` in response).
+//   • reference — regex `memory:[a-zA-Z0-9_-]+` parsed from content;
+//                 emitted only when target is in the returned node set.
+//
+// Bi-temporal correctness: nodes come from `listMemories` which already
+// filters `valid_to IS NULL OR valid_to > now()` (task 1). Semantic
+// edges use the node-key set as input, so superseded memories never
+// appear as edge endpoints. Reference edges are resolved against the
+// same node set.
+//
+// Auth: tenant + user-scoped; mirrors `/sessions` pattern. Numeric
+// user_id parsed from path; cross-tenant access impossible by
+// construction.
+//
+// Query params:
+//   ?since=<unix>           — lower bound on created_at; default unbounded
+//   ?max_nodes=<int>        — cap node count, default 500, max 2000
+//   ?node_kinds=<csv>       — filter by category (core,daily,...);
+//                             default all categories
+//
+// Response shape (defined in `docs/frontend-vision-brief.md`):
+//   {
+//     "nodes": [{ "id", "kind", "created_at", "session_id", "summary",
+//                 "valid_to" }],
+//     "edges": [
+//       { "type": "session",   "source", "target" },
+//       { "type": "semantic",  "source", "target", "weight" },
+//       { "type": "reference", "source", "target" }
+//     ],
+//     "trimmed": bool,                    — true when corpus > max_nodes
+//     "total_skipped": int,               — nodes elided by cap
+//     "total_nodes_in_corpus": int,       — full corpus size before cap
+//     "semantic_degraded": bool           — true when pgvector unavailable
+//   }
+
+/// Memory keys today use `[a-zA-Z0-9_:./-]+` so this regex pattern is
+/// sufficient. The reference-edge parser scans memory content for the
+/// `memory:<key>` token (no spaces inside the key), then resolves to
+/// keys present in the returned node set.
+const BRAIN_REF_PREFIX = "memory:";
+const BRAIN_DEFAULT_MAX_NODES: u32 = 500;
+const BRAIN_MAX_MAX_NODES: u32 = 2000;
+const BRAIN_SEMANTIC_THRESHOLD: f32 = 0.7;
+const BRAIN_SESSION_EDGE_CAP_PER_SESSION: usize = 50;
+const BRAIN_SUMMARY_CHARS: usize = 200;
+const BRAIN_SEMANTIC_MAX_PAIRS: u32 = 5000;
+
+const BrainNode = struct {
+    key: []const u8, // borrowed from MemoryEntry — do not free
+    kind: []const u8, // borrowed (category.toString()) — do not free
+    session_id: ?[]const u8, // borrowed — do not free
+    created_at: i64,
+    summary: []const u8, // borrowed (slice of content) — do not free
+    valid_to: ?i64,
+};
+
+const BrainSessionEdge = struct {
+    source: []const u8, // borrowed
+    target: []const u8, // borrowed
+};
+
+const BrainRefEdge = struct {
+    source: []const u8, // borrowed
+    target: []const u8, // borrowed
+};
+
+fn isBrainRefKeyChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == ':' or ch == '.' or ch == '/';
+}
+
+/// Parse `node_kinds` CSV (e.g. "core,daily") and return true if `kind`
+/// is included. When `csv` is null, all kinds are included.
+fn brainKindAllowed(csv: ?[]const u8, kind: []const u8) bool {
+    const list = csv orelse return true;
+    var it = std.mem.tokenizeScalar(u8, list, ',');
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry, kind)) return true;
+    }
+    return false;
+}
+
+/// Build session edges: chain pattern within each session_id group.
+/// Within a group, entries are sorted by created_at ASC and emitted as
+/// a→b, b→c, ... up to BRAIN_SESSION_EDGE_CAP_PER_SESSION per session.
+/// Caller owns the returned slice.
+fn buildBrainSessionEdges(
+    allocator: std.mem.Allocator,
+    nodes: []const BrainNode,
+) ![]BrainSessionEdge {
+    // Bucket nodes by session_id.
+    var by_session: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .{};
+    defer {
+        var it = by_session.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        by_session.deinit(allocator);
+    }
+
+    for (nodes, 0..) |n, idx| {
+        const sid = n.session_id orelse continue;
+        if (sid.len == 0) continue;
+        const gop = try by_session.getOrPut(allocator, sid);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        try gop.value_ptr.append(allocator, idx);
+    }
+
+    var edges: std.ArrayListUnmanaged(BrainSessionEdge) = .{};
+    errdefer edges.deinit(allocator);
+
+    var it = by_session.iterator();
+    while (it.next()) |entry| {
+        const indices = entry.value_ptr.items;
+        if (indices.len < 2) continue;
+
+        // Sort indices by created_at ascending (timeline order).
+        std.mem.sort(usize, indices, nodes, struct {
+            fn lt(ctx: []const BrainNode, a: usize, b: usize) bool {
+                return ctx[a].created_at < ctx[b].created_at;
+            }
+        }.lt);
+
+        // Emit chain edges, capped per session.
+        const cap = @min(indices.len - 1, BRAIN_SESSION_EDGE_CAP_PER_SESSION);
+        var i: usize = 0;
+        while (i < cap) : (i += 1) {
+            try edges.append(allocator, .{
+                .source = nodes[indices[i]].key,
+                .target = nodes[indices[i + 1]].key,
+            });
+        }
+    }
+
+    return edges.toOwnedSlice(allocator);
+}
+
+/// Scan memory content for `memory:<key>` references. When the target
+/// key is in `node_keys`, emit a reference edge. Source < target
+/// canonicalization NOT enforced for reference edges (they are
+/// directional — "X references Y" is not symmetric). Caller owns the
+/// returned slice.
+fn buildBrainReferenceEdges(
+    allocator: std.mem.Allocator,
+    nodes: []const BrainNode,
+    contents: []const []const u8,
+    node_keys: *std.StringHashMapUnmanaged(void),
+) ![]BrainRefEdge {
+    std.debug.assert(nodes.len == contents.len);
+
+    var edges: std.ArrayListUnmanaged(BrainRefEdge) = .{};
+    errdefer edges.deinit(allocator);
+
+    for (nodes, contents) |source_node, content| {
+        var i: usize = 0;
+        while (i + BRAIN_REF_PREFIX.len < content.len) {
+            const remaining = content[i..];
+            const idx = std.mem.indexOf(u8, remaining, BRAIN_REF_PREFIX) orelse break;
+            const start = i + idx + BRAIN_REF_PREFIX.len;
+            // Walk until we hit a non-key character.
+            var end = start;
+            while (end < content.len and isBrainRefKeyChar(content[end])) : (end += 1) {}
+            if (end > start) {
+                const candidate = content[start..end];
+                // Self-reference is meaningless; skip.
+                if (!std.mem.eql(u8, candidate, source_node.key)) {
+                    if (node_keys.get(candidate) != null) {
+                        try edges.append(allocator, .{
+                            .source = source_node.key,
+                            .target = candidate, // borrowed from content
+                        });
+                    }
+                }
+            }
+            i = end;
+        }
+    }
+
+    return edges.toOwnedSlice(allocator);
+}
+
+fn handleBrainGraph(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    target: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    // ── Parse query params ────────────────────────────────────────
+    const since_param = parseQueryParam(target, "since");
+    const max_nodes_param = parseQueryParam(target, "max_nodes");
+    const node_kinds_csv = parseQueryParam(target, "node_kinds");
+
+    const since: ?i64 = if (since_param) |s| std.fmt.parseInt(i64, s, 10) catch null else null;
+    var max_nodes: u32 = if (max_nodes_param) |s|
+        std.fmt.parseInt(u32, s, 10) catch BRAIN_DEFAULT_MAX_NODES
+    else
+        BRAIN_DEFAULT_MAX_NODES;
+    if (max_nodes == 0) max_nodes = BRAIN_DEFAULT_MAX_NODES;
+    if (max_nodes > BRAIN_MAX_MAX_NODES) max_nodes = BRAIN_MAX_MAX_NODES;
+
+    // ── Fetch nodes ───────────────────────────────────────────────
+    // listMemories already applies the bi-temporal validity filter
+    // (task 1); we receive only currently-valid entries.
+    const all_entries = state_mgr.listMemories(allocator, numeric_user_id, null, null) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"memory_list_failed\"}" };
+    };
+    defer memory_mod.freeEntries(allocator, all_entries);
+
+    // ── Filter (since + node_kinds) ───────────────────────────────
+    var filtered_indices: std.ArrayListUnmanaged(usize) = .{};
+    defer filtered_indices.deinit(allocator);
+
+    for (all_entries, 0..) |entry, idx| {
+        const ts = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0;
+        if (since) |lower| {
+            if (ts < lower) continue;
+        }
+        const kind = entry.category.toString();
+        if (!brainKindAllowed(node_kinds_csv, kind)) continue;
+        filtered_indices.append(allocator, idx) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+        };
+    }
+
+    const total_in_corpus: usize = filtered_indices.items.len;
+
+    // Sort by created_at DESC (newest first) for stable cap behavior.
+    std.mem.sort(usize, filtered_indices.items, all_entries, struct {
+        fn gt(ctx: []memory_mod.MemoryEntry, a: usize, b: usize) bool {
+            const a_ts = std.fmt.parseInt(i64, ctx[a].timestamp, 10) catch 0;
+            const b_ts = std.fmt.parseInt(i64, ctx[b].timestamp, 10) catch 0;
+            return a_ts > b_ts;
+        }
+    }.gt);
+
+    const trimmed = total_in_corpus > max_nodes;
+    const node_count: usize = @min(total_in_corpus, max_nodes);
+    const total_skipped: usize = total_in_corpus - node_count;
+
+    // ── Build BrainNode array ─────────────────────────────────────
+    const nodes = allocator.alloc(BrainNode, node_count) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+    };
+    defer allocator.free(nodes);
+    const contents = allocator.alloc([]const u8, node_count) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+    };
+    defer allocator.free(contents);
+
+    for (filtered_indices.items[0..node_count], 0..) |entry_idx, i| {
+        const entry = all_entries[entry_idx];
+        const ts = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0;
+        const summary_len = @min(entry.content.len, BRAIN_SUMMARY_CHARS);
+        nodes[i] = .{
+            .key = entry.key,
+            .kind = entry.category.toString(),
+            .session_id = entry.session_id,
+            .created_at = ts,
+            .summary = entry.content[0..summary_len],
+            .valid_to = entry.valid_to,
+        };
+        contents[i] = entry.content;
+    }
+
+    // Build a key set for reference-edge dangling-prevention.
+    var node_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer node_keys.deinit(allocator);
+    for (nodes) |n| {
+        node_keys.put(allocator, n.key, {}) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+        };
+    }
+
+    // ── Build session edges ───────────────────────────────────────
+    const session_edges = buildBrainSessionEdges(allocator, nodes) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"session_edges_failed\"}" };
+    };
+    defer allocator.free(session_edges);
+
+    // ── Build semantic edges (pairwise via vector store) ─────────
+    var vector_store_opt: ?memory_mod.VectorStore = null;
+    {
+        state.tenant_runtime_mutex.lock();
+        defer state.tenant_runtime_mutex.unlock();
+        if (state.tenant_runtimes.get(user_id)) |runtime| {
+            if (runtime.mem_rt) |*rt| {
+                vector_store_opt = rt._vector_store;
+            }
+        }
+    }
+
+    var semantic_edges: []memory_mod.vector_store.EdgeResult = &.{};
+    var semantic_degraded = false;
+    if (vector_store_opt) |vs| {
+        // Build keys array for pairwise call.
+        const keys = allocator.alloc([]const u8, node_count) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+        };
+        defer allocator.free(keys);
+        for (nodes, 0..) |n, i| keys[i] = n.key;
+
+        semantic_edges = vs.pairwiseSimilarities(
+            allocator,
+            numeric_user_id,
+            keys,
+            BRAIN_SEMANTIC_THRESHOLD,
+            BRAIN_SEMANTIC_MAX_PAIRS,
+        ) catch blk: {
+            semantic_degraded = true;
+            break :blk &.{};
+        };
+    } else {
+        semantic_degraded = true;
+    }
+    defer memory_mod.vector_store.freeEdgeResults(allocator, semantic_edges);
+
+    // ── Build reference edges (regex over content) ───────────────
+    const ref_edges = buildBrainReferenceEdges(allocator, nodes, contents, &node_keys) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"ref_edges_failed\"}" };
+    };
+    defer allocator.free(ref_edges);
+
+    // ── Build JSON response ──────────────────────────────────────
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    w.writeAll("{\"nodes\":[") catch return response_build_err;
+    for (nodes, 0..) |n, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        w.writeAll("{\"id\":\"") catch return response_build_err;
+        jsonEscapeInto(w, n.key) catch return response_build_err;
+        w.writeAll("\",\"kind\":\"") catch return response_build_err;
+        jsonEscapeInto(w, n.kind) catch return response_build_err;
+        w.print("\",\"created_at\":{d},\"session_id\":", .{n.created_at}) catch return response_build_err;
+        if (n.session_id) |sid| {
+            w.writeAll("\"") catch return response_build_err;
+            jsonEscapeInto(w, sid) catch return response_build_err;
+            w.writeAll("\"") catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll(",\"summary\":\"") catch return response_build_err;
+        jsonEscapeInto(w, n.summary) catch return response_build_err;
+        w.writeAll("\",\"valid_to\":") catch return response_build_err;
+        if (n.valid_to) |vt| {
+            w.print("{d}", .{vt}) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll("}") catch return response_build_err;
+    }
+
+    w.writeAll("],\"edges\":[") catch return response_build_err;
+    var emitted_first_edge = true;
+    for (session_edges) |e| {
+        if (!emitted_first_edge) w.writeAll(",") catch return response_build_err;
+        emitted_first_edge = false;
+        w.writeAll("{\"type\":\"session\",\"source\":\"") catch return response_build_err;
+        jsonEscapeInto(w, e.source) catch return response_build_err;
+        w.writeAll("\",\"target\":\"") catch return response_build_err;
+        jsonEscapeInto(w, e.target) catch return response_build_err;
+        w.writeAll("\"}") catch return response_build_err;
+    }
+    for (semantic_edges) |e| {
+        if (!emitted_first_edge) w.writeAll(",") catch return response_build_err;
+        emitted_first_edge = false;
+        w.writeAll("{\"type\":\"semantic\",\"source\":\"") catch return response_build_err;
+        jsonEscapeInto(w, e.source_key) catch return response_build_err;
+        w.writeAll("\",\"target\":\"") catch return response_build_err;
+        jsonEscapeInto(w, e.target_key) catch return response_build_err;
+        w.print("\",\"weight\":{d:.4}}}", .{e.similarity}) catch return response_build_err;
+    }
+    for (ref_edges) |e| {
+        if (!emitted_first_edge) w.writeAll(",") catch return response_build_err;
+        emitted_first_edge = false;
+        w.writeAll("{\"type\":\"reference\",\"source\":\"") catch return response_build_err;
+        jsonEscapeInto(w, e.source) catch return response_build_err;
+        w.writeAll("\",\"target\":\"") catch return response_build_err;
+        jsonEscapeInto(w, e.target) catch return response_build_err;
+        w.writeAll("\"}") catch return response_build_err;
+    }
+    w.writeAll("]") catch return response_build_err;
+
+    w.print(",\"trimmed\":{s},\"total_skipped\":{d},\"total_nodes_in_corpus\":{d},\"semantic_degraded\":{s}}}", .{
+        if (trimmed) "true" else "false",
+        total_skipped,
+        total_in_corpus,
+        if (semantic_degraded) "true" else "false",
+    }) catch return response_build_err;
+
+    return finalizeJsonBuf(allocator, &out);
+}
+
 // ── GDPR data purge handler (Sprint 7B — S7.6) ─────────────────────
 //
 // DELETE /api/v1/users/:user_id/data
@@ -11983,6 +12405,16 @@ fn handleApiRoute(
     // the file_read tool with path "attachments/<safe_name>".
     if (std.mem.eql(u8, parsed.subpath, "attachments")) {
         return handleAttachmentUpload(req_allocator, method, raw_request, &user_ctx);
+    }
+
+    // ── /brain/graph — V1.5 day-2 task 2B ────────────────────────────────
+    // GET /api/v1/users/{id}/brain/graph[?since=<unix>&max_nodes=N&node_kinds=csv]
+    // Returns nodes + edges (session, semantic, reference) for the user's
+    // memory. Powers the frontend `/brain` page. Bi-temporal correctness:
+    // listMemories already filters superseded entries (task 1).
+    if (std.mem.eql(u8, parsed.subpath, "brain/graph")) {
+        const brain_target = extractRequestTarget(raw_request) orelse base_path;
+        return handleBrainGraph(req_allocator, method, scoped_user_id, brain_target, state);
     }
 
     // ── Session CRUD endpoints (Phase 3.5) ──────────────────────────────
@@ -21898,4 +22330,188 @@ test "appendSubagentCompletionToGatewaySession repeated zaki_app completions do 
     const thread_events = try sm.loadCompletionEvents(thread_key);
     defer memory_mod.freeCompletionEvents(allocator, thread_events);
     try std.testing.expectEqual(@as(usize, 0), thread_events.len);
+}
+
+// ── /brain/graph handler — V1.5 day-2 task 2B unit tests ──────────────
+
+test "brain: isBrainRefKeyChar accepts nullalis key charset" {
+    // Memory keys today: snake_case, colon-separated, slash-pathed, dotted.
+    // e.g. `agent:zaki:user:1:main`, `timeline_summary/agent:zaki:user:1:main/3`.
+    try std.testing.expect(isBrainRefKeyChar('a'));
+    try std.testing.expect(isBrainRefKeyChar('Z'));
+    try std.testing.expect(isBrainRefKeyChar('5'));
+    try std.testing.expect(isBrainRefKeyChar('_'));
+    try std.testing.expect(isBrainRefKeyChar('-'));
+    try std.testing.expect(isBrainRefKeyChar(':'));
+    try std.testing.expect(isBrainRefKeyChar('.'));
+    try std.testing.expect(isBrainRefKeyChar('/'));
+
+    // Negatives: whitespace, punctuation, quotes terminate a key match.
+    try std.testing.expect(!isBrainRefKeyChar(' '));
+    try std.testing.expect(!isBrainRefKeyChar('\n'));
+    try std.testing.expect(!isBrainRefKeyChar(','));
+    try std.testing.expect(!isBrainRefKeyChar(';'));
+    try std.testing.expect(!isBrainRefKeyChar('"'));
+}
+
+test "brain: brainKindAllowed null csv passes everything" {
+    try std.testing.expect(brainKindAllowed(null, "core"));
+    try std.testing.expect(brainKindAllowed(null, "daily"));
+    try std.testing.expect(brainKindAllowed(null, "anything"));
+}
+
+test "brain: brainKindAllowed CSV filters precisely" {
+    try std.testing.expect(brainKindAllowed("core,daily", "core"));
+    try std.testing.expect(brainKindAllowed("core,daily", "daily"));
+    try std.testing.expect(!brainKindAllowed("core,daily", "conversation"));
+    try std.testing.expect(brainKindAllowed("conversation", "conversation"));
+    try std.testing.expect(!brainKindAllowed("conversation", "core"));
+}
+
+test "brain: buildBrainSessionEdges produces chain pattern in time order" {
+    // Three nodes in the same session, out of insertion order. Builder
+    // must sort by created_at ASC and emit chain edges.
+    const nodes = [_]BrainNode{
+        .{
+            .key = "k_third",
+            .kind = "core",
+            .session_id = "s1",
+            .created_at = 300,
+            .summary = "",
+            .valid_to = null,
+        },
+        .{
+            .key = "k_first",
+            .kind = "core",
+            .session_id = "s1",
+            .created_at = 100,
+            .summary = "",
+            .valid_to = null,
+        },
+        .{
+            .key = "k_second",
+            .kind = "core",
+            .session_id = "s1",
+            .created_at = 200,
+            .summary = "",
+            .valid_to = null,
+        },
+    };
+    const edges = try buildBrainSessionEdges(std.testing.allocator, &nodes);
+    defer std.testing.allocator.free(edges);
+
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+    try std.testing.expectEqualStrings("k_first", edges[0].source);
+    try std.testing.expectEqualStrings("k_second", edges[0].target);
+    try std.testing.expectEqualStrings("k_second", edges[1].source);
+    try std.testing.expectEqualStrings("k_third", edges[1].target);
+}
+
+test "brain: buildBrainSessionEdges separates sessions" {
+    // Two sessions; edges must NOT cross session boundaries.
+    const nodes = [_]BrainNode{
+        .{ .key = "a1", .kind = "core", .session_id = "session_a", .created_at = 100, .summary = "", .valid_to = null },
+        .{ .key = "b1", .kind = "core", .session_id = "session_b", .created_at = 110, .summary = "", .valid_to = null },
+        .{ .key = "a2", .kind = "core", .session_id = "session_a", .created_at = 200, .summary = "", .valid_to = null },
+        .{ .key = "b2", .kind = "core", .session_id = "session_b", .created_at = 210, .summary = "", .valid_to = null },
+    };
+    const edges = try buildBrainSessionEdges(std.testing.allocator, &nodes);
+    defer std.testing.allocator.free(edges);
+
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+    // Each edge stays within its session.
+    for (edges) |e| {
+        const same_a = std.mem.eql(u8, e.source, "a1") and std.mem.eql(u8, e.target, "a2");
+        const same_b = std.mem.eql(u8, e.source, "b1") and std.mem.eql(u8, e.target, "b2");
+        try std.testing.expect(same_a or same_b);
+    }
+}
+
+test "brain: buildBrainSessionEdges skips singleton + null-session nodes" {
+    const nodes = [_]BrainNode{
+        .{ .key = "lonely", .kind = "core", .session_id = "s_lonely", .created_at = 50, .summary = "", .valid_to = null },
+        .{ .key = "no_session", .kind = "core", .session_id = null, .created_at = 60, .summary = "", .valid_to = null },
+    };
+    const edges = try buildBrainSessionEdges(std.testing.allocator, &nodes);
+    defer std.testing.allocator.free(edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "brain: buildBrainReferenceEdges parses memory:<key> tokens" {
+    const nodes = [_]BrainNode{
+        .{ .key = "node_a", .kind = "core", .session_id = null, .created_at = 1, .summary = "", .valid_to = null },
+        .{ .key = "node_b", .kind = "core", .session_id = null, .created_at = 2, .summary = "", .valid_to = null },
+        .{ .key = "node_c", .kind = "core", .session_id = null, .created_at = 3, .summary = "", .valid_to = null },
+    };
+    // node_a content references node_b and node_c via memory:<key> tokens.
+    const contents = [_][]const u8{
+        "see memory:node_b for context, also memory:node_c is relevant",
+        "no references here",
+        "another note",
+    };
+
+    var node_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer node_keys.deinit(std.testing.allocator);
+    for (nodes) |n| try node_keys.put(std.testing.allocator, n.key, {});
+
+    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys);
+    defer std.testing.allocator.free(edges);
+
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+    for (edges) |e| {
+        try std.testing.expectEqualStrings("node_a", e.source);
+        try std.testing.expect(std.mem.eql(u8, e.target, "node_b") or std.mem.eql(u8, e.target, "node_c"));
+    }
+}
+
+test "brain: buildBrainReferenceEdges drops references to keys not in node set" {
+    // Reference to memory:nonexistent is in the content but the target
+    // is NOT in the node set — edge must be dropped (dangling prevention).
+    const nodes = [_]BrainNode{
+        .{ .key = "src_node", .kind = "core", .session_id = null, .created_at = 1, .summary = "", .valid_to = null },
+    };
+    const contents = [_][]const u8{
+        "see memory:nonexistent for the elided context",
+    };
+    var node_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer node_keys.deinit(std.testing.allocator);
+    for (nodes) |n| try node_keys.put(std.testing.allocator, n.key, {});
+
+    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys);
+    defer std.testing.allocator.free(edges);
+
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "brain: buildBrainReferenceEdges skips self-references" {
+    // memory:<self> references in your own content are bookkeeping
+    // artifacts (e.g. timeline indices); they shouldn't produce
+    // self-loops in the graph.
+    const nodes = [_]BrainNode{
+        .{ .key = "self_ref", .kind = "core", .session_id = null, .created_at = 1, .summary = "", .valid_to = null },
+    };
+    const contents = [_][]const u8{
+        "this is memory:self_ref pointing at itself",
+    };
+    var node_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer node_keys.deinit(std.testing.allocator);
+    for (nodes) |n| try node_keys.put(std.testing.allocator, n.key, {});
+
+    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys);
+    defer std.testing.allocator.free(edges);
+
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "handleBrainGraph rejects non-GET methods" {
+    // GatewayState mock not needed — early method check fires first.
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainGraph(std.testing.allocator, "POST", "1", "/api/v1/users/1/brain/graph", &dummy_state);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleBrainGraph rejects invalid user_id" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainGraph(std.testing.allocator, "GET", "not_a_number", "/api/v1/users/not_a_number/brain/graph", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
 }
