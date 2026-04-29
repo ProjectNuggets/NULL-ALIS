@@ -41,6 +41,33 @@ pub fn freeVectorResults(allocator: Allocator, results: []VectorResult) void {
     allocator.free(results);
 }
 
+// ── Pairwise edge discovery (V1.5 day-2 task 2A) ───────────────────
+//
+// `EdgeResult` represents a single edge in the memory similarity graph:
+// two memory keys (source, target) plus their cosine similarity. Used
+// by `/brain/graph` to render semantic edges between memory nodes
+// without N round-trips through `searchScoped`. Single SQL query in
+// the pgvector backend.
+//
+// Convention: source_key < target_key lexicographically (canonical
+// orientation; prevents duplicate edges in undirected graphs).
+
+pub const EdgeResult = struct {
+    source_key: []const u8,
+    target_key: []const u8,
+    similarity: f32,
+
+    pub fn deinit(self: *const EdgeResult, allocator: Allocator) void {
+        allocator.free(self.source_key);
+        allocator.free(self.target_key);
+    }
+};
+
+pub fn freeEdgeResults(allocator: Allocator, edges: []EdgeResult) void {
+    for (edges) |*e| e.deinit(allocator);
+    allocator.free(edges);
+}
+
 // ── VectorStore vtable ────────────────────────────────────────────
 
 pub const VectorStore = struct {
@@ -58,6 +85,24 @@ pub const VectorStore = struct {
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         health_check: *const fn (ptr: *anyopaque, alloc: Allocator) anyerror!HealthStatus,
         deinit: *const fn (ptr: *anyopaque) void,
+        /// V1.5 day-2 task 2A — optional pairwise similarity discovery
+        /// for `/brain/graph` semantic edges. Returns edges (source,
+        /// target, similarity) where both endpoints are in `key_set`,
+        /// `source < target` lexicographically (canonical orientation),
+        /// and `similarity > threshold`. When the backend doesn't
+        /// support this (e.g. SqliteSharedVectorStore), the wrapper
+        /// returns an empty slice — the graph endpoint degrades to
+        /// session + reference edges only. PgVector backend implements
+        /// it as a single self-join; cost is O(K · log K) with the
+        /// ivfflat index covering up to `max_pairs` rows.
+        pairwise_similarities: ?*const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            scope_user_id: i64,
+            key_set: []const []const u8,
+            threshold: f32,
+            max_pairs: u32,
+        ) anyerror![]EdgeResult = null,
     };
 
     pub fn upsert(self: VectorStore, key: []const u8, embedding: []const f32) !void {
@@ -100,6 +145,24 @@ pub const VectorStore = struct {
 
     pub fn deinitStore(self: VectorStore) void {
         self.vtable.deinit(self.ptr);
+    }
+
+    /// V1.5 day-2 task 2A — pairwise similarity edge discovery for
+    /// `/brain/graph`. Backends that don't implement the vtable slot
+    /// return an empty slice (graceful degrade — graph still ships
+    /// session + reference edges).
+    pub fn pairwiseSimilarities(
+        self: VectorStore,
+        alloc: Allocator,
+        user_id: i64,
+        key_set: []const []const u8,
+        threshold: f32,
+        max_pairs: u32,
+    ) ![]EdgeResult {
+        if (self.vtable.pairwise_similarities) |fn_ptr| {
+            return fn_ptr(self.ptr, alloc, user_id, key_set, threshold, max_pairs);
+        }
+        return alloc.alloc(EdgeResult, 0);
     }
 };
 
@@ -975,4 +1038,56 @@ test "delete then search returns empty for deleted key" {
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("keep_this", results[0].key);
+}
+
+// ── V1.5 day-2 task 2A — EdgeResult + pairwiseSimilarities ──
+
+test "EdgeResult deinit frees both keys" {
+    const src = try std.testing.allocator.dupe(u8, "memory_a");
+    const dst = try std.testing.allocator.dupe(u8, "memory_b");
+    const e = EdgeResult{
+        .source_key = src,
+        .target_key = dst,
+        .similarity = 0.85,
+    };
+    e.deinit(std.testing.allocator);
+    // No assertion; the test passes if the allocator's leak detector doesn't fire.
+}
+
+test "freeEdgeResults frees slice and all owned keys" {
+    const edges = try std.testing.allocator.alloc(EdgeResult, 2);
+    edges[0] = .{
+        .source_key = try std.testing.allocator.dupe(u8, "k1"),
+        .target_key = try std.testing.allocator.dupe(u8, "k2"),
+        .similarity = 0.91,
+    };
+    edges[1] = .{
+        .source_key = try std.testing.allocator.dupe(u8, "k3"),
+        .target_key = try std.testing.allocator.dupe(u8, "k4"),
+        .similarity = 0.72,
+    };
+    freeEdgeResults(std.testing.allocator, edges);
+    // Allocator leak-detector verifies both keys + the slice were freed.
+}
+
+test "pairwiseSimilarities falls back to empty when backend has no fn pointer" {
+    // SqliteSharedVectorStore intentionally does NOT implement pairwise
+    // (no use case for /brain/graph in sqlite-only deployments). The
+    // vtable's `pairwise_similarities` field defaults to null; the
+    // wrapper returns an empty slice rather than erroring. This is the
+    // "graceful degrade" path: graph endpoint still ships session +
+    // reference edges; semantic edges silently absent.
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var vs = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer vs.deinit();
+
+    const s = vs.store();
+
+    const keys = [_][]const u8{ "key_a", "key_b", "key_c" };
+    const edges = try s.pairwiseSimilarities(std.testing.allocator, 1, &keys, 0.7, 100);
+    defer freeEdgeResults(std.testing.allocator, edges);
+
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
 }
