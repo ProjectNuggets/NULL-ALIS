@@ -34,6 +34,13 @@ const ChannelSelection = struct {
     enable_channel_irc: bool = false,
     enable_channel_imessage: bool = false,
     enable_channel_email: bool = false,
+    // enable_channel_lark: REMOVED from operator-facing build flags
+    // 2026-04-30 (Nova directive — "delete Lark, we are not going to offer
+    // it at all"). Field retained at default `false` for ABI compat with
+    // the rest of the build_options switch in channel_catalog.zig; no
+    // -Dchannels= token can flip it true. Dead-code cleanup of
+    // src/channels/lark.zig + LarkConfig + 200+ call sites is scheduled
+    // for V1.5 first-week per scope-before-delete discipline.
     enable_channel_lark: bool = false,
     // enable_channel_dingtalk: deleted Sprint 8 (S8.4+S8.6, 2026-04-24).
     enable_channel_line: bool = false,
@@ -53,7 +60,8 @@ const ChannelSelection = struct {
         self.enable_channel_irc = true;
         self.enable_channel_imessage = true;
         self.enable_channel_email = true;
-        self.enable_channel_lark = true;
+        // Lark intentionally NOT enabled by `-Dchannels=all` (2026-04-30).
+        // Operator-facing surface removed; see field comment above.
         self.enable_channel_line = true;
         self.enable_channel_onebot = true;
         self.enable_channel_qq = true;
@@ -123,7 +131,12 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
         } else if (std.mem.eql(u8, token, "email")) {
             selection.enable_channel_email = true;
         } else if (std.mem.eql(u8, token, "lark")) {
-            selection.enable_channel_lark = true;
+            // 2026-04-30 — Lark removed from operator-facing surface. The
+            // build option no longer accepts it; the runtime channel is
+            // unreachable. Erroring loudly so deploy scripts that still
+            // request it surface immediately.
+            std.log.err("-Dchannels=lark is no longer supported (channel removed 2026-04-30). Drop 'lark' from your channels list.", .{});
+            return error.InvalidChannelsOption;
         } else if (std.mem.eql(u8, token, "line")) {
             selection.enable_channel_line = true;
         } else if (std.mem.eql(u8, token, "onebot")) {
