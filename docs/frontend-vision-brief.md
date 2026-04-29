@@ -353,3 +353,226 @@ When designs land, hand them to Codex (or the frontend agent) with a tight PR sc
 **V1.6 enhancements queued:** `session_filter` query param (CSV of session keys), `direction` param (asc/desc — currently always desc).
 
 — backend, signed.
+
+---
+
+## Implementation handoff package
+
+**For Claude design (wireframes):** see "Surfaces to design or refine" + the `/brain/graph` and `/brain/timeline` addendums above. Empty-state shape, edge visual conventions, and `valid_to` deprecated-state reservation are the key constraints.
+
+**For Codex + Opus (implementation):** the four artifacts below give you everything you need to wire the frontend without reading backend code.
+
+### TypeScript types (paste into `src/types/brain.ts`)
+
+```typescript
+// /api/v1/users/{user_id}/brain/graph response
+export interface BrainGraphResponse {
+  nodes: BrainGraphNode[];
+  edges: BrainGraphEdge[];
+  trimmed: boolean;
+  total_skipped: number;
+  total_nodes_in_corpus: number;
+  semantic_degraded: boolean;
+}
+
+export interface BrainGraphNode {
+  id: string;                     // memory key (unique, opaque)
+  kind: "core" | "daily" | "conversation" | string;  // category
+  created_at: number;             // unix seconds
+  session_id: string | null;      // null = global memory
+  summary: string;                // first 200 chars of content (UTF-8 safe)
+  valid_to: number | null;        // V1.5 always null; V1.6 superseded timestamp
+}
+
+export type BrainGraphEdge =
+  | { type: "session";   source: string; target: string }
+  | { type: "semantic";  source: string; target: string; weight: number }
+  | { type: "reference"; source: string; target: string };
+
+// /api/v1/users/{user_id}/brain/timeline response
+export interface BrainTimelineResponse {
+  entries: BrainTimelineEntry[];
+  next_cursor: string | null;     // opaque base64 — pass back to next request
+  has_more: boolean;
+}
+
+export interface BrainTimelineEntry {
+  id: string;                     // internal row id (16-byte hex)
+  key: string;                    // user-visible memory key
+  kind: "core" | "daily" | "conversation" | string;
+  created_at: number;             // unix seconds
+  session_id: string | null;
+  summary: string;
+  valid_to: number | null;
+}
+
+// Query parameter helpers
+export interface BrainGraphQuery {
+  since?: number;                 // unix seconds lower bound
+  max_nodes?: number;             // 1-2000, default 500
+  node_kinds?: string;            // CSV, e.g. "core,daily"
+}
+
+export interface BrainTimelineQuery {
+  cursor?: string;                // opaque, omit on first page
+  limit?: number;                 // 1-200, default 50
+  from?: number;                  // unix seconds
+  to?: number;                    // unix seconds
+}
+```
+
+### Example response — `/brain/graph` populated user
+
+```json
+{
+  "nodes": [
+    {
+      "id": "user_lang",
+      "kind": "core",
+      "created_at": 1714510800,
+      "session_id": null,
+      "summary": "Prefers Zig as primary language for systems work; uses NeoVim editor with vim-zig plugin.",
+      "valid_to": null
+    },
+    {
+      "id": "user_topic_today",
+      "kind": "daily",
+      "created_at": 1714521600,
+      "session_id": "agent:zaki-bot:user:42:main",
+      "summary": "Working on bi-temporal schema design for nullalis V1.5; reviewed Graphiti pattern.",
+      "valid_to": null
+    },
+    {
+      "id": "summary_latest/agent:zaki-bot:user:42:thread:abc",
+      "kind": "conversation",
+      "created_at": 1714525200,
+      "session_id": "agent:zaki-bot:user:42:thread:abc",
+      "summary": "Discussion about Mem0 ADD/UPDATE/DELETE/NONE classifier — see memory:user_lang for context.",
+      "valid_to": null
+    }
+  ],
+  "edges": [
+    { "type": "session",   "source": "user_topic_today", "target": "summary_latest/agent:zaki-bot:user:42:thread:abc" },
+    { "type": "semantic",  "source": "user_lang", "target": "user_topic_today", "weight": 0.7841 },
+    { "type": "reference", "source": "summary_latest/agent:zaki-bot:user:42:thread:abc", "target": "user_lang" }
+  ],
+  "trimmed": false,
+  "total_skipped": 0,
+  "total_nodes_in_corpus": 3,
+  "semantic_degraded": false
+}
+```
+
+### Example response — `/brain/graph` semantic-degraded
+
+When pgvector is unavailable (circuit breaker open or no embeddings provider configured), the graph still ships session + reference edges. Frontend should show a soft banner: "Semantic connections temporarily unavailable — showing structural links only."
+
+```json
+{
+  "nodes": [...],
+  "edges": [
+    { "type": "session", "source": "k_a", "target": "k_b" }
+  ],
+  "trimmed": false,
+  "total_skipped": 0,
+  "total_nodes_in_corpus": 12,
+  "semantic_degraded": true
+}
+```
+
+### Example response — `/brain/timeline` first page
+
+```json
+{
+  "entries": [
+    {
+      "id": "f6e5d4c3b2a17890",
+      "key": "summary_latest/agent:zaki-bot:user:42:thread:abc",
+      "kind": "conversation",
+      "created_at": 1714525200,
+      "session_id": "agent:zaki-bot:user:42:thread:abc",
+      "summary": "Discussion about Mem0 classifier — see memory:user_lang for context.",
+      "valid_to": null
+    },
+    {
+      "id": "a1b2c3d4e5f67890",
+      "key": "user_topic_today",
+      "kind": "daily",
+      "created_at": 1714521600,
+      "session_id": "agent:zaki-bot:user:42:main",
+      "summary": "Working on bi-temporal schema design for nullalis V1.5.",
+      "valid_to": null
+    }
+  ],
+  "next_cursor": "MTcxNDUyMTYwMDphMWIyYzNkNGU1ZjY3ODkw",
+  "has_more": true
+}
+```
+
+### Example response — empty state
+
+Both endpoints when the user has zero memories:
+
+```json
+// /brain/graph
+{ "nodes": [], "edges": [], "trimmed": false, "total_skipped": 0, "total_nodes_in_corpus": 0, "semantic_degraded": false }
+
+// /brain/timeline
+{ "entries": [], "next_cursor": null, "has_more": false }
+```
+
+### Curl examples — live testing once gateway is running
+
+```bash
+# Replace with your actual gateway URL + internal token
+GATEWAY="http://localhost:7878"
+TOKEN="$(cat ~/.nullalis/state/internal_token)"
+
+# Get graph for user 1
+curl -s -H "X-Internal-Token: $TOKEN" \
+  "$GATEWAY/api/v1/users/1/brain/graph" | jq .
+
+# Filter to core memories, last 30 days, max 100 nodes
+curl -s -H "X-Internal-Token: $TOKEN" \
+  "$GATEWAY/api/v1/users/1/brain/graph?node_kinds=core&since=$(date -v-30d +%s)&max_nodes=100" | jq .
+
+# First page of timeline
+curl -s -H "X-Internal-Token: $TOKEN" \
+  "$GATEWAY/api/v1/users/1/brain/timeline?limit=20" | jq .
+
+# Next page (substitute the cursor from previous response)
+curl -s -H "X-Internal-Token: $TOKEN" \
+  "$GATEWAY/api/v1/users/1/brain/timeline?limit=20&cursor=MTcxNDUyMTYwMDphMWIyYzNkNGU1ZjY3ODkw" | jq .
+```
+
+### Suggested file layout (zaki-prod side)
+
+```
+src/
+  types/
+    brain.ts                          ← TS types from above
+  lib/
+    api/
+      brain.ts                        ← fetch wrappers (getBrainGraph, getBrainTimeline)
+  app/
+    brain/                            ← Next.js route /brain
+      page.tsx                        ← BrainPage shell
+      _components/
+        BrainGraph.tsx                ← graph view (vendor Supermemory's packages/memory-graph)
+        BrainTimeline.tsx             ← infinite-scroll timeline
+        BrainEmptyState.tsx           ← onboarding hint
+        BrainSemanticDegradedBanner.tsx
+```
+
+### Implementation checklist for the frontend agent
+
+1. Create `src/types/brain.ts` from the TS types above.
+2. Create fetch wrappers in `src/lib/api/brain.ts` — handle internal-token auth (mirror existing API client pattern in zaki-prod).
+3. Vendor Supermemory's `packages/memory-graph` (MIT, see `docs/graph-memory-research.md`) into `src/vendor/memory-graph/`. Adapter from `BrainGraphResponse` → their `{nodes, edges}` type.
+4. Build `BrainPage` with two tabs: "Graph" + "Timeline." Default to Timeline (it's the more reliable render path; graph requires layout work).
+5. Empty state for both views with onboarding hint.
+6. Mobile breakpoint: graph collapses to vertical-list view (the d3-force layout doesn't fit mobile screens cleanly).
+7. Add to sidebar: "Brain" entry with brain icon.
+8. Wire to `/brain` route in Next.js.
+
+— backend, signed. The endpoints are live and ready to consume.
