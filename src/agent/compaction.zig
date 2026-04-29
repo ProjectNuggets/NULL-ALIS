@@ -85,10 +85,23 @@ pub const TokenBudgetPolicy = struct {
     /// Reserve-based force-compress threshold. Hard guard against context
     /// exhaustion; keep existing 65% floor semantics.
     threshold: u64,
-    /// Hermes-style early-compaction trigger. Fires when context pressure
-    /// crosses 50% of the model's resolved context window, letting the cheap
-    /// 3-pass escalation in autoCompactHistory (60/75/85%) engage BEFORE
-    /// pressure is high enough to need the expensive full-LLM summary pass.
+    /// **Advisory marker — NOT a fire signal.** Set to 50% of the resolved
+    /// context window. When pressure crosses this, the agent's
+    /// `context_pressure.compaction_recommended` flag flips to true so the
+    /// UI can render a "halfway through context" hint and the agent's
+    /// reasoning knows to be mindful of length. **Compaction itself does
+    /// NOT fire here.**
+    ///
+    /// The actual firing thresholds live inside `autoCompactHistory` below
+    /// (single source of truth — do not duplicate the percentages here):
+    ///   - **Pass A (cheap dedup + placeholder substitution): 70%**
+    ///   - **Pass C (LLM summarization, expensive):           90%**
+    ///
+    /// Two-tier hot path. Pass B was deleted in iter28 (commit 8136f8d) —
+    /// it duplicated work the post-reply lifecycle summarizer already does.
+    /// Earlier commits referenced 60/75/85% thresholds; that comment is
+    /// stale, current truth is 70/90.
+    ///
     /// Derived as (token_limit * 50) / 100.
     compaction_trigger: u64,
 };
