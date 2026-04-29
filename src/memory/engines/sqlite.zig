@@ -13,6 +13,17 @@ const std = @import("std");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
+
+/// V1.5 day-2 — single source of truth for the bi-temporal retrieval
+/// filter (sqlite flavor). Every memory-read SELECT in this file
+/// appends this clause with appropriate `AND` placement so superseded
+/// entries never leak. Sqlite uses `unixepoch()` since `EXTRACT(EPOCH
+/// FROM NOW())` is postgres-only. The same logical filter lives in
+/// `src/zaki_state.zig::MEMORIES_VALIDITY_FILTER` for the postgres
+/// production path. The `_M` variant is for queries that JOIN against
+/// the `memories` table aliased as `m` (FTS5 path).
+const VALIDITY_FILTER_SQL = "(valid_to IS NULL OR valid_to > unixepoch())";
+const VALIDITY_FILTER_M_SQL = "(m.valid_to IS NULL OR m.valid_to > unixepoch())";
 const MemoryEntry = root.MemoryEntry;
 const log = std.log.scoped(.memory_sqlite);
 
@@ -347,8 +358,8 @@ pub const SqliteMemory = struct {
         self_.mutex.lock();
         defer self_.mutex.unlock();
 
-        // V1.5 day-2 — valid_to filter: superseded entries hidden.
-        const sql = "SELECT id, key, content, category, created_at, session_id, valid_to FROM memories WHERE key = ?1 AND (valid_to IS NULL OR valid_to > unixepoch())";
+        // V1.5 day-2 — valid_to filter via VALIDITY_FILTER_SQL constant.
+        const sql = "SELECT id, key, content, category, created_at, session_id, valid_to FROM memories WHERE key = ?1 AND " ++ VALIDITY_FILTER_SQL;
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -376,9 +387,9 @@ pub const SqliteMemory = struct {
 
         if (category) |cat| {
             const cat_str = cat.toString();
-            // V1.5 day-2 — valid_to filter applied uniformly across list paths.
+            // V1.5 day-2 — valid_to filter via VALIDITY_FILTER_SQL constant.
             const sql = "SELECT id, key, content, category, created_at, session_id, valid_to FROM memories " ++
-                "WHERE category = ?1 AND (valid_to IS NULL OR valid_to > unixepoch()) ORDER BY updated_at DESC";
+                "WHERE category = ?1 AND " ++ VALIDITY_FILTER_SQL ++ " ORDER BY updated_at DESC";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -400,7 +411,7 @@ pub const SqliteMemory = struct {
                 } else break;
             }
         } else {
-            const sql = "SELECT id, key, content, category, created_at, session_id, valid_to FROM memories WHERE (valid_to IS NULL OR valid_to > unixepoch()) ORDER BY updated_at DESC";
+            const sql = "SELECT id, key, content, category, created_at, session_id, valid_to FROM memories WHERE " ++ VALIDITY_FILTER_SQL ++ " ORDER BY updated_at DESC";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -789,21 +800,20 @@ pub const SqliteMemory = struct {
 
         // V1.5 day-2 — FTS recall returns: id(0), key(1), content(2),
         // category(3), created_at(4), score(5), session_id(6), valid_to(7).
-        // The valid_to filter (`m.valid_to IS NULL OR m.valid_to > unixepoch()`)
-        // is appended to every WHERE clause so superseded memories never
-        // surface from FTS search.
+        // Filter via VALIDITY_FILTER_M_SQL (table-alias `m.` form) so
+        // superseded memories never surface from FTS search.
         const sql_unscoped =
             "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id, m.valid_to " ++
             "FROM memories_fts f " ++
             "JOIN memories m ON m.rowid = f.rowid " ++
-            "WHERE memories_fts MATCH ?1 AND (m.valid_to IS NULL OR m.valid_to > unixepoch()) " ++
+            "WHERE memories_fts MATCH ?1 AND " ++ VALIDITY_FILTER_M_SQL ++ " " ++
             "ORDER BY score " ++
             "LIMIT ?2";
         const sql_scoped =
             "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id, m.valid_to " ++
             "FROM memories_fts f " ++
             "JOIN memories m ON m.rowid = f.rowid " ++
-            "WHERE memories_fts MATCH ?1 AND m.session_id = ?2 AND (m.valid_to IS NULL OR m.valid_to > unixepoch()) " ++
+            "WHERE memories_fts MATCH ?1 AND m.session_id = ?2 AND " ++ VALIDITY_FILTER_M_SQL ++ " " ++
             "ORDER BY score " ++
             "LIMIT ?3";
         const sql = if (session_id != null) sql_scoped else sql_unscoped;
@@ -872,7 +882,7 @@ pub const SqliteMemory = struct {
             try sql_buf.appendSlice(allocator, " ESCAPE '\\')");
         }
 
-        try sql_buf.appendSlice(allocator, ") AND (valid_to IS NULL OR valid_to > unixepoch())");
+        try sql_buf.appendSlice(allocator, ") AND " ++ VALIDITY_FILTER_SQL);
 
         const session_param_index: ?usize = if (session_id != null) keywords.items.len * 2 + 1 else null;
         const limit_param_index: usize = if (session_param_index != null)
@@ -2261,14 +2271,38 @@ test "sqlite clearMessages does not affect other sessions" {
 // reach down to sqlite3_exec to simulate what the V1.6 correction
 // classifier will eventually call. They prove the read-side filter works
 // end-to-end across get / list / recall paths.
+//
+// Test timestamps are computed from `std.time.timestamp()` rather than
+// hardcoded so the tests don't silently invert in 2030+. PAST_OFFSET
+// resolves to ~1 year before now; FUTURE_OFFSET to ~10 years after.
 
+const TEST_PAST_OFFSET_S: i64 = -365 * 86400;
+const TEST_FUTURE_OFFSET_S: i64 = 10 * 365 * 86400;
+
+fn testPast() i64 {
+    return std.time.timestamp() + TEST_PAST_OFFSET_S;
+}
+
+fn testFuture() i64 {
+    return std.time.timestamp() + TEST_FUTURE_OFFSET_S;
+}
+
+/// Parameterized helper — binds key + valid_to via sqlite_bind so we
+/// don't string-format SQL with potentially quote-bearing key bytes.
+/// V1.5 tests use literal keys; this defends against future tests that
+/// might not.
 fn testSetValidTo(mem: *SqliteMemory, key: []const u8, valid_to_unix: i64) !void {
-    var sql_buf: [256]u8 = undefined;
-    const sql = try std.fmt.bufPrintZ(&sql_buf, "UPDATE memories SET valid_to = {d} WHERE key = '{s}'", .{ valid_to_unix, key });
-    var err_msg: [*c]u8 = null;
-    const rc = c.sqlite3_exec(mem.db, sql.ptr, null, null, &err_msg);
-    if (err_msg) |msg| c.sqlite3_free(msg);
-    if (rc != c.SQLITE_OK) return error.UpdateFailed;
+    const sql = "UPDATE memories SET valid_to = ?1 WHERE key = ?2";
+    var stmt: ?*c.sqlite3_stmt = null;
+    const prep_rc = c.sqlite3_prepare_v2(mem.db, sql, -1, &stmt, null);
+    if (prep_rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    _ = c.sqlite3_bind_int64(stmt, 1, valid_to_unix);
+    _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_STATIC);
+
+    const step_rc = c.sqlite3_step(stmt);
+    if (step_rc != c.SQLITE_DONE) return error.UpdateFailed;
 }
 
 test "sqlite valid_to default null on store" {
@@ -2291,8 +2325,7 @@ test "sqlite valid_to past hides entry from get" {
     const m = mem.memory();
 
     try m.store("stale", "outdated fact", .core, null);
-    // 2026-01-01 — definitely in the past at test time (current date 2026-04-29 +).
-    try testSetValidTo(&mem, "stale", 1735689600);
+    try testSetValidTo(&mem, "stale", testPast());
 
     const entry = try m.get(std.testing.allocator, "stale");
     try std.testing.expect(entry == null);
@@ -2304,14 +2337,14 @@ test "sqlite valid_to future keeps entry visible" {
     const m = mem.memory();
 
     try m.store("future_fact", "valid for a while", .core, null);
-    // 2030-01-01 — far future.
-    try testSetValidTo(&mem, "future_fact", 1893456000);
+    const future = testFuture();
+    try testSetValidTo(&mem, "future_fact", future);
 
     const entry = try m.get(std.testing.allocator, "future_fact");
     try std.testing.expect(entry != null);
     defer entry.?.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("valid for a while", entry.?.content);
-    try std.testing.expectEqual(@as(?i64, 1893456000), entry.?.valid_to);
+    try std.testing.expectEqual(@as(?i64, future), entry.?.valid_to);
 }
 
 test "sqlite valid_to past hides entry from list" {
@@ -2321,7 +2354,7 @@ test "sqlite valid_to past hides entry from list" {
 
     try m.store("a", "alive entry", .core, null);
     try m.store("b", "expired entry", .core, null);
-    try testSetValidTo(&mem, "b", 1735689600);
+    try testSetValidTo(&mem, "b", testPast());
 
     const entries = try m.list(std.testing.allocator, null, null);
     defer root.freeEntries(std.testing.allocator, entries);
@@ -2337,7 +2370,7 @@ test "sqlite valid_to past hides entry from recall" {
 
     try m.store("a", "the alpha keyword lives", .core, null);
     try m.store("b", "another alpha keyword expired", .core, null);
-    try testSetValidTo(&mem, "b", 1735689600);
+    try testSetValidTo(&mem, "b", testPast());
 
     const results = try m.recall(std.testing.allocator, "alpha", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
@@ -2352,8 +2385,9 @@ test "sqlite valid_to roundtrip null + value via list" {
     const m = mem.memory();
 
     try m.store("k1", "always valid", .core, null);
-    try m.store("k2", "valid into 2030", .core, null);
-    try testSetValidTo(&mem, "k2", 1893456000);
+    try m.store("k2", "valid for a decade", .core, null);
+    const future = testFuture();
+    try testSetValidTo(&mem, "k2", future);
 
     const entries = try m.list(std.testing.allocator, null, null);
     defer root.freeEntries(std.testing.allocator, entries);
@@ -2366,7 +2400,7 @@ test "sqlite valid_to roundtrip null + value via list" {
             try std.testing.expect(e.valid_to == null);
             saw_null = true;
         } else if (std.mem.eql(u8, e.key, "k2")) {
-            try std.testing.expectEqual(@as(?i64, 1893456000), e.valid_to);
+            try std.testing.expectEqual(@as(?i64, future), e.valid_to);
             saw_future = true;
         }
     }

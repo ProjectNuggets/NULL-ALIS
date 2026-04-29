@@ -40,6 +40,16 @@ const c = if (build_options.enable_postgres) @cImport({
     @cInclude("libpq-fe.h");
 }) else struct {};
 
+/// V1.5 day-2 — single source of truth for the bi-temporal retrieval
+/// filter. Every memory-read SELECT in this module appends this clause
+/// (with appropriate `AND` placement) so superseded entries (valid_to
+/// in the past) never leak to the agent. Extracted as a constant so
+/// future SELECTs can't forget the filter — they reference the symbol.
+/// The corresponding clause in `memory/engines/sqlite.zig` uses
+/// `unixepoch()` instead of `EXTRACT(EPOCH FROM NOW())` because sqlite
+/// has no equivalent function.
+const MEMORIES_VALIDITY_FILTER = "(valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint)";
+
 pub const ChannelIdentityBinding = struct {
     id: []u8,
     user_id: i64,
@@ -1966,11 +1976,10 @@ const ManagerImpl = struct {
     }
 
     pub fn getMemory(self: *Self, allocator: std.mem.Allocator, user_id: i64, key: []const u8) !?memory_root.MemoryEntry {
-        // V1.5 day-2: valid_to filter — superseded memories (valid_to <= now)
-        // are skipped; null/future valid_to are returned. Same shape on every
-        // memory-read query in this module.
+        // V1.5 day-2: valid_to filter via MEMORIES_VALIDITY_FILTER. Every
+        // memory-read SELECT in this module appends this clause.
         const q = try self.buildQuery(
-            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND key = $2 AND (valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint)",
+            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND key = $2 AND " ++ MEMORIES_VALIDITY_FILTER,
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -1988,12 +1997,13 @@ const ManagerImpl = struct {
 
     pub fn listMemories(self: *Self, allocator: std.mem.Allocator, user_id: i64, category: ?memory_root.MemoryCategory, session_id: ?[]const u8) ![]memory_root.MemoryEntry {
         const cat = if (category) |value| categoryToMemoryType(value) else null;
-        // V1.5 day-2: every list path appends `AND (valid_to IS NULL OR valid_to >
-        // now())` to filter superseded memories. valid_to column added to SELECT.
+        // V1.5 day-2: every list path appends MEMORIES_VALIDITY_FILTER
+        // so future-us can't skip the filter — extract → reference, not
+        // copy/paste.
         if (cat != null and session_id != null) {
             return self.queryMemories(
                 allocator,
-                "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND memory_type = $2 AND session_id = $3 AND (valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint) ORDER BY updated_at DESC",
+                "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND memory_type = $2 AND session_id = $3 AND " ++ MEMORIES_VALIDITY_FILTER ++ " ORDER BY updated_at DESC",
                 user_id,
                 cat.?,
                 session_id.?,
@@ -2002,7 +2012,7 @@ const ManagerImpl = struct {
         if (cat != null) {
             return self.queryMemories(
                 allocator,
-                "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND memory_type = $2 AND (valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint) ORDER BY updated_at DESC",
+                "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND memory_type = $2 AND " ++ MEMORIES_VALIDITY_FILTER ++ " ORDER BY updated_at DESC",
                 user_id,
                 cat.?,
                 null,
@@ -2011,7 +2021,7 @@ const ManagerImpl = struct {
         if (session_id != null) {
             return self.queryMemories(
                 allocator,
-                "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND session_id = $2 AND (valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint) ORDER BY updated_at DESC",
+                "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND session_id = $2 AND " ++ MEMORIES_VALIDITY_FILTER ++ " ORDER BY updated_at DESC",
                 user_id,
                 session_id.?,
                 null,
@@ -2019,7 +2029,7 @@ const ManagerImpl = struct {
         }
         return self.queryMemories(
             allocator,
-            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND (valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint) ORDER BY updated_at DESC",
+            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " ORDER BY updated_at DESC",
             user_id,
             null,
             null,
@@ -2038,16 +2048,16 @@ const ManagerImpl = struct {
         // V1.5 day-2: valid_to at column 6, score moves to column 7. Decoder
         // path tracked via decodeMemoryRows(has_score=true) — column indices
         // are: 0=id, 1=key, 2=content, 3=memory_type, 4=ts_text, 5=session_id,
-        // 6=valid_to, 7=score.
+        // 6=valid_to, 7=score. Filter via MEMORIES_VALIDITY_FILTER constant.
         const q = try self.buildQuery(
             if (session_id != null)
                 "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to, " ++
                     "(CASE WHEN key ILIKE $2 THEN 2.0 ELSE 0.0 END + CASE WHEN content ILIKE $2 THEN 1.0 ELSE 0.0 END) AS score " ++
-                    "FROM {schema}.memories WHERE user_id = $1 AND session_id = $4 AND (key ILIKE $2 OR content ILIKE $2) AND (valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint) ORDER BY score DESC, updated_at DESC LIMIT $3"
+                    "FROM {schema}.memories WHERE user_id = $1 AND session_id = $4 AND (key ILIKE $2 OR content ILIKE $2) AND " ++ MEMORIES_VALIDITY_FILTER ++ " ORDER BY score DESC, updated_at DESC LIMIT $3"
             else
                 "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to, " ++
                     "(CASE WHEN key ILIKE $2 THEN 2.0 ELSE 0.0 END + CASE WHEN content ILIKE $2 THEN 1.0 ELSE 0.0 END) AS score " ++
-                    "FROM {schema}.memories WHERE user_id = $1 AND (key ILIKE $2 OR content ILIKE $2) AND (valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint) ORDER BY score DESC, updated_at DESC LIMIT $3",
+                    "FROM {schema}.memories WHERE user_id = $1 AND (key ILIKE $2 OR content ILIKE $2) AND " ++ MEMORIES_VALIDITY_FILTER ++ " ORDER BY score DESC, updated_at DESC LIMIT $3",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;

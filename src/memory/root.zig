@@ -292,10 +292,26 @@ pub const MemoryEntry = struct {
     /// surface populate this with `extract(epoch from now())::bigint`
     /// when a fact is invalidated, leaving the row in place as audit
     /// evidence. Retrieval paths filter `valid_to IS NULL OR valid_to >
-    /// now()` so superseded memories never reach the agent. Stored as
-    /// BIGINT (unix epoch seconds) in postgres / sqlite backends; carried
-    /// through every engine even when the engine has no SQL surface
-    /// (markdown/redis/lru/none — they pass the field through unchanged).
+    /// now()` so superseded memories never reach the agent.
+    ///
+    /// Three downstream uses unlocked by this column:
+    ///   1. **Correction primitive** — V1.6 classifier writes `valid_to`
+    ///      when ADD/UPDATE/DELETE decisions land; the row stays as audit.
+    ///   2. **Agent timeline narration** — the agent can construct a
+    ///      truthful temporal account ("I learned X on Tue, you corrected
+    ///      to Y on Fri") by reading both the always-valid current set
+    ///      and the historical `valid_to IS NOT NULL` set together.
+    ///      The `/brain/timeline` endpoint surfaces this; the agent's
+    ///      retrieval path defaults to current-only.
+    ///   3. **As-of queries** — "what did the agent believe last March?"
+    ///      becomes one timestamp parameter (V2 feature).
+    ///
+    /// Stored as BIGINT (unix epoch seconds) in postgres + sqlite backends.
+    /// Other engines (markdown/redis/lru/lancedb/lucid/none) carry the
+    /// field via struct passthrough but **do not yet filter on read** —
+    /// V1.6 will land filter-aware reads in those backends when the
+    /// classifier starts populating `valid_to`. Today (V1.5 always-null)
+    /// this gap is invisible since no backend has anything to filter.
     valid_to: ?i64 = null,
 
     /// Free all allocated strings owned by this entry.

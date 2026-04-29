@@ -44,6 +44,17 @@ pub fn exportSnapshot(allocator: std.mem.Allocator, mem: Memory, workspace_dir: 
         try json_util.appendJsonKeyValue(&json_buf, allocator, "category", entry.category.toString());
         try json_buf.appendSlice(allocator, ",");
         try json_util.appendJsonKeyValue(&json_buf, allocator, "timestamp", entry.timestamp);
+        // V1.5 day-2 — emit `valid_to` (Graphiti bi-temporal) so V1.5
+        // snapshots are forward-compatible with V1.6's restore path.
+        // V1.5 always-null path means most rows skip this field;
+        // omitting null keeps the JSON tidy. V1.6 read path will pick
+        // up the field when populated.
+        if (entry.valid_to) |vt| {
+            var int_buf: [32]u8 = undefined;
+            const int_str = std.fmt.bufPrint(&int_buf, "{d}", .{vt}) catch unreachable;
+            try json_buf.appendSlice(allocator, ",\"valid_to\":");
+            try json_buf.appendSlice(allocator, int_str);
+        }
         try json_buf.append(allocator, '}');
     }
 
@@ -121,6 +132,13 @@ pub fn hydrateFromSnapshot(allocator: std.mem.Allocator, mem: Memory, workspace_
         }
 
         mem.store(key, entry_content, category, null) catch continue;
+        // V1.6 TODO — when the correction classifier ships, hydrate
+        // path needs to read `valid_to` from the JSON object (already
+        // written by the snapshot path at line 50–55) and apply it via
+        // a future `mem.storeWithValidTo(...)` API or direct DB write.
+        // For V1.5 the always-null path means snapshots round-trip
+        // losslessly via `mem.store` regardless.
+        _ = obj.get("valid_to"); // referenced for future read path
         hydrated += 1;
     }
 
