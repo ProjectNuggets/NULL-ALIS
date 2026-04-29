@@ -73,6 +73,7 @@ pub const transcript_read = @import("transcript_read.zig");
 pub const memory_forget = @import("memory_forget.zig");
 pub const memory_purge_topic = @import("memory_purge_topic.zig");
 pub const schedule = @import("schedule.zig");
+pub const todo = @import("todo.zig");
 pub const delegate = @import("delegate.zig");
 pub const browser = @import("browser.zig");
 pub const image = @import("image.zig");
@@ -442,6 +443,15 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .cost_class = .a,
     },
     .{
+        // V1.5 todo tool — same shape as schedule (list/get is read-only
+        // but the tool as a whole mutates persisted lists). Per-session
+        // scope; cost is local memory writes only.
+        .name = todo.TodoTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
         // Spawns a full subagent turn — potentially many LLM calls + tools.
         .name = delegate.DelegateTool.tool_name,
         .flags = .{ .mutating = true },
@@ -738,6 +748,7 @@ pub fn refineMetadata(base: metadata.ToolMetadata, args: JsonObjectMap) metadata
         if (std.mem.eql(u8, base.name, git.GitTool.tool_name)) break :blk isReadOnlyGitOperation(args);
         if (std.mem.eql(u8, base.name, http_request.HttpRequestTool.tool_name)) break :blk isReadOnlyHttpMethod(args);
         if (std.mem.eql(u8, base.name, skill_registry.SkillRegistryTool.tool_name)) break :blk isReadOnlySkillRegistryAction(args);
+        if (std.mem.eql(u8, base.name, todo.TodoTool.tool_name)) break :blk isReadOnlyTodoAction(args);
         break :blk false;
     };
 
@@ -1040,6 +1051,14 @@ pub fn allTools(
     const scht = try allocator.create(schedule.ScheduleTool);
     scht.* = .{ .config = opts.config };
     try list.append(allocator, scht.tool());
+
+    // V1.5 — Todo tool. Per-session task lists with status tracking,
+    // persisted via the memory layer. Memory backend is bound below by
+    // bindMemoryRuntime / bindMemory; if neither runs, the tool will
+    // fail gracefully at execute() with "memory backend not configured."
+    const todot = try allocator.create(todo.TodoTool);
+    todot.* = .{};
+    try list.append(allocator, todot.tool());
 
     // Cron tools + push notifications
     const cat = try allocator.create(cron_add.CronAddTool);
@@ -1459,6 +1478,12 @@ fn isReadOnlyScheduleAction(args: JsonObjectMap) bool {
         std.ascii.eqlIgnoreCase(action, "runs");
 }
 
+/// V1.5 todo tool: `list` is read-only; `create` and `update` mutate.
+fn isReadOnlyTodoAction(args: JsonObjectMap) bool {
+    const action = getString(args, "action") orelse return false;
+    return std.ascii.eqlIgnoreCase(action, "list");
+}
+
 fn isEnsureScheduleAction(args: JsonObjectMap) bool {
     const action = getString(args, "action") orelse return false;
     return std.ascii.eqlIgnoreCase(action, "ensure");
@@ -1567,6 +1592,11 @@ pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
         } else if (t.vtable == &memory_purge_topic.MemoryPurgeTopicTool.vtable) {
             const mt: *memory_purge_topic.MemoryPurgeTopicTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
+        } else if (t.vtable == &todo.TodoTool.vtable) {
+            // V1.5 — todo tool persists via memory layer; bind same as
+            // other memory-backed tools.
+            const tt: *todo.TodoTool = @ptrCast(@alignCast(t.ptr));
+            tt.memory = memory;
         }
     }
 }
@@ -2054,8 +2084,9 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 29 (delegate + spawn dormant by default) + http_request + web_fetch + web_search + browser = 33
-    try std.testing.expectEqual(@as(usize, 33), tools.len);
+    // base 30 (delegate + spawn dormant by default; +1 for V1.5 todo)
+    // + http_request + web_fetch + web_search + browser = 34
+    try std.testing.expectEqual(@as(usize, 34), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2069,10 +2100,10 @@ test "all tools excludes extras when disabled" {
     defer deinitTools(std.testing.allocator, tools);
     // Core tool catalog (delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT):
     // shell + file_read + file_write + file_edit + file_append + git + image_info + image_generate
-    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + schedule
+    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + schedule + todo
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot = 29
-    try std.testing.expectEqual(@as(usize, 29), tools.len);
+    // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot = 30
+    try std.testing.expectEqual(@as(usize, 30), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2198,8 +2229,9 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    // 29 core tools; delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT.
-    try std.testing.expectEqual(@as(usize, 29), tools.len);
+    // 30 core tools (was 29 pre-V1.5 — added `todo`); delegate + spawn
+    // gated behind NULLALIS_ENABLE_MULTIAGENT.
+    try std.testing.expectEqual(@as(usize, 30), tools.len);
 
     var found_message = false;
     for (tools) |t| {
