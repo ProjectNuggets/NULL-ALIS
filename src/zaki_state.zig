@@ -273,6 +273,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn recallMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8, _: usize, _: ?[]const u8) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
+    /// V1.5 day-2 task 3 — stub for non-postgres builds; returns empty
+    /// timeline so `/brain/timeline` gracefully degrades when state
+    /// manager is the disabled variant.
+    pub fn listMemoriesTimeline(_: *@This(), allocator: std.mem.Allocator, _: i64, _: ?i64, _: ?[]const u8, _: u32, _: ?i64, _: ?i64) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
@@ -2076,6 +2082,151 @@ const ManagerImpl = struct {
         };
         defer c.PQclear(result);
         return try decodeMemoryRows(allocator, result, true);
+    }
+
+    /// V1.5 day-2 task 3 — cursor-paginated timeline read for `/brain/timeline`.
+    ///
+    /// Returns memory entries ordered by `created_at DESC, id DESC` (newest
+    /// first; id breaks ties on identical timestamps for stable cursor
+    /// pagination). The `cursor_ts` + `cursor_id` pair encodes the position
+    /// of the last entry from the previous page; pass null on the first
+    /// request. The cursor predicate `(created_at, id) < (cursor_ts,
+    /// cursor_id)` is the canonical row-tuple comparison — stable across
+    /// concurrent writes (new entries with later timestamps don't shuffle
+    /// the page).
+    ///
+    /// Optional `from` / `to` apply unix-second range filtering on
+    /// `created_at`. The bi-temporal validity filter (task 1) is always
+    /// applied; superseded entries never appear in the timeline.
+    ///
+    /// `session_filter` is deferred to a V1.6 enhancement; today the
+    /// timeline returns all sessions for the user. Frontend can filter
+    /// client-side from the returned set.
+    ///
+    /// Note: this method reads `created_at` (when the memory was learned)
+    /// rather than `updated_at` (which the other list/recall paths use).
+    /// The returned `MemoryEntry.timestamp` is the unix-second text of
+    /// `created_at` so the timeline view shows when each fact entered the
+    /// agent's memory.
+    pub fn listMemoriesTimeline(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        cursor_ts: ?i64,
+        cursor_id: ?[]const u8,
+        limit: u32,
+        from: ?i64,
+        to: ?i64,
+    ) ![]memory_root.MemoryEntry {
+        // Build SQL conditionally — base + optional cursor + from + to.
+        // Use a fixed parameter ordering: $1=user_id, then conditional
+        // adds in declared order (cursor_ts, cursor_id, from, to).
+        const schema_q = try pg_helpers.quoteIdentifier(self.allocator, self.schemaRaw());
+        defer self.allocator.free(schema_q);
+
+        var sql_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer sql_buf.deinit(self.allocator);
+        const w = sql_buf.writer(self.allocator);
+        try w.print(
+            "SELECT id, key, content, memory_type, " ++
+                "COALESCE((EXTRACT(EPOCH FROM created_at))::bigint::text, '0'), " ++
+                "session_id, valid_to FROM {s}.memories WHERE user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER,
+            .{schema_q},
+        );
+
+        var next_param_idx: u32 = 2;
+        var cursor_ts_idx: u32 = 0;
+        var cursor_id_idx: u32 = 0;
+        var from_idx: u32 = 0;
+        var to_idx: u32 = 0;
+
+        if (cursor_ts != null and cursor_id != null) {
+            cursor_ts_idx = next_param_idx;
+            cursor_id_idx = next_param_idx + 1;
+            next_param_idx += 2;
+            try w.print(
+                " AND ((EXTRACT(EPOCH FROM created_at))::bigint < ${d}::bigint OR " ++
+                    "((EXTRACT(EPOCH FROM created_at))::bigint = ${d}::bigint AND id < ${d}))",
+                .{ cursor_ts_idx, cursor_ts_idx, cursor_id_idx },
+            );
+        }
+        if (from) |_| {
+            from_idx = next_param_idx;
+            next_param_idx += 1;
+            try w.print(
+                " AND (EXTRACT(EPOCH FROM created_at))::bigint >= ${d}::bigint",
+                .{from_idx},
+            );
+        }
+        if (to) |_| {
+            to_idx = next_param_idx;
+            next_param_idx += 1;
+            try w.print(
+                " AND (EXTRACT(EPOCH FROM created_at))::bigint <= ${d}::bigint",
+                .{to_idx},
+            );
+        }
+
+        const limit_idx = next_param_idx;
+        try w.print(
+            " ORDER BY created_at DESC, id DESC LIMIT ${d}::int",
+            .{limit_idx},
+        );
+
+        const q = try self.allocator.dupeZ(u8, sql_buf.items);
+        defer self.allocator.free(q);
+
+        // Build params arrays. Maximum parameter count: user_id + cursor_ts +
+        // cursor_id + from + to + limit = 6 slots.
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        var cursor_ts_buf: [32]u8 = undefined;
+        var from_buf: [32]u8 = undefined;
+        var to_buf: [32]u8 = undefined;
+        var limit_buf: [16]u8 = undefined;
+
+        const cursor_ts_s = if (cursor_ts) |v| try std.fmt.bufPrintZ(&cursor_ts_buf, "{d}", .{v}) else null;
+        const cursor_id_z = if (cursor_id) |s| try self.allocator.dupeZ(u8, s) else null;
+        defer if (cursor_id_z) |z| self.allocator.free(std.mem.span(z));
+        const from_s = if (from) |v| try std.fmt.bufPrintZ(&from_buf, "{d}", .{v}) else null;
+        const to_s = if (to) |v| try std.fmt.bufPrintZ(&to_buf, "{d}", .{v}) else null;
+        const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+
+        var params: [6]?[*:0]const u8 = undefined;
+        var lengths: [6]c_int = undefined;
+        var n_params: usize = 0;
+
+        params[n_params] = user_s.ptr;
+        lengths[n_params] = @intCast(user_s.len);
+        n_params += 1;
+
+        if (cursor_ts_s) |cts| {
+            params[n_params] = cts.ptr;
+            lengths[n_params] = @intCast(cts.len);
+            n_params += 1;
+            const cid = cursor_id_z.?;
+            params[n_params] = cid;
+            lengths[n_params] = @intCast(std.mem.span(cid).len);
+            n_params += 1;
+        }
+        if (from_s) |fs| {
+            params[n_params] = fs.ptr;
+            lengths[n_params] = @intCast(fs.len);
+            n_params += 1;
+        }
+        if (to_s) |ts| {
+            params[n_params] = ts.ptr;
+            lengths[n_params] = @intCast(ts.len);
+            n_params += 1;
+        }
+        params[n_params] = limit_s.ptr;
+        lengths[n_params] = @intCast(limit_s.len);
+        n_params += 1;
+
+        const result = try self.execParams(q, params[0..n_params], lengths[0..n_params]);
+        defer c.PQclear(result);
+        return try decodeMemoryRows(allocator, result, false);
     }
 
     pub fn forgetMemory(self: *Self, user_id: i64, key: []const u8) !bool {

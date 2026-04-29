@@ -278,12 +278,78 @@ When designs land, hand them to Codex (or the frontend agent) with a tight PR sc
 
 ---
 
-## Addendum — `/brain/timeline` (V1.5 day-2 task 3 — coming next)
+## Addendum — `/brain/timeline` response contract (V1.5 day-2 task 3)
 
-**Stub for now — full contract lands when task 3 ships.** Design hint:
+**Endpoint:** `GET /api/v1/users/{user_id}/brain/timeline`
 
-- Endpoint: `GET /api/v1/users/{user_id}/brain/timeline?cursor=<opaque>&limit=50&from=<unix>&to=<unix>&session_filter=<csv>`
-- Returns chronological list of memory entries with cursor pagination (stable across writes).
-- Designer should plan a vertical timeline view (newest at top) with collapse-by-day grouping. The cursor is opaque; client just re-passes whatever `next_cursor` returned.
+**Authentication:** mirrors `/sessions` pattern — internal token + tenant scope.
 
-Full response contract lands when task 3 ships. — backend
+**Query parameters (all optional):**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `cursor` | base64 string | null (start from newest) | Opaque pagination cursor returned by previous request as `next_cursor`. Client just re-passes it; never inspect or construct manually. |
+| `limit` | int (1–200) | 50 | Page size cap. |
+| `from` | unix epoch seconds (int) | unbounded | Lower bound on `created_at` |
+| `to` | unix epoch seconds (int) | unbounded | Upper bound on `created_at` |
+
+**Response shape (locked contract):**
+
+```json
+{
+  "entries": [
+    {
+      "id": "a1b2c3d4e5f6...",
+      "key": "user_lang",
+      "kind": "core",
+      "created_at": 1714521600,
+      "session_id": "agent:zaki-bot:user:42:main",
+      "summary": "Prefers Zig as primary language; uses NeoVim editor...",
+      "valid_to": null
+    },
+    {
+      "id": "f6e5d4c3b2a1...",
+      "key": "user_topic_today",
+      "kind": "daily",
+      "created_at": 1714515000,
+      "session_id": null,
+      "summary": "Working on bi-temporal schema design...",
+      "valid_to": null
+    }
+  ],
+  "next_cursor": "MTcxNDUxNTAwMDpmNmU1ZDRjM2IyYTE...",
+  "has_more": true
+}
+```
+
+**Field semantics:**
+
+- **`entries[].id`** — internal memory row ID (16-byte hex). Different from `key`. Use as React list key.
+- **`entries[].key`** — the memory's user-visible identifier (e.g. `user_lang`). Same as graph node IDs.
+- **`entries[].kind`** — category (`core | daily | conversation | <custom>`). Drives icon/color.
+- **`entries[].created_at`** — unix seconds when memory was learned. Use for "X minutes ago" display + day-grouping.
+- **`entries[].session_id`** — null for global memories; otherwise the session of origin.
+- **`entries[].summary`** — first 200 chars of content. Truncate further if needed.
+- **`entries[].valid_to`** — `null` for currently-valid (V1.5 default). V1.6 corrections will populate; designer reserves a "this fact was superseded" visual treatment.
+
+**Pagination:**
+
+- **`next_cursor`** — when not null, pass to next request as `cursor=<value>`. The cursor encodes `(created_at, id)` tuple; **stable across concurrent writes** — new memories landing during pagination don't shuffle the page (they appear on the FIRST page on the next refresh, never duplicated mid-scroll).
+- **`has_more`** — `true` when `entries.length === limit`. When false, `next_cursor` is null and you've reached the oldest entry matching the filter.
+- **Filter changes mid-pagination are well-defined.** If the user changes `from`/`to` while scrolling, the cursor still works — the new filter is applied alongside the cursor predicate.
+
+**Suggested UX:**
+
+- Vertical timeline, newest-at-top, collapse-by-day grouping.
+- Infinite scroll: when user reaches bottom, fetch next page with `cursor=next_cursor`.
+- Filter chips at top: date range slider, kind filter (core/daily/conversation), session selector. **Session filtering is not yet a server-side query param** — frontend can filter the returned set client-side, or wait for V1.6 enhancement when it lands.
+- Empty state: "Your timeline will populate as ZAKI learns about you."
+- "Showing N of M" not applicable here (cursor pagination doesn't know corpus total) — instead show "Loaded N entries" + load-more button.
+
+**Tenant + bi-temporal correctness guaranteed by backend:** strictly user-scoped; superseded entries (V1.6 `valid_to < now`) never appear.
+
+**Empty-state response:** `{"entries": [], "next_cursor": null, "has_more": false}` — render the empty state.
+
+**V1.6 enhancements queued:** `session_filter` query param (CSV of session keys), `direction` param (asc/desc — currently always desc).
+
+— backend, signed.

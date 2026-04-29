@@ -11169,6 +11169,206 @@ fn handleBrainGraph(
     return finalizeJsonBuf(allocator, &out);
 }
 
+// ── /brain/timeline — V1.5 day-2 task 3 ────────────────────────────
+//
+// GET /api/v1/users/:user_id/brain/timeline
+//
+// Cursor-paginated chronological view of the user's memory entries.
+// Powers the timeline panel on the frontend `/brain` page. Stable
+// cursor pagination — new memories landing during pagination don't
+// shuffle the page (cursor is `(created_at, id)` tuple, ordered DESC).
+//
+// Bi-temporal correctness inherited from listMemoriesTimeline (task 1
+// validity filter applied at row level). Superseded entries never
+// appear in the timeline.
+//
+// Query params (all optional):
+//   ?cursor=<base64>     — opaque pagination cursor; null on first page
+//   ?limit=<int>         — page size, default 50, max 200, min 1
+//   ?from=<unix>         — lower bound on created_at
+//   ?to=<unix>           — upper bound on created_at
+//
+// Response shape (defined in `docs/frontend-vision-brief.md`):
+//   {
+//     "entries": [
+//       { "id", "key", "kind", "created_at", "session_id", "summary",
+//         "valid_to" }
+//     ],
+//     "next_cursor": "<base64>" | null,   — null when has_more is false
+//     "has_more": bool                     — true when entries.len == limit
+//   }
+//
+// Cursor encoding: base64("<ts>:<id>"). Opaque to client; client just
+// re-passes whatever next_cursor returned. If client changes from/to
+// filters mid-pagination, the cursor still works (filter is re-applied
+// alongside cursor predicate).
+
+const BRAIN_TIMELINE_DEFAULT_LIMIT: u32 = 50;
+const BRAIN_TIMELINE_MAX_LIMIT: u32 = 200;
+const BRAIN_TIMELINE_SUMMARY_CHARS: usize = 200;
+
+const TimelineCursor = struct {
+    ts: i64,
+    id: []u8, // owned
+
+    pub fn deinit(self: *const TimelineCursor, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+    }
+};
+
+/// Encode a cursor as base64("<ts>:<id>"). Caller owns the returned
+/// slice. `id` is the memory row's PK; `ts` is the unix-second of
+/// `created_at`. Together they form the canonical row-tuple position
+/// used by `listMemoriesTimeline`.
+fn encodeTimelineCursor(allocator: std.mem.Allocator, ts: i64, id: []const u8) ![]u8 {
+    var raw_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw_buf.deinit(allocator);
+    try raw_buf.writer(allocator).print("{d}:{s}", .{ ts, id });
+    const encoded_len = std.base64.standard.Encoder.calcSize(raw_buf.items.len);
+    const out = try allocator.alloc(u8, encoded_len);
+    _ = std.base64.standard.Encoder.encode(out, raw_buf.items);
+    return out;
+}
+
+/// Decode a base64 cursor back to (ts, id). Returns null on any parse
+/// error (invalid base64, missing colon, non-numeric ts) — caller
+/// treats null as "start from newest" rather than failing the request.
+fn decodeTimelineCursor(allocator: std.mem.Allocator, encoded: []const u8) ?TimelineCursor {
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return null;
+    const decoded = allocator.alloc(u8, decoded_len) catch return null;
+    defer allocator.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, encoded) catch return null;
+
+    const colon = std.mem.indexOfScalar(u8, decoded, ':') orelse return null;
+    const ts = std.fmt.parseInt(i64, decoded[0..colon], 10) catch return null;
+    const id_slice = decoded[colon + 1 ..];
+    if (id_slice.len == 0) return null;
+    const id_owned = allocator.dupe(u8, id_slice) catch return null;
+    return .{ .ts = ts, .id = id_owned };
+}
+
+fn handleBrainTimeline(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    target: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    // ── Parse query params ────────────────────────────────────────
+    const cursor_param = parseQueryParam(target, "cursor");
+    const limit_param = parseQueryParam(target, "limit");
+    const from_param = parseQueryParam(target, "from");
+    const to_param = parseQueryParam(target, "to");
+
+    var limit: u32 = if (limit_param) |s|
+        std.fmt.parseInt(u32, s, 10) catch BRAIN_TIMELINE_DEFAULT_LIMIT
+    else
+        BRAIN_TIMELINE_DEFAULT_LIMIT;
+    if (limit == 0) limit = BRAIN_TIMELINE_DEFAULT_LIMIT;
+    if (limit > BRAIN_TIMELINE_MAX_LIMIT) limit = BRAIN_TIMELINE_MAX_LIMIT;
+
+    const from: ?i64 = if (from_param) |s| std.fmt.parseInt(i64, s, 10) catch null else null;
+    const to: ?i64 = if (to_param) |s| std.fmt.parseInt(i64, s, 10) catch null else null;
+
+    var cursor_opt: ?TimelineCursor = null;
+    if (cursor_param) |c_str| {
+        cursor_opt = decodeTimelineCursor(allocator, c_str);
+        // Silent fallback to no-cursor when decode fails — caller treats
+        // null as "start from newest", same shape as a first request.
+    }
+    defer if (cursor_opt) |c| c.deinit(allocator);
+
+    const cursor_ts: ?i64 = if (cursor_opt) |c| c.ts else null;
+    const cursor_id: ?[]const u8 = if (cursor_opt) |c| c.id else null;
+
+    // ── Fetch entries ─────────────────────────────────────────────
+    // listMemoriesTimeline applies bi-temporal validity filter
+    // automatically. Returns up to `limit` entries newest-first.
+    const entries = state_mgr.listMemoriesTimeline(
+        allocator,
+        numeric_user_id,
+        cursor_ts,
+        cursor_id,
+        limit,
+        from,
+        to,
+    ) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"timeline_query_failed\"}" };
+    };
+    defer memory_mod.freeEntries(allocator, entries);
+
+    // ── Compute next_cursor ───────────────────────────────────────
+    const has_more = entries.len == limit;
+    var next_cursor: ?[]u8 = null;
+    if (has_more and entries.len > 0) {
+        const last = entries[entries.len - 1];
+        const last_ts = std.fmt.parseInt(i64, last.timestamp, 10) catch 0;
+        next_cursor = encodeTimelineCursor(allocator, last_ts, last.id) catch null;
+    }
+    defer if (next_cursor) |c| allocator.free(c);
+
+    // ── Build JSON response ──────────────────────────────────────
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    w.writeAll("{\"entries\":[") catch return response_build_err;
+    for (entries, 0..) |entry, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        const ts = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0;
+        const summary_len = @min(entry.content.len, BRAIN_TIMELINE_SUMMARY_CHARS);
+        const summary = entry.content[0..summary_len];
+        w.writeAll("{\"id\":\"") catch return response_build_err;
+        jsonEscapeInto(w, entry.id) catch return response_build_err;
+        w.writeAll("\",\"key\":\"") catch return response_build_err;
+        jsonEscapeInto(w, entry.key) catch return response_build_err;
+        w.writeAll("\",\"kind\":\"") catch return response_build_err;
+        jsonEscapeInto(w, entry.category.toString()) catch return response_build_err;
+        w.print("\",\"created_at\":{d},\"session_id\":", .{ts}) catch return response_build_err;
+        if (entry.session_id) |sid| {
+            w.writeAll("\"") catch return response_build_err;
+            jsonEscapeInto(w, sid) catch return response_build_err;
+            w.writeAll("\"") catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll(",\"summary\":\"") catch return response_build_err;
+        jsonEscapeInto(w, summary) catch return response_build_err;
+        w.writeAll("\",\"valid_to\":") catch return response_build_err;
+        if (entry.valid_to) |vt| {
+            w.print("{d}", .{vt}) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.writeAll("],\"next_cursor\":") catch return response_build_err;
+    if (next_cursor) |c| {
+        w.writeAll("\"") catch return response_build_err;
+        jsonEscapeInto(w, c) catch return response_build_err;
+        w.writeAll("\"") catch return response_build_err;
+    } else {
+        w.writeAll("null") catch return response_build_err;
+    }
+    w.print(",\"has_more\":{s}}}", .{
+        if (has_more) "true" else "false",
+    }) catch return response_build_err;
+
+    return finalizeJsonBuf(allocator, &out);
+}
+
 // ── GDPR data purge handler (Sprint 7B — S7.6) ─────────────────────
 //
 // DELETE /api/v1/users/:user_id/data
@@ -12415,6 +12615,15 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "brain/graph")) {
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainGraph(req_allocator, method, scoped_user_id, brain_target, state);
+    }
+
+    // ── /brain/timeline — V1.5 day-2 task 3 ──────────────────────────────
+    // GET /api/v1/users/{id}/brain/timeline[?cursor=<b64>&limit=N&from=<unix>&to=<unix>]
+    // Cursor-paginated chronological view of user's memory. Stable across
+    // concurrent writes via `(created_at, id)` tuple cursor.
+    if (std.mem.eql(u8, parsed.subpath, "brain/timeline")) {
+        const brain_target = extractRequestTarget(raw_request) orelse base_path;
+        return handleBrainTimeline(req_allocator, method, scoped_user_id, brain_target, state);
     }
 
     // ── Session CRUD endpoints (Phase 3.5) ──────────────────────────────
@@ -22513,5 +22722,74 @@ test "handleBrainGraph rejects non-GET methods" {
 test "handleBrainGraph rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainGraph(std.testing.allocator, "GET", "not_a_number", "/api/v1/users/not_a_number/brain/graph", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+// ── /brain/timeline cursor pagination unit tests ───────────────────
+
+test "timeline cursor: encode + decode round-trip" {
+    const encoded = try encodeTimelineCursor(std.testing.allocator, 1714521600, "abc123def456");
+    defer std.testing.allocator.free(encoded);
+    const decoded = decodeTimelineCursor(std.testing.allocator, encoded) orelse return error.DecodeFailed;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 1714521600), decoded.ts);
+    try std.testing.expectEqualStrings("abc123def456", decoded.id);
+}
+
+test "timeline cursor: encode preserves id with special chars" {
+    // Memory IDs are hex-only today, but defend against future shape.
+    const encoded = try encodeTimelineCursor(std.testing.allocator, 100, "id_with-special.chars");
+    defer std.testing.allocator.free(encoded);
+    const decoded = decodeTimelineCursor(std.testing.allocator, encoded) orelse return error.DecodeFailed;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 100), decoded.ts);
+    try std.testing.expectEqualStrings("id_with-special.chars", decoded.id);
+}
+
+test "timeline cursor: decode invalid base64 returns null" {
+    const result = decodeTimelineCursor(std.testing.allocator, "!!!not-base64!!!");
+    try std.testing.expect(result == null);
+}
+
+test "timeline cursor: decode missing colon returns null" {
+    // Valid base64 but no colon delimiter.
+    const encoded = std.base64.standard.Encoder.encode(
+        std.testing.allocator.alloc(u8, std.base64.standard.Encoder.calcSize("nocolon".len)) catch unreachable,
+        "nocolon",
+    );
+    defer std.testing.allocator.free(encoded);
+    const result = decodeTimelineCursor(std.testing.allocator, encoded);
+    try std.testing.expect(result == null);
+}
+
+test "timeline cursor: decode non-numeric ts returns null" {
+    // base64 of "abc:xyz" — colon present but ts isn't a number.
+    const raw = "abc:xyz";
+    const encoded = std.testing.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len)) catch unreachable;
+    defer std.testing.allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, raw);
+    const result = decodeTimelineCursor(std.testing.allocator, encoded);
+    try std.testing.expect(result == null);
+}
+
+test "timeline cursor: decode empty id returns null" {
+    // base64 of "100:" — no id after colon.
+    const raw = "100:";
+    const encoded = std.testing.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len)) catch unreachable;
+    defer std.testing.allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, raw);
+    const result = decodeTimelineCursor(std.testing.allocator, encoded);
+    try std.testing.expect(result == null);
+}
+
+test "handleBrainTimeline rejects non-GET methods" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainTimeline(std.testing.allocator, "POST", "1", "/api/v1/users/1/brain/timeline", &dummy_state);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleBrainTimeline rejects invalid user_id" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainTimeline(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/timeline", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
 }
