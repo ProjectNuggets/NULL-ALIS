@@ -4430,17 +4430,38 @@ fn enqueueTenantTelegramAsync(
     chat_id: i64,
     message: []const u8,
 ) bool {
+    // V1 close-out 2026-04-30: log allocator failures distinctly from
+    // "policy declined." Caller treats `false` as "Telegram message
+    // dropped"; without these log.err lines, an OOM looks identical to a
+    // legitimate skip. Now operators can grep `tenant_telegram_async.alloc_fail`
+    // to distinguish memory pressure from queue policy.
+    const log_alloc = std.log.scoped(.tenant_telegram_async);
     const allocator = state.allocator;
-    const job = allocator.create(TenantTelegramAsyncJob) catch return false;
+    const job = allocator.create(TenantTelegramAsyncJob) catch {
+        log_alloc.err("tenant_telegram_async.alloc_fail step=create_job user_id={s} chat_id={d} — message dropped", .{ user_id, chat_id });
+        return false;
+    };
     errdefer allocator.destroy(job);
 
-    const user_id_dup = allocator.dupe(u8, user_id) catch return false;
+    const user_id_dup = allocator.dupe(u8, user_id) catch {
+        log_alloc.err("tenant_telegram_async.alloc_fail step=dup_user_id user_id={s} chat_id={d}", .{ user_id, chat_id });
+        return false;
+    };
     errdefer allocator.free(user_id_dup);
-    const account_id_dup = allocator.dupe(u8, account_id) catch return false;
+    const account_id_dup = allocator.dupe(u8, account_id) catch {
+        log_alloc.err("tenant_telegram_async.alloc_fail step=dup_account_id user_id={s} chat_id={d}", .{ user_id, chat_id });
+        return false;
+    };
     errdefer allocator.free(account_id_dup);
-    const bot_token_dup = allocator.dupe(u8, bot_token) catch return false;
+    const bot_token_dup = allocator.dupe(u8, bot_token) catch {
+        log_alloc.err("tenant_telegram_async.alloc_fail step=dup_bot_token user_id={s} chat_id={d}", .{ user_id, chat_id });
+        return false;
+    };
     errdefer allocator.free(bot_token_dup);
-    const message_dup = allocator.dupe(u8, message) catch return false;
+    const message_dup = allocator.dupe(u8, message) catch {
+        log_alloc.err("tenant_telegram_async.alloc_fail step=dup_message user_id={s} chat_id={d} message_len={d}", .{ user_id, chat_id, message.len });
+        return false;
+    };
     errdefer allocator.free(message_dup);
 
     job.* = .{
@@ -6429,19 +6450,50 @@ fn loadDiagnosticsConfigSnapshot(
     state: *const GatewayState,
     user_id_raw: []const u8,
 ) ?DiagnosticsConfigSnapshot {
-    var user_ctx = resolveUserContext(allocator, state, user_id_raw) catch return null;
+    var user_ctx = resolveUserContext(allocator, state, user_id_raw) catch |err| {
+        // V1 close-out 2026-04-30: don't fold infra errors into "no config."
+        // Real failures (PG drop, disk full, permissions, OOM) used to surface
+        // as 404 user_not_found because all `catch return null` collapsed
+        // them. Now operator logs distinguish "user truly absent" from
+        // "infrastructure failed during lookup."
+        std.log.scoped(.gateway).warn(
+            "diagnostics_config_load: resolveUserContext failed for user_id={s} err={s}",
+            .{ user_id_raw, @errorName(err) },
+        );
+        return null;
+    };
     defer user_ctx.deinit(allocator);
 
     var source: []const u8 = "user_file_config";
     const raw_user_config = blk: {
         if (state.zaki_state) |mgr| {
-            const numeric_user_id = parseNumericUserId(user_id_raw) catch return null;
+            const numeric_user_id = parseNumericUserId(user_id_raw) catch |err| {
+                std.log.scoped(.gateway).warn(
+                    "diagnostics_config_load: parseNumericUserId failed for user_id={s} err={s}",
+                    .{ user_id_raw, @errorName(err) },
+                );
+                return null;
+            };
             if (mgr.getConfigJson(allocator, numeric_user_id)) |value| {
                 source = "postgres_user_config";
                 break :blk value;
-            } else |_| {}
+            } else |err| {
+                // PG fetch failed but file fallback may still work — log and
+                // continue. Distinguishes "PG had nothing for this user" (the
+                // expected pre-provision case) from "PG itself broke."
+                std.log.scoped(.gateway).warn(
+                    "diagnostics_config_load: getConfigJson failed user_id={d} err={s} — falling back to file",
+                    .{ numeric_user_id, @errorName(err) },
+                );
+            }
         }
-        break :blk readFileOrDefault(allocator, user_ctx.config_path, "{}\n") catch return null;
+        break :blk readFileOrDefault(allocator, user_ctx.config_path, "{}\n") catch |err| {
+            std.log.scoped(.gateway).warn(
+                "diagnostics_config_load: readFileOrDefault failed path={s} err={s}",
+                .{ user_ctx.config_path, @errorName(err) },
+            );
+            return null;
+        };
     };
     defer allocator.free(raw_user_config);
 
