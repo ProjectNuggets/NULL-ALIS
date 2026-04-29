@@ -1,9 +1,62 @@
 # V1 Frontend Activation List — nullalis backend capabilities dormant pending zaki-prod wiring
 
-**Date:** 2026-04-28
+**Date:** 2026-04-28 (baseline) — UPDATE 2026-04-30 banner below
 **Audience:** Nova / zaki-prod frontend planning
 **Source-of-truth scope:** nullalis repo only (zaki-prod not on this machine)
 **Method:** code-truth audit of `src/gateway.zig` route dispatch, `src/agent/commands.zig`, `src/agent/run_event_types.zig` SSE schema, `src/security/`, `src/tools/`, `src/channels/`, and `docs/slash-commands-spec.md`.
+
+> ## ⚡ UPDATE 2026-04-30 — read this before the 2026-04-28 baseline below
+>
+> Significant frontend work shipped between 2026-04-28 and 2026-04-30. Use the
+> tables in this banner instead of the historical priority table further down
+> when planning V1.5 frontend remaining-work.
+>
+> ### Closed (shipped to zaki-prod main):
+> - ✅ **Approval card UI** (Queue B) — was the top V1 blocker; no longer is
+> - ✅ **Autonomy radio** (read_only / supervised / full) in ZakiSettingsSheet
+> - ✅ **Sandbox status badge** in chat header
+> - ✅ **Cost view (V1-sufficient)** — usage accordion in ZakiSettingsSheet
+> - ✅ **Session mapping + durable history** (Codex's session-truth fix)
+> - ✅ **Legal hygiene** — Stripe + Cloudflare subprocessors named, cookie
+>   banner, effective dates, DPA mention (chatzaki.com)
+>
+> ### Pending Codex (in-flight on `feat/zaki-in-thread-controls` branch):
+> - In-thread `ZakiSessionControlStrip` (Plan/Execute/Review segmented control)
+> - PowerUserSheet refactor (controls + diagnostics tabs)
+> - Approval count badges in 3 surfaces (strip, session list, sidebar)
+> - Session list mode + approval indicators
+> - Sidebar `Controls` first-class entry
+> - Retire `ZakiBotControlPanel`
+> - BFF `/v1/me/bot/runtime` canonicalize to upstream `/api/v1/status`
+>   (drop env-var fallback)
+>
+> ### Backend channel scope changed 2026-04-30:
+> - **Lark removed from operator surface** (Nova directive). Drop the Lark row
+>   from the "Channel toggles" section below — the build flag no longer accepts
+>   `-Dchannels=lark` and `-Dchannels=all` skips it. Dead-code cleanup of
+>   ~200 source refs deferred to V1.5 first-week.
+>
+> ### Slash command palette — STILL DORMANT
+>
+> The 54-command palette doc is at `docs/slash-commands-spec.md`. Backend
+> dispatch is fully wired; frontend `/`-trigger + autocomplete UI is not yet
+> built. Same status as the 2026-04-28 baseline.
+>
+> ### V1.5 P0 frontend work
+>
+> 1. Codex's in-thread controls (in flight)
+> 2. Slash command palette (still missing)
+> 3. Second-brain visualization (V1.5 design — see `docs/v1.5-design-kickoff.md`)
+> 4. Todo tool MemoryViewer filter (V1.5 design — same doc)
+>
+> Everything else in the original 2026-04-28 priority table below is reference;
+> match against shipped/in-flight state above before queuing new work.
+
+---
+
+## Original 2026-04-28 baseline (kept for archaeology)
+
+
 
 ---
 
