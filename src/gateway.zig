@@ -9953,10 +9953,33 @@ fn handleSessionList(
                     w.writeAll("Session") catch return response_build_err;
                 }
             }
-            w.print("\",\"message_count\":{d},\"last_active\":{d},\"live\":true}}", .{
+            // Truthful runtime fields (Codex 2026-04-29 — frontend session
+            // truth). Pending approvals: single-slot model (agent stores one
+            // PendingToolApproval at a time), so the count is 0 or 1.
+            // last_channel: origin_channel is set when the session was
+            // anchored to an inbound channel; null if web/REST-only.
+            const live_mode = session.agent.execution_mode.toSlice();
+            const live_pending: u8 = if (session.agent.pending_tool_approval != null) 1 else 0;
+            const live_pressure: u8 = blk: {
+                if (session.agent.token_limit == 0) break :blk 0;
+                const pct = @divTrunc(session.agent.tokensUsed() * 100, session.agent.token_limit);
+                break :blk if (pct > 100) 100 else @as(u8, @intCast(pct));
+            };
+            w.print("\",\"message_count\":{d},\"last_active\":{d},\"live\":true,\"mode\":\"{s}\",\"pending_approval_count\":{d},\"context_pressure_percent\":{d},\"last_channel\":", .{
                 session.turn_count,
                 session.last_active,
+                live_mode,
+                live_pending,
+                live_pressure,
             }) catch return response_build_err;
+            if (session.origin_channel) |ch| {
+                w.writeAll("\"") catch return response_build_err;
+                jsonEscapeInto(w, ch) catch return response_build_err;
+                w.writeAll("\"") catch return response_build_err;
+            } else {
+                w.writeAll("null") catch return response_build_err;
+            }
+            w.writeAll("}") catch return response_build_err;
             // Store owned copy of key (safe after mutex release)
             const key_copy = allocator.dupe(u8, entry.key_ptr.*) catch continue;
             seen_keys.put(allocator, key_copy, {}) catch allocator.free(key_copy);
@@ -9982,7 +10005,14 @@ fn handleSessionList(
                     jsonEscapeInto(w, info.title) catch return response_build_err;
                     w.print("\",\"message_count\":{d},\"last_active\":\"", .{info.message_count}) catch return response_build_err;
                     jsonEscapeInto(w, info.last_active) catch return response_build_err;
-                    w.writeAll("\",\"live\":false}") catch return response_build_err;
+                    // Evicted/persisted sessions: runtime fields are null.
+                    // UI uses these nulls + live=false as the explicit
+                    // "inactive session" signal to disable mode/approval
+                    // controls cleanly. The mode endpoint requires a live
+                    // agent process, so attempting POST /mode on these
+                    // returns 404; the frontend should never offer the
+                    // control in the first place when live=false.
+                    w.writeAll("\",\"live\":false,\"mode\":null,\"pending_approval_count\":null,\"context_pressure_percent\":null,\"last_channel\":null}") catch return response_build_err;
                 }
             } else |_| {}
         }
@@ -10040,7 +10070,7 @@ fn handleSessionAction(
     if (action == null) {
         // GET /sessions/{key} — session info
         if (std.mem.eql(u8, method, "GET")) {
-            return handleSessionGet(allocator, mgr, session_key);
+            return handleSessionGet(allocator, mgr, session_key, state_mgr_opt, user_id);
         }
         // DELETE /sessions/{key} — destroy session
         if (std.mem.eql(u8, method, "DELETE")) {
@@ -10175,28 +10205,124 @@ fn handleSessionGet(
     allocator: std.mem.Allocator,
     mgr: *session_mod.SessionManager,
     session_key: []const u8,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
+    user_id: []const u8,
 ) RouteResponse {
     // Lock escalation: mgr.mutex → session.mutex → release mgr.mutex
     mgr.mutex.lock();
-    const session = mgr.sessions.get(session_key) orelse {
+    const live_session_opt = mgr.sessions.get(session_key);
+    if (live_session_opt) |session| {
+        session.mutex.lock();
         mgr.mutex.unlock();
-        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
-    };
-    session.mutex.lock();
-    mgr.mutex.unlock();
-    defer session.mutex.unlock();
+        defer session.mutex.unlock();
 
+        return renderLiveSessionDetail(allocator, session_key, session);
+    }
+    // RAM miss — release manager mutex before any DB work.
+    mgr.mutex.unlock();
+
+    // Persisted-session fallback (Codex 2026-04-29 — frontend session truth).
+    // Without this, evicted sessions visible in the list but no longer in
+    // RAM 404 here, breaking the UI's "click into the session" flow. With
+    // it, we return live=false + null runtime fields so the UI can render
+    // the detail page (history loads via /sessions/:key/history just fine,
+    // already DB-backed) and disable mode/approval controls cleanly.
+    if (state_mgr_opt) |state_mgr| {
+        const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch 0;
+        if (numeric_user_id > 0) {
+            if (state_mgr.listUserSessions(allocator, numeric_user_id)) |persisted| {
+                defer {
+                    for (persisted) |*info| info.deinit(allocator);
+                    allocator.free(persisted);
+                }
+                for (persisted) |info| {
+                    if (!std.mem.eql(u8, info.session_key, session_key)) continue;
+                    return renderPersistedSessionDetail(allocator, info);
+                }
+            } else |_| {}
+        }
+    }
+
+    return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+}
+
+/// Live (RAM) session detail. Caller holds session.mutex.
+fn renderLiveSessionDetail(
+    allocator: std.mem.Allocator,
+    session_key: []const u8,
+    session: *session_mod.Session,
+) RouteResponse {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
+
+    const mode_str = session.agent.execution_mode.toSlice();
+    const pending_count: u8 = if (session.agent.pending_tool_approval != null) 1 else 0;
+    const pressure_percent: u8 = blk: {
+        if (session.agent.token_limit == 0) break :blk 0;
+        const pct = @divTrunc(session.agent.tokensUsed() * 100, session.agent.token_limit);
+        break :blk if (pct > 100) 100 else @as(u8, @intCast(pct));
+    };
+
     w.writeAll("{\"session_key\":\"") catch return response_build_err;
     jsonEscapeInto(w, session_key) catch return response_build_err;
-    w.print("\",\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d},\"history_len\":{d}}}", .{
+    w.print("\",\"live\":true,\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d},\"history_len\":{d},\"mode\":\"{s}\",\"pending_approval_count\":{d},\"context_pressure_percent\":{d},\"last_channel\":", .{
         session.created_at,
         session.last_active,
         session.turn_count,
         session.agent.historyLen(),
+        mode_str,
+        pending_count,
+        pressure_percent,
     }) catch return response_build_err;
+
+    if (session.origin_channel) |ch| {
+        w.writeAll("\"") catch return response_build_err;
+        jsonEscapeInto(w, ch) catch return response_build_err;
+        w.writeAll("\"") catch return response_build_err;
+    } else {
+        w.writeAll("null") catch return response_build_err;
+    }
+
+    // pending_approvals: array of 0 or 1 item. Single-slot model in the
+    // agent — matches PendingToolApproval struct at agent/root.zig:1387.
+    // arguments_json deliberately omitted (can be large; tool_call_id +
+    // reason + risk_level are sufficient for the approval UI).
+    w.writeAll(",\"pending_approvals\":[") catch return response_build_err;
+    if (session.agent.pending_tool_approval) |pending| {
+        w.print("{{\"id\":{d},\"tool\":\"", .{pending.id}) catch return response_build_err;
+        jsonEscapeInto(w, pending.tool_name) catch return response_build_err;
+        w.writeAll("\",\"reason\":\"") catch return response_build_err;
+        jsonEscapeInto(w, pending.reason) catch return response_build_err;
+        w.writeAll("\",\"risk_level\":\"") catch return response_build_err;
+        jsonEscapeInto(w, pending.risk_level.toSlice()) catch return response_build_err;
+        w.writeAll("\"}") catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+/// Persisted (DB-only, evicted from RAM) session detail. Returns the
+/// inactive-session shape the UI uses to disable runtime controls.
+fn renderPersistedSessionDetail(
+    allocator: std.mem.Allocator,
+    info: zaki_state_mod.SessionInfo,
+) RouteResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    w.writeAll("{\"session_key\":\"") catch return response_build_err;
+    jsonEscapeInto(w, info.session_key) catch return response_build_err;
+    w.writeAll("\",\"live\":false,\"title\":\"") catch return response_build_err;
+    jsonEscapeInto(w, info.title) catch return response_build_err;
+    w.print("\",\"message_count\":{d},\"last_active\":\"", .{info.message_count}) catch return response_build_err;
+    jsonEscapeInto(w, info.last_active) catch return response_build_err;
+    // Runtime fields all null — UI uses these as the explicit signal to
+    // disable the in-thread Plan|Execute|Review control, hide approval
+    // badges, etc. History remains accessible via /sessions/:key/history
+    // which is DB-backed and works for evicted sessions today.
+    w.writeAll("\",\"mode\":null,\"pending_approval_count\":null,\"context_pressure_percent\":null,\"last_channel\":null,\"pending_approvals\":[]}") catch return response_build_err;
     return finalizeJsonBuf(allocator, &out);
 }
 
@@ -21167,7 +21293,7 @@ test "handleSessionGet returns session info JSON" {
     // Seed a turn so history and turn_count are non-zero
     session.turn_count = 3;
 
-    const resp = handleSessionGet(std.testing.allocator, &mgr, "agent:zaki-bot:user:42:thread:abc");
+    const resp = handleSessionGet(std.testing.allocator, &mgr, "agent:zaki-bot:user:42:thread:abc", null, "42");
     defer std.testing.allocator.free(resp.body);
     try std.testing.expectEqualStrings("200 OK", resp.status);
     // Verify key fields are present in JSON
@@ -21175,6 +21301,14 @@ test "handleSessionGet returns session info JSON" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "agent:zaki-bot:user:42:thread:abc") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"turn_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"history_len\"") != null);
+
+    // Codex 2026-04-29 session-truth fields — frontend session-state truth.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"live\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"mode\":\"execute\"") != null); // default
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"pending_approval_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"context_pressure_percent\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"last_channel\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"pending_approvals\":[]") != null);
 }
 
 test "handleSessionGet returns 404 for unknown session" {
@@ -21182,7 +21316,7 @@ test "handleSessionGet returns 404 for unknown session" {
     var mgr = testCrudSessionManager(std.testing.allocator, &mock);
     defer mgr.deinit();
 
-    const resp = handleSessionGet(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:nonexistent");
+    const resp = handleSessionGet(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:nonexistent", null, "1");
     try std.testing.expectEqualStrings("404 Not Found", resp.status);
 }
 
