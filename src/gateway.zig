@@ -1483,7 +1483,7 @@ const TenantRuntime = struct {
             runtime.tools,
             mem_opt,
             runtime.observer_multi.observer(),
-            if (runtime.pg_session_store) |store| store.sessionStore() else if (runtime.mem_rt) |rt| rt.session_store else null,
+            runtime.resolvedSessionStore(),
             if (runtime.mem_rt) |*rt| rt.response_cache else null,
         );
         errdefer runtime.session_mgr.deinit();
@@ -1504,12 +1504,10 @@ const TenantRuntime = struct {
             runtime.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(runtime.tools, rt);
         }
-        // iter27: wire SessionStore for transcript_read. Tenant PG store wins;
+        // iter27: wire SessionStore for transcript_read. See
+        // TenantRuntime.resolvedSessionStore — tenant PG store wins,
         // falls back to mem_rt.session_store for standalone.
-        tools_mod.bindSessionStore(
-            runtime.tools,
-            if (runtime.pg_session_store) |store| store.sessionStore() else if (runtime.mem_rt) |rt| rt.session_store else null,
-        );
+        tools_mod.bindSessionStore(runtime.tools, runtime.resolvedSessionStore());
         // N1: wire Together API key into image_generate. The slice lives in
         // runtime.config.providers which outlives the tool. Empty key makes
         // the tool fall back to TOGETHER_API_KEY env at invocation time.
@@ -1587,6 +1585,21 @@ const TenantRuntime = struct {
         rt._engine = eng;
         rt.resolved.retrieval_mode = if (rt._vector_store != null and rt._embedding_provider != null) "hybrid" else "keyword";
         rt.resolved.source_count = source_count;
+    }
+
+    /// Single source of truth for session-store priority on the tenant
+    /// runtime. Tenant Postgres store wins; falls back to in-memory
+    /// (mem_rt.session_store) for standalone or PG-degraded paths.
+    ///
+    /// V1 close-out 2026-04-30 — extracted to eliminate the duplicated
+    /// chained-if at the session_mgr.init transcript-store arg and the
+    /// bindSessionStore call. Without one source, a future refactor to
+    /// the priority logic could update one site and silently leave the
+    /// other reading the wrong store.
+    fn resolvedSessionStore(self: *const TenantRuntime) ?memory_mod.SessionStore {
+        if (self.pg_session_store) |store| return store.sessionStore();
+        if (self.mem_rt) |*rt| return rt.session_store;
+        return null;
     }
 
     fn deinit(self: *TenantRuntime) void {
