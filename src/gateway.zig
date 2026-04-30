@@ -59,6 +59,7 @@ const ObserverEvent = observability.ObserverEvent;
 const agent_routing = @import("agent_routing.zig");
 const agent_prompt = @import("agent/prompt.zig");
 const security = @import("security/policy.zig");
+const security_secrets_mod = @import("security/secrets.zig");
 const http_util = @import("http_util.zig");
 const http_native = @import("http_native/root.zig");
 const json_util = @import("json_util.zig");
@@ -11507,6 +11508,258 @@ fn handleBrainTimeline(
     return finalizeJsonBuf(allocator, &out);
 }
 
+// ── /brain/compose — V1.5 day-3 chunk 3C ────────────────────────────
+//
+// POST /api/v1/users/:user_id/brain/compose
+//
+// Synthesize 2+ existing memories into one consolidated fact with
+// metadata-canonical provenance. Mirror of the `compose_memory` agent
+// tool but exposed via HTTP for frontend `/brain` page (user clicks
+// "synthesize these" on a graph selection).
+//
+// Differences from the tool path:
+//   1. Server-side reference validation — every key in `references[]`
+//      MUST exist as a memory for this user (rejects 400 on dangling).
+//      Tool path trusts the agent; HTTP path trusts no one.
+//   2. `synthesized_by` value is `"user"` instead of `"agent"` —
+//      provenance shows the user did the consolidation. Frontend can
+//      render distinct visual treatment (user-authored vs agent-
+//      authored syntheses).
+//   3. V1.5 caller provides synthesis text in the body. V1.6 will add
+//      an alternative shape that accepts only `references[]` and
+//      triggers an agent turn to do the synthesis (auto-compose UX).
+//
+// Request body:
+//   {
+//     "title": "...",
+//     "content": "...",
+//     "references": ["k1", "k2"],
+//     "category": "core" | "daily" | "conversation" (default "core"),
+//     "key": "..." (optional; auto-generated as compose:<hex> if omitted)
+//   }
+//
+// Response (201 Created):
+//   {
+//     "key": "compose:abc123def456",
+//     "synthesized_by": "user",
+//     "references_count": 2,
+//     "category": "core",
+//     "composed_at": 1714521600
+//   }
+//
+// Errors:
+//   400 — invalid body / missing fields / bounds exceeded / dangling references
+//   405 — non-POST method
+//   500 — store-write failure
+//   503 — state manager unavailable
+
+const BRAIN_COMPOSE_MAX_TITLE_LEN: usize = 240;
+const BRAIN_COMPOSE_MAX_CONTENT_LEN: usize = 50_000;
+const BRAIN_COMPOSE_MIN_REFERENCES: usize = 2;
+const BRAIN_COMPOSE_MAX_REFERENCES: usize = 50;
+const BRAIN_COMPOSE_MAX_REF_KEY_LEN: usize = 256;
+const BRAIN_COMPOSE_KEY_PREFIX = "compose:";
+
+fn handleBrainCompose(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    raw_request: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\",\"detail\":\"use POST to compose memory\"}" };
+    }
+
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    // ── Parse body ──
+    const body = extractBody(raw_request) orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_body\"}" };
+    };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_json\"}" };
+    };
+    defer parsed.deinit();
+
+    const root_obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return .{ .status = "400 Bad Request", .body = "{\"error\":\"body_must_be_object\"}" },
+    };
+
+    // ── title ──
+    const title_val = root_obj.get("title") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_title\"}" };
+    };
+    const title = switch (title_val) {
+        .string => |s| std.mem.trim(u8, s, " \t\r\n"),
+        else => return .{ .status = "400 Bad Request", .body = "{\"error\":\"title_must_be_string\"}" },
+    };
+    if (title.len == 0) return .{ .status = "400 Bad Request", .body = "{\"error\":\"title_empty\"}" };
+    if (title.len > BRAIN_COMPOSE_MAX_TITLE_LEN) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"title_too_long\"}" };
+    }
+
+    // ── content ──
+    const content_val = root_obj.get("content") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_content\"}" };
+    };
+    const content = switch (content_val) {
+        .string => |s| std.mem.trim(u8, s, " \t\r\n"),
+        else => return .{ .status = "400 Bad Request", .body = "{\"error\":\"content_must_be_string\"}" },
+    };
+    if (content.len == 0) return .{ .status = "400 Bad Request", .body = "{\"error\":\"content_empty\"}" };
+    if (content.len > BRAIN_COMPOSE_MAX_CONTENT_LEN) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"content_too_long\"}" };
+    }
+
+    // ── references ──
+    const refs_val = root_obj.get("references") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_references\"}" };
+    };
+    const refs = switch (refs_val) {
+        .array => |a| a,
+        else => return .{ .status = "400 Bad Request", .body = "{\"error\":\"references_must_be_array\"}" },
+    };
+    if (refs.items.len < BRAIN_COMPOSE_MIN_REFERENCES) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"references_min_2\"}" };
+    }
+    if (refs.items.len > BRAIN_COMPOSE_MAX_REFERENCES) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"references_max_50\"}" };
+    }
+    // Collect borrowed slices for validation. Detect duplicates.
+    var ref_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer ref_keys.deinit(allocator);
+    var ref_seen: std.StringHashMapUnmanaged(void) = .{};
+    defer ref_seen.deinit(allocator);
+    for (refs.items) |item| {
+        const k = switch (item) {
+            .string => |s| s,
+            else => return .{ .status = "400 Bad Request", .body = "{\"error\":\"references_must_be_strings\"}" },
+        };
+        if (k.len == 0 or k.len > BRAIN_COMPOSE_MAX_REF_KEY_LEN) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"reference_key_invalid\"}" };
+        }
+        if (ref_seen.contains(k)) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"duplicate_reference\"}" };
+        }
+        ref_seen.put(allocator, k, {}) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+        };
+        ref_keys.append(allocator, k) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+        };
+    }
+
+    // ── Server-side reference validation ──
+    // Every reference MUST exist as a memory for this user. Dangling
+    // references would produce invisible edges in /brain/graph; reject
+    // upfront so the user gets clear feedback.
+    var existing = state_mgr.existsMemoryKeys(allocator, numeric_user_id, ref_keys.items) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"reference_check_failed\"}" };
+    };
+    defer {
+        var it = existing.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        existing.deinit(allocator);
+    }
+    for (ref_keys.items) |k| {
+        if (!existing.contains(k)) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"dangling_reference\",\"detail\":\"one or more references[] keys do not resolve to existing memories for this user\"}" };
+        }
+    }
+
+    // ── category ──
+    const cat_str = blk: {
+        const v = root_obj.get("category") orelse break :blk "core";
+        const s = switch (v) {
+            .string => |str| str,
+            else => return .{ .status = "400 Bad Request", .body = "{\"error\":\"category_must_be_string\"}" },
+        };
+        break :blk s;
+    };
+    const category: memory_mod.MemoryCategory = if (std.mem.eql(u8, cat_str, "core"))
+        .core
+    else if (std.mem.eql(u8, cat_str, "daily"))
+        .daily
+    else if (std.mem.eql(u8, cat_str, "conversation"))
+        .conversation
+    else {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_category\"}" };
+    };
+
+    // ── key (auto-generated when not provided) ──
+    var key_buf: [80]u8 = undefined;
+    var key_owned: ?[]u8 = null;
+    defer if (key_owned) |k| allocator.free(k);
+    const memory_key: []const u8 = blk: {
+        const v = root_obj.get("key");
+        if (v) |kv| {
+            const s = switch (kv) {
+                .string => |str| std.mem.trim(u8, str, " \t\r\n"),
+                else => return .{ .status = "400 Bad Request", .body = "{\"error\":\"key_must_be_string\"}" },
+            };
+            if (s.len == 0) return .{ .status = "400 Bad Request", .body = "{\"error\":\"key_empty\"}" };
+            const owned = allocator.dupe(u8, s) catch return response_build_err;
+            key_owned = owned;
+            break :blk owned;
+        }
+        var rand_buf: [8]u8 = undefined;
+        std.crypto.random.bytes(&rand_buf);
+        var hex_buf: [16]u8 = undefined;
+        const hex = security_secrets_mod.hexEncode(&rand_buf, &hex_buf);
+        const full = std.fmt.bufPrint(&key_buf, "{s}{s}", .{ BRAIN_COMPOSE_KEY_PREFIX, hex }) catch return response_build_err;
+        const owned = allocator.dupe(u8, full) catch return response_build_err;
+        key_owned = owned;
+        break :blk owned;
+    };
+
+    // ── Build metadata JSON ──
+    // Shape: {"synthesized_by":"user","references":["k1","k2"],"composed_at":<unix>}
+    const ts = std.time.timestamp();
+    var meta_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer meta_buf.deinit(allocator);
+    const mw = meta_buf.writer(allocator);
+    mw.writeAll("{\"synthesized_by\":\"user\",\"references\":[") catch return response_build_err;
+    for (ref_keys.items, 0..) |k, idx| {
+        if (idx > 0) mw.writeAll(",") catch return response_build_err;
+        mw.writeAll("\"") catch return response_build_err;
+        jsonEscapeInto(mw, k) catch return response_build_err;
+        mw.writeAll("\"") catch return response_build_err;
+    }
+    mw.print("],\"composed_at\":{d},\"title\":\"", .{ts}) catch return response_build_err;
+    jsonEscapeInto(mw, title) catch return response_build_err;
+    mw.writeAll("\"}") catch return response_build_err;
+
+    // ── Write via state_mgr.upsertMemoryWithMetadata ──
+    state_mgr.upsertMemoryWithMetadata(numeric_user_id, memory_key, content, category, null, meta_buf.items) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"compose_write_failed\"}" };
+    };
+
+    // ── Build success response ──
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"key\":\"") catch return response_build_err;
+    jsonEscapeInto(w, memory_key) catch return response_build_err;
+    w.writeAll("\",\"synthesized_by\":\"user\",\"references_count\":") catch return response_build_err;
+    w.print("{d}", .{ref_keys.items.len}) catch return response_build_err;
+    w.writeAll(",\"category\":\"") catch return response_build_err;
+    jsonEscapeInto(w, cat_str) catch return response_build_err;
+    w.print("\",\"composed_at\":{d}}}", .{ts}) catch return response_build_err;
+
+    var resp = finalizeJsonBuf(allocator, &out);
+    resp.status = "201 Created";
+    return resp;
+}
+
 // ── GDPR data purge handler (Sprint 7B — S7.6) ─────────────────────
 //
 // DELETE /api/v1/users/:user_id/data
@@ -12762,6 +13015,16 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "brain/timeline")) {
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainTimeline(req_allocator, method, scoped_user_id, brain_target, state);
+    }
+
+    // ── /brain/compose — V1.5 day-3 chunk 3C ─────────────────────────────
+    // POST /api/v1/users/{id}/brain/compose
+    // Body: { title, content, references[], category?, key? }
+    // Synthesizes 2+ existing memories into one consolidated fact with
+    // server-validated provenance. Mirror of the `compose_memory` agent
+    // tool but exposes the capability to the frontend `/brain` page.
+    if (std.mem.eql(u8, parsed.subpath, "brain/compose")) {
+        return handleBrainCompose(req_allocator, method, scoped_user_id, raw_request, state);
     }
 
     // ── Session CRUD endpoints (Phase 3.5) ──────────────────────────────
@@ -23074,6 +23337,20 @@ test "handleBrainTimeline rejects non-GET methods" {
 test "handleBrainTimeline rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainTimeline(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/timeline", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+// ── /brain/compose handler tests — V1.5 day-3 chunk 3C ────────────────
+
+test "handleBrainCompose rejects non-POST methods" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainCompose(std.testing.allocator, "GET", "1", "GET /api/v1/users/1/brain/compose HTTP/1.1\r\n\r\n", &dummy_state);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleBrainCompose rejects invalid user_id" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainCompose(std.testing.allocator, "POST", "abc", "POST /api/v1/users/abc/brain/compose HTTP/1.1\r\n\r\n", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
 }
 

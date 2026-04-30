@@ -287,6 +287,9 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listMemoriesMetadata(_: *@This(), _: std.mem.Allocator, _: i64, _: []const []const u8) !std.StringHashMapUnmanaged([]u8) {
         return .{};
     }
+    pub fn existsMemoryKeys(_: *@This(), _: std.mem.Allocator, _: i64, _: []const []const u8) !std.StringHashMapUnmanaged(void) {
+        return .{};
+    }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
@@ -2018,6 +2021,73 @@ const ManagerImpl = struct {
         const stored_id = try dupeResultValue(self.allocator, result, 0, 0);
         defer self.allocator.free(stored_id);
         try self.insertMemoryEvent(user_id, stored_id, "compose", key, content, mem_type, session_id);
+    }
+
+    /// V1.5 day-3 chunk 3C — batch-check which keys exist as memories
+    /// for the given user. Used by `/brain/compose` HTTP handler to
+    /// reject requests whose `references[]` contains keys that don't
+    /// resolve (server-side validation; the tool path trusts the
+    /// agent). Returns an owned hashmap whose keys are owned strings —
+    /// caller frees each key + the map. Keys NOT present in the result
+    /// are dangling references.
+    pub fn existsMemoryKeys(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        keys: []const []const u8,
+    ) !std.StringHashMapUnmanaged(void) {
+        var out: std.StringHashMapUnmanaged(void) = .{};
+        errdefer {
+            var it = out.iterator();
+            while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+            out.deinit(allocator);
+        }
+        if (keys.len == 0) return out;
+
+        // Format keys as postgres text array (same pattern as
+        // listMemoriesMetadata + pgvector pairwiseSimilarities).
+        var keys_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer keys_buf.deinit(self.allocator);
+        try keys_buf.append(self.allocator, '{');
+        for (keys, 0..) |k, i| {
+            if (i > 0) try keys_buf.append(self.allocator, ',');
+            try keys_buf.append(self.allocator, '"');
+            for (k) |ch| {
+                switch (ch) {
+                    '"' => try keys_buf.appendSlice(self.allocator, "\\\""),
+                    '\\' => try keys_buf.appendSlice(self.allocator, "\\\\"),
+                    else => try keys_buf.append(self.allocator, ch),
+                }
+            }
+            try keys_buf.append(self.allocator, '"');
+        }
+        try keys_buf.append(self.allocator, '}');
+        const keys_z = try self.allocator.dupeZ(u8, keys_buf.items);
+        defer self.allocator.free(keys_z);
+
+        const q = try self.buildQuery(
+            "SELECT key FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND key = ANY($2::text[]) AND " ++ MEMORIES_VALIDITY_FILTER,
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, keys_z.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(keys_buf.items.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const nrows: usize = @intCast(c.PQntuples(result));
+        var i: usize = 0;
+        while (i < nrows) : (i += 1) {
+            const row: c_int = @intCast(i);
+            const k = try dupeResultValue(allocator, result, row, 0);
+            errdefer allocator.free(k);
+            try out.put(allocator, k, {});
+        }
+        return out;
     }
 
     /// V1.5 day-3 — batch-load `metadata` JSONB strings for a set of

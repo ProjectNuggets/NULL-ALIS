@@ -574,5 +574,128 @@ src/
 6. Mobile breakpoint: graph collapses to vertical-list view (the d3-force layout doesn't fit mobile screens cleanly).
 7. Add to sidebar: "Brain" entry with brain icon.
 8. Wire to `/brain` route in Next.js.
+9. **V1.5 day-3 — `/brain/compose` UX.** Add a "Synthesize selected" button on the graph view that becomes active when the user has 2+ nodes selected. Clicking it opens a modal where the user types/edits the synthesis title + content (V1.5 caller-provides-text path). On submit, POST to `/brain/compose`. The new node animates into the graph with a "synthesized" badge.
 
 — backend, signed. The endpoints are live and ready to consume.
+
+---
+
+## Addendum — `/brain/compose` response contract (V1.5 day-3 chunk 3C)
+
+**Endpoint:** `POST /api/v1/users/{user_id}/brain/compose`
+
+**Authentication:** mirrors `/sessions` pattern — internal token + tenant scope.
+
+**Request body:**
+
+```json
+{
+  "title": "Nova's preferences in tooling",
+  "content": "Prefers Zig for systems work, NeoVim editor, and pgvector over standalone vector DBs. Consistent across multiple sessions.",
+  "references": ["user_lang", "user_editor", "user_topic_today"],
+  "category": "core",
+  "key": "compose:custom_id"
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `title` | string | yes | ≤ 240 chars, non-empty (used as memory display title in metadata) |
+| `content` | string | yes | ≤ 50000 chars, non-empty — the synthesis text. **Pure synthesis, no boilerplate** (no `memory:<key>` markers; provenance lives in metadata) |
+| `references` | string[] | yes | min 2, max 50; each ≤ 256 chars; **server-validated** (must exist as memories for this user, else 400) |
+| `category` | string | no | `core` (default) \| `daily` \| `conversation` |
+| `key` | string | no | auto-generated as `compose:<16-hex>` if omitted |
+
+**Response (201 Created):**
+
+```json
+{
+  "key": "compose:abc123def456789a",
+  "synthesized_by": "user",
+  "references_count": 3,
+  "category": "core",
+  "composed_at": 1714521600
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `key` | string | Final memory key (auto-generated or user-provided). Use this on subsequent requests. |
+| `synthesized_by` | `"user"` | **Distinct from agent-authored** (`"agent"`) — frontend can render different visual treatments |
+| `references_count` | int | Echo of `references[].length` for client-side sanity |
+| `category` | string | Echo of category |
+| `composed_at` | unix seconds | Server-side timestamp |
+
+**Error responses:**
+
+| Status | Body shape | When |
+|---|---|---|
+| 400 | `{"error":"missing_title"}` etc. | Required fields missing or invalid |
+| 400 | `{"error":"references_min_2"}` | Fewer than 2 references |
+| 400 | `{"error":"references_max_50"}` | More than 50 references |
+| 400 | `{"error":"duplicate_reference"}` | Same key listed twice in `references[]` |
+| 400 | `{"error":"dangling_reference","detail":"..."}` | One or more references[] keys don't resolve to existing memories. **Client should highlight the offending nodes.** |
+| 405 | `{"error":"method_not_allowed"}` | Non-POST verb |
+| 500 | `{"error":"compose_write_failed"}` | DB write error (transient — frontend can retry) |
+| 503 | `{"error":"state_manager_unavailable"}` | Backend not configured |
+
+**Side effects:**
+
+1. **Memory created** at the returned `key` with `synthesized_by: "user"` + `references[]` in JSONB metadata.
+2. **memory_events row** lands with `event_type='compose'` — audit trail (V1.6 traversal-event log foundation).
+3. **`/brain/graph` reflects the new memory** on the next call: it appears as a node with reference edges to each source memory.
+4. **`/brain/timeline` reflects the new memory** as the newest entry on the next call.
+
+**Source memories are NOT modified.** They remain visible alongside the synthesis. V1.6 correction work will allow explicit retirement (sets `valid_to`).
+
+**TypeScript types (paste into `src/types/brain.ts` alongside the others):**
+
+```typescript
+// POST /api/v1/users/{user_id}/brain/compose request
+export interface BrainComposeRequest {
+  title: string;
+  content: string;
+  references: string[];           // 2-50 keys, all must exist
+  category?: "core" | "daily" | "conversation";  // default "core"
+  key?: string;                   // optional explicit key
+}
+
+// /brain/compose response
+export interface BrainComposeResponse {
+  key: string;
+  synthesized_by: "user";          // V1.5 endpoint always "user"
+  references_count: number;
+  category: string;
+  composed_at: number;             // unix seconds
+}
+```
+
+**Curl example:**
+
+```bash
+curl -s -X POST -H "X-Internal-Token: $TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "title":"Tool preferences",
+    "content":"Nova prefers Zig + NeoVim + pgvector across all sessions.",
+    "references":["user_lang","user_editor","user_topic_today"],
+    "category":"core"
+  }' \
+  "$GATEWAY/api/v1/users/1/brain/compose"
+```
+
+**Suggested UX flow:**
+
+1. User opens `/brain` page → sees graph
+2. Multi-selects 2+ related nodes (e.g. `user_lang`, `user_editor`, `user_topic_today`)
+3. Clicks "Synthesize selected" button → opens modal with auto-suggested title (concatenation of source titles)
+4. User edits title + types/pastes synthesis content (V1.5 — manual; V1.6 will auto-suggest via LLM trigger)
+5. Submits → POST to `/brain/compose` → 201 returns the new key
+6. Frontend animates the new node into the graph with reference edges to each selected source. "Synthesized" badge on the node.
+
+**V1.6 enhancements queued:**
+
+- LLM-trigger mode: alternative request shape `{references: string[]}` (no title/content) → backend triggers an agent turn to generate the synthesis. Same final API shape; auto-compose UX bolts on as a new mode.
+- Auto-suggested references: graph view suggests "these N nodes look like they cluster — synthesize?" based on cosine similarity threshold.
+- Source retirement: when V1.6 correction classifier ships, compose can optionally `retire_sources: true` to set `valid_to=now()` on the source memories.
+
+— backend, signed. `/brain/compose` is live and ready to consume.
