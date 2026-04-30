@@ -36,6 +36,25 @@ pub const ZakiPostgresMemory = struct {
         try self.manager.upsertMemory(self.user_id, key, content, category, session_id);
     }
 
+    /// V1.5 day-3 — write path with attached JSONB metadata. Used by
+    /// the `compose_memory` tool to land synthesized memories with
+    /// `{"synthesized_by":"agent","references":["k1","k2"]}` provenance
+    /// alongside the synthesis content. Routes to
+    /// `state_mgr.upsertMemoryWithMetadata` which also writes a
+    /// `compose` row to the `memory_events` audit table for free V1.6
+    /// traversal-logging substrate.
+    fn implStoreWithMetadata(
+        ptr: *anyopaque,
+        key: []const u8,
+        content: []const u8,
+        category: root.MemoryCategory,
+        session_id: ?[]const u8,
+        metadata_json: []const u8,
+    ) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.manager.upsertMemoryWithMetadata(self.user_id, key, content, category, session_id, metadata_json);
+    }
+
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]root.MemoryEntry {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return try self.manager.recallMemories(allocator, self.user_id, query, limit, session_id);
@@ -81,5 +100,6 @@ pub const ZakiPostgresMemory = struct {
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
+        .store_with_metadata = &implStoreWithMetadata,
     };
 };

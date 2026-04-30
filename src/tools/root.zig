@@ -74,6 +74,7 @@ pub const memory_forget = @import("memory_forget.zig");
 pub const memory_purge_topic = @import("memory_purge_topic.zig");
 pub const schedule = @import("schedule.zig");
 pub const todo = @import("todo.zig");
+pub const compose_memory = @import("compose_memory.zig");
 pub const delegate = @import("delegate.zig");
 pub const browser = @import("browser.zig");
 pub const image = @import("image.zig");
@@ -447,6 +448,17 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // but the tool as a whole mutates persisted lists). Per-session
         // scope; cost is local memory writes only.
         .name = todo.TodoTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        // V1.5 day-3 compose_memory tool — synthesizes 2+ existing
+        // memories into one consolidated fact with provenance metadata.
+        // Mutating (writes a new memory), but cost is a single memory
+        // write + 1 memory_event row. Risk low: bounded inputs +
+        // dangling references are filtered at /brain/graph render time.
+        .name = compose_memory.ComposeMemoryTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .low,
         .cost_class = .a,
@@ -1060,6 +1072,15 @@ pub fn allTools(
     todot.* = .{};
     try list.append(allocator, todot.tool());
 
+    // V1.5 day-3 — compose_memory tool. Synthesizes 2+ existing memories
+    // into one consolidated fact with metadata-canonical provenance.
+    // Same memory-backend wiring as todo; falls back to plain store
+    // (metadata dropped) when the engine doesn't support metadata.
+    // Production zaki_postgres engine implements the metadata path.
+    const cmt = try allocator.create(compose_memory.ComposeMemoryTool);
+    cmt.* = .{};
+    try list.append(allocator, cmt.tool());
+
     // Cron tools + push notifications
     const cat = try allocator.create(cron_add.CronAddTool);
     cat.* = .{ .config = opts.config };
@@ -1597,6 +1618,13 @@ pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
             // other memory-backed tools.
             const tt: *todo.TodoTool = @ptrCast(@alignCast(t.ptr));
             tt.memory = memory;
+        } else if (t.vtable == &compose_memory.ComposeMemoryTool.vtable) {
+            // V1.5 day-3 — compose_memory persists via memory layer;
+            // uses storeWithMetadata when the backend supports it
+            // (zaki_postgres production), falls back to plain store
+            // otherwise (metadata dropped — graceful degrade).
+            const cmt: *compose_memory.ComposeMemoryTool = @ptrCast(@alignCast(t.ptr));
+            cmt.memory = memory;
         }
     }
 }
@@ -2084,9 +2112,10 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 30 (delegate + spawn dormant by default; +1 for V1.5 todo)
-    // + http_request + web_fetch + web_search + browser = 34
-    try std.testing.expectEqual(@as(usize, 34), tools.len);
+    // base 31 (delegate + spawn dormant by default; +1 for V1.5 todo,
+    // +1 for V1.5 day-3 compose_memory) + http_request + web_fetch
+    // + web_search + browser = 35.
+    try std.testing.expectEqual(@as(usize, 35), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2100,10 +2129,10 @@ test "all tools excludes extras when disabled" {
     defer deinitTools(std.testing.allocator, tools);
     // Core tool catalog (delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT):
     // shell + file_read + file_write + file_edit + file_append + git + image_info + image_generate
-    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + schedule + todo
+    // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + schedule + todo + compose_memory
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot = 30
-    try std.testing.expectEqual(@as(usize, 30), tools.len);
+    // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot = 31
+    try std.testing.expectEqual(@as(usize, 31), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2229,9 +2258,9 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    // 30 core tools (was 29 pre-V1.5 — added `todo`); delegate + spawn
-    // gated behind NULLALIS_ENABLE_MULTIAGENT.
-    try std.testing.expectEqual(@as(usize, 30), tools.len);
+    // 31 core tools (was 30 — V1.5 day-3 added `compose_memory`);
+    // delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT.
+    try std.testing.expectEqual(@as(usize, 31), tools.len);
 
     var found_message = false;
     for (tools) |t| {

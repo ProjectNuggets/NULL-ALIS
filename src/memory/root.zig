@@ -1065,6 +1065,15 @@ pub const Memory = struct {
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         healthCheck: *const fn (ptr: *anyopaque) bool,
         deinit: *const fn (ptr: *anyopaque) void,
+        /// V1.5 day-3 — optional write path that attaches a JSONB
+        /// metadata blob to the row. Used by `compose_memory` to record
+        /// `{"synthesized_by":"agent","references":["k1","k2"]}` alongside
+        /// the synthesis content. When the backend doesn't support
+        /// metadata (sqlite, markdown, lru, etc.), the wrapper falls
+        /// back to plain `store` and silently drops the metadata —
+        /// graceful degrade. Today only `zaki_postgres` (production
+        /// path) implements this slot.
+        store_with_metadata: ?*const fn (ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8, metadata_json: []const u8) anyerror!void = null,
     };
 
     pub fn name(self: Memory) []const u8 {
@@ -1072,6 +1081,27 @@ pub const Memory = struct {
     }
 
     pub fn store(self: Memory, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) !void {
+        return self.vtable.store(self.ptr, key, content, category, session_id);
+    }
+
+    /// V1.5 day-3 — store with structured JSONB metadata attached.
+    /// When the backend has the `store_with_metadata` vtable slot,
+    /// uses it. Otherwise falls back to plain `store` (metadata
+    /// silently dropped — graceful degrade). The compose_memory tool
+    /// uses this; if the backend is sqlite/markdown/lru/etc., the
+    /// content still lands but `references` won't surface in
+    /// `/brain/graph` reference-edge generation.
+    pub fn storeWithMetadata(
+        self: Memory,
+        key: []const u8,
+        content: []const u8,
+        category: MemoryCategory,
+        session_id: ?[]const u8,
+        metadata_json: []const u8,
+    ) !void {
+        if (self.vtable.store_with_metadata) |fn_ptr| {
+            return fn_ptr(self.ptr, key, content, category, session_id, metadata_json);
+        }
         return self.vtable.store(self.ptr, key, content, category, session_id);
     }
 
