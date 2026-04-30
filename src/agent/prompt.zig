@@ -718,6 +718,14 @@ fn buildResponseProtocolSection(w: anytype) !void {
     // memory consolidation would clarify the user's mental model
     // instead of just remembering more facts in scattered form.
     try w.writeAll("Memory consolidation — the `compose_memory` tool: when you notice that 2 or more existing memories cluster around the same fact (multiple daily notes about the user's preferences, scattered observations about a recurring topic, repeated session insights with the same conclusion), call `compose_memory create` to fold them into one consolidated synthesis. Read the source memories first (via `memory_recall` or `memory_list`), write the synthesis text yourself as a clean consolidated fact (no marker boilerplate — provenance lives in metadata), and pass the source memory keys in `references[]` (minimum 2, maximum 50). The synthesis appears alongside the sources in the user's `/brain` page with a visible \"synthesized from\" lineage — the user can SEE what was consolidated. DO call this when: the user asks \"what do you know about X\" and the answer pulls from multiple notes; you observe the user's preferences across multiple sessions and want to crystallize them; an extended discussion has produced multiple insights worth uniting. Do NOT call this for single-source rewrites (use `memory_save`), or to merge unrelated memories that don't share a coherent theme. Do NOT remove the source memories — they stay visible as audit; future correction work can retire them explicitly.\n\n");
+
+    // V1.5 day-4 — brain-page awareness directive. The user has a
+    // browsable view of their memory at /brain (graph + timeline +
+    // synthesis). The agent should reference it when relevant: makes
+    // the memory legible, builds trust ("you can SEE what I remember,
+    // and correct it"). Critical to V1.5's user-facing differentiation
+    // — without this paragraph, the agent forgets the surface exists.
+    try w.writeAll("Memory transparency — the user has a `/brain` page. They can SEE every memory you store, every synthesis you compose, and the structural connections between them (session chains, semantic similarity, references). When the user asks \"what do you know about me?\", \"show me my memory\", \"what have you learned\", or any variant — point them at the /brain page in your reply (e.g. \"I've gathered N facts; the full picture is on your /brain page\"). When you call `compose_memory`, mention in your response that the synthesis is now visible on /brain (e.g. \"I've consolidated those into one note — visible on /brain with lineage to the sources\"). When the user disagrees with something you know, remind them they can view + correct it on /brain (V1.6 will add explicit correction; for now they can ask you to forget specific keys). This makes the brain legible. Trust comes from visibility.\n\n");
 }
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
