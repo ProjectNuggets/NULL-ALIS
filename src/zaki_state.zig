@@ -279,6 +279,14 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listMemoriesTimeline(_: *@This(), allocator: std.mem.Allocator, _: i64, _: ?i64, _: ?[]const u8, _: u32, _: ?i64, _: ?i64) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
+    /// V1.5 day-3 — stubs for non-postgres builds; compose path silently
+    /// degrades when state manager is the disabled variant.
+    pub fn upsertMemoryWithMetadata(_: *@This(), _: i64, _: []const u8, _: []const u8, _: memory_root.MemoryCategory, _: ?[]const u8, _: []const u8) !void {
+        return error.PostgresNotEnabled;
+    }
+    pub fn listMemoriesMetadata(_: *@This(), _: std.mem.Allocator, _: i64, _: []const []const u8) !std.StringHashMapUnmanaged([]u8) {
+        return .{};
+    }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
@@ -1924,6 +1932,170 @@ const ManagerImpl = struct {
         const lengths = [_]c_int{ @intCast(user_s.len), @intCast(event_id.len) };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
+    }
+
+    /// V1.5 day-3 — write a memory with structured `metadata` JSON in the
+    /// `metadata` JSONB column. Used by `compose_memory` (synthesized
+    /// memories) and any future writer that needs to attach provenance,
+    /// authorship, or correction data alongside the content. Caller
+    /// provides a pre-serialized JSON string (e.g.
+    /// `{"synthesized_by":"agent","references":["k1","k2"]}`); we don't
+    /// re-parse it server-side. Validation is the caller's
+    /// responsibility — postgres will reject malformed JSON at INSERT.
+    ///
+    /// Backward-compat: existing `upsertMemory` callers unchanged. The
+    /// hot-path retrieval queries (`listMemories`, `recallMemories`,
+    /// `getMemory`) don't read the `metadata` column — keeps the
+    /// agent's per-turn cost identical to V1.5 day-2. Consumers that
+    /// need metadata (the /brain/graph reference-edge builder) call
+    /// `listMemoriesMetadata` separately.
+    pub fn upsertMemoryWithMetadata(
+        self: *Self,
+        user_id: i64,
+        key: []const u8,
+        content: []const u8,
+        category: memory_root.MemoryCategory,
+        session_id: ?[]const u8,
+        metadata_json: []const u8,
+    ) !void {
+        if (session_id) |sid| try self.ensureSession(user_id, sid);
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, metadata, updated_at) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW()) " ++
+                "ON CONFLICT (user_id, key) DO UPDATE SET session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, memory_type = EXCLUDED.memory_type, metadata = EXCLUDED.metadata, updated_at = NOW() " ++
+                "RETURNING id",
+        );
+        defer self.allocator.free(q);
+
+        const id = try self.randomHexId(self.allocator, 16);
+        defer self.allocator.free(id);
+        const id_z = try self.allocator.dupeZ(u8, id);
+        defer self.allocator.free(id_z);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const session_text = session_id orelse "";
+        const session_z = try self.allocator.dupeZ(u8, session_text);
+        defer self.allocator.free(session_z);
+        const key_z = try self.allocator.dupeZ(u8, key);
+        defer self.allocator.free(key_z);
+        const content_z = try self.allocator.dupeZ(u8, content);
+        defer self.allocator.free(content_z);
+        const content_hash = try computeContentHash(self.allocator, content);
+        defer self.allocator.free(content_hash);
+        const content_hash_z = try self.allocator.dupeZ(u8, content_hash);
+        defer self.allocator.free(content_hash_z);
+        const mem_type = categoryToMemoryType(category);
+        const mem_type_z = try self.allocator.dupeZ(u8, mem_type);
+        defer self.allocator.free(mem_type_z);
+        const metadata_z = try self.allocator.dupeZ(u8, metadata_json);
+        defer self.allocator.free(metadata_z);
+
+        const params = [_]?[*:0]const u8{
+            id_z,
+            user_s.ptr,
+            if (session_text.len == 0) null else session_z,
+            key_z,
+            content_z,
+            content_hash_z,
+            mem_type_z,
+            metadata_z,
+        };
+        const lengths = [_]c_int{
+            @intCast(id.len),
+            @intCast(user_s.len),
+            @intCast(session_text.len),
+            @intCast(key.len),
+            @intCast(content.len),
+            @intCast(content_hash.len),
+            @intCast(mem_type.len),
+            @intCast(metadata_json.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return;
+
+        const stored_id = try dupeResultValue(self.allocator, result, 0, 0);
+        defer self.allocator.free(stored_id);
+        try self.insertMemoryEvent(user_id, stored_id, "compose", key, content, mem_type, session_id);
+    }
+
+    /// V1.5 day-3 — batch-load `metadata` JSONB strings for a set of
+    /// memory keys. Used by `/brain/graph` reference-edge builder to
+    /// resolve `metadata.references` without an N+1 query. Returns an
+    /// owned hashmap (key → metadata JSON string); caller frees each
+    /// value + the map. Keys absent from the result simply have no
+    /// metadata; the caller treats them as empty.
+    pub fn listMemoriesMetadata(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        keys: []const []const u8,
+    ) !std.StringHashMapUnmanaged([]u8) {
+        var out: std.StringHashMapUnmanaged([]u8) = .{};
+        errdefer {
+            var it = out.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            out.deinit(allocator);
+        }
+        if (keys.len == 0) return out;
+
+        // Format keys as postgres text array; reuse the pattern from
+        // pgvector pairwiseSimilarities.
+        var keys_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer keys_buf.deinit(self.allocator);
+        try keys_buf.append(self.allocator, '{');
+        for (keys, 0..) |k, i| {
+            if (i > 0) try keys_buf.append(self.allocator, ',');
+            try keys_buf.append(self.allocator, '"');
+            for (k) |ch| {
+                switch (ch) {
+                    '"' => try keys_buf.appendSlice(self.allocator, "\\\""),
+                    '\\' => try keys_buf.appendSlice(self.allocator, "\\\\"),
+                    else => try keys_buf.append(self.allocator, ch),
+                }
+            }
+            try keys_buf.append(self.allocator, '"');
+        }
+        try keys_buf.append(self.allocator, '}');
+        const keys_z = try self.allocator.dupeZ(u8, keys_buf.items);
+        defer self.allocator.free(keys_z);
+
+        const q = try self.buildQuery(
+            "SELECT key, metadata::text FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND key = ANY($2::text[]) AND " ++ MEMORIES_VALIDITY_FILTER,
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, keys_z.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(keys_buf.items.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const nrows: usize = @intCast(c.PQntuples(result));
+        var i: usize = 0;
+        while (i < nrows) : (i += 1) {
+            const row: c_int = @intCast(i);
+            const k = try dupeResultValue(allocator, result, row, 0);
+            errdefer allocator.free(k);
+            const metadata = try dupeResultValue(allocator, result, row, 1);
+            errdefer allocator.free(metadata);
+            // Skip rows with empty metadata (defaults to '{}' but might
+            // be all-empty if column was added later — defensive).
+            if (metadata.len == 0 or std.mem.eql(u8, metadata, "{}")) {
+                allocator.free(k);
+                allocator.free(metadata);
+                continue;
+            }
+            try out.put(allocator, k, metadata);
+        }
+        return out;
     }
 
     pub fn upsertMemory(self: *Self, user_id: i64, key: []const u8, content: []const u8, category: memory_root.MemoryCategory, session_id: ?[]const u8) !void {

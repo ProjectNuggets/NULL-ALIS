@@ -10947,13 +10947,25 @@ fn buildBrainReferenceEdges(
     nodes: []const BrainNode,
     contents: []const []const u8,
     node_keys: *std.StringHashMapUnmanaged(void),
+    metadata_json_map: ?*const std.StringHashMapUnmanaged([]u8),
 ) ![]BrainRefEdge {
     std.debug.assert(nodes.len == contents.len);
 
     var edges: std.ArrayListUnmanaged(BrainRefEdge) = .{};
     errdefer edges.deinit(allocator);
 
+    // Track edges already emitted from this source to avoid duplicate
+    // edges when the same target is referenced via BOTH content marker
+    // AND metadata.references. Key format: "src||tgt".
+    var seen: std.StringHashMapUnmanaged(void) = .{};
+    defer {
+        var sit = seen.iterator();
+        while (sit.next()) |e| allocator.free(e.key_ptr.*);
+        seen.deinit(allocator);
+    }
+
     for (nodes, contents) |source_node, content| {
+        // ── Path 1: regex over content (legacy + agent-emitted markers) ──
         var i: usize = 0;
         while (i + BRAIN_REF_PREFIX.len < content.len) {
             const remaining = content[i..];
@@ -10967,14 +10979,69 @@ fn buildBrainReferenceEdges(
                 // Self-reference is meaningless; skip.
                 if (!std.mem.eql(u8, candidate, source_node.key)) {
                     if (node_keys.get(candidate) != null) {
-                        try edges.append(allocator, .{
-                            .source = source_node.key,
-                            .target = candidate, // borrowed from content
-                        });
+                        const seen_key = try std.fmt.allocPrint(allocator, "{s}||{s}", .{ source_node.key, candidate });
+                        if (!seen.contains(seen_key)) {
+                            try seen.put(allocator, seen_key, {});
+                            try edges.append(allocator, .{
+                                .source = source_node.key,
+                                .target = candidate, // borrowed from content
+                            });
+                        } else {
+                            allocator.free(seen_key);
+                        }
                     }
                 }
             }
             i = end;
+        }
+
+        // ── Path 2: V1.5 day-3 — `metadata.references` JSON array ──
+        // Compose memories store provenance in JSONB metadata column
+        // (clean separation: synthesis content is pure, references
+        // canonical in metadata). Parse the JSON, extract `references`
+        // array, emit edges (with same dangling-prevention + self-loop
+        // skip + dedup as the regex path).
+        if (metadata_json_map) |map| {
+            const meta_json = map.get(source_node.key) orelse continue;
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, meta_json, .{}) catch continue;
+            defer parsed.deinit();
+            const obj = switch (parsed.value) {
+                .object => |o| o,
+                else => continue,
+            };
+            const refs_val = obj.get("references") orelse continue;
+            const refs_arr = switch (refs_val) {
+                .array => |a| a,
+                else => continue,
+            };
+            for (refs_arr.items) |item| {
+                const target = switch (item) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                if (std.mem.eql(u8, target, source_node.key)) continue;
+                if (node_keys.get(target) == null) continue;
+                const seen_key = try std.fmt.allocPrint(allocator, "{s}||{s}", .{ source_node.key, target });
+                if (seen.contains(seen_key)) {
+                    allocator.free(seen_key);
+                    continue;
+                }
+                try seen.put(allocator, seen_key, {});
+                // `target` is borrowed from the parsed JSON which is
+                // freed when `parsed.deinit()` runs at this iteration's
+                // end. We need a borrowable pointer that outlives the
+                // edge slice. Look up the canonical key in `node_keys`
+                // — it was inserted from the BrainNode array which
+                // outlives this function (handler-scope lifetime).
+                var nk_it = node_keys.keyIterator();
+                const canonical = while (nk_it.next()) |k| {
+                    if (std.mem.eql(u8, k.*, target)) break k.*;
+                } else continue;
+                try edges.append(allocator, .{
+                    .source = source_node.key,
+                    .target = canonical,
+                });
+            }
         }
     }
 
@@ -11132,8 +11199,37 @@ fn handleBrainGraph(
     }
     defer memory_mod.vector_store.freeEdgeResults(allocator, semantic_edges);
 
-    // ── Build reference edges (regex over content) ───────────────
-    const ref_edges = buildBrainReferenceEdges(allocator, nodes, contents, &node_keys) catch {
+    // ── Build reference edges (regex over content + metadata.references) ─
+    // V1.5 day-3: also batch-load `metadata` JSONB for the cap'd node set.
+    // Compose memories store provenance in metadata.references rather
+    // than content markers; the builder reads both paths and dedupes.
+    var metadata_map: std.StringHashMapUnmanaged([]u8) = .{};
+    defer {
+        var it = metadata_map.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        metadata_map.deinit(allocator);
+    }
+    {
+        // Build a key slice from nodes to pass to listMemoriesMetadata.
+        const keys_for_metadata = allocator.alloc([]const u8, node_count) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+        };
+        defer allocator.free(keys_for_metadata);
+        for (nodes, 0..) |n, i| keys_for_metadata[i] = n.key;
+        // Errors here are non-fatal — graph still ships with regex-only
+        // reference edges (V1.5 day-2 behavior).
+        if (state_mgr.listMemoriesMetadata(allocator, numeric_user_id, keys_for_metadata)) |result_map| {
+            metadata_map = result_map;
+        } else |_| {
+            // Keep metadata_map empty; reference-edge builder degrades
+            // gracefully (regex path still fires).
+        }
+    }
+
+    const ref_edges = buildBrainReferenceEdges(allocator, nodes, contents, &node_keys, &metadata_map) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"ref_edges_failed\"}" };
     };
     defer allocator.free(ref_edges);
@@ -22705,7 +22801,7 @@ test "brain: buildBrainReferenceEdges parses memory:<key> tokens" {
     defer node_keys.deinit(std.testing.allocator);
     for (nodes) |n| try node_keys.put(std.testing.allocator, n.key, {});
 
-    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys);
+    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys, null);
     defer std.testing.allocator.free(edges);
 
     try std.testing.expectEqual(@as(usize, 2), edges.len);
@@ -22728,7 +22824,7 @@ test "brain: buildBrainReferenceEdges drops references to keys not in node set" 
     defer node_keys.deinit(std.testing.allocator);
     for (nodes) |n| try node_keys.put(std.testing.allocator, n.key, {});
 
-    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys);
+    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys, null);
     defer std.testing.allocator.free(edges);
 
     try std.testing.expectEqual(@as(usize, 0), edges.len);
@@ -22748,7 +22844,152 @@ test "brain: buildBrainReferenceEdges skips self-references" {
     defer node_keys.deinit(std.testing.allocator);
     for (nodes) |n| try node_keys.put(std.testing.allocator, n.key, {});
 
-    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys);
+    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys, null);
+    defer std.testing.allocator.free(edges);
+
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+// ── V1.5 day-3 chunk 3A — metadata-driven reference edges ───────────
+
+test "brain: buildBrainReferenceEdges reads metadata.references" {
+    // Compose memories store provenance in JSONB metadata, not content
+    // markers. The graph builder must produce edges from
+    // metadata.references[] when the metadata map is provided.
+    const nodes = [_]BrainNode{
+        .{ .key = "synth", .kind = "core", .session_id = null, .created_at = 100, .summary = "", .valid_to = null },
+        .{ .key = "src_a", .kind = "core", .session_id = null, .created_at = 50, .summary = "", .valid_to = null },
+        .{ .key = "src_b", .kind = "core", .session_id = null, .created_at = 60, .summary = "", .valid_to = null },
+    };
+    // Pure synthesis content — no markers. Provenance lives in metadata.
+    const contents = [_][]const u8{
+        "Synthesized fact: X is true.",
+        "Source A says X.",
+        "Source B confirms X.",
+    };
+
+    var node_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer node_keys.deinit(std.testing.allocator);
+    for (nodes) |n| try node_keys.put(std.testing.allocator, n.key, {});
+
+    var metadata_map: std.StringHashMapUnmanaged([]u8) = .{};
+    defer {
+        var it = metadata_map.iterator();
+        while (it.next()) |e| {
+            std.testing.allocator.free(e.key_ptr.*);
+            std.testing.allocator.free(e.value_ptr.*);
+        }
+        metadata_map.deinit(std.testing.allocator);
+    }
+    const synth_key = try std.testing.allocator.dupe(u8, "synth");
+    const synth_meta = try std.testing.allocator.dupe(u8, "{\"synthesized_by\":\"agent\",\"references\":[\"src_a\",\"src_b\"]}");
+    try metadata_map.put(std.testing.allocator, synth_key, synth_meta);
+
+    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys, &metadata_map);
+    defer std.testing.allocator.free(edges);
+
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+    for (edges) |e| {
+        try std.testing.expectEqualStrings("synth", e.source);
+        try std.testing.expect(std.mem.eql(u8, e.target, "src_a") or std.mem.eql(u8, e.target, "src_b"));
+    }
+}
+
+test "brain: buildBrainReferenceEdges dedups regex + metadata path" {
+    // If the same edge is referenced via BOTH content marker AND
+    // metadata.references, it must only appear once. Future-proofs
+    // against legacy compose memories that have markers in content.
+    const nodes = [_]BrainNode{
+        .{ .key = "src", .kind = "core", .session_id = null, .created_at = 100, .summary = "", .valid_to = null },
+        .{ .key = "tgt", .kind = "core", .session_id = null, .created_at = 50, .summary = "", .valid_to = null },
+    };
+    const contents = [_][]const u8{
+        "see memory:tgt for details",
+        "target content",
+    };
+
+    var node_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer node_keys.deinit(std.testing.allocator);
+    for (nodes) |n| try node_keys.put(std.testing.allocator, n.key, {});
+
+    var metadata_map: std.StringHashMapUnmanaged([]u8) = .{};
+    defer {
+        var it = metadata_map.iterator();
+        while (it.next()) |e| {
+            std.testing.allocator.free(e.key_ptr.*);
+            std.testing.allocator.free(e.value_ptr.*);
+        }
+        metadata_map.deinit(std.testing.allocator);
+    }
+    const src_key = try std.testing.allocator.dupe(u8, "src");
+    const src_meta = try std.testing.allocator.dupe(u8, "{\"references\":[\"tgt\"]}");
+    try metadata_map.put(std.testing.allocator, src_key, src_meta);
+
+    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys, &metadata_map);
+    defer std.testing.allocator.free(edges);
+
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("src", edges[0].source);
+    try std.testing.expectEqualStrings("tgt", edges[0].target);
+}
+
+test "brain: buildBrainReferenceEdges metadata path drops dangling targets" {
+    // metadata.references pointing at a key not in node_keys must be
+    // dropped (same dangling-prevention as the regex path).
+    const nodes = [_]BrainNode{
+        .{ .key = "src", .kind = "core", .session_id = null, .created_at = 100, .summary = "", .valid_to = null },
+    };
+    const contents = [_][]const u8{"orphan source"};
+
+    var node_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer node_keys.deinit(std.testing.allocator);
+    for (nodes) |n| try node_keys.put(std.testing.allocator, n.key, {});
+
+    var metadata_map: std.StringHashMapUnmanaged([]u8) = .{};
+    defer {
+        var it = metadata_map.iterator();
+        while (it.next()) |e| {
+            std.testing.allocator.free(e.key_ptr.*);
+            std.testing.allocator.free(e.value_ptr.*);
+        }
+        metadata_map.deinit(std.testing.allocator);
+    }
+    const src_key = try std.testing.allocator.dupe(u8, "src");
+    // References point at keys that aren't in node_keys.
+    const src_meta = try std.testing.allocator.dupe(u8, "{\"references\":[\"missing_a\",\"missing_b\"]}");
+    try metadata_map.put(std.testing.allocator, src_key, src_meta);
+
+    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys, &metadata_map);
+    defer std.testing.allocator.free(edges);
+
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "brain: buildBrainReferenceEdges metadata path skips self-references" {
+    // Metadata-declared self-reference must not produce a self-loop.
+    const nodes = [_]BrainNode{
+        .{ .key = "self_synth", .kind = "core", .session_id = null, .created_at = 100, .summary = "", .valid_to = null },
+    };
+    const contents = [_][]const u8{"clean content"};
+
+    var node_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer node_keys.deinit(std.testing.allocator);
+    for (nodes) |n| try node_keys.put(std.testing.allocator, n.key, {});
+
+    var metadata_map: std.StringHashMapUnmanaged([]u8) = .{};
+    defer {
+        var it = metadata_map.iterator();
+        while (it.next()) |e| {
+            std.testing.allocator.free(e.key_ptr.*);
+            std.testing.allocator.free(e.value_ptr.*);
+        }
+        metadata_map.deinit(std.testing.allocator);
+    }
+    const k = try std.testing.allocator.dupe(u8, "self_synth");
+    const meta = try std.testing.allocator.dupe(u8, "{\"references\":[\"self_synth\"]}");
+    try metadata_map.put(std.testing.allocator, k, meta);
+
+    const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys, &metadata_map);
     defer std.testing.allocator.free(edges);
 
     try std.testing.expectEqual(@as(usize, 0), edges.len);
