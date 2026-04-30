@@ -699,3 +699,60 @@ curl -s -X POST -H "X-Internal-Token: $TOKEN" -H "Content-Type: application/json
 - Source retirement: when V1.6 correction classifier ships, compose can optionally `retire_sources: true` to set `valid_to=now()` on the source memories.
 
 — backend, signed. `/brain/compose` is live and ready to consume.
+
+---
+
+## Ship strategy (V1.5 — coordinating with Claude design)
+
+Claude design is overhauling the full zaki-prod design system, but rate-limited as of 2026-04-30. Strategy:
+
+1. **Phase 1 (V1.5 ship 2026-05-05)** — Codex+Opus tag-team implements the `/brain` page on the **current zaki-prod design system**. Visual fidelity matches existing surfaces; functionality is what matters for ship. The 3 endpoints + tool + agent prompts are all locked.
+
+2. **Phase 2 (post-ship, when Claude design returns)** — visual layer migrates to the new design system. Backend doesn't care which system the frontend uses; endpoints are JSON-in/JSON-out.
+
+**Migration cost is small if Phase 1 keeps these layers stable:**
+- `src/types/brain.ts` (TypeScript types — should not change between phases)
+- `src/lib/api/brain.ts` (fetch wrappers — should not change between phases)
+- `src/app/brain/page.tsx` shell (just hosts the components)
+- Visual components (`BrainGraph.tsx`, `BrainTimeline.tsx`, `BrainComposeModal.tsx`) — these get rewritten in Phase 2 against the new design system
+
+**Phase 1 success criteria:**
+- /brain page exists at `/brain` route
+- Three views work end-to-end against the live backend: Graph + Timeline + Compose
+- Empty states implemented
+- Mobile breakpoint reasonable (graph collapses to vertical-list view)
+- Sidebar "Brain" entry navigates to /brain
+- Loading + error states handled
+- Internal-token auth wired (mirror existing zaki-prod patterns)
+
+That's it. Ship Phase 1 on 05-05; Phase 2 is post-ship polish.
+
+---
+
+## Final pre-handoff checklist for the frontend agent
+
+Before starting implementation:
+
+- [ ] Read this entire brief (especially `## Surfaces to design or refine` for context + the three `/brain/*` addendums for contracts)
+- [ ] Skim `docs/v1.5-release-notes.md` for the broader context of what's shipping
+- [ ] Skim `docs/graph-memory-research.md` for why we picked Supermemory's `packages/memory-graph` to vendor
+- [ ] Confirm with backend: gateway URL + internal-token + an example user_id with populated memories for live curl tests
+- [ ] Confirm with backend: which Phase 1 surfaces (#1-#10 in `## Surfaces`) ship in V1.5 vs deferred. Default: ship #1 (Brain) + #10 (Sidebar Brain entry); others are pre-V1.5 polish that's already shipped or deferred.
+
+During implementation:
+
+- [ ] Don't change the `BrainGraphResponse` / `BrainTimelineResponse` / `BrainComposeRequest` TypeScript types unless backend explicitly approves (these are the backward-compat contract).
+- [ ] When in doubt about behavior, curl the live endpoint and inspect the JSON. The backend's response shape is the source of truth.
+- [ ] Render `valid_to: number | null` deprecated state even though V1.5 always returns null — the visual treatment is a V1.6 substrate.
+- [ ] On `semantic_degraded: true`, show a soft banner; don't block render.
+
+Ship time:
+
+- [ ] All three views render against the live backend
+- [ ] Empty states + error states handled
+- [ ] Mobile breakpoint reasonable
+- [ ] Sidebar Brain entry wired
+- [ ] Backend QA: curl /brain/graph + /brain/timeline + POST /brain/compose all return expected shapes
+- [ ] Hand back to Nova for ship approval
+
+— backend, signed. Final brief revision for V1.5 ship.
