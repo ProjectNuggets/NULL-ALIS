@@ -2435,7 +2435,7 @@ const ManagerImpl = struct {
 
         const cursor_ts_s = if (cursor_ts) |v| try std.fmt.bufPrintZ(&cursor_ts_buf, "{d}", .{v}) else null;
         const cursor_id_z = if (cursor_id) |s| try self.allocator.dupeZ(u8, s) else null;
-        defer if (cursor_id_z) |z| self.allocator.free(std.mem.span(z));
+        defer if (cursor_id_z) |z| self.allocator.free(z);
         const from_s = if (from) |v| try std.fmt.bufPrintZ(&from_buf, "{d}", .{v}) else null;
         const to_s = if (to) |v| try std.fmt.bufPrintZ(&to_buf, "{d}", .{v}) else null;
         const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
@@ -2453,8 +2453,8 @@ const ManagerImpl = struct {
             lengths[n_params] = @intCast(cts.len);
             n_params += 1;
             const cid = cursor_id_z.?;
-            params[n_params] = cid;
-            lengths[n_params] = @intCast(std.mem.span(cid).len);
+            params[n_params] = cid.ptr;
+            lengths[n_params] = @intCast(cid.len);
             n_params += 1;
         }
         if (from_s) |fs| {
@@ -4251,6 +4251,142 @@ test "postgres memory upsert recall list and forget stay user-scoped" {
     try std.testing.expect(try mgr.forgetMemory(2, "favorite_snack"));
     const count_after = try mgr.countMemories(2);
     try std.testing.expectEqual(@as(usize, 0), count_after);
+}
+
+test "postgres V1.5 day-3+4: compose write + metadata read + traversal event roundtrip" {
+    // Exercises chunks 3A (upsertMemoryWithMetadata + listMemoriesMetadata),
+    // 3C (existsMemoryKeys), and 4A (insertTraversalEvent) against live PG
+    // in an isolated schema. Closes the day-4 smoke-test gap — verifies
+    // the new SQL statements actually execute end-to-end (the
+    // unit/handler tests cover code paths but not SQL syntax).
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+
+    const user_id: i64 = 42;
+    try mgr.provisionUser(user_id, "/tmp/nullalis-zaki-bot-test-user-42/workspace");
+
+    // ── Seed two source memories ──
+    try mgr.upsertMemory(user_id, "user_lang", "Prefers Zig", .core, null);
+    try mgr.upsertMemory(user_id, "user_editor", "Uses NeoVim", .core, null);
+
+    // ── chunk 3C: existsMemoryKeys ──
+    {
+        const seed_keys = [_][]const u8{ "user_lang", "user_editor", "missing_key" };
+        var existing = try mgr.existsMemoryKeys(allocator, user_id, &seed_keys);
+        defer {
+            var it = existing.iterator();
+            while (it.next()) |e| allocator.free(e.key_ptr.*);
+            existing.deinit(allocator);
+        }
+        try std.testing.expect(existing.contains("user_lang"));
+        try std.testing.expect(existing.contains("user_editor"));
+        try std.testing.expect(!existing.contains("missing_key"));
+    }
+
+    // ── chunk 3A: upsertMemoryWithMetadata ──
+    const meta_json = "{\"synthesized_by\":\"agent\",\"references\":[\"user_lang\",\"user_editor\"],\"composed_at\":1714521600}";
+    try mgr.upsertMemoryWithMetadata(
+        user_id,
+        "compose:smoketest_001",
+        "User prefers Zig + NeoVim — consistent across sessions.",
+        .core,
+        null,
+        meta_json,
+    );
+
+    // ── chunk 3A: listMemoriesMetadata ──
+    {
+        const compose_keys = [_][]const u8{"compose:smoketest_001"};
+        var meta_map = try mgr.listMemoriesMetadata(allocator, user_id, &compose_keys);
+        defer {
+            var it = meta_map.iterator();
+            while (it.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                allocator.free(e.value_ptr.*);
+            }
+            meta_map.deinit(allocator);
+        }
+        const fetched = meta_map.get("compose:smoketest_001") orelse return error.MetadataMissing;
+        // Postgres normalizes JSONB so we check for presence of key fields rather
+        // than byte-equality with the input string.
+        try std.testing.expect(std.mem.indexOf(u8, fetched, "synthesized_by") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fetched, "user_lang") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fetched, "user_editor") != null);
+    }
+
+    // ── Verify the compose memory_event row landed (chunk 3A side effect) ──
+    {
+        const ev_q = try mgr.buildQuery(
+            "SELECT COUNT(*) FROM {schema}.memory_events WHERE user_id = $1 AND event_type = 'compose'",
+        );
+        defer allocator.free(ev_q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try mgr.execParams(ev_q, &params, &lengths);
+        defer c.PQclear(result);
+        const count_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(count_str);
+        const count = try std.fmt.parseInt(i64, count_str, 10);
+        try std.testing.expectEqual(@as(i64, 1), count);
+    }
+
+    // ── chunk 4A: insertTraversalEvent ──
+    const payload = "{\"action\":\"view_graph\",\"node_keys\":[\"user_lang\",\"user_editor\",\"compose:smoketest_001\"],\"total_nodes_in_corpus\":3,\"trimmed\":false,\"semantic_degraded\":false,\"viewed_at\":1714521600}";
+    try mgr.insertTraversalEvent(user_id, payload);
+
+    // ── Verify the traversal row landed ──
+    {
+        const ev_q = try mgr.buildQuery(
+            "SELECT COUNT(*) FROM {schema}.memory_events WHERE user_id = $1 AND event_type = 'traversal'",
+        );
+        defer allocator.free(ev_q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try mgr.execParams(ev_q, &params, &lengths);
+        defer c.PQclear(result);
+        const count_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(count_str);
+        const count = try std.fmt.parseInt(i64, count_str, 10);
+        try std.testing.expectEqual(@as(i64, 1), count);
+    }
+
+    // ── Cleanup: drop the test schema ──
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
 }
 
 test "postgres channel identity bindings upsert resolve list delete and backfill candidates" {
