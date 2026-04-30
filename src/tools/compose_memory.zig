@@ -181,10 +181,19 @@ fn executeCreate(
     };
 
     // ── key (auto-generated when not provided) ──
+    // V1.5 day-3 review fix: user-provided keys MUST start with the
+    // compose: prefix. Without this guard, a caller could overwrite an
+    // unrelated memory by passing its key (e.g. `"user_lang"` would
+    // OVERWRITE the user_lang memory via the upsert ON CONFLICT path).
+    // Enforcing the prefix isolates compose-write namespace from other
+    // memory writers.
     var key_buf: [64]u8 = undefined;
     const memory_key = if (root.getString(args, "key")) |provided_key| blk_key: {
         const trimmed_key = std.mem.trim(u8, provided_key, " \t\r\n");
         if (trimmed_key.len == 0) return ToolResult.fail("'key' must not be empty if provided");
+        if (!std.mem.startsWith(u8, trimmed_key, COMPOSE_KEY_PREFIX)) {
+            return ToolResult.fail("'key' must start with 'compose:' to prevent overwriting unrelated memories");
+        }
         break :blk_key try allocator.dupe(u8, trimmed_key);
     } else blk_key: {
         // Generate `compose:<16-hex>` from 8 random bytes. Use the
@@ -303,4 +312,15 @@ test "compose_memory: writeJsonString escapes control chars below 0x20" {
     defer buf.deinit(std.testing.allocator);
     try writeJsonString(buf.writer(std.testing.allocator), &[_]u8{ 'a', 0x01, 0x1f, 'b' });
     try std.testing.expectEqualStrings("\"a\\u0001\\u001fb\"", buf.items);
+}
+
+test "compose_memory: COMPOSE_KEY_PREFIX guards against arbitrary key writes" {
+    // V1.5 day-3 review fix: user-provided keys must start with the
+    // prefix to prevent overwriting unrelated memories via upsert ON
+    // CONFLICT. The check uses startsWith — verify the prefix shape
+    // here so a future rename catches missing-fix call sites.
+    try std.testing.expect(std.mem.startsWith(u8, "compose:abc123", COMPOSE_KEY_PREFIX));
+    try std.testing.expect(!std.mem.startsWith(u8, "user_lang", COMPOSE_KEY_PREFIX));
+    try std.testing.expect(!std.mem.startsWith(u8, "Compose:abc", COMPOSE_KEY_PREFIX));
+    try std.testing.expect(!std.mem.startsWith(u8, "memory:foo", COMPOSE_KEY_PREFIX));
 }

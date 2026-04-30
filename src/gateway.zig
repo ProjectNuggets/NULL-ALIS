@@ -11696,6 +11696,11 @@ fn handleBrainCompose(
     };
 
     // ── key (auto-generated when not provided) ──
+    // V1.5 day-3 review fix: user-provided keys MUST start with
+    // BRAIN_COMPOSE_KEY_PREFIX. Without this guard, a caller could
+    // POST a request with `key:"user_lang"` and OVERWRITE the user_lang
+    // memory via the upsert's ON CONFLICT path. Prefix enforcement
+    // isolates the compose-write namespace from other writers.
     var key_buf: [80]u8 = undefined;
     var key_owned: ?[]u8 = null;
     defer if (key_owned) |k| allocator.free(k);
@@ -11707,6 +11712,9 @@ fn handleBrainCompose(
                 else => return .{ .status = "400 Bad Request", .body = "{\"error\":\"key_must_be_string\"}" },
             };
             if (s.len == 0) return .{ .status = "400 Bad Request", .body = "{\"error\":\"key_empty\"}" };
+            if (!std.mem.startsWith(u8, s, BRAIN_COMPOSE_KEY_PREFIX)) {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"key_must_start_with_compose_prefix\",\"detail\":\"user-provided keys must start with 'compose:' to prevent overwriting unrelated memories\"}" };
+            }
             const owned = allocator.dupe(u8, s) catch return response_build_err;
             key_owned = owned;
             break :blk owned;
