@@ -290,6 +290,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn existsMemoryKeys(_: *@This(), _: std.mem.Allocator, _: i64, _: []const []const u8) !std.StringHashMapUnmanaged(void) {
         return .{};
     }
+    /// V1.5 day-4 — stub for non-postgres builds; traversal logging
+    /// silently no-ops.
+    pub fn insertTraversalEvent(_: *@This(), _: i64, _: []const u8) !void {
+        return;
+    }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
@@ -3310,6 +3315,54 @@ const ManagerImpl = struct {
         defer self.allocator.free(key_z);
         const params = [_]?[*:0]const u8{ user_s.ptr, key_z };
         const lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    /// V1.5 day-4 chunk 4A — log a traversal event (user viewed
+    /// /brain/graph or /brain/timeline). Writes to `memory_events`
+    /// with `event_type='traversal'` and `memory_id=NULL` (traversal
+    /// events span multiple memories — the keys are in payload).
+    /// Caller provides a pre-formed JSON payload string; we don't
+    /// re-parse server-side.
+    ///
+    /// V1.6 ADD/UPDATE/DELETE classifier reads the `traversal` event
+    /// stream as a learning signal (memories the user viewed are
+    /// user-interesting). The Mem0 namespace pattern (locked in
+    /// V1.5 day-2 design) reserves `event_type` so the classifier
+    /// shares this table.
+    ///
+    /// Errors are non-fatal at the caller — the brain endpoint
+    /// returns its result regardless. Logging gaps are preferable to
+    /// failed user-facing requests.
+    pub fn insertTraversalEvent(
+        self: *Self,
+        user_id: i64,
+        payload_json: []const u8,
+    ) !void {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.memory_events (id, user_id, memory_id, event_type, payload) " ++
+                "VALUES ($1, $2, NULL, 'traversal', $3::jsonb)",
+        );
+        defer self.allocator.free(q);
+
+        const event_id = try self.randomHexId(self.allocator, 16);
+        defer self.allocator.free(event_id);
+        const event_id_z = try self.allocator.dupeZ(u8, event_id);
+        defer self.allocator.free(event_id_z);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        const payload_z = try self.allocator.dupeZ(u8, payload_json);
+        defer self.allocator.free(payload_z);
+
+        const params = [_]?[*:0]const u8{ event_id_z, user_s.ptr, payload_z };
+        const lengths = [_]c_int{
+            @intCast(event_id.len),
+            @intCast(user_s.len),
+            @intCast(payload_json.len),
+        };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
     }

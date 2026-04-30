@@ -11049,6 +11049,76 @@ fn buildBrainReferenceEdges(
     return edges.toOwnedSlice(allocator);
 }
 
+// ── V1.5 day-4 — traversal-event logging helpers ───────────────────
+//
+// `/brain/graph` and `/brain/timeline` are the user's main windows
+// into their memory. Logging the traversal events sets up V1.6's
+// ADD/UPDATE/DELETE classifier with a learning signal — memories the
+// user actively viewed are user-interesting; the classifier prefers
+// them when ranking ADD vs DELETE candidates.
+//
+// Events land in the existing `memory_events` audit table with
+// `event_type='traversal'`. Reuses Mem0 namespace pattern locked in
+// V1.5 day-2 design (the classifier shares this table).
+//
+// Errors are non-fatal at the caller — the user-facing graph /
+// timeline still ships even if the event-write fails. Logging gaps
+// are preferable to user-visible 500s.
+
+fn brainLogGraphView(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state_mod.Manager,
+    user_id: i64,
+    nodes: []const BrainNode,
+    total_in_corpus: usize,
+    trimmed: bool,
+    semantic_degraded: bool,
+) !void {
+    var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload_buf.deinit(allocator);
+    const pw = payload_buf.writer(allocator);
+    try pw.writeAll("{\"action\":\"view_graph\",\"node_keys\":[");
+    for (nodes, 0..) |n, i| {
+        if (i > 0) try pw.writeAll(",");
+        try pw.writeAll("\"");
+        try jsonEscapeInto(pw, n.key);
+        try pw.writeAll("\"");
+    }
+    try pw.print("],\"total_nodes_in_corpus\":{d},\"trimmed\":{s},\"semantic_degraded\":{s},\"viewed_at\":{d}}}", .{
+        total_in_corpus,
+        if (trimmed) "true" else "false",
+        if (semantic_degraded) "true" else "false",
+        std.time.timestamp(),
+    });
+    try state_mgr.insertTraversalEvent(user_id, payload_buf.items);
+}
+
+fn brainLogTimelineView(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state_mod.Manager,
+    user_id: i64,
+    entries: []const memory_mod.MemoryEntry,
+    has_more: bool,
+    cursor_used: bool,
+) !void {
+    var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload_buf.deinit(allocator);
+    const pw = payload_buf.writer(allocator);
+    try pw.writeAll("{\"action\":\"view_timeline\",\"entry_keys\":[");
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try pw.writeAll(",");
+        try pw.writeAll("\"");
+        try jsonEscapeInto(pw, entry.key);
+        try pw.writeAll("\"");
+    }
+    try pw.print("],\"has_more\":{s},\"cursor_used\":{s},\"viewed_at\":{d}}}", .{
+        if (has_more) "true" else "false",
+        if (cursor_used) "true" else "false",
+        std.time.timestamp(),
+    });
+    try state_mgr.insertTraversalEvent(user_id, payload_buf.items);
+}
+
 fn handleBrainGraph(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -11304,6 +11374,21 @@ fn handleBrainGraph(
         if (semantic_degraded) "true" else "false",
     }) catch return response_build_err;
 
+    // ── V1.5 day-4: log traversal event ───────────────────────────
+    // Non-fatal — graph still ships if logging fails. The event feeds
+    // the V1.6 classifier with "user-interesting" signal.
+    brainLogGraphView(
+        allocator,
+        state_mgr,
+        numeric_user_id,
+        nodes,
+        total_in_corpus,
+        trimmed,
+        semantic_degraded,
+    ) catch |err| {
+        log.warn("brain/graph traversal log failed user={d} err={s}", .{ numeric_user_id, @errorName(err) });
+    };
+
     return finalizeJsonBuf(allocator, &out);
 }
 
@@ -11504,6 +11589,20 @@ fn handleBrainTimeline(
     w.print(",\"has_more\":{s}}}", .{
         if (has_more) "true" else "false",
     }) catch return response_build_err;
+
+    // ── V1.5 day-4: log traversal event ───────────────────────────
+    // Same shape as /brain/graph — non-fatal logging feeds the V1.6
+    // classifier with user-attention signal.
+    brainLogTimelineView(
+        allocator,
+        state_mgr,
+        numeric_user_id,
+        entries,
+        has_more,
+        cursor_opt != null,
+    ) catch |err| {
+        log.warn("brain/timeline traversal log failed user={d} err={s}", .{ numeric_user_id, @errorName(err) });
+    };
 
     return finalizeJsonBuf(allocator, &out);
 }
