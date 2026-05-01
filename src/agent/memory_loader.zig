@@ -199,6 +199,19 @@ fn isSummaryLatestKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "summary_latest/");
 }
 
+/// V1.5.5 polish — compaction Pass C archives at
+/// `compaction_summary/{session}/{ts}` (compaction.zig:535). These are
+/// recallable continuity artifacts on par with summary_latest and
+/// timeline_summary; agent retrieval should treat them as warm
+/// continuity entries, not generic vector hits. Without this predicate,
+/// compaction_summary entries only surface through general retrieval
+/// scoring and lose to fresher noise on long sessions.
+fn isCompactionSummaryKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "compaction_summary/") or
+        std.mem.startsWith(u8, key, "summary_fallback/") or
+        std.mem.startsWith(u8, key, "compaction_dropped/");
+}
+
 fn isSessionCheckpointKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "session_checkpoint_");
 }
@@ -274,7 +287,16 @@ fn markSeenKey(allocator: std.mem.Allocator, seen_keys: *std.ArrayListUnmanaged(
 }
 
 fn isSemanticContinuityKey(key: []const u8) bool {
-    return isDurableFactKey(key) or isTimelineSummaryKey(key) or isSummaryLatestKey(key);
+    return isDurableFactKey(key) or
+        isTimelineSummaryKey(key) or
+        isSummaryLatestKey(key) or
+        // V1.5.5 polish: compaction Pass C summaries are continuity-class
+        // per `memory_root.classifyArtifactKey` and per the iter29 family
+        // taxonomy — but they were missing from this list, so the agent's
+        // retrieval bucket-routing would not preferentially surface them.
+        // Wired now so compaction summaries warm-bucket alongside their
+        // sibling continuity families.
+        isCompactionSummaryKey(key);
 }
 
 fn isNegativeDiagnosticKeyOrContent(content: []const u8) bool {
@@ -951,6 +973,40 @@ test "truncateUtf8 does not split multi-byte sequences" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8(s2, 4)));
     try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8(s3, 3)));
     try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8(s4, 2)));
+}
+
+test "isSemanticContinuityKey covers all warm continuity families (V1.5.5 polish)" {
+    // V1.5.5 polish: compaction Pass C archives at compaction_summary/{s}/{ts}
+    // (compaction.zig:535). Without this test, regressions to the predicate
+    // would silently demote compaction summaries from warm-bucket retrieval
+    // back to generic vector scoring.
+    //
+    // ── Should be warm-continuity (returns true) ──────────────────────
+    try std.testing.expect(isSemanticContinuityKey("durable_fact/1714521600/0"));
+    try std.testing.expect(isSemanticContinuityKey("timeline_summary/agent:zaki-bot:user:1:thread:main/1714521600"));
+    try std.testing.expect(isSemanticContinuityKey("summary_latest/agent:zaki-bot:user:1:thread:main"));
+    try std.testing.expect(isSemanticContinuityKey("compaction_summary/agent:zaki-bot:user:1:thread:main/1714521600"));
+    // iter29 sibling families: summary_fallback/* and compaction_dropped/*
+    // are also continuity per memory_root.classifyArtifactKey:498-502.
+    try std.testing.expect(isSemanticContinuityKey("summary_fallback/agent:zaki-bot:user:1:thread:main/1714521600"));
+    try std.testing.expect(isSemanticContinuityKey("compaction_dropped/agent:zaki-bot:user:1:thread:main/1714521600"));
+
+    // ── Should NOT be warm-continuity (returns false) ─────────────────
+    // User-authored memories — never warm-bucket via this path
+    try std.testing.expect(!isSemanticContinuityKey("user_lang"));
+    try std.testing.expect(!isSemanticContinuityKey("favorite_snack"));
+    try std.testing.expect(!isSemanticContinuityKey("compose:0123456789abcdef"));
+    // Audit family — explicitly demoted from continuity
+    try std.testing.expect(!isSemanticContinuityKey("autosave_user_1714521600"));
+    try std.testing.expect(!isSemanticContinuityKey("session_checkpoint_1714521600"));
+    try std.testing.expect(!isSemanticContinuityKey("audit_shell/1714521600"));
+    // Index family
+    try std.testing.expect(!isSemanticContinuityKey("timeline_index/current"));
+    // Internal anchors / tombstones / bootstrap
+    try std.testing.expect(!isSemanticContinuityKey("context_anchor_current"));
+    try std.testing.expect(!isSemanticContinuityKey("__tombstone__/anything"));
+    try std.testing.expect(!isSemanticContinuityKey("__bootstrap.prompt.AGENTS.md"));
+    try std.testing.expect(!isSemanticContinuityKey("last_hygiene_at"));
 }
 
 test "loadTurnMemorySlot returns empty when no memory available" {
