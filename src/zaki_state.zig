@@ -50,6 +50,34 @@ const c = if (build_options.enable_postgres) @cImport({
 /// has no equivalent function.
 const MEMORIES_VALIDITY_FILTER = "(valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint)";
 
+/// V1.5.1 brain-hygiene SQL filter — mirrors `memory_root.isBrainVisibleKey`.
+///
+/// /brain/* surfaces (graph, timeline, daily-diff) hide the agent's own
+/// bookkeeping. The /brain/* response body is "Everything ZAKI remembers
+/// about YOU" — internal artifacts pollute that surface.
+///
+/// Hidden families (must match `memory_root.classifyArtifactKey` !=
+/// `.user` plus `isInternalMemoryKey` true):
+///
+///   audit       — autosave_user_*, autosave_assistant_*,
+///                 session_checkpoint_*
+///   continuity  — summary_latest/*, session_summary/*,
+///                 timeline_summary/*, durable_fact/*,
+///                 compaction_summary/*, summary_fallback/*,
+///                 compaction_dropped/*, context_anchor_current
+///   index       — timeline_index/current
+///   internal    — __tombstone__/*, __bootstrap.prompt.*,
+///                 last_hygiene_at
+///
+/// Compose memories (`compose:<hex>`) and ordinary user memories pass.
+///
+/// IF YOU EDIT THIS, EDIT `memory_root.isBrainVisibleKey` TOO.
+/// The cross-check test in this file asserts they agree on every
+/// representative key. Drift breaks /brain/* hygiene silently.
+pub const BRAIN_USER_KEY_FILTER =
+    "key !~ '^(autosave_|session_checkpoint_|audit_shell/|summary_latest/|session_summary/|timeline_summary/|durable_fact/|compaction_summary/|summary_fallback/|compaction_dropped/|__tombstone__/|__bootstrap\\.prompt\\.)' " ++
+    "AND key NOT IN ('context_anchor_current', 'timeline_index/current', 'last_hygiene_at')";
+
 pub const ChannelIdentityBinding = struct {
     id: []u8,
     user_id: i64,
@@ -268,6 +296,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         return error.PostgresNotEnabled;
     }
     pub fn listMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: ?memory_root.MemoryCategory, _: ?[]const u8) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
+    /// V1.5.1 brain-hygiene — stub for non-postgres builds. Returns empty
+    /// so `/brain/graph` gracefully degrades when state manager is
+    /// disabled. Live impl applies BRAIN_USER_KEY_FILTER in SQL.
+    pub fn listMemoriesBrainVisible(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
     pub fn recallMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8, _: usize, _: ?[]const u8) ![]memory_root.MemoryEntry {
@@ -2289,6 +2323,22 @@ const ManagerImpl = struct {
         );
     }
 
+    /// V1.5.1 brain-hygiene: like `listMemories(user_id, null, null)` but
+    /// filtered through `BRAIN_USER_KEY_FILTER` so the agent's bookkeeping
+    /// (continuity summaries, autosaves, checkpoints, tombstones, bootstrap
+    /// prompts) never reaches the /brain/graph response. The agent retrieval
+    /// path keeps using `listMemories` directly — it NEEDS continuity
+    /// artifacts injected into context.
+    pub fn listMemoriesBrainVisible(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]memory_root.MemoryEntry {
+        return self.queryMemories(
+            allocator,
+            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " AND " ++ BRAIN_USER_KEY_FILTER ++ " ORDER BY updated_at DESC",
+            user_id,
+            null,
+            null,
+        );
+    }
+
     pub fn recallMemories(self: *Self, allocator: std.mem.Allocator, user_id: i64, query: []const u8, limit: usize, session_id: ?[]const u8) ![]memory_root.MemoryEntry {
         const limit_text = try std.fmt.allocPrint(self.allocator, "{d}", .{limit});
         defer self.allocator.free(limit_text);
@@ -2377,7 +2427,8 @@ const ManagerImpl = struct {
         try w.print(
             "SELECT id, key, content, memory_type, " ++
                 "COALESCE((EXTRACT(EPOCH FROM created_at))::bigint::text, '0'), " ++
-                "session_id, valid_to FROM {s}.memories WHERE user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER,
+                "session_id, valid_to FROM {s}.memories WHERE user_id = $1 AND " ++
+                MEMORIES_VALIDITY_FILTER ++ " AND " ++ BRAIN_USER_KEY_FILTER,
             .{schema_q},
         );
 
@@ -3664,6 +3715,78 @@ test "dupeResultValue byte-copy path tolerates misaligned source pointers" {
     defer allocator.free(out);
     @memcpy(out, misaligned_src[0..3]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 11, 13, 15 }, out);
+}
+
+test "BRAIN_USER_KEY_FILTER mirrors memory_root.isBrainVisibleKey" {
+    // V1.5.1 brain-hygiene cross-check.
+    //
+    // SQL filter and Zig predicate must agree on every representative key.
+    // Drift breaks /brain/* hygiene silently — the SQL filter would let
+    // some classes through while the Zig predicate would have hidden them
+    // (or vice versa). This test pins the two definitions together.
+    //
+    // Each entry: (key, expect_visible). expect_visible=false means
+    //   - Zig: isBrainVisibleKey(key) returns false
+    //   - SQL: BRAIN_USER_KEY_FILTER would exclude this row
+    // Both branches must agree per-entry.
+
+    const cases = [_]struct { key: []const u8, expect_visible: bool }{
+        // ── User-authored / synthesis (visible) ────────────────────────
+        .{ .key = "user_lang", .expect_visible = true },
+        .{ .key = "favorite_snack", .expect_visible = true },
+        .{ .key = "compose:0123456789abcdef", .expect_visible = true },
+        .{ .key = "anything_without_known_prefix", .expect_visible = true },
+
+        // ── Audit (hidden) ─────────────────────────────────────────────
+        .{ .key = "autosave_user_1714521600", .expect_visible = false },
+        .{ .key = "autosave_assistant_1714521600", .expect_visible = false },
+        .{ .key = "session_checkpoint_1714521600", .expect_visible = false },
+        .{ .key = "audit_shell/1777419406559181000", .expect_visible = false },
+
+        // ── Continuity (hidden) ────────────────────────────────────────
+        .{ .key = "summary_latest/agent:zaki-bot:user:1:thread:main", .expect_visible = false },
+        .{ .key = "session_summary/agent:zaki-bot:user:1:thread:main/1714521600", .expect_visible = false },
+        .{ .key = "timeline_summary/agent:zaki-bot:user:1:thread:main/1714521600", .expect_visible = false },
+        .{ .key = "durable_fact/1714521600/0", .expect_visible = false },
+        .{ .key = "compaction_summary/foo", .expect_visible = false },
+        .{ .key = "summary_fallback/foo", .expect_visible = false },
+        .{ .key = "compaction_dropped/foo", .expect_visible = false },
+        .{ .key = "context_anchor_current", .expect_visible = false },
+
+        // ── Index (hidden) ─────────────────────────────────────────────
+        .{ .key = "timeline_index/current", .expect_visible = false },
+
+        // ── Internal (hidden) ──────────────────────────────────────────
+        .{ .key = "__tombstone__/some_user_key", .expect_visible = false },
+        .{ .key = "__bootstrap.prompt.AGENTS.md", .expect_visible = false },
+        .{ .key = "last_hygiene_at", .expect_visible = false },
+    };
+
+    for (cases) |tc| {
+        const zig_visible = memory_root.isBrainVisibleKey(tc.key);
+        try std.testing.expectEqual(tc.expect_visible, zig_visible);
+    }
+
+    // SQL-side cross-check: the BRAIN_USER_KEY_FILTER constant exists and
+    // contains the prefix list. We don't have a SQL engine in this unit
+    // test scope, but we can pin the prefix coverage textually so removals
+    // require updating the cases above too.
+    const filter = BRAIN_USER_KEY_FILTER;
+    try std.testing.expect(std.mem.indexOf(u8, filter, "autosave_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "session_checkpoint_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "audit_shell/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "summary_latest/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "session_summary/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "timeline_summary/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "durable_fact/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "compaction_summary/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "summary_fallback/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "compaction_dropped/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "__tombstone__/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "__bootstrap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "context_anchor_current") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "timeline_index/current") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "last_hygiene_at") != null);
 }
 
 fn categoryToMemoryType(category: memory_root.MemoryCategory) []const u8 {

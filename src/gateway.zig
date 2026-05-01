@@ -11152,9 +11152,12 @@ fn handleBrainGraph(
     if (max_nodes > BRAIN_MAX_MAX_NODES) max_nodes = BRAIN_MAX_MAX_NODES;
 
     // ── Fetch nodes ───────────────────────────────────────────────
-    // listMemories already applies the bi-temporal validity filter
-    // (task 1); we receive only currently-valid entries.
-    const all_entries = state_mgr.listMemories(allocator, numeric_user_id, null, null) catch {
+    // listMemoriesBrainVisible applies BOTH the bi-temporal validity
+    // filter (V1.5 day-2 task 1) AND the brain-hygiene filter
+    // (V1.5.1 — hides agent bookkeeping like summary_latest,
+    // session_checkpoint_*, autosave_*, tombstones). The user-facing
+    // /brain/graph never sees machine-state artifacts.
+    const all_entries = state_mgr.listMemoriesBrainVisible(allocator, numeric_user_id) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"memory_list_failed\"}" };
     };
     defer memory_mod.freeEntries(allocator, all_entries);

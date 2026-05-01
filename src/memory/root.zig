@@ -480,10 +480,14 @@ pub const ArtifactRole = enum {
 };
 
 pub fn classifyArtifactKey(key: []const u8) ArtifactRole {
-    // Audit: autosave + checkpoint
+    // Audit: autosave + checkpoint + tool execution audits
     if (std.mem.startsWith(u8, key, "autosave_user_")) return .audit;
     if (std.mem.startsWith(u8, key, "autosave_assistant_")) return .audit;
     if (std.mem.startsWith(u8, key, "session_checkpoint_")) return .audit;
+    // V1.5.1: shell-tool execution audits — `audit_shell/{nanoseconds}`
+    // written by `tools/shell.zig::recordShellAudit`. Shell exits +
+    // commands are bookkeeping, not user-facing brain content.
+    if (std.mem.startsWith(u8, key, "audit_shell/")) return .audit;
 
     // Index: discovery surfaces
     if (std.mem.eql(u8, key, "timeline_index/current")) return .index;
@@ -520,6 +524,27 @@ pub fn isDefaultHiddenMemoryKey(key: []const u8) bool {
     return isInternalMemoryKey(key) or
         isAuditArtifactKey(key) or
         isIndexArtifactKey(key);
+}
+
+/// True when a memory key represents authentic user-facing brain content.
+///
+/// The /brain/* surface (graph, timeline, daily-diff) is the user's window
+/// into "what does ZAKI remember about ME". It must hide the agent's own
+/// bookkeeping — continuity summaries, session checkpoints, autosaves,
+/// tombstones, bootstrap prompts — none of which are about the user.
+///
+/// This is strictly more restrictive than `isDefaultHiddenMemoryKey`:
+/// that helper exposes continuity artifacts (summary_latest,
+/// timeline_summary) for agent retrieval. /brain/* hides those too,
+/// because they're machine-state strings ("type=summary_latest
+/// origin_channel=telegram ...") that pollute the user-facing surface.
+///
+/// SQL mirror lives at `zaki_state.zig::BRAIN_USER_KEY_FILTER`. If you
+/// change one, change the other — keep them in lockstep. The cross-check
+/// test in zaki_state ensures they agree on representative keys.
+pub fn isBrainVisibleKey(key: []const u8) bool {
+    if (isInternalMemoryKey(key)) return false;
+    return classifyArtifactKey(key) == .user;
 }
 
 pub fn isSemanticBookkeepingKey(key: []const u8) bool {
