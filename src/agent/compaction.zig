@@ -697,7 +697,35 @@ fn summarizeSlice(
     const transcript = try buildCompactionTranscript(allocator, history_items, start, end, config.max_source_chars);
     defer allocator.free(transcript);
 
-    const summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
+    // V1.5.5 prompt strengthening (Path A iteration 1):
+    //   1. NO FACTS guard — when conversation is pure pleasantries / no
+    //      semantic content, output exactly "NO FACTS" instead of forcing
+    //      meta-narrative bullets. Fixes casual/conv_02 over-extraction
+    //      observed in V1.5.5 baseline.
+    //   2. Direct-support rule — every bullet must be supported by
+    //      user/assistant text in the conversation. No inferences,
+    //      no suggestions you offered that the user didn't accept,
+    //      no editorial commentary. Fixes long_multi_topic alternative-
+    //      pricing-as-fact misattribution observed in baseline.
+    //   3. Attribution hint — when a fact comes from the assistant's
+    //      offer rather than the user's statement, prefix with
+    //      "(assistant offered)" so V1.6's attributed_to extraction
+    //      can pick it up. Today's prompt has no signal for this.
+    const summarizer_system =
+        "You are a conversation compaction engine. Summarize older chat history " ++
+        "into concise context for future turns. Preserve: user preferences, " ++
+        "commitments, decisions, unresolved tasks, key facts. Omit: filler, " ++
+        "repeated chit-chat, verbose tool logs. Output plain text bullet points only.\n\n" ++
+        "RULES:\n" ++
+        "1. If the conversation contains no factual content (pure greetings, " ++
+        "pleasantries, ack-only exchanges with nothing established), output " ++
+        "EXACTLY the two characters: NO FACTS\n" ++
+        "2. Every bullet must be DIRECTLY supported by user or assistant text " ++
+        "in the conversation. Do NOT add inferences, suggestions you offered " ++
+        "that were not adopted, or general commentary.\n" ++
+        "3. When a fact reflects an assistant offer or suggestion (not a user " ++
+        "statement or decision), prefix the bullet with \"(assistant offered) \". " ++
+        "When it reflects an unresolved consideration, prefix with \"(undecided) \".";
     const summarizer_user = try std.fmt.allocPrint(allocator, "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{s}", .{transcript});
     defer allocator.free(summarizer_user);
 

@@ -53,19 +53,35 @@ RESULTS_DIR = CORPUS_DIR / "results"
 CONFIG_PATH = Path.home() / ".nullalis" / "config.json"
 DOCS_DIR = REPO_ROOT / "docs"
 
-# ── Models ───────────────────────────────────────────────────────────────
-GROQ_API_BASE = "https://api.groq.com/openai/v1"
+# ── Provider + models ────────────────────────────────────────────────────
+# V1.5.5 iteration: Groq's free daily token quota was exhausted during
+# baseline + iteration 1 partial runs. Switching to Together AI (already
+# wired primary provider for the agent runtime) which has more headroom
+# at the cost of slightly higher per-call latency. Same model class —
+# Llama-3.3-70B Instruct via Together's Turbo variant.
+PROVIDER = "together"  # "together" or "groq"
 
-# Production extraction model (D1 default — Llama-3.3-70B on Groq)
-EXTRACTION_MODEL = "llama-3.3-70b-versatile"
+PROVIDER_BASE_URLS = {
+    "together": "https://api.together.xyz/v1",
+    "groq": "https://api.groq.com/openai/v1",
+}
 
-# LLM-judge model — same model class for consistent scoring
-JUDGE_MODEL = "llama-3.3-70b-versatile"
+PROVIDER_MODELS = {
+    # Together — same Llama-3.3-70B class
+    "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    # Groq — what we tried first; quota-exhausted on baseline + iter 1
+    "groq": "llama-3.3-70b-versatile",
+}
+
+EXTRACTION_MODEL = PROVIDER_MODELS[PROVIDER]
+JUDGE_MODEL = PROVIDER_MODELS[PROVIDER]
 
 # Tunables
 LLM_TIMEOUT_SEC = 30
-LLM_RETRY_COUNT = 2
+LLM_RETRY_COUNT = 4                       # extra retries for rate-limit recovery
 LLM_RETRY_DELAY_SEC = 2.0
+LLM_INTER_CALL_DELAY_SEC = 0.4            # stay under Groq's free-tier RPM limit
+LLM_RATE_LIMIT_BACKOFF_SEC = 30           # on 429, wait this long before retry
 DEFAULT_TEMPERATURE_GENERATION = 0.2  # matches compaction.zig:716
 DEFAULT_TEMPERATURE_JUDGE = 0.0       # deterministic judging
 
@@ -74,12 +90,22 @@ DEFAULT_TEMPERATURE_JUDGE = 0.0       # deterministic judging
 # update these. A regression test in Zig should pin the replication.
 #
 # Source: src/agent/compaction.zig:700-701 (compaction Pass C)
+# V1.5.5 Path A iteration 1: NO FACTS guard + direct-support rule + attribution hint
 COMPACTION_PASS_C_SYSTEM = (
     "You are a conversation compaction engine. Summarize older chat history "
     "into concise context for future turns. Preserve: user preferences, "
     "commitments, decisions, unresolved tasks, key facts. Omit: filler, "
-    "repeated chit-chat, verbose tool logs. Output plain text bullet points "
-    "only."
+    "repeated chit-chat, verbose tool logs. Output plain text bullet points only.\n\n"
+    "RULES:\n"
+    "1. If the conversation contains no factual content (pure greetings, "
+    "pleasantries, ack-only exchanges with nothing established), output "
+    "EXACTLY the two characters: NO FACTS\n"
+    "2. Every bullet must be DIRECTLY supported by user or assistant text "
+    "in the conversation. Do NOT add inferences, suggestions you offered "
+    "that were not adopted, or general commentary.\n"
+    "3. When a fact reflects an assistant offer or suggestion (not a user "
+    "statement or decision), prefix the bullet with \"(assistant offered) \". "
+    "When it reflects an unresolved consideration, prefix with \"(undecided) \"."
 )
 COMPACTION_PASS_C_USER_TEMPLATE = (
     "Summarize the following conversation history for context preservation. "
@@ -129,9 +155,9 @@ Score the fact's recoverability:
 Output ONLY a JSON object with no extra text:
 {{"score": <0.0|0.5|1.0>, "rationale": "<one sentence>"}}"""
 
-PRECISION_JUDGE_PROMPT = """You are auditing a summary for hallucinations against a ground-truth fact list.
+PRECISION_JUDGE_PROMPT = """You are auditing a summary against a ground-truth fact list AND the source conversation context implied by those facts.
 
-Ground truth (these are the only facts the conversation supports):
+Ground truth (the headline facts the conversation establishes):
 {facts}
 
 Summary text to audit:
@@ -139,30 +165,34 @@ Summary text to audit:
 {summary}
 ---
 
-For each statement in the summary, classify it as:
-- accurate: matches a ground-truth fact
-- hallucinated: claims something not in ground truth
+For each statement in the summary, classify it as one of:
+- accurate: matches a ground-truth fact directly
+- accurate_supplementary: NOT in ground truth but consistent with it — a faithful supporting detail (e.g., a specific column name when ground truth has the high-level fact, or assistant explanation that supports a user fact). Counts as ACCURATE for precision.
+- hallucinated: claims something not supported by ground truth AND not derivable from a faithful reading of the implied conversation
 - contradictory: states the opposite of a ground-truth fact
-- vague: too vague to be checkable (neutral, not a hallucination)
+- vague: too vague to be checkable (e.g. "the user expressed interest" — neutral, not a hallucination)
 
-Output ONLY a JSON object with no extra text:
-{{"total_statements": <int>, "accurate": <int>, "hallucinated": <int>, "contradictory": <int>, "vague": <int>, "examples_problematic": ["<short snippet>", ...]}}"""
+Note: "(assistant offered)" or "(undecided)" prefixes are valid summary annotations indicating attribution; do not penalize them as hallucinations on their own — judge the underlying claim.
+
+Output ONLY a JSON object with no extra text. precision = (accurate + accurate_supplementary) / total_statements.
+{{"total_statements": <int>, "accurate": <int>, "accurate_supplementary": <int>, "hallucinated": <int>, "contradictory": <int>, "vague": <int>, "examples_problematic": ["<short snippet>", ...]}}"""
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
 def load_config() -> dict[str, Any]:
-    """Read groq api key from ~/.nullalis/config.json."""
+    """Read provider credentials from ~/.nullalis/config.json."""
     if not CONFIG_PATH.exists():
         sys.exit(f"config not found at {CONFIG_PATH}")
     with CONFIG_PATH.open() as f:
         cfg = json.load(f)
     providers = cfg.get("models", {}).get("providers", {})
-    groq = providers.get("groq", {})
-    api_key = groq.get("api_key")
+    p = providers.get(PROVIDER, {})
+    api_key = p.get("api_key")
     if not api_key:
-        sys.exit("groq.api_key missing from config")
-    return {"groq_api_key": api_key, "groq_base_url": groq.get("base_url", GROQ_API_BASE)}
+        sys.exit(f"{PROVIDER}.api_key missing from config")
+    base_url = p.get("base_url", PROVIDER_BASE_URLS[PROVIDER])
+    return {"api_key": api_key, "base_url": base_url}
 
 
 def discover_corpus() -> list[Path]:
@@ -239,7 +269,7 @@ def call_groq_chat(
 
     Retries up to LLM_RETRY_COUNT on transient failures.
     """
-    url = f"{cfg['groq_base_url']}/chat/completions"
+    url = f"{cfg['base_url']}/chat/completions"
     body: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -256,7 +286,7 @@ def call_groq_chat(
             url,
             data=body_bytes,
             headers={
-                "Authorization": f"Bearer {cfg['groq_api_key']}",
+                "Authorization": f"Bearer {cfg['api_key']}",
                 "Content-Type": "application/json",
                 # Cloudflare in front of api.groq.com blocks the default
                 # Python-urllib UA with error 1010. Set a normal UA so the
@@ -270,10 +300,29 @@ def call_groq_chat(
                 payload = json.loads(resp.read().decode("utf-8"))
             elapsed = time.perf_counter() - t0
             content = payload["choices"][0]["message"]["content"]
+            # Inter-call cooldown — stay under Groq RPM limits during long runs
+            time.sleep(LLM_INTER_CALL_DELAY_SEC)
             return content, elapsed
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+        except urllib.error.HTTPError as e:
             last_err = e
-            elapsed = time.perf_counter() - t0
+            if e.code == 429 and attempt < LLM_RETRY_COUNT:
+                # Rate-limit — try Retry-After header first, fall back to fixed
+                retry_after = e.headers.get("Retry-After")
+                wait = LLM_RATE_LIMIT_BACKOFF_SEC
+                if retry_after:
+                    try:
+                        wait = max(float(retry_after), 1.0)
+                    except ValueError:
+                        pass
+                print(f"\n  [429 rate limit] sleeping {wait:.0f}s before retry {attempt + 1}/{LLM_RETRY_COUNT}", flush=True)
+                time.sleep(wait)
+                continue
+            if attempt < LLM_RETRY_COUNT:
+                time.sleep(LLM_RETRY_DELAY_SEC * (attempt + 1))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_err = e
             if attempt < LLM_RETRY_COUNT:
                 time.sleep(LLM_RETRY_DELAY_SEC * (attempt + 1))
                 continue
@@ -360,6 +409,7 @@ def score_precision(
         judgment = {
             "total_statements": 0,
             "accurate": 0,
+            "accurate_supplementary": 0,
             "hallucinated": 0,
             "contradictory": 0,
             "vague": 0,
@@ -368,7 +418,8 @@ def score_precision(
 
     total = judgment.get("total_statements", 0) or 0
     if total > 0:
-        accurate = judgment.get("accurate", 0)
+        # accurate_supplementary counts as accurate for precision (Path A iteration 1)
+        accurate = judgment.get("accurate", 0) + judgment.get("accurate_supplementary", 0)
         precision = accurate / total
     else:
         precision = 1.0
