@@ -22,3 +22,4 @@ result
 .claude/settings.local.json
 .codex/
 .codex-tmp/
+tests/compaction_corpus/results/
