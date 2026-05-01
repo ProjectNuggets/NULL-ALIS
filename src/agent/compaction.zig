@@ -725,7 +725,12 @@ fn summarizeSlice(
         "that were not adopted, or general commentary.\n" ++
         "3. When a fact reflects an assistant offer or suggestion (not a user " ++
         "statement or decision), prefix the bullet with \"(assistant offered) \". " ++
-        "When it reflects an unresolved consideration, prefix with \"(undecided) \".";
+        "When it reflects an unresolved consideration, prefix with \"(undecided) \".\n" ++
+        "4. Do NOT include conversational meta-statements like \"user thanked the " ++
+        "assistant\", \"user mentioned X\", \"user asked about Y\", \"user requested Z\". " ++
+        "State the FACT or DECISION itself, never that the user articulated it. " ++
+        "Bad: \"User asked about pgvector indexing options\". " ++
+        "Good: \"User chose ivfflat over HNSW for pgvector indexing\".";
     const summarizer_user = try std.fmt.allocPrint(allocator, "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{s}", .{transcript});
     defer allocator.free(summarizer_user);
 
