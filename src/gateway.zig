@@ -13112,8 +13112,21 @@ fn handleApiRoute(
     // GET /api/v1/users/{id}/brain/graph[?since=<unix>&max_nodes=N&node_kinds=csv]
     // Returns nodes + edges (session, semantic, reference) for the user's
     // memory. Powers the frontend `/brain` page. Bi-temporal correctness:
-    // listMemories already filters superseded entries (task 1).
+    // listMemoriesBrainVisible filters superseded + agent bookkeeping.
+    //
+    // V1.5.1: ensure the tenant runtime is materialised before the handler
+    // reads `state.tenant_runtimes` for the vector store. Without this,
+    // `semantic_degraded` fires on the first request after a gateway
+    // restart for any user who hasn't yet had an agent turn — the
+    // hashmap is empty, vector_store_opt stays null, all semantic edges
+    // disappear. Pay one-time cold-start (~500ms-2s) here so subsequent
+    // requests are warm and edges render.
     if (std.mem.eql(u8, parsed.subpath, "brain/graph")) {
+        if (config_opt) |cfg| {
+            _ = getTenantRuntime(state, cfg, &user_ctx) catch |err| {
+                log.warn("brain.graph.tenant_init_failed user={s} err={s} — semantic edges will degrade", .{ user_ctx.user_id, @errorName(err) });
+            };
+        }
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainGraph(req_allocator, method, scoped_user_id, brain_target, state);
     }
