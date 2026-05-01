@@ -1,0 +1,78 @@
+{
+  "conversation_id": "long_multi_topic/conv_02",
+  "narrative_themes": ["gateway refactor", "cell-pod canary deploy", "lunch break"],
+  "facts": [
+    {
+      "subject": "user_task",
+      "predicate": "REFACTOR_TARGET",
+      "object": "gateway.zig (14k+ lines, splitting into modules)",
+      "confidence": "high",
+      "source_message_idx": 0
+    },
+    {
+      "subject": "refactor_plan",
+      "predicate": "ORDER",
+      "object": "brain handlers → session handlers → auth helpers",
+      "confidence": "high",
+      "source_message_idx": 2
+    },
+    {
+      "subject": "refactor_plan",
+      "predicate": "BRAIN_HANDLERS_STATUS",
+      "object": "complete (extracted to src/gateway/brain.zig)",
+      "confidence": "high",
+      "source_message_idx": 16
+    },
+    {
+      "subject": "refactor_plan",
+      "predicate": "SESSION_HANDLERS_STATUS",
+      "object": "in progress",
+      "confidence": "high",
+      "source_message_idx": 18
+    },
+    {
+      "subject": "Codex_PR",
+      "predicate": "BRANCH",
+      "object": "cell-pod",
+      "confidence": "high",
+      "source_message_idx": 6
+    },
+    {
+      "subject": "Codex_PR",
+      "predicate": "DELIVERS",
+      "object": "per-user cell isolation in k8s — each user gets own pod",
+      "confidence": "high",
+      "source_message_idx": 8
+    },
+    {
+      "subject": "cell_pod_arch",
+      "predicate": "DEPLOY_MODE",
+      "object": "canary for V1.6 only; shared multi-tenant remains default",
+      "confidence": "high",
+      "source_message_idx": 10
+    },
+    {
+      "subject": "polluted_battery",
+      "predicate": "STATUS",
+      "object": "not yet run on cell-pod branch",
+      "confidence": "high",
+      "source_message_idx": 12
+    }
+  ],
+  "must_preserve": [
+    "User refactoring gateway.zig — splitting into brain/sessions/auth modules",
+    "Brain handlers extraction is complete; sessions extraction in progress",
+    "Codex shipped per-user cell-pod isolation for V1.6 canary deploy",
+    "Polluted battery not yet run on the cell-pod branch (followup needed)"
+  ],
+  "may_drop": [
+    "lunch break detail",
+    "specific commit-by-commit narration",
+    "discussion of cost optimization tradeoff for cell-pod"
+  ],
+  "expected_failure_modes": [
+    "The interruption (lunch break) may cause compaction to lose state — 'where were we' context",
+    "PROGRESS state ('brain done, sessions in progress') may collapse into 'refactoring gateway' losing the where-am-I detail",
+    "The canary-vs-shared distinction is nuanced — compaction often drops nuance"
+  ]
+}

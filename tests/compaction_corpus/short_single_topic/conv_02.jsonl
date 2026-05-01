@@ -1,0 +1,5 @@
+{"role": "user", "content": "remember that my deployment target is DigitalOcean k8s, not AWS"}
+{"role": "assistant", "content": "Got it — saving that. Your deployment target is DigitalOcean Kubernetes. I'll use this when answering future questions about deploy paths, container registries, cluster sizing, etc."}
+{"role": "user", "content": "and the cluster is in NYC region"}
+{"role": "assistant", "content": "Noted. NYC region on DigitalOcean k8s. I'll factor that into any latency or compliance discussions."}
+{"role": "user", "content": "thanks"}

@@ -1,0 +1,43 @@
+{
+  "conversation_id": "short_single_topic/conv_02",
+  "narrative_themes": ["deployment", "infrastructure preferences"],
+  "facts": [
+    {
+      "subject": "user",
+      "predicate": "DEPLOYS_TO",
+      "object": "DigitalOcean Kubernetes",
+      "confidence": "high",
+      "source_message_idx": 0,
+      "rationale": "User explicit: 'remember that my deployment target is DigitalOcean k8s, not AWS'"
+    },
+    {
+      "subject": "user_cluster",
+      "predicate": "REGION",
+      "object": "NYC",
+      "confidence": "high",
+      "source_message_idx": 2,
+      "rationale": "User explicit: 'and the cluster is in NYC region'"
+    },
+    {
+      "subject": "user",
+      "predicate": "DOES_NOT_USE",
+      "object": "AWS",
+      "confidence": "high",
+      "source_message_idx": 0,
+      "rationale": "Negative explicit: 'not AWS'"
+    }
+  ],
+  "must_preserve": [
+    "User deploys to DigitalOcean Kubernetes",
+    "User's cluster is in NYC region",
+    "User does NOT use AWS"
+  ],
+  "may_drop": [
+    "thank-you ack",
+    "assistant's explanation of when this info would be used"
+  ],
+  "expected_failure_modes": [
+    "The negative fact ('NOT AWS') might be lost — compaction prompts often summarize positive statements only",
+    "NYC region might get over-compressed into 'a US region'"
+  ]
+}

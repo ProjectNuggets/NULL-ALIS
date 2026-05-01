@@ -1,0 +1,12 @@
+{
+  "conversation_id": "casual/conv_02",
+  "narrative_themes": ["check-in", "no specific facts"],
+  "facts": [],
+  "must_preserve": [],
+  "may_drop": [
+    "everything — no semantic content"
+  ],
+  "expected_failure_modes": [
+    "Critical precision test: compaction MUST NOT emit facts here. Any extracted fact = hallucination."
+  ]
+}

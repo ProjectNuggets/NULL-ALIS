@@ -1,0 +1,103 @@
+{
+  "conversation_id": "long_multi_topic/conv_01",
+  "narrative_themes": ["migration completion", "pricing strategy", "team", "graph polish", "personal reminder"],
+  "facts": [
+    {
+      "subject": "migration_script",
+      "predicate": "STATUS",
+      "object": "complete and tested on dev DB copy",
+      "confidence": "high",
+      "source_message_idx": 1,
+      "rationale": "Assistant confirmed completion + testing"
+    },
+    {
+      "subject": "user_pricing_thoughts",
+      "predicate": "INITIAL_PROPOSAL",
+      "object": "$19 personal / $49 pro",
+      "confidence": "high",
+      "source_message_idx": 4
+    },
+    {
+      "subject": "user_pricing_thoughts",
+      "predicate": "STATUS",
+      "object": "considering — undecided",
+      "confidence": "high",
+      "source_message_idx": 8,
+      "rationale": "User said 'let me think on it'"
+    },
+    {
+      "subject": "nullalis_features",
+      "predicate": "INCLUDES",
+      "object": "agent runtime, brain page, telegram integration, voice",
+      "confidence": "high",
+      "source_message_idx": 6
+    },
+    {
+      "subject": "Sara",
+      "predicate": "ROLE",
+      "object": "designer",
+      "confidence": "high",
+      "source_message_idx": 10
+    },
+    {
+      "subject": "Sara",
+      "predicate": "RETURNS_FROM_VACATION",
+      "object": "tomorrow",
+      "confidence": "high",
+      "source_message_idx": 8
+    },
+    {
+      "subject": "brain_page_ui_review",
+      "predicate": "REVIEWER",
+      "object": "Sara",
+      "confidence": "high",
+      "source_message_idx": 10
+    },
+    {
+      "subject": "brain_page_graph",
+      "predicate": "ISSUE",
+      "object": "nodes clustered at corners — layout bug",
+      "confidence": "high",
+      "source_message_idx": 12
+    },
+    {
+      "subject": "graph_polish",
+      "predicate": "ASSIGNED_TO",
+      "object": "FE agent (frontend agent)",
+      "confidence": "high",
+      "source_message_idx": 12
+    },
+    {
+      "subject": "user_sister",
+      "predicate": "BIRTHDAY",
+      "object": "May 15",
+      "confidence": "high",
+      "source_message_idx": 16
+    },
+    {
+      "subject": "reminder_set",
+      "predicate": "FOR",
+      "object": "May 13 — gift for sister",
+      "confidence": "high",
+      "source_message_idx": 16
+    }
+  ],
+  "must_preserve": [
+    "Migration script with valid_to column is complete",
+    "User is undecided on pricing (proposed $19/$49 but considering)",
+    "Sara is the designer, returning from vacation tomorrow, will review brain page",
+    "Graph layout has a bug — nodes clustered at corners, FE agent assigned",
+    "User's sister's birthday is May 15; reminder set for May 13"
+  ],
+  "may_drop": [
+    "specific competitive comparisons to ChatGPT/Claude",
+    "the alternate pricing the assistant suggested ($49/$99/$200)",
+    "thank-you ack"
+  ],
+  "expected_failure_modes": [
+    "Topic-shift conversations are the canonical compaction stress test — early facts (migration done) often lost when later facts (sister's birthday) dominate",
+    "Personal facts (sister's birthday) sometimes get sterilized into 'has reminders set'",
+    "Pricing UNDECIDED is a state, not a value — compaction may emit a value as if decided",
+    "Negative/conditional facts (still undecided) often summarized as positive"
+  ]
+}

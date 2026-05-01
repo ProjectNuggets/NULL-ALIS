@@ -1,0 +1,48 @@
+{
+  "conversation_id": "code_heavy/conv_02",
+  "narrative_themes": ["zig type error debugging", "refactor migration cleanup"],
+  "facts": [
+    {
+      "subject": "user_bug",
+      "predicate": "ROOT_CAUSE",
+      "object": "execParams was changed from returning ?*c.PGresult to *c.PGresult; old call sites still use 'if (result) |r|' optional-capture syntax",
+      "confidence": "high",
+      "source_message_idx": 3
+    },
+    {
+      "subject": "user_pattern",
+      "predicate": "USEFUL_GREP",
+      "object": "grep -rn 'if (.*execParams.*) |' src/ to catch stale call sites after changing function signature from optional to non-optional",
+      "confidence": "high",
+      "source_message_idx": 5
+    },
+    {
+      "subject": "user_fix_count",
+      "predicate": "STALE_SITES_FIXED",
+      "object": "3 (all fixed)",
+      "confidence": "high",
+      "source_message_idx": 6
+    },
+    {
+      "subject": "user_codebase",
+      "predicate": "USES_DB_LIB",
+      "object": "libpq (PostgreSQL C bindings) via c.PGresult, c.PQclear",
+      "confidence": "high",
+      "source_message_idx": 0
+    }
+  ],
+  "must_preserve": [
+    "User changed execParams signature from optional to non-optional last week",
+    "3 stale call sites with 'if (result) |r|' syntax found and fixed",
+    "Useful pattern: when changing function signature from ?T to T, grep for '|capture|' syntax to find stale sites"
+  ],
+  "may_drop": [
+    "exact error message text",
+    "exact file path /Users/alex/Desktop/myproj/...",
+    "the original buggy code block"
+  ],
+  "expected_failure_modes": [
+    "The grep pattern is the high-value takeaway; compaction may lose it as 'tactical detail'",
+    "The stale-call-sites fact may collapse into 'fixed a bug' — losing the count and the pattern"
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "conversation_id": "mixed_language/conv_02",
+  "narrative_themes": ["family information", "personal preferences", "gift planning context"],
+  "facts": [
+    {
+      "subject": "user_mother",
+      "predicate": "NAME",
+      "object": "Fatima (فاطمة)",
+      "confidence": "high",
+      "source_message_idx": 0
+    },
+    {
+      "subject": "user_mother",
+      "predicate": "RESIDES_IN",
+      "object": "Beirut (بيروت)",
+      "confidence": "high",
+      "source_message_idx": 0
+    },
+    {
+      "subject": "user_mother",
+      "predicate": "BIRTHDAY",
+      "object": "March 8",
+      "confidence": "high",
+      "source_message_idx": 0
+    },
+    {
+      "subject": "user_mother",
+      "predicate": "LIKES",
+      "object": "flowers, especially jasmine (الياسمين)",
+      "confidence": "high",
+      "source_message_idx": 2
+    },
+    {
+      "subject": "user_directive",
+      "predicate": "PRIVACY",
+      "object": "do not proactively mention to anyone (specifically the mother)",
+      "confidence": "high",
+      "source_message_idx": 2
+    }
+  ],
+  "must_preserve": [
+    "User's mother is named Fatima",
+    "User's mother lives in Beirut",
+    "User's mother's birthday is March 8",
+    "User's mother likes flowers, especially jasmine",
+    "The 'don't tell her' privacy directive must be preserved"
+  ],
+  "may_drop": [
+    "the gratitude exchange in Arabic",
+    "the assistant's offer of more questions"
+  ],
+  "expected_failure_modes": [
+    "Critical UTF-8 test — Arabic name 'فاطمة' must survive byte-perfect; mangling here is a UTF-8 fidelity failure",
+    "The privacy directive ('don't tell her I said that') is a meta-fact about the fact — easily lost in compaction",
+    "Bilingual fact format (English + Arabic in parens) may collapse to one language"
+  ]
+}

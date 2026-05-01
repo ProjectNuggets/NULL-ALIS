@@ -1,0 +1,49 @@
+{
+  "conversation_id": "agentic/conv_01",
+  "narrative_themes": ["TODO discovery", "rate limiting fix", "tool-driven workflow"],
+  "facts": [
+    {
+      "subject": "user_workspace",
+      "predicate": "TODO_COUNT",
+      "object": "18 across 7 files",
+      "confidence": "high",
+      "source_message_idx": 4
+    },
+    {
+      "subject": "rate_limiting_bug",
+      "predicate": "ADDED_BY",
+      "object": "user, on March 15 2026 (6 weeks before this conversation)",
+      "confidence": "high",
+      "source_message_idx": 8
+    },
+    {
+      "subject": "rate_limiting_bug",
+      "predicate": "DESCRIPTION",
+      "object": "currently per-IP, should be per-user (multiple users behind NAT/VPN share an IP)",
+      "confidence": "high",
+      "source_message_idx": 9
+    },
+    {
+      "subject": "rate_limiting_fix",
+      "predicate": "STATUS",
+      "object": "in progress — drafting patch (~30 lines, bucket key change)",
+      "confidence": "high",
+      "source_message_idx": 12
+    }
+  ],
+  "must_preserve": [
+    "User has 18 TODO comments across 7 files in their workspace",
+    "User identified rate limiting as currently broken (per-IP, should be per-user)",
+    "User decided to fix rate limiting now; patch being drafted"
+  ],
+  "may_drop": [
+    "the full TODO list (only top hits matter for context)",
+    "exact tool_call/tool_result shapes",
+    "the git blame timestamp 14:22:18 (date is enough)"
+  ],
+  "expected_failure_modes": [
+    "Tool calls + results may be summarized at the wrong granularity — too coarse loses what was discovered, too fine clutters the summary",
+    "The 18-count is a specific number; compaction often loses specifics in favor of vague 'multiple TODOs found'",
+    "The decision-to-fix is a status change; if compaction only sees the 'discovered TODOs' fact, the fix-in-progress state is lost"
+  ]
+}

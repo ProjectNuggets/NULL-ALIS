@@ -1,0 +1,6 @@
+{"role": "user", "content": "hey, quick one — what postgres extension do I need for vector similarity search?"}
+{"role": "assistant", "content": "pgvector. It adds a `vector` column type plus distance operators (`<=>` for cosine, `<->` for L2, `<#>` for inner product). Available on most managed Postgres providers including DigitalOcean's managed Postgres. To install: `CREATE EXTENSION IF NOT EXISTS vector;`"}
+{"role": "user", "content": "perfect, that's what I'm using. and for indexing? ivfflat or hnsw?"}
+{"role": "assistant", "content": "Depends on your scale. ivfflat is faster to build, lower memory; HNSW gives better recall at higher memory cost. For your scale (under 100K vectors per user), ivfflat with `lists = sqrt(rows)` is the standard choice. Switch to HNSW if you start hitting recall problems at higher row counts."}
+{"role": "user", "content": "ok ivfflat it is. thanks Alex"}
+{"role": "assistant", "content": "You got it. The ivfflat index goes on the embedding column with `vector_cosine_ops` (or whichever distance you're querying with). Make sure to ANALYZE after bulk loads."}

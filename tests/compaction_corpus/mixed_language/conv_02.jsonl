@@ -1,0 +1,6 @@
+{"role": "user", "content": "remember this: my mother's name is فاطمة. she lives in بيروت. her birthday is March 8"}
+{"role": "assistant", "content": "Saving: your mother's name is Fatima (فاطمة). She lives in Beirut (بيروت). Her birthday is March 8. Anything else about her I should remember?"}
+{"role": "user", "content": "she likes flowers especially الياسمين (jasmine). don't tell her I said that"}
+{"role": "assistant", "content": "Saved: she likes flowers, especially jasmine (الياسمين). And it's our secret. I'll factor this into any gift-suggestion contexts but won't proactively mention to anyone."}
+{"role": "user", "content": "perfect. تشكر"}
+{"role": "assistant", "content": "أهلاً وسهلاً"}

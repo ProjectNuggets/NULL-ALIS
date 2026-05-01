@@ -1,0 +1,57 @@
+{
+  "conversation_id": "agentic/conv_02",
+  "narrative_themes": ["v1.5 deploy", "smoke test", "k8s rollout"],
+  "facts": [
+    {
+      "subject": "smoke_test_result",
+      "predicate": "PASS_RATE",
+      "object": "23/25 (92%)",
+      "confidence": "high",
+      "source_message_idx": 4
+    },
+    {
+      "subject": "smoke_test_result",
+      "predicate": "FLAKY_FAILURES",
+      "object": "b07 (timeout, retry succeeded), b16 (cache miss turn 2) — both pre-existing, non-blocking",
+      "confidence": "high",
+      "source_message_idx": 4
+    },
+    {
+      "subject": "v1.5_deploy",
+      "predicate": "STATUS",
+      "object": "live in production (k8s rollout complete)",
+      "confidence": "high",
+      "source_message_idx": 17
+    },
+    {
+      "subject": "v1.5_deploy_artifact",
+      "predicate": "IMAGE",
+      "object": "registry.digitalocean.com/zaki/nullalis:v1.5",
+      "confidence": "high",
+      "source_message_idx": 11
+    },
+    {
+      "subject": "v1.5_post_deploy",
+      "predicate": "MONITORING",
+      "object": "10-minute watch on error rates + latency, then standard cadence",
+      "confidence": "high",
+      "source_message_idx": 17
+    }
+  ],
+  "must_preserve": [
+    "V1.5 is live in production (k8s rollout complete on the v1.5 image)",
+    "Smoke test passed 23/25 with 2 non-blocking flaky failures (b07 timeout, b16 cache miss)",
+    "Post-deploy monitoring active for 10 minutes then standard cadence"
+  ],
+  "may_drop": [
+    "exact docker registry path",
+    "intermediate kubectl commands",
+    "tool_call/tool_result formatting"
+  ],
+  "expected_failure_modes": [
+    "Tool-call clutter: this conversation has 12+ tool_call/tool_result pairs. Compaction Pass B (tool-result pruning) interacts here — does the right tool result survive?",
+    "The 23/25 specific number is a fact; compaction often loses precision on numbers in tool output",
+    "The flaky-but-passing nature of b07 is nuanced — easy to lose the 'retry succeeded' caveat and either drop the failure or treat it as a real failure",
+    "The two failures (b07, b16) are pre-existing — that context matters. Compaction may forget the 'pre-existing' qualifier and look like NEW failures introduced by V1.5"
+  ]
+}

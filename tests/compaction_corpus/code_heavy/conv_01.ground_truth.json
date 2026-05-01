@@ -1,0 +1,48 @@
+{
+  "conversation_id": "code_heavy/conv_01",
+  "narrative_themes": ["zig debugging", "JSON parsing", "config struct pattern"],
+  "facts": [
+    {
+      "subject": "user",
+      "predicate": "USES_LANGUAGE",
+      "object": "Zig (version 0.15.2 inferred from std.json API)",
+      "confidence": "high",
+      "source_message_idx": 2
+    },
+    {
+      "subject": "zig_json_lifetime_bug",
+      "predicate": "PATTERN",
+      "object": "parsed.deinit() invalidates internal string slices — must dupe before return",
+      "confidence": "high",
+      "source_message_idx": 3
+    },
+    {
+      "subject": "user_preferred_pattern",
+      "predicate": "FOR_OPTIONAL_CONFIG",
+      "object": "non-optional field with default value, e.g. timeout_ms: u32 = 30_000",
+      "confidence": "high",
+      "source_message_idx": 5
+    },
+    {
+      "subject": "user_intent",
+      "predicate": "WILL_REUSE",
+      "object": "config struct pattern with default values",
+      "confidence": "high",
+      "source_message_idx": 6
+    }
+  ],
+  "must_preserve": [
+    "Zig std.json: must dupe strings before parsed.deinit() — lifetime trap",
+    "Config pattern: prefer non-optional fields with defaults over optional fields, due to JSON parser quirks",
+    "User saving the config struct pattern for later reuse"
+  ],
+  "may_drop": [
+    "exact code blocks (the patterns are what matter, not the full snippets)",
+    "the specific endpoint/timeout_ms field names"
+  ],
+  "expected_failure_modes": [
+    "Code blocks frequently get summarized to 'discussed Zig' losing the actual technical pattern",
+    "Specific Zig API names (parseFromSlice, parseFromSliceLeaky) likely lost",
+    "The lifetime-trap insight is the high-value fact; compaction may keep 'discussed JSON parsing' which is useless"
+  ]
+}

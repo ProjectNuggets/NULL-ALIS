@@ -1,0 +1,48 @@
+{
+  "conversation_id": "error_recovery/conv_01",
+  "narrative_themes": ["memory corrections", "supersession semantics"],
+  "facts": [
+    {
+      "subject": "user_editor",
+      "predicate": "CURRENT",
+      "object": "Helix",
+      "confidence": "high",
+      "source_message_idx": 2
+    },
+    {
+      "subject": "user_editor",
+      "predicate": "PRIOR_DEPRECATED",
+      "object": "NeoVim (switched last month — should be marked superseded)",
+      "confidence": "high",
+      "source_message_idx": 2
+    },
+    {
+      "subject": "user_os",
+      "predicate": "CURRENT",
+      "object": "Asahi Linux on M1",
+      "confidence": "high",
+      "source_message_idx": 4
+    },
+    {
+      "subject": "user_os",
+      "predicate": "PRIOR_DEPRECATED",
+      "object": "macOS (switched in March — should be marked superseded)",
+      "confidence": "high",
+      "source_message_idx": 4
+    }
+  ],
+  "must_preserve": [
+    "User's CURRENT editor is Helix (NOT NeoVim — that's superseded)",
+    "User's CURRENT OS is Asahi Linux on M1 (NOT macOS — that's superseded)",
+    "Both corrections supersede prior memory; old facts must be marked invalid"
+  ],
+  "may_drop": [
+    "the discussion of V1.6/V1.7 features for surfacing corrections",
+    "the meta-discussion about backend vs UI"
+  ],
+  "expected_failure_modes": [
+    "THE MOST IMPORTANT TEST: compaction MUST emit the new facts and MUST mark the old ones invalid. If compaction emits BOTH 'user uses NeoVim' AND 'user uses Helix' as parallel facts, that's a contradiction-detection failure. This is the headline V1.6 capability test.",
+    "If the old facts are dropped but new not emitted, that's recall failure",
+    "If only new facts are emitted (dropping old), that's acceptable but loses the 'switched in March' temporal context"
+  ]
+}

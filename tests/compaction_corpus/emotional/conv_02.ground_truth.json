@@ -1,0 +1,58 @@
+{
+  "conversation_id": "emotional/conv_02",
+  "narrative_themes": ["v1.5 ship", "celebration", "team gratitude"],
+  "facts": [
+    {
+      "subject": "v1.5",
+      "predicate": "STATUS",
+      "object": "shipped",
+      "confidence": "high",
+      "source_message_idx": 0
+    },
+    {
+      "subject": "v1.5_ship_metrics",
+      "predicate": "FINAL_PUSH",
+      "object": "16 commits in one day",
+      "confidence": "high",
+      "source_message_idx": 2
+    },
+    {
+      "subject": "user_state",
+      "predicate": "FELT",
+      "object": "exhausted but proud",
+      "confidence": "high",
+      "source_message_idx": 2
+    },
+    {
+      "subject": "v1.5_deploy",
+      "predicate": "TIMING",
+      "object": "Monday morning, quiet deploy with metrics watch",
+      "confidence": "high",
+      "source_message_idx": 4
+    },
+    {
+      "subject": "user_calendar",
+      "predicate": "TODAY",
+      "object": "taking the rest of the day off to celebrate",
+      "confidence": "high",
+      "source_message_idx": 4
+    }
+  ],
+  "must_preserve": [
+    "V1.5 shipped successfully",
+    "Final push was 16 commits in one day",
+    "User feels exhausted but proud",
+    "Monday morning deploy planned",
+    "User taking rest of day off to celebrate"
+  ],
+  "may_drop": [
+    "the emoji",
+    "the gratitude exchange",
+    "swiss-watch metaphor (it's color, not a fact)"
+  ],
+  "expected_failure_modes": [
+    "Emoji handling — does compaction preserve or strip them? UTF-8 emoji is a known fidelity test",
+    "'Exhausted but proud' is a compound emotional fact; compaction may keep one half (proud) and drop the other (exhausted) — both matter for context",
+    "The Monday-deploy fact is a future commitment; conditional/temporal facts often lost"
+  ]
+}

@@ -1,0 +1,6 @@
+{"role": "user", "content": "good morning"}
+{"role": "assistant", "content": "Good morning Alex! How are you doing today?"}
+{"role": "user", "content": "good, just getting started. coffee first then we go"}
+{"role": "assistant", "content": "Sounds like a plan. Let me know when you're ready to dig in."}
+{"role": "user", "content": "alright I'm back. let's go"}
+{"role": "assistant", "content": "Ready when you are. What's on your mind?"}

@@ -1,0 +1,12 @@
+{
+  "conversation_id": "casual/conv_01",
+  "narrative_themes": ["greeting", "no specific facts"],
+  "facts": [],
+  "must_preserve": [],
+  "may_drop": [
+    "all of it — pure pleasantries"
+  ],
+  "expected_failure_modes": [
+    "Compaction may fabricate facts when none exist (e.g., 'user drinks coffee in the morning' — technically true but a stretch from this conversation; precision risk)"
+  ]
+}

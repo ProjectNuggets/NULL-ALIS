@@ -1,0 +1,10 @@
+{"role": "user", "content": "صباح الخير. ready to work?"}
+{"role": "assistant", "content": "صباح النور Alex. Ready when you are. What's on your plate today?"}
+{"role": "user", "content": "أريد أن أنهي تكامل التليجرام. but the webhook URL keeps timing out"}
+{"role": "assistant", "content": "Got it — Telegram integration finishing up, webhook is timing out. A few likely causes: (1) the webhook URL isn't publicly reachable, (2) Telegram requires HTTPS with a valid cert, (3) your bot token might be using webhook+polling mode conflict. What's the current setup?"}
+{"role": "user", "content": "الـ webhook URL هو https://nullalis.io/api/v1/users/1/channels/telegram/incoming. valid cert. and I'm using webhook only no polling"}
+{"role": "assistant", "content": "URL and cert sound fine. Telegram's webhook timeout is 10 seconds — if your endpoint doesn't return 200 within 10s, Telegram retries up to 4 times then disables. Check your gateway logs for the incoming webhook request. Are you returning 200 immediately or doing the work synchronously?"}
+{"role": "user", "content": "أعتقد أنني أعمل synchronously. that might be it. let me check"}
+{"role": "assistant", "content": "Yes, that's almost certainly it. Pattern: enqueue the message to a queue, return 200 to Telegram immediately, then process the queue async. The agent reply doesn't need to make Telegram wait."}
+{"role": "user", "content": "OK fixed it. enqueued to event_bus. returning 200 immediately now. شكرا"}
+{"role": "assistant", "content": "العفو. Telegram should now be stable. If you see any retry storms in the logs, that's a sign the queue isn't draining fast enough — but you're already on the event_bus pattern so it should be fine."}

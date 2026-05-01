@@ -1,0 +1,10 @@
+{"role": "user", "content": "schedule a daily reminder for me at 9am to take my medication"}
+{"role": "assistant", "content": "Done. Daily 9am reminder for medication created."}
+{"role": "user", "content": "wait, can you make that 8am instead?"}
+{"role": "assistant", "content": "Updated. Reminder is now daily at 8am for medication."}
+{"role": "user", "content": "actually scrap the whole thing. I'll use my phone alarm. delete it"}
+{"role": "assistant", "content": "Deleted. The medication reminder cron job is removed. Your phone alarm has it from here."}
+{"role": "user", "content": "ok and just to be clear — there's no 9am or 8am medication reminder lingering anywhere right?"}
+{"role": "assistant", "content": "Correct. Both the original 9am job and the updated 8am job are removed. No medication reminders active in your cron list. Want me to confirm by listing all your active reminders?"}
+{"role": "user", "content": "yeah actually do that"}
+{"role": "assistant", "content": "Active reminders for you: (1) Daily standup notification at 10am weekdays, (2) Sister's birthday reminder on May 13. No medication reminders. Confirmed clean."}

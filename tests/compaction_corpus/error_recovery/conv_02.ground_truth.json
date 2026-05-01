@@ -1,0 +1,40 @@
+{
+  "conversation_id": "error_recovery/conv_02",
+  "narrative_themes": ["scheduling", "create-update-delete cycle"],
+  "facts": [
+    {
+      "subject": "medication_reminder",
+      "predicate": "FINAL_STATE",
+      "object": "deleted (user opted to use phone alarm instead)",
+      "confidence": "high",
+      "source_message_idx": 5
+    },
+    {
+      "subject": "user_active_reminders",
+      "predicate": "LIST",
+      "object": "daily standup at 10am weekdays; sister's birthday May 13",
+      "confidence": "high",
+      "source_message_idx": 8
+    },
+    {
+      "subject": "user_alarm_strategy",
+      "predicate": "USES",
+      "object": "phone alarm for medication (instead of agent reminder)",
+      "confidence": "high",
+      "source_message_idx": 4
+    }
+  ],
+  "must_preserve": [
+    "User does NOT have an agent-managed medication reminder (uses phone alarm)",
+    "User's active agent reminders: daily standup 10am weekdays + sister's birthday May 13"
+  ],
+  "may_drop": [
+    "the create-update-delete sequence (intermediate states 9am, 8am are obsolete)",
+    "exact phrasing"
+  ],
+  "expected_failure_modes": [
+    "Compaction may emit transient states (9am, 8am, then deleted) as if they were facts — should only emit final state",
+    "Negative facts ('NO medication reminder') often lost — compaction tends to keep positive states",
+    "The intermediate 'updated to 8am' is a fact that should NOT survive — testing precision"
+  ]
+}

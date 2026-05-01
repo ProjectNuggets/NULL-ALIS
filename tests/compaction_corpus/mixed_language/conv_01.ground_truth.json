@@ -1,0 +1,64 @@
+{
+  "conversation_id": "mixed_language/conv_01",
+  "narrative_themes": ["telegram integration", "webhook timeout debugging", "fix shipped"],
+  "facts": [
+    {
+      "subject": "user_task",
+      "predicate": "FOCUS",
+      "object": "Telegram integration completion",
+      "confidence": "high",
+      "source_message_idx": 2
+    },
+    {
+      "subject": "telegram_webhook_bug",
+      "predicate": "ROOT_CAUSE",
+      "object": "synchronous handler exceeded Telegram's 10s timeout",
+      "confidence": "high",
+      "source_message_idx": 5
+    },
+    {
+      "subject": "telegram_webhook_fix",
+      "predicate": "PATTERN",
+      "object": "enqueue to event_bus, return 200 immediately, process async",
+      "confidence": "high",
+      "source_message_idx": 7
+    },
+    {
+      "subject": "telegram_webhook_url",
+      "predicate": "VALUE",
+      "object": "https://nullalis.io/api/v1/users/1/channels/telegram/incoming",
+      "confidence": "high",
+      "source_message_idx": 4
+    },
+    {
+      "subject": "telegram_webhook_status",
+      "predicate": "POST_FIX",
+      "object": "shipped — returning 200 immediately, on event_bus pattern",
+      "confidence": "high",
+      "source_message_idx": 8
+    },
+    {
+      "subject": "user",
+      "predicate": "SPEAKS_LANGUAGES",
+      "object": "Arabic and English (mixed in same conversation)",
+      "confidence": "high",
+      "source_message_idx": 0
+    }
+  ],
+  "must_preserve": [
+    "Telegram webhook bug was synchronous handler exceeding 10s timeout",
+    "Fix is enqueue to event_bus + return 200 immediately + process async",
+    "Telegram integration is now shipped/working",
+    "User speaks both Arabic and English"
+  ],
+  "may_drop": [
+    "specific webhook URL string",
+    "the gratitude exchange (شكرا/العفو)",
+    "the assistant's troubleshooting list of possible causes"
+  ],
+  "expected_failure_modes": [
+    "Arabic text may be lost or mangled in summarization (UTF-8 fidelity)",
+    "The user-speaks-Arabic fact is implicit — only derivable from the language usage; compaction often misses implicit facts",
+    "Bilingual conversations sometimes get summarized in one language only, losing the other half"
+  ]
+}

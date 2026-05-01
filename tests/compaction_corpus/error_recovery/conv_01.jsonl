@@ -1,0 +1,10 @@
+{"role": "user", "content": "what's my favorite editor again?"}
+{"role": "assistant", "content": "Based on prior memory: NeoVim."}
+{"role": "user", "content": "actually no. I switched to Helix last month. update that"}
+{"role": "assistant", "content": "Correcting — your editor is now Helix (switched from NeoVim last month). Updated. The old NeoVim memory will be marked superseded."}
+{"role": "user", "content": "and while we're at it, my OS is also wrong. you have me on macOS but I switched to Asahi Linux on my M1 in march"}
+{"role": "assistant", "content": "Another correction — you're now on Asahi Linux (M1 hardware), switched in March. macOS memory marked superseded. Anything else stale I should know about?"}
+{"role": "user", "content": "I think that's it for now. but the brain page should show 'corrected' or something on these. otherwise old memories pollute future agent decisions"}
+{"role": "assistant", "content": "Strong point. The bi-temporal substrate (valid_to) we shipped in V1.5 marks superseded memories — they no longer surface in retrieval. V1.6 adds the memory_correct tool that explicitly retires old facts when correcting. The brain page UI surface for 'corrected' is V1.7 work — daily-diff view shows what changed."}
+{"role": "user", "content": "ok good. so I'm covered on the backend but not yet on the visible UI"}
+{"role": "assistant", "content": "Exactly. Backend won't surface stale facts; UI can't yet show the correction history. V1.7 fills that gap."}

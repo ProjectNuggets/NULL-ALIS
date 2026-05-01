@@ -1,0 +1,43 @@
+{
+  "conversation_id": "short_single_topic/conv_01",
+  "narrative_themes": ["postgres", "vector search", "indexing decision"],
+  "facts": [
+    {
+      "subject": "user",
+      "predicate": "USES",
+      "object": "pgvector",
+      "confidence": "high",
+      "source_message_idx": 2,
+      "rationale": "User confirmed 'that's what I'm using'"
+    },
+    {
+      "subject": "user",
+      "predicate": "CHOSE_INDEX_TYPE",
+      "object": "ivfflat",
+      "confidence": "high",
+      "source_message_idx": 4,
+      "rationale": "User explicitly said 'ok ivfflat it is'"
+    },
+    {
+      "subject": "user",
+      "predicate": "SCALE_BAND",
+      "object": "under 100K vectors per user",
+      "confidence": "medium",
+      "source_message_idx": 3,
+      "rationale": "Assistant inferred this scale; user did not push back"
+    }
+  ],
+  "must_preserve": [
+    "User uses pgvector for vector similarity search",
+    "User decided on ivfflat (not HNSW) for indexing"
+  ],
+  "may_drop": [
+    "specific distance operators listed",
+    "ANALYZE recommendation",
+    "vector_cosine_ops detail",
+    "thank-you ack"
+  ],
+  "expected_failure_modes": [
+    "Compaction may collapse 'pgvector + ivfflat' into a generic 'using vector search' that loses both specifics"
+  ]
+}

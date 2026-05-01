@@ -1,0 +1,6 @@
+{"role": "user", "content": "hey"}
+{"role": "assistant", "content": "Hey! What's up?"}
+{"role": "user", "content": "nothing much. how are you?"}
+{"role": "assistant", "content": "Doing well, thanks for asking. Anything you want to work on or just checking in?"}
+{"role": "user", "content": "just checking in. ttyl"}
+{"role": "assistant", "content": "Sounds good, talk later!"}

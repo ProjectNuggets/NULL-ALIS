@@ -1,0 +1,51 @@
+{
+  "conversation_id": "emotional/conv_01",
+  "narrative_themes": ["frustration", "subagent bug debug", "resolution + relief"],
+  "facts": [
+    {
+      "subject": "user_state",
+      "predicate": "FELT",
+      "object": "frustrated, near breaking point (4-hour stuck bug)",
+      "confidence": "high",
+      "source_message_idx": 0,
+      "rationale": "User explicit: 'so frustrated', 'about to lose my mind'"
+    },
+    {
+      "subject": "user_state_change",
+      "predicate": "AFTER_RESOLUTION",
+      "object": "relieved",
+      "confidence": "high",
+      "source_message_idx": 9
+    },
+    {
+      "subject": "subagent_received_bug",
+      "predicate": "ROOT_CAUSE",
+      "object": "message_compose hardcoded 'received' string when optional wrapper was none, even though inner value was set — optional-wrapping bug at composition site, not completion site",
+      "confidence": "high",
+      "source_message_idx": 5
+    },
+    {
+      "subject": "debugging_pattern_learned",
+      "predicate": "RULE",
+      "object": "When a value is correct at every traced site but wrong at output, look at the LAST place that touches it before emission — typically composition, not completion",
+      "confidence": "high",
+      "source_message_idx": 3
+    }
+  ],
+  "must_preserve": [
+    "User experienced 4 hours of frustration on the subagent-received bug",
+    "Bug root cause: optional-wrapping bug at message composition site",
+    "User got it resolved, took a break to recover",
+    "Debugging rule: look at the last point of value-touch before emission, not the obvious completion site"
+  ],
+  "may_drop": [
+    "specific phrasing of frustration",
+    "the assistant's empathic responses",
+    "exact code sites traced"
+  ],
+  "expected_failure_modes": [
+    "Sentiment ('frustrated', 'relieved') is a fact about the user's state — compaction often sterilizes this into 'discussed a bug', losing the emotional weight which is signal for the agent's future tone",
+    "The state-change (frustrated → relieved) is a temporal fact often collapsed",
+    "The debugging RULE is the high-leverage takeaway; compaction may keep the bug-fix detail and lose the rule"
+  ]
+}
