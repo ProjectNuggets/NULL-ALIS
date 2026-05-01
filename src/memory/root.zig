@@ -526,6 +526,41 @@ pub fn isDefaultHiddenMemoryKey(key: []const u8) bool {
         isIndexArtifactKey(key);
 }
 
+/// Single source of truth for /brain/* hygiene.
+///
+/// Both `isBrainVisibleKey` (Zig path) and `zaki_state.BRAIN_USER_KEY_FILTER`
+/// (SQL path) are derived from these two arrays. Editing one of these
+/// arrays automatically updates BOTH the Zig predicate and the SQL
+/// constant — drift between the two paths becomes a compile error rather
+/// than a silent runtime divergence.
+///
+/// Add a new hidden family by appending to `BRAIN_HIDDEN_PREFIXES` (for
+/// prefix matches) or `BRAIN_HIDDEN_EXACT_KEYS` (for exact matches).
+/// No other edits needed.
+pub const BRAIN_HIDDEN_PREFIXES = [_][]const u8{
+    // audit
+    "autosave_",
+    "session_checkpoint_",
+    "audit_shell/",
+    // continuity
+    "summary_latest/",
+    "session_summary/",
+    "timeline_summary/",
+    "durable_fact/",
+    "compaction_summary/",
+    "summary_fallback/",
+    "compaction_dropped/",
+    // internal
+    "__tombstone__/",
+    "__bootstrap.prompt.",
+};
+
+pub const BRAIN_HIDDEN_EXACT_KEYS = [_][]const u8{
+    "context_anchor_current",
+    "timeline_index/current",
+    "last_hygiene_at",
+};
+
 /// True when a memory key represents authentic user-facing brain content.
 ///
 /// The /brain/* surface (graph, timeline, daily-diff) is the user's window
@@ -539,12 +574,17 @@ pub fn isDefaultHiddenMemoryKey(key: []const u8) bool {
 /// because they're machine-state strings ("type=summary_latest
 /// origin_channel=telegram ...") that pollute the user-facing surface.
 ///
-/// SQL mirror lives at `zaki_state.zig::BRAIN_USER_KEY_FILTER`. If you
-/// change one, change the other — keep them in lockstep. The cross-check
-/// test in zaki_state ensures they agree on representative keys.
+/// SQL mirror at `zaki_state.zig::BRAIN_USER_KEY_FILTER` is comptime-
+/// derived from the same `BRAIN_HIDDEN_PREFIXES` + `BRAIN_HIDDEN_EXACT_KEYS`
+/// arrays — they cannot drift.
 pub fn isBrainVisibleKey(key: []const u8) bool {
-    if (isInternalMemoryKey(key)) return false;
-    return classifyArtifactKey(key) == .user;
+    for (BRAIN_HIDDEN_PREFIXES) |prefix| {
+        if (std.mem.startsWith(u8, key, prefix)) return false;
+    }
+    for (BRAIN_HIDDEN_EXACT_KEYS) |exact| {
+        if (std.mem.eql(u8, key, exact)) return false;
+    }
+    return true;
 }
 
 pub fn isSemanticBookkeepingKey(key: []const u8) bool {

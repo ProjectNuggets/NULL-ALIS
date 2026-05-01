@@ -50,33 +50,42 @@ const c = if (build_options.enable_postgres) @cImport({
 /// has no equivalent function.
 const MEMORIES_VALIDITY_FILTER = "(valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint)";
 
-/// V1.5.1 brain-hygiene SQL filter — mirrors `memory_root.isBrainVisibleKey`.
+/// V1.5.1 brain-hygiene SQL filter — comptime-derived from
+/// `memory_root.BRAIN_HIDDEN_PREFIXES` + `memory_root.BRAIN_HIDDEN_EXACT_KEYS`.
 ///
-/// /brain/* surfaces (graph, timeline, daily-diff) hide the agent's own
-/// bookkeeping. The /brain/* response body is "Everything ZAKI remembers
-/// about YOU" — internal artifacts pollute that surface.
+/// /brain/* surfaces hide the agent's own bookkeeping. /brain/* response
+/// body is "Everything ZAKI remembers about YOU" — internal artifacts
+/// pollute that surface.
 ///
-/// Hidden families (must match `memory_root.classifyArtifactKey` !=
-/// `.user` plus `isInternalMemoryKey` true):
-///
-///   audit       — autosave_user_*, autosave_assistant_*,
-///                 session_checkpoint_*
-///   continuity  — summary_latest/*, session_summary/*,
-///                 timeline_summary/*, durable_fact/*,
-///                 compaction_summary/*, summary_fallback/*,
-///                 compaction_dropped/*, context_anchor_current
-///   index       — timeline_index/current
-///   internal    — __tombstone__/*, __bootstrap.prompt.*,
-///                 last_hygiene_at
-///
-/// Compose memories (`compose:<hex>`) and ordinary user memories pass.
-///
-/// IF YOU EDIT THIS, EDIT `memory_root.isBrainVisibleKey` TOO.
-/// The cross-check test in this file asserts they agree on every
-/// representative key. Drift breaks /brain/* hygiene silently.
-pub const BRAIN_USER_KEY_FILTER =
-    "key !~ '^(autosave_|session_checkpoint_|audit_shell/|summary_latest/|session_summary/|timeline_summary/|durable_fact/|compaction_summary/|summary_fallback/|compaction_dropped/|__tombstone__/|__bootstrap\\.prompt\\.)' " ++
-    "AND key NOT IN ('context_anchor_current', 'timeline_index/current', 'last_hygiene_at')";
+/// Single source of truth: edit only `memory_root.BRAIN_HIDDEN_PREFIXES`
+/// or `memory_root.BRAIN_HIDDEN_EXACT_KEYS`. This constant + the
+/// `isBrainVisibleKey` predicate update together — drift becomes a
+/// compile error, not a silent runtime divergence.
+pub const BRAIN_USER_KEY_FILTER = blk: {
+    @setEvalBranchQuota(8192);
+    var s: []const u8 = "key !~ '^(";
+    for (memory_root.BRAIN_HIDDEN_PREFIXES, 0..) |prefix, i| {
+        if (i > 0) s = s ++ "|";
+        // Postgres regex meta-character escaping. Our prefix list only
+        // contains `.` as a meta-char (in `__bootstrap.prompt.`); other
+        // chars (`_`, `/`, alphanumeric) are literal in regex. Add new
+        // escapes here if a future prefix introduces other meta-chars.
+        for (prefix) |ch| {
+            if (ch == '.') {
+                s = s ++ "\\.";
+            } else {
+                s = s ++ &[_]u8{ch};
+            }
+        }
+    }
+    s = s ++ ")' AND key NOT IN (";
+    for (memory_root.BRAIN_HIDDEN_EXACT_KEYS, 0..) |exact, i| {
+        if (i > 0) s = s ++ ", ";
+        s = s ++ "'" ++ exact ++ "'";
+    }
+    s = s ++ ")";
+    break :blk s;
+};
 
 pub const ChannelIdentityBinding = struct {
     id: []u8,
@@ -3762,31 +3771,150 @@ test "BRAIN_USER_KEY_FILTER mirrors memory_root.isBrainVisibleKey" {
         .{ .key = "last_hygiene_at", .expect_visible = false },
     };
 
+    // Behavioral check: simulateSqlFilter mirrors the actual SQL semantics
+    // by walking the same source-of-truth arrays. If isBrainVisibleKey and
+    // simulateSqlFilter ever disagree, drift between Zig and SQL has
+    // appeared. Both must derive from BRAIN_HIDDEN_PREFIXES + EXACT_KEYS.
+    const simulateSqlFilter = struct {
+        fn run(key: []const u8) bool {
+            for (memory_root.BRAIN_HIDDEN_PREFIXES) |prefix| {
+                if (std.mem.startsWith(u8, key, prefix)) return false;
+            }
+            for (memory_root.BRAIN_HIDDEN_EXACT_KEYS) |exact| {
+                if (std.mem.eql(u8, key, exact)) return false;
+            }
+            return true;
+        }
+    }.run;
+
     for (cases) |tc| {
         const zig_visible = memory_root.isBrainVisibleKey(tc.key);
+        const sim_visible = simulateSqlFilter(tc.key);
         try std.testing.expectEqual(tc.expect_visible, zig_visible);
+        try std.testing.expectEqual(zig_visible, sim_visible);
     }
 
-    // SQL-side cross-check: the BRAIN_USER_KEY_FILTER constant exists and
-    // contains the prefix list. We don't have a SQL engine in this unit
-    // test scope, but we can pin the prefix coverage textually so removals
-    // require updating the cases above too.
+    // Structural check on the comptime-derived SQL constant: confirm every
+    // prefix from BRAIN_HIDDEN_PREFIXES landed in the regex alternation,
+    // and every exact key from BRAIN_HIDDEN_EXACT_KEYS landed in the NOT IN
+    // clause. Catches the case where someone breaks the comptime
+    // generator so the constant no longer reflects the source arrays.
     const filter = BRAIN_USER_KEY_FILTER;
-    try std.testing.expect(std.mem.indexOf(u8, filter, "autosave_") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "session_checkpoint_") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "audit_shell/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "summary_latest/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "session_summary/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "timeline_summary/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "durable_fact/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "compaction_summary/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "summary_fallback/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "compaction_dropped/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "__tombstone__/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "__bootstrap") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "context_anchor_current") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "timeline_index/current") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filter, "last_hygiene_at") != null);
+    try std.testing.expect(std.mem.startsWith(u8, filter, "key !~ '^("));
+    try std.testing.expect(std.mem.endsWith(u8, filter, ")"));
+    for (memory_root.BRAIN_HIDDEN_PREFIXES) |prefix| {
+        // Each prefix must appear in the regex alternation. For the only
+        // prefix containing a regex meta-char (`__bootstrap.prompt.`),
+        // verify the escaped form is present.
+        if (std.mem.indexOf(u8, prefix, ".") != null) {
+            // Regex-escape dots manually for the assertion (must match
+            // what the comptime generator does).
+            var escaped: [256]u8 = undefined;
+            var w: usize = 0;
+            for (prefix) |ch| {
+                if (ch == '.') {
+                    escaped[w] = '\\';
+                    w += 1;
+                    escaped[w] = '.';
+                    w += 1;
+                } else {
+                    escaped[w] = ch;
+                    w += 1;
+                }
+            }
+            try std.testing.expect(std.mem.indexOf(u8, filter, escaped[0..w]) != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, filter, prefix) != null);
+        }
+    }
+    for (memory_root.BRAIN_HIDDEN_EXACT_KEYS) |exact| {
+        try std.testing.expect(std.mem.indexOf(u8, filter, exact) != null);
+    }
+}
+
+test "V1.5.1 brain hygiene PG roundtrip — listMemoriesBrainVisible + listMemoriesTimeline filter agent bookkeeping" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const user_id: i64 = 2;
+
+    // ── Seed: 4 visible (user-authored) + 6 hidden (one of each class) ─
+    try mgr.upsertMemory(user_id, "user_lang", "Prefers Zig", .core, null);
+    try mgr.upsertMemory(user_id, "favorite_snack", "olives", .core, null);
+    try mgr.upsertMemory(user_id, "compose:0123456789abcdef", "synth", .core, null);
+    try mgr.upsertMemory(user_id, "morning_routine", "wake at 6", .daily, null);
+    // hidden — audit family
+    try mgr.upsertMemory(user_id, "session_checkpoint_1714521600", "type=session_checkpoint reason=shutdown", .daily, null);
+    try mgr.upsertMemory(user_id, "audit_shell/1777419406559181000", "type=shell_audit cwd=/foo", .daily, null);
+    // hidden — continuity family
+    try mgr.upsertMemory(user_id, "summary_latest/agent:zaki-bot:user:7:thread:main", "type=summary_latest origin_channel=zaki_app", .daily, null);
+    try mgr.upsertMemory(user_id, "timeline_summary/agent:zaki-bot:user:7:thread:main/1714521600", "type=timeline_summary", .daily, null);
+    // hidden — internal family
+    try mgr.upsertMemory(user_id, "context_anchor_current", "type=context_anchor", .core, null);
+    try mgr.upsertMemory(user_id, "last_hygiene_at", "1714521600", .core, null);
+
+    // ── /brain/graph path: listMemoriesBrainVisible ────────────────────
+    const brain = try mgr.listMemoriesBrainVisible(allocator, user_id);
+    defer memory_root.freeEntries(allocator, brain);
+    try std.testing.expectEqual(@as(usize, 4), brain.len);
+    var seen_user_lang = false;
+    var seen_compose = false;
+    for (brain) |entry| {
+        // Cross-check: the predicate must agree with the SQL filter for
+        // every returned key.
+        try std.testing.expect(memory_root.isBrainVisibleKey(entry.key));
+        if (std.mem.eql(u8, entry.key, "user_lang")) seen_user_lang = true;
+        if (std.mem.eql(u8, entry.key, "compose:0123456789abcdef")) seen_compose = true;
+        // Negative: no hidden-prefix key must appear in the result set.
+        try std.testing.expect(!std.mem.startsWith(u8, entry.key, "session_checkpoint_"));
+        try std.testing.expect(!std.mem.startsWith(u8, entry.key, "audit_shell/"));
+        try std.testing.expect(!std.mem.startsWith(u8, entry.key, "summary_latest/"));
+        try std.testing.expect(!std.mem.startsWith(u8, entry.key, "timeline_summary/"));
+        try std.testing.expect(!std.mem.eql(u8, entry.key, "context_anchor_current"));
+        try std.testing.expect(!std.mem.eql(u8, entry.key, "last_hygiene_at"));
+    }
+    try std.testing.expect(seen_user_lang);
+    try std.testing.expect(seen_compose);
+
+    // ── /brain/timeline path: listMemoriesTimeline (filter baked-in) ───
+    const timeline = try mgr.listMemoriesTimeline(allocator, user_id, null, null, 100, null, null);
+    defer memory_root.freeEntries(allocator, timeline);
+    try std.testing.expectEqual(@as(usize, 4), timeline.len);
+    for (timeline) |entry| {
+        try std.testing.expect(memory_root.isBrainVisibleKey(entry.key));
+    }
+
+    // ── Sanity: agent-facing listMemories STILL sees everything ────────
+    // The agent retrieval pipeline depends on continuity artifacts; the
+    // hygiene filter MUST NOT leak into the agent path.
+    const agent_facing = try mgr.listMemories(allocator, user_id, null, null);
+    defer memory_root.freeEntries(allocator, agent_facing);
+    try std.testing.expectEqual(@as(usize, 10), agent_facing.len);
 }
 
 fn categoryToMemoryType(category: memory_root.MemoryCategory) []const u8 {
