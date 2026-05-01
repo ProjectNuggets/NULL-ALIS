@@ -194,9 +194,25 @@ When designs land, hand them to Codex (or the frontend agent) with a tight PR sc
 
 ---
 
+## ⚠️ Addendum — Routing convention (read this first)
+
+**The frontend NEVER calls nullalis paths directly.** All `/api/v1/users/{id}/*` endpoints below describe the **nullalis** contract for documentation only. Frontend code calls the **express BFF** at `/api/agent/...` which proxies to nullalis with the canonical bigint user_id derived from the auth context.
+
+| What frontend calls (BFF, via `backendAuthRequest`) | What BFF proxies to (nullalis) |
+|---|---|
+| `GET  /api/agent/brain/graph?<query>`     | `GET  /api/v1/users/{canonical}/brain/graph?<query>` |
+| `GET  /api/agent/brain/timeline?<query>`  | `GET  /api/v1/users/{canonical}/brain/timeline?<query>` |
+| `POST /api/agent/brain/compose`           | `POST /api/v1/users/{canonical}/brain/compose` |
+
+The BFF derives `{canonical}` from the JWT — frontend must NOT include `user_id` in the URL path. Use `backendAuthRequest("/api/agent/brain/...")`, never `apiRequest("/api/v1/users/...")`.
+
+This matches how every other agent route works (sessions, secrets, voice, attachments, cron, telegram, etc.) — see `backend/src/index.js` `makeAgentUserProxyHandler` for the proxy pattern. New nullalis user-scoped endpoints require a one-line BFF mount in zaki-prod's express server before the frontend can reach them.
+
+---
+
 ## Addendum — `/brain/graph` response contract (V1.5 day-2 task 2B)
 
-**Endpoint:** `GET /api/v1/users/{user_id}/brain/graph`
+**Nullalis endpoint:** `GET /api/v1/users/{user_id}/brain/graph` (frontend calls `/api/agent/brain/graph` per routing convention above)
 
 **Authentication:** mirrors `/sessions` pattern — internal token + tenant scope. Same auth headers as other `/api/v1/users/{id}/*` endpoints.
 
