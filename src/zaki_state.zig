@@ -949,6 +949,98 @@ const ManagerImpl = struct {
             // never reach the agent. Partial index — most rows stay NULL.
             "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS valid_to BIGINT",
             "CREATE INDEX IF NOT EXISTS idx_memories_valid_to ON {schema}.memories(valid_to) WHERE valid_to IS NOT NULL",
+
+            // ── V1.6 schema (commit 2 of V1.6 work order) ────────────────
+            //
+            // All ALTERs are `ADD COLUMN IF NOT EXISTS` — instant metadata-
+            // only on populated tables (no row rewrite). Indexes are partial
+            // where appropriate to keep cost low on rows that won't have
+            // the field populated until extraction backfills them.
+            //
+            // Reference: `docs/v1.6-v1.7-spec.md` §4.1
+            //   + `docs/v1.5.5-compaction-fidelity-final.md` (substrate gates)
+            //   + `nullalis_audit.md` §E.1 (gap mapping)
+
+            // V1.6 atomic-fact extraction (Mem0/Graphiti typed-edge schema)
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS subject TEXT",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS predicate TEXT",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS object_key TEXT",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS link_type TEXT",
+            // attribution: 'agent_tool' | 'extraction_classifier' | 'compose'
+            //   per spec D4 — distinguishes write-source for cosine-dedup
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS attribution TEXT",
+            // attributed_to: 'user' | 'assistant' | 'assistant_offer'
+            //   per Mem0 V3 — who said the thing the fact reflects
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS attributed_to TEXT",
+
+            // V1.6 Graphiti six-field bi-temporal — extends V1.5's lone valid_to
+            //   created_at exists already (TIMESTAMPTZ system time)
+            //   valid_to exists already (event-time end)
+            //   valid_at = event time when fact became true
+            //   invalid_at = event time when fact stopped (synonym for valid_to but
+            //     kept distinct in case future refinements need both)
+            //   expired_at = system time of close-out (when the row was
+            //     marked superseded; differs from invalid_at when correcting
+            //     historical facts)
+            //   reference_time = originating episode's valid_at
+            //   episodes[] = source episode/session UUIDs (multi-source attribution)
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS valid_at BIGINT",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS invalid_at BIGINT",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS expired_at BIGINT",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS reference_time BIGINT",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS episodes TEXT[] DEFAULT '{}'",
+
+            // V1.6 retrieval + supersession (Mem0 + supermemory parity)
+            //   lemmatized = pre-processed BM25 surface (V1.6 commit 3 wires)
+            //   is_latest = false on superseded rows (supermemory parity)
+            //   parent_memory_id = supermemory-style version chain
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS lemmatized TEXT",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS is_latest BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS parent_memory_id TEXT",
+
+            // V1.6 source attribution (M4 from spec §4.10) — answer "where
+            // did ZAKI learn this?" on the brain page. existing schema has
+            // source_channel + source_message_id; V1.6 adds session_id +
+            // snippet for /brain/memory/{key} drilldown UX.
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS source_session_id TEXT",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS source_snippet TEXT",
+
+            // V1.6 indexes — partial where the field is sparsely populated
+            "CREATE INDEX IF NOT EXISTS idx_memories_subject ON {schema}.memories(user_id, subject) WHERE subject IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_memories_object_key ON {schema}.memories(user_id, object_key) WHERE object_key IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_memories_parent ON {schema}.memories(user_id, parent_memory_id) WHERE parent_memory_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_memories_is_latest ON {schema}.memories(user_id, is_latest) WHERE is_latest = TRUE",
+            // GIN over lemmatized field — V1.6 commit 3 will populate the
+            // column + switch BM25 surface to use this index.
+            "CREATE INDEX IF NOT EXISTS idx_memories_lemmatized ON {schema}.memories USING gin (to_tsvector('simple', lemmatized))",
+
+            // V1.6 entity vector plane (separate from memory_vectors per
+            // spec §D7 — entity-name embeddings live at different
+            // granularity than memory-content embeddings; mixing them
+            // cross-contaminates cosine ANN). Used by V1.6 commit 7
+            // entity coreference (cosine ≥ 0.95 threshold per Mem0).
+            // VECTOR(1024) matches the production embedding model
+            // intfloat/multilingual-e5-large-instruct (config.json:90).
+            // pgvector requires a dimension on columns indexed by ivfflat;
+            // changing model dimensions in the future requires a migration.
+            \\CREATE TABLE IF NOT EXISTS {schema}.memory_entities (
+            \\    id TEXT PRIMARY KEY,
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    name TEXT NOT NULL,
+            \\    name_lower TEXT NOT NULL,
+            \\    entity_type TEXT NOT NULL DEFAULT 'PROPER',
+            \\    name_embedding VECTOR(1024),
+            \\    linked_memory_ids TEXT[] DEFAULT '{}',
+            \\    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            \\    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            \\    UNIQUE (user_id, name_lower)
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_entities_user ON {schema}.memory_entities(user_id)",
+            // ivfflat lists tuned for 5-50K rows per user; revisit if
+            // production sees larger entity counts (uncommon — entities
+            // are typically nouns/proper-names, much sparser than memories)
+            "CREATE INDEX IF NOT EXISTS idx_entities_vec ON {schema}.memory_entities USING ivfflat (name_embedding vector_cosine_ops) WITH (lists = 100)",
             \\CREATE TABLE IF NOT EXISTS {schema}.memory_events (
             \\    id TEXT PRIMARY KEY,
             \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
@@ -3829,6 +3921,146 @@ test "BRAIN_USER_KEY_FILTER mirrors memory_root.isBrainVisibleKey" {
     }
     for (memory_root.BRAIN_HIDDEN_EXACT_KEYS) |exact| {
         try std.testing.expect(std.mem.indexOf(u8, filter, exact) != null);
+    }
+}
+
+test "V1.6 schema migration applies cleanly + memory_entities round-trips" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    // First migrate — fresh schema
+    try mgr.migrate();
+
+    // Second migrate — must be idempotent (re-running on populated DB)
+    try mgr.migrate();
+
+    // ── Verify all V1.6 columns exist on memories ─────────────────────
+    const expected_columns = [_][]const u8{
+        // V1.6 atomic-fact extraction
+        "subject", "predicate", "object_key", "link_type",
+        "attribution", "attributed_to",
+        // V1.6 Graphiti six-field bi-temporal
+        "valid_at", "invalid_at", "expired_at",
+        "reference_time", "episodes",
+        // V1.6 retrieval + supersession
+        "lemmatized", "is_latest", "parent_memory_id",
+        // V1.6 source attribution (M4)
+        "source_session_id", "source_snippet",
+    };
+
+    for (expected_columns) |col| {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT column_name FROM information_schema.columns " ++
+                "WHERE table_schema = '{s}' AND table_name = 'memories' " ++
+                "AND column_name = '{s}'",
+            .{ schema, col },
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) != 1) {
+            std.debug.print("V1.6 column missing: {s}\n", .{col});
+            return error.MissingColumn;
+        }
+    }
+
+    // ── Verify memory_entities table exists + round-trips a row ───────
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const insert_q = try std.fmt.allocPrint(
+        allocator,
+        "INSERT INTO {s}.memory_entities (id, user_id, name, name_lower, entity_type) " ++
+            "VALUES ('ent-1', 2, 'Alex', 'alex', 'PROPER')",
+        .{schema},
+    );
+    defer allocator.free(insert_q);
+    const ins_result = try mgr.exec(insert_q);
+    c.PQclear(ins_result);
+
+    const select_q = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id, name, name_lower, entity_type FROM {s}.memory_entities WHERE user_id = 2",
+        .{schema},
+    );
+    defer allocator.free(select_q);
+    const sel_result = try mgr.exec(select_q);
+    defer c.PQclear(sel_result);
+    try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(sel_result));
+
+    const id = try dupeResultValue(allocator, sel_result, 0, 0);
+    defer allocator.free(id);
+    const name = try dupeResultValue(allocator, sel_result, 0, 1);
+    defer allocator.free(name);
+    const name_lower = try dupeResultValue(allocator, sel_result, 0, 2);
+    defer allocator.free(name_lower);
+
+    try std.testing.expectEqualStrings("ent-1", id);
+    try std.testing.expectEqualStrings("Alex", name);
+    try std.testing.expectEqualStrings("alex", name_lower);
+
+    // ── Verify the partial indexes exist ───────────────────────────────
+    const index_q = try std.fmt.allocPrint(
+        allocator,
+        "SELECT indexname FROM pg_indexes WHERE schemaname = '{s}' " ++
+            "AND tablename IN ('memories', 'memory_entities') " ++
+            "ORDER BY indexname",
+        .{schema},
+    );
+    defer allocator.free(index_q);
+    const idx_result = try mgr.exec(index_q);
+    defer c.PQclear(idx_result);
+
+    const expected_indexes = [_][]const u8{
+        "idx_entities_user",
+        "idx_entities_vec",
+        "idx_memories_is_latest",
+        "idx_memories_lemmatized",
+        "idx_memories_object_key",
+        "idx_memories_parent",
+        "idx_memories_subject",
+    };
+
+    var found_indexes: std.StringHashMapUnmanaged(void) = .{};
+    defer found_indexes.deinit(allocator);
+    const tuples = c.PQntuples(idx_result);
+    var i: c_int = 0;
+    while (i < tuples) : (i += 1) {
+        const idx_name = try dupeResultValue(allocator, idx_result, i, 0);
+        try found_indexes.put(allocator, idx_name, {});
+    }
+    defer {
+        var it = found_indexes.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+    }
+
+    for (expected_indexes) |idx_name| {
+        if (!found_indexes.contains(idx_name)) {
+            std.debug.print("V1.6 index missing: {s}\n", .{idx_name});
+            return error.MissingIndex;
+        }
     }
 }
 
