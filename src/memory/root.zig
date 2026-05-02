@@ -394,6 +394,30 @@ pub fn freeEntries(allocator: std.mem.Allocator, entries: []MemoryEntry) void {
     allocator.free(entries);
 }
 
+/// V1.6 commit 7 — typed edge in the materialized graph (`memory_edges`
+/// table). Mirrors the (subject, predicate, object) triples extracted by
+/// compaction Pass C, but addressable as a real row (vs. JSONB-derived
+/// reconstruction). Bi-temporal close-out cascades from
+/// `setMemoryInvalidation` via `valid_to` mirroring the source memory.
+pub const TypedEdge = struct {
+    source_key: []const u8,
+    target_key: []const u8,
+    predicate: []const u8,
+    confidence: f64 = 1.0,
+    weight: f64 = 1.0,
+
+    pub fn deinit(self: *const TypedEdge, allocator: std.mem.Allocator) void {
+        allocator.free(self.source_key);
+        allocator.free(self.target_key);
+        allocator.free(self.predicate);
+    }
+};
+
+pub fn freeTypedEdges(allocator: std.mem.Allocator, edges: []TypedEdge) void {
+    for (edges) |*e| e.deinit(allocator);
+    allocator.free(edges);
+}
+
 pub const PromptBootstrapKeyPrefix = "__bootstrap.prompt.";
 pub const TombstoneKeyPrefix = "__tombstone__/";
 

@@ -367,6 +367,17 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn setMemoryInvalidation(_: *@This(), _: i64, _: []const u8, _: i64, _: i64) !void {
         return;
     }
+    /// V1.6 commit 7 — stub for non-postgres builds. Edge writes silently
+    /// no-op; the materialized graph is a postgres-only feature today.
+    pub fn upsertMemoryEdge(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8, _: ?[]const u8, _: ?f64) !void {
+        return;
+    }
+    pub fn countEdgesForSource(_: *@This(), _: i64, _: []const u8) !usize {
+        return 0;
+    }
+    pub fn listEdgesForUser(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]memory_root.TypedEdge {
+        return allocator.alloc(memory_root.TypedEdge, 0);
+    }
     pub fn countMemories(_: *@This(), _: i64) !usize {
         return error.PostgresNotEnabled;
     }
@@ -1092,6 +1103,56 @@ const ManagerImpl = struct {
             // production sees larger entity counts (uncommon — entities
             // are typically nouns/proper-names, much sparser than memories)
             "CREATE INDEX IF NOT EXISTS idx_entities_vec ON {schema}.memory_entities USING ivfflat (name_embedding vector_cosine_ops) WITH (lists = 100)",
+
+            // V1.6 commit 7 — materialized typed-edge graph (Gap 1 from
+            // memory pipeline handoff 2026-05-02).
+            //
+            // Until now the (subject, predicate, object) triples lived ONLY
+            // in JSONB metadata, requiring an O(N) seq-scan in
+            // gateway.buildBrainTypedEdges to reconstruct the graph on each
+            // /brain/graph request. Real edges in a real table:
+            //   - speed up brain rendering (index lookups vs JSONB extraction)
+            //   - unblock graph-aware retrieval (neighbor traversal)
+            //   - feed real edge_count into importance scoring (was half-blind
+            //     when called outside the brain-graph context)
+            //
+            // Schema follows the same bi-temporal model as memories:
+            //   valid_to / invalid_at / expired_at — set when the source or
+            //     target memory is closed-out via setMemoryInvalidation
+            //     (cascading from V1.6 cmt6).
+            //   is_latest — supermemory parity; UI filters default to TRUE.
+            //   confidence — pulled from extraction LLM's per-fact confidence.
+            //   attribution — 'extraction_classifier' today; future write
+            //     paths (agent_tool, compose) tag their origin.
+            //
+            // UNIQUE (user_id, source_key, predicate, target_key) WHERE is_latest
+            //   ensures the same triple cannot accumulate duplicate edges
+            //   (defends against Pass C re-extracting the same fact across
+            //   sessions — pairs with V1.6 5b.3 MD5 dedup at the memory level).
+            \\CREATE TABLE IF NOT EXISTS {schema}.memory_edges (
+            \\    id BIGSERIAL PRIMARY KEY,
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    source_key TEXT NOT NULL,
+            \\    target_key TEXT NOT NULL,
+            \\    predicate TEXT NOT NULL,
+            \\    attribution TEXT,
+            \\    confidence FLOAT,
+            \\    weight FLOAT NOT NULL DEFAULT 1.0,
+            \\    valid_from BIGINT,
+            \\    valid_to BIGINT,
+            \\    invalid_at BIGINT,
+            \\    expired_at BIGINT,
+            \\    is_latest BOOLEAN NOT NULL DEFAULT TRUE,
+            \\    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_edges_source ON {schema}.memory_edges(user_id, source_key) WHERE is_latest",
+            "CREATE INDEX IF NOT EXISTS idx_edges_target ON {schema}.memory_edges(user_id, target_key) WHERE is_latest",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_triple ON {schema}.memory_edges(user_id, source_key, predicate, target_key) WHERE is_latest",
+            // Validity index — drives the cascade-on-close from
+            // setMemoryInvalidation. Partial because invalid edges are
+            // append-only / archived, not actively queried.
+            "CREATE INDEX IF NOT EXISTS idx_edges_validity ON {schema}.memory_edges(user_id, valid_to) WHERE valid_to IS NOT NULL",
             \\CREATE TABLE IF NOT EXISTS {schema}.memory_events (
             \\    id TEXT PRIMARY KEY,
             \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
@@ -3237,6 +3298,161 @@ const ManagerImpl = struct {
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
+
+        // V1.6 commit 7 — cascade close-out to memory_edges. Any edge whose
+        // source OR target is the closed-out memory key gets the same
+        // bi-temporal close-out columns set + is_latest=false. This keeps
+        // graph traversal consistent: a closed-out fact's edges vanish
+        // alongside the node from is_latest queries.
+        const cascade_q = try self.buildQuery(
+            "UPDATE {schema}.memory_edges SET " ++
+                "valid_to = $3, " ++
+                "invalid_at = $3, " ++
+                "expired_at = $4, " ++
+                "is_latest = FALSE " ++
+                "WHERE user_id = $1 AND (source_key = $2 OR target_key = $2) AND is_latest",
+        );
+        defer self.allocator.free(cascade_q);
+        const cascade_result = try self.execParams(cascade_q, &params, &lengths);
+        defer c.PQclear(cascade_result);
+    }
+
+    /// V1.6 commit 7 — write a typed edge into the materialized graph.
+    /// ON CONFLICT on the unique triple (user_id, source_key, predicate,
+    /// target_key) WHERE is_latest — re-extracting the same triple just
+    /// bumps confidence + weight; no duplicate row.
+    ///
+    /// Idempotent. Called from extraction_persist.persistExtracted after
+    /// the contradiction judge resolves (so closed-out triples are
+    /// already cleared by setMemoryInvalidation's cascade above).
+    pub fn upsertMemoryEdge(
+        self: *Self,
+        user_id: i64,
+        source_key: []const u8,
+        target_key: []const u8,
+        predicate: []const u8,
+        attribution: ?[]const u8,
+        confidence: ?f64,
+    ) !void {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.memory_edges " ++
+                "(user_id, source_key, target_key, predicate, attribution, confidence, valid_from) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW())::bigint) " ++
+                "ON CONFLICT (user_id, source_key, predicate, target_key) WHERE is_latest " ++
+                "DO UPDATE SET " ++
+                "confidence = COALESCE(EXCLUDED.confidence, {schema}.memory_edges.confidence), " ++
+                "weight = {schema}.memory_edges.weight + 1.0, " ++
+                "attribution = COALESCE(EXCLUDED.attribution, {schema}.memory_edges.attribution)",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const src_z = try self.allocator.dupeZ(u8, source_key);
+        defer self.allocator.free(src_z);
+        const tgt_z = try self.allocator.dupeZ(u8, target_key);
+        defer self.allocator.free(tgt_z);
+        const pred_z = try self.allocator.dupeZ(u8, predicate);
+        defer self.allocator.free(pred_z);
+        const attr_text = attribution orelse "";
+        const attr_z = try self.allocator.dupeZ(u8, attr_text);
+        defer self.allocator.free(attr_z);
+        var conf_buf: [32]u8 = undefined;
+        const conf_text = if (confidence) |cv| try std.fmt.bufPrintZ(&conf_buf, "{d:.6}", .{cv}) else "";
+        const conf_z = try self.allocator.dupeZ(u8, conf_text);
+        defer self.allocator.free(conf_z);
+        const params = [_]?[*:0]const u8{
+            user_s.ptr,
+            src_z,
+            tgt_z,
+            pred_z,
+            if (attr_text.len == 0) null else attr_z,
+            if (confidence == null) null else conf_z,
+        };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(source_key.len),
+            @intCast(target_key.len),
+            @intCast(predicate.len),
+            @intCast(attr_text.len),
+            @intCast(conf_text.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+    }
+
+    /// V1.6 commit 7 — degree-count for a memory key in the active graph.
+    /// Uses the partial index `idx_edges_source` for O(log N) lookup.
+    /// Returns the number of edges where this key is the source AND
+    /// the edge is still latest. Feeds importance scoring caller in
+    /// gateway.handleBrainGraph (replaces the JSONB-derived typed_edges
+    /// degree counter).
+    pub fn countEdgesForSource(self: *Self, user_id: i64, source_key: []const u8) !usize {
+        const q = try self.buildQuery(
+            "SELECT COUNT(*) FROM {schema}.memory_edges " ++
+                "WHERE user_id = $1 AND source_key = $2 AND is_latest",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const src_z = try self.allocator.dupeZ(u8, source_key);
+        defer self.allocator.free(src_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, src_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(source_key.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const text = try dupeResultValue(self.allocator, result, 0, 0);
+        defer self.allocator.free(text);
+        return try std.fmt.parseInt(usize, text, 10);
+    }
+
+    /// V1.6 commit 7 — list all active edges for a user. Used by
+    /// gateway.handleBrainGraph to render the typed-edge surface — replaces
+    /// the JSONB-derived `buildBrainTypedEdges` reconstruction with a real
+    /// table read. Caller frees each TypedEdge + the slice via
+    /// memory_root.freeTypedEdges.
+    pub fn listEdgesForUser(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]memory_root.TypedEdge {
+        const q = try self.buildQuery(
+            "SELECT source_key, target_key, predicate, COALESCE(confidence, 1.0), weight " ++
+                "FROM {schema}.memory_edges " ++
+                "WHERE user_id = $1 AND is_latest " ++
+                "ORDER BY weight DESC, source_key ASC",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const tuples = c.PQntuples(result);
+        var out: std.ArrayListUnmanaged(memory_root.TypedEdge) = .{};
+        errdefer {
+            for (out.items) |*e| e.deinit(allocator);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const src = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(src);
+            const tgt = try dupeResultValue(allocator, result, i, 1);
+            errdefer allocator.free(tgt);
+            const pred = try dupeResultValue(allocator, result, i, 2);
+            errdefer allocator.free(pred);
+            const conf_str = try dupeResultValue(allocator, result, i, 3);
+            defer allocator.free(conf_str);
+            const weight_str = try dupeResultValue(allocator, result, i, 4);
+            defer allocator.free(weight_str);
+            const conf = std.fmt.parseFloat(f64, conf_str) catch 1.0;
+            const weight = std.fmt.parseFloat(f64, weight_str) catch 1.0;
+            try out.append(allocator, .{
+                .source_key = src,
+                .target_key = tgt,
+                .predicate = pred,
+                .confidence = conf,
+                .weight = weight,
+            });
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     /// Delete autosave_user_* and autosave_assistant_* memory rows for the
@@ -4618,7 +4834,7 @@ test "V1.6 schema migration applies cleanly + memory_entities round-trips" {
     const index_q = try std.fmt.allocPrint(
         allocator,
         "SELECT indexname FROM pg_indexes WHERE schemaname = '{s}' " ++
-            "AND tablename IN ('memories', 'memory_entities') " ++
+            "AND tablename IN ('memories', 'memory_entities', 'memory_edges') " ++
             "ORDER BY indexname",
         .{schema},
     );
@@ -4627,6 +4843,10 @@ test "V1.6 schema migration applies cleanly + memory_entities round-trips" {
     defer c.PQclear(idx_result);
 
     const expected_indexes = [_][]const u8{
+        "idx_edges_source",
+        "idx_edges_target",
+        "idx_edges_triple",
+        "idx_edges_validity",
         "idx_entities_user",
         "idx_entities_vec",
         "idx_memories_is_latest",
@@ -6288,5 +6508,101 @@ test "V1.6 commit 6 × V1.7 W-INT-01 resurrect-on-upsert clears close-out cols" 
     {
         const closed_core = try mgr.getMemory(allocator, 2, "core_stays_closed");
         try std.testing.expect(closed_core == null); // still hidden — core close-out preserved
+    }
+}
+
+// V1.6 commit 7 — memory_edges round-trip + dedup + cascade-close-out.
+//
+// Acceptance gates per spec: (a) upsertMemoryEdge inserts a row and the
+// UNIQUE INDEX on (user_id, source_key, predicate, target_key) WHERE
+// is_latest dedupes re-writes (weight bumps instead); (b) countEdgesForSource
+// returns the active edge count; (c) listEdgesForUser returns active edges;
+// (d) setMemoryInvalidation cascades — closing a memory closes its edges.
+test "V1.6 commit 7 memory_edges insert + dedup + cascade-on-close" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Seed a parent memory + an edge from it
+    try mgr.upsertMemoryWithMetadata(2, "extracted_helix_pref",
+        "User prefers Helix",
+        .daily, "session-A",
+        \\{"subject":"user","predicate":"PREFERS","object_key":"Helix","attributed_to":"user","attribution":"extraction_classifier","confidence":0.95}
+    );
+    try mgr.upsertMemoryEdge(2, "extracted_helix_pref", "entity_helix", "PREFERS", "extraction_classifier", 0.95);
+
+    // ── Step A: countEdgesForSource sees the active edge
+    {
+        const n = try mgr.countEdgesForSource(2, "extracted_helix_pref");
+        try std.testing.expectEqual(@as(usize, 1), n);
+    }
+
+    // ── Step B: re-insert same triple — UNIQUE INDEX dedupes (weight bumps to 2.0)
+    try mgr.upsertMemoryEdge(2, "extracted_helix_pref", "entity_helix", "PREFERS", "extraction_classifier", 0.99);
+    {
+        const n = try mgr.countEdgesForSource(2, "extracted_helix_pref");
+        try std.testing.expectEqual(@as(usize, 1), n); // still 1 — deduped
+    }
+
+    // ── Step C: different triple from same source → new edge
+    try mgr.upsertMemoryEdge(2, "extracted_helix_pref", "entity_neovim", "REPLACES", "extraction_classifier", 0.85);
+    {
+        const n = try mgr.countEdgesForSource(2, "extracted_helix_pref");
+        try std.testing.expectEqual(@as(usize, 2), n);
+    }
+
+    // ── Step D: listEdgesForUser returns both active edges
+    {
+        const edges = try mgr.listEdgesForUser(allocator, 2);
+        defer memory_root.freeTypedEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+    }
+
+    // ── Step E: cascade close-out — closing the memory closes its edges
+    const close_ts: i64 = std.time.timestamp();
+    try mgr.setMemoryInvalidation(2, "extracted_helix_pref", close_ts, close_ts);
+    {
+        const n = try mgr.countEdgesForSource(2, "extracted_helix_pref");
+        try std.testing.expectEqual(@as(usize, 0), n); // cascade fired — edges hidden
+    }
+    {
+        const edges = try mgr.listEdgesForUser(allocator, 2);
+        defer memory_root.freeTypedEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+
+    // ── Step F: cascade audit — direct SQL confirms is_latest=false on closed edges
+    {
+        const audit_q = try std.fmt.allocPrint(allocator,
+            "SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND is_latest = FALSE",
+            .{schema},
+        );
+        defer allocator.free(audit_q);
+        const result = try mgr.exec(audit_q);
+        defer c.PQclear(result);
+        const closed_count_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(closed_count_str);
+        try std.testing.expectEqualStrings("2", closed_count_str); // both edges closed
     }
 }

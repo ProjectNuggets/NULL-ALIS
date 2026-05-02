@@ -261,19 +261,47 @@ fn categoryForAttribution(attributed_to: []const u8) memory_root.MemoryCategory 
     return .daily;
 }
 
-/// Generate a key for a compaction-derived extracted memory. Shape:
-/// `extracted_<unix_seconds>_<hex8>`. The `extracted_` prefix is added
-/// to `BRAIN_HIDDEN_PREFIXES` (TODO V1.7) — for V1.6 these surface on
-/// /brain/* directly, which is the desired "your son thinks" UX. The
-/// hex8 suffix avoids collisions on rapid-fire writes within the same
-/// second.
-fn deriveExtractionKey(allocator: std.mem.Allocator) ![]u8 {
-    const ts: i64 = std.time.timestamp();
-    var random_bytes: [4]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
-    var hex_buf: [8]u8 = undefined;
-    _ = security_secrets.hexEncode(&random_bytes, &hex_buf);
-    return std.fmt.allocPrint(allocator, "extracted_{d}_{s}", .{ ts, hex_buf });
+/// V1.6 commit 7 (Gap 2 from memory pipeline handoff): deterministic key
+/// derivation via SHA-256 of `subject|predicate|object`. Same fact extracted
+/// across different sessions / different times maps to the SAME key.
+///
+/// **Why this matters:** the contradiction judge prevents writes that
+/// duplicate semantics, but write paths that BYPASS the judge (session-end
+/// loop, agent memory_store tool — Gap 3) could otherwise accumulate
+/// phantom nodes for the same fact under different random keys. Stable
+/// keys make the judge's role purely "should we close out the prior
+/// version" rather than "should we suppress this write".
+///
+/// Pairs with the V1.6 5b.3 MD5 content_hash dedup pre-filter:
+///   - MD5 catches re-extractions with byte-identical text → silent skip
+///   - Stable key catches re-extractions with rephrased text + identical
+///     (subject, predicate, object) triple → ON CONFLICT DO UPDATE on the
+///     same row, which the W-INT-01 fix's resurrect-on-upsert handles.
+///
+/// SHA-256 truncated to 16 hex chars = 64 bits of entropy. Collision
+/// probability for 1M extracted facts per user: ~2.7e-8. Acceptable.
+///
+/// Pre-V1.6 cmt7 extraction_<unix>_<hex8> rows survive untouched — they
+/// just don't dedupe across re-extractions. New writes use the stable
+/// shape going forward; one-shot backfill (V1.6 cmt15) will rekey legacy
+/// rows if needed.
+fn deriveExtractionKey(
+    allocator: std.mem.Allocator,
+    subject: []const u8,
+    predicate: []const u8,
+    object: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(subject);
+    hasher.update("|");
+    hasher.update(predicate);
+    hasher.update("|");
+    hasher.update(object);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    var hex_buf: [16]u8 = undefined;
+    _ = security_secrets.hexEncode(digest[0..8], &hex_buf);
+    return std.fmt.allocPrint(allocator, "extracted_{s}", .{hex_buf});
 }
 
 /// Build the metadata JSON for an extracted memory. Format:
@@ -492,8 +520,12 @@ pub fn persistExtracted(
             }
         }
 
-        // Step 4-5 — derive key + metadata + write
-        const key = deriveExtractionKey(allocator) catch |err| {
+        // Step 4-5 — derive key + metadata + write.
+        // V1.6 cmt7 (Gap 2): key is deterministic from (subject, predicate,
+        // object) so re-extracting the same fact across sessions hits the
+        // same row via ON CONFLICT (the W-INT-01 resurrect-on-upsert path
+        // takes care of any prior close-out state).
+        const key = deriveExtractionKey(allocator, m.subject, m.predicate, m.object) catch |err| {
             log.warn("extraction.key_derivation_failed err={s}", .{@errorName(err)});
             result.failed_count += 1;
             continue;
@@ -522,6 +554,41 @@ pub fn persistExtracted(
             continue;
         };
 
+        // V1.6 commit 7 (Gap 1 from memory pipeline handoff): materialize
+        // the typed edge into memory_edges. Source key is the just-written
+        // memory row; target key is a synthetic entity ref derived from
+        // (subject, object). For "user PREFERS Helix":
+        //   source_key = "extracted_<hash(user|PREFERS|Helix)>"  (this row)
+        //   target_key = "entity_<hash(Helix)>"                  (target side)
+        //   predicate  = "PREFERS"
+        // V1.6 commit 8 (entity coreference) will populate the target side
+        // with stable entity IDs from memory_entities; for now the synthetic
+        // entity_<hash(object)> shape gives us a queryable graph.
+        //
+        // Failure mode: edge write failure does NOT abort persistence.
+        // The memory row is already written; an orphan-without-edge is
+        // benign (importance scoring sees edge_count=0 for that node, same
+        // as pre-V1.6cmt7 baseline).
+        const target_key = deriveEntityKey(allocator, m.object) catch |err| blk: {
+            log.warn("extraction.edge_target_failed err={s}", .{@errorName(err)});
+            break :blk @as(?[]u8, null);
+        };
+        if (target_key) |tk| {
+            defer allocator.free(tk);
+            state_mgr.upsertMemoryEdge(
+                user_id,
+                key,
+                tk,
+                m.predicate,
+                "extraction_classifier",
+                m.confidence,
+            ) catch |err| {
+                log.warn("extraction.edge_write_failed source={s} target={s} predicate={s} err={s}", .{
+                    key, tk, m.predicate, @errorName(err),
+                });
+            };
+        }
+
         log.info("extraction.persisted key={s} subject={s} predicate={s} attributed_to={s}", .{
             key, m.subject, m.predicate, m.attributed_to,
         });
@@ -529,6 +596,32 @@ pub fn persistExtracted(
     }
 
     return result;
+}
+
+/// V1.6 commit 7 — derive a stable entity-side target key from an object
+/// string. Shape: `entity_<sha256(lower(object))[0..16]>`. Lowercase to
+/// stabilize against capitalization variance ("Helix" vs "helix").
+///
+/// V1.6 commit 8 (entity coreference) will replace this with a real
+/// memory_entities lookup that handles "Helix" / "Helix editor" /
+/// "the helix editor" cosine-merging. Today's hash gives us a consistent
+/// target key for the graph topology; coreference can rewrite later
+/// without losing existing edges (the edge UNIQUE INDEX includes
+/// target_key so re-keying generates fresh edges + cascades old ones via
+/// is_latest=false).
+fn deriveEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
+    var lower_buf: [256]u8 = undefined;
+    const lower = if (object.len <= lower_buf.len) blk: {
+        for (object, 0..) |ch, i| lower_buf[i] = std.ascii.toLower(ch);
+        break :blk lower_buf[0..object.len];
+    } else object;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(lower);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    var hex_buf: [16]u8 = undefined;
+    _ = security_secrets.hexEncode(digest[0..8], &hex_buf);
+    return std.fmt.allocPrint(allocator, "entity_{s}", .{hex_buf});
 }
 
 /// V1.6 commit 6 helper — drop entries from `xs` whose key appears in
