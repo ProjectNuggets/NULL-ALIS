@@ -146,6 +146,32 @@ fn memoryRuntimePtr(self: anytype) ?*memory_mod.MemoryRuntime {
     return if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
 }
 
+/// V1.6 cmt9.5 — derive a hash-stable entity key from an `object` string,
+/// mirroring extraction_persist.deriveEntityKey shape so session-end edges
+/// land on the SAME entity nodes that compaction Pass C extraction creates.
+/// `entity_<sha256(lower(object))[0..16]>`. Lowercase normalizes capitalization
+/// variance ("Helix" vs "helix"). Cmt8 entity coreference (cosine ≥0.95) is
+/// not plumbed here — commands.zig has no embedding provider in scope; full
+/// coref requires routing through extraction_persist (cmt9.6 follow-up).
+fn deriveSessionEndEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
+    var lower_buf: [256]u8 = undefined;
+    const lower = if (object.len <= lower_buf.len) blk: {
+        for (object, 0..) |ch, i| lower_buf[i] = std.ascii.toLower(ch);
+        break :blk lower_buf[0..object.len];
+    } else object;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(lower);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    var hex_buf: [16]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (digest[0..8], 0..) |b, i| {
+        hex_buf[i * 2] = hex_chars[b >> 4];
+        hex_buf[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+    return std.fmt.allocPrint(allocator, "entity_{s}", .{hex_buf});
+}
+
 fn setModelName(self: anytype, model: []const u8) !void {
     const owned_model = try self.allocator.dupe(u8, model);
     if (self.model_name_owned) self.allocator.free(self.model_name);
@@ -1261,6 +1287,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     updateTimelineIndex(self.allocator, mem, rt, session_id, now_iso, focus, timeline_key, summary_origin);
 
     if (parsed_summary) |parsed| {
+        var triple_edges_written: usize = 0;
         for (parsed.extracted_facts, 0..) |fact, idx| {
             const fact_key = std.fmt.allocPrint(
                 self.allocator,
@@ -1270,13 +1297,59 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             defer self.allocator.free(fact_key);
             if (mem.store(fact_key, fact.content, .core, null)) |_| {
                 if (rt) |mem_rt| _ = mem_rt.syncVectorAfterStore(self.allocator, fact_key, fact.content);
-            } else |_| {}
+            } else |_| {
+                continue;
+            }
+
+            // V1.6 cmt9.5 (Gap 3): when the LLM emitted a structured triple
+            // alongside the prose Key fact (===EXTRACTED=== JSON tail), also
+            // write an edge to memory_edges so the session-end fact joins
+            // the materialized graph. Source is the durable_fact row we
+            // just wrote (continuity-bucket; agent context preserved);
+            // target is a hash-derived entity key (V1.6 cmt7 shape — cmt8
+            // entity coreference is intentionally NOT plumbed here, since
+            // commands.zig doesn't have an embedding provider in scope and
+            // adding one through the agent surface is a separate refactor).
+            //
+            // This is partial Gap 3: edges flow into the graph from the
+            // session-end loop. Full Gap 3 (judge + coref + unified write)
+            // would route fact through extraction_persist.persistExtracted
+            // BUT that introduces a duplicate memory row (extracted_<hash>
+            // alongside durable_fact/...), which would need memory_loader
+            // continuity changes. Deferred as cmt9.6 follow-up; the edge
+            // emission here delivers the graph-completeness win without
+            // destabilizing continuity.
+            if (fact.hasTriple()) {
+                if (self.extraction_state_mgr) |smgr| {
+                    if (self.extraction_user_id) |uid| {
+                        const target_key = deriveSessionEndEntityKey(self.allocator, fact.object.?) catch null;
+                        if (target_key) |tk| {
+                            defer self.allocator.free(tk);
+                            smgr.upsertMemoryEdge(
+                                uid,
+                                fact_key,
+                                tk,
+                                fact.predicate.?,
+                                "session_end_loop",
+                                fact.confidence,
+                            ) catch |err| {
+                                log.warn("session_end edge write failed key={s} predicate={s} err={s}", .{
+                                    fact_key, fact.predicate.?, @errorName(err),
+                                });
+                                continue;
+                            };
+                            triple_edges_written += 1;
+                        }
+                    }
+                }
+            }
         }
-        log.info("memory.timeline_summary status=ok session={s} reason={s} entries={d} facts={d} next={s}", .{
+        log.info("memory.timeline_summary status=ok session={s} reason={s} entries={d} facts={d} edges={d} next={s}", .{
             session_id,
             reason,
             entries.len,
             parsed.extracted_facts.len,
+            triple_edges_written,
             next,
         });
     }
