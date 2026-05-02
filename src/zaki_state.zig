@@ -12,6 +12,7 @@ const build_options = @import("build_options");
 const config_types = @import("config_types.zig");
 const env_rebrand = @import("env_rebrand.zig");
 const memory_root = @import("memory/root.zig");
+const text_norm = @import("memory/text_norm.zig");
 const cron_mod = @import("cron.zig");
 const security_secrets = @import("security/secrets.zig");
 
@@ -1013,6 +1014,14 @@ const ManagerImpl = struct {
             // GIN over lemmatized field — V1.6 commit 3 will populate the
             // column + switch BM25 surface to use this index.
             "CREATE INDEX IF NOT EXISTS idx_memories_lemmatized ON {schema}.memories USING gin (to_tsvector('simple', lemmatized))",
+            // V1.6 commit 3 lazy backfill — populate `lemmatized` for any
+            // pre-V1.6 row that doesn't have it yet. Uses Postgres's
+            // Unicode-aware `lower()` (multilingual-safe). New writes go
+            // through the richer Zig `lemmatizeForBm25` path with stopword
+            // removal; backfill is intentionally a strict subset (basic
+            // lowercasing) to avoid running heuristics on rows we didn't
+            // capture at write time.
+            "UPDATE {schema}.memories SET lemmatized = lower(content) WHERE lemmatized IS NULL",
 
             // V1.6 entity vector plane (separate from memory_vectors per
             // spec §D7 — entity-name embeddings live at different
@@ -2102,10 +2111,13 @@ const ManagerImpl = struct {
         metadata_json: []const u8,
     ) !void {
         if (session_id) |sid| try self.ensureSession(user_id, sid);
+        // V1.6 commit 3: also write `lemmatized` for BM25 retrieval (same
+        // semantics as upsertMemory; this metadata variant is the path
+        // compose_memory takes).
         const q = try self.buildQuery(
-            "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, metadata, updated_at) " ++
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW()) " ++
-                "ON CONFLICT (user_id, key) DO UPDATE SET session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, memory_type = EXCLUDED.memory_type, metadata = EXCLUDED.metadata, updated_at = NOW() " ++
+            "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, metadata, lemmatized, updated_at) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW()) " ++
+                "ON CONFLICT (user_id, key) DO UPDATE SET session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, memory_type = EXCLUDED.memory_type, metadata = EXCLUDED.metadata, lemmatized = EXCLUDED.lemmatized, updated_at = NOW() " ++
                 "RETURNING id",
         );
         defer self.allocator.free(q);
@@ -2133,6 +2145,11 @@ const ManagerImpl = struct {
         defer self.allocator.free(mem_type_z);
         const metadata_z = try self.allocator.dupeZ(u8, metadata_json);
         defer self.allocator.free(metadata_z);
+        // V1.6 commit 3: BM25 lemmatized form
+        const lemmatized = try text_norm.lemmatizeForBm25(self.allocator, content);
+        defer self.allocator.free(lemmatized);
+        const lemmatized_z = try self.allocator.dupeZ(u8, lemmatized);
+        defer self.allocator.free(lemmatized_z);
 
         const params = [_]?[*:0]const u8{
             id_z,
@@ -2143,6 +2160,7 @@ const ManagerImpl = struct {
             content_hash_z,
             mem_type_z,
             metadata_z,
+            lemmatized_z,
         };
         const lengths = [_]c_int{
             @intCast(id.len),
@@ -2153,6 +2171,7 @@ const ManagerImpl = struct {
             @intCast(content_hash.len),
             @intCast(mem_type.len),
             @intCast(metadata_json.len),
+            @intCast(lemmatized.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -2310,10 +2329,14 @@ const ManagerImpl = struct {
 
     pub fn upsertMemory(self: *Self, user_id: i64, key: []const u8, content: []const u8, category: memory_root.MemoryCategory, session_id: ?[]const u8) !void {
         if (session_id) |sid| try self.ensureSession(user_id, sid);
+        // V1.6 commit 3: also write `lemmatized` for BM25 retrieval. Existing
+        // rows backfilled at migrate via `UPDATE memories SET lemmatized =
+        // lower(content) WHERE lemmatized IS NULL` — new writes use the
+        // richer Zig path with stopword removal.
         const q = try self.buildQuery(
-            "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, updated_at) " ++
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) " ++
-                "ON CONFLICT (user_id, key) DO UPDATE SET session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, memory_type = EXCLUDED.memory_type, updated_at = NOW() " ++
+            "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, updated_at) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) " ++
+                "ON CONFLICT (user_id, key) DO UPDATE SET session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, memory_type = EXCLUDED.memory_type, lemmatized = EXCLUDED.lemmatized, updated_at = NOW() " ++
                 "WHERE {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id OR {schema}.memories.content IS DISTINCT FROM EXCLUDED.content OR {schema}.memories.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR {schema}.memories.memory_type IS DISTINCT FROM EXCLUDED.memory_type " ++
                 "RETURNING id",
         );
@@ -2340,8 +2363,13 @@ const ManagerImpl = struct {
         const mem_type = categoryToMemoryType(category);
         const mem_type_z = try self.allocator.dupeZ(u8, mem_type);
         defer self.allocator.free(mem_type_z);
+        // V1.6 commit 3: BM25 lemmatized form
+        const lemmatized = try text_norm.lemmatizeForBm25(self.allocator, content);
+        defer self.allocator.free(lemmatized);
+        const lemmatized_z = try self.allocator.dupeZ(u8, lemmatized);
+        defer self.allocator.free(lemmatized_z);
 
-        const params = [_]?[*:0]const u8{ id_z, user_s.ptr, if (session_text.len == 0) null else session_z, key_z, content_z, content_hash_z, mem_type_z };
+        const params = [_]?[*:0]const u8{ id_z, user_s.ptr, if (session_text.len == 0) null else session_z, key_z, content_z, content_hash_z, mem_type_z, lemmatized_z };
         const lengths = [_]c_int{
             @intCast(id.len),
             @intCast(user_s.len),
@@ -2350,6 +2378,7 @@ const ManagerImpl = struct {
             @intCast(content.len),
             @intCast(content_hash.len),
             @intCast(mem_type.len),
+            @intCast(lemmatized.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -2441,6 +2470,15 @@ const ManagerImpl = struct {
     }
 
     pub fn recallMemories(self: *Self, allocator: std.mem.Allocator, user_id: i64, query: []const u8, limit: usize, session_id: ?[]const u8) ![]memory_root.MemoryEntry {
+        // V1.6 commit 3: BM25 surface now uses the GIN index on
+        // to_tsvector('simple', lemmatized) instead of `content ILIKE`.
+        // Score formula:
+        //   key ILIKE match → 2.0 (key-shaped query exact-hit)
+        //   lemmatized full-text match → 1.0
+        //   total = sum (max 3.0)
+        // The lemmatized query is computed at runtime so it tokenizes the
+        // same way write-time lemmatization did. Falls back to no-op match
+        // when the lemmatized form is empty (all-stopword or empty query).
         const limit_text = try std.fmt.allocPrint(self.allocator, "{d}", .{limit});
         defer self.allocator.free(limit_text);
         const limit_z = try self.allocator.dupeZ(u8, limit_text);
@@ -2449,19 +2487,56 @@ const ManagerImpl = struct {
         defer self.allocator.free(like);
         const like_z = try self.allocator.dupeZ(u8, like);
         defer self.allocator.free(like_z);
+        // V1.6 commit 3: lemmatize the query for tsquery match
+        const lemmatized_query = try text_norm.lemmatizeForBm25(self.allocator, query);
+        defer self.allocator.free(lemmatized_query);
+        const lemmatized_query_z = try self.allocator.dupeZ(u8, lemmatized_query);
+        defer self.allocator.free(lemmatized_query_z);
         // V1.5 day-2: valid_to at column 6, score moves to column 7. Decoder
         // path tracked via decodeMemoryRows(has_score=true) — column indices
         // are: 0=id, 1=key, 2=content, 3=memory_type, 4=ts_text, 5=session_id,
         // 6=valid_to, 7=score. Filter via MEMORIES_VALIDITY_FILTER constant.
+        //
+        // V1.6: $5 is the pre-lemmatized query string (matches the GIN
+        // index expression `to_tsvector('simple', lemmatized)`). Using
+        // plainto_tsquery so user-supplied query text doesn't need to be
+        // pre-escaped for tsquery operators.
+        // Three signals contributing to recall score (additive):
+        //   key ILIKE match            → 2.0  (key-shaped query exact-hit)
+        //   lemmatized BM25 match      → 1.0  (V1.6 — uses GIN index)
+        //   content substring (ILIKE)  → 0.5  (preserves V1.5 substring
+        //                                       behavior — "pista" finds
+        //                                       "pistachios" — which BM25
+        //                                       full-word matching can't)
+        // Lemmatized full-text match takes precedence in score; content
+        // ILIKE is the fallback that preserves backward-compat behavior
+        // for partial-word queries.
+        // Parameter numbering differs between session-scoped and global:
+        //   With session:    $1=user_id $2=key-ILIKE $3=limit $4=session_id $5=lemma_q
+        //   Without session: $1=user_id $2=key-ILIKE $3=limit $4=lemma_q
+        // Postgres requires every $N to be referenced or castable; we
+        // can't pass an unused null at $4 in the no-session case.
         const q = try self.buildQuery(
             if (session_id != null)
                 "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to, " ++
-                    "(CASE WHEN key ILIKE $2 THEN 2.0 ELSE 0.0 END + CASE WHEN content ILIKE $2 THEN 1.0 ELSE 0.0 END) AS score " ++
-                    "FROM {schema}.memories WHERE user_id = $1 AND session_id = $4 AND (key ILIKE $2 OR content ILIKE $2) AND " ++ MEMORIES_VALIDITY_FILTER ++ " ORDER BY score DESC, updated_at DESC LIMIT $3"
+                    "(CASE WHEN key ILIKE $2 THEN 2.0 ELSE 0.0 END + " ++
+                    "CASE WHEN lemmatized IS NOT NULL AND length($5) > 0 AND to_tsvector('simple', lemmatized) @@ plainto_tsquery('simple', $5) THEN 1.0 ELSE 0.0 END + " ++
+                    "CASE WHEN content ILIKE $2 THEN 0.5 ELSE 0.0 END) AS score " ++
+                    "FROM {schema}.memories WHERE user_id = $1 AND session_id = $4 AND " ++
+                    "(key ILIKE $2 OR " ++
+                    "(lemmatized IS NOT NULL AND length($5) > 0 AND to_tsvector('simple', lemmatized) @@ plainto_tsquery('simple', $5)) OR " ++
+                    "content ILIKE $2) AND " ++
+                    MEMORIES_VALIDITY_FILTER ++ " ORDER BY score DESC, updated_at DESC LIMIT $3"
             else
                 "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to, " ++
-                    "(CASE WHEN key ILIKE $2 THEN 2.0 ELSE 0.0 END + CASE WHEN content ILIKE $2 THEN 1.0 ELSE 0.0 END) AS score " ++
-                    "FROM {schema}.memories WHERE user_id = $1 AND (key ILIKE $2 OR content ILIKE $2) AND " ++ MEMORIES_VALIDITY_FILTER ++ " ORDER BY score DESC, updated_at DESC LIMIT $3",
+                    "(CASE WHEN key ILIKE $2 THEN 2.0 ELSE 0.0 END + " ++
+                    "CASE WHEN lemmatized IS NOT NULL AND length($4) > 0 AND to_tsvector('simple', lemmatized) @@ plainto_tsquery('simple', $4) THEN 1.0 ELSE 0.0 END + " ++
+                    "CASE WHEN content ILIKE $2 THEN 0.5 ELSE 0.0 END) AS score " ++
+                    "FROM {schema}.memories WHERE user_id = $1 AND " ++
+                    "(key ILIKE $2 OR " ++
+                    "(lemmatized IS NOT NULL AND length($4) > 0 AND to_tsvector('simple', lemmatized) @@ plainto_tsquery('simple', $4)) OR " ++
+                    "content ILIKE $2) AND " ++
+                    MEMORIES_VALIDITY_FILTER ++ " ORDER BY score DESC, updated_at DESC LIMIT $3",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -2470,12 +2545,14 @@ const ManagerImpl = struct {
         const session_z = try self.allocator.dupeZ(u8, session_text);
         defer self.allocator.free(session_z);
         const result = if (session_id != null) blk: {
-            const params = [_]?[*:0]const u8{ user_s.ptr, like_z, limit_z, session_z };
-            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(like.len), @intCast(limit_text.len), @intCast(session_text.len) };
+            // With session: $1=user_id $2=key-ILIKE $3=limit $4=session_id $5=lemma_q
+            const params = [_]?[*:0]const u8{ user_s.ptr, like_z, limit_z, session_z, lemmatized_query_z };
+            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(like.len), @intCast(limit_text.len), @intCast(session_text.len), @intCast(lemmatized_query.len) };
             break :blk try self.execParams(q, &params, &lengths);
         } else blk: {
-            const params = [_]?[*:0]const u8{ user_s.ptr, like_z, limit_z };
-            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(like.len), @intCast(limit_text.len) };
+            // No session: $1=user_id $2=key-ILIKE $3=limit $4=lemma_q
+            const params = [_]?[*:0]const u8{ user_s.ptr, like_z, limit_z, lemmatized_query_z };
+            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(like.len), @intCast(limit_text.len), @intCast(lemmatized_query.len) };
             break :blk try self.execParams(q, &params, &lengths);
         };
         defer c.PQclear(result);
