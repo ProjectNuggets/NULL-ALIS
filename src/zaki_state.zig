@@ -3588,6 +3588,19 @@ const ManagerImpl = struct {
     pub fn findEdgesByKeys(self: *Self, allocator: std.mem.Allocator, user_id: i64, keys: []const []const u8) ![]memory_root.TypedEdge {
         if (keys.len == 0) return allocator.alloc(memory_root.TypedEdge, 0);
 
+        // V1.6 cmt7-10 review WARN-2 fix: reject keys containing NUL bytes
+        // up front. The literal gets passed to libpq via dupeZ which silently
+        // truncates at the first NUL — passing a key like "a\x00malicious"
+        // would scope the IN-list to just "a", potentially returning edges
+        // an adversary shouldn't see. Today all callers pass hex-derived
+        // keys (extracted_<hex>, entity_<hex>, node_<hex>) which can't
+        // contain NUL by construction, but findEdgesByKeys is a public
+        // surface — defend it. Returning error.InvalidKey instead of
+        // silently truncating gives the caller a chance to surface the bug.
+        for (keys) |k| {
+            if (std.mem.indexOfScalar(u8, k, 0) != null) return error.InvalidKey;
+        }
+
         // Build PG TEXT[] literal: ARRAY['k1', 'k2', ...]::text[]
         var arr_buf: std.ArrayListUnmanaged(u8) = .{};
         defer arr_buf.deinit(allocator);
@@ -3763,9 +3776,19 @@ const ManagerImpl = struct {
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
-        if (c.PQntuples(result) == 0) return id;
-        // ON CONFLICT might have returned the existing row's id if name_lower
-        // collided — caller-owned new id either way.
+        // V1.6 cmt7-10 review WARN-1 fix: every return path uses the CALLER's
+        // allocator. Previously the RETURNING-empty branch returned `id`
+        // (self.allocator-owned) while the RETURNING-present branch returned
+        // a caller-allocator-owned slice — caller would `free()` with the
+        // wrong allocator if those differed. Latent today (call sites use
+        // the same allocator), but a per-tenant arena in the future would
+        // surface it as a heap corruption.
+        if (c.PQntuples(result) == 0) {
+            const owned = try allocator.dupe(u8, id);
+            self.allocator.free(id);
+            return owned;
+        }
+        // ON CONFLICT branch: dupe directly into caller's allocator.
         const returned_id = try dupeResultValue(allocator, result, 0, 0);
         self.allocator.free(id);
         return returned_id;
