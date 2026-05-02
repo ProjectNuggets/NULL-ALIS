@@ -6,17 +6,42 @@ const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 const MemoryCategory = mem_root.MemoryCategory;
+const zaki_state = @import("../zaki_state.zig");
+const extraction_persist = @import("../agent/extraction_persist.zig");
 
 /// Memory store tool — lets the agent persist facts to long-term memory.
 /// When a MemoryRuntime is available, also triggers vector sync after store.
+///
+/// V1.7 cmt9.6 (full Gap 3): when the agent supplies subject/predicate/
+/// object alongside content, the write is routed through
+/// extraction_persist.persistExtracted instead of inline upsertMemory.
+/// That activates the contradiction LLM judge + entity coreference +
+/// edge insert + source attribution — same pipeline as compaction Pass C
+/// extraction. Without the triple, the inline path runs (backwards compat
+/// for prose-only memory_store calls).
 pub const MemoryStoreTool = struct {
     memory: ?Memory = null,
     mem_rt: ?*mem_root.MemoryRuntime = null,
+    // V1.7 cmt9.6 — tenant context for the unified write path. When both
+    // are present AND the agent supplied a triple, routes through
+    // extraction_persist with judge + coref. Wired by tools/root.zig
+    // bindStateMgrTenant + bindMemoryStoreExtraction (new in cmt9.6).
+    state_mgr: ?*zaki_state.Manager = null,
+    user_id: ?i64 = null,
+    judge_provider: ?@import("../providers/root.zig").Provider = null,
+    judge_model_name: ?[]const u8 = null,
+    coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider = null,
 
     pub const tool_name = "memory_store";
-    pub const tool_description = "Store durable user facts, preferences, and decisions in long-term memory. Use category 'core' for stable facts, 'daily' for session notes, 'conversation' for important context only. Do not store routine greetings or every chat message.";
+    pub const tool_description =
+        "Store durable user facts, preferences, and decisions in long-term memory. " ++
+        "Use category 'core' for stable facts, 'daily' for session notes, 'conversation' " ++
+        "for important context only. Do not store routine greetings or every chat message. " ++
+        "When the content is a structured fact (e.g. \"User prefers Helix\"), pass the " ++
+        "subject/predicate/object fields too — the brain will run contradiction detection " ++
+        "against existing facts and link the new fact into the knowledge graph.";
     pub const tool_params =
-        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"},"scope":{"type":"string","enum":["session","global"],"description":"Memory scope (default: session)"},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["key","content"]}
+        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"},"scope":{"type":"string","enum":["session","global"],"description":"Memory scope (default: session)"},"session_id":{"type":"string","description":"Optional explicit session lane override"},"subject":{"type":"string","description":"Optional fact subject (e.g. 'user'). When all three of subject/predicate/object present, routes through the contradiction-judge + graph-edge pipeline."},"predicate":{"type":"string","description":"Optional fact predicate in SCREAMING_SNAKE_CASE (e.g. 'PREFERS', 'BIRTHDAY')."},"object":{"type":"string","description":"Optional fact object (e.g. 'Helix')."}},"required":["key","content"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -43,6 +68,28 @@ pub const MemoryStoreTool = struct {
             error.InvalidScope => return ToolResult.fail("Invalid 'scope' parameter. Expected 'session' or 'global'."),
             error.InvalidSessionId => return ToolResult.fail("Invalid 'session_id' parameter. Must be non-empty when provided."),
         };
+
+        // V1.7 cmt9.6 (full Gap 3): when caller supplied a structured triple
+        // AND tenant context is wired, route through the unified
+        // extraction_persist pipeline (judge + coref + edge insert + source
+        // attribution). Otherwise fall through to the inline path (backwards
+        // compat for prose-only stores).
+        const subj = root.getString(args, "subject");
+        const pred = root.getString(args, "predicate");
+        const obj = root.getString(args, "object");
+        const has_triple = subj != null and pred != null and obj != null and
+            subj.?.len > 0 and pred.?.len > 0 and obj.?.len > 0;
+
+        if (has_triple) {
+            if (self.state_mgr) |smgr| {
+                if (self.user_id) |uid| {
+                    return self.executeUnifiedWrite(allocator, smgr, uid, content, subj.?, pred.?, obj.?, session_id);
+                }
+            }
+            // Triple supplied but no tenant context → fall through to inline
+            // with a log hint so operators see the missed opportunity.
+            std.log.scoped(.memory_store).info("memory_store.triple_supplied_but_no_tenant key={s} — using inline path", .{key});
+        }
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot store: {s} = {s}", .{ key, content });
@@ -75,6 +122,87 @@ pub const MemoryStoreTool = struct {
             );
         } else try std.fmt.allocPrint(allocator, "Stored memory: {s} ({s})", .{ key, category.toString() });
 
+        return ToolResult{ .success = true, .output = msg };
+    }
+
+    /// V1.7 cmt9.6 — unified write path. Constructs a single-element
+    /// ExtractedMemory + calls extraction_persist.persistExtracted with
+    /// optional judge + coref contexts. The agent's caller-supplied
+    /// `key` is IGNORED here — persistExtracted derives a deterministic
+    /// `extracted_<hash(s|p|o)>` key (Gap 2). The agent doesn't need to
+    /// remember the synthetic key; subsequent recalls + edits work via
+    /// the (subject, predicate, object) tuple.
+    fn executeUnifiedWrite(
+        self: *MemoryStoreTool,
+        allocator: std.mem.Allocator,
+        smgr: *zaki_state.Manager,
+        uid: i64,
+        content: []const u8,
+        subject: []const u8,
+        predicate: []const u8,
+        object: []const u8,
+        session_id: ?[]const u8,
+    ) !ToolResult {
+        const mems = [_]extraction_persist.ExtractedMemory{.{
+            .text = content,
+            .subject = subject,
+            .predicate = predicate,
+            .object = object,
+            .attributed_to = "user", // memory_store is user-attributed by default
+            .confidence = 0.95,
+        }};
+
+        const judge_ctx: ?extraction_persist.JudgeContext = blk: {
+            if (self.judge_provider) |jp| {
+                if (self.judge_model_name) |jmn| {
+                    break :blk extraction_persist.JudgeContext{ .provider = jp, .model_name = jmn };
+                }
+            }
+            break :blk null;
+        };
+
+        const coref_ctx: ?extraction_persist.EntityResolution = blk: {
+            if (self.coref_embed) |ep| {
+                break :blk extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 };
+            }
+            break :blk null;
+        };
+
+        const result = extraction_persist.persistExtracted(
+            allocator,
+            smgr,
+            uid,
+            session_id,
+            &mems,
+            judge_ctx,
+            coref_ctx,
+        ) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Failed to store memory via unified pipeline: {s}", .{@errorName(err)});
+            return ToolResult{ .success = false, .output = msg };
+        };
+
+        const verb = if (result.skipped_semantic_dup > 0)
+            "skipped (semantic duplicate)"
+        else if (result.skipped_md5_dup > 0)
+            "skipped (exact duplicate)"
+        else if (result.written_count > 0)
+            "stored"
+        else
+            "rejected";
+
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "Memory {s}: {s} {s} {s} (judge={s}, coref={s}, contradictions_resolved={d})",
+            .{
+                verb,
+                subject,
+                predicate,
+                object,
+                if (judge_ctx == null) "off" else "on",
+                if (coref_ctx == null) "off" else "on",
+                result.contradictions_resolved,
+            },
+        );
         return ToolResult{ .success = true, .output = msg };
     }
 

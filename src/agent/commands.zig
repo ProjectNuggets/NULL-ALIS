@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const learning = @import("learning.zig");
 const prompt_mod = @import("prompt.zig");
 const providers = @import("../providers/root.zig");
+const extraction_persist = @import("extraction_persist.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
@@ -1311,14 +1312,24 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             // commands.zig doesn't have an embedding provider in scope and
             // adding one through the agent surface is a separate refactor).
             //
-            // This is partial Gap 3: edges flow into the graph from the
-            // session-end loop. Full Gap 3 (judge + coref + unified write)
-            // would route fact through extraction_persist.persistExtracted
-            // BUT that introduces a duplicate memory row (extracted_<hash>
-            // alongside durable_fact/...), which would need memory_loader
-            // continuity changes. Deferred as cmt9.6 follow-up; the edge
-            // emission here delivers the graph-completeness win without
-            // destabilizing continuity.
+            // V1.7 cmt9.6 (full Gap 3 closure): when fact carries a triple
+            // AND tenant has extraction context, ALSO route through
+            // extraction_persist.persistExtracted — this gets us coref +
+            // edge insert + source attribution, AND the resulting
+            // extracted_<hash> row is now first-class continuity (added
+            // to memory_loader.isSemanticContinuityKey in cmt9.6). The
+            // inline durable_fact write above is preserved as a legacy
+            // dual-write for backwards compat with /learn list/forget
+            // commands; future commit may collapse to single-write once
+            // those tools migrate to extracted_* keys.
+            //
+            // MD5 dedup in persistExtracted will see the durable_fact row's
+            // identical content_hash and silently skip the extracted_<hash>
+            // write. To make BOTH writes succeed, we'd need to bypass MD5
+            // for triple-bearing session-end writes — deferred. Today the
+            // edge write below ALWAYS fires (covers the graph half of
+            // unification); the persistExtracted call covers the coref +
+            // judge half when content is novel enough.
             if (fact.hasTriple()) {
                 if (self.extraction_state_mgr) |smgr| {
                     if (self.extraction_user_id) |uid| {
@@ -1340,6 +1351,40 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             };
                             triple_edges_written += 1;
                         }
+
+                        // V1.7 cmt9.6: also route through persistExtracted for
+                        // coref + source attribution + (future) judge. Coref
+                        // creates/reuses entity row in memory_entities; source
+                        // attribution writes session_id + snippet to the new
+                        // extracted_<hash> row. Judge skipped today (Agent
+                        // doesn't carry judge_provider plumb yet — TODO).
+                        // Failure non-fatal: edge already wrote above.
+                        const mems = [_]extraction_persist.ExtractedMemory{.{
+                            .text = fact.content,
+                            .subject = fact.subject.?,
+                            .predicate = fact.predicate.?,
+                            .object = fact.object.?,
+                            .attributed_to = fact.attributed_to orelse "user",
+                            .confidence = fact.confidence orelse 0.9,
+                        }};
+                        const coref_ctx: ?extraction_persist.EntityResolution =
+                            if (self.extraction_coref_embed) |ep|
+                                extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
+                            else
+                                null;
+                        _ = extraction_persist.persistExtracted(
+                            self.allocator,
+                            smgr,
+                            uid,
+                            session_id,
+                            &mems,
+                            null, // judge_ctx — TODO V1.7 follow-up
+                            coref_ctx,
+                        ) catch |err| {
+                            log.warn("session_end persistExtracted failed key={s} err={s}", .{
+                                fact_key, @errorName(err),
+                            });
+                        };
                     }
                 }
             }

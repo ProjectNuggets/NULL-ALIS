@@ -1520,6 +1520,27 @@ const TenantRuntime = struct {
         };
         tools_mod.bindStateMgrTenant(runtime.tools, state_mgr, cmt11_uid);
 
+        // V1.7 cmt9.6 — wire memory_store's coref embedder for the unified
+        // triple-write path. Uses the same embedding provider mem_rt has
+        // for vector retrieval. Judge LLM provider plumbing deferred —
+        // requires per-tenant model_name accessor which the runtime bundle
+        // doesn't expose today. Without judge: memory_store's triple path
+        // still gets MD5 dedup + entity coreference + edge insert +
+        // source attribution (V1.6 cmt6/7/8/14 pipeline), just skips
+        // contradiction judging until follow-up wires the model name.
+        const cmt96_coref_embed: ?@import("memory/vector/embeddings.zig").EmbeddingProvider = blk: {
+            if (runtime.mem_rt) |*mrt| {
+                if (mrt._embedding_provider) |ep| break :blk ep;
+            }
+            break :blk null;
+        };
+        tools_mod.bindMemoryStoreUnifiedContext(
+            runtime.tools,
+            null, // judge_provider — TODO V1.7 follow-up
+            null, // judge_model_name — TODO V1.7 follow-up
+            cmt96_coref_embed,
+        );
+
         // V1.6 commit 5b.3 — extraction wire-up. When the gateway has
         // a postgres state manager AND the tenant has a numeric user_id,
         // per-session agents inherit these via buildSessionAgent and

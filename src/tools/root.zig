@@ -1718,6 +1718,37 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const mt: *memory_demote.MemoryDemoteTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;
             mt.user_id = user_id;
+        } else if (t.vtable == &memory_store.MemoryStoreTool.vtable) {
+            // V1.7 cmt9.6 — memory_store gains tenant context for the
+            // unified write path. When agent supplies subject/predicate/
+            // object alongside content, the tool routes through
+            // extraction_persist.persistExtracted instead of inline upsert.
+            // judge_provider + coref_embed wired separately via
+            // bindMemoryStoreUnifiedContext.
+            const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
+        }
+    }
+}
+
+/// V1.7 cmt9.6 — wire judge LLM provider + coref embedding provider to
+/// memory_store for the unified write path. Without these, memory_store's
+/// triple-routed path skips judging/coref (still produces an
+/// extracted_<hash> row but without contradiction detection or entity
+/// resolution). Pairs with bindStateMgrTenant.
+pub fn bindMemoryStoreUnifiedContext(
+    tools: []const Tool,
+    judge_provider: ?@import("../providers/root.zig").Provider,
+    judge_model_name: ?[]const u8,
+    coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider,
+) void {
+    for (tools) |t| {
+        if (t.vtable == &memory_store.MemoryStoreTool.vtable) {
+            const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
+            mt.judge_provider = judge_provider;
+            mt.judge_model_name = judge_model_name;
+            mt.coref_embed = coref_embed;
         }
     }
 }

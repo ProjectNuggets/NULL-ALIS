@@ -185,6 +185,22 @@ fn isDurableFactKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "durable_fact/");
 }
 
+/// V1.7 commit 9.6 (full Gap 3 closure) — extracted-fact rows from
+/// V1.6 cmt7+ are now first-class continuity artifacts, equivalent in
+/// role to durable_fact for agent bootstrap context. Without this
+/// predicate, persistExtracted-derived facts (the new authoritative
+/// source after cmt9.6 unification) wouldn't be picked up at session
+/// start; the agent would lose its working memory of structured facts
+/// produced by Pass C extraction or the unified write paths.
+///
+/// The `extracted_<hash>` prefix matches deriveExtractionKey shape
+/// (V1.6 cmt7 Gap 2). Brain-visible (per memory/root.zig — extracted_*
+/// is NOT in BRAIN_HIDDEN_PREFIXES) AND continuity-bucket-eligible
+/// (this predicate). Two roles, no conflict.
+fn isExtractedFactKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "extracted_");
+}
+
 // Legacy compatibility artifact: retained for audit/debug access only and
 // intentionally excluded from normal continuity injection.
 fn isSessionSummaryAuditKey(key: []const u8) bool {
@@ -288,6 +304,12 @@ fn markSeenKey(allocator: std.mem.Allocator, seen_keys: *std.ArrayListUnmanaged(
 
 fn isSemanticContinuityKey(key: []const u8) bool {
     return isDurableFactKey(key) or
+        // V1.7 cmt9.6 — extracted_<hash> rows are first-class continuity
+        // alongside durable_fact. Once cmt9.6 unifies write paths, the
+        // session-end fact loop produces extracted_* keys instead of
+        // (or in addition to) durable_fact/* keys; both must surface to
+        // the agent's bootstrap context.
+        isExtractedFactKey(key) or
         isTimelineSummaryKey(key) or
         isSummaryLatestKey(key) or
         // V1.5.5 polish: compaction Pass C summaries are continuity-class
@@ -445,7 +467,9 @@ fn loadContextDetailed(
 
     if (global_entries) |entries| {
         for (entries) |entry| {
-            if (!isDurableFactKey(entry.key)) continue;
+            // V1.7 cmt9.6: extracted_<hash> rows join durable_fact in the
+            // continuity bucket. Both shapes feed agent bootstrap context.
+            if (!isDurableFactKey(entry.key) and !isExtractedFactKey(entry.key)) continue;
             if (containsKey(scoped_entries, entry.key)) continue;
             if (containsString(seen_keys.items, entry.key)) continue;
             const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
@@ -604,7 +628,9 @@ fn loadContextWithRuntimeDetailed(
 
     if (global_entries) |entries| {
         for (entries) |entry| {
-            if (!isDurableFactKey(entry.key)) continue;
+            // V1.7 cmt9.6: extracted_<hash> rows join durable_fact in the
+            // continuity bucket. Both shapes feed agent bootstrap context.
+            if (!isDurableFactKey(entry.key) and !isExtractedFactKey(entry.key)) continue;
             if (containsString(seen_keys.items, entry.key)) continue;
             const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
             if (!canAppendToBucket(buf.items.len, semantic_bytes, stats.semantic_bucket_entries, SEMANTIC_BUCKET_MAX_BYTES, null, estimated_bytes)) break;
