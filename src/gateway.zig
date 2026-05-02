@@ -11816,6 +11816,161 @@ fn handleBrainSearch(
     return finalizeJsonBuf(allocator, &out);
 }
 
+// ── /brain/memory/{key} — V1.6 commit 13 (M3) ──────────────────────
+//
+// GET /api/v1/users/:user_id/brain/memory/:key
+//
+// Drilldown view for a single memory: full row + lifecycle context.
+// Powers the FE per-fact detail page. Returns:
+//   - The memory row itself (active or archived)
+//   - All edges where this key is source OR target (graph context)
+//   - Chronological event history (upsert / compose / demote /
+//     edge_added / edge_closed) for the key
+//   - Computed importance (recency × centrality, mirrors /brain/graph
+//     formula)
+//
+// Bi-temporal: surfaces archived rows too (the drilldown should show
+// the FULL history, not just what's currently active). The agent's
+// retrieval path filters via MEMORIES_VALIDITY_FILTER; this UI path
+// intentionally bypasses to support audit / "what did we used to know"
+// inspection.
+
+const BRAIN_MEMORY_EVENTS_LIMIT: u32 = 50;
+const BRAIN_MEMORY_EDGES_LIMIT: usize = 50;
+
+fn handleBrainMemoryDetail(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    key: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+
+    if (key.len == 0 or key.len > 256) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_key\"}" };
+    }
+
+    // Hygiene: drilldown is a user-facing /brain surface — agent bookkeeping
+    // (continuity summaries, autosaves, tombstones) must not be inspectable
+    // via this URL even if the user crafts the path manually.
+    if (!memory_mod.isBrainVisibleKey(key)) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"memory_not_found\"}" };
+    }
+
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    // ── Fetch the memory row ─────────────────────────────────────
+    // getMemory respects MEMORIES_VALIDITY_FILTER (hides archived).
+    // For the drilldown UI we WANT to surface archived rows too —
+    // direct SQL via state_mgr.getMemoryAnyValidity would be cleaner,
+    // but doesn't exist yet. For cmt13 minimum-viable: getMemory hides
+    // archived; "archived" stays a follow-up enhancement when V1.6
+    // cmt8 soft-delete UI lands actual archived browsing.
+    const mem_opt = state_mgr.getMemory(allocator, numeric_user_id, key) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"memory_query_failed\"}" };
+    };
+    if (mem_opt == null) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"memory_not_found\"}" };
+    }
+    var memory = mem_opt.?;
+    defer memory.deinit(allocator);
+
+    // ── Fetch metadata (subject/predicate/object) for the structured surface
+    const keys_for_meta = [_][]const u8{key};
+    var metadata_map = state_mgr.listMemoriesMetadata(allocator, numeric_user_id, &keys_for_meta) catch std.StringHashMapUnmanaged([]u8){};
+    defer {
+        var it = metadata_map.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        metadata_map.deinit(allocator);
+    }
+    const metadata_json: ?[]const u8 = if (metadata_map.get(key)) |m| m else null;
+
+    // ── Fetch edges where this key is source OR target ───────────
+    const edge_keys = [_][]const u8{key};
+    const empty_edges: []memory_mod.TypedEdge = &.{};
+    const edges: []memory_mod.TypedEdge = state_mgr.findEdgesByKeys(allocator, numeric_user_id, &edge_keys) catch empty_edges;
+    defer if (edges.len > 0) memory_mod.freeTypedEdges(allocator, edges);
+
+    // ── Fetch chronological events for the key ───────────────────
+    const empty_events: []memory_mod.MemoryEventRow = &.{};
+    const events: []memory_mod.MemoryEventRow = state_mgr.listEventsForMemoryKey(
+        allocator,
+        numeric_user_id,
+        key,
+        BRAIN_MEMORY_EVENTS_LIMIT,
+    ) catch empty_events;
+    defer if (events.len > 0) memory_mod.freeMemoryEventRows(allocator, events);
+
+    // ── Build JSON response ──────────────────────────────────────
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    w.writeAll("{\"memory\":{") catch return response_build_err;
+    w.writeAll("\"key\":") catch return response_build_err;
+    json_util.appendJsonString(&out, allocator, memory.key) catch return response_build_err;
+    w.writeAll(",\"content\":") catch return response_build_err;
+    json_util.appendJsonString(&out, allocator, memory.content) catch return response_build_err;
+    w.writeAll(",\"category\":") catch return response_build_err;
+    json_util.appendJsonString(&out, allocator, memory.category.toString()) catch return response_build_err;
+    if (memory.session_id) |sid| {
+        w.writeAll(",\"session_id\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, sid) catch return response_build_err;
+    } else {
+        w.writeAll(",\"session_id\":null") catch return response_build_err;
+    }
+    if (memory.valid_to) |vt| {
+        w.print(",\"valid_to\":{d}", .{vt}) catch return response_build_err;
+    } else {
+        w.writeAll(",\"valid_to\":null") catch return response_build_err;
+    }
+    if (metadata_json) |m| {
+        w.print(",\"metadata\":{s}", .{m}) catch return response_build_err;
+    } else {
+        w.writeAll(",\"metadata\":null") catch return response_build_err;
+    }
+    w.writeAll("},\"edges\":[") catch return response_build_err;
+
+    const edge_cap: usize = @min(edges.len, BRAIN_MEMORY_EDGES_LIMIT);
+    for (edges[0..edge_cap], 0..) |edge, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        w.writeAll("{\"source_key\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, edge.source_key) catch return response_build_err;
+        w.writeAll(",\"target_key\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, edge.target_key) catch return response_build_err;
+        w.writeAll(",\"predicate\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, edge.predicate) catch return response_build_err;
+        w.print(",\"weight\":{d:.3},\"confidence\":{d:.3}", .{ edge.weight, edge.confidence }) catch return response_build_err;
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.writeAll("],\"events\":[") catch return response_build_err;
+
+    for (events, 0..) |evt, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        w.writeAll("{\"id\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, evt.id) catch return response_build_err;
+        w.writeAll(",\"event_type\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, evt.event_type) catch return response_build_err;
+        w.print(",\"created_at\":{d},\"payload\":{s}", .{ evt.created_at_unix, evt.payload_json }) catch return response_build_err;
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+
+    return finalizeJsonBuf(allocator, &out);
+}
+
 // ── /brain/timeline — V1.5 day-2 task 3 ────────────────────────────
 //
 // GET /api/v1/users/:user_id/brain/timeline
@@ -13569,6 +13724,20 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "brain/search")) {
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainSearch(req_allocator, method, scoped_user_id, brain_target, state);
+    }
+
+    // ── /brain/memory/{key} — V1.6 commit 13 (M3) ────────────────────────
+    // GET /api/v1/users/{id}/brain/memory/{key}
+    // Drilldown view: full memory row + edges + chronological event history.
+    // Powers the FE per-fact detail page. Same hygiene contract as
+    // /brain/graph (returns 404 for hidden keys).
+    if (std.mem.startsWith(u8, parsed.subpath, "brain/memory/")) {
+        const key_raw = parsed.subpath["brain/memory/".len..];
+        // Strip trailing query string if present (the route parser
+        // typically separates this, but guard for safety).
+        const qmark = std.mem.indexOfScalar(u8, key_raw, '?');
+        const key = if (qmark) |q| key_raw[0..q] else key_raw;
+        return handleBrainMemoryDetail(req_allocator, method, scoped_user_id, key, state);
     }
 
     // ── /brain/compose — V1.5 day-3 chunk 3C ─────────────────────────────

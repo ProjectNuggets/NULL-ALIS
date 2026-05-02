@@ -434,6 +434,28 @@ pub const EntityRow = struct {
     }
 };
 
+/// V1.6 commit 13 — single row in memory_events as returned by
+/// listEventsForMemoryKey. Powers the /brain/memory/{key} drilldown's
+/// chronological event timeline. `payload_json` is the raw JSONB string
+/// (pre-parsed at the FE — keeps the Zig surface allocator-light).
+pub const MemoryEventRow = struct {
+    id: []const u8,
+    event_type: []const u8,
+    payload_json: []const u8,
+    created_at_unix: i64,
+
+    pub fn deinit(self: *const MemoryEventRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.event_type);
+        allocator.free(self.payload_json);
+    }
+};
+
+pub fn freeMemoryEventRows(allocator: std.mem.Allocator, rows: []MemoryEventRow) void {
+    for (rows) |*r| r.deinit(allocator);
+    allocator.free(rows);
+}
+
 pub const PromptBootstrapKeyPrefix = "__bootstrap.prompt.";
 pub const TombstoneKeyPrefix = "__tombstone__/";
 

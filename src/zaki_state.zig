@@ -373,6 +373,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn demoteMemoryFromCore(_: *@This(), _: i64, _: []const u8, _: []const u8) !bool {
         return false;
     }
+    /// V1.6 commit 13 — stub for non-postgres builds. Drilldown events
+    /// stream is empty; the brain/memory/{key} endpoint returns just
+    /// the memory + (empty) edges + (empty) events.
+    pub fn listEventsForMemoryKey(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8, _: u32) ![]memory_root.MemoryEventRow {
+        return allocator.alloc(memory_root.MemoryEventRow, 0);
+    }
     /// V1.6 commit 7 — stub for non-postgres builds. Edge writes silently
     /// no-op; the materialized graph is a postgres-only feature today.
     pub fn upsertMemoryEdge(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8, _: ?[]const u8, _: ?f64) !void {
@@ -3423,6 +3429,77 @@ const ManagerImpl = struct {
         const event_result = self.execParams(event_q, &event_params, &event_lengths) catch return true;
         c.PQclear(event_result);
         return true;
+    }
+
+    /// V1.6 commit 13 — chronological event timeline for a single memory
+    /// key. Powers /brain/memory/{key} drilldown. Matches events where:
+    ///   - payload->>'key' = $2 (upsert / compose / demote)
+    ///   - payload->>'source_key' = $2 OR payload->>'target_key' = $2
+    ///     (edge_added / edge_closed)
+    ///
+    /// Episode events (event_type='episode') are session-scoped not key-
+    /// scoped — excluded from this view. The drilldown shows the lifecycle
+    /// of THIS memory; episode timeline lives at /brain/timeline.
+    ///
+    /// Returned slice is allocator-owned; free via
+    /// memory_root.freeMemoryEventRows. Newest-first.
+    pub fn listEventsForMemoryKey(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        key: []const u8,
+        limit: u32,
+    ) ![]memory_root.MemoryEventRow {
+        const q = try self.buildQuery(
+            "SELECT id, event_type, payload::text, " ++
+                "COALESCE((EXTRACT(EPOCH FROM created_at))::bigint, 0) " ++
+                "FROM {schema}.memory_events " ++
+                "WHERE user_id = $1 AND (" ++
+                "  payload->>'key' = $2 " ++
+                "  OR payload->>'source_key' = $2 " ++
+                "  OR payload->>'target_key' = $2" ++
+                ") " ++
+                "ORDER BY created_at DESC, id DESC " ++
+                "LIMIT $3",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+        const limit_text = try std.fmt.allocPrint(self.allocator, "{d}", .{limit});
+        defer self.allocator.free(limit_text);
+        const limit_z = try self.allocator.dupeZ(u8, limit_text);
+        defer self.allocator.free(limit_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, key_z, limit_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len), @intCast(limit_text.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const tuples = c.PQntuples(result);
+        var out: std.ArrayListUnmanaged(memory_root.MemoryEventRow) = .{};
+        errdefer {
+            for (out.items) |*r| r.deinit(allocator);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const id_v = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(id_v);
+            const et_v = try dupeResultValue(allocator, result, i, 1);
+            errdefer allocator.free(et_v);
+            const pl_v = try dupeResultValue(allocator, result, i, 2);
+            errdefer allocator.free(pl_v);
+            const ts_str = try dupeResultValue(allocator, result, i, 3);
+            defer allocator.free(ts_str);
+            const ts = std.fmt.parseInt(i64, ts_str, 10) catch 0;
+            try out.append(allocator, .{
+                .id = id_v,
+                .event_type = et_v,
+                .payload_json = pl_v,
+                .created_at_unix = ts,
+            });
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     /// V1.6 commit 7 — write a typed edge into the materialized graph.
