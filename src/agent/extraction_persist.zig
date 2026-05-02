@@ -115,6 +115,17 @@ inline fn isRejectedPredicate(predicate: []const u8) bool {
     return false;
 }
 
+/// Compute MD5 hex of normalized content for V1.6 5b.3 dedup pre-filter.
+/// Mirrors `zaki_state.computeContentHash` semantics so the hash matches
+/// what the upsert path stores in the `content_hash` column.
+fn computeMd5Hex(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(content, &digest, .{});
+    const out = try allocator.alloc(u8, digest.len * 2);
+    _ = security_secrets.hexEncode(&digest, out);
+    return out;
+}
+
 /// Parse the JSON tail from a compaction Pass C dual-output response.
 ///
 /// Tolerant of common LLM format quirks:
@@ -328,7 +339,32 @@ pub fn persistExtracted(
             continue;
         }
 
-        // Step 2-5 — derive key + metadata + write
+        // Step 2 (V1.6 5b.3 WR-1): MD5 content_hash dedup. Compaction
+        // Pass C re-summarizes prior prose summaries on each trigger,
+        // causing the LLM to re-emit the same atomic facts. Skip if a
+        // memory with identical normalized content already exists for
+        // this user. Cheap — uses idx_memories_hash directly.
+        const content_hash = computeMd5Hex(allocator, m.text) catch |err| {
+            log.warn("extraction.hash_failed err={s}", .{@errorName(err)});
+            result.failed_count += 1;
+            continue;
+        };
+        defer allocator.free(content_hash);
+        const existing = state_mgr.findMemoryByContentHash(allocator, user_id, content_hash) catch |err| blk: {
+            // Don't gate write on lookup failure — log + proceed (worst
+            // case: one duplicate this trigger; cosine dedup later catches
+            // it).
+            log.warn("extraction.dedup_lookup_failed err={s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (existing) |e| {
+            log.info("extraction.md5_dup_skipped subject={s} predicate={s} matches_key={s}", .{ m.subject, m.predicate, e.key });
+            e.deinit(allocator);
+            result.skipped_md5_dup += 1;
+            continue;
+        }
+
+        // Step 3-5 — derive key + metadata + write
         const key = deriveExtractionKey(allocator) catch |err| {
             log.warn("extraction.key_derivation_failed err={s}", .{@errorName(err)});
             result.failed_count += 1;

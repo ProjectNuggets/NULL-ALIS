@@ -19,6 +19,7 @@ const Tool = tools_mod.Tool;
 const result_cache_mod = @import("../tools/result_cache.zig");
 const entitlement_mod = @import("../entitlement.zig");
 const memory_mod = @import("../memory/root.zig");
+const zaki_state_mod = @import("../zaki_state.zig");
 const Memory = memory_mod.Memory;
 const capabilities_mod = @import("../capabilities.zig");
 const multimodal = @import("../multimodal.zig");
@@ -361,6 +362,14 @@ pub const Agent = struct {
     mem_rt: ?*memory_mod.MemoryRuntime = null,
     /// Optional session scope for memory read/write operations.
     memory_session_id: ?[]const u8 = null,
+    /// V1.6 commit 5b.3 — extraction wiring. When both are set, Pass C
+    /// of compaction parses its JSON tail and persists atomic facts
+    /// via extraction_persist.persistExtracted. Populated at agent
+    /// init from the gateway's tenant runtime (state.zaki_state +
+    /// numeric user_id from tenant_ctx). When null/0, extraction is
+    /// disabled and CompactionConfig stays V1.5-equivalent.
+    extraction_state_mgr: ?*zaki_state_mod.Manager = null,
+    extraction_user_id: i64 = 0,
     /// Last known origin metadata for this session, owned by Session when present.
     origin_channel: ?[]const u8 = null,
     origin_lane: ?[]const u8 = null,
@@ -854,6 +863,13 @@ pub const Agent = struct {
             // iter31: also index the summary into the vector store so it
             // surfaces in semantic memory_recall, not just prefix-browse.
             .archive_mem_rt = self.mem_rt,
+            // V1.6 commit 5b.3 — extraction wiring. When state_mgr +
+            // user_id are set on the agent, Pass C also persists atomic
+            // facts via extraction_persist. Defaults stay
+            // null/0 so V1.5 production (where these aren't yet wired
+            // at the gateway level) is unaffected.
+            .extraction_state_mgr = self.extraction_state_mgr,
+            .extraction_user_id = self.extraction_user_id,
         };
 
         // iter22 (Nova's Medium finding): measure thrash savings in TOKENS,

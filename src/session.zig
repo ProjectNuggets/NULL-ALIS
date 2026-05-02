@@ -174,6 +174,15 @@ pub const SessionManager = struct {
     /// Sidecar provider for cheap auxiliary calls (narration, compaction).
     sidecar_provider: ?Provider = null,
     sidecar_model: []const u8 = "",
+    /// V1.6 commit 5b.3 — extraction wiring. When both are set, the
+    /// per-session Agent inherits these via buildSessionAgent and
+    /// they flow into compaction Pass C, where the JSON tail is
+    /// parsed + persisted via extraction_persist.persistExtracted.
+    /// Populated by gateway's TenantRuntime init when state_mgr +
+    /// numeric user_id are available. Default null/0 → extraction
+    /// disabled (V1.5-equivalent behavior).
+    extraction_state_mgr: ?*@import("zaki_state.zig").Manager = null,
+    extraction_user_id: i64 = 0,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -384,6 +393,12 @@ pub const SessionManager = struct {
         agent.sidecar_provider = self.sidecar_provider;
         agent.sidecar_model = self.sidecar_model;
         agent.narration_interval = self.config.sidecar.narration_interval;
+        // V1.6 commit 5b.3 — extraction wiring. When SessionManager has
+        // these fields populated (gateway TenantRuntime init), each
+        // per-turn agent inherits them and runs compaction-derived
+        // atomic-fact extraction.
+        agent.extraction_state_mgr = self.extraction_state_mgr;
+        agent.extraction_user_id = self.extraction_user_id;
         return agent;
     }
 

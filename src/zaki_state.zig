@@ -305,6 +305,13 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn getMemory(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?memory_root.MemoryEntry {
         return error.PostgresNotEnabled;
     }
+    /// V1.6 commit 5b.3 (WR-1): stub for non-postgres builds. Returns
+    /// null so extraction-persist's MD5 dedup degrades to "every fact
+    /// is unique" — extraction may produce duplicates without postgres
+    /// but this build variant doesn't run extraction anyway.
+    pub fn findMemoryByContentHash(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?memory_root.MemoryEntry {
+        return null;
+    }
     pub fn listMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: ?memory_root.MemoryCategory, _: ?[]const u8) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
@@ -2447,17 +2454,21 @@ const ManagerImpl = struct {
             }
             // CR-02: fire the conflict marker on EVERY cross-session write
             // (count > 1), not just the first one (count == 2).
-            // writePendingConflictMarker is an UPSERT — subsequent fires
-            // simply overwrite with the latest conflicting key, which is
-            // correct: after a user resolves and the key is updated again,
-            // the new conflict is surfaced fresh.
-            if (seen_count > 1) {
-                // session_text is guaranteed non-empty here: seen_count > 1
-                // requires both session_ids to be non-NULL per the CASE SQL.
-                std.debug.assert(session_text.len > 0);
-                self.writePendingConflictMarker(user_id, key, session_text) catch |err| {
-                    log.warn("upsertMemory: conflict marker failed key={s}: {}", .{ key, err });
-                };
+            // LR-03: suppress for already-promoted (core) rows — they have
+            // been deliberately elevated to global truth; further cross-session
+            // writes are expected and should not generate false-positive alerts.
+            if (seen_count > 1 and !std.mem.eql(u8, returned_type, "core")) {
+                // NF-01: replace assert with a logged guard — std.debug.assert
+                // is elided in ReleaseFast, making the safety net vanish in
+                // production. The session_text.len == 0 case can arise from
+                // a caller passing session_id = Some(""); skip and warn instead.
+                if (session_text.len == 0) {
+                    log.warn("upsertMemory: conflict marker skipped — empty session_id key={s}", .{key});
+                } else {
+                    self.writePendingConflictMarker(user_id, key, session_text) catch |err| {
+                        log.warn("upsertMemory: conflict marker failed key={s}: {}", .{ key, err });
+                    };
+                }
             }
         }
     }
@@ -2632,6 +2643,44 @@ const ManagerImpl = struct {
         defer c.PQclear(result);
         if (c.PQntuples(result) == 0) return null;
         try self.bumpMemoryAccess(user_id, key);
+        return try decodeMemoryEntry(allocator, result, 0);
+    }
+
+    /// V1.6 commit 5b.3 (WR-1): MD5 content_hash dedup pre-filter for
+    /// extraction-derived writes. Returns the existing memory row if
+    /// the user already has a memory with identical normalized content,
+    /// or null otherwise.
+    ///
+    /// Uses `idx_memories_hash ON (user_id, content_hash)` directly —
+    /// O(1) hashtable index probe per call. Critical for V1.6
+    /// extraction at scale: compaction Pass C re-summarizes prior prose
+    /// summaries on each trigger, causing the LLM to re-emit the same
+    /// atomic facts. Without this guard, brain page accumulates
+    /// duplicates after 5-10 compactions.
+    ///
+    /// Skips superseded entries (MEMORIES_VALIDITY_FILTER) so a
+    /// previously-retired fact doesn't block a fresh re-extraction.
+    /// Caller frees the returned MemoryEntry.
+    pub fn findMemoryByContentHash(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        content_hash: []const u8,
+    ) !?memory_root.MemoryEntry {
+        const q = try self.buildQuery(
+            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND content_hash = $2 AND " ++ MEMORIES_VALIDITY_FILTER ++ " LIMIT 1",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const hash_z = try allocator.dupeZ(u8, content_hash);
+        defer allocator.free(hash_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, hash_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(content_hash.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
         return try decodeMemoryEntry(allocator, result, 0);
     }
 

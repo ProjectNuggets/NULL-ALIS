@@ -1506,6 +1506,22 @@ const TenantRuntime = struct {
             runtime.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(runtime.tools, rt);
         }
+
+        // V1.6 commit 5b.3 — extraction wire-up. When the gateway has
+        // a postgres state manager AND the tenant has a numeric user_id,
+        // per-session agents inherit these via buildSessionAgent and
+        // run compaction-derived atomic-fact extraction. Defaults stay
+        // null/0 so non-postgres builds and missing-state-mgr deploys
+        // are unaffected. `state_mgr` and `user_ctx` are TenantRuntime.init
+        // parameters in scope here.
+        if (state_mgr) |smgr| {
+            const numeric_user_id = std.fmt.parseInt(i64, user_ctx.user_id, 10) catch 0;
+            if (numeric_user_id > 0) {
+                runtime.session_mgr.extraction_state_mgr = smgr;
+                runtime.session_mgr.extraction_user_id = numeric_user_id;
+                log.info("extraction.enabled user_id={d}", .{numeric_user_id});
+            }
+        }
         // iter27: wire SessionStore for transcript_read. See
         // TenantRuntime.resolvedSessionStore — tenant PG store wins,
         // falls back to mem_rt.session_store for standalone.
@@ -10854,6 +10870,28 @@ const BrainRefEdge = struct {
     target: []const u8, // borrowed
 };
 
+/// V1.6 commit 5b.3 (WR-2) — typed atomic-fact edges. Connect memories
+/// that share a `subject` per their metadata JSONB. The label is the
+/// predicate so the FE can render the relationship verbatim ("PREFERS",
+/// "DEPLOYS_TO", "BIRTHDAY", etc.). Strings are duped from the
+/// metadata_map's parsed JSON values — owned by the caller.
+const BrainTypedEdge = struct {
+    source: []u8, // owned — duped from metadata
+    target: []u8, // owned
+    predicate: []u8, // owned
+
+    fn deinit(self: *const BrainTypedEdge, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        allocator.free(self.target);
+        allocator.free(self.predicate);
+    }
+};
+
+fn freeBrainTypedEdges(allocator: std.mem.Allocator, edges: []BrainTypedEdge) void {
+    for (edges) |e| e.deinit(allocator);
+    allocator.free(edges);
+}
+
 fn isBrainRefKeyChar(ch: u8) bool {
     return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == ':' or ch == '.' or ch == '/';
 }
@@ -11049,6 +11087,119 @@ fn buildBrainReferenceEdges(
 
     return edges.toOwnedSlice(allocator);
 }
+
+/// V1.6 commit 5b.3 (WR-2) — typed-edge builder.
+///
+/// Reads `metadata.subject` + `metadata.predicate` from each node's
+/// metadata JSONB (loaded into `metadata_map` by handleBrainGraph).
+/// Memories that share a subject get connected pairwise (chain pattern
+/// matching session edges) with the predicate of one as the edge label.
+///
+/// Bounds: `BRAIN_TYPED_EDGE_CAP_PER_SUBJECT` per subject group to
+/// prevent dense clusters from dominating the graph.
+///
+/// Caller owns the returned slice; free via `freeBrainTypedEdges`.
+fn buildBrainTypedEdges(
+    allocator: std.mem.Allocator,
+    nodes: []const BrainNode,
+    metadata_map: *std.StringHashMapUnmanaged([]u8),
+) ![]BrainTypedEdge {
+    // Group node indices by metadata.subject value.
+    // subject_key → list of (node_idx, predicate)
+    const NodeMeta = struct { idx: usize, predicate: []const u8 };
+    var by_subject: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeMeta)) = .{};
+    defer {
+        var it = by_subject.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        by_subject.deinit(allocator);
+    }
+    // Per-subject parsed JSON arenas — keep them alive across the
+    // grouping pass so subject/predicate slices into the parsed tree
+    // remain valid.
+    var parsed_keepalive: std.ArrayListUnmanaged(std.json.Parsed(std.json.Value)) = .{};
+    defer {
+        for (parsed_keepalive.items) |*p| p.deinit();
+        parsed_keepalive.deinit(allocator);
+    }
+
+    for (nodes, 0..) |n, idx| {
+        const md_blob = metadata_map.get(n.key) orelse continue;
+        if (md_blob.len == 0) continue;
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, md_blob, .{}) catch continue;
+        if (parsed.value != .object) {
+            parsed.deinit();
+            continue;
+        }
+        try parsed_keepalive.append(allocator, parsed);
+
+        const subject_v = parsed.value.object.get("subject") orelse continue;
+        const predicate_v = parsed.value.object.get("predicate") orelse continue;
+        if (subject_v != .string or predicate_v != .string) continue;
+        if (subject_v.string.len == 0 or predicate_v.string.len == 0) continue;
+
+        // Skip rejected predicates (defense-in-depth — extraction_persist
+        // already filters at write time, but a future write path bypassing
+        // extraction_persist could leak a meta-predicate. Don't render them
+        // as edges.)
+        if (isRejectedExtractionPredicate(predicate_v.string)) continue;
+
+        const list_entry = try by_subject.getOrPut(allocator, subject_v.string);
+        if (!list_entry.found_existing) {
+            list_entry.value_ptr.* = .{};
+        }
+        try list_entry.value_ptr.append(allocator, .{ .idx = idx, .predicate = predicate_v.string });
+    }
+
+    var edges: std.ArrayListUnmanaged(BrainTypedEdge) = .{};
+    errdefer {
+        for (edges.items) |*e| e.deinit(allocator);
+        edges.deinit(allocator);
+    }
+
+    var sub_it = by_subject.iterator();
+    while (sub_it.next()) |entry| {
+        const group = entry.value_ptr.*.items;
+        if (group.len < 2) continue;
+        const cap = if (group.len > BRAIN_TYPED_EDGE_CAP_PER_SUBJECT) BRAIN_TYPED_EDGE_CAP_PER_SUBJECT else group.len - 1;
+        var i: usize = 0;
+        while (i < cap and i + 1 < group.len) : (i += 1) {
+            const a = group[i];
+            const b = group[i + 1];
+            try edges.append(allocator, .{
+                .source = try allocator.dupe(u8, nodes[a.idx].key),
+                .target = try allocator.dupe(u8, nodes[b.idx].key),
+                .predicate = try allocator.dupe(u8, a.predicate),
+            });
+        }
+    }
+
+    // Deterministic ordering: sort by (source, target) for stable JSON
+    std.mem.sort(BrainTypedEdge, edges.items, {}, struct {
+        fn lt(_: void, x: BrainTypedEdge, y: BrainTypedEdge) bool {
+            const cmp_src = std.mem.order(u8, x.source, y.source);
+            if (cmp_src != .eq) return cmp_src == .lt;
+            return std.mem.order(u8, x.target, y.target) == .lt;
+        }
+    }.lt);
+
+    return edges.toOwnedSlice(allocator);
+}
+
+/// Defense-in-depth: same predicate blacklist as extraction_persist.
+/// Mirrored here because gateway.zig can't import agent/extraction_persist
+/// (would create a cycle: agent → memory → gateway → agent).
+fn isRejectedExtractionPredicate(predicate: []const u8) bool {
+    const rejected = [_][]const u8{
+        "GREETED", "SAID",      "ASKED",         "MENTIONED",          "REPLIED",
+        "ACKNOWLEDGED", "EXPRESSED", "INDICATED_READINESS", "IS_GETTING_STARTED", "OFFERED_TO_WAIT",
+        "PRIORITIZED",  "ADDRESSED_AS", "IS_UNKNOWN",  "EXPRESSED_READINESS", "INITIATED_CONVERSATION",
+    };
+    for (rejected) |p| if (std.mem.eql(u8, p, predicate)) return true;
+    return false;
+}
+
+const BRAIN_TYPED_EDGE_CAP_PER_SUBJECT: usize = 20;
 
 // ── V1.5 day-4 — traversal-event logging helpers ───────────────────
 //
@@ -11309,11 +11460,19 @@ fn handleBrainGraph(
     };
     defer allocator.free(ref_edges);
 
+    // V1.6 commit 5b.3 (WR-2) — typed atomic-fact edges. Reads
+    // metadata.subject + metadata.predicate from each node and connects
+    // memories that share a subject. Empty when no nodes have V1.6
+    // extraction metadata (graceful degradation pre-extraction-rollout).
+    const empty_typed: []BrainTypedEdge = &.{};
+    const typed_edges = buildBrainTypedEdges(allocator, nodes, &metadata_map) catch empty_typed;
+    defer freeBrainTypedEdges(allocator, typed_edges);
+
     // ── V1.6 commit 4 — compute per-node importance score ────────────
     //
     // Sized for FE node-radius rendering (M1 from spec §4.3). Count
-    // edges incident on each node across all three edge types (session,
-    // semantic, reference), then compose with recency_decay.
+    // edges incident on each node across all FOUR edge types (session,
+    // semantic, reference, typed), then compose with recency_decay.
     // Recomputed per request — cheap at 500-node cap, stays fresh.
     const importance_scores = allocator.alloc(f64, node_count) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
@@ -11340,6 +11499,17 @@ fn handleBrainGraph(
             b_entry.value_ptr.* += 1;
         }
         for (ref_edges) |e| {
+            const a_entry = degree.getOrPut(allocator, e.source) catch continue;
+            if (!a_entry.found_existing) a_entry.value_ptr.* = 0;
+            a_entry.value_ptr.* += 1;
+            const b_entry = degree.getOrPut(allocator, e.target) catch continue;
+            if (!b_entry.found_existing) b_entry.value_ptr.* = 0;
+            b_entry.value_ptr.* += 1;
+        }
+        // V1.6 commit 5b.3 (WR-2 + IN-3 closure) — typed edges count
+        // toward node importance. Hub memories (e.g., shared subject
+        // appearing in many facts) get higher importance score.
+        for (typed_edges) |e| {
             const a_entry = degree.getOrPut(allocator, e.source) catch continue;
             if (!a_entry.found_existing) a_entry.value_ptr.* = 0;
             a_entry.value_ptr.* += 1;
@@ -11415,6 +11585,20 @@ fn handleBrainGraph(
         jsonEscapeInto(w, e.source) catch return response_build_err;
         w.writeAll("\",\"target\":\"") catch return response_build_err;
         jsonEscapeInto(w, e.target) catch return response_build_err;
+        w.writeAll("\"}") catch return response_build_err;
+    }
+    // V1.6 commit 5b.3 (WR-2) — typed atomic-fact edges with predicate
+    // label. FE renders the predicate as the edge label (e.g.,
+    // "PREFERS", "DEPLOYS_TO") so the user sees the relationship type.
+    for (typed_edges) |e| {
+        if (!emitted_first_edge) w.writeAll(",") catch return response_build_err;
+        emitted_first_edge = false;
+        w.writeAll("{\"type\":\"typed\",\"source\":\"") catch return response_build_err;
+        jsonEscapeInto(w, e.source) catch return response_build_err;
+        w.writeAll("\",\"target\":\"") catch return response_build_err;
+        jsonEscapeInto(w, e.target) catch return response_build_err;
+        w.writeAll("\",\"predicate\":\"") catch return response_build_err;
+        jsonEscapeInto(w, e.predicate) catch return response_build_err;
         w.writeAll("\"}") catch return response_build_err;
     }
     w.writeAll("]") catch return response_build_err;
