@@ -3314,17 +3314,44 @@ const ManagerImpl = struct {
         // bi-temporal close-out columns set + is_latest=false. This keeps
         // graph traversal consistent: a closed-out fact's edges vanish
         // alongside the node from is_latest queries.
+        //
+        // V1.6 commit 9 — RETURNING the closed edges so we can emit one
+        // edge_closed event per cascaded row into memory_events. Bi-temporal
+        // graph history matches bi-temporal memory history.
         const cascade_q = try self.buildQuery(
             "UPDATE {schema}.memory_edges SET " ++
                 "valid_to = $3, " ++
                 "invalid_at = $3, " ++
                 "expired_at = $4, " ++
                 "is_latest = FALSE " ++
-                "WHERE user_id = $1 AND (source_key = $2 OR target_key = $2) AND is_latest",
+                "WHERE user_id = $1 AND (source_key = $2 OR target_key = $2) AND is_latest " ++
+                "RETURNING source_key, target_key, predicate, COALESCE(confidence, 1.0)",
         );
         defer self.allocator.free(cascade_q);
         const cascade_result = try self.execParams(cascade_q, &params, &lengths);
         defer c.PQclear(cascade_result);
+
+        // Emit one edge_closed event per cascaded edge. Failure on any
+        // single event is non-fatal (the cascade UPDATE already succeeded;
+        // the event row is metadata for graph-history queries).
+        const closed_count = c.PQntuples(cascade_result);
+        var i: c_int = 0;
+        while (i < closed_count) : (i += 1) {
+            const closed_src = dupeResultValue(self.allocator, cascade_result, i, 0) catch continue;
+            defer self.allocator.free(closed_src);
+            const closed_tgt = dupeResultValue(self.allocator, cascade_result, i, 1) catch continue;
+            defer self.allocator.free(closed_tgt);
+            const closed_pred = dupeResultValue(self.allocator, cascade_result, i, 2) catch continue;
+            defer self.allocator.free(closed_pred);
+            const conf_str = dupeResultValue(self.allocator, cascade_result, i, 3) catch continue;
+            defer self.allocator.free(conf_str);
+            const conf_val = std.fmt.parseFloat(f64, conf_str) catch 1.0;
+            self.insertEdgeEvent(user_id, closed_src, closed_tgt, closed_pred, "closed", conf_val) catch |err| {
+                log.warn("edge_event.close_failed err={s} source={s} predicate={s}", .{
+                    @errorName(err), closed_src, closed_pred,
+                });
+            };
+        }
     }
 
     /// V1.6 commit 7 — write a typed edge into the materialized graph.
@@ -3388,6 +3415,85 @@ const ManagerImpl = struct {
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
+
+        // V1.6 commit 9 — edge mutation event. Records every edge add/bump
+        // in memory_events with event_type='edge_added'. This gives the
+        // brain bi-temporal graph history (point-in-time "what edges existed
+        // when") and is the foundation for V1.6 cmt10 graph-expand retrieval.
+        // Failure is non-fatal: log + continue (the edge is already written;
+        // missing the event row degrades to "history starts here", not data
+        // loss).
+        self.insertEdgeEvent(user_id, source_key, target_key, predicate, "added", confidence) catch |err| {
+            log.warn("edge_event.add_failed err={s} source={s} predicate={s}", .{
+                @errorName(err), source_key, predicate,
+            });
+        };
+    }
+
+    /// V1.6 commit 9 — write an edge mutation event to memory_events.
+    /// `op` is one of `"added"` | `"closed"`. Payload carries the triple
+    /// + confidence. Used by upsertMemoryEdge (added) and the cascade
+    /// branch of setMemoryInvalidation (closed).
+    fn insertEdgeEvent(
+        self: *Self,
+        user_id: i64,
+        source_key: []const u8,
+        target_key: []const u8,
+        predicate: []const u8,
+        op: []const u8,
+        confidence: ?f64,
+    ) !void {
+        const src_json = try jsonString(self.allocator, source_key);
+        defer self.allocator.free(src_json);
+        const tgt_json = try jsonString(self.allocator, target_key);
+        defer self.allocator.free(tgt_json);
+        const pred_json = try jsonString(self.allocator, predicate);
+        defer self.allocator.free(pred_json);
+        const op_json = try jsonString(self.allocator, op);
+        defer self.allocator.free(op_json);
+
+        const payload = if (confidence) |cv|
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"source_key\":{s},\"target_key\":{s},\"predicate\":{s},\"op\":{s},\"confidence\":{d:.6}}}",
+                .{ src_json, tgt_json, pred_json, op_json, cv },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"source_key\":{s},\"target_key\":{s},\"predicate\":{s},\"op\":{s}}}",
+                .{ src_json, tgt_json, pred_json, op_json },
+            );
+        defer self.allocator.free(payload);
+
+        // event_type: "edge_added" or "edge_closed"
+        const event_type = try std.fmt.allocPrint(self.allocator, "edge_{s}", .{op});
+        defer self.allocator.free(event_type);
+        const event_type_z = try self.allocator.dupeZ(u8, event_type);
+        defer self.allocator.free(event_type_z);
+
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.memory_events (id, user_id, memory_id, event_type, payload) " ++
+                "VALUES ($1, $2, NULL, $3, $4::jsonb)",
+        );
+        defer self.allocator.free(q);
+        const event_id = try self.randomHexId(self.allocator, 16);
+        defer self.allocator.free(event_id);
+        const event_id_z = try self.allocator.dupeZ(u8, event_id);
+        defer self.allocator.free(event_id_z);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const payload_z = try self.allocator.dupeZ(u8, payload);
+        defer self.allocator.free(payload_z);
+        const params = [_]?[*:0]const u8{ event_id_z, user_s.ptr, event_type_z, payload_z };
+        const lengths = [_]c_int{
+            @intCast(event_id.len),
+            @intCast(user_s.len),
+            @intCast(event_type.len),
+            @intCast(payload.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
     }
 
     /// V1.6 commit 7 — degree-count for a memory key in the active graph.
@@ -6814,6 +6920,119 @@ test "V1.6 commit 8 entity coreference — cosine match + miss" {
         const row = found.?;
         defer row.deinit(allocator);
         try std.testing.expectEqualStrings("NeoVim", row.name);
+    }
+}
+
+// V1.6 commit 9 — edge mutation events.
+//
+// Acceptance: every upsertMemoryEdge call emits one edge_added event;
+// every cascaded close-out (via setMemoryInvalidation on the source memory)
+// emits one edge_closed event per closed edge. Bi-temporal graph history
+// queryable as a typed event stream.
+test "V1.6 commit 9 edge mutation events — added + closed via cascade" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Seed parent memory + 2 edges ──────────────────────────────────
+    try mgr.upsertMemoryWithMetadata(2, "extracted_helix_pref",
+        "User prefers Helix",
+        .daily, "session-A",
+        \\{"subject":"user","predicate":"PREFERS","object_key":"Helix","attributed_to":"user","attribution":"extraction_classifier"}
+    );
+    try mgr.upsertMemoryEdge(2, "extracted_helix_pref", "entity_helix", "PREFERS", "extraction_classifier", 0.95);
+    try mgr.upsertMemoryEdge(2, "extracted_helix_pref", "entity_neovim", "REPLACES", "extraction_classifier", 0.85);
+
+    // ── Step A: 2 edge_added events recorded
+    const count_q = try std.fmt.allocPrint(allocator,
+        "SELECT COUNT(*) FROM {s}.memory_events WHERE user_id = 2 AND event_type = 'edge_added'",
+        .{schema},
+    );
+    defer allocator.free(count_q);
+    {
+        const result = try mgr.exec(count_q);
+        defer c.PQclear(result);
+        const n_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(n_str);
+        try std.testing.expectEqualStrings("2", n_str);
+    }
+
+    // ── Step B: payload of the first edge_added event has the right shape
+    {
+        const payload_q = try std.fmt.allocPrint(allocator,
+            "SELECT payload->>'source_key', payload->>'predicate', payload->>'op' " ++
+                "FROM {s}.memory_events WHERE user_id = 2 AND event_type = 'edge_added' " ++
+                "ORDER BY created_at ASC LIMIT 1",
+            .{schema},
+        );
+        defer allocator.free(payload_q);
+        const result = try mgr.exec(payload_q);
+        defer c.PQclear(result);
+        const src = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(src);
+        const pred = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(pred);
+        const op = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(op);
+        try std.testing.expectEqualStrings("extracted_helix_pref", src);
+        try std.testing.expectEqualStrings("PREFERS", pred);
+        try std.testing.expectEqualStrings("added", op);
+    }
+
+    // ── Step C: cascade close-out emits 2 edge_closed events
+    const close_ts: i64 = std.time.timestamp();
+    try mgr.setMemoryInvalidation(2, "extracted_helix_pref", close_ts, close_ts);
+    {
+        const close_count_q = try std.fmt.allocPrint(allocator,
+            "SELECT COUNT(*) FROM {s}.memory_events WHERE user_id = 2 AND event_type = 'edge_closed'",
+            .{schema},
+        );
+        defer allocator.free(close_count_q);
+        const result = try mgr.exec(close_count_q);
+        defer c.PQclear(result);
+        const n_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(n_str);
+        try std.testing.expectEqualStrings("2", n_str);
+    }
+
+    // ── Step D: chronological event order — added first, closed after
+    {
+        const order_q = try std.fmt.allocPrint(allocator,
+            "SELECT event_type FROM {s}.memory_events " ++
+                "WHERE user_id = 2 AND event_type LIKE 'edge_%' " ++
+                "ORDER BY created_at ASC, id ASC",
+            .{schema},
+        );
+        defer allocator.free(order_q);
+        const result = try mgr.exec(order_q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 4), c.PQntuples(result));
+        const e0 = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(e0);
+        const e3 = try dupeResultValue(allocator, result, 3, 0);
+        defer allocator.free(e3);
+        try std.testing.expectEqualStrings("edge_added", e0);
+        try std.testing.expectEqualStrings("edge_closed", e3);
     }
 }
 
