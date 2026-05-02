@@ -1034,7 +1034,7 @@ const ManagerImpl = struct {
             // has survived two independent sessions → eligible for Tier-3
             // (core) promotion. Default 1 so existing rows don't immediately
             // promote on boot. ADD COLUMN IF NOT EXISTS → safe on old DBs.
-            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS seen_in_session_count INTEGER DEFAULT 1",
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS seen_in_session_count INTEGER NOT NULL DEFAULT 1",
 
             // V1.6 entity vector plane (separate from memory_vectors per
             // spec §D7 — entity-name embeddings live at different
@@ -2416,22 +2416,27 @@ const ManagerImpl = struct {
         defer c.PQclear(result);
         if (c.PQntuples(result) == 0) return;
 
-        const stored_id = if (c.PQntuples(result) > 0)
-            try dupeResultValue(self.allocator, result, 0, 0)
-        else
-            try self.allocator.dupe(u8, id);
+        // CR-01: remove dead else branch — early return on line above guarantees
+        // PQntuples > 0 here. The old fallback to `allocator.dupe(id)` was
+        // unreachable and obscured the true control flow.
+        const stored_id = try dupeResultValue(self.allocator, result, 0, 0);
         defer self.allocator.free(stored_id);
         try self.insertMemoryEvent(user_id, stored_id, "upsert", key, content, mem_type, session_id);
 
         // V1.7 Item 2 + 3: post-upsert promotion and conflict surfacing.
         // Only act when a row was actually modified (RETURNING has a row).
         const seen_count = blk: {
-            const raw = c.PQgetvalue(result, 0, 1);
-            if (raw == null) break :blk @as(i32, 1);
-            break :blk std.fmt.parseInt(i32, std.mem.span(raw), 10) catch 1;
+            // PQgetisnull returns 1 for SQL NULL, 0 for a real value.
+            // PQgetvalue on a NULL column returns "" not a C null pointer.
+            if (c.PQgetisnull(result, 0, 1) != 0) break :blk @as(i32, 1);
+            break :blk std.fmt.parseInt(i32, std.mem.span(c.PQgetvalue(result, 0, 1)), 10) catch 1;
         };
-        const returned_type_raw = c.PQgetvalue(result, 0, 2);
-        const returned_type: []const u8 = if (returned_type_raw != null) std.mem.span(returned_type_raw) else "core";
+        // HR-01: default to "" (not "core") so a NULL/missing memory_type
+        // does NOT silently suppress promotion.
+        const returned_type: []const u8 = if (c.PQgetisnull(result, 0, 2) == 0)
+            std.mem.span(c.PQgetvalue(result, 0, 2))
+        else
+            "";
 
         if (!isSystemMemoryKey(key)) {
             // Tier-3 promotion: fact seen across >= 2 sessions and not yet core.
@@ -2440,9 +2445,16 @@ const ManagerImpl = struct {
                     log.warn("upsertMemory: tier-3 promotion failed key={s}: {}", .{ key, err });
                 };
             }
-            // Conflict marker: first cross-session update (count just hit 2)
-            // so the agent sees it at the next session start.
-            if (seen_count == 2) {
+            // CR-02: fire the conflict marker on EVERY cross-session write
+            // (count > 1), not just the first one (count == 2).
+            // writePendingConflictMarker is an UPSERT — subsequent fires
+            // simply overwrite with the latest conflicting key, which is
+            // correct: after a user resolves and the key is updated again,
+            // the new conflict is surfaced fresh.
+            if (seen_count > 1) {
+                // session_text is guaranteed non-empty here: seen_count > 1
+                // requires both session_ids to be non-NULL per the CASE SQL.
+                std.debug.assert(session_text.len > 0);
                 self.writePendingConflictMarker(user_id, key, session_text) catch |err| {
                     log.warn("upsertMemory: conflict marker failed key={s}: {}", .{ key, err });
                 };
@@ -2471,14 +2483,15 @@ const ManagerImpl = struct {
 
     /// V1.7 Item 3 — write/overwrite the `pending_conflicts` sentinel so
     /// memory_loader surfaces it at the next session start. Stores the most
-    /// recently conflicted key; the agent resolves it and calls
+    /// recently conflicted key (MR-02: earlier conflicts are overwritten;
+    /// only the latest is shown). The agent resolves it and calls
     /// memory_forget("pending_conflicts") to clear. Inline SQL avoids
     /// recursive upsertMemory() calls.
     fn writePendingConflictMarker(self: *Self, user_id: i64, key: []const u8, session_id: []const u8) !void {
         const now_s = std.time.timestamp();
         const content = try std.fmt.allocPrint(
             self.allocator,
-            "type=pending_conflicts\nkey={s}\nsession={s}\nat={d}\ninstruction=A fact you know was updated from a new session. Verify with the user which value is correct, then call memory_store to update it and memory_forget(\"pending_conflicts\") to clear this flag.\n",
+            "type=pending_conflicts\nkey={s}\nsession={s}\nat={d}\ninstruction=One or more facts you know were updated from a new session. Verify with the user which value is correct for the key shown, then call memory_store to update it and memory_forget(\"pending_conflicts\") to clear this flag. Note: only the most recent conflicted key is shown here.\n",
             .{ key, session_id, now_s },
         );
         defer self.allocator.free(content);
@@ -2535,13 +2548,16 @@ const ManagerImpl = struct {
             "audit_shell/",
             "memory_health_",
             "durable_fact/",
-            "pending_conflicts",
+            // MR-04: "pending_conflicts" moved to exact-match below —
+            // a prefix match would incorrectly catch future keys like
+            // "pending_conflicts_v2". The sentinel is always an exact key.
         };
         for (prefixes) |p| {
             if (std.mem.startsWith(u8, key, p)) return true;
         }
         return std.mem.eql(u8, key, "last_hygiene_at") or
-            std.mem.eql(u8, key, "timeline_index/current");
+            std.mem.eql(u8, key, "timeline_index/current") or
+            std.mem.eql(u8, key, "pending_conflicts");
     }
 
     /// V1.7 Item 1 — record a structured episode event in memory_events
@@ -2558,8 +2574,15 @@ const ManagerImpl = struct {
         defer self.allocator.free(session_json);
         const trigger_json = try jsonString(self.allocator, trigger);
         defer self.allocator.free(trigger_json);
-        // Truncate summary to 2KB so the JSONB payload stays reasonable.
-        const summary_clip = if (summary.len > 2048) summary[0..2048] else summary;
+        // LR-02: truncate at a UTF-8 codepoint boundary so the jsonb cast
+        // never sees a split multi-byte sequence. Back up over continuation
+        // bytes (0x80..0xBF) the same way memory_loader.truncateUtf8 does.
+        const summary_clip = blk: {
+            if (summary.len <= 2048) break :blk summary;
+            var end: usize = 2048;
+            while (end > 0 and summary[end] & 0xC0 == 0x80) end -= 1;
+            break :blk summary[0..end];
+        };
         const summary_json = try jsonString(self.allocator, summary_clip);
         defer self.allocator.free(summary_json);
         const payload = try std.fmt.allocPrint(

@@ -304,9 +304,14 @@ fn normalizeJobForRequest(
             job.session_target = .isolated;
             job.wake_mode = .now;
             job.delivery.mode = .none;
+            // MR-05: explicitly clear best_effort so stale values from a
+            // prior job kind (e.g. report) don't linger in serialized state.
+            job.delivery.best_effort = false;
             _ = try replaceOptionalOwnedString(allocator, &job.delivery.channel, &job.delivery_channel_owned, null);
             _ = try replaceOptionalOwnedString(allocator, &job.delivery.to, &job.delivery_to_owned, null);
             resetJobExecutionState(job);
+            // LR-04: explicit return for consistency with all sibling branches.
+            return;
         },
     }
 }
