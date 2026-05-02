@@ -5924,22 +5924,22 @@ test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retri
         c.PQclear(result);
     }
     try mgr.migrate();
-    try mgr.provisionUser(99, "/tmp/nullalis-zaki-bot-test-user-99/workspace");
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
 
     // ── Seed: existing extraction-classifier memory ───────────────────
     const old_metadata =
         \\{"subject":"user","predicate":"PREFERS","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0,"extracted_at":1000000}
     ;
-    try mgr.upsertMemoryWithMetadata(99, "extracted_old_pref", "User prefers NeoVim", .core, null, old_metadata);
+    try mgr.upsertMemoryWithMetadata(2, "extracted_old_pref", "User prefers NeoVim", .core, null, old_metadata);
 
     // Sanity: row reachable via getMemory + findRelatedExtractedMemories
     {
-        const before = try mgr.getMemory(allocator, 99, "extracted_old_pref");
+        const before = try mgr.getMemory(allocator, 2, "extracted_old_pref");
         try std.testing.expect(before != null);
         before.?.deinit(allocator);
     }
     {
-        const related = try mgr.findRelatedExtractedMemories(allocator, 99, "user", 8);
+        const related = try mgr.findRelatedExtractedMemories(allocator, 2, "user", 8);
         defer {
             for (related) |e| e.deinit(allocator);
             allocator.free(related);
@@ -5950,17 +5950,17 @@ test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retri
 
     // ── Close out: new "Helix" fact contradicts old "NeoVim" fact ─────
     const close_out_ts: i64 = std.time.timestamp();
-    try mgr.setMemoryInvalidation(99, "extracted_old_pref", close_out_ts, close_out_ts);
+    try mgr.setMemoryInvalidation(2, "extracted_old_pref", close_out_ts, close_out_ts);
 
     // ── Assertions ───────────────────────────────────────────────────
     // 1. getMemory hides the closed-out row (MEMORIES_VALIDITY_FILTER)
     {
-        const after = try mgr.getMemory(allocator, 99, "extracted_old_pref");
+        const after = try mgr.getMemory(allocator, 2, "extracted_old_pref");
         try std.testing.expect(after == null);
     }
     // 2. findRelatedExtractedMemories also hides it
     {
-        const related = try mgr.findRelatedExtractedMemories(allocator, 99, "user", 8);
+        const related = try mgr.findRelatedExtractedMemories(allocator, 2, "user", 8);
         defer {
             for (related) |e| e.deinit(allocator);
             allocator.free(related);
@@ -5971,7 +5971,7 @@ test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retri
     //    valid_to + invalid_at + expired_at populated, is_latest = false.
     {
         const audit_q = try std.fmt.allocPrint(allocator,
-            "SELECT valid_to, invalid_at, expired_at, is_latest FROM {s}.memories WHERE user_id = 99 AND key = 'extracted_old_pref'",
+            "SELECT valid_to, invalid_at, expired_at, is_latest FROM {s}.memories WHERE user_id = 2 AND key = 'extracted_old_pref'",
             .{schema},
         );
         defer allocator.free(audit_q);
@@ -6001,10 +6001,10 @@ test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retri
 
     // 4. Idempotent: a second invalidation with the same timestamps is
     //    a no-op (UPDATE re-writes the same values, returns successfully).
-    try mgr.setMemoryInvalidation(99, "extracted_old_pref", close_out_ts, close_out_ts);
+    try mgr.setMemoryInvalidation(2, "extracted_old_pref", close_out_ts, close_out_ts);
 
     // 5. Non-existent key: silent no-op (caller doesn't gate on existence).
-    try mgr.setMemoryInvalidation(99, "no_such_key", close_out_ts, close_out_ts);
+    try mgr.setMemoryInvalidation(2, "no_such_key", close_out_ts, close_out_ts);
 }
 
 // V1.6 commit 6 — findRelatedExtractedMemories scoping smoke test.
@@ -6031,6 +6031,12 @@ test "V1.6 commit 6 findRelatedExtractedMemories scopes by subject + attribution
 
     var mgr = try ManagerImpl.init(allocator, cfg);
     defer mgr.deinit();
+    // Suppress libpq NOTICE-level messages during migrate. See user_99
+    // test above for rationale.
+    {
+        const result = try mgr.exec("SET client_min_messages TO WARNING");
+        c.PQclear(result);
+    }
     {
         const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
         defer allocator.free(schema_q);
@@ -6040,37 +6046,37 @@ test "V1.6 commit 6 findRelatedExtractedMemories scopes by subject + attribution
         c.PQclear(result);
     }
     try mgr.migrate();
-    try mgr.provisionUser(77, "/tmp/nullalis-zaki-bot-test-user-77/workspace");
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
 
     // Same subject="user", extraction-classifier attribution → MUST be returned
-    try mgr.upsertMemoryWithMetadata(77, "ec_user_helix",
+    try mgr.upsertMemoryWithMetadata(2, "ec_user_helix",
         "User uses Helix",
         .core, null,
         \\{"subject":"user","predicate":"USES","object_key":"Helix","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
     );
     // Same subject="user", DIFFERENT attribution ("agent_tool") → MUST NOT be returned
-    try mgr.upsertMemoryWithMetadata(77, "agent_tool_user_other",
+    try mgr.upsertMemoryWithMetadata(2, "agent_tool_user_other",
         "User session log",
         .core, null,
         \\{"subject":"user","predicate":"NOTE","object_key":"x","attributed_to":"user","attribution":"agent_tool","confidence":1.0}
     );
     // DIFFERENT subject="alex", extraction-classifier → MUST NOT be returned
-    try mgr.upsertMemoryWithMetadata(77, "ec_alex_birthday",
+    try mgr.upsertMemoryWithMetadata(2, "ec_alex_birthday",
         "Alex birthday May 15",
         .core, null,
         \\{"subject":"alex","predicate":"BIRTHDAY","object_key":"May 15","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
     );
     // Same subject="user", extraction-classifier, but CLOSED OUT → MUST NOT be returned
-    try mgr.upsertMemoryWithMetadata(77, "ec_user_neovim_closed",
+    try mgr.upsertMemoryWithMetadata(2, "ec_user_neovim_closed",
         "User uses NeoVim",
         .core, null,
         \\{"subject":"user","predicate":"USES","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
     );
     const closed_ts: i64 = std.time.timestamp();
-    try mgr.setMemoryInvalidation(77, "ec_user_neovim_closed", closed_ts, closed_ts);
+    try mgr.setMemoryInvalidation(2, "ec_user_neovim_closed", closed_ts, closed_ts);
 
     // ── The query MUST return exactly 1 row: ec_user_helix ────────────
-    const related = try mgr.findRelatedExtractedMemories(allocator, 77, "user", 16);
+    const related = try mgr.findRelatedExtractedMemories(allocator, 2, "user", 16);
     defer {
         for (related) |e| e.deinit(allocator);
         allocator.free(related);
