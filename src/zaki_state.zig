@@ -378,6 +378,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listEdgesForUser(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]memory_root.TypedEdge {
         return allocator.alloc(memory_root.TypedEdge, 0);
     }
+    /// V1.6 commit 10 — stub for non-postgres builds. Graph hop expansion
+    /// is a postgres-only feature; non-postgres returns empty.
+    pub fn findEdgesByKeys(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8) ![]memory_root.TypedEdge {
+        return allocator.alloc(memory_root.TypedEdge, 0);
+    }
     /// V1.6 commit 8 — stub for non-postgres builds. Entity coreference is
     /// a postgres-pgvector feature; non-postgres builds fall back to a
     /// hash-based stable key (entity_<hash(lower(name))>) computed by the
@@ -3538,6 +3543,81 @@ const ManagerImpl = struct {
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
         const params = [_]?[*:0]const u8{user_s.ptr};
         const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const tuples = c.PQntuples(result);
+        var out: std.ArrayListUnmanaged(memory_root.TypedEdge) = .{};
+        errdefer {
+            for (out.items) |*e| e.deinit(allocator);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const src = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(src);
+            const tgt = try dupeResultValue(allocator, result, i, 1);
+            errdefer allocator.free(tgt);
+            const pred = try dupeResultValue(allocator, result, i, 2);
+            errdefer allocator.free(pred);
+            const conf_str = try dupeResultValue(allocator, result, i, 3);
+            defer allocator.free(conf_str);
+            const weight_str = try dupeResultValue(allocator, result, i, 4);
+            defer allocator.free(weight_str);
+            const conf = std.fmt.parseFloat(f64, conf_str) catch 1.0;
+            const weight = std.fmt.parseFloat(f64, weight_str) catch 1.0;
+            try out.append(allocator, .{
+                .source_key = src,
+                .target_key = tgt,
+                .predicate = pred,
+                .confidence = conf,
+                .weight = weight,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// V1.6 commit 10 — batched edge lookup for graph hop expansion.
+    /// Returns all active edges where `source_key` OR `target_key` is in
+    /// `keys[]`. One round trip via `WHERE ANY($::text[])`.
+    ///
+    /// Used by graph_expand.expandFromSeeds: each BFS frontier batches its
+    /// keys into a single SQL call instead of N round-trips. Caller frees
+    /// each TypedEdge + the slice via memory_root.freeTypedEdges.
+    ///
+    /// Empty `keys` slice returns an empty []. Skips the SQL round trip.
+    pub fn findEdgesByKeys(self: *Self, allocator: std.mem.Allocator, user_id: i64, keys: []const []const u8) ![]memory_root.TypedEdge {
+        if (keys.len == 0) return allocator.alloc(memory_root.TypedEdge, 0);
+
+        // Build PG TEXT[] literal: ARRAY['k1', 'k2', ...]::text[]
+        var arr_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer arr_buf.deinit(allocator);
+        try arr_buf.appendSlice(allocator, "{");
+        for (keys, 0..) |k, i| {
+            if (i > 0) try arr_buf.append(allocator, ',');
+            try arr_buf.append(allocator, '"');
+            // Escape backslash and double-quote for PG array literal
+            for (k) |ch| {
+                if (ch == '\\' or ch == '"') try arr_buf.append(allocator, '\\');
+                try arr_buf.append(allocator, ch);
+            }
+            try arr_buf.append(allocator, '"');
+        }
+        try arr_buf.appendSlice(allocator, "}");
+
+        const q = try self.buildQuery(
+            "SELECT source_key, target_key, predicate, COALESCE(confidence, 1.0), weight " ++
+                "FROM {schema}.memory_edges " ++
+                "WHERE user_id = $1 AND is_latest " ++
+                "AND (source_key = ANY($2::text[]) OR target_key = ANY($2::text[])) " ++
+                "ORDER BY weight DESC, source_key ASC",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const arr_z = try allocator.dupeZ(u8, arr_buf.items);
+        defer allocator.free(arr_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, arr_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(arr_buf.items.len) };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
         const tuples = c.PQntuples(result);
@@ -7033,6 +7113,92 @@ test "V1.6 commit 9 edge mutation events — added + closed via cascade" {
         defer allocator.free(e3);
         try std.testing.expectEqualStrings("edge_added", e0);
         try std.testing.expectEqualStrings("edge_closed", e3);
+    }
+}
+
+// V1.6 commit 10 — graph-expand retrieval primitive end-to-end.
+//
+// Acceptance: build a 3-node chain A→B→C via memory_edges, expand from [A]
+// with max_hops=2, assert the neighborhood includes A (hop 0), B (hop 1),
+// C (hop 2) with descending scores. Also verify findEdgesByKeys batched
+// lookup returns only the active edges where source OR target match.
+test "V1.6 commit 10 graph-expand — 3-node chain expansion" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Build chain A→B→C
+    try mgr.upsertMemoryEdge(2, "node_a", "node_b", "RELATES_TO", "extraction_classifier", 0.9);
+    try mgr.upsertMemoryEdge(2, "node_b", "node_c", "RELATES_TO", "extraction_classifier", 0.85);
+    // Add an unrelated edge that should NOT appear in the expansion
+    try mgr.upsertMemoryEdge(2, "node_x", "node_y", "OTHER", "extraction_classifier", 0.5);
+
+    // ── findEdgesByKeys(["node_a"]) returns only the A→B edge
+    {
+        const keys = [_][]const u8{"node_a"};
+        const edges = try mgr.findEdgesByKeys(allocator, 2, &keys);
+        defer memory_root.freeTypedEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("node_a", edges[0].source_key);
+        try std.testing.expectEqualStrings("node_b", edges[0].target_key);
+    }
+
+    // ── findEdgesByKeys(["node_b"]) returns BOTH adjacent edges (a→b AND b→c)
+    {
+        const keys = [_][]const u8{"node_b"};
+        const edges = try mgr.findEdgesByKeys(allocator, 2, &keys);
+        defer memory_root.freeTypedEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+    }
+
+    // ── Full expansion: from [node_a], max_hops=2 → reach a, b, c
+    const graph_expand = @import("agent/graph_expand.zig");
+    const seeds = [_][]const u8{"node_a"};
+    const result = try graph_expand.expandFromSeeds(allocator, &mgr, 2, &seeds, .{ .max_hops = 2 });
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), result.nodes.len);
+
+    // Build a key→hop map to assert hop distances
+    var hop_map: std.StringHashMapUnmanaged(u8) = .{};
+    defer hop_map.deinit(allocator);
+    for (result.nodes) |n| try hop_map.put(allocator, n.key, n.hop_distance);
+
+    try std.testing.expectEqual(@as(?u8, 0), hop_map.get("node_a"));
+    try std.testing.expectEqual(@as(?u8, 1), hop_map.get("node_b"));
+    try std.testing.expectEqual(@as(?u8, 2), hop_map.get("node_c"));
+
+    // Sort order: scores descending. node_a (hop 0, hop_decay=1.0) should
+    // outrank node_c (hop 2, hop_decay=0.33). With recency identical,
+    // hop_decay dominates → node_a > node_b > node_c.
+    try std.testing.expectEqualStrings("node_a", result.nodes[0].key);
+    try std.testing.expect(result.nodes[0].score > result.nodes[1].score);
+    try std.testing.expect(result.nodes[1].score > result.nodes[2].score);
+
+    // The unrelated edge (x→y) MUST NOT appear in the expansion
+    for (result.nodes) |n| {
+        try std.testing.expect(!std.mem.eql(u8, n.key, "node_x"));
+        try std.testing.expect(!std.mem.eql(u8, n.key, "node_y"));
     }
 }
 
