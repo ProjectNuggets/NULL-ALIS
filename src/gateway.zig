@@ -11694,6 +11694,128 @@ fn handleBrainGraph(
     return finalizeJsonBuf(allocator, &out);
 }
 
+// ── /brain/search — V1.6 commit 12 (M2) ────────────────────────────
+//
+// GET /api/v1/users/:user_id/brain/search?q=<text>[&limit=N]
+//
+// Server-side keyword + lemmatized BM25 search across the user's
+// brain-visible memories. Powers the `/brain` page search bar.
+//
+// Reuses state_mgr.recallMemories (3-signal scorer: key ILIKE + BM25 +
+// content ILIKE), then post-filters via memory_root.isBrainVisibleKey
+// to hide agent bookkeeping (continuity summaries, autosaves, tombstones).
+// Same hygiene contract as /brain/graph.
+//
+// Pagination is intentionally NOT cursor-based (unlike /brain/timeline):
+// search is single-shot top-N by relevance score, not chronological. The
+// FE re-queries with a longer limit if the user wants more.
+//
+// Response shape mirrors /brain/graph nodes for FE consistency:
+//   {"results":[{"key", "content", "category", "score", "valid_to"}],
+//    "query":"<echoed>", "limit":N, "total_returned":N}
+
+const BRAIN_SEARCH_DEFAULT_LIMIT: u32 = 20;
+const BRAIN_SEARCH_MAX_LIMIT: u32 = 100;
+
+fn handleBrainSearch(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    target: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    // ── Parse query params ────────────────────────────────────────
+    const q_param = parseQueryParam(target, "q") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_query_param_q\"}" };
+    };
+    if (q_param.len == 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"empty_query\"}" };
+    }
+    if (q_param.len > 512) {
+        // Defense: cap query length so a multi-MB GET param doesn't blow up
+        // the BM25 lemmatizer or downstream SQL parameter binding.
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"query_too_long\"}" };
+    }
+
+    var limit: u32 = if (parseQueryParam(target, "limit")) |s|
+        std.fmt.parseInt(u32, s, 10) catch BRAIN_SEARCH_DEFAULT_LIMIT
+    else
+        BRAIN_SEARCH_DEFAULT_LIMIT;
+    if (limit == 0) limit = BRAIN_SEARCH_DEFAULT_LIMIT;
+    if (limit > BRAIN_SEARCH_MAX_LIMIT) limit = BRAIN_SEARCH_MAX_LIMIT;
+
+    // ── Fetch with overshoot to compensate for hygiene-filter loss ─
+    // recallMemories doesn't apply BRAIN_USER_KEY_FILTER (the agent's
+    // retrieval path NEEDS continuity artifacts). Fetch 2× to give the
+    // post-filter room without needing pagination, then trim to the
+    // user's requested limit.
+    const fetch_limit: usize = @as(usize, limit) * 2;
+    const raw_entries = state_mgr.recallMemories(
+        allocator,
+        numeric_user_id,
+        q_param,
+        fetch_limit,
+        null, // no session scope — search the whole user namespace
+    ) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"search_query_failed\"}" };
+    };
+    defer memory_mod.freeEntries(allocator, raw_entries);
+
+    // ── Post-filter via brain-visibility predicate ────────────────
+    var filtered: std.ArrayListUnmanaged(memory_mod.MemoryEntry) = .empty;
+    defer filtered.deinit(allocator);
+    for (raw_entries) |e| {
+        if (filtered.items.len >= limit) break;
+        if (!memory_mod.isBrainVisibleKey(e.key)) continue;
+        filtered.append(allocator, e) catch break;
+    }
+
+    // ── Build JSON response ──────────────────────────────────────
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    w.writeAll("{\"query\":") catch return response_build_err;
+    json_util.appendJsonString(&out, allocator, q_param) catch return response_build_err;
+    w.print(",\"limit\":{d},\"total_returned\":{d},\"results\":[", .{ limit, filtered.items.len }) catch return response_build_err;
+
+    for (filtered.items, 0..) |entry, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        w.writeAll("{\"key\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.key) catch return response_build_err;
+        w.writeAll(",\"content\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.content) catch return response_build_err;
+        w.writeAll(",\"category\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.category.toString()) catch return response_build_err;
+        if (entry.score) |sc| {
+            w.print(",\"score\":{d:.3}", .{sc}) catch return response_build_err;
+        } else {
+            w.writeAll(",\"score\":null") catch return response_build_err;
+        }
+        if (entry.valid_to) |vt| {
+            w.print(",\"valid_to\":{d}", .{vt}) catch return response_build_err;
+        } else {
+            w.writeAll(",\"valid_to\":null") catch return response_build_err;
+        }
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+
+    return finalizeJsonBuf(allocator, &out);
+}
+
 // ── /brain/timeline — V1.5 day-2 task 3 ────────────────────────────
 //
 // GET /api/v1/users/:user_id/brain/timeline
@@ -13437,6 +13559,16 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "brain/timeline")) {
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainTimeline(req_allocator, method, scoped_user_id, brain_target, state);
+    }
+
+    // ── /brain/search — V1.6 commit 12 (M2) ──────────────────────────────
+    // GET /api/v1/users/{id}/brain/search?q=<text>[&limit=N]
+    // Server-side keyword + lemmatized BM25 search across brain-visible
+    // memories. Same hygiene contract as /brain/graph (continuity / autosave /
+    // tombstones hidden via memory_root.isBrainVisibleKey post-filter).
+    if (std.mem.eql(u8, parsed.subpath, "brain/search")) {
+        const brain_target = extractRequestTarget(raw_request) orelse base_path;
+        return handleBrainSearch(req_allocator, method, scoped_user_id, brain_target, state);
     }
 
     // ── /brain/compose — V1.5 day-3 chunk 3C ─────────────────────────────
