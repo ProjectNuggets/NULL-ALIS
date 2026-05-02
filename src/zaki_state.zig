@@ -339,6 +339,10 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn insertTraversalEvent(_: *@This(), _: i64, _: []const u8) !void {
         return;
     }
+    /// V1.7 Item 1 — stub for non-postgres builds; episode events no-op.
+    pub fn insertEpisodeEvent(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8) !void {
+        return;
+    }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
@@ -1022,6 +1026,15 @@ const ManagerImpl = struct {
             // lowercasing) to avoid running heuristics on rows we didn't
             // capture at write time.
             "UPDATE {schema}.memories SET lemmatized = lower(content) WHERE lemmatized IS NULL",
+
+            // ── V1.7 schema ────────────────────────────────────────────────
+            //
+            // seen_in_session_count: incremented each time the same key is
+            // written from a DIFFERENT session. When count >= 2 the fact
+            // has survived two independent sessions → eligible for Tier-3
+            // (core) promotion. Default 1 so existing rows don't immediately
+            // promote on boot. ADD COLUMN IF NOT EXISTS → safe on old DBs.
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS seen_in_session_count INTEGER DEFAULT 1",
 
             // V1.6 entity vector plane (separate from memory_vectors per
             // spec §D7 — entity-name embeddings live at different
@@ -2333,12 +2346,31 @@ const ManagerImpl = struct {
         // rows backfilled at migrate via `UPDATE memories SET lemmatized =
         // lower(content) WHERE lemmatized IS NULL` — new writes use the
         // richer Zig path with stopword removal.
+        //
+        // V1.7: seen_in_session_count is incremented when the session_id
+        // differs from the stored row — meaning the same fact has surfaced
+        // across two independent sessions. When count reaches 2 the fact is
+        // eligible for Tier-3 (core) promotion (see post-exec logic below).
+        // RETURNING also fetches the new count and memory_type so the
+        // promotion and conflict-marker paths can act without a second SELECT.
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, updated_at) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) " ++
-                "ON CONFLICT (user_id, key) DO UPDATE SET session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, memory_type = EXCLUDED.memory_type, lemmatized = EXCLUDED.lemmatized, updated_at = NOW() " ++
-                "WHERE {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id OR {schema}.memories.content IS DISTINCT FROM EXCLUDED.content OR {schema}.memories.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR {schema}.memories.memory_type IS DISTINCT FROM EXCLUDED.memory_type " ++
-                "RETURNING id",
+                "ON CONFLICT (user_id, key) DO UPDATE SET " ++
+                "session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
+                "memory_type = EXCLUDED.memory_type, lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
+                "seen_in_session_count = CASE " ++
+                "  WHEN {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
+                "       AND EXCLUDED.session_id IS NOT NULL " ++
+                "       AND {schema}.memories.session_id IS NOT NULL " ++
+                "  THEN {schema}.memories.seen_in_session_count + 1 " ++
+                "  ELSE {schema}.memories.seen_in_session_count " ++
+                "END " ++
+                "WHERE {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
+                "OR {schema}.memories.content IS DISTINCT FROM EXCLUDED.content " ++
+                "OR {schema}.memories.content_hash IS DISTINCT FROM EXCLUDED.content_hash " ++
+                "OR {schema}.memories.memory_type IS DISTINCT FROM EXCLUDED.memory_type " ++
+                "RETURNING id, seen_in_session_count, memory_type",
         );
         defer self.allocator.free(q);
 
@@ -2390,6 +2422,174 @@ const ManagerImpl = struct {
             try self.allocator.dupe(u8, id);
         defer self.allocator.free(stored_id);
         try self.insertMemoryEvent(user_id, stored_id, "upsert", key, content, mem_type, session_id);
+
+        // V1.7 Item 2 + 3: post-upsert promotion and conflict surfacing.
+        // Only act when a row was actually modified (RETURNING has a row).
+        const seen_count = blk: {
+            const raw = c.PQgetvalue(result, 0, 1);
+            if (raw == null) break :blk @as(i32, 1);
+            break :blk std.fmt.parseInt(i32, std.mem.span(raw), 10) catch 1;
+        };
+        const returned_type_raw = c.PQgetvalue(result, 0, 2);
+        const returned_type: []const u8 = if (returned_type_raw != null) std.mem.span(returned_type_raw) else "core";
+
+        if (!isSystemMemoryKey(key)) {
+            // Tier-3 promotion: fact seen across >= 2 sessions and not yet core.
+            if (seen_count >= 2 and !std.mem.eql(u8, returned_type, "core")) {
+                self.promoteMemoryToCore(user_id, key) catch |err| {
+                    log.warn("upsertMemory: tier-3 promotion failed key={s}: {}", .{ key, err });
+                };
+            }
+            // Conflict marker: first cross-session update (count just hit 2)
+            // so the agent sees it at the next session start.
+            if (seen_count == 2) {
+                self.writePendingConflictMarker(user_id, key, session_text) catch |err| {
+                    log.warn("upsertMemory: conflict marker failed key={s}: {}", .{ key, err });
+                };
+            }
+        }
+    }
+
+    /// V1.7 Item 2 — promote a memory row to Tier-3 (core). Sets
+    /// memory_type='core', clears session_id (makes it global), and raises
+    /// confidence_score to 0.9 to reflect multi-session corroboration.
+    fn promoteMemoryToCore(self: *Self, user_id: i64, key: []const u8) !void {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.memories SET memory_type = 'core', session_id = NULL, confidence_score = 0.9, updated_at = NOW() " ++
+                "WHERE user_id = $1 AND key = $2 AND memory_type != 'core'",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const key_z = try self.allocator.dupeZ(u8, key);
+        defer self.allocator.free(key_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, key_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len) };
+        const res = try self.execParams(q, &params, &lengths);
+        c.PQclear(res);
+    }
+
+    /// V1.7 Item 3 — write/overwrite the `pending_conflicts` sentinel so
+    /// memory_loader surfaces it at the next session start. Stores the most
+    /// recently conflicted key; the agent resolves it and calls
+    /// memory_forget("pending_conflicts") to clear. Inline SQL avoids
+    /// recursive upsertMemory() calls.
+    fn writePendingConflictMarker(self: *Self, user_id: i64, key: []const u8, session_id: []const u8) !void {
+        const now_s = std.time.timestamp();
+        const content = try std.fmt.allocPrint(
+            self.allocator,
+            "type=pending_conflicts\nkey={s}\nsession={s}\nat={d}\ninstruction=A fact you know was updated from a new session. Verify with the user which value is correct, then call memory_store to update it and memory_forget(\"pending_conflicts\") to clear this flag.\n",
+            .{ key, session_id, now_s },
+        );
+        defer self.allocator.free(content);
+        const hash = try computeContentHash(self.allocator, content);
+        defer self.allocator.free(hash);
+        const lem = try text_norm.lemmatizeForBm25(self.allocator, content);
+        defer self.allocator.free(lem);
+        const new_id = try self.randomHexId(self.allocator, 16);
+        defer self.allocator.free(new_id);
+
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, updated_at) " ++
+                "VALUES ($1, $2, NULL, 'pending_conflicts', $3, $4, 'core', $5, NOW()) " ++
+                "ON CONFLICT (user_id, key) DO UPDATE SET content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
+                "lemmatized = EXCLUDED.lemmatized, updated_at = NOW()",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const new_id_z = try self.allocator.dupeZ(u8, new_id);
+        defer self.allocator.free(new_id_z);
+        const content_z = try self.allocator.dupeZ(u8, content);
+        defer self.allocator.free(content_z);
+        const hash_z = try self.allocator.dupeZ(u8, hash);
+        defer self.allocator.free(hash_z);
+        const lem_z = try self.allocator.dupeZ(u8, lem);
+        defer self.allocator.free(lem_z);
+
+        const params = [_]?[*:0]const u8{ new_id_z, user_s.ptr, content_z, hash_z, lem_z };
+        const lengths = [_]c_int{
+            @intCast(new_id.len),
+            @intCast(user_s.len),
+            @intCast(content.len),
+            @intCast(hash.len),
+            @intCast(lem.len),
+        };
+        const res = try self.execParams(q, &params, &lengths);
+        c.PQclear(res);
+    }
+
+    /// V1.7 — true for system-managed memory keys that should never be
+    /// promoted to Tier-3 or trigger conflict markers.
+    fn isSystemMemoryKey(key: []const u8) bool {
+        const prefixes = [_][]const u8{
+            "session_checkpoint_",
+            "autosave_",
+            "compaction_summary/",
+            "compaction_dropped/",
+            "summary_fallback/",
+            "timeline_summary/",
+            "summary_latest/",
+            "context_anchor_",
+            "audit_shell/",
+            "memory_health_",
+            "durable_fact/",
+            "pending_conflicts",
+        };
+        for (prefixes) |p| {
+            if (std.mem.startsWith(u8, key, p)) return true;
+        }
+        return std.mem.eql(u8, key, "last_hygiene_at") or
+            std.mem.eql(u8, key, "timeline_index/current");
+    }
+
+    /// V1.7 Item 1 — record a structured episode event in memory_events
+    /// when a session summary lands. `event_type='episode'` is queryable
+    /// by the brain timeline for structured session history.
+    pub fn insertEpisodeEvent(
+        self: *Self,
+        user_id: i64,
+        session_id: []const u8,
+        summary: []const u8,
+        trigger: []const u8,
+    ) !void {
+        const session_json = try jsonString(self.allocator, session_id);
+        defer self.allocator.free(session_json);
+        const trigger_json = try jsonString(self.allocator, trigger);
+        defer self.allocator.free(trigger_json);
+        // Truncate summary to 2KB so the JSONB payload stays reasonable.
+        const summary_clip = if (summary.len > 2048) summary[0..2048] else summary;
+        const summary_json = try jsonString(self.allocator, summary_clip);
+        defer self.allocator.free(summary_json);
+        const payload = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"session_id\":{s},\"trigger\":{s},\"summary\":{s}}}",
+            .{ session_json, trigger_json, summary_json },
+        );
+        defer self.allocator.free(payload);
+
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.memory_events (id, user_id, memory_id, event_type, payload) " ++
+                "VALUES ($1, $2, NULL, 'episode', $3::jsonb)",
+        );
+        defer self.allocator.free(q);
+        const event_id = try self.randomHexId(self.allocator, 16);
+        defer self.allocator.free(event_id);
+        const event_id_z = try self.allocator.dupeZ(u8, event_id);
+        defer self.allocator.free(event_id_z);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const payload_z = try self.allocator.dupeZ(u8, payload);
+        defer self.allocator.free(payload_z);
+        const params = [_]?[*:0]const u8{ event_id_z, user_s.ptr, payload_z };
+        const lengths = [_]c_int{
+            @intCast(event_id.len),
+            @intCast(user_s.len),
+            @intCast(payload.len),
+        };
+        const res = try self.execParams(q, &params, &lengths);
+        c.PQclear(res);
     }
 
     pub fn getMemory(self: *Self, allocator: std.mem.Allocator, user_id: i64, key: []const u8) !?memory_root.MemoryEntry {

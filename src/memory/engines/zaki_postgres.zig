@@ -34,6 +34,19 @@ pub const ZakiPostgresMemory = struct {
     fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: root.MemoryCategory, session_id: ?[]const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         try self.manager.upsertMemory(self.user_id, key, content, category, session_id);
+        // V1.7 Item 1: when a session summary lands, record a structured
+        // episode event so sessions are queryable by the brain timeline.
+        // Key shape: timeline_summary/{session_id}/{ts}
+        // Best-effort — a logging failure must not break the store path.
+        if (std.mem.startsWith(u8, key, "timeline_summary/")) {
+            const after_prefix = key["timeline_summary/".len..];
+            if (std.mem.lastIndexOfScalar(u8, after_prefix, '/')) |slash| {
+                const ep_session = after_prefix[0..slash];
+                self.manager.insertEpisodeEvent(self.user_id, ep_session, content, "checkpoint") catch |err| {
+                    std.log.warn("zaki_postgres: episode event write failed session={s}: {}", .{ ep_session, err });
+                };
+            }
+        }
     }
 
     /// V1.5 day-3 — write path with attached JSONB metadata. Used by

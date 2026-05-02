@@ -21,6 +21,9 @@ const DesiredJobKind = enum {
     brief,
     report,
     follow_up,
+    /// Silent background maintenance — agent type, no delivery, full tool access.
+    /// Use for operator-defined system jobs that must not ping the user.
+    maintenance,
 };
 
 const EnsureMode = enum {
@@ -59,6 +62,7 @@ fn parseDesiredJobKind(raw: ?[]const u8) DesiredJobKind {
     if (std.ascii.eqlIgnoreCase(value, "report")) return .report;
     if (std.ascii.eqlIgnoreCase(value, "follow_up")) return .follow_up;
     if (std.ascii.eqlIgnoreCase(value, "follow-up")) return .follow_up;
+    if (std.ascii.eqlIgnoreCase(value, "maintenance")) return .maintenance;
     return .auto;
 }
 
@@ -94,6 +98,14 @@ fn buildAgentTaskPrompt(
         .reminder => std.fmt.allocPrint(
             allocator,
             "Send exactly this reminder text to the user with no extra words: {s}",
+            .{command},
+        ),
+        .maintenance => std.fmt.allocPrint(
+            allocator,
+            "You are executing a scheduled maintenance task. Task: {s}. " ++
+                "Use memory and file tools as needed — reads and writes are both permitted. " ++
+                "Do not message the user. Do not call the message tool. " ++
+                "Do not create or modify scheduled jobs. Complete the task silently and stop.",
             .{command},
         ),
         else => allocator.dupe(u8, command),
@@ -278,6 +290,23 @@ fn normalizeJobForRequest(
             }
             _ = try replaceOwnedString(allocator, &job.command, request.command);
             return applyTenantDefaults(scheduler, allocator, job.id, request.command);
+        },
+        .maintenance => {
+            const prompt = try buildAgentTaskPrompt(allocator, request.kind, request.command);
+            defer allocator.free(prompt);
+            const job = scheduler.getMutableJob(job_id) orelse return error.JobNotFound;
+            if (request.requested_id) |target_id| {
+                _ = try replaceOwnedString(allocator, &job.id, target_id);
+            }
+            _ = try replaceOwnedString(allocator, &job.command, request.command);
+            _ = try replaceOptionalOwnedString(allocator, &job.prompt, &job.prompt_owned, prompt);
+            job.job_type = .agent;
+            job.session_target = .isolated;
+            job.wake_mode = .now;
+            job.delivery.mode = .none;
+            _ = try replaceOptionalOwnedString(allocator, &job.delivery.channel, &job.delivery_channel_owned, null);
+            _ = try replaceOptionalOwnedString(allocator, &job.delivery.to, &job.delivery_to_owned, null);
+            resetJobExecutionState(job);
         },
     }
 }

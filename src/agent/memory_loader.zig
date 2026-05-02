@@ -426,6 +426,11 @@ fn loadContextDetailed(
     const current_timeline_prefix = try timelinePrefixForSession(allocator, session_id);
     defer if (current_timeline_prefix) |prefix| allocator.free(prefix);
 
+    // V1.7 Item 3: surface any unresolved memory conflict at the top so
+    // the agent sees it before any other context and can resolve it with
+    // the user. Best-effort — failure must not block context loading.
+    _ = appendDirectEntry(allocator, mem, w, &wrote_header, "pending_conflicts", 300) catch false;
+
     if (summary_latest_key) |key| {
         if (try appendDirectEntry(allocator, mem, w, &wrote_header, key, CONTINUITY_ENTRY_MAX_BYTES)) {
             appended += 1;
@@ -582,6 +587,9 @@ fn loadContextWithRuntimeDetailed(
     defer if (summary_latest_key) |key| allocator.free(key);
     const current_timeline_prefix = try timelinePrefixForSession(allocator, session_id);
     defer if (current_timeline_prefix) |prefix| allocator.free(prefix);
+
+    // V1.7 Item 3: surface any unresolved memory conflict first.
+    _ = appendDirectEntry(allocator, mem, buf.writer(allocator), &wrote_header, "pending_conflicts", 300) catch false;
 
     if (summary_latest_key) |key| {
         if (try appendDirectEntry(allocator, mem, buf.writer(allocator), &wrote_header, key, CONTINUITY_ENTRY_MAX_BYTES)) {
