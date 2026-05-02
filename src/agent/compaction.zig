@@ -16,6 +16,8 @@ const MemoryRuntime = memory_mod.MemoryRuntime;
 
 const Agent = @import("root.zig").Agent;
 const OwnedMessage = Agent.OwnedMessage;
+const zaki_state = @import("../zaki_state.zig");
+const extraction_persist = @import("extraction_persist.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -75,6 +77,18 @@ pub const CompactionConfig = struct {
     // store via syncVectorAfterStore — so they're reachable by semantic
     // memory_recall, not just prefix-browse via memory_timeline.
     archive_mem_rt: ?*MemoryRuntime = null,
+    // V1.6 commit 5b.2: when set alongside archive_memory + archive_session_id,
+    // Pass C's extraction JSON tail is parsed and persisted via
+    // extraction_persist.persistExtracted. Provider-agnostic — when the
+    // parallel memory-pipeline work adds new fact-write sources, they
+    // pipe through the same extraction_persist.persistExtracted entry.
+    extraction_state_mgr: ?*zaki_state.Manager = null,
+    // V1.6 commit 5b.2: numeric user_id for extraction_persist call.
+    // CompactionConfig today has session_id but not user_id (the
+    // archive path doesn't need it because Memory.store wraps
+    // user-scoping). extraction_persist needs user_id explicitly for
+    // upsertMemoryWithMetadata. When 0, extraction is skipped.
+    extraction_user_id: i64 = 0,
 };
 
 pub const TokenBudgetPolicy = struct {
@@ -334,16 +348,21 @@ fn compactHistoryKeepingRecent(
 
     const compact_end = start + compact_count;
 
-    // Multi-part strategy: if >10 messages to summarize, split into halves
+    // Multi-part strategy: if >10 messages to summarize, split into halves.
+    // Split-half branches don't capture extraction tail (acceptable V1.6
+    // simplification — merging two batches' extracted facts adds complexity
+    // for a rare path; deferred to V1.7 if measurably valuable).
+    var extraction_tail: []u8 = &.{};
+    defer if (extraction_tail.len > 0) allocator.free(extraction_tail);
     const summary = if (compact_count > 10) blk: {
         const mid = start + compact_count / 2;
 
-        // Summarize first half
-        const summary_a = try summarizeSlice(allocator, provider, model_name, history.items, start, mid, config);
+        // Summarize first half (no extraction capture for split path)
+        const summary_a = try summarizeSlice(allocator, provider, model_name, history.items, start, mid, config, null);
         defer allocator.free(summary_a);
 
-        // Summarize second half
-        const summary_b = try summarizeSlice(allocator, provider, model_name, history.items, mid, compact_end, config);
+        // Summarize second half (no extraction capture for split path)
+        const summary_b = try summarizeSlice(allocator, provider, model_name, history.items, mid, compact_end, config, null);
         defer allocator.free(summary_b);
 
         // Merge the two summaries
@@ -361,7 +380,9 @@ fn compactHistoryKeepingRecent(
         }
 
         break :blk merged;
-    } else try summarizeSlice(allocator, provider, model_name, history.items, start, compact_end, config);
+        // V1.6 commit 5b.2: single-call branch captures extraction tail
+        // for downstream persist via extraction_persist.persistExtracted.
+    } else try summarizeSlice(allocator, provider, model_name, history.items, start, compact_end, config, &extraction_tail);
     defer allocator.free(summary);
 
     const workspace_context = try readWorkspaceContextForSummary(allocator, config.workspace_dir);
@@ -385,6 +406,54 @@ fn compactHistoryKeepingRecent(
             archiveCompactionSummary(allocator, mem, config.archive_mem_rt, session_id, summary_with_context, compact_count) catch |err| {
                 log.warn("compaction: failed to archive Pass C summary: {}", .{err});
             };
+        }
+    }
+
+    // V1.6 commit 5b.2: persist atomic facts from JSON tail.
+    //
+    // Runs only when:
+    //   - extraction_state_mgr + extraction_user_id are configured
+    //   - The single-call summarization branch produced a tail
+    //     (split-half branch passed null per V1.6 simplification)
+    //
+    // Failure modes are non-fatal — extraction_persist.persistExtracted
+    // already logs per-fact failures + returns counts. A failed
+    // extraction does NOT abort the compaction (the prose summary
+    // already archived above is preserved).
+    if (config.extraction_state_mgr) |state_mgr| {
+        if (config.extraction_user_id != 0 and extraction_tail.len > 0) {
+            const session_id_for_extract: ?[]const u8 = config.archive_session_id;
+            const empty_slice: []extraction_persist.ExtractedMemory = &.{};
+            const extracted = extraction_persist.parseExtractedJson(allocator, extraction_tail) catch |err| blk: {
+                log.warn("compaction: extraction parse failed err={s} tail_len={d}", .{ @errorName(err), extraction_tail.len });
+                break :blk empty_slice;
+            };
+            defer if (extracted.len > 0) extraction_persist.freeExtractedMemories(allocator, extracted);
+
+            if (extracted.len > 0) {
+                const persist_result = extraction_persist.persistExtracted(
+                    allocator,
+                    state_mgr,
+                    config.extraction_user_id,
+                    session_id_for_extract,
+                    extracted,
+                ) catch |err| blk: {
+                    log.warn("compaction: extraction persist failed err={s}", .{@errorName(err)});
+                    break :blk extraction_persist.PersistResult{
+                        .written_count = 0,
+                        .skipped_blacklist = 0,
+                        .skipped_md5_dup = 0,
+                        .skipped_cosine_dup = 0,
+                        .failed_count = 0,
+                    };
+                };
+                log.info("compaction.extraction parsed={d} written={d} skipped_blacklist={d} failed={d}", .{
+                    extracted.len,
+                    persist_result.written_count,
+                    persist_result.skipped_blacklist,
+                    persist_result.failed_count,
+                });
+            }
         }
     }
 
@@ -693,6 +762,13 @@ fn summarizeSlice(
     start: usize,
     end: usize,
     config: CompactionConfig,
+    // V1.6 commit 5b.2: optional extraction-tail capture. When non-null,
+    // the JSON tail (the part after "===EXTRACTED===") is duplicated into
+    // out.*; caller frees. When null, tail is discarded as in V1.5.5.
+    // Used by Pass C's single-call branch to feed extraction_persist.
+    // Split-in-half branch passes null (each half's tail is discarded —
+    // simpler than merging two batches; acceptable for V1.6 ship).
+    json_tail_out: ?*[]u8,
 ) ![]u8 {
     const transcript = try buildCompactionTranscript(allocator, history_items, start, end, config.max_source_chars);
     defer allocator.free(transcript);
@@ -837,10 +913,27 @@ fn summarizeSlice(
     // response as prose (LLM didn't follow the format — happens; the
     // existing summary path keeps working).
     const delimiter = "===EXTRACTED===";
-    const prose_summary = if (std.mem.indexOf(u8, raw_summary, delimiter)) |idx|
+    const split_idx = std.mem.indexOf(u8, raw_summary, delimiter);
+    const prose_summary = if (split_idx) |idx|
         std.mem.trimRight(u8, raw_summary[0..idx], &std.ascii.whitespace)
     else
         raw_summary;
+
+    // V1.6 commit 5b.2: pipe JSON tail to caller's out pointer when
+    // requested. When delimiter absent (LLM didn't follow new format),
+    // out is set to empty string so caller can detect no-tail case.
+    if (json_tail_out) |out| {
+        if (split_idx) |idx| {
+            const tail_start = idx + delimiter.len;
+            if (tail_start < raw_summary.len) {
+                out.* = try allocator.dupe(u8, raw_summary[tail_start..]);
+            } else {
+                out.* = try allocator.dupe(u8, "");
+            }
+        } else {
+            out.* = try allocator.dupe(u8, "");
+        }
+    }
 
     const max_len = @min(prose_summary.len, config.max_summary_chars);
     return try allocator.dupe(u8, prose_summary[0..max_len]);

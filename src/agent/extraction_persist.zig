@@ -44,6 +44,9 @@
 
 const std = @import("std");
 const log = std.log.scoped(.extraction_persist);
+const zaki_state = @import("../zaki_state.zig");
+const memory_root = @import("../memory/root.zig");
+const security_secrets = @import("../security/secrets.zig");
 
 /// One atomic fact extracted from a conversation. Mirrors the JSON
 /// schema specified in compaction.zig::summarizer_system. Produced by
@@ -204,6 +207,164 @@ pub fn parseExtractedJson(
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+/// Map Mem0/Graphiti `attributed_to` strings to MemoryCategory.
+/// Convention:
+///   "user"            → .core    (user-stated facts get the highest tier)
+///   "assistant_offer" → .daily   (assistant offered, user didn't reject)
+///   "undecided"       → .daily   (unresolved consideration)
+///   "assistant"       → .daily   (assistant statement; lower priority)
+///   anything else     → .daily   (safe default)
+fn categoryForAttribution(attributed_to: []const u8) memory_root.MemoryCategory {
+    if (std.mem.eql(u8, attributed_to, "user")) return .core;
+    return .daily;
+}
+
+/// Generate a key for a compaction-derived extracted memory. Shape:
+/// `extracted_<unix_seconds>_<hex8>`. The `extracted_` prefix is added
+/// to `BRAIN_HIDDEN_PREFIXES` (TODO V1.7) — for V1.6 these surface on
+/// /brain/* directly, which is the desired "your son thinks" UX. The
+/// hex8 suffix avoids collisions on rapid-fire writes within the same
+/// second.
+fn deriveExtractionKey(allocator: std.mem.Allocator) ![]u8 {
+    const ts: i64 = std.time.timestamp();
+    var random_bytes: [4]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes);
+    var hex_buf: [8]u8 = undefined;
+    _ = security_secrets.hexEncode(&random_bytes, &hex_buf);
+    return std.fmt.allocPrint(allocator, "extracted_{d}_{s}", .{ ts, hex_buf });
+}
+
+/// Build the metadata JSON for an extracted memory. Format:
+///   {
+///     "subject": "...",
+///     "predicate": "...",
+///     "object_key": "...",
+///     "attributed_to": "user|assistant|assistant_offer|undecided",
+///     "attribution": "extraction_classifier",
+///     "confidence": 0.0-1.0,
+///     "extracted_at": <unix>
+///   }
+///
+/// Caller frees returned slice.
+fn buildExtractionMetadata(
+    allocator: std.mem.Allocator,
+    mem: ExtractedMemory,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"subject\":\"");
+    try writeJsonEscaped(w, mem.subject);
+    try w.writeAll("\",\"predicate\":\"");
+    try writeJsonEscaped(w, mem.predicate);
+    try w.writeAll("\",\"object_key\":\"");
+    try writeJsonEscaped(w, mem.object);
+    try w.writeAll("\",\"attributed_to\":\"");
+    try writeJsonEscaped(w, mem.attributed_to);
+    try w.writeAll("\",\"attribution\":\"extraction_classifier\"");
+    try w.print(",\"confidence\":{d:.3}", .{mem.confidence});
+    try w.print(",\"extracted_at\":{d}", .{std.time.timestamp()});
+    try w.writeAll("}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => try writer.print("\\u{x:0>4}", .{c}),
+            else => try writer.writeByte(c),
+        }
+    }
+}
+
+/// Persist a batch of extracted memories.
+///
+/// Provider-agnostic. The `memories` slice can come from the compaction
+/// LLM (today's primary path), agent tool writes, or the classifier
+/// when those land. Each fact passes through:
+///   1. predicate blacklist (defense-in-depth against meta-narrative)
+///   2. write via state_mgr.upsertMemoryWithMetadata with V1.6 metadata
+///
+/// Future enhancements (tracked, not blocking):
+///   - MD5 content_hash dedup before write (gap #13 from audit)
+///   - Cosine dedup vs recent rows in same session (D4 mitigation)
+///
+/// Both are deferred to a follow-up commit because they require state
+/// not yet plumbed (recent-rows snapshot for cosine, hash-keyed lookup
+/// for MD5). For 5b.2 minimum-viable: rely on the LLM not emitting
+/// duplicates within one extraction batch + the upsert ON CONFLICT
+/// behavior keying on (user_id, key) which gives unique extraction
+/// keys naturally.
+///
+/// Per-fact failures emit log.warn but don't abort the batch — one
+/// bad fact shouldn't kill the run.
+pub fn persistExtracted(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    session_id: ?[]const u8,
+    memories: []const ExtractedMemory,
+) !PersistResult {
+    var result = PersistResult{
+        .written_count = 0,
+        .skipped_blacklist = 0,
+        .skipped_md5_dup = 0,
+        .skipped_cosine_dup = 0,
+        .failed_count = 0,
+    };
+
+    for (memories) |m| {
+        // Step 1: predicate blacklist
+        if (isRejectedPredicate(m.predicate)) {
+            log.warn("extraction.rejected_predicate predicate={s} subject={s}", .{ m.predicate, m.subject });
+            result.skipped_blacklist += 1;
+            continue;
+        }
+
+        // Step 2-5 — derive key + metadata + write
+        const key = deriveExtractionKey(allocator) catch |err| {
+            log.warn("extraction.key_derivation_failed err={s}", .{@errorName(err)});
+            result.failed_count += 1;
+            continue;
+        };
+        defer allocator.free(key);
+
+        const metadata_json = buildExtractionMetadata(allocator, m) catch |err| {
+            log.warn("extraction.metadata_build_failed err={s}", .{@errorName(err)});
+            result.failed_count += 1;
+            continue;
+        };
+        defer allocator.free(metadata_json);
+
+        const category = categoryForAttribution(m.attributed_to);
+
+        state_mgr.upsertMemoryWithMetadata(
+            user_id,
+            key,
+            m.text,
+            category,
+            session_id,
+            metadata_json,
+        ) catch |err| {
+            log.warn("extraction.write_failed key={s} err={s}", .{ key, @errorName(err) });
+            result.failed_count += 1;
+            continue;
+        };
+
+        log.info("extraction.persisted key={s} subject={s} predicate={s} attributed_to={s}", .{
+            key, m.subject, m.predicate, m.attributed_to,
+        });
+        result.written_count += 1;
+    }
+
+    return result;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
