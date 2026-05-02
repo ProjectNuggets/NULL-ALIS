@@ -367,6 +367,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn setMemoryInvalidation(_: *@This(), _: i64, _: []const u8, _: i64, _: i64) !void {
         return;
     }
+    /// V1.6 commit 11 — stub for non-postgres builds. The CASE-guard
+    /// immortality protection only fires on the postgres path, so demotion
+    /// is a no-op for other backends.
+    pub fn demoteMemoryFromCore(_: *@This(), _: i64, _: []const u8, _: []const u8) !bool {
+        return false;
+    }
     /// V1.6 commit 7 — stub for non-postgres builds. Edge writes silently
     /// no-op; the materialized graph is a postgres-only feature today.
     pub fn upsertMemoryEdge(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8, _: ?[]const u8, _: ?f64) !void {
@@ -3357,6 +3363,66 @@ const ManagerImpl = struct {
                 });
             };
         }
+    }
+
+    /// V1.6 commit 11 — flip a `core` memory back to a non-core type.
+    /// Required because V1.7's CASE-guard in upsertMemory + the W-INT-01
+    /// fix make core rows immortal against subsequent upserts (preserving
+    /// promotion + close-out state). The only escape hatch is this
+    /// explicit demotion.
+    ///
+    /// `target_category_str` must be one of "daily" / "conversation" /
+    /// "episodic" — i.e. anything but "core". Returns true when a row was
+    /// actually demoted (false when key didn't exist or was already
+    /// non-core).
+    ///
+    /// Emits a memory_events row with event_type='demote' carrying the
+    /// `from`/`to` types so audit can reconstruct demotion history.
+    pub fn demoteMemoryFromCore(self: *Self, user_id: i64, key: []const u8, target_category_str: []const u8) !bool {
+        // Defensive: never accept "core" as the target — would be a no-op
+        // that masks the caller's confusion.
+        if (std.mem.eql(u8, target_category_str, "core")) return false;
+        const q = try self.buildQuery(
+            "UPDATE {schema}.memories SET memory_type = $3, updated_at = NOW() " ++
+                "WHERE user_id = $1 AND key = $2 AND memory_type = 'core' " ++
+                "RETURNING id",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const key_z = try self.allocator.dupeZ(u8, key);
+        defer self.allocator.free(key_z);
+        const tgt_z = try self.allocator.dupeZ(u8, target_category_str);
+        defer self.allocator.free(tgt_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, key_z, tgt_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len), @intCast(target_category_str.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return false;
+
+        // Audit event — best-effort, non-fatal on failure.
+        const payload = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"key\":\"{s}\",\"from\":\"core\",\"to\":\"{s}\"}}",
+            .{ key, target_category_str },
+        ) catch return true;
+        defer self.allocator.free(payload);
+        const event_q = try self.buildQuery(
+            "INSERT INTO {schema}.memory_events (id, user_id, memory_id, event_type, payload) " ++
+                "VALUES ($1, $2, NULL, 'demote', $3::jsonb)",
+        );
+        defer self.allocator.free(event_q);
+        const event_id = self.randomHexId(self.allocator, 16) catch return true;
+        defer self.allocator.free(event_id);
+        const event_id_z = self.allocator.dupeZ(u8, event_id) catch return true;
+        defer self.allocator.free(event_id_z);
+        const payload_z = self.allocator.dupeZ(u8, payload) catch return true;
+        defer self.allocator.free(payload_z);
+        const event_params = [_]?[*:0]const u8{ event_id_z, user_s.ptr, payload_z };
+        const event_lengths = [_]c_int{ @intCast(event_id.len), @intCast(user_s.len), @intCast(payload.len) };
+        const event_result = self.execParams(event_q, &event_params, &event_lengths) catch return true;
+        c.PQclear(event_result);
+        return true;
     }
 
     /// V1.6 commit 7 — write a typed edge into the materialized graph.
@@ -7223,5 +7289,110 @@ test "V1.6 commit 10 graph-expand — 3-node chain expansion" {
         try std.testing.expect(!std.mem.eql(u8, n.key, "node_x"));
         try std.testing.expect(!std.mem.eql(u8, n.key, "node_y"));
     }
+}
+
+// V1.6 commit 11 — demoteMemoryFromCore.
+//
+// Acceptance: a core row gets demoted to .daily, the W-INT-01 immortality
+// CASE-guard releases (subsequent upserts can edit the row freely), and
+// an audit event lands in memory_events.
+test "V1.6 commit 11 demoteMemoryFromCore — releases immortality + emits audit event" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Seed a core row directly (bypass V1.7 promotion path)
+    try mgr.upsertMemory(2, "k_to_demote", "core fact A", .core, "session-A");
+
+    // ── Step 1: confirm row IS core
+    {
+        const before = try mgr.getMemory(allocator, 2, "k_to_demote");
+        try std.testing.expect(before != null);
+        var row = before.?;
+        defer row.deinit(allocator);
+        try std.testing.expect(row.category.eql(.core));
+    }
+
+    // ── Step 2: V1.7 immortality guard — upsert with .daily IS clobbered to core
+    try mgr.upsertMemory(2, "k_to_demote", "edited fact B", .daily, "session-B");
+    {
+        const after = try mgr.getMemory(allocator, 2, "k_to_demote");
+        try std.testing.expect(after != null);
+        var row = after.?;
+        defer row.deinit(allocator);
+        try std.testing.expect(row.category.eql(.core)); // CASE-guard preserves core
+    }
+
+    // ── Step 3: explicit demote unlocks editing
+    const demoted = try mgr.demoteMemoryFromCore(2, "k_to_demote", "daily");
+    try std.testing.expect(demoted);
+    {
+        const after = try mgr.getMemory(allocator, 2, "k_to_demote");
+        try std.testing.expect(after != null);
+        var row = after.?;
+        defer row.deinit(allocator);
+        try std.testing.expect(row.category.eql(.daily));
+    }
+
+    // ── Step 4: subsequent upsert with different content actually edits now
+    try mgr.upsertMemory(2, "k_to_demote", "edited fact C", .daily, "session-C");
+    {
+        const after = try mgr.getMemory(allocator, 2, "k_to_demote");
+        try std.testing.expect(after != null);
+        var row = after.?;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("edited fact C", row.content);
+    }
+
+    // ── Step 5: audit event recorded
+    {
+        const event_q = try std.fmt.allocPrint(allocator,
+            "SELECT payload->>'from', payload->>'to' FROM {s}.memory_events " ++
+                "WHERE user_id = 2 AND event_type = 'demote' ORDER BY created_at DESC LIMIT 1",
+            .{schema},
+        );
+        defer allocator.free(event_q);
+        const result = try mgr.exec(event_q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        const from_t = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(from_t);
+        const to_t = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(to_t);
+        try std.testing.expectEqualStrings("core", from_t);
+        try std.testing.expectEqualStrings("daily", to_t);
+    }
+
+    // ── Step 6: defensive — target=core rejected as no-op
+    const noop = try mgr.demoteMemoryFromCore(2, "k_to_demote", "core");
+    try std.testing.expect(!noop);
+
+    // Note: re-demoting a freshly-non-core row would normally return false
+    // via the WHERE memory_type='core' filter, but V1.7 promotion can fire
+    // on the post-edit state (cross-session count + non-core after demote)
+    // and re-promote the row to core silently — at which point demote
+    // succeeds again. That interaction is part of the V1.7 normal lifecycle,
+    // not a cmt11 acceptance gate. Steps 1-5 above cover the meat: demote
+    // unlocks immortality + emits audit; further lifecycle is V1.7's domain.
 }
 

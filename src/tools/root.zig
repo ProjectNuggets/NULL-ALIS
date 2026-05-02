@@ -80,6 +80,8 @@ pub const memory_list = @import("memory_list.zig");
 pub const memory_timeline = @import("memory_timeline.zig");
 pub const transcript_read = @import("transcript_read.zig");
 pub const memory_forget = @import("memory_forget.zig");
+pub const memory_archive = @import("memory_archive.zig");
+pub const memory_demote = @import("memory_demote.zig");
 pub const memory_purge_topic = @import("memory_purge_topic.zig");
 pub const schedule = @import("schedule.zig");
 pub const todo = @import("todo.zig");
@@ -1060,6 +1062,18 @@ pub fn allTools(
     mft.* = .{};
     try list.append(allocator, mft.tool());
 
+    // V1.6 commit 11 — soft-delete + demote-from-core agent surfaces.
+    // Pair with memory_forget (hard delete). The agent picks based on
+    // the user's intent: scrub forever (forget), preserve audit (archive),
+    // unlock a core fact for editing (demote).
+    const mat = try allocator.create(memory_archive.MemoryArchiveTool);
+    mat.* = .{};
+    try list.append(allocator, mat.tool());
+
+    const mdt = try allocator.create(memory_demote.MemoryDemoteTool);
+    mdt.* = .{};
+    try list.append(allocator, mdt.tool());
+
     const mpt = try allocator.create(memory_purge_topic.MemoryPurgeTopicTool);
     mpt.* = .{};
     try list.append(allocator, mpt.tool());
@@ -1634,6 +1648,12 @@ pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
         } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
             const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
+        } else if (t.vtable == &memory_archive.MemoryArchiveTool.vtable) {
+            // V1.6 cmt11 — memory_archive needs the Memory backend for
+            // the protected-key lifecycle check; tenant context (state_mgr
+            // + user_id) wired separately via bindStateMgrTenant below.
+            const mt: *memory_archive.MemoryArchiveTool = @ptrCast(@alignCast(t.ptr));
+            mt.memory = memory;
         } else if (t.vtable == &memory_purge_topic.MemoryPurgeTopicTool.vtable) {
             const mt: *memory_purge_topic.MemoryPurgeTopicTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
@@ -1678,6 +1698,26 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
         } else if (t.vtable == &transcript_read.TranscriptReadTool.vtable) {
             const trt: *transcript_read.TranscriptReadTool = @ptrCast(@alignCast(t.ptr));
             trt.session_store = if (mem_rt) |rt| rt.session_store else null;
+        }
+    }
+}
+
+/// V1.6 cmt11 — bind tenant context (state_mgr + user_id) to tools that
+/// need direct postgres access for bi-temporal close-out / demote operations.
+/// Today's consumers: memory_archive (calls setMemoryInvalidation) and
+/// memory_demote (calls demoteMemoryFromCore). Both require numeric user_id
+/// for SQL params; pass null when tenant has no postgres lane (the tools
+/// will surface a clear "soft-delete unavailable" error to the agent).
+pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, user_id: ?i64) void {
+    for (tools) |t| {
+        if (t.vtable == &memory_archive.MemoryArchiveTool.vtable) {
+            const mt: *memory_archive.MemoryArchiveTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
+        } else if (t.vtable == &memory_demote.MemoryDemoteTool.vtable) {
+            const mt: *memory_demote.MemoryDemoteTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
         }
     }
 }
@@ -2136,11 +2176,12 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 34 (delegate + spawn dormant by default; +1 for V1.5 todo,
+    // base 36 (delegate + spawn dormant by default; +1 for V1.5 todo,
     // +1 for V1.5 day-3 compose_memory; +1 calculator + 1 file_read_hashed
-    // + 1 file_edit_hashed from nullclaw cherry-pick) + http_request +
-    // web_fetch + web_search + browser = 38.
-    try std.testing.expectEqual(@as(usize, 38), tools.len);
+    // + 1 file_edit_hashed from nullclaw cherry-pick; +1 memory_archive
+    // + 1 memory_demote from V1.6 cmt11) + http_request + web_fetch +
+    // web_search + browser = 40.
+    try std.testing.expectEqual(@as(usize, 40), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2157,8 +2198,9 @@ test "all tools excludes extras when disabled" {
     // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + schedule + todo + compose_memory
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
     // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot
-    // + calculator + file_read_hashed + file_edit_hashed (nullclaw cherry-pick) = 34
-    try std.testing.expectEqual(@as(usize, 34), tools.len);
+    // + calculator + file_read_hashed + file_edit_hashed (nullclaw cherry-pick)
+    // + memory_archive + memory_demote (V1.6 cmt11) = 36
+    try std.testing.expectEqual(@as(usize, 36), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2284,10 +2326,11 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    // 34 core tools (was 30 — V1.5 day-3 added `compose_memory`; nullclaw
-    // cherry-pick added calculator + file_read_hashed + file_edit_hashed);
+    // 36 core tools (was 30 — V1.5 day-3 added `compose_memory`; nullclaw
+    // cherry-pick added calculator + file_read_hashed + file_edit_hashed;
+    // V1.6 cmt11 added memory_archive + memory_demote);
     // delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT.
-    try std.testing.expectEqual(@as(usize, 34), tools.len);
+    try std.testing.expectEqual(@as(usize, 36), tools.len);
 
     var found_message = false;
     for (tools) |t| {

@@ -1507,6 +1507,19 @@ const TenantRuntime = struct {
             tools_mod.bindMemoryRuntime(runtime.tools, rt);
         }
 
+        // V1.6 commit 11 — wire tenant context (state_mgr + numeric user_id)
+        // to memory_archive + memory_demote tools. Both need direct postgres
+        // access for bi-temporal close-out / demote SQL. When state_mgr is
+        // null (non-postgres deploy) or user_id is non-numeric, tools surface
+        // a clear "soft-delete unavailable" error to the agent rather than
+        // silently failing.
+        const cmt11_uid: ?i64 = blk: {
+            const parsed = std.fmt.parseInt(i64, user_ctx.user_id, 10) catch break :blk null;
+            if (parsed <= 0) break :blk null;
+            break :blk parsed;
+        };
+        tools_mod.bindStateMgrTenant(runtime.tools, state_mgr, cmt11_uid);
+
         // V1.6 commit 5b.3 — extraction wire-up. When the gateway has
         // a postgres state manager AND the tenant has a numeric user_id,
         // per-session agents inherit these via buildSessionAgent and
