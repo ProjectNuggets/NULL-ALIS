@@ -1194,6 +1194,45 @@ const ManagerImpl = struct {
             // setMemoryInvalidation. Partial because invalid edges are
             // append-only / archived, not actively queried.
             "CREATE INDEX IF NOT EXISTS idx_edges_validity ON {schema}.memory_edges(user_id, valid_to) WHERE valid_to IS NOT NULL",
+
+            // V1.6 commit 16 — one-shot backfill: populate memory_edges from
+            // existing JSONB triples on legacy memories. Idempotent via the
+            // partial UNIQUE INDEX on (user_id, source_key, predicate,
+            // target_key) WHERE is_latest — re-running migrate is safe.
+            //
+            // target_key shape mirrors extraction_persist.deriveEntityKey:
+            //   'entity_' + first 16 hex chars of sha256(lower(object))
+            // (pgcrypto's digest() returns bytea; encode → hex → substring.
+            //  pgcrypto is installed by the cmt0 CREATE EXTENSION above.)
+            //
+            // Skips closed-out rows (valid_to in past) so cascade semantics
+            // stay consistent with cmt6/cmt7 — closed-out memories can't
+            // resurrect edges via backfill.
+            //
+            // Confidence: defaults to 1.0 when metadata.confidence absent
+            // (legacy V1.5 rows). Attribution: defaults to
+            // 'extraction_classifier' since pre-cmt7 extraction was the
+            // only writer of subject/predicate/object metadata.
+            //
+            // Cost: O(N) over rows with metadata.subject populated. On
+            // Nova's user_id=1 dev DB this is a small number; production
+            // scale will run during a maintenance window.
+            "INSERT INTO {schema}.memory_edges (user_id, source_key, target_key, predicate, attribution, confidence, valid_from) " ++
+                "SELECT user_id, key AS source_key, " ++
+                "'entity_' || substring(encode(digest(lower(metadata->>'object'), 'sha256'), 'hex') from 1 for 16) AS target_key, " ++
+                "metadata->>'predicate' AS predicate, " ++
+                "COALESCE(metadata->>'attribution', 'extraction_classifier') AS attribution, " ++
+                "COALESCE((metadata->>'confidence')::float, 1.0) AS confidence, " ++
+                "EXTRACT(EPOCH FROM created_at)::bigint AS valid_from " ++
+                "FROM {schema}.memories " ++
+                "WHERE metadata IS NOT NULL " ++
+                "AND metadata ? 'subject' " ++
+                "AND metadata ? 'predicate' " ++
+                "AND metadata ? 'object' " ++
+                "AND length(metadata->>'object') > 0 " ++
+                "AND length(metadata->>'predicate') > 0 " ++
+                "AND (valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint) " ++
+                "ON CONFLICT (user_id, source_key, predicate, target_key) WHERE is_latest DO NOTHING",
             \\CREATE TABLE IF NOT EXISTS {schema}.memory_events (
             \\    id TEXT PRIMARY KEY,
             \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
@@ -7652,5 +7691,91 @@ test "V1.6 commit 11 demoteMemoryFromCore — releases immortality + emits audit
     // succeeds again. That interaction is part of the V1.7 normal lifecycle,
     // not a cmt11 acceptance gate. Steps 1-5 above cover the meat: demote
     // unlocks immortality + emits audit; further lifecycle is V1.7's domain.
+}
+
+// V1.6 commit 16 — one-shot backfill of memory_edges from JSONB triples.
+//
+// Acceptance: a memory inserted directly via SQL (bypassing extraction_persist)
+// with metadata.subject/predicate/object — the next migrate() call MUST
+// populate memory_edges with a row whose target_key matches the
+// deriveEntityKey shape. Re-running migrate is idempotent (UNIQUE INDEX).
+test "V1.6 commit 16 backfill populates memory_edges from JSONB triples" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Seed a "legacy" memory directly (bypass extraction_persist) so the
+    // edge wasn't auto-written. Simulates a pre-cmt7 row that needs backfill.
+    try mgr.upsertMemoryWithMetadata(2, "legacy_helix_pref",
+        "User prefers Helix",
+        .core, "session-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"Helix","attributed_to":"user","attribution":"extraction_classifier","confidence":0.9}
+    );
+
+    // ── Confirm no edge exists yet (extraction_persist didn't write it)
+    {
+        const before = try mgr.countEdgesForSource(2, "legacy_helix_pref");
+        try std.testing.expectEqual(@as(usize, 0), before);
+    }
+
+    // ── Run migrate() again — idempotent + triggers the backfill
+    try mgr.migrate();
+
+    // ── Backfill should have created exactly one edge
+    {
+        const after = try mgr.countEdgesForSource(2, "legacy_helix_pref");
+        try std.testing.expectEqual(@as(usize, 1), after);
+    }
+
+    // ── Edge target_key matches the deterministic entity_<hash> shape
+    {
+        const edges = try mgr.findEdgesByKeys(allocator, 2, &[_][]const u8{"legacy_helix_pref"});
+        defer memory_root.freeTypedEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expect(std.mem.startsWith(u8, edges[0].target_key, "entity_"));
+        try std.testing.expectEqual(@as(usize, 7 + 16), edges[0].target_key.len); // "entity_" + 16 hex chars
+        try std.testing.expectEqualStrings("PREFERS", edges[0].predicate);
+    }
+
+    // ── Re-running migrate() is idempotent — no duplicate edge
+    try mgr.migrate();
+    {
+        const after = try mgr.countEdgesForSource(2, "legacy_helix_pref");
+        try std.testing.expectEqual(@as(usize, 1), after); // still 1 — UNIQUE INDEX caught duplicate
+    }
+
+    // ── Closed-out memories don't get edges (cascade-consistency check)
+    try mgr.upsertMemoryWithMetadata(2, "legacy_archived",
+        "User used to prefer NeoVim",
+        .core, "session-A",
+        \\{"subject":"user","predicate":"USED_TO_PREFER","object":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":0.9}
+    );
+    const close_ts: i64 = std.time.timestamp();
+    try mgr.setMemoryInvalidation(2, "legacy_archived", close_ts, close_ts);
+    try mgr.migrate(); // re-run backfill
+    {
+        const after = try mgr.countEdgesForSource(2, "legacy_archived");
+        try std.testing.expectEqual(@as(usize, 0), after); // skipped — closed-out
+    }
 }
 
