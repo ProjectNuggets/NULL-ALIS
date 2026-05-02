@@ -35,6 +35,7 @@ const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
 const mcp_mod = @import("mcp.zig");
 const memory_mod = @import("memory/root.zig");
+const importance_mod = @import("memory/importance.zig");
 const zaki_dual_memory = @import("memory/engines/zaki_dual.zig");
 const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
@@ -11308,6 +11309,51 @@ fn handleBrainGraph(
     };
     defer allocator.free(ref_edges);
 
+    // ── V1.6 commit 4 — compute per-node importance score ────────────
+    //
+    // Sized for FE node-radius rendering (M1 from spec §4.3). Count
+    // edges incident on each node across all three edge types (session,
+    // semantic, reference), then compose with recency_decay.
+    // Recomputed per request — cheap at 500-node cap, stays fresh.
+    const importance_scores = allocator.alloc(f64, node_count) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+    };
+    defer allocator.free(importance_scores);
+    {
+        // Count incident edges per node-key in O(E + N) via hashmap pass.
+        var degree: std.StringHashMapUnmanaged(usize) = .{};
+        defer degree.deinit(allocator);
+        for (session_edges) |e| {
+            const a_entry = degree.getOrPut(allocator, e.source) catch continue;
+            if (!a_entry.found_existing) a_entry.value_ptr.* = 0;
+            a_entry.value_ptr.* += 1;
+            const b_entry = degree.getOrPut(allocator, e.target) catch continue;
+            if (!b_entry.found_existing) b_entry.value_ptr.* = 0;
+            b_entry.value_ptr.* += 1;
+        }
+        for (semantic_edges) |e| {
+            const a_entry = degree.getOrPut(allocator, e.source_key) catch continue;
+            if (!a_entry.found_existing) a_entry.value_ptr.* = 0;
+            a_entry.value_ptr.* += 1;
+            const b_entry = degree.getOrPut(allocator, e.target_key) catch continue;
+            if (!b_entry.found_existing) b_entry.value_ptr.* = 0;
+            b_entry.value_ptr.* += 1;
+        }
+        for (ref_edges) |e| {
+            const a_entry = degree.getOrPut(allocator, e.source) catch continue;
+            if (!a_entry.found_existing) a_entry.value_ptr.* = 0;
+            a_entry.value_ptr.* += 1;
+            const b_entry = degree.getOrPut(allocator, e.target) catch continue;
+            if (!b_entry.found_existing) b_entry.value_ptr.* = 0;
+            b_entry.value_ptr.* += 1;
+        }
+        const now = std.time.timestamp();
+        for (nodes, 0..) |n, i| {
+            const edge_count: usize = if (degree.get(n.key)) |d| d else 0;
+            importance_scores[i] = importance_mod.computeImportance(n.created_at, now, edge_count);
+        }
+    }
+
     // ── Build JSON response ──────────────────────────────────────
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
@@ -11336,6 +11382,9 @@ fn handleBrainGraph(
         } else {
             w.writeAll("null") catch return response_build_err;
         }
+        // V1.6 commit 4 — M1 importance score (FE drives node-radius rendering).
+        // 3 decimals = 1000 visually-distinct buckets, plenty for graph sizing.
+        w.print(",\"importance\":{d:.3}", .{importance_scores[i]}) catch return response_build_err;
         w.writeAll("}") catch return response_build_err;
     }
 
