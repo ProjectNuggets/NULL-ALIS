@@ -184,6 +184,11 @@ pub const SessionManager = struct {
     extraction_state_mgr: ?*@import("zaki_state.zig").Manager = null,
     /// 5b-loose-ends-sweep — `?i64` instead of `0` sentinel (IN-4).
     extraction_user_id: ?i64 = null,
+    /// V1.6 commit 8 — embedding provider for entity coreference
+    /// (memory_entities cosine ≥0.95). When set, extraction_persist
+    /// resolves object strings to canonical entity_ids; absent →
+    /// hash-fallback (V1.6 cmt7 behavior).
+    extraction_coref_embed: ?@import("memory/vector/embeddings.zig").EmbeddingProvider = null,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -400,6 +405,7 @@ pub const SessionManager = struct {
         // atomic-fact extraction.
         agent.extraction_state_mgr = self.extraction_state_mgr;
         agent.extraction_user_id = self.extraction_user_id;
+        agent.extraction_coref_embed = self.extraction_coref_embed;
         return agent;
     }
 

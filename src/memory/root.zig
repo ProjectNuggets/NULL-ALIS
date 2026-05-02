@@ -418,6 +418,22 @@ pub fn freeTypedEdges(allocator: std.mem.Allocator, edges: []TypedEdge) void {
     allocator.free(edges);
 }
 
+/// V1.6 commit 8 — entity row in memory_entities. Returned by
+/// findEntityByCosine when a cosine ≥ threshold neighbor exists for a
+/// query embedding. The agent uses `id` as the stable target_key for
+/// edges pointing at this entity. `similarity` reports the cosine
+/// score that matched (1.0 = identical, ≥0.95 = coreferent per Mem0).
+pub const EntityRow = struct {
+    id: []const u8,
+    name: []const u8,
+    similarity: f64 = 0.0,
+
+    pub fn deinit(self: *const EntityRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+    }
+};
+
 pub const PromptBootstrapKeyPrefix = "__bootstrap.prompt.";
 pub const TombstoneKeyPrefix = "__tombstone__/";
 

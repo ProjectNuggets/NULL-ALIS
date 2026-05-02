@@ -1521,7 +1521,19 @@ const TenantRuntime = struct {
                 if (numeric_user_id > 0) {
                     runtime.session_mgr.extraction_state_mgr = smgr;
                     runtime.session_mgr.extraction_user_id = numeric_user_id;
-                    log.info("extraction.enabled user_id={d}", .{numeric_user_id});
+                    // V1.6 commit 8: also wire entity coreference when an
+                    // embedding provider is available on this tenant runtime.
+                    // Without it, extraction_persist falls back to V1.6 cmt7
+                    // hash-based entity keys (graph still works, just no
+                    // surface-form coreference).
+                    var coref_on = false;
+                    if (runtime.mem_rt) |*mrt| {
+                        if (mrt._embedding_provider) |ep| {
+                            runtime.session_mgr.extraction_coref_embed = ep;
+                            coref_on = true;
+                        }
+                    }
+                    log.info("extraction.enabled user_id={d} coref={s}", .{ numeric_user_id, if (coref_on) "on" else "off-no-embed" });
                 }
             } else |_| {
                 // user_ctx.user_id is non-numeric (e.g., email) — skip

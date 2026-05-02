@@ -378,6 +378,16 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listEdgesForUser(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]memory_root.TypedEdge {
         return allocator.alloc(memory_root.TypedEdge, 0);
     }
+    /// V1.6 commit 8 — stub for non-postgres builds. Entity coreference is
+    /// a postgres-pgvector feature; non-postgres builds fall back to a
+    /// hash-based stable key (entity_<hash(lower(name))>) computed by the
+    /// caller, no DB row created.
+    pub fn findEntityByCosine(_: *@This(), _: std.mem.Allocator, _: i64, _: []const f32, _: f64) !?memory_root.EntityRow {
+        return null;
+    }
+    pub fn upsertEntity(_: *@This(), allocator: std.mem.Allocator, _: i64, name: []const u8, _: []const f32) ![]u8 {
+        return allocator.dupe(u8, name);
+    }
     pub fn countMemories(_: *@This(), _: i64) !usize {
         return error.PostgresNotEnabled;
     }
@@ -3453,6 +3463,126 @@ const ManagerImpl = struct {
             });
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    /// V1.6 commit 8 — entity coreference via pgvector cosine similarity.
+    /// Returns the closest existing entity for `user_id` whose
+    /// `1 - (name_embedding <=> $2)` ≥ `threshold` (typically 0.95 per
+    /// Mem0). Used to dedupe surface variants ("Helix" / "helix" /
+    /// "Helix editor") into a single entity row.
+    ///
+    /// Cosine via pgvector's `<=>` operator (returns distance; similarity
+    /// = 1 - distance). The ivfflat index `idx_entities_vec` accelerates
+    /// the search.
+    ///
+    /// Caller frees the returned EntityRow.
+    pub fn findEntityByCosine(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        embedding: []const f32,
+        threshold: f64,
+    ) !?memory_root.EntityRow {
+        // Format embedding as pgvector literal: "[v1,v2,...,vN]"
+        var emb_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer emb_buf.deinit(allocator);
+        try emb_buf.append(allocator, '[');
+        for (embedding, 0..) |v, i| {
+            if (i > 0) try emb_buf.append(allocator, ',');
+            const w = emb_buf.writer(allocator);
+            try w.print("{d:.6}", .{v});
+        }
+        try emb_buf.append(allocator, ']');
+
+        const q = try self.buildQuery(
+            "SELECT id, name, 1 - (name_embedding <=> $2::vector) AS sim " ++
+                "FROM {schema}.memory_entities " ++
+                "WHERE user_id = $1 AND name_embedding IS NOT NULL " ++
+                "ORDER BY name_embedding <=> $2::vector " ++
+                "LIMIT 1",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const emb_z = try allocator.dupeZ(u8, emb_buf.items);
+        defer allocator.free(emb_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, emb_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(emb_buf.items.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+        const sim_str = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(sim_str);
+        const sim = std.fmt.parseFloat(f64, sim_str) catch return null;
+        if (sim < threshold) return null;
+        const id = try dupeResultValue(allocator, result, 0, 0);
+        errdefer allocator.free(id);
+        const name = try dupeResultValue(allocator, result, 0, 1);
+        errdefer allocator.free(name);
+        return memory_root.EntityRow{ .id = id, .name = name, .similarity = sim };
+    }
+
+    /// V1.6 commit 8 — write a new entity row to memory_entities with its
+    /// embedding. Returns the entity `id` (caller-owned). Generates a
+    /// random hex ID using the same pattern as memory rows. ON CONFLICT
+    /// on (user_id, name_lower) re-uses the existing entity if a strict
+    /// case-insensitive match exists (handles the trivial "Helix" / "helix"
+    /// case before cosine even runs).
+    ///
+    /// Caller has already determined no cosine ≥ threshold neighbor exists
+    /// (via findEntityByCosine returning null) — this is the create branch.
+    pub fn upsertEntity(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        name: []const u8,
+        embedding: []const f32,
+    ) ![]u8 {
+        // pgvector literal
+        var emb_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer emb_buf.deinit(allocator);
+        try emb_buf.append(allocator, '[');
+        for (embedding, 0..) |v, i| {
+            if (i > 0) try emb_buf.append(allocator, ',');
+            const w = emb_buf.writer(allocator);
+            try w.print("{d:.6}", .{v});
+        }
+        try emb_buf.append(allocator, ']');
+
+        const id = try self.randomHexId(self.allocator, 16);
+        errdefer self.allocator.free(id);
+
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.memory_entities (id, user_id, name, name_lower, name_embedding) " ++
+                "VALUES ($1, $2, $3, LOWER($3), $4::vector) " ++
+                "ON CONFLICT (user_id, name_lower) DO UPDATE SET " ++
+                "name_embedding = EXCLUDED.name_embedding, updated_at = NOW() " ++
+                "RETURNING id",
+        );
+        defer self.allocator.free(q);
+        const id_z = try self.allocator.dupeZ(u8, id);
+        defer self.allocator.free(id_z);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const name_z = try self.allocator.dupeZ(u8, name);
+        defer self.allocator.free(name_z);
+        const emb_z = try self.allocator.dupeZ(u8, emb_buf.items);
+        defer self.allocator.free(emb_z);
+        const params = [_]?[*:0]const u8{ id_z, user_s.ptr, name_z, emb_z };
+        const lengths = [_]c_int{
+            @intCast(id.len),
+            @intCast(user_s.len),
+            @intCast(name.len),
+            @intCast(emb_buf.items.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return id;
+        // ON CONFLICT might have returned the existing row's id if name_lower
+        // collided — caller-owned new id either way.
+        const returned_id = try dupeResultValue(allocator, result, 0, 0);
+        self.allocator.free(id);
+        return returned_id;
     }
 
     /// Delete autosave_user_* and autosave_assistant_* memory rows for the
@@ -6606,3 +6736,84 @@ test "V1.6 commit 7 memory_edges insert + dedup + cascade-on-close" {
         try std.testing.expectEqualStrings("2", closed_count_str); // both edges closed
     }
 }
+
+// V1.6 commit 8 — entity coreference via cosine ≥ threshold.
+//
+// Acceptance: upsertEntity inserts a new entity with a deterministic embedding;
+// findEntityByCosine finds it back when queried with a similar embedding (sim
+// ≥ threshold) and returns null when sim < threshold.
+//
+// Uses synthetic 1024-d embeddings (zeros + a single 1.0 at varying indexes)
+// so cosine similarity is exact: identical vectors → 1.0, orthogonal → 0.0.
+test "V1.6 commit 8 entity coreference — cosine match + miss" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // Build two synthetic 1024-d embeddings:
+    //   helix: index 5 = 1.0, rest 0.0
+    //   neovim: index 100 = 1.0, rest 0.0
+    // cosine(helix, helix) = 1.0; cosine(helix, neovim) = 0.0
+    var helix_emb: [1024]f32 = [_]f32{0.0} ** 1024;
+    helix_emb[5] = 1.0;
+    var neovim_emb: [1024]f32 = [_]f32{0.0} ** 1024;
+    neovim_emb[100] = 1.0;
+
+    // ── Step 1: insert "Helix" entity. Returns new id.
+    const helix_id = try mgr.upsertEntity(allocator, 2, "Helix", &helix_emb);
+    defer allocator.free(helix_id);
+    try std.testing.expect(helix_id.len > 0);
+
+    // ── Step 2: cosine-search with the SAME embedding finds Helix back.
+    {
+        const found = try mgr.findEntityByCosine(allocator, 2, &helix_emb, 0.95);
+        try std.testing.expect(found != null);
+        const row = found.?;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("Helix", row.name);
+        try std.testing.expectEqualStrings(helix_id, row.id);
+        try std.testing.expect(row.similarity >= 0.95);
+    }
+
+    // ── Step 3: cosine-search with the NeoVim embedding does NOT match
+    //    Helix at the 0.95 threshold (sim ≈ 0.0).
+    {
+        const not_found = try mgr.findEntityByCosine(allocator, 2, &neovim_emb, 0.95);
+        try std.testing.expect(not_found == null);
+    }
+
+    // ── Step 4: insert NeoVim entity, verify two distinct rows now exist.
+    const neovim_id = try mgr.upsertEntity(allocator, 2, "NeoVim", &neovim_emb);
+    defer allocator.free(neovim_id);
+    try std.testing.expect(!std.mem.eql(u8, helix_id, neovim_id));
+
+    // ── Step 5: each entity now finds itself back, not the other.
+    {
+        const found = try mgr.findEntityByCosine(allocator, 2, &neovim_emb, 0.95);
+        try std.testing.expect(found != null);
+        const row = found.?;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("NeoVim", row.name);
+    }
+}
+

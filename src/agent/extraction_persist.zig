@@ -49,6 +49,7 @@ const memory_root = @import("../memory/root.zig");
 const security_secrets = @import("../security/secrets.zig");
 const providers = @import("../providers/root.zig");
 const edge_resolution = @import("edge_resolution.zig");
+const memory_embeddings = @import("../memory/vector/embeddings.zig");
 
 /// One atomic fact extracted from a conversation. Mirrors the JSON
 /// schema specified in compaction.zig::summarizer_system. Produced by
@@ -108,6 +109,24 @@ pub const PersistResult = struct {
 pub const JudgeContext = struct {
     provider: providers.Provider,
     model_name: []const u8,
+};
+
+/// V1.6 commit 8 — optional embedding provider for entity coreference.
+/// When set, the object side of each extracted triple is embedded and
+/// matched against existing entities via pgvector cosine ≥0.95 (Mem0
+/// threshold). Cosine match → reuse entity_id as edge target_key.
+/// No match → create new entity row, use its id as target_key.
+/// Provider absent → fall back to hash-based entity_<sha256(lower(object))>
+/// (V1.6 cmt7 behavior).
+///
+/// The embed call adds ~50-200ms per fact. Acceptable for Pass C
+/// (already async after summary archive). Failures are non-fatal:
+/// fall back to hash key + log.warn.
+pub const EntityResolution = struct {
+    embed_provider: memory_embeddings.EmbeddingProvider,
+    /// Cosine similarity threshold above which two entity strings are
+    /// considered coreferent (the same entity). Mem0 spec: 0.95.
+    threshold: f64 = 0.95,
 };
 
 /// Predicate blacklist — same list as compaction.zig prompt's
@@ -379,6 +398,7 @@ pub fn persistExtracted(
     session_id: ?[]const u8,
     memories: []const ExtractedMemory,
     judge: ?JudgeContext,
+    coref: ?EntityResolution,
 ) !PersistResult {
     var result = PersistResult{
         .written_count = 0,
@@ -569,9 +589,17 @@ pub fn persistExtracted(
         // The memory row is already written; an orphan-without-edge is
         // benign (importance scoring sees edge_count=0 for that node, same
         // as pre-V1.6cmt7 baseline).
-        const target_key = deriveEntityKey(allocator, m.object) catch |err| blk: {
-            log.warn("extraction.edge_target_failed err={s}", .{@errorName(err)});
-            break :blk @as(?[]u8, null);
+        // V1.6 commit 8: resolve entity-side target_key. With a coref
+        // provider configured, embed the object + cosine-search existing
+        // entities (≥0.95 = same entity, reuse its id). Without a provider,
+        // fall back to V1.6 cmt7's hash-based shape entity_<hash(lower(o))>.
+        // Either way: every fact about the same object lands on the same
+        // graph node — the difference is whether "Helix" and "Helix editor"
+        // collapse to ONE node (cosine yes, hash no).
+        const target_key = resolveEntityKey(allocator, state_mgr, user_id, m.object, coref) catch |err| blk: {
+            log.warn("extraction.entity_resolve_failed err={s} object={s}", .{ @errorName(err), m.object });
+            // Final fallback: hash-only key so the edge still writes
+            break :blk deriveEntityKey(allocator, m.object) catch null;
         };
         if (target_key) |tk| {
             defer allocator.free(tk);
@@ -609,6 +637,61 @@ pub fn persistExtracted(
 /// without losing existing edges (the edge UNIQUE INDEX includes
 /// target_key so re-keying generates fresh edges + cascades old ones via
 /// is_latest=false).
+/// V1.6 commit 8 — resolve the canonical entity_id for an object string,
+/// using cosine coreference when an embedding provider is available, falling
+/// back to the V1.6 cmt7 hash shape otherwise.
+///
+/// Resolution order:
+///   1. coref absent → return deriveEntityKey(object) (hash fallback)
+///   2. coref present → embed(object). On embed failure → hash fallback.
+///   3. findEntityByCosine(user_id, embedding, threshold). Match → reuse id.
+///   4. No match → upsertEntity(user_id, name=object, embedding). Use new id.
+///
+/// Caller frees the returned slice. The returned key is the value the
+/// edge writer uses as `target_key`, so a coreference match means existing
+/// edges to that entity gain weight via the UNIQUE INDEX.
+fn resolveEntityKey(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    object: []const u8,
+    coref: ?EntityResolution,
+) ![]u8 {
+    const c = coref orelse return deriveEntityKey(allocator, object);
+
+    // Embed the object. Failure → log + hash fallback; never abort the write.
+    const embedding = c.embed_provider.embed(allocator, object) catch |err| {
+        log.warn("extraction.embed_failed err={s} object={s} — using hash fallback", .{
+            @errorName(err), object,
+        });
+        return deriveEntityKey(allocator, object);
+    };
+    defer allocator.free(embedding);
+
+    // Cosine match → reuse existing entity_id.
+    const existing = state_mgr.findEntityByCosine(allocator, user_id, embedding, c.threshold) catch |err| blk: {
+        log.warn("extraction.entity_search_failed err={s}", .{@errorName(err)});
+        break :blk null;
+    };
+    if (existing) |row| {
+        defer row.deinit(allocator);
+        log.info("extraction.entity_coref_match object={s} matches_existing={s} similarity={d:.3}", .{
+            object, row.name, row.similarity,
+        });
+        return allocator.dupe(u8, row.id);
+    }
+
+    // No match → create new entity.
+    const new_id = state_mgr.upsertEntity(allocator, user_id, object, embedding) catch |err| {
+        log.warn("extraction.entity_upsert_failed err={s} object={s} — using hash fallback", .{
+            @errorName(err), object,
+        });
+        return deriveEntityKey(allocator, object);
+    };
+    log.info("extraction.entity_created object={s} entity_id={s}", .{ object, new_id });
+    return new_id;
+}
+
 fn deriveEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
     var lower_buf: [256]u8 = undefined;
     const lower = if (object.len <= lower_buf.len) blk: {

@@ -372,6 +372,11 @@ pub const Agent = struct {
     /// 5b-loose-ends-sweep — was sentinel `i64 = 0`; replaced with optional
     /// to avoid magic-value brittleness per IN-4.
     extraction_user_id: ?i64 = null,
+    /// V1.6 commit 8 — embedding provider for entity coreference. When set,
+    /// extraction_persist resolves object strings via memory_entities
+    /// cosine ≥0.95 (Mem0 threshold). Without it, falls back to
+    /// hash-based entity_<sha256(lower(object))> from V1.6 cmt7.
+    extraction_coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider = null,
     /// Last known origin metadata for this session, owned by Session when present.
     origin_channel: ?[]const u8 = null,
     origin_lane: ?[]const u8 = null,
@@ -873,6 +878,7 @@ pub const Agent = struct {
             // at the gateway level) is unaffected.
             .extraction_state_mgr = self.extraction_state_mgr,
             .extraction_user_id = self.extraction_user_id,
+            .extraction_coref_embed = self.extraction_coref_embed,
         };
 
         // iter22 (Nova's Medium finding): measure thrash savings in TOKENS,

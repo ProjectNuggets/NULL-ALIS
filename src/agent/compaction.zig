@@ -104,6 +104,13 @@ pub const CompactionConfig = struct {
     // sidecar model for latency.
     extraction_judge_provider: ?Provider = null,
     extraction_judge_model_name: ?[]const u8 = null,
+    // V1.6 commit 8: optional embedding provider for entity coreference.
+    // When set, extracted-fact object strings get cosine-resolved against
+    // existing memory_entities rows (≥0.95 = same entity, reuse id; new
+    // entities get inserted). Without it, edges fall back to the V1.6 cmt7
+    // hash-based target_key shape — graph still works, just no surface-form
+    // coreference (Helix vs HELIX = two nodes instead of one).
+    extraction_coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider = null,
 };
 
 pub const TokenBudgetPolicy = struct {
@@ -462,6 +469,14 @@ fn compactHistoryKeepingRecent(
                         .model_name = judge_model,
                     };
 
+                // V1.6 cmt8: coref context wraps the runtime embedding
+                // provider when configured. Mem0's 0.95 cosine threshold.
+                const coref_ctx: ?extraction_persist.EntityResolution =
+                    if (config.extraction_coref_embed) |ep|
+                        extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
+                    else
+                        null;
+
                 const persist_result = extraction_persist.persistExtracted(
                     allocator,
                     state_mgr,
@@ -469,6 +484,7 @@ fn compactHistoryKeepingRecent(
                     session_id_for_extract,
                     extracted,
                     judge_ctx,
+                    coref_ctx,
                 ) catch |err| blk: {
                     log.warn("compaction: extraction persist failed err={s}", .{@errorName(err)});
                     break :blk extraction_persist.PersistResult{
