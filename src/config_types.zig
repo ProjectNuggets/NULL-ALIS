@@ -618,6 +618,39 @@ pub const MaixCamConfig = struct {
     name: []const u8 = "maixcam",
 };
 
+pub const TeamsConfig = struct {
+    account_id: []const u8 = "default",
+    client_id: []const u8,
+    client_secret: []const u8,
+    tenant_id: []const u8,
+    webhook_secret: ?[]const u8 = null,
+    notification_channel_id: ?[]const u8 = null,
+    bot_id: ?[]const u8 = null,
+    config_dir: []const u8 = ".",
+};
+
+pub const NostrConfig = struct {
+    account_id: []const u8 = "default",
+    /// enc2:-encrypted private key or bunker:// URI (set bunker_uri instead if using remote signer)
+    private_key: []const u8 = "",
+    /// Hex pubkey of the bot (64 lowercase hex chars)
+    bot_pubkey: []const u8 = "",
+    /// Hex pubkey of the owner (always allowed to DM)
+    owner_pubkey: []const u8 = "",
+    /// NIP-04/NIP-17 allowlist. Use "*" to allow anyone.
+    dm_allowed_pubkeys: []const []const u8 = &.{},
+    /// Relay URLs for publishing and listening. Default: public relays.
+    relays: []const []const u8 = &.{ "wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band" },
+    /// DM inbox relays for NIP-17 kind:10050 announcements.
+    dm_relays: []const []const u8 = &.{ "wss://auth.nostr1.com", "wss://relay.damus.io" },
+    /// Path to nak binary. Defaults to "nak" (must be in PATH).
+    nak_path: []const u8 = "nak",
+    /// NIP-46 remote signer URI (bunker://...). When set, private_key is not decrypted.
+    bunker_uri: ?[]const u8 = null,
+    /// Config directory for persistent state (conversation refs, key files).
+    config_dir: []const u8 = ".",
+};
+
 pub const ChannelsConfig = struct {
     cli: bool = true,
     telegram: []const TelegramConfig = &.{},
@@ -636,6 +669,8 @@ pub const ChannelsConfig = struct {
     qq: []const QQConfig = &.{},
     onebot: []const OneBotConfig = &.{},
     maixcam: []const MaixCamConfig = &.{},
+    teams: []const TeamsConfig = &.{},
+    nostr: []const NostrConfig = &.{},
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
         if (items.len == 0) return null;
@@ -696,6 +731,12 @@ pub const ChannelsConfig = struct {
     }
     pub fn maixcamPrimary(self: *const ChannelsConfig) ?MaixCamConfig {
         return primaryAccount(MaixCamConfig, self.maixcam);
+    }
+    pub fn teamsPrimary(self: *const ChannelsConfig) ?TeamsConfig {
+        return primaryAccount(TeamsConfig, self.teams);
+    }
+    pub fn nostrPrimary(self: *const ChannelsConfig) ?NostrConfig {
+        return primaryAccount(NostrConfig, self.nostr);
     }
 };
 
@@ -1225,9 +1266,15 @@ pub const NamedAgentConfig = struct {
     provider: []const u8,
     model: []const u8,
     system_prompt: ?[]const u8 = null,
+    /// Path to a file whose contents are used as the system prompt.
+    /// Takes precedence over `system_prompt` when both are set.
+    system_prompt_path: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
+    /// Working directory override for this agent. Included as workspace
+    /// context in the system prompt for file-aware sub-agents.
+    workspace_path: ?[]const u8 = null,
 };
 
 // ── MCP Server Config ──────────────────────────────────────────

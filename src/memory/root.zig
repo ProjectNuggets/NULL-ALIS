@@ -559,6 +559,11 @@ pub const BRAIN_HIDDEN_EXACT_KEYS = [_][]const u8{
     "context_anchor_current",
     "timeline_index/current",
     "last_hygiene_at",
+    // V1.7 conflict-surfacing sentinel — written by writePendingConflictMarker
+    // with memory_type='core' so memory_loader picks it up at session start.
+    // Without this entry, the row leaks to /brain/graph and /brain/timeline as
+    // a user-visible "core memory" carrying machine-state JSON.
+    "pending_conflicts",
 };
 
 /// True when a memory key represents authentic user-facing brain content.

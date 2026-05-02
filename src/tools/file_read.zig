@@ -10,6 +10,83 @@ const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed
 /// Default maximum file size to read (10MB).
 const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
+const BinarySignature = struct { magic: []const u8, type_name: []const u8 };
+
+const BINARY_SIGNATURES: []const BinarySignature = &.{
+    .{ .magic = "\x89PNG", .type_name = "PNG image" },
+    .{ .magic = "\xFF\xD8\xFF", .type_name = "JPEG image" },
+    .{ .magic = "GIF87a", .type_name = "GIF image" },
+    .{ .magic = "GIF89a", .type_name = "GIF image" },
+    .{ .magic = "%PDF", .type_name = "PDF document" },
+    .{ .magic = "PK\x03\x04", .type_name = "ZIP archive" },
+    .{ .magic = "Rar!", .type_name = "RAR archive" },
+    .{ .magic = "7z\xBC\xAF\x27\x1C", .type_name = "7z archive" },
+    .{ .magic = "MZ", .type_name = "Windows executable" },
+    .{ .magic = "\x7FELF", .type_name = "Linux executable" },
+};
+
+const EXTENSION_TYPES: []const struct { []const u8, []const u8 } = &.{
+    .{ ".png", "PNG image" },     .{ ".jpg", "JPEG image" },
+    .{ ".jpeg", "JPEG image" },   .{ ".gif", "GIF image" },
+    .{ ".webp", "WebP image" },   .{ ".avif", "AVIF image" },
+    .{ ".heic", "HEIC image" },   .{ ".heif", "HEIF image" },
+    .{ ".pdf", "PDF document" },  .{ ".zip", "ZIP archive" },
+    .{ ".mp4", "MP4 video" },     .{ ".mov", "QuickTime video" },
+    .{ ".mp3", "MP3 audio" },     .{ ".m4a", "M4A audio" },
+    .{ ".wav", "WAV audio" },     .{ ".exe", "Windows executable" },
+    .{ ".dll", "Windows DLL" },   .{ ".so", "Linux shared library" },
+    .{ ".dylib", "macOS shared library" },
+};
+
+fn isWebP(data: []const u8) bool {
+    return data.len >= 12 and
+        std.mem.eql(u8, data[0..4], "RIFF") and
+        std.mem.eql(u8, data[8..12], "WEBP");
+}
+
+fn hasIsoBmffHeader(data: []const u8) bool {
+    return data.len >= 8 and std.mem.eql(u8, data[4..8], "ftyp");
+}
+
+/// Returns true if `data` looks like binary content (magic bytes or null bytes).
+pub fn isBinaryContent(data: []const u8) bool {
+    if (data.len == 0) return false;
+    for (BINARY_SIGNATURES) |sig| {
+        if (std.mem.startsWith(u8, data, sig.magic)) return true;
+    }
+    if (isWebP(data)) return true;
+    if (hasIsoBmffHeader(data)) return true;
+    const check_len = @min(data.len, 8192);
+    for (data[0..check_len]) |byte| {
+        if (byte == 0) return true;
+    }
+    return false;
+}
+
+/// Returns a human-readable type label for `data` (e.g. "PNG image").
+pub fn getBinaryFileType(data: []const u8, path: []const u8) []const u8 {
+    for (BINARY_SIGNATURES) |sig| {
+        if (std.mem.startsWith(u8, data, sig.magic)) return sig.type_name;
+    }
+    // V1.7-cherrypick fix (WR-WIP-03): lowercase the extension before
+    // comparison so `Photo.JPG` and `image.PDF` get the right human label.
+    // The magic-byte detection above already catches the common formats; this
+    // is just for files whose extension is known but whose magic isn't (e.g.
+    // shared libraries, executables).
+    const ext_raw = std.fs.path.extension(path);
+    var ext_buf: [16]u8 = undefined;
+    const ext = if (ext_raw.len <= ext_buf.len) blk: {
+        for (ext_raw, 0..) |c, i| ext_buf[i] = std.ascii.toLower(c);
+        break :blk ext_buf[0..ext_raw.len];
+    } else ext_raw;
+    for (EXTENSION_TYPES) |entry| {
+        if (std.mem.eql(u8, ext, entry[0])) return entry[1];
+    }
+    if (isWebP(data)) return "WebP image";
+    if (hasIsoBmffHeader(data)) return "ISO media container";
+    return "binary file";
+}
+
 /// Maximum output bytes from extractor subprocesses (8 MB of extracted text is
 /// plenty — a 100-page dense document is typically under 500 KB of text).
 const DOC_EXTRACTION_MAX_OUTPUT: u64 = 8 * 1024 * 1024;

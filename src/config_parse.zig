@@ -523,6 +523,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             if (item.object.get("system_prompt")) |sp| {
                                 if (sp == .string) agent_cfg.system_prompt = try self.allocator.dupe(u8, sp.string);
                             }
+                            if (item.object.get("system_prompt_path")) |spp| {
+                                if (spp == .string) agent_cfg.system_prompt_path = try self.allocator.dupe(u8, spp.string);
+                            }
                             if (item.object.get("api_key")) |ak| {
                                 if (ak == .string) agent_cfg.api_key = try self.allocator.dupe(u8, ak.string);
                             }
@@ -532,6 +535,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                             if (item.object.get("max_depth")) |md| {
                                 if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
+                            }
+                            if (item.object.get("workspace_path")) |wp| {
+                                if (wp == .string) agent_cfg.workspace_path = try self.allocator.dupe(u8, wp.string);
                             }
                             try list.append(self.allocator, agent_cfg);
                         }

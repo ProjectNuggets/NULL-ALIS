@@ -418,6 +418,7 @@ pub const Agent = struct {
     usage_mode: UsageMode = .off,
     execution_mode: ExecutionMode = .execute,
     cancellation_token: CancellationToken = .{},
+    last_executed_tool: []const u8 = "",
     exec_host: ExecHost = .gateway,
     exec_security: ExecSecurity = .allowlist,
     exec_ask: ExecAsk = .on_miss,
@@ -1977,6 +1978,7 @@ pub const Agent = struct {
             const file_hint = toolFileFromCall(call);
             var files_buf: [1][]const u8 = undefined;
             const files = filesFromHint(file_hint, &files_buf);
+            self.last_executed_tool = call.name;
             const tool_start_event = ObserverEvent{ .tool_call_start = .{
                 .tool = call.name,
                 .tool_use_id = tool_use_id,
@@ -2947,6 +2949,14 @@ pub const Agent = struct {
         var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer iter_arena.deinit();
 
+        // V1.7-cherrypick fix (CR-WIP-03): reset `last_executed_tool` at the
+        // start of every turn. The field is assigned via `self.last_executed_tool
+        // = call.name;` (line ~1981), where `call.name` is allocated in this
+        // iter_arena and freed on the defer above. Without this reset, turn
+        // N+1's cancellation print at lines ~2975-2976 reads freed memory if
+        // cancellation fires before any tool runs in N+1.
+        self.last_executed_tool = "";
+
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
@@ -2970,8 +2980,12 @@ pub const Agent = struct {
                 self.observer.recordEvent(&cancel_event);
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
+                const cancel_text = if (self.last_executed_tool.len > 0)
+                    try std.fmt.allocPrint(self.allocator, "[Cancelled: last tool was {s}]", .{self.last_executed_tool})
+                else
+                    try self.allocator.dupe(u8, "[Cancelled]");
                 return TurnOutcome{
-                    .text = try self.allocator.dupe(u8, "[Cancelled]"),
+                    .text = cancel_text,
                     .iterations_used = iteration,
                 };
             }

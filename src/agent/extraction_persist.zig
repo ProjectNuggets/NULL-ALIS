@@ -420,7 +420,7 @@ pub fn persistExtracted(
                 });
                 break :blk empty_entries;
             };
-            defer freeMemoryEntries(allocator, related);
+            defer memory_root.freeEntries(allocator, related);
 
             const broader: []memory_root.MemoryEntry = state_mgr.recallMemories(
                 allocator,
@@ -432,7 +432,7 @@ pub fn persistExtracted(
                 log.warn("extraction.broader_fetch_failed err={s}", .{@errorName(err)});
                 break :blk empty_entries;
             };
-            defer freeMemoryEntries(allocator, broader);
+            defer memory_root.freeEntries(allocator, broader);
 
             // De-overlap: filter broader candidates whose keys also appear
             // in related, so the judge's idx range stays semantically
@@ -552,11 +552,8 @@ fn filterOverlap(
     return out.toOwnedSlice(allocator);
 }
 
-/// Free a slice of MemoryEntry returned by zaki_state readers.
-fn freeMemoryEntries(allocator: std.mem.Allocator, entries: []memory_root.MemoryEntry) void {
-    for (entries) |e| e.deinit(allocator);
-    allocator.free(entries);
-}
+// I3: dropped local `freeMemoryEntries` — was a duplicate of
+// `memory_root.freeEntries`. All call sites now use the canonical helper.
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 

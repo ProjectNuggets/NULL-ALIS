@@ -50,6 +50,15 @@ pub fn getValue(args: JsonObjectMap, key: []const u8) ?JsonValue {
     return args.get(key);
 }
 
+/// Return the items of a JSON array argument, or null if the key is absent or not an array.
+pub fn getArray(args: JsonObjectMap, key: []const u8) ?[]const JsonValue {
+    const val = args.get(key) orelse return null;
+    return switch (val) {
+        .array => |a| a.items,
+        else => null,
+    };
+}
+
 /// Test helper: parse a JSON string into a Parsed(Value) for use in tool tests.
 /// The caller must `defer parsed.deinit()` and extract `.value.object` for the ObjectMap.
 pub fn parseTestArgs(json_str: []const u8) !std.json.Parsed(JsonValue) {
@@ -108,6 +117,9 @@ pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
 pub const set_execution_mode = @import("set_execution_mode.zig");
 pub const context_snapshot = @import("context_snapshot.zig");
+pub const calculator = @import("calculator.zig");
+pub const file_read_hashed = @import("file_read_hashed.zig");
+pub const file_edit_hashed = @import("file_edit_hashed.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -984,6 +996,18 @@ pub fn allTools(
         .max_file_size = tc.max_file_size_bytes,
     };
     try list.append(allocator, fat.tool());
+
+    const calct = try allocator.create(calculator.CalculatorTool);
+    calct.* = .{};
+    try list.append(allocator, calct.tool());
+
+    const frht = try allocator.create(file_read_hashed.FileReadHashedTool);
+    frht.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .max_file_size = tc.max_file_size_bytes };
+    try list.append(allocator, frht.tool());
+
+    const feht = try allocator.create(file_edit_hashed.FileEditHashedTool);
+    feht.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    try list.append(allocator, feht.tool());
 
     const gt = try allocator.create(git.GitTool);
     gt.* = .{
@@ -2112,10 +2136,11 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 31 (delegate + spawn dormant by default; +1 for V1.5 todo,
-    // +1 for V1.5 day-3 compose_memory) + http_request + web_fetch
-    // + web_search + browser = 35.
-    try std.testing.expectEqual(@as(usize, 35), tools.len);
+    // base 34 (delegate + spawn dormant by default; +1 for V1.5 todo,
+    // +1 for V1.5 day-3 compose_memory; +1 calculator + 1 file_read_hashed
+    // + 1 file_edit_hashed from nullclaw cherry-pick) + http_request +
+    // web_fetch + web_search + browser = 38.
+    try std.testing.expectEqual(@as(usize, 38), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2131,8 +2156,9 @@ test "all tools excludes extras when disabled" {
     // shell + file_read + file_write + file_edit + file_append + git + image_info + image_generate
     // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + schedule + todo + compose_memory
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
-    // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot = 31
-    try std.testing.expectEqual(@as(usize, 31), tools.len);
+    // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot
+    // + calculator + file_read_hashed + file_edit_hashed (nullclaw cherry-pick) = 34
+    try std.testing.expectEqual(@as(usize, 34), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2258,9 +2284,10 @@ test "all tools includes message when event bus is available" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    // 31 core tools (was 30 — V1.5 day-3 added `compose_memory`);
+    // 34 core tools (was 30 — V1.5 day-3 added `compose_memory`; nullclaw
+    // cherry-pick added calculator + file_read_hashed + file_edit_hashed);
     // delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT.
-    try std.testing.expectEqual(@as(usize, 31), tools.len);
+    try std.testing.expectEqual(@as(usize, 34), tools.len);
 
     var found_message = false;
     for (tools) |t| {

@@ -1033,6 +1033,14 @@ const ManagerImpl = struct {
 
             // V1.6 indexes — partial where the field is sparsely populated
             "CREATE INDEX IF NOT EXISTS idx_memories_subject ON {schema}.memories(user_id, subject) WHERE subject IS NOT NULL",
+            // V1.6 commit 6 review (W1 fix): expression index on the JSONB
+            // path because findRelatedExtractedMemories queries
+            // `metadata->>'subject'` (not the typed `subject` column —
+            // upsertMemoryWithMetadata writes JSONB only). Without this,
+            // the contradiction-judge candidate fetch falls back to a
+            // user-scoped seq-scan + sort. Cheap to maintain (only fires
+            // when subject is in the JSONB).
+            "CREATE INDEX IF NOT EXISTS idx_memories_metadata_subject ON {schema}.memories(user_id, (metadata->>'subject')) WHERE metadata ? 'subject'",
             "CREATE INDEX IF NOT EXISTS idx_memories_object_key ON {schema}.memories(user_id, object_key) WHERE object_key IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_memories_parent ON {schema}.memories(user_id, parent_memory_id) WHERE parent_memory_id IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_memories_is_latest ON {schema}.memories(user_id, is_latest) WHERE is_latest = TRUE",
@@ -2153,12 +2161,21 @@ const ManagerImpl = struct {
         // NOT fired here (composed facts are agent-synthesized, not organically
         // corroborated), but conflict surfacing MUST fire — a compose overwrite
         // from a different session is as much a conflict as a tool-store one.
+        //
+        // V1.7 commit 6 review (CRITICAL-1 fix): same CASE-guard as upsertMemory
+        // — preserve memory_type='core' and session_id=NULL on ON CONFLICT writes
+        // so compose_memory cannot demote a row that was Tier-3 promoted via the
+        // memory_store path. Without this, calling compose_memory on a promoted
+        // key from a fresh session would clobber the promotion + spuriously fire
+        // a conflict marker.
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, metadata, lemmatized, updated_at) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW()) " ++
                 "ON CONFLICT (user_id, key) DO UPDATE SET " ++
-                "session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
-                "memory_type = EXCLUDED.memory_type, metadata = EXCLUDED.metadata, lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
+                "session_id = CASE WHEN {schema}.memories.memory_type = 'core' THEN NULL ELSE EXCLUDED.session_id END, " ++
+                "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
+                "memory_type = CASE WHEN {schema}.memories.memory_type = 'core' THEN 'core' ELSE EXCLUDED.memory_type END, " ++
+                "metadata = EXCLUDED.metadata, lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
                 "seen_in_session_count = CASE " ++
                 "  WHEN {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
                 "       AND EXCLUDED.session_id IS NOT NULL " ++
@@ -2409,12 +2426,35 @@ const ManagerImpl = struct {
         // eligible for Tier-3 (core) promotion (see post-exec logic below).
         // RETURNING also fetches the new count and memory_type so the
         // promotion and conflict-marker paths can act without a second SELECT.
+        // V1.7 commit 6 (CRITICAL-1 fix): preserve `memory_type='core'` and
+        // `session_id=NULL` on ON CONFLICT writes. Without these CASE-guards,
+        // promoted (Tier-3 / core) rows are silently demoted by the very next
+        // upsertMemory call from a fresh session — the unconditional SET
+        // overwrote `memory_type → episodic` and `session_id → new_session`,
+        // causing flapping core/non-core state and false-positive
+        // `pending_conflicts` markers (LR-03 was bypassed because the SET
+        // clobbered before RETURNING).
+        //
+        // The promoteMemoryToCore UPDATE already includes
+        // `AND memory_type != 'core'` to be idempotent; this extends the same
+        // discipline to the upsert path. Content CAN still update (a core
+        // fact may have its phrasing refined by a re-statement), but the
+        // tier and the global-scope marker (NULL session_id) are immutable
+        // once promoted. To revert a promotion, use the explicit
+        // demoteMemoryFromCore writer (when V1.6 commit 8 lands soft-delete).
+        //
+        // The WHERE clause's "OR memory_type IS DISTINCT" no longer fires
+        // for core rows — the CASE makes that branch a no-op — so the row
+        // is updated only when content/content_hash/session actually
+        // diverge from stored.
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, updated_at) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) " ++
                 "ON CONFLICT (user_id, key) DO UPDATE SET " ++
-                "session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
-                "memory_type = EXCLUDED.memory_type, lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
+                "session_id = CASE WHEN {schema}.memories.memory_type = 'core' THEN NULL ELSE EXCLUDED.session_id END, " ++
+                "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
+                "memory_type = CASE WHEN {schema}.memories.memory_type = 'core' THEN 'core' ELSE EXCLUDED.memory_type END, " ++
+                "lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
                 "seen_in_session_count = CASE " ++
                 "  WHEN {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
                 "       AND EXCLUDED.session_id IS NOT NULL " ++
@@ -4548,6 +4588,7 @@ test "V1.6 schema migration applies cleanly + memory_entities round-trips" {
         "idx_entities_vec",
         "idx_memories_is_latest",
         "idx_memories_lemmatized",
+        "idx_memories_metadata_subject",
         "idx_memories_object_key",
         "idx_memories_parent",
         "idx_memories_subject",

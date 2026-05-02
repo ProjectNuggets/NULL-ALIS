@@ -146,6 +146,8 @@ pub const onebot = @import("onebot.zig");
 pub const qq = @import("qq.zig");
 pub const maixcam = @import("maixcam.zig");
 pub const signal = @import("signal.zig");
+pub const teams = @import("teams.zig");
+pub const nostr = @import("nostr.zig");
 pub const dispatch = @import("dispatch.zig");
 
 // ════════════════════════════════════════════════════════════════════════════

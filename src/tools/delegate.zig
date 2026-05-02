@@ -91,7 +91,35 @@ pub const DelegateTool = struct {
 
         // Determine system prompt, API key, provider, model from agent config or defaults
         if (agent_cfg) |ac| {
-            const sys_prompt = ac.system_prompt orelse "You are a helpful assistant. Respond concisely.";
+            // Resolve system prompt: file path > inline string > default.
+            // base_owned tracks whether base_sys_prompt was heap-allocated so
+            // the defer only frees when there is something to free.
+            var base_owned: bool = false;
+            const base_sys_prompt: []const u8 = blk: {
+                if (ac.system_prompt_path) |spp| {
+                    const file_contents = std.fs.cwd().readFileAlloc(allocator, spp, 1024 * 1024) catch |err| {
+                        const msg = std.fmt.allocPrint(
+                            allocator,
+                            "Delegation to agent '{s}' failed: cannot read system_prompt_path '{s}': {s}",
+                            .{ trimmed_agent, spp, @errorName(err) },
+                        ) catch return ToolResult.fail("Delegation failed");
+                        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    };
+                    base_owned = true;
+                    break :blk file_contents;
+                }
+                break :blk ac.system_prompt orelse "You are a helpful assistant. Respond concisely.";
+            };
+            defer if (base_owned) allocator.free(base_sys_prompt);
+
+            // Append workspace context only when configured; otherwise borrow base directly.
+            const sys_prompt_owned = ac.workspace_path != null;
+            const sys_prompt: []const u8 = if (ac.workspace_path) |wp|
+                try std.fmt.allocPrint(allocator, "{s}\n\nWorkspace directory: {s}", .{ base_sys_prompt, wp })
+            else
+                base_sys_prompt;
+            defer if (sys_prompt_owned) allocator.free(sys_prompt);
+
             const base_cfg = self.config_ref orelse {
                 const msg = std.fmt.allocPrint(
                     allocator,
