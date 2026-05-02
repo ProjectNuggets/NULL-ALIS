@@ -89,28 +89,63 @@ DEFAULT_TEMPERATURE_JUDGE = 0.0       # deterministic judging
 # These mirror the Zig prompts BYTE-FOR-BYTE. If you change the Zig source,
 # update these. A regression test in Zig should pin the replication.
 #
-# Source: src/agent/compaction.zig:700-701 (compaction Pass C)
-# V1.5.5 Path A iteration 1: NO FACTS guard + direct-support rule + attribution hint
+# Source: src/agent/compaction.zig (compaction Pass C system prompt)
+# V1.5.5 + V1.6 commit 5a: dual-output (prose + JSON tail via delimiter)
 COMPACTION_PASS_C_SYSTEM = (
     "You are a conversation compaction engine. Summarize older chat history "
     "into concise context for future turns. Preserve: user preferences, "
     "commitments, decisions, unresolved tasks, key facts. Omit: filler, "
-    "repeated chit-chat, verbose tool logs. Output plain text bullet points only.\n\n"
-    "RULES:\n"
-    "1. If the conversation contains no factual content (pure greetings, "
-    "pleasantries, ack-only exchanges with nothing established), output "
-    "EXACTLY the two characters: NO FACTS\n"
-    "2. Every bullet must be DIRECTLY supported by user or assistant text "
-    "in the conversation. Do NOT add inferences, suggestions you offered "
-    "that were not adopted, or general commentary.\n"
+    "repeated chit-chat, verbose tool logs.\n\n"
+    "OUTPUT FORMAT (two sections, in this exact order):\n"
+    "1. Plain text bullet points (max 12 bullets, one per line, hyphen or asterisk prefix).\n"
+    "2. The literal delimiter line: ===EXTRACTED===\n"
+    "3. A JSON array of atomic-fact objects (empty array `[]` if no facts).\n\n"
+    "RULES (apply to both bullet output and JSON facts):\n"
+    "1. NO FACTS guard takes ABSOLUTE PRECEDENCE. If the conversation contains "
+    "no factual content — pure greetings (\"hi\", \"good morning\", \"hey\"), "
+    "pleasantries (\"thanks\", \"how are you\"), ack-only exchanges (\"ok\", "
+    "\"got it\", \"ttyl\"), or any exchange where nothing substantive was "
+    "established — output EXACTLY:\nNO FACTS\n===EXTRACTED===\n[]\n\n"
+    "Even if you could mechanically extract a triplet like (user, GREETED, "
+    "assistant), DO NOT. Greetings, acknowledgements, and conversational "
+    "filler are NEVER facts. The JSON schema below tempts you to fill it; "
+    "RESIST that temptation when no real fact exists.\n\n"
+    "Test: ask yourself \"would a human reading this conversation later care "
+    "about this detail?\" If no, omit it. \"User said good morning\" — no human "
+    "cares. \"User prefers Helix\" — that's a fact.\n\n"
+    "2. Every bullet AND every fact must be DIRECTLY supported by user or "
+    "assistant text in the conversation. Do NOT add inferences, suggestions "
+    "you offered that were not adopted, or general commentary.\n"
     "3. When a fact reflects an assistant offer or suggestion (not a user "
-    "statement or decision), prefix the bullet with \"(assistant offered) \". "
-    "When it reflects an unresolved consideration, prefix with \"(undecided) \".\n"
+    "statement or decision), prefix the bullet with \"(assistant offered) \" "
+    "AND set \"attributed_to\":\"assistant_offer\" in the JSON entry. "
+    "When it reflects an unresolved consideration, prefix with "
+    "\"(undecided) \" AND set \"attributed_to\":\"undecided\".\n"
     "4. Do NOT include conversational meta-statements like \"user thanked the "
-    "assistant\", \"user mentioned X\", \"user asked about Y\", \"user requested Z\". "
+    "assistant\", \"user greeted the assistant\", \"user mentioned X\", "
+    "\"user asked about Y\", \"user requested Z\", \"assistant offered help\". "
     "State the FACT or DECISION itself, never that the user articulated it. "
     "Bad: \"User asked about pgvector indexing options\". "
-    "Good: \"User chose ivfflat over HNSW for pgvector indexing\"."
+    "Good: \"User chose ivfflat over HNSW for pgvector indexing\". "
+    "Bad: \"User greeted the assistant\". "
+    "Good: (omit entirely — greetings are not facts).\n\n"
+    "JSON FACT SCHEMA (each object in the array):\n"
+    "{\n"
+    "  \"text\": \"<15-80 word atomic self-contained fact>\",\n"
+    "  \"subject\": \"<entity name, e.g. 'user', 'Alex', 'project'>\",\n"
+    "  \"predicate\": \"<RELATION_TYPE_SCREAMING_SNAKE_CASE, e.g. 'PREFERS', 'DEPLOYS_TO', 'BIRTHDAY'>\",\n"
+    "  \"object\": \"<value or target entity name>\",\n"
+    "  \"attributed_to\": \"user\" | \"assistant\" | \"assistant_offer\" | \"undecided\",\n"
+    "  \"confidence\": <number 0.0-1.0>\n"
+    "}\n"
+    "Each JSON fact corresponds to one bullet (1:1). The bullets describe "
+    "the same facts in human-readable prose; the JSON describes them in "
+    "structured form for downstream indexing.\n\n"
+    "REJECTED PREDICATES (never use these — they signal you're extracting "
+    "meta-narrative instead of facts): GREETED, SAID, ASKED, MENTIONED, "
+    "REPLIED, ACKNOWLEDGED, EXPRESSED, INDICATED_READINESS, IS_GETTING_STARTED, "
+    "OFFERED_TO_WAIT, PRIORITIZED, ADDRESSED_AS, IS_UNKNOWN. "
+    "If the only predicate you can come up with is in this list, omit the fact."
 )
 COMPACTION_PASS_C_USER_TEMPLATE = (
     "Summarize the following conversation history for context preservation. "
@@ -472,18 +507,34 @@ def run_one(
     # ── Compaction Pass C ──
     print("  compaction Pass C...", end=" ", flush=True)
     try:
-        compaction_summary, compaction_latency = call_groq_chat(
+        compaction_response, compaction_latency = call_groq_chat(
             cfg, EXTRACTION_MODEL, compaction_messages, temperature=DEFAULT_TEMPERATURE_GENERATION
         )
+        # V1.6 commit 5a: split prose from JSON tail at "===EXTRACTED===".
+        # Recall + precision judges score against the prose only — the
+        # JSON tail is structured V1.6 output for downstream persistence,
+        # not part of the prose-recall measurement that V1.5.5 substrate
+        # gates were calibrated on.
+        delimiter = "===EXTRACTED==="
+        if delimiter in compaction_response:
+            prose_part, json_part = compaction_response.split(delimiter, 1)
+            compaction_prose = prose_part.rstrip()
+            compaction_json_tail = json_part.strip()
+        else:
+            # LLM didn't follow new format; treat whole response as prose
+            compaction_prose = compaction_response
+            compaction_json_tail = ""
         print(f"ok ({compaction_latency:.2f}s)")
         result["compaction"] = {
-            "summary": compaction_summary,
+            "summary": compaction_prose,
+            "json_tail": compaction_json_tail,
+            "raw_response": compaction_response,
             "latency_sec": compaction_latency,
-            "recall": score_recall(cfg, compaction_summary, gt.get("must_preserve", [])),
+            "recall": score_recall(cfg, compaction_prose, gt.get("must_preserve", [])),
         }
         if not skip_precision:
             result["compaction"]["precision"] = score_precision(
-                cfg, compaction_summary, gt.get("facts", [])
+                cfg, compaction_prose, gt.get("facts", [])
             )
     except Exception as e:
         print(f"FAILED: {e}")

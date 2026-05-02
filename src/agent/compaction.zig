@@ -697,40 +697,81 @@ fn summarizeSlice(
     const transcript = try buildCompactionTranscript(allocator, history_items, start, end, config.max_source_chars);
     defer allocator.free(transcript);
 
-    // V1.5.5 prompt strengthening (Path A iteration 1):
-    //   1. NO FACTS guard — when conversation is pure pleasantries / no
-    //      semantic content, output exactly "NO FACTS" instead of forcing
-    //      meta-narrative bullets. Fixes casual/conv_02 over-extraction
-    //      observed in V1.5.5 baseline.
-    //   2. Direct-support rule — every bullet must be supported by
-    //      user/assistant text in the conversation. No inferences,
-    //      no suggestions you offered that the user didn't accept,
-    //      no editorial commentary. Fixes long_multi_topic alternative-
-    //      pricing-as-fact misattribution observed in baseline.
-    //   3. Attribution hint — when a fact comes from the assistant's
-    //      offer rather than the user's statement, prefix with
-    //      "(assistant offered)" so V1.6's attributed_to extraction
-    //      can pick it up. Today's prompt has no signal for this.
+    // V1.5.5 prompt (rules 1-4) + V1.6 commit 5 dual-output extension.
+    //
+    // Output format: prose bullets first (existing V1.5.5 substrate,
+    // measured 0.94 recall / 0.92 precision against compaction_corpus),
+    // followed by a delimiter and a JSON array of structured atomic
+    // facts ready for V1.6 commit 5b persistence into the typed-edge
+    // memory surface.
+    //
+    // Why delimiter approach over JSON-mode:
+    //   - Prose format unchanged → V1.5.5 substrate gates re-validate
+    //     against the same corpus without regression risk on the
+    //     prose-recall path
+    //   - JSON parsing failure leaves prose intact (graceful degradation)
+    //   - No response_format flag needed (works on Groq + Together
+    //     uniformly without provider-specific JSON mode)
+    //
+    // V1.5.5 RULES carry through unchanged (1: NO FACTS guard,
+    // 2: direct-support, 3: attribution prefixes, 4: no meta-statements).
+    // The extracted_memories JSON section honors the SAME rules — facts
+    // there must be the same atomic-fact universe the prose covers.
     const summarizer_system =
         "You are a conversation compaction engine. Summarize older chat history " ++
         "into concise context for future turns. Preserve: user preferences, " ++
         "commitments, decisions, unresolved tasks, key facts. Omit: filler, " ++
-        "repeated chit-chat, verbose tool logs. Output plain text bullet points only.\n\n" ++
-        "RULES:\n" ++
-        "1. If the conversation contains no factual content (pure greetings, " ++
-        "pleasantries, ack-only exchanges with nothing established), output " ++
-        "EXACTLY the two characters: NO FACTS\n" ++
-        "2. Every bullet must be DIRECTLY supported by user or assistant text " ++
-        "in the conversation. Do NOT add inferences, suggestions you offered " ++
-        "that were not adopted, or general commentary.\n" ++
+        "repeated chit-chat, verbose tool logs.\n\n" ++
+        "OUTPUT FORMAT (two sections, in this exact order):\n" ++
+        "1. Plain text bullet points (max 12 bullets, one per line, hyphen or asterisk prefix).\n" ++
+        "2. The literal delimiter line: ===EXTRACTED===\n" ++
+        "3. A JSON array of atomic-fact objects (empty array `[]` if no facts).\n\n" ++
+        "RULES (apply to both bullet output and JSON facts):\n" ++
+        "1. NO FACTS guard takes ABSOLUTE PRECEDENCE. If the conversation contains " ++
+        "no factual content — pure greetings (\"hi\", \"good morning\", \"hey\"), " ++
+        "pleasantries (\"thanks\", \"how are you\"), ack-only exchanges (\"ok\", " ++
+        "\"got it\", \"ttyl\"), or any exchange where nothing substantive was " ++
+        "established — output EXACTLY:\nNO FACTS\n===EXTRACTED===\n[]\n\n" ++
+        "Even if you could mechanically extract a triplet like (user, GREETED, " ++
+        "assistant), DO NOT. Greetings, acknowledgements, and conversational " ++
+        "filler are NEVER facts. The JSON schema below tempts you to fill it; " ++
+        "RESIST that temptation when no real fact exists.\n\n" ++
+        "Test: ask yourself \"would a human reading this conversation later care " ++
+        "about this detail?\" If no, omit it. \"User said good morning\" — no human " ++
+        "cares. \"User prefers Helix\" — that's a fact.\n\n" ++
+        "2. Every bullet AND every fact must be DIRECTLY supported by user or " ++
+        "assistant text in the conversation. Do NOT add inferences, suggestions " ++
+        "you offered that were not adopted, or general commentary.\n" ++
         "3. When a fact reflects an assistant offer or suggestion (not a user " ++
-        "statement or decision), prefix the bullet with \"(assistant offered) \". " ++
-        "When it reflects an unresolved consideration, prefix with \"(undecided) \".\n" ++
+        "statement or decision), prefix the bullet with \"(assistant offered) \" " ++
+        "AND set \"attributed_to\":\"assistant_offer\" in the JSON entry. " ++
+        "When it reflects an unresolved consideration, prefix with " ++
+        "\"(undecided) \" AND set \"attributed_to\":\"undecided\".\n" ++
         "4. Do NOT include conversational meta-statements like \"user thanked the " ++
-        "assistant\", \"user mentioned X\", \"user asked about Y\", \"user requested Z\". " ++
+        "assistant\", \"user greeted the assistant\", \"user mentioned X\", " ++
+        "\"user asked about Y\", \"user requested Z\", \"assistant offered help\". " ++
         "State the FACT or DECISION itself, never that the user articulated it. " ++
         "Bad: \"User asked about pgvector indexing options\". " ++
-        "Good: \"User chose ivfflat over HNSW for pgvector indexing\".";
+        "Good: \"User chose ivfflat over HNSW for pgvector indexing\". " ++
+        "Bad: \"User greeted the assistant\". " ++
+        "Good: (omit entirely — greetings are not facts).\n\n" ++
+        "JSON FACT SCHEMA (each object in the array):\n" ++
+        "{\n" ++
+        "  \"text\": \"<15-80 word atomic self-contained fact>\",\n" ++
+        "  \"subject\": \"<entity name, e.g. 'user', 'Alex', 'project'>\",\n" ++
+        "  \"predicate\": \"<RELATION_TYPE_SCREAMING_SNAKE_CASE, e.g. 'PREFERS', 'DEPLOYS_TO', 'BIRTHDAY'>\",\n" ++
+        "  \"object\": \"<value or target entity name>\",\n" ++
+        "  \"attributed_to\": \"user\" | \"assistant\" | \"assistant_offer\" | \"undecided\",\n" ++
+        "  \"confidence\": <number 0.0-1.0>\n" ++
+        "}\n" ++
+        "Each JSON fact corresponds to one bullet (1:1). The bullets describe " ++
+        "the same facts in human-readable prose; the JSON describes them in " ++
+        "structured form for downstream indexing.\n\n" ++
+        "REJECTED PREDICATES (never use these — they signal you're extracting " ++
+        "meta-narrative instead of facts): GREETED, SAID, ASKED, MENTIONED, " ++
+        "REPLIED, ACKNOWLEDGED, EXPRESSED, INDICATED_READINESS, IS_GETTING_STARTED, " ++
+        "OFFERED_TO_WAIT, PRIORITIZED, ADDRESSED_AS, IS_UNKNOWN. " ++
+        "If the only predicate you can come up with is in this list, omit the fact.";
     const summarizer_user = try std.fmt.allocPrint(allocator, "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{s}", .{transcript});
     defer allocator.free(summarizer_user);
 
@@ -779,8 +820,30 @@ fn summarizeSlice(
     }
 
     const raw_summary = summary_resp.contentOrEmpty();
-    const max_len = @min(raw_summary.len, config.max_summary_chars);
-    return try allocator.dupe(u8, raw_summary[0..max_len]);
+
+    // V1.6 commit 5a — split prose from extracted_memories JSON tail.
+    // Output format (system prompt above): bullet prose, then literal
+    // line "===EXTRACTED===", then a JSON array. The prose half is
+    // what gets archived as the compaction_summary continuity artifact;
+    // the JSON tail is consumed by V1.6 commit 5b's persist hook.
+    //
+    // For 5a (this commit) we just split + return prose; JSON tail is
+    // discarded silently. 5b adds the persist call. This sequencing
+    // keeps the substrate-validation step (V1.5.5 corpus re-run)
+    // independent of the persistence layer — if the prompt change
+    // regresses prose recall, we know before we wire writes.
+    //
+    // Graceful degradation: if no delimiter present, treat the whole
+    // response as prose (LLM didn't follow the format — happens; the
+    // existing summary path keeps working).
+    const delimiter = "===EXTRACTED===";
+    const prose_summary = if (std.mem.indexOf(u8, raw_summary, delimiter)) |idx|
+        std.mem.trimRight(u8, raw_summary[0..idx], &std.ascii.whitespace)
+    else
+        raw_summary;
+
+    const max_len = @min(prose_summary.len, config.max_summary_chars);
+    return try allocator.dupe(u8, prose_summary[0..max_len]);
 }
 
 const HeadingInfo = struct {
