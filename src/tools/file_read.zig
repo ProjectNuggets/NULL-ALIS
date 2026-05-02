@@ -21,7 +21,14 @@ const BINARY_SIGNATURES: []const BinarySignature = &.{
     .{ .magic = "PK\x03\x04", .type_name = "ZIP archive" },
     .{ .magic = "Rar!", .type_name = "RAR archive" },
     .{ .magic = "7z\xBC\xAF\x27\x1C", .type_name = "7z archive" },
-    .{ .magic = "MZ", .type_name = "Windows executable" },
+    // V1.7-cherrypick side-effect fix (SE-WIP-01): "MZ" was the 2-byte
+    // DOS-header signature for Windows .exe / .dll files, but it false-
+    // positives on any text file beginning with "MZ" (e.g. a markdown
+    // document starting "MZ Industries quarterly report"). Real PE binaries
+    // are still detected via the null-byte fallback in isBinaryContent
+    // (lines ~62-64) — DOS-header padding contains zero bytes within the
+    // first 8KB scan window. Removing the MZ row is safe: every other
+    // signature in this table is ≥3 bytes or contains non-ASCII.
     .{ .magic = "\x7FELF", .type_name = "Linux executable" },
 };
 

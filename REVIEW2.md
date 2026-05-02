@@ -103,3 +103,115 @@ The Nullclaw cherry-pick (surface c) integrates cleanly: tool counts mathematica
 _Reviewed: 2026-05-02_
 _Reviewer: Claude (gsd integration reviewer)_
 _Depth: deep — cross-surface_
+
+## Side-Effect Audit (Surfaces A + B)
+
+**Reviewed:** 2026-05-02 (post-b711142, post-053fc3c)
+**Depth:** deep — side-effect pass beyond stated scope of parallel agents
+**Status:** ONE WARNING (binary-detect false positive on 2-byte signatures), TWO INFO, FIVE PASS-NOTE
+
+---
+
+### WARNING — SE-WIP-01: `MZ` 2-byte signature triggers false-positive binary detection (surface b)
+
+**File:** `src/tools/file_read.zig:24` (signature table), `src/tools/file_read_hashed.zig:103-112` (consumer)
+
+**Issue:** `BINARY_SIGNATURES` includes `{ .magic = "MZ", .type_name = "Windows executable" }`. `isBinaryContent` checks `std.mem.startsWith(u8, data, sig.magic)` — for `MZ` this matches any text file whose first two bytes are `0x4D 0x5A`. Plausible false positives: a markdown file beginning with "MZ Industries quarterly report", a test fixture starting with "MZ" as a label, ASCII art with `MZ` as the first glyph. Consumer (`file_read_hashed.zig:111`) returns `"[Binary file detected: Windows executable, size: N bytes...]"` and discards content — agent never sees the actual lines, cannot edit via `file_edit_hashed`. Silent data hiding.
+
+**Why MZ is the only worry:** all other signatures in the table are ≥3 bytes (`%PDF`, `Rar!`, `GIF87a`, `\x89PNG`, `PK\x03\x04`, etc.) or contain non-ASCII bytes (`\xFF\xD8\xFF`, `\x7FELF`, `\x89PNG`, `7z\xBC\xAF\x27\x1C`). Only `MZ` is 2 ASCII bytes that can plausibly start a text file.
+
+**Fix (pick one):**
+1. Drop `MZ` from the table — Windows executables in a Zig agent's workspace are rare and the null-byte fallback (line 60-62: any `0x00` in first 8KB → binary) catches real PE files anyway (every PE has nulls in the DOS header padding).
+2. Strengthen the check: require `MZ` PLUS PE-typical bytes (e.g., `data.len >= 0x40 and data[0x3C] != 0x00 or data[0x3D] != 0x00 or data[0x3E] != 0x00 or data[0x3F] != 0x00` — the e_lfanew offset). Verbose; option 1 is cleaner.
+
+Recommendation: option 1. Add a regression test reading a markdown file starting with "MZ Industries 2026 Q1 — note that the PE format begins with these bytes" and asserting `isBinaryContent == false`.
+
+---
+
+### INFO — SE-V17-01: Promoted-to-core rows drop from `memory_list` per-session listings (surface a)
+
+**File:** `src/zaki_state.zig:2606` (promote sets session_id=NULL), `src/zaki_state.zig:2820,2838` (listMemories filters `WHERE session_id = $X`), `src/tools/memory_list.zig:41-49` (caller)
+
+**Issue:** `memory_list` with `scope=session` calls `listMemories(category, session_id)`, which filters by `session_id = $X`. Promoted-to-core rows (session_id=NULL) silently disappear from per-session results. Conceptually correct ("promoted = transcends sessions"), but a user/agent debugging "where did my fact go?" via `memory_list scope=session` after promotion will see it vanish. The fact is still discoverable via `scope=global` and `memory_recall`. Marginal — flag for tool-description clarity, not a bug.
+
+**Recommendation:** add one line to `memory_list.zig`'s `tool_description` clarifying scope=session excludes promoted core memories. Or: have `listMemories(session_id)` do `WHERE session_id = $X OR (memory_type = 'core' AND session_id IS NULL)` to surface promoted facts in session view too. Defer until users hit it.
+
+---
+
+### INFO — SE-V17-02: `pending_conflicts` marker text wording is mildly ambiguous (surface a)
+
+**File:** `src/zaki_state.zig:2630`
+
+**Issue:** Marker content reads `"... call memory_store to update it and memory_forget(\"pending_conflicts\") to clear this flag."`. The "it" refers to the conflicted key (shown above as `key={s}`). A literal-minded LLM could mis-read this as "call memory_store on `pending_conflicts`" then "memory_forget pending_conflicts" — leaving the actual conflicted key untouched. The conflicted key IS shown in the marker, so a competent agent will get it right; a small model might not. `memory_forget("pending_conflicts")` itself works correctly: lifecycle-lookup classifies the key as `editable` (pure `core`, not in `isSystemManagedMemoryKey` list, not append-only), so the delete succeeds.
+
+**Recommendation:** rewrite as `"call memory_store(key=\"<KEY ABOVE>\", content=...) to update the conflicted fact, then call memory_forget(key=\"pending_conflicts\") to clear this flag."`. One-line text fix.
+
+---
+
+### PASS-NOTE — SE-V17-03: `insertEpisodeEvent` writes to `memory_events`, not `completion_events` — no collision
+
+**Files:** `src/zaki_state.zig:2702-2752` (insertEpisodeEvent → `memory_events`), `src/zaki_state.zig:2070-2113` (loadCompletionEvents reads `completion_events`)
+
+These are distinct tables. `loadCompletionEvents` returns `CompletionEvent` rows from `completion_events` ordered by `created_at, id` — `insertEpisodeEvent` cannot affect its results. Existing `event_type='upsert'` aggregations on `memory_events` (lines 5421, 5443) filter by exact event_type match (`compose`, `traversal`); `'episode'` rows do not enter those COUNTs.
+
+---
+
+### PASS-NOTE — SE-V17-04: `pending_conflicts` IS deliberately injected into agent context — by design, not a leak
+
+**Files:** `src/agent/memory_loader.zig:432, 592` (appendDirectEntry on session-load), `src/memory/root.zig:558-567` (BRAIN_HIDDEN_EXACT_KEYS)
+
+The `pending_conflicts` marker IS supposed to surface to the agent at session start (entire point of V1.7 Item 3). The `BRAIN_HIDDEN_EXACT_KEYS` entry only hides it from `/brain/*` (user-facing surfaces); the agent-context loader explicitly reads it. The marker content uses a structured `type=...` prefix that the agent recognizes and does not parrot to the user verbatim. Confirmed working as designed.
+
+---
+
+### PASS-NOTE — SE-V17-05: `confidence_score = 0.9` on promotion does not affect retrieval ranking
+
+**Files:** `src/zaki_state.zig:2606`, `src/memory/importance.zig:23` (gap-analysis comment)
+
+`importance.zig` explicitly notes `confidence_score` is column-only, NOT consumed by importance scoring as of V1.6. Grep confirms no retrieval path SELECTs or sorts by `confidence_score`. Promoted rows do not unfairly outrank organic ones.
+
+---
+
+### PASS-NOTE — SE-V17-06: `seen_in_session_count` column has no out-of-V1.7 readers
+
+**File:** `src/zaki_state.zig:1066` (ALTER TABLE), `src/zaki_state.zig:2186-2193, 2481-2494` (only writers/readers in upsert RETURNING)
+
+ALTER TABLE adds with `DEFAULT 1 NOT NULL`. Only readers are the RETURNING clauses of upsertMemory + upsertMemoryWithMetadata. No SELECT path reads it; no risk to non-V1.7 code. Backfill of pre-existing rows handled by NOT NULL DEFAULT 1.
+
+---
+
+### PASS-NOTE — SE-WIP-02: `delegate.zig` default-branch behavior unchanged for callers without new fields
+
+**File:** `src/tools/delegate.zig:98-121`
+
+When `agent_cfg.system_prompt_path == null` AND `agent_cfg.workspace_path == null`, code falls through to `ac.system_prompt orelse "You are a helpful assistant. Respond concisely."` — exact pre-cherrypick behavior. Existing delegate calls without these fields are byte-identical. Bonus: `sys_prompt_owned` flag correctly gates the deferred free, no leak when borrowed.
+
+---
+
+### PASS-NOTE — SE-WIP-03: `getArray` helper used by calculator only; correctly handles `.array` JsonValue
+
+**Files:** `src/tools/root.zig:54-60` (helper), `src/tools/calculator.zig:33` (sole caller)
+
+Switch on `JsonValue` correctly returns `null` for non-array variants. No risk of UB on string/object/number inputs.
+
+---
+
+### PASS-NOTE — SE-WIP-04: Teams + Nostr modules build cleanly under `-Dchannels=all`; type errors would surface in production-equivalent build
+
+**Files:** `src/channels/root.zig:149-150` (unconditional pub const), `build.zig:72-73` (`-Dchannels=all` enables both)
+
+Verified `zig build -Dchannels=all` exits 0. The `pub const teams = @import("teams.zig")` at root.zig:149 is consistent with every other channel and does not force module analysis on its own (Zig's lazy semantic analysis), but `-Dchannels=all` is the canonical CI/release invocation per build.zig and exercises full type-checking. Channel-manager wire-up is still pending (CR-WIP-02 note in REVIEW.md), but that's a feature gap, not a side-effect.
+
+---
+
+### PASS-NOTE — SE-WIP-05: TeamsConfig + NostrConfig parse safely from configs missing those blocks
+
+**File:** `src/config_types.zig:672-673`
+
+`teams: []const TeamsConfig = &.{}, nostr: []const NostrConfig = &.{}` — Zig std.json honors struct defaults, missing fields parse to empty slices. Existing `config.json` files without these blocks load unchanged.
+
+---
+
+_Side-effect audit: 2026-05-02_
+_Auditor: Claude (gsd integration reviewer)_
+_Scope: surfaces beyond the parallel agents' stated targets_
