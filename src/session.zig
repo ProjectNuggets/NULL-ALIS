@@ -182,7 +182,8 @@ pub const SessionManager = struct {
     /// numeric user_id are available. Default null/0 → extraction
     /// disabled (V1.5-equivalent behavior).
     extraction_state_mgr: ?*@import("zaki_state.zig").Manager = null,
-    extraction_user_id: i64 = 0,
+    /// 5b-loose-ends-sweep — `?i64` instead of `0` sentinel (IN-4).
+    extraction_user_id: ?i64 = null,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),

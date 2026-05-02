@@ -87,8 +87,10 @@ pub const CompactionConfig = struct {
     // CompactionConfig today has session_id but not user_id (the
     // archive path doesn't need it because Memory.store wraps
     // user-scoping). extraction_persist needs user_id explicitly for
-    // upsertMemoryWithMetadata. When 0, extraction is skipped.
-    extraction_user_id: i64 = 0,
+    // upsertMemoryWithMetadata. null → extraction skipped.
+    // (5b-loose-ends-sweep: was sentinel `i64 = 0`; replaced with
+    // optional to avoid magic-value brittleness per IN-4.)
+    extraction_user_id: ?i64 = null,
 };
 
 pub const TokenBudgetPolicy = struct {
@@ -421,7 +423,8 @@ fn compactHistoryKeepingRecent(
     // extraction does NOT abort the compaction (the prose summary
     // already archived above is preserved).
     if (config.extraction_state_mgr) |state_mgr| {
-        if (config.extraction_user_id != 0 and extraction_tail.len > 0) {
+        if (config.extraction_user_id) |uid| {
+            if (extraction_tail.len > 0) {
             const session_id_for_extract: ?[]const u8 = config.archive_session_id;
             const empty_slice: []extraction_persist.ExtractedMemory = &.{};
             const extracted = extraction_persist.parseExtractedJson(allocator, extraction_tail) catch |err| blk: {
@@ -434,7 +437,7 @@ fn compactHistoryKeepingRecent(
                 const persist_result = extraction_persist.persistExtracted(
                     allocator,
                     state_mgr,
-                    config.extraction_user_id,
+                    uid,
                     session_id_for_extract,
                     extracted,
                 ) catch |err| blk: {
@@ -453,6 +456,7 @@ fn compactHistoryKeepingRecent(
                     persist_result.skipped_blacklist,
                     persist_result.failed_count,
                 });
+            }
             }
         }
     }

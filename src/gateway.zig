@@ -1515,11 +1515,17 @@ const TenantRuntime = struct {
         // are unaffected. `state_mgr` and `user_ctx` are TenantRuntime.init
         // parameters in scope here.
         if (state_mgr) |smgr| {
-            const numeric_user_id = std.fmt.parseInt(i64, user_ctx.user_id, 10) catch 0;
-            if (numeric_user_id > 0) {
-                runtime.session_mgr.extraction_state_mgr = smgr;
-                runtime.session_mgr.extraction_user_id = numeric_user_id;
-                log.info("extraction.enabled user_id={d}", .{numeric_user_id});
+            // 5b-loose-ends-sweep IN-4: parseInt errors → don't enable
+            // extraction (instead of mapping to 0 sentinel).
+            if (std.fmt.parseInt(i64, user_ctx.user_id, 10)) |numeric_user_id| {
+                if (numeric_user_id > 0) {
+                    runtime.session_mgr.extraction_state_mgr = smgr;
+                    runtime.session_mgr.extraction_user_id = numeric_user_id;
+                    log.info("extraction.enabled user_id={d}", .{numeric_user_id});
+                }
+            } else |_| {
+                // user_ctx.user_id is non-numeric (e.g., email) — skip
+                // extraction wire-up; agent runs V1.5-equivalent.
             }
         }
         // iter27: wire SessionStore for transcript_read. See
@@ -11555,6 +11561,41 @@ fn handleBrainGraph(
         // V1.6 commit 4 — M1 importance score (FE drives node-radius rendering).
         // 3 decimals = 1000 visually-distinct buckets, plenty for graph sizing.
         w.print(",\"importance\":{d:.3}", .{importance_scores[i]}) catch return response_build_err;
+        // 5b-loose-ends-sweep IN-2: emit `display_label` for nodes that
+        // have V1.6 extraction metadata (subject + predicate + object).
+        // FE renders this instead of the raw `extracted_<unix>_<hex>`
+        // key on hover/drilldown — gives a clean
+        // "subject - predicate - object" label like
+        // "user PREFERS Helix" or "Sara WORKS_AT designer" without
+        // forcing the FE to parse the metadata blob.
+        if (metadata_map.get(n.key)) |md_blob| {
+            if (md_blob.len > 0) {
+                if (std.json.parseFromSlice(std.json.Value, allocator, md_blob, .{})) |parsed| {
+                    defer parsed.deinit();
+                    if (parsed.value == .object) {
+                        const subject_v = parsed.value.object.get("subject");
+                        const predicate_v = parsed.value.object.get("predicate");
+                        const object_v = parsed.value.object.get("object_key");
+                        if (subject_v) |s| if (predicate_v) |p| if (object_v) |o| {
+                            if (s == .string and p == .string and o == .string and
+                                s.string.len > 0 and p.string.len > 0 and o.string.len > 0)
+                            {
+                                w.writeAll(",\"display_label\":\"") catch return response_build_err;
+                                jsonEscapeInto(w, s.string) catch return response_build_err;
+                                w.writeAll(" ") catch return response_build_err;
+                                jsonEscapeInto(w, p.string) catch return response_build_err;
+                                w.writeAll(" ") catch return response_build_err;
+                                jsonEscapeInto(w, o.string) catch return response_build_err;
+                                w.writeAll("\"") catch return response_build_err;
+                            }
+                        };
+                    }
+                } else |_| {
+                    // metadata not JSON or malformed — silently skip the
+                    // display_label; FE falls back to using key as label
+                }
+            }
+        }
         w.writeAll("}") catch return response_build_err;
     }
 

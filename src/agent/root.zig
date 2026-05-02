@@ -369,7 +369,9 @@ pub const Agent = struct {
     /// numeric user_id from tenant_ctx). When null/0, extraction is
     /// disabled and CompactionConfig stays V1.5-equivalent.
     extraction_state_mgr: ?*zaki_state_mod.Manager = null,
-    extraction_user_id: i64 = 0,
+    /// 5b-loose-ends-sweep — was sentinel `i64 = 0`; replaced with optional
+    /// to avoid magic-value brittleness per IN-4.
+    extraction_user_id: ?i64 = null,
     /// Last known origin metadata for this session, owned by Session when present.
     origin_channel: ?[]const u8 = null,
     origin_lane: ?[]const u8 = null,
