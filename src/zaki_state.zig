@@ -2134,11 +2134,25 @@ const ManagerImpl = struct {
         // V1.6 commit 3: also write `lemmatized` for BM25 retrieval (same
         // semantics as upsertMemory; this metadata variant is the path
         // compose_memory takes).
+        // HR-03: include seen_in_session_count CASE so compose_memory writes
+        // participate in cross-session tracking. Promotion is intentionally
+        // NOT fired here (composed facts are agent-synthesized, not organically
+        // corroborated), but conflict surfacing MUST fire — a compose overwrite
+        // from a different session is as much a conflict as a tool-store one.
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, metadata, lemmatized, updated_at) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW()) " ++
-                "ON CONFLICT (user_id, key) DO UPDATE SET session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, memory_type = EXCLUDED.memory_type, metadata = EXCLUDED.metadata, lemmatized = EXCLUDED.lemmatized, updated_at = NOW() " ++
-                "RETURNING id",
+                "ON CONFLICT (user_id, key) DO UPDATE SET " ++
+                "session_id = EXCLUDED.session_id, content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
+                "memory_type = EXCLUDED.memory_type, metadata = EXCLUDED.metadata, lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
+                "seen_in_session_count = CASE " ++
+                "  WHEN {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
+                "       AND EXCLUDED.session_id IS NOT NULL " ++
+                "       AND {schema}.memories.session_id IS NOT NULL " ++
+                "  THEN {schema}.memories.seen_in_session_count + 1 " ++
+                "  ELSE {schema}.memories.seen_in_session_count " ++
+                "END " ++
+                "RETURNING id, seen_in_session_count, memory_type",
         );
         defer self.allocator.free(q);
 
@@ -2200,6 +2214,27 @@ const ManagerImpl = struct {
         const stored_id = try dupeResultValue(self.allocator, result, 0, 0);
         defer self.allocator.free(stored_id);
         try self.insertMemoryEvent(user_id, stored_id, "compose", key, content, mem_type, session_id);
+
+        // HR-03: fire conflict marker when compose_memory overwrites a fact
+        // from a different session. Promotion is intentionally skipped —
+        // agent-synthesized facts should not auto-promote to Tier-3 core.
+        if (!isSystemMemoryKey(key)) {
+            const seen_count: i32 = if (c.PQgetisnull(result, 0, 1) == 0)
+                std.fmt.parseInt(i32, std.mem.span(c.PQgetvalue(result, 0, 1)), 10) catch 1
+            else
+                1;
+            const returned_type: []const u8 = if (c.PQgetisnull(result, 0, 2) == 0)
+                std.mem.span(c.PQgetvalue(result, 0, 2))
+            else
+                "";
+            if (seen_count > 1 and !std.mem.eql(u8, returned_type, "core")) {
+                if (session_text.len > 0) {
+                    self.writePendingConflictMarker(user_id, key, session_text) catch |err| {
+                        log.warn("upsertMemoryWithMetadata: conflict marker failed key={s}: {}", .{ key, err });
+                    };
+                }
+            }
+        }
     }
 
     /// V1.5 day-3 chunk 3C — batch-check which keys exist as memories

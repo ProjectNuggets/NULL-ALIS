@@ -37,6 +37,11 @@ pub const ZakiPostgresMemory = struct {
         // V1.7 Item 1: when a session summary lands, record a structured
         // episode event so sessions are queryable by the brain timeline.
         // Key shape: timeline_summary/{session_id}/{ts}
+        // MR-01 design note: multiple episode events per session are intentional
+        // — each compaction checkpoint produces a new timeline_summary key
+        // (different {ts}), so a long session with N compactions gets N episode
+        // events, each representing a knowledge snapshot. This is not a
+        // deduplication bug; it is the correct semantics for episodic recall.
         // Best-effort — a logging failure must not break the store path.
         if (std.mem.startsWith(u8, key, "timeline_summary/")) {
             const after_prefix = key["timeline_summary/".len..];
