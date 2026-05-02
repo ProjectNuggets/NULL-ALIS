@@ -379,6 +379,15 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listEventsForMemoryKey(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8, _: u32) ![]memory_root.MemoryEventRow {
         return allocator.alloc(memory_root.MemoryEventRow, 0);
     }
+    /// V1.6 commit 14 — stub for non-postgres builds. Source attribution
+    /// columns are postgres-only; non-postgres backends silently skip.
+    pub fn setMemorySource(_: *@This(), _: i64, _: []const u8, _: ?[]const u8, _: ?[]const u8) !void {
+        return;
+    }
+    pub fn getMemorySource(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8) !?memory_root.MemorySource {
+        _ = allocator;
+        return null;
+    }
     /// V1.6 commit 7 — stub for non-postgres builds. Edge writes silently
     /// no-op; the materialized graph is a postgres-only feature today.
     pub fn upsertMemoryEdge(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8, _: ?[]const u8, _: ?f64) !void {
@@ -3500,6 +3509,92 @@ const ManagerImpl = struct {
             });
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    /// V1.6 commit 14 (M4) — populate source_session_id + source_snippet
+    /// columns (already in schema from cmt2 migration). Both fields are
+    /// independently optional: pass null to leave a column untouched
+    /// (UPDATE only sets the columns that are non-null in the call).
+    ///
+    /// Called from extraction_persist after upsertMemoryWithMetadata when
+    /// the source context is known (compaction Pass C has session_id +
+    /// can use the fact's own text as the snippet).
+    pub fn setMemorySource(self: *Self, user_id: i64, key: []const u8, session_id: ?[]const u8, snippet: ?[]const u8) !void {
+        if (session_id == null and snippet == null) return; // nothing to do
+
+        // Build SET clause based on which fields are present.
+        // Both null short-circuited above; one or both non-null land here.
+        const both = session_id != null and snippet != null;
+        const set_clause = if (both)
+            "source_session_id = $3, source_snippet = $4"
+        else if (session_id != null)
+            "source_session_id = $3"
+        else
+            "source_snippet = $3";
+
+        const q = try std.fmt.allocPrint(
+            self.allocator,
+            "UPDATE {{schema}}.memories SET {s}, updated_at = NOW() WHERE user_id = $1 AND key = $2",
+            .{set_clause},
+        );
+        defer self.allocator.free(q);
+        const expanded = try self.buildQuery(q);
+        defer self.allocator.free(expanded);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const key_z = try self.allocator.dupeZ(u8, key);
+        defer self.allocator.free(key_z);
+
+        if (both) {
+            const sid_z = try self.allocator.dupeZ(u8, session_id.?);
+            defer self.allocator.free(sid_z);
+            const sn_z = try self.allocator.dupeZ(u8, snippet.?);
+            defer self.allocator.free(sn_z);
+            const params = [_]?[*:0]const u8{ user_s.ptr, key_z, sid_z, sn_z };
+            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len), @intCast(session_id.?.len), @intCast(snippet.?.len) };
+            const result = try self.execParams(expanded, &params, &lengths);
+            c.PQclear(result);
+        } else {
+            const val = session_id orelse snippet.?;
+            const val_z = try self.allocator.dupeZ(u8, val);
+            defer self.allocator.free(val_z);
+            const params = [_]?[*:0]const u8{ user_s.ptr, key_z, val_z };
+            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len), @intCast(val.len) };
+            const result = try self.execParams(expanded, &params, &lengths);
+            c.PQclear(result);
+        }
+    }
+
+    /// V1.6 commit 14 (M4) — read source attribution for /brain/memory/{key}
+    /// drilldown. Returns null when key doesn't exist OR neither column
+    /// is populated. Caller frees via MemorySource.deinit.
+    pub fn getMemorySource(self: *Self, allocator: std.mem.Allocator, user_id: i64, key: []const u8) !?memory_root.MemorySource {
+        const q = try self.buildQuery(
+            "SELECT source_session_id, source_snippet FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND key = $2 LIMIT 1",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, key_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+        const sid: ?[]const u8 = if (c.PQgetisnull(result, 0, 0) != 0)
+            null
+        else
+            try dupeResultValue(allocator, result, 0, 0);
+        errdefer if (sid) |s| allocator.free(s);
+        const sn: ?[]const u8 = if (c.PQgetisnull(result, 0, 1) != 0)
+            null
+        else
+            try dupeResultValue(allocator, result, 0, 1);
+        if (sid == null and sn == null) return null;
+        return memory_root.MemorySource{ .session_id = sid, .snippet = sn };
     }
 
     /// V1.6 commit 7 — write a typed edge into the materialized graph.

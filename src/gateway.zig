@@ -11897,6 +11897,10 @@ fn handleBrainMemoryDetail(
     }
     const metadata_json: ?[]const u8 = if (metadata_map.get(key)) |m| m else null;
 
+    // ── V1.6 cmt14 (M4): fetch source attribution (session + snippet)
+    var source_opt = state_mgr.getMemorySource(allocator, numeric_user_id, key) catch null;
+    defer if (source_opt) |*s| s.deinit(allocator);
+
     // ── Fetch edges where this key is source OR target ───────────
     const edge_keys = [_][]const u8{key};
     const empty_edges: []memory_mod.TypedEdge = &.{};
@@ -11940,6 +11944,25 @@ fn handleBrainMemoryDetail(
         w.print(",\"metadata\":{s}", .{m}) catch return response_build_err;
     } else {
         w.writeAll(",\"metadata\":null") catch return response_build_err;
+    }
+    // V1.6 cmt14 (M4) source attribution surface
+    if (source_opt) |s| {
+        w.writeAll(",\"source\":{") catch return response_build_err;
+        if (s.session_id) |sid| {
+            w.writeAll("\"session_id\":") catch return response_build_err;
+            json_util.appendJsonString(&out, allocator, sid) catch return response_build_err;
+        } else {
+            w.writeAll("\"session_id\":null") catch return response_build_err;
+        }
+        if (s.snippet) |sn| {
+            w.writeAll(",\"snippet\":") catch return response_build_err;
+            json_util.appendJsonString(&out, allocator, sn) catch return response_build_err;
+        } else {
+            w.writeAll(",\"snippet\":null") catch return response_build_err;
+        }
+        w.writeAll("}") catch return response_build_err;
+    } else {
+        w.writeAll(",\"source\":null") catch return response_build_err;
     }
     w.writeAll("},\"edges\":[") catch return response_build_err;
 

@@ -574,6 +574,29 @@ pub fn persistExtracted(
             continue;
         };
 
+        // V1.6 commit 14 (M4): populate source attribution columns. The
+        // session_id is already known; the snippet uses the fact's own
+        // text truncated to 256 chars (covers ~50 words; enough for
+        // "where did this come from?" UI without bloating the row).
+        // Future enhancement: have the extraction LLM emit a verbatim
+        // source_snippet from the originating message (more accurate
+        // attribution); today's truncated-fact-text is good enough for
+        // the M4 spec milestone. Failure is non-fatal — the memory row
+        // is already written; missing source attribution degrades the
+        // drilldown UX but preserves the fact.
+        const SNIPPET_CAP: usize = 256;
+        const snippet: ?[]const u8 = blk: {
+            if (m.text.len == 0) break :blk null;
+            if (m.text.len <= SNIPPET_CAP) break :blk m.text;
+            // UTF-8-safe truncation: back up over continuation bytes.
+            var end: usize = SNIPPET_CAP;
+            while (end > 0 and m.text[end] & 0xC0 == 0x80) end -= 1;
+            break :blk m.text[0..end];
+        };
+        state_mgr.setMemorySource(user_id, key, session_id, snippet) catch |err| {
+            log.warn("extraction.source_set_failed key={s} err={s}", .{ key, @errorName(err) });
+        };
+
         // V1.6 commit 7 (Gap 1 from memory pipeline handoff): materialize
         // the typed edge into memory_edges. Source key is the just-written
         // memory row; target key is a synthetic entity ref derived from

@@ -456,6 +456,21 @@ pub fn freeMemoryEventRows(allocator: std.mem.Allocator, rows: []MemoryEventRow)
     allocator.free(rows);
 }
 
+/// V1.6 commit 14 (M4) — source attribution for a memory row. Returned
+/// by getMemorySource and surfaced in /brain/memory/{key} drilldown.
+/// Both fields are independently optional: a memory may have a session
+/// origin without a snippet (e.g. agent_tool writes), or vice versa
+/// (legacy data). Powers the FE's "where did this come from?" surface.
+pub const MemorySource = struct {
+    session_id: ?[]const u8,
+    snippet: ?[]const u8,
+
+    pub fn deinit(self: *const MemorySource, allocator: std.mem.Allocator) void {
+        if (self.session_id) |s| allocator.free(s);
+        if (self.snippet) |s| allocator.free(s);
+    }
+};
+
 pub const PromptBootstrapKeyPrefix = "__bootstrap.prompt.";
 pub const TombstoneKeyPrefix = "__tombstone__/";
 
