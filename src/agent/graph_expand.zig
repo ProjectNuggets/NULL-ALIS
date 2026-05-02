@@ -226,16 +226,16 @@ pub fn expandFromSeeds(
         // Recency: we don't have created_at on the node here (would require
         // an additional getMemory round trip). Approximation: assume "now"
         // for nodes we just discovered. Caller can re-score with real
-        // created_at if they care. Acceptable for V1.6 scoping.
+        // created_at if they care — `recallMemoriesAsGraph` does exactly
+        // that via `getMemoryTimestamps` post-expansion. Acceptable
+        // placeholder for the standalone primitive.
         const recency = importance.recencyDecay(now, now);
         const centrality = importance.edgeCountNormalized(degree);
-        const hop_decay = 1.0 / (1.0 + @as(f64, @floatFromInt(hop_dist)));
-        const score = 0.4 * recency + 0.3 * centrality + 0.3 * hop_decay;
 
         try scored.append(allocator, .{
             .key = try allocator.dupe(u8, key),
             .hop_distance = hop_dist,
-            .score = score,
+            .score = scoreFromComponents(recency, centrality, hop_dist),
         });
     }
 
@@ -256,6 +256,125 @@ fn scoredNodeDesc(_: void, a: ScoredNode, b: ScoredNode) bool {
     if (a.score != b.score) return a.score > b.score;
     if (a.hop_distance != b.hop_distance) return a.hop_distance < b.hop_distance;
     return std.mem.lessThan(u8, a.key, b.key);
+}
+
+/// Composite score formula used by both `expandFromSeeds` (placeholder
+/// recency) and `recallMemoriesAsGraph` (real recency from
+/// `getMemoryTimestamps`). Single source of truth so the rescoring path
+/// can't drift from the primitive's formula.
+///
+///   score = 0.4 * recency_decay + 0.3 * centrality + 0.3 * hop_decay
+///
+/// Same weights as the docstring at the top of this module. `hop_distance`
+/// of 0 (seed) gives hop_decay=1.0; hop=1 gives 0.5; hop=2 gives 0.33.
+pub fn scoreFromComponents(recency_decay: f64, centrality: f64, hop_distance: u8) f64 {
+    const hop_decay = 1.0 / (1.0 + @as(f64, @floatFromInt(hop_distance)));
+    return 0.4 * recency_decay + 0.3 * centrality + 0.3 * hop_decay;
+}
+
+/// V1.7a-2 — recall + graph expansion in one call.
+///
+/// Composes the existing `recallMemories` (BM25 + key + content seeds) with
+/// `expandFromSeeds` (BFS along memory_edges) and re-scores the resulting
+/// neighborhood with REAL recency derived from `getMemoryTimestamps`.
+///
+/// Owns the returned slices (`seeds` MemoryEntries + `neighborhood` nodes
+/// and edges); caller frees via `RecallGraph.deinit`.
+///
+/// **Rollout knob:** `config.max_hops == 0` short-circuits past the
+/// expansion entirely — returns just the recall seeds with an empty
+/// neighborhood. memory_loader uses this to gate graph mode behind an
+/// env flag for ship-safe rollout (default 1, set 0 to disable).
+///
+/// **Performance:** worst case is recallMemories (1 SQL) + expandFromSeeds
+/// (≤ max_hops SQL) + getMemoryTimestamps (1 SQL) = max_hops + 2 round
+/// trips. For default max_hops=1: 3 round trips total per recall.
+pub const RecallGraph = struct {
+    /// Top-K memory entries from the seed recall pass — already in the
+    /// neighborhood (at hop_distance=0). Kept separately so callers that
+    /// only want the canonical "matched memory" content can read it
+    /// without crawling the neighborhood.
+    seeds: []memory_root.MemoryEntry,
+    /// All nodes (including the seed keys at hop=0) and edges discovered
+    /// during BFS expansion. Re-scored with real recency.
+    neighborhood: GraphNeighborhood,
+
+    pub fn deinit(self: *const RecallGraph, allocator: std.mem.Allocator) void {
+        memory_root.freeEntries(allocator, self.seeds);
+        self.neighborhood.deinit(allocator);
+    }
+};
+
+pub fn recallMemoriesAsGraph(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    query: []const u8,
+    max_seeds: usize,
+    config: ExpandConfig,
+    session_id: ?[]const u8,
+) !RecallGraph {
+    const seeds = try state_mgr.recallMemories(allocator, user_id, query, max_seeds, session_id);
+    errdefer memory_root.freeEntries(allocator, seeds);
+
+    if (config.max_hops == 0 or seeds.len == 0) {
+        return .{
+            .seeds = seeds,
+            .neighborhood = .{
+                .nodes = try allocator.alloc(ScoredNode, 0),
+                .edges = try allocator.alloc(memory_root.TypedEdge, 0),
+            },
+        };
+    }
+
+    // Borrow seed key slices into a flat array for expandFromSeeds.
+    var seed_keys = try allocator.alloc([]const u8, seeds.len);
+    defer allocator.free(seed_keys);
+    for (seeds, 0..) |s, i| seed_keys[i] = s.key;
+
+    var neighborhood = try expandFromSeeds(allocator, state_mgr, user_id, seed_keys, config);
+    errdefer neighborhood.deinit(allocator);
+
+    // ── Re-score with REAL recency (cmt10 INFO closure) ────────────────
+    // Collect all node keys, batch-fetch timestamps, recompute scores
+    // using the same scoreFromComponents formula. Centrality is recomputed
+    // from the local edge set so it matches what expandFromSeeds saw.
+    if (neighborhood.nodes.len > 0) {
+        var keys = try allocator.alloc([]const u8, neighborhood.nodes.len);
+        defer allocator.free(keys);
+        for (neighborhood.nodes, 0..) |n, i| keys[i] = n.key;
+
+        const timestamps = state_mgr.getMemoryTimestamps(allocator, user_id, keys) catch |err| blk: {
+            log.warn("graph_expand.recall.rescore_failed err={s} — keeping placeholder scores", .{@errorName(err)});
+            break :blk null;
+        };
+        if (timestamps) |ts_slice| {
+            defer allocator.free(ts_slice);
+            const now = std.time.timestamp();
+            for (neighborhood.nodes, 0..) |*n, i| {
+                // Real recency when we have created_at; else fall back to
+                // now-as-now (matches placeholder semantics, never errors).
+                const recency = if (ts_slice[i]) |ts|
+                    importance.recencyDecay(now, ts)
+                else
+                    importance.recencyDecay(now, now);
+
+                // Recompute centrality locally from the same edge set.
+                var degree: usize = 0;
+                for (neighborhood.edges) |e| {
+                    if (std.mem.eql(u8, e.source_key, n.key) or std.mem.eql(u8, e.target_key, n.key)) {
+                        degree += 1;
+                    }
+                }
+                const centrality = importance.edgeCountNormalized(degree);
+                n.score = scoreFromComponents(recency, centrality, n.hop_distance);
+            }
+            // Re-sort: scores changed.
+            std.sort.pdq(ScoredNode, neighborhood.nodes, {}, scoredNodeDesc);
+        }
+    }
+
+    return .{ .seeds = seeds, .neighborhood = neighborhood };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

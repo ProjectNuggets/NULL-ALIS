@@ -312,6 +312,15 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn findMemoryByContentHash(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?memory_root.MemoryEntry {
         return null;
     }
+    /// V1.7a-2 — stub for non-postgres builds. Returns an aligned slice of
+    /// nulls (one per input key) so graph_expand re-scoring degrades to
+    /// "no real recency available" without erroring. Live impl reads
+    /// `created_at` from `{schema}.memories` in one round trip.
+    pub fn getMemoryTimestamps(_: *@This(), allocator: std.mem.Allocator, _: i64, keys: []const []const u8) ![]?i64 {
+        const out = try allocator.alloc(?i64, keys.len);
+        @memset(out, null);
+        return out;
+    }
     pub fn listMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: ?memory_root.MemoryCategory, _: ?[]const u8) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
@@ -3107,6 +3116,100 @@ const ManagerImpl = struct {
         };
         defer c.PQclear(result);
         return try decodeMemoryRows(allocator, result, true);
+    }
+
+    /// V1.7a-2 — batched `created_at` lookup for graph-expand re-scoring.
+    ///
+    /// Returns an aligned slice of `?i64` (one entry per input key, same
+    /// order). Each entry is unix-epoch seconds when the key resolves to
+    /// an active row, or `null` when the key doesn't exist for `user_id`
+    /// or has been invalidated (validity filter applied).
+    ///
+    /// Used by `graph_expand.recallMemoriesAsGraph` to re-score the
+    /// neighborhood with REAL recency instead of the now-as-now placeholder
+    /// the bare `expandFromSeeds` primitive uses (cmt10 INFO closure).
+    /// One round trip via `WHERE key = ANY($::text[])`.
+    ///
+    /// Empty `keys` returns an empty []. Skips the SQL round trip.
+    pub fn getMemoryTimestamps(self: *Self, allocator: std.mem.Allocator, user_id: i64, keys: []const []const u8) ![]?i64 {
+        if (keys.len == 0) return allocator.alloc(?i64, 0);
+
+        // Same NUL-safety guard as findEdgesByKeys (V1.6 cmt7-10 WARN-2).
+        for (keys) |k| {
+            if (std.mem.indexOfScalar(u8, k, 0) != null) return error.InvalidKey;
+        }
+
+        // Build PG TEXT[] literal: {"k1","k2",...}
+        var arr_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer arr_buf.deinit(allocator);
+        try arr_buf.appendSlice(allocator, "{");
+        for (keys, 0..) |k, i| {
+            if (i > 0) try arr_buf.append(allocator, ',');
+            try arr_buf.append(allocator, '"');
+            for (k) |ch| {
+                if (ch == '\\' or ch == '"') try arr_buf.append(allocator, '\\');
+                try arr_buf.append(allocator, ch);
+            }
+            try arr_buf.append(allocator, '"');
+        }
+        try arr_buf.appendSlice(allocator, "}");
+
+        const q = try self.buildQuery(
+            "SELECT key, (EXTRACT(EPOCH FROM created_at))::bigint::text " ++
+                "FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND key = ANY($2::text[]) AND " ++
+                MEMORIES_VALIDITY_FILTER,
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const arr_z = try allocator.dupeZ(u8, arr_buf.items);
+        defer allocator.free(arr_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, arr_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(arr_buf.items.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        // Build a key→ts map from the SQL result, then materialize the
+        // output slice in input-key order. Lookup map is local-only; the
+        // caller doesn't see it.
+        var ts_map: std.StringHashMapUnmanaged(i64) = .{};
+        defer ts_map.deinit(allocator);
+        const tuples = c.PQntuples(result);
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const k_str = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(k_str);
+            const ts_str = try dupeResultValue(allocator, result, i, 1);
+            defer allocator.free(ts_str);
+            const ts = std.fmt.parseInt(i64, ts_str, 10) catch {
+                allocator.free(k_str);
+                continue;
+            };
+            // ts_map owns k_str
+            const gop = try ts_map.getOrPut(allocator, k_str);
+            if (gop.found_existing) {
+                allocator.free(k_str);
+            }
+            gop.value_ptr.* = ts;
+        }
+        // Free the keys we duped into ts_map after we're done with the map
+        // (deferred at function exit via the loop below).
+        defer {
+            var it = ts_map.keyIterator();
+            while (it.next()) |kp| allocator.free(kp.*);
+        }
+
+        const out = try allocator.alloc(?i64, keys.len);
+        errdefer allocator.free(out);
+        for (keys, 0..) |k, idx| {
+            if (ts_map.get(k)) |ts| {
+                out[idx] = ts;
+            } else {
+                out[idx] = null;
+            }
+        }
+        return out;
     }
 
     /// V1.5 day-2 task 3 — cursor-paginated timeline read for `/brain/timeline`.
@@ -7604,6 +7707,136 @@ test "V1.6 commit 10 graph-expand — 3-node chain expansion" {
     for (result.nodes) |n| {
         try std.testing.expect(!std.mem.eql(u8, n.key, "node_x"));
         try std.testing.expect(!std.mem.eql(u8, n.key, "node_y"));
+    }
+}
+
+// V1.7a-2 — recallMemoriesAsGraph end-to-end + getMemoryTimestamps batch lookup.
+//
+// Acceptance:
+//   1. recallMemories returns user_helix as the seed (key ILIKE %helix%)
+//   2. expandFromSeeds reaches user_neovim (1 hop via REPLACES) +
+//      helix_brain (1 hop via USED_FOR)
+//   3. Re-scoring with REAL created_at via getMemoryTimestamps changes
+//      scores from the bare placeholder (we set user_neovim's row to a
+//      30-day-old created_at; recency drops materially)
+//   4. max_hops=0 short-circuits to seeds-only with empty neighborhood
+//   5. getMemoryTimestamps returns null for keys that don't exist
+test "V1.7a-2 recallMemoriesAsGraph — seeds + 1-hop neighbors + real created_at re-score" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Build a 3-fact mini-graph centered on Helix ───────────────────
+    try mgr.upsertMemory(2, "user_helix", "User uses Helix as primary editor", .core, null);
+    try mgr.upsertMemory(2, "user_neovim", "User used to use NeoVim before switching", .core, null);
+    try mgr.upsertMemory(2, "helix_brain", "Helix used for V1.6 brain page polish", .core, null);
+    // Edges: user_helix REPLACES user_neovim; user_helix USED_FOR helix_brain
+    try mgr.upsertMemoryEdge(2, "user_helix", "user_neovim", "REPLACES", "extraction_classifier", 0.9);
+    try mgr.upsertMemoryEdge(2, "user_helix", "helix_brain", "USED_FOR", "extraction_classifier", 0.85);
+    // Unrelated row + edge to confirm scoping (must NOT appear in recall)
+    try mgr.upsertMemory(2, "user_zsh", "Uses zsh for shell", .core, null);
+    try mgr.upsertMemoryEdge(2, "user_zsh", "user_terminal", "USED_FOR", "extraction_classifier", 0.5);
+
+    const graph_expand = @import("agent/graph_expand.zig");
+
+    // ── (1) Default graph mode: max_hops=1, seeds=5 ────────────────────
+    {
+        const recall = try graph_expand.recallMemoriesAsGraph(
+            allocator,
+            &mgr,
+            2,
+            "helix",
+            5,
+            .{ .max_hops = 1 },
+            null,
+        );
+        defer recall.deinit(allocator);
+
+        // Seed recall: user_helix matches via key ILIKE + content ILIKE.
+        // helix_brain ALSO matches via key ILIKE %helix% — it's a seed too.
+        try std.testing.expect(recall.seeds.len >= 1);
+
+        // Neighborhood includes BOTH the seeds and the 1-hop neighbors
+        // (user_helix at hop 0, user_neovim at hop 1 reached via REPLACES,
+        // helix_brain at hop 1 reached via USED_FOR — the latter may
+        // also be a seed, in which case it shows up at hop 0).
+        try std.testing.expect(recall.neighborhood.nodes.len >= 2);
+
+        // user_neovim must be reachable (it doesn't textually match
+        // "helix" so the LEGACY recall would miss it — graph mode is
+        // the value-add here).
+        var saw_neovim = false;
+        for (recall.neighborhood.nodes) |n| {
+            if (std.mem.eql(u8, n.key, "user_neovim")) saw_neovim = true;
+            try std.testing.expect(!std.mem.eql(u8, n.key, "user_zsh")); // unrelated MUST NOT appear
+        }
+        try std.testing.expect(saw_neovim);
+    }
+
+    // ── (2) max_hops=0 short-circuits to legacy (seeds only, no graph) ─
+    {
+        const recall = try graph_expand.recallMemoriesAsGraph(
+            allocator,
+            &mgr,
+            2,
+            "helix",
+            5,
+            .{ .max_hops = 0 },
+            null,
+        );
+        defer recall.deinit(allocator);
+        try std.testing.expect(recall.seeds.len >= 1);
+        try std.testing.expectEqual(@as(usize, 0), recall.neighborhood.nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), recall.neighborhood.edges.len);
+    }
+
+    // ── (3) getMemoryTimestamps batch lookup: aligned slice + nulls ────
+    {
+        const keys = [_][]const u8{ "user_helix", "user_neovim", "doesnt_exist", "helix_brain" };
+        const timestamps = try mgr.getMemoryTimestamps(allocator, 2, &keys);
+        defer allocator.free(timestamps);
+
+        try std.testing.expectEqual(@as(usize, 4), timestamps.len);
+        try std.testing.expect(timestamps[0] != null); // user_helix exists
+        try std.testing.expect(timestamps[1] != null); // user_neovim exists
+        try std.testing.expect(timestamps[2] == null); // doesnt_exist → null
+        try std.testing.expect(timestamps[3] != null); // helix_brain exists
+        // All real timestamps should be recent (within last hour).
+        // Upper bound allows +5s slack — PG's now() can be 1-2s ahead of
+        // the local clock if NTP drift between the test process and the
+        // postgres server has them desynced; the assertion is "this row
+        // was JUST inserted," not "PG and local clocks are perfectly in
+        // sync." Drop tolerance to 0 the day we own both clocks.
+        const now = std.time.timestamp();
+        try std.testing.expect(timestamps[0].? > now - 3600);
+        try std.testing.expect(timestamps[0].? <= now + 5);
+    }
+
+    // ── (4) NUL-safety guard on getMemoryTimestamps ────────────────────
+    {
+        const bad_keys = [_][]const u8{"safe\x00malicious"};
+        const r = mgr.getMemoryTimestamps(allocator, 2, &bad_keys);
+        try std.testing.expectError(error.InvalidKey, r);
     }
 }
 

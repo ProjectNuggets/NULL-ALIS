@@ -2588,7 +2588,19 @@ pub const Agent = struct {
         // include it in the system prompt rebuild below.
         const enrich_start_ms = std.time.milliTimestamp();
         const memory_slot_result = if (self.mem) |mem|
-            memory_loader.loadTurnMemorySlot(self.allocator, mem, self.mem_rt, user_message, self.memory_session_id) catch |err| blk: {
+            memory_loader.loadTurnMemorySlot(
+                self.allocator,
+                mem,
+                self.mem_rt,
+                user_message,
+                self.memory_session_id,
+                // V1.7a-2 graph-recall: thread the same state_mgr +
+                // user_id we already use for extraction so the memory
+                // loader can append a `<graph_neighbors>` block when
+                // NULLALIS_GRAPH_RECALL_MAX_HOPS > 0 (default 1).
+                self.extraction_state_mgr,
+                self.extraction_user_id,
+            ) catch |err| blk: {
                 log.warn("memory.enrichment_failed error={s} — proceeding without memory slot", .{@errorName(err)});
                 break :blk memory_loader.MemorySlot{
                     .fenced_content = try self.allocator.dupe(u8, ""),

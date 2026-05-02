@@ -2,9 +2,12 @@ const std = @import("std");
 const config_types = @import("../config_types.zig");
 const memory_mod = @import("../memory/root.zig");
 const multimodal = @import("../multimodal.zig");
+const zaki_state = @import("../zaki_state.zig");
+const graph_expand = @import("graph_expand.zig");
 const Memory = memory_mod.Memory;
 const MemoryEntry = memory_mod.MemoryEntry;
 const MemoryRuntime = memory_mod.MemoryRuntime;
+const log = std.log.scoped(.memory_loader);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Memory Loader — inject relevant memory context into user messages
@@ -33,6 +36,28 @@ const FALLBACK_BUCKET_MAX_ENTRIES: usize = 2;
 const FALLBACK_BUCKET_MAX_BYTES: usize = 700;
 const FALLBACK_ENTRY_MAX_BYTES: usize = 320;
 
+// V1.7a-2 — graph-expand recall consumer.
+//
+// When a state_mgr is threaded through `loadTurnMemorySlot` AND
+// `NULLALIS_GRAPH_RECALL_MAX_HOPS` (default 1) is non-zero, an additional
+// `<graph_neighbors>` block is appended to the memory_for_turn slot. This
+// block lists 1-hop neighbors of the recall seeds that the legacy keyword/
+// vector recall would NOT have surfaced (because they don't textually
+// match the query, but they are graph-connected to a seed that does).
+//
+// `max_hops=0` disables graph-mode entirely (legacy behavior — strict
+// backward compat). Operators set the env to 0 to roll back if needed.
+const DEFAULT_GRAPH_RECALL_MAX_HOPS: u8 = 1;
+const DEFAULT_GRAPH_RECALL_SEEDS: usize = 5;
+const DEFAULT_GRAPH_RECALL_MAX_NODES_PER_HOP: usize = 20;
+/// Hard cap on the appended `<graph_neighbors>` block bytes. Keeps the
+/// graph-mode addition bounded so the volatile system block doesn't blow
+/// the prompt cache budget when the graph is dense.
+const GRAPH_NEIGHBORS_BLOCK_MAX_BYTES: usize = 1500;
+/// Per-neighbor content cap inside the block. Same shape as
+/// SEMANTIC_ENTRY_MAX_BYTES — short, scannable.
+const GRAPH_NEIGHBOR_CONTENT_MAX_BYTES: usize = 220;
+
 pub const SelectionStats = struct {
     available: bool = false,
     candidate_count: usize = 0,
@@ -51,6 +76,12 @@ pub const SelectionStats = struct {
     fallback_bucket_bytes: usize = 0,
     context_bytes: usize = 0,
     injected: bool = false,
+    // V1.7a-2 — graph-expand recall consumer telemetry.
+    graph_recall_active: bool = false,
+    graph_recall_seed_count: usize = 0,
+    graph_recall_neighbor_count: usize = 0,
+    graph_recall_appended_bytes: usize = 0,
+    graph_recall_max_hops: u8 = 0,
 };
 
 pub const ContextResult = struct {
@@ -786,19 +817,69 @@ pub fn loadContextWithRuntime(
 ///
 /// Preserves all existing retrieval semantics via loadContext* — only the
 /// packaging changes.
+///
+/// **V1.7a-2 (graph mode):** when `state_mgr_for_graph` AND
+/// `user_id_for_graph` are both provided AND the env-derived
+/// `max_hops > 0` (default 1), an additional `<graph_neighbors>` block is
+/// appended inside the same `<memory_for_turn>` wrapping. The block lists
+/// 1-hop graph neighbors of the recall seeds that the legacy keyword/
+/// vector path would not have surfaced (because they don't textually
+/// match the query but ARE graph-connected via memory_edges). The block
+/// is bounded to `GRAPH_NEIGHBORS_BLOCK_MAX_BYTES` (1500 bytes) so it
+/// can't blow the prompt cache budget. Caller passes `null` for either
+/// param to force legacy behavior; `NULLALIS_GRAPH_RECALL_MAX_HOPS=0`
+/// also disables (operator-side rollback).
 pub fn loadTurnMemorySlot(
     allocator: std.mem.Allocator,
     mem: Memory,
     mem_rt: ?*MemoryRuntime,
     user_message: []const u8,
     session_id: ?[]const u8,
+    state_mgr_for_graph: ?*zaki_state.Manager,
+    user_id_for_graph: ?i64,
 ) !MemorySlot {
-    const result = if (mem_rt) |rt|
+    var result = if (mem_rt) |rt|
         try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id)
     else
         try loadContextDetailed(allocator, mem, user_message, session_id);
 
-    if (result.context.len == 0) {
+    // ── V1.7a-2 graph-expand recall consumer ───────────────────────────
+    // Append graph_neighbors block when state_mgr + user_id are both
+    // present AND max_hops > 0. Falls back silently on any error so
+    // graph mode can never make memory injection WORSE than legacy.
+    var graph_block: ?[]u8 = null;
+    var graph_stats = GraphAppendResult{};
+    if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
+        const max_hops = readGraphRecallMaxHops();
+        graph_stats.max_hops_resolved = max_hops;
+        if (max_hops > 0) {
+            graph_block = buildGraphNeighborsBlock(
+                allocator,
+                sm,
+                uid,
+                user_message,
+                session_id,
+                max_hops,
+                &graph_stats,
+            ) catch |err| blk: {
+                log.warn("graph_recall.append_failed err={s} — keeping legacy memory_for_turn", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+    };
+    defer if (graph_block) |g| allocator.free(g);
+
+    // Merge graph stats into the carried SelectionStats.
+    result.stats.graph_recall_active = graph_stats.appended;
+    result.stats.graph_recall_seed_count = graph_stats.seed_count;
+    result.stats.graph_recall_neighbor_count = graph_stats.neighbor_count;
+    result.stats.graph_recall_appended_bytes = graph_stats.appended_bytes;
+    result.stats.graph_recall_max_hops = graph_stats.max_hops_resolved;
+
+    // If both legacy + graph are empty, return empty slot (no fence).
+    const has_legacy = result.context.len > 0;
+    const has_graph = if (graph_block) |g| g.len > 0 else false;
+    if (!has_legacy and !has_graph) {
         allocator.free(result.context);
         return .{
             .fenced_content = try allocator.dupe(u8, ""),
@@ -807,15 +888,165 @@ pub fn loadTurnMemorySlot(
     }
 
     defer allocator.free(result.context);
-    const fenced = try std.fmt.allocPrint(
-        allocator,
-        "<memory_for_turn>\n{s}</memory_for_turn>\n",
-        .{result.context},
-    );
+    const graph_payload: []const u8 = if (graph_block) |g| g else "";
+    const fenced = if (has_graph)
+        try std.fmt.allocPrint(
+            allocator,
+            "<memory_for_turn>\n{s}{s}</memory_for_turn>\n",
+            .{ result.context, graph_payload },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "<memory_for_turn>\n{s}</memory_for_turn>\n",
+            .{result.context},
+        );
     return .{
         .fenced_content = fenced,
         .stats = result.stats,
     };
+}
+
+// ── V1.7a-2 graph-expand recall consumer helpers ──────────────────────────
+
+/// Internal accumulator passed by-pointer into `buildGraphNeighborsBlock`
+/// so the outer `loadTurnMemorySlot` can pull telemetry into SelectionStats.
+const GraphAppendResult = struct {
+    appended: bool = false,
+    seed_count: usize = 0,
+    neighbor_count: usize = 0,
+    appended_bytes: usize = 0,
+    max_hops_resolved: u8 = 0,
+};
+
+/// Read `NULLALIS_GRAPH_RECALL_MAX_HOPS` env override; default
+/// `DEFAULT_GRAPH_RECALL_MAX_HOPS` (1) when unset or unparseable.
+/// Operator-side rollback knob: set to "0" to disable graph mode.
+/// Capped at 3 — we never want unbounded BFS in a hot retrieval path.
+fn readGraphRecallMaxHops() u8 {
+    const raw = std.posix.getenv("NULLALIS_GRAPH_RECALL_MAX_HOPS") orelse return DEFAULT_GRAPH_RECALL_MAX_HOPS;
+    const parsed = std.fmt.parseInt(u8, raw, 10) catch return DEFAULT_GRAPH_RECALL_MAX_HOPS;
+    return @min(parsed, 3);
+}
+
+/// Build the `<graph_neighbors>` block for the current turn.
+///
+/// Runs `graph_expand.recallMemoriesAsGraph` with the configured
+/// max_hops, then formats only the NON-SEED nodes (1+ hop neighbors)
+/// into a bounded text block. Seeds themselves are intentionally
+/// omitted — the legacy semantic/fallback buckets already cover them
+/// via direct keyword/vector recall, and including them again would
+/// duplicate content.
+///
+/// Per-neighbor lookup uses `state_mgr.getMemory` once per key. With
+/// `DEFAULT_GRAPH_RECALL_MAX_NODES_PER_HOP=20` and `max_hops=1`, that's
+/// ≤20 round trips per turn. If profiling shows this is hot, replace
+/// with a `getMemoriesByKeys` batch helper (out-of-scope for this commit).
+///
+/// Returns an empty slice (caller must still free it) when no neighbors
+/// were found or the block would have been empty after dedup vs seeds.
+fn buildGraphNeighborsBlock(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+    max_hops: u8,
+    out_stats: *GraphAppendResult,
+) ![]u8 {
+    const recall = try graph_expand.recallMemoriesAsGraph(
+        allocator,
+        state_mgr,
+        user_id,
+        user_message,
+        DEFAULT_GRAPH_RECALL_SEEDS,
+        .{
+            .max_hops = max_hops,
+            .max_nodes_per_hop = DEFAULT_GRAPH_RECALL_MAX_NODES_PER_HOP,
+        },
+        session_id,
+    );
+    defer recall.deinit(allocator);
+
+    out_stats.seed_count = recall.seeds.len;
+    if (recall.neighborhood.nodes.len == 0) return allocator.alloc(u8, 0);
+
+    // Build a seed-key set for dedup (we only emit NON-SEED nodes).
+    var seed_set: std.StringHashMapUnmanaged(void) = .{};
+    defer seed_set.deinit(allocator);
+    for (recall.seeds) |s| try seed_set.put(allocator, s.key, {});
+
+    // For each non-seed node, find an edge that connects it to a seed
+    // (so we can show the predicate + via-key context). If multiple edges
+    // exist, the first match in `recall.neighborhood.edges` wins (already
+    // sorted by weight DESC inside expandFromSeeds).
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("<graph_neighbors source=\"graph_expand\" hops=\"");
+    try w.print("{d}", .{max_hops});
+    try w.writeAll("\">\n");
+    const header_bytes = buf.items.len;
+
+    var emitted: usize = 0;
+    for (recall.neighborhood.nodes) |node| {
+        if (node.hop_distance == 0) continue; // seeds covered elsewhere
+        if (seed_set.contains(node.key)) continue; // belt-and-suspenders dedup
+        if (buf.items.len >= GRAPH_NEIGHBORS_BLOCK_MAX_BYTES) break;
+
+        // Find a connecting edge (any edge incident to this node where
+        // the OTHER endpoint is a seed).
+        var via_seed: ?[]const u8 = null;
+        var via_predicate: ?[]const u8 = null;
+        for (recall.neighborhood.edges) |e| {
+            if (std.mem.eql(u8, e.source_key, node.key) and seed_set.contains(e.target_key)) {
+                via_seed = e.target_key;
+                via_predicate = e.predicate;
+                break;
+            } else if (std.mem.eql(u8, e.target_key, node.key) and seed_set.contains(e.source_key)) {
+                via_seed = e.source_key;
+                via_predicate = e.predicate;
+                break;
+            }
+        }
+        // No connecting edge to any seed → skip (might be a 2-hop node;
+        // we don't emit those in the v1 ship to keep the block focused).
+        if (via_seed == null or via_predicate == null) continue;
+
+        // Fetch content for this neighbor key (one round trip per neighbor).
+        const entry_opt = state_mgr.getMemory(allocator, user_id, node.key) catch null;
+        if (entry_opt) |entry| {
+            defer entry.deinit(allocator);
+            const trimmed = truncateUtf8(std.mem.trim(u8, entry.content, " \t\n\r"), GRAPH_NEIGHBOR_CONTENT_MAX_BYTES);
+            // Format: one line per neighbor for easy LLM scanning.
+            try w.print(
+                "neighbor_key={s} predicate={s} via={s} content={s}\n",
+                .{ node.key, via_predicate.?, via_seed.?, trimmed },
+            );
+            emitted += 1;
+        } else {
+            // Lookup failed (key vanished mid-flight) — emit a stub so the
+            // edge isn't silently dropped from the agent's view.
+            try w.print(
+                "neighbor_key={s} predicate={s} via={s} content=<unavailable>\n",
+                .{ node.key, via_predicate.?, via_seed.? },
+            );
+            emitted += 1;
+        }
+    }
+
+    // If nothing was emitted, drop the header too (no point in an empty block).
+    if (emitted == 0) {
+        buf.deinit(allocator);
+        return allocator.alloc(u8, 0);
+    }
+
+    try w.writeAll("</graph_neighbors>\n");
+    out_stats.neighbor_count = emitted;
+    out_stats.appended_bytes = buf.items.len - header_bytes; // body bytes
+    out_stats.appended = true;
+    return buf.toOwnedSlice(allocator);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1048,7 +1279,7 @@ test "loadTurnMemorySlot returns empty when no memory available" {
     var none_mem = memory_mod.NoneMemory.init();
     const mem = none_mem.memory();
 
-    const slot = try loadTurnMemorySlot(allocator, mem, null, "hello world", null);
+    const slot = try loadTurnMemorySlot(allocator, mem, null, "hello world", null, null, null);
     defer allocator.free(slot.fenced_content);
 
     try std.testing.expectEqualStrings("", slot.fenced_content);
@@ -1063,7 +1294,7 @@ test "loadTurnMemorySlot fences retrieved memory with markers (context v2 packag
 
     try mem.store("user_lang", "Zig is the favorite language", .core, null);
 
-    const slot = try loadTurnMemorySlot(allocator, mem, null, "language", null);
+    const slot = try loadTurnMemorySlot(allocator, mem, null, "language", null, null, null);
     defer allocator.free(slot.fenced_content);
 
     // Context v2: payload wrapped in <memory_for_turn>...</memory_for_turn> —
@@ -1104,6 +1335,8 @@ test "loadTurnMemorySlot reports selection stats (context v2 packaging)" {
         null,
         "shipping",
         "agent:zaki-bot:user:1:main",
+        null,
+        null,
     );
     defer allocator.free(slot.fenced_content);
 
@@ -1198,7 +1431,7 @@ test "loadContextWithRuntime caps visible warm matches while overfetching raw ca
         ._allocator = allocator,
     };
 
-    const slot = try loadTurnMemorySlot(allocator, mem, &rt, "shipping memory", null);
+    const slot = try loadTurnMemorySlot(allocator, mem, &rt, "shipping memory", null, null, null);
     defer allocator.free(slot.fenced_content);
 
     try std.testing.expectEqual(@as(usize, 12), slot.stats.candidate_count);
