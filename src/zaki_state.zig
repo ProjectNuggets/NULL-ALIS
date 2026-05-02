@@ -388,6 +388,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         _ = allocator;
         return null;
     }
+    /// V1.6 commit 15 — stub for non-postgres builds. /brain/documents
+    /// returns empty when postgres isn't configured.
+    pub fn listBrainDocumentSummaries(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.BrainDocument {
+        return allocator.alloc(memory_root.BrainDocument, 0);
+    }
     /// V1.6 commit 7 — stub for non-postgres builds. Edge writes silently
     /// no-op; the materialized graph is a postgres-only feature today.
     pub fn upsertMemoryEdge(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8, _: ?[]const u8, _: ?f64) !void {
@@ -3595,6 +3600,87 @@ const ManagerImpl = struct {
             try dupeResultValue(allocator, result, 0, 1);
         if (sid == null and sn == null) return null;
         return memory_root.MemorySource{ .session_id = sid, .snippet = sn };
+    }
+
+    /// V1.6 commit 15 — aggregate session-summary "documents" for the
+    /// /brain/documents surface. Groups by session_id over rows with
+    /// continuity-summary key prefixes (timeline_summary/, session_summary/,
+    /// summary_latest/). Returns one row per session with summary count,
+    /// latest timestamp, and latest content excerpt (200-char cap).
+    ///
+    /// Newest-session-first by max(updated_at). Caller frees via
+    /// memory_root.freeBrainDocuments.
+    pub fn listBrainDocumentSummaries(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        limit: u32,
+    ) ![]memory_root.BrainDocument {
+        // DISTINCT ON (session_id) returns the latest row per session.
+        // Pair with a JOIN against an aggregate count subquery for the
+        // summary_count field.
+        const q = try self.buildQuery(
+            "WITH counts AS (" ++
+                "  SELECT session_id, COUNT(*) AS n, MAX(updated_at) AS latest_at " ++
+                "  FROM {schema}.memories " ++
+                "  WHERE user_id = $1 AND session_id IS NOT NULL " ++
+                "  AND (key LIKE 'timeline_summary/%' OR key LIKE 'session_summary/%' OR key LIKE 'summary_latest/%') " ++
+                "  AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "  GROUP BY session_id" ++
+                "), latest AS (" ++
+                "  SELECT DISTINCT ON (session_id) session_id, content " ++
+                "  FROM {schema}.memories " ++
+                "  WHERE user_id = $1 AND session_id IS NOT NULL " ++
+                "  AND (key LIKE 'timeline_summary/%' OR key LIKE 'session_summary/%' OR key LIKE 'summary_latest/%') " ++
+                "  AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "  ORDER BY session_id, updated_at DESC" ++
+                ") " ++
+                "SELECT c.session_id, c.n, " ++
+                "COALESCE((EXTRACT(EPOCH FROM c.latest_at))::bigint, 0), " ++
+                "SUBSTRING(l.content FROM 1 FOR 200) " ++
+                "FROM counts c LEFT JOIN latest l ON c.session_id = l.session_id " ++
+                "ORDER BY c.latest_at DESC LIMIT $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const limit_text = try std.fmt.allocPrint(self.allocator, "{d}", .{limit});
+        defer self.allocator.free(limit_text);
+        const limit_z = try self.allocator.dupeZ(u8, limit_text);
+        defer self.allocator.free(limit_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, limit_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(limit_text.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const tuples = c.PQntuples(result);
+        var out: std.ArrayListUnmanaged(memory_root.BrainDocument) = .{};
+        errdefer {
+            for (out.items) |*d| d.deinit(allocator);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const sid = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(sid);
+            const count_str = try dupeResultValue(allocator, result, i, 1);
+            defer allocator.free(count_str);
+            const ts_str = try dupeResultValue(allocator, result, i, 2);
+            defer allocator.free(ts_str);
+            const excerpt = if (c.PQgetisnull(result, i, 3) != 0)
+                try allocator.dupe(u8, "")
+            else
+                try dupeResultValue(allocator, result, i, 3);
+            errdefer allocator.free(excerpt);
+            const count = std.fmt.parseInt(usize, count_str, 10) catch 0;
+            const ts = std.fmt.parseInt(i64, ts_str, 10) catch 0;
+            try out.append(allocator, .{
+                .session_id = sid,
+                .summary_count = count,
+                .latest_at_unix = ts,
+                .latest_excerpt = excerpt,
+            });
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     /// V1.6 commit 7 — write a typed edge into the materialized graph.

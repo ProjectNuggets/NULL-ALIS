@@ -471,6 +471,31 @@ pub const MemorySource = struct {
     }
 };
 
+/// V1.6 commit 15 — aggregate "document" view over session summaries.
+/// Powers /brain/documents — supermemory-style two-tier surface where
+/// each document represents a session that produced memories. The FE
+/// browses documents to drill into the memories derived from each.
+///
+/// `latest_excerpt` is a content excerpt (first ~200 chars) of the most
+/// recent summary for this session — gives the FE a preview without a
+/// second round trip per row.
+pub const BrainDocument = struct {
+    session_id: []const u8,
+    summary_count: usize,
+    latest_at_unix: i64,
+    latest_excerpt: []const u8,
+
+    pub fn deinit(self: *const BrainDocument, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.latest_excerpt);
+    }
+};
+
+pub fn freeBrainDocuments(allocator: std.mem.Allocator, docs: []BrainDocument) void {
+    for (docs) |*d| d.deinit(allocator);
+    allocator.free(docs);
+}
+
 pub const PromptBootstrapKeyPrefix = "__bootstrap.prompt.";
 pub const TombstoneKeyPrefix = "__tombstone__/";
 

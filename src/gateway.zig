@@ -11816,6 +11816,65 @@ fn handleBrainSearch(
     return finalizeJsonBuf(allocator, &out);
 }
 
+// ── /brain/documents — V1.6 commit 15 ──────────────────────────────
+//
+// GET /api/v1/users/:user_id/brain/documents[?limit=N]
+//
+// Two-tier document view (supermemory parity). Each "document" is a
+// session that has produced summaries, with aggregate metadata: count,
+// latest timestamp, latest excerpt. The FE drills into a document to
+// see the memories derived from that session.
+
+const BRAIN_DOCS_DEFAULT_LIMIT: u32 = 20;
+const BRAIN_DOCS_MAX_LIMIT: u32 = 100;
+
+fn handleBrainDocuments(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    target: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    var limit: u32 = if (parseQueryParam(target, "limit")) |s|
+        std.fmt.parseInt(u32, s, 10) catch BRAIN_DOCS_DEFAULT_LIMIT
+    else
+        BRAIN_DOCS_DEFAULT_LIMIT;
+    if (limit == 0) limit = BRAIN_DOCS_DEFAULT_LIMIT;
+    if (limit > BRAIN_DOCS_MAX_LIMIT) limit = BRAIN_DOCS_MAX_LIMIT;
+
+    const docs = state_mgr.listBrainDocumentSummaries(allocator, numeric_user_id, limit) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"documents_query_failed\"}" };
+    };
+    defer memory_mod.freeBrainDocuments(allocator, docs);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    w.print("{{\"limit\":{d},\"total_returned\":{d},\"documents\":[", .{ limit, docs.len }) catch return response_build_err;
+    for (docs, 0..) |d, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        w.writeAll("{\"session_id\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, d.session_id) catch return response_build_err;
+        w.print(",\"summary_count\":{d},\"latest_at\":{d},\"latest_excerpt\":", .{ d.summary_count, d.latest_at_unix }) catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, d.latest_excerpt) catch return response_build_err;
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+
+    return finalizeJsonBuf(allocator, &out);
+}
+
 // ── /brain/memory/{key} — V1.6 commit 13 (M3) ──────────────────────
 //
 // GET /api/v1/users/:user_id/brain/memory/:key
@@ -13747,6 +13806,16 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "brain/search")) {
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainSearch(req_allocator, method, scoped_user_id, brain_target, state);
+    }
+
+    // ── /brain/documents — V1.6 commit 15 ────────────────────────────────
+    // GET /api/v1/users/{id}/brain/documents[?limit=N]
+    // Two-tier document view (supermemory parity). Each document = a session
+    // that has produced summaries; aggregate of summary count, latest
+    // timestamp, latest excerpt.
+    if (std.mem.eql(u8, parsed.subpath, "brain/documents")) {
+        const brain_target = extractRequestTarget(raw_request) orelse base_path;
+        return handleBrainDocuments(req_allocator, method, scoped_user_id, brain_target, state);
     }
 
     // ── /brain/memory/{key} — V1.6 commit 13 (M3) ────────────────────────
