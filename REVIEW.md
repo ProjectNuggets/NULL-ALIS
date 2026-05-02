@@ -1,146 +1,173 @@
 ---
-phase: v1.6-commits-2-3-4
-reviewed: 2026-05-01
+phase: v1.6-commits-5a-5b1-5b2
+reviewed: 2026-05-02
 reviewer: Claude (self-review, same bar as gsd-code-reviewer)
 scope_commits:
-  - 4471cd0 V1.6 commit 2 — schema migration (14 cols + memory_entities + 7 indexes)
-  - f043a00 V1.6 commit 3 — lemmatized BM25 + lazy backfill
-  - 4d21bd8 V1.6 commit 4 — importance scoring (M1) wired into /brain/graph
+  - 7e899dd V1.6 5a   — dual-output prompt (substrate green precision 0.92)
+  - 3aed0c3 V1.6 5b.1 — extracted-fact JSON parser (8 unit tests)
+  - 4b9bbf2 V1.6 5b.2 — persistExtracted + compaction wiring (opt-in via config)
 files_reviewed:
-  - src/zaki_state.zig (schema migration block + upsert paths + recallMemories)
-  - src/memory/text_norm.zig (lemmatizeForBm25)
-  - src/memory/importance.zig (computeImportance + recencyDecay + edgeCountNormalized)
-  - src/gateway.zig (importance wiring in handleBrainGraph)
+  - src/agent/compaction.zig (prompt + summarizeSlice signature + Pass C wiring)
+  - src/agent/extraction_persist.zig (parser + persistExtracted + helpers)
+  - tests/compaction_corpus/score.py (Python prompt mirror + harness changes)
 findings:
   critical: 0
-  warning: 0
-  info: 3
-status: ship
+  warning: 2
+  info: 5
+status: ship_with_warnings_addressed_in_5b3
 ---
 
-# V1.6 Commits 2-4 Review — Pre-Commit-5 Gate
+# V1.6 Commits 5a / 5b.1 / 5b.2 Review — Pre-Wire-Up Gate
 
-**Reviewed:** 2026-05-01
+**Reviewed:** 2026-05-02
 **Bar:** S-tier — same standard the FE agent's GSD review pass applied to Phase-1.
+**Pre-condition:** V1.5.5 substrate validation passed iter2 (precision 0.92 ≥ gate 0.90).
 
 ## Summary
 
-Three commits laying the schema and recall foundation for atomic-fact extraction (which lands in commit 5). The structure is clean, test coverage is appropriate, and live verification on Nova's dev DB confirms the contract surfaces work.
+Three commits implementing the heart of V1.6 atomic-fact extraction. Prompt extends Pass C to dual-output, parser handles the JSON tail, persist function writes through state_mgr with V1.6 schema columns. Provider-agnostic design — Nova's parallel memory-pipeline work can reuse the same persist entry point.
 
-**Critical: 0. Warning: 0. Info-level: 3 — all are documented trade-offs or forward-action notes, none blocking commit 5.**
+**Critical: 0. Warning: 2 (must land in 5b.3 before extraction goes live). Info: 5.**
 
-Verdict: **ship.** Proceed to commit 5.
-
----
-
-## What was reviewed
-
-### 1. Schema migration (`4471cd0`)
-
-- 14 ALTER ADD COLUMN IF NOT EXISTS — all idempotent, instant metadata-only on populated tables
-- 5 new partial indexes (subject, object_key, parent, is_latest, lemmatized GIN)
-- New `memory_entities` table with VECTOR(1024) hardcoded to match production e5_1024 model
-- 2 new entity-table indexes (user, ivfflat vector)
-- PG smoke test verifies all 16 columns + all 7 indexes + memory_entities round-trip
-
-**Audit:**
-- ✅ All migrations are online-safe (no NOT NULL on unpopulated columns)
-- ✅ GIN index on `to_tsvector('simple', lemmatized)` matches the query expression exactly (so Postgres uses the index)
-- ✅ memory_entities FK to users.user_id with ON DELETE CASCADE
-- ✅ Composite uniqueness on (user_id, name_lower) for cosine-coreference dedup
-- ✅ VECTOR(1024) trade-off documented in source comment (not just commit message)
-
-### 2. Lemmatized BM25 (`f043a00`)
-
-- New `src/memory/text_norm.zig::lemmatizeForBm25` (~115 lines + 6 tests)
-- Wired into `upsertMemory` and `upsertMemoryWithMetadata` at write time
-- Lazy backfill SQL (`UPDATE ... lower(content) WHERE lemmatized IS NULL`) runs on every migrate; idempotent
-- `recallMemories` SQL switched to 3-signal score: key ILIKE (2.0) + lemmatized BM25 (1.0) + content ILIKE (0.5)
-
-**Audit:**
-- ✅ Memory ownership: `lemmatize → ` returns owned slice, caller frees via defer. Cross-checked at both call sites.
-- ✅ Empty-query guard via `length($N) > 0` short-circuits BOTH the SELECT score column AND the WHERE clause
-- ✅ Parameter numbering correct in both branches (with-session uses $5; no-session uses $4 for lemma_q since session_id absent)
-- ✅ Backward compat preserved — substring queries ("pista" → "pistachios") still work via content ILIKE fallback (postgres_test passes)
-- ✅ UTF-8 byte-perfect Arabic preservation tested
-- ✅ Negation words ("not", "no") preserved (not in stopword list — semantic-meaningful)
-
-### 3. Importance scoring (`4d21bd8`)
-
-- New `src/memory/importance.zig` pure-function module (~100 lines + 4 tests)
-- Formula: `0.5 * recency_decay(half_life=30d) + 0.5 * edge_count_normalized(scale=8)`
-- /brain/graph computes per-node importance after edges build, includes in node JSON
-- Live verification: 10-node sample on Nova's user_id=1 returns importance values 0.45-0.60
-
-**Audit:**
-- ✅ Formula bounded [0, 1] per tests
-- ✅ Recency decay handles future timestamps (clock-skew tolerance)
-- ✅ Edge-count saturation prevents hubs from saturating to 1.0 too fast (n/(n+8))
-- ✅ degree HashMap uses borrowed n.key strings — keys persist for handler duration
-- ✅ Recomputed per request — formula can evolve without backfill
+Verdict: **ship 5a/5b.1/5b.2 as-is**, but 5b.3 must close WR-1 + WR-2 before populating `extraction_state_mgr` in CompactionConfig at runtime. Otherwise duplicate facts flood the brain page on every compaction.
 
 ---
 
-## Info-level findings (none blocking)
+## Warnings — must land in 5b.3
 
-### IN-1: degree HashMap getOrPut OOM swallowed via `catch continue`
+### WR-1: No MD5 content_hash dedup at write time → duplicate facts on every compaction
 
-**File:** `src/gateway.zig` (handleBrainGraph importance computation)
+**File:** `src/agent/extraction_persist.zig::persistExtracted`
+
+**Issue:** Compaction Pass C fires at 70/80/90% context pressure. Each trigger summarizes the prior (older) segment. After a compaction lands, the next trigger's input includes the previously-archived prose summary — the LLM is likely to re-emit the same atomic facts as JSON. Without dedup, after 5-10 compactions on Nova's session, the brain page will accumulate near-duplicates of the same fact ("user prefers Helix", "user uses Helix as editor", "user switched to Helix from NeoVim", etc.).
+
+The schema already has `content_hash TEXT` on every memory row, populated by `computeContentHash` at write time. There's an existing index `idx_memories_hash ON memories(user_id, content_hash)`. Wiring an MD5 pre-filter is cheap:
 
 ```zig
-const a_entry = degree.getOrPut(allocator, e.source) catch continue;
+// Before persistExtracted's upsert call, in the per-fact loop:
+const new_hash = try computeContentHash(allocator, m.text);
+defer allocator.free(new_hash);
+if (try state_mgr.findMemoryByContentHash(user_id, new_hash)) |existing| {
+    log.info("extraction.duplicate_skipped key={s} matches_existing={s}", .{key, existing.key});
+    result.skipped_md5_dup += 1;
+    continue;
+}
 ```
 
-Allocator failure during degree counting silently undercounts the node's degree. Practical risk is near-zero (we just allocated the node array bigger than this hashmap), but for hardening parity with V1.5.1's "no silent failures on memory write paths," consider a `log.warn` on getOrPut failures in handler paths.
+**Required addition:** new `state_mgr.findMemoryByContentHash(user_id, hash) → ?MemoryEntry` method on `zaki_state.Manager`. Single SQL `SELECT id FROM {schema}.memories WHERE user_id = $1 AND content_hash = $2 LIMIT 1` — uses `idx_memories_hash` directly.
 
-**Severity:** info. Not a memory write path; brain/graph rendering with one slightly-undersized degree count is harmless.
+**Severity:** warning. Without this, V1.6 ships visible duplicates on the brain page. Spec §4.4 D4-mitigation already documented; just needs to land.
 
-### IN-2: Stopword list is English-only
+**Action:** add to 5b.3 alongside the wire-up.
 
-**File:** `src/memory/text_norm.zig::STOPWORDS`
+### WR-2: /brain/graph typed-edge surface still pending (carries IN-3 from prior review)
 
-42 common English stopwords. Arabic, Chinese, French, etc. content keeps all words. Trade-off:
-- More recall on non-English content (every word indexed)
-- Less precision (high-frequency non-English stopwords pollute results)
+**File:** `src/gateway.zig::handleBrainGraph`
 
-For Nova's bilingual usage (en + ar), this is acceptable today — Postgres's `to_tsvector('simple', ...)` does no language-specific stopword removal anyway. V1.7 candidate: language-detected stopword sets if measured value supports it.
+**Issue:** Commits 2-4 review (`66a1c92`) flagged IN-3 as a forward-action for commit 5: "when typed atomic-fact edges land, the importance degree counter must be extended in the same commit." Commit 5b.2 wires the WRITE side (subject/predicate/object_key columns get populated) but the READ side hasn't caught up — `/brain/graph` still emits only `session`, `semantic`, `reference` edge types. Memories that are connected only via subject/object relationships won't show as connected on the FE.
 
-**Severity:** info. Documented trade-off; recall over precision is the right V1 default.
+Worse: the importance scoring (commit 4) won't count typed-edge participation, so a hub memory with 10 typed edges will look isolated on the FE.
 
-### IN-3: importance edge-degree counter doesn't yet count typed atomic-fact edges
+**Required addition:** in `handleBrainGraph` after `buildBrainReferenceEdges`:
 
-**File:** `src/gateway.zig` (handleBrainGraph importance computation)
+1. Build a 4th edge type `"typed"` connecting nodes that share `subject`, OR connecting `subject_node → object_key target` when `object_key` resolves to another node's key
+2. Update the `degree` HashMap to include typed edges in the count
+3. Emit typed edges in the JSON edge array
 
-The degree counter iterates `session_edges`, `semantic_edges`, `ref_edges` — the three edge types that exist as of V1.6 commit 4. V1.6 commit 5 will introduce typed atomic-fact edges (subject/predicate/object_key relations). Without updating the degree counter, those typed edges won't contribute to importance scores → memories connected only via typed edges would have lower importance than they should.
+The schema is ready (commit 2 added `subject`/`predicate`/`object_key` columns + `idx_memories_subject` + `idx_memories_object_key` indexes). Just needs the gateway to read them and build edges.
 
-**Action item for commit 5:** when typed-edge surface is added to /brain/graph, also extend the degree counter in the same edit. Don't ship commit 5 without this.
+**Severity:** warning. Without this, V1.6 atomic facts persist invisibly — the FE won't see typed relationships, defeating half the second-brain pillar in Nova's vision.
 
-**Severity:** info → forward-action. Not a current bug; only matters once commit 5 introduces the edge type.
+**Action:** must land in 5b.3 alongside the wire-up.
 
 ---
 
-## What stays untouched (still at parity)
+## Info-level findings
 
-- V1.5.1 hygiene filter (BRAIN_USER_KEY_FILTER + BRAIN_HIDDEN_PREFIXES) — drift-proof comptime derivation continues working
-- V1.5.5 compaction Pass C prompt — substrate gates still pass (commit 5 will extend it carefully)
-- Silent-catch fixes (S4.1-S4.5) — verified no regressions
-- bumpMemoryAccess + access_count — left intact (importance formula deliberately doesn't use access_count yet per IN-2 in importance.zig)
+### IN-1: No cosine dedup at write time (D4 mitigation deferred)
+
+**File:** `src/agent/extraction_persist.zig::persistExtracted`
+
+**Issue:** MD5 dedup (WR-1) catches exact-duplicate content. But the LLM emits slightly-different phrasings of the same fact ("user prefers Helix" vs "Helix is the user's editor" vs "Alex uses Helix") — MD5 won't match those. Spec D4 requires cosine ≥ 0.92 dedup vs recent rows in same session.
+
+**Why deferred:** cosine dedup needs `MemoryRuntime` plumbing through `CompactionConfig` (not currently wired) plus an embedding call per fact (cost). MD5 covers the high-frequency case (Pass C re-summarizing prose); cosine is the polish that catches paraphrases.
+
+**Severity:** info. WR-1 closes the worst case. Cosine catches the long tail.
+
+**Action:** track for V1.6 follow-up commit (between commit 7 entity-coreference and ship gate).
+
+### IN-2: `extracted_<unix>_<hex8>` keys are visible raw on /brain page
+
+**File:** `src/agent/extraction_persist.zig::deriveExtractionKey` + FE rendering
+
+**Issue:** The key shape `extracted_1714521600_a1b2c3d4` is correct (collision-resistant, addressable) but ugly when the FE renders the raw key on hover or in the M3 drilldown panel. The FE should derive its display label from `subject - predicate - object` instead of the raw key.
+
+**Severity:** info. Backend contract is correct; this is an FE rendering choice.
+
+**Action:** flag in V1.6 commit 10 (M3 drilldown handler) — `/brain/memory/{key}` response should include a `display_label: "<subject> <predicate> <object>"` field for FE convenience.
+
+### IN-3: REJECTED_PREDICATES list is finite
+
+**File:** `src/agent/extraction_persist.zig::REJECTED_PREDICATES`
+
+**Issue:** 15 hardcoded meta-predicates (GREETED, SAID, etc.) cover what we observed in V1.5.5 iter1 regression. The LLM may invent novel meta-predicates not on the list (e.g., "MENTIONED_TOPIC", "STARTED_DISCUSSING").
+
+**Severity:** info. The blacklist is defense-in-depth; the prompt's RULE 1 + RULE 4 are the primary guard. Belt + suspenders.
+
+**Action:** monitor production. Expand list as new meta-predicates surface. Could grow to a regex pattern (`SAID_*`, `ASKED_*`, `MENTIONED_*`) if the long tail demands it.
+
+### IN-4: `extraction_user_id: i64 = 0` sentinel is brittle
+
+**File:** `src/agent/compaction.zig::CompactionConfig`
+
+**Issue:** Using `0` as the "extraction disabled" sentinel works because no production user has `user_id = 0`, but it's a magic value. Cleaner: `?i64 = null`. Refactor would require updating call sites and the gate condition (`config.extraction_user_id != 0` → `config.extraction_user_id != null`).
+
+**Severity:** info. Functionally correct; stylistic.
+
+**Action:** backlog for V1.7 cleanup.
+
+### IN-5: `emotional` type-precision dipped 0.91 → 0.75 in 5a iter2
+
+**File:** V1.5.5 corpus `emotional/` cases
+
+**Issue:** Strengthening the NO FACTS guard for casual conversations may have pulled the LLM toward over-aggressive omission on emotional conversations (where tone-as-fact is legitimate). Dropped from V1.5.5 iter2 baseline. Still well above the 0.70 type-floor gate.
+
+**Severity:** info. Not a regression to substrate gate; per-type observation.
+
+**Action:** monitor in V1.6 production. If user-visible quality dips on emotional content, iterate the prompt with emotional-fact-preservation guidance.
+
+---
+
+## What stays clean across all three commits
+
+- **No silent-catch on memory writes** — V1.5.1 hardening pattern preserved in `persistExtracted` (every per-fact failure logs structured `metric=extraction.X`)
+- **Memory ownership is correct** — `parseExtractedJson` errdefer covers partial-output cleanup; `persistExtracted` defers free for key + metadata_json before each loop iteration
+- **V1.5 callers unaffected** — `summarizeSlice` signature change is the only API delta; both internal callers updated; external callers don't exist
+- **Provider-agnostic** — `persistExtracted` accepts any `[]ExtractedMemory` source; future caller (parallel memory-pipeline work) plugs in without re-architecture
+- **Substrate validation** — V1.5.5 corpus re-run on 5a iter2 confirmed precision 0.92 / recall 0.92 / all type-floors ≥0.75
 
 ---
 
 ## Acceptance gates
 
-- All commits build clean (Debug + ReleaseFast verified per commit)
-- PG smoke tests added for new SQL surfaces (schema migration test + 6 lemmatize unit tests + 4 importance unit tests)
-- Live verification via curl on user_id=1 dev DB confirms the contract surfaces emit expected fields
-- 5701/5711 tests pass; +0 net failures introduced (the 1 exit-1 is pre-existing `postgres_pool_releases_on_exec_error` logged-errors test, unchanged since baseline)
+- ✅ All commits build clean (Debug + ReleaseFast verified per commit)
+- ✅ V1.5.5 corpus re-validates on the strengthened 5a prompt
+- ✅ 8 new unit tests in `extraction_persist.zig` (parser tolerance to malformed input, control char escaping, etc.)
+- ✅ 0 critical, 0 warning IN BLOCKING SCOPE for the work-as-shipped — WR-1 + WR-2 are forward-actions for 5b.3 (the gate before atomic facts go live)
 
 ---
 
 ## Verdict
 
-**Ship. Proceed to V1.6 commit 5** — extend compaction Pass C prompt to emit JSON `extracted_memories[]` alongside prose, with the V1.5.5 corpus re-run as the validation gate (substrate fidelity must hold post-prompt-change).
+**Ship 5a/5b.1/5b.2 as-is** — they form a coherent, testable, non-breaking set. `extraction_state_mgr` defaults to null, so atomic-fact extraction is OPT-IN; nothing changes in production until 5b.3 populates it.
 
-Acknowledged forward-action: when commit 5 adds typed atomic-fact edges to /brain/graph, **the importance degree counter in src/gateway.zig must be extended in the same commit** (per IN-3).
+**5b.3 scope (mandatory before extraction goes live):**
+1. **WR-1 fix**: add `state_mgr.findMemoryByContentHash` + MD5 pre-filter in `persistExtracted`
+2. **WR-2 fix**: typed-edge surface in `/brain/graph` + degree counter extension
+3. **Wire-up**: populate `CompactionConfig.extraction_state_mgr` + `extraction_user_id` at agent runtime init
+4. **PG smoke test**: end-to-end fixture exercising compaction → extract → persist → /brain/graph visibility
+5. **Live verification on Nova's user_id=1**: trigger real compaction → confirm extracted rows + typed edges
 
-— signed by the backend, V1.6 commits 2-4 self-review, 2026-05-01.
+Without WR-1 + WR-2, atomic-fact extraction would ship with visible duplicate facts AND no typed-edge connectivity on the FE.
+
+— signed by the backend, V1.6 5a/5b.1/5b.2 self-review, 2026-05-02.
