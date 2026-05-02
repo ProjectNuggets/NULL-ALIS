@@ -1217,9 +1217,21 @@ const ManagerImpl = struct {
             // Cost: O(N) over rows with metadata.subject populated. On
             // Nova's user_id=1 dev DB this is a small number; production
             // scale will run during a maintenance window.
+            // V1.6 ship review WR-02: align SQL lowercasing with the Zig
+            // path's std.ascii.toLower (ASCII-only). PG's `lower()` is
+            // locale-aware and lowercases non-ASCII (e.g. "CAFÉ" → "café"),
+            // which would diverge from extraction_persist.deriveEntityKey
+            // and commands.deriveSessionEndEntityKey for non-ASCII names.
+            // `translate()` with explicit ASCII A-Z → a-z mapping matches
+            // the Zig-side semantic exactly. Forward-write paths producing
+            // non-ASCII entity names (rare but possible) still hash to the
+            // same `entity_<hash>` whether they go through the Zig or SQL
+            // path. A future commit can move both paths to Unicode-aware
+            // lowercasing if real workloads need it; aligning to the
+            // existing Zig semantic is the safe-now move.
             "INSERT INTO {schema}.memory_edges (user_id, source_key, target_key, predicate, attribution, confidence, valid_from) " ++
                 "SELECT user_id, key AS source_key, " ++
-                "'entity_' || substring(encode(digest(lower(metadata->>'object'), 'sha256'), 'hex') from 1 for 16) AS target_key, " ++
+                "'entity_' || substring(encode(digest(translate(metadata->>'object', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sha256'), 'hex') from 1 for 16) AS target_key, " ++
                 "metadata->>'predicate' AS predicate, " ++
                 "COALESCE(metadata->>'attribution', 'extraction_classifier') AS attribution, " ++
                 "COALESCE((metadata->>'confidence')::float, 1.0) AS confidence, " ++
@@ -3460,10 +3472,17 @@ const ManagerImpl = struct {
         if (c.PQntuples(result) == 0) return false;
 
         // Audit event — best-effort, non-fatal on failure.
+        // V1.6 ship review WR-01: use jsonString() to escape `key` (agent-
+        // controlled — could contain `"` or `\`). Without escaping, the
+        // ::jsonb cast silently drops the audit row on certain keys.
+        // target_category_str is enum-validated upstream — safe to inline
+        // without escape (spec allows daily/conversation/episodic only).
+        const key_json = jsonString(self.allocator, key) catch return true;
+        defer self.allocator.free(key_json);
         const payload = std.fmt.allocPrint(
             self.allocator,
-            "{{\"key\":\"{s}\",\"from\":\"core\",\"to\":\"{s}\"}}",
-            .{ key, target_category_str },
+            "{{\"key\":{s},\"from\":\"core\",\"to\":\"{s}\"}}",
+            .{ key_json, target_category_str },
         ) catch return true;
         defer self.allocator.free(payload);
         const event_q = try self.buildQuery(
