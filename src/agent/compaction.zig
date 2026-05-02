@@ -91,6 +91,19 @@ pub const CompactionConfig = struct {
     // (5b-loose-ends-sweep: was sentinel `i64 = 0`; replaced with
     // optional to avoid magic-value brittleness per IN-4.)
     extraction_user_id: ?i64 = null,
+    // V1.6 commit 6: optional contradiction-judge LLM context. When set,
+    // extraction_persist runs the Graphiti resolve_edge prompt per new
+    // fact (after MD5 dedup) to detect semantic duplicates + close out
+    // contradicted older rows via bi-temporal valid_to/invalid_at/
+    // expired_at + is_latest=false. Pairs with extraction_state_mgr +
+    // extraction_user_id; null leaves V1.6 5b.3 MD5-only behavior intact.
+    //
+    // Today the same provider + model_name used for the summarization
+    // call also serves as judge (Together's Llama-3.3-70B handles both
+    // surfaces fine). A future commit could route the judge to a smaller
+    // sidecar model for latency.
+    extraction_judge_provider: ?Provider = null,
+    extraction_judge_model_name: ?[]const u8 = null,
 };
 
 pub const TokenBudgetPolicy = struct {
@@ -434,12 +447,28 @@ fn compactHistoryKeepingRecent(
             defer if (extracted.len > 0) extraction_persist.freeExtractedMemories(allocator, extracted);
 
             if (extracted.len > 0) {
+                // V1.6 commit 6: build the contradiction-judge context.
+                // Prefers explicit `extraction_judge_*` fields when set
+                // (lets a future sidecar judge model override). Otherwise
+                // falls back to the active summarization provider +
+                // model_name — already in scope, already authenticated,
+                // already configured; saves wiring two fields up through
+                // SessionManager / Agent / TenantRuntime.
+                const judge_provider: providers.Provider = config.extraction_judge_provider orelse provider;
+                const judge_model: []const u8 = config.extraction_judge_model_name orelse model_name;
+                const judge_ctx: ?extraction_persist.JudgeContext =
+                    extraction_persist.JudgeContext{
+                        .provider = judge_provider,
+                        .model_name = judge_model,
+                    };
+
                 const persist_result = extraction_persist.persistExtracted(
                     allocator,
                     state_mgr,
                     uid,
                     session_id_for_extract,
                     extracted,
+                    judge_ctx,
                 ) catch |err| blk: {
                     log.warn("compaction: extraction persist failed err={s}", .{@errorName(err)});
                     break :blk extraction_persist.PersistResult{
@@ -447,13 +476,18 @@ fn compactHistoryKeepingRecent(
                         .skipped_blacklist = 0,
                         .skipped_md5_dup = 0,
                         .skipped_cosine_dup = 0,
+                        .skipped_semantic_dup = 0,
+                        .contradictions_resolved = 0,
                         .failed_count = 0,
                     };
                 };
-                log.info("compaction.extraction parsed={d} written={d} skipped_blacklist={d} failed={d}", .{
+                log.info("compaction.extraction parsed={d} written={d} skipped_blacklist={d} skipped_md5_dup={d} skipped_semantic_dup={d} contradictions_resolved={d} failed={d}", .{
                     extracted.len,
                     persist_result.written_count,
                     persist_result.skipped_blacklist,
+                    persist_result.skipped_md5_dup,
+                    persist_result.skipped_semantic_dup,
+                    persist_result.contradictions_resolved,
                     persist_result.failed_count,
                 });
             }

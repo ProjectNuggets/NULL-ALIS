@@ -353,6 +353,20 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
+    /// V1.6 commit 6 — stub for non-postgres builds. Returns empty
+    /// candidate list so `edge_resolution.resolveOne` short-circuits to
+    /// the no-op outcome (caller writes new fact normally without
+    /// contradiction judging — extraction itself doesn't run on this
+    /// build variant anyway).
+    pub fn findRelatedExtractedMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8, _: usize) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
+    /// V1.6 commit 6 — stub for non-postgres builds. Bi-temporal close-out
+    /// silently no-ops; the contradiction judge path is already disabled
+    /// upstream when the live state manager is absent.
+    pub fn setMemoryInvalidation(_: *@This(), _: i64, _: []const u8, _: i64, _: i64) !void {
+        return;
+    }
     pub fn countMemories(_: *@This(), _: i64) !usize {
         return error.PostgresNotEnabled;
     }
@@ -3028,6 +3042,118 @@ const ManagerImpl = struct {
         const affected = c.PQcmdTuples(result);
         if (affected == null) return false;
         return !std.mem.eql(u8, std.mem.span(affected), "0");
+    }
+
+    /// V1.6 commit 6 — fetch same-subject extraction-classifier memories
+    /// for the contradiction judge's EXISTING FACTS list.
+    ///
+    /// Filters:
+    ///   - `user_id = $1` (tenant scope)
+    ///   - `metadata->>'subject' = $2` (same-subject scope per Graphiti
+    ///     `related_edges`)
+    ///   - `metadata->>'attribution' = 'extraction_classifier'`
+    ///     (exclude agent_tool / compose writes — judge candidate pool
+    ///     stays in the typed-edge universe)
+    ///   - `MEMORIES_VALIDITY_FILTER` (skip already-superseded rows so
+    ///     the judge can't re-contradict a closed-out memory)
+    ///
+    /// Ordered by `updated_at DESC` so the most recent N are surfaced;
+    /// the judge handles older context via the broader `recallMemories`
+    /// neighborhood.
+    ///
+    /// Today the `subject` column is unpopulated by upsertMemoryWithMetadata
+    /// (V1.6 5b.3 wrote subject only into JSONB metadata). This query
+    /// reads the JSONB path directly so it works without a forward
+    /// migration. Future commit may lift to typed columns + reuse
+    /// `idx_memories_subject` once the writer populates them.
+    ///
+    /// Caller frees each MemoryEntry + the slice.
+    pub fn findRelatedExtractedMemories(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        subject: []const u8,
+        limit: usize,
+    ) ![]memory_root.MemoryEntry {
+        const q = try self.buildQuery(
+            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories " ++
+                "WHERE user_id = $1 " ++
+                "AND metadata->>'subject' = $2 " ++
+                "AND metadata->>'attribution' = 'extraction_classifier' " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "ORDER BY updated_at DESC LIMIT $3",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const subject_z = try allocator.dupeZ(u8, subject);
+        defer allocator.free(subject_z);
+        const limit_text = try std.fmt.allocPrint(self.allocator, "{d}", .{limit});
+        defer self.allocator.free(limit_text);
+        const limit_z = try self.allocator.dupeZ(u8, limit_text);
+        defer self.allocator.free(limit_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, subject_z, limit_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(subject.len), @intCast(limit_text.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        return try decodeMemoryRows(allocator, result, false);
+    }
+
+    /// V1.6 commit 6 — bi-temporal close-out writer.
+    ///
+    /// Marks the row superseded by setting:
+    ///   `valid_to     = $3` (event-time end — synonym with invalid_at today)
+    ///   `invalid_at   = $3` (Graphiti six-field equivalent)
+    ///   `expired_at   = $4` (system time of close-out)
+    ///   `is_latest    = false` (supermemory parity — drops the row from
+    ///                          "latest version" filters)
+    ///
+    /// Why all four columns:
+    ///   - `valid_to` is the V1.5 retrieval filter — the agent stops
+    ///     seeing this row immediately
+    ///   - `invalid_at` is the Graphiti event-time field for analytics
+    ///   - `expired_at` is the audit trail (when did WE decide it was
+    ///     superseded; differs from invalid_at when correcting historical
+    ///     data)
+    ///   - `is_latest = false` makes the timeline + drilldown UIs hide
+    ///     superseded versions by default
+    ///
+    /// Idempotent — running twice with the same args produces the same
+    /// row state. Returns silently if the row doesn't exist (caller's
+    /// fault to track existence; we don't gate on it).
+    pub fn setMemoryInvalidation(
+        self: *Self,
+        user_id: i64,
+        key: []const u8,
+        invalid_at: i64,
+        expired_at: i64,
+    ) !void {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.memories SET " ++
+                "valid_to = $3, " ++
+                "invalid_at = $3, " ++
+                "expired_at = $4, " ++
+                "is_latest = FALSE " ++
+                "WHERE user_id = $1 AND key = $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const key_z = try self.allocator.dupeZ(u8, key);
+        defer self.allocator.free(key_z);
+        var invalid_buf: [32]u8 = undefined;
+        const invalid_s = try std.fmt.bufPrintZ(&invalid_buf, "{d}", .{invalid_at});
+        var expired_buf: [32]u8 = undefined;
+        const expired_s = try std.fmt.bufPrintZ(&expired_buf, "{d}", .{expired_at});
+        const params = [_]?[*:0]const u8{ user_s.ptr, key_z, invalid_s.ptr, expired_s.ptr };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(key.len),
+            @intCast(invalid_s.len),
+            @intCast(expired_s.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
     }
 
     /// Delete autosave_user_* and autosave_assistant_* memory rows for the
@@ -5762,4 +5888,194 @@ test "postgres deleteSession removes thread durable state and preserves non-auto
     }
     try std.testing.expectEqual(@as(usize, 1), sessions_after.len);
     try std.testing.expectEqualStrings("agent:zaki-bot:user:2:main", sessions_after[0].session_key);
+}
+
+// V1.6 commit 6 — bi-temporal close-out PG smoke test.
+//
+// Acceptance gate per spec: feed an existing extraction-classifier row
+// and a contradicting NEW fact; setMemoryInvalidation closes the old
+// row; findRelatedExtractedMemories no longer returns it; getMemory
+// (which applies MEMORIES_VALIDITY_FILTER) also hides it. The agent's
+// retrieval path can never see a closed-out row again.
+test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retrieval" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(99, "/tmp/nullalis-zaki-bot-test-user-99/workspace");
+
+    // ── Seed: existing extraction-classifier memory ───────────────────
+    const old_metadata =
+        \\{"subject":"user","predicate":"PREFERS","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0,"extracted_at":1000000}
+    ;
+    try mgr.upsertMemoryWithMetadata(99, "extracted_old_pref", "User prefers NeoVim", .core, null, old_metadata);
+
+    // Sanity: row reachable via getMemory + findRelatedExtractedMemories
+    {
+        const before = try mgr.getMemory(allocator, 99, "extracted_old_pref");
+        try std.testing.expect(before != null);
+        before.?.deinit(allocator);
+    }
+    {
+        const related = try mgr.findRelatedExtractedMemories(allocator, 99, "user", 8);
+        defer {
+            for (related) |e| e.deinit(allocator);
+            allocator.free(related);
+        }
+        try std.testing.expectEqual(@as(usize, 1), related.len);
+        try std.testing.expectEqualStrings("extracted_old_pref", related[0].key);
+    }
+
+    // ── Close out: new "Helix" fact contradicts old "NeoVim" fact ─────
+    const close_out_ts: i64 = std.time.timestamp();
+    try mgr.setMemoryInvalidation(99, "extracted_old_pref", close_out_ts, close_out_ts);
+
+    // ── Assertions ───────────────────────────────────────────────────
+    // 1. getMemory hides the closed-out row (MEMORIES_VALIDITY_FILTER)
+    {
+        const after = try mgr.getMemory(allocator, 99, "extracted_old_pref");
+        try std.testing.expect(after == null);
+    }
+    // 2. findRelatedExtractedMemories also hides it
+    {
+        const related = try mgr.findRelatedExtractedMemories(allocator, 99, "user", 8);
+        defer {
+            for (related) |e| e.deinit(allocator);
+            allocator.free(related);
+        }
+        try std.testing.expectEqual(@as(usize, 0), related.len);
+    }
+    // 3. The row IS still in the table — for audit. Direct SQL confirms
+    //    valid_to + invalid_at + expired_at populated, is_latest = false.
+    {
+        const audit_q = try std.fmt.allocPrint(allocator,
+            "SELECT valid_to, invalid_at, expired_at, is_latest FROM {s}.memories WHERE user_id = 99 AND key = 'extracted_old_pref'",
+            .{schema},
+        );
+        defer allocator.free(audit_q);
+        const result = try mgr.exec(audit_q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+
+        const valid_to_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(valid_to_str);
+        const invalid_at_str = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(invalid_at_str);
+        const expired_at_str = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(expired_at_str);
+        const is_latest_str = try dupeResultValue(allocator, result, 0, 3);
+        defer allocator.free(is_latest_str);
+
+        const valid_to = try std.fmt.parseInt(i64, valid_to_str, 10);
+        const invalid_at = try std.fmt.parseInt(i64, invalid_at_str, 10);
+        const expired_at = try std.fmt.parseInt(i64, expired_at_str, 10);
+
+        try std.testing.expectEqual(close_out_ts, valid_to);
+        try std.testing.expectEqual(close_out_ts, invalid_at);
+        try std.testing.expectEqual(close_out_ts, expired_at);
+        // postgres BOOLEAN serializes as "f" / "t"
+        try std.testing.expectEqualStrings("f", is_latest_str);
+    }
+
+    // 4. Idempotent: a second invalidation with the same timestamps is
+    //    a no-op (UPDATE re-writes the same values, returns successfully).
+    try mgr.setMemoryInvalidation(99, "extracted_old_pref", close_out_ts, close_out_ts);
+
+    // 5. Non-existent key: silent no-op (caller doesn't gate on existence).
+    try mgr.setMemoryInvalidation(99, "no_such_key", close_out_ts, close_out_ts);
+}
+
+// V1.6 commit 6 — findRelatedExtractedMemories scoping smoke test.
+//
+// Confirms the candidate fetcher correctly filters by:
+//   - subject (only same-subject rows)
+//   - attribution = 'extraction_classifier' (excludes agent_tool / compose)
+//   - MEMORIES_VALIDITY_FILTER (excludes closed-out rows)
+test "V1.6 commit 6 findRelatedExtractedMemories scopes by subject + attribution + validity" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(77, "/tmp/nullalis-zaki-bot-test-user-77/workspace");
+
+    // Same subject="user", extraction-classifier attribution → MUST be returned
+    try mgr.upsertMemoryWithMetadata(77, "ec_user_helix",
+        "User uses Helix",
+        .core, null,
+        \\{"subject":"user","predicate":"USES","object_key":"Helix","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
+    );
+    // Same subject="user", DIFFERENT attribution ("agent_tool") → MUST NOT be returned
+    try mgr.upsertMemoryWithMetadata(77, "agent_tool_user_other",
+        "User session log",
+        .core, null,
+        \\{"subject":"user","predicate":"NOTE","object_key":"x","attributed_to":"user","attribution":"agent_tool","confidence":1.0}
+    );
+    // DIFFERENT subject="alex", extraction-classifier → MUST NOT be returned
+    try mgr.upsertMemoryWithMetadata(77, "ec_alex_birthday",
+        "Alex birthday May 15",
+        .core, null,
+        \\{"subject":"alex","predicate":"BIRTHDAY","object_key":"May 15","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
+    );
+    // Same subject="user", extraction-classifier, but CLOSED OUT → MUST NOT be returned
+    try mgr.upsertMemoryWithMetadata(77, "ec_user_neovim_closed",
+        "User uses NeoVim",
+        .core, null,
+        \\{"subject":"user","predicate":"USES","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
+    );
+    const closed_ts: i64 = std.time.timestamp();
+    try mgr.setMemoryInvalidation(77, "ec_user_neovim_closed", closed_ts, closed_ts);
+
+    // ── The query MUST return exactly 1 row: ec_user_helix ────────────
+    const related = try mgr.findRelatedExtractedMemories(allocator, 77, "user", 16);
+    defer {
+        for (related) |e| e.deinit(allocator);
+        allocator.free(related);
+    }
+    try std.testing.expectEqual(@as(usize, 1), related.len);
+    try std.testing.expectEqualStrings("ec_user_helix", related[0].key);
+    try std.testing.expectEqualStrings("User uses Helix", related[0].content);
 }

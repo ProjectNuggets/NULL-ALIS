@@ -47,6 +47,8 @@ const log = std.log.scoped(.extraction_persist);
 const zaki_state = @import("../zaki_state.zig");
 const memory_root = @import("../memory/root.zig");
 const security_secrets = @import("../security/secrets.zig");
+const providers = @import("../providers/root.zig");
+const edge_resolution = @import("edge_resolution.zig");
 
 /// One atomic fact extracted from a conversation. Mirrors the JSON
 /// schema specified in compaction.zig::summarizer_system. Produced by
@@ -78,7 +80,34 @@ pub const PersistResult = struct {
     skipped_blacklist: usize,
     skipped_md5_dup: usize,
     skipped_cosine_dup: usize,
+    /// V1.6 commit 6 — facts the contradiction judge marked as semantic
+    /// duplicates of an existing extraction-classifier memory. Distinct
+    /// from `skipped_md5_dup` (which catches byte-identical content):
+    /// this catches "User uses Helix" vs "Helix is what user uses" — the
+    /// judge says they're the same fact under different phrasing.
+    skipped_semantic_dup: usize = 0,
+    /// V1.6 commit 6 — count of existing rows the new batch closed out
+    /// via `setMemoryInvalidation`. One contradicting NEW fact may close
+    /// multiple older rows (e.g. correcting a chain of stale prefs).
+    contradictions_resolved: usize = 0,
     failed_count: usize,
+};
+
+/// V1.6 commit 6 — optional context for the contradiction LLM judge.
+///
+/// Callers that have an LLM provider in scope (compaction Pass C is the
+/// primary case today) pass this struct to enable bi-temporal close-out.
+/// Callers without a provider (agent tool writes, classifier writes that
+/// land in V1.7) pass `null` and persist proceeds with MD5 dedup only.
+///
+/// Provider must implement `chat()`. Judge model can be the same as the
+/// extraction model (Together's Llama-3.3-70B-Instruct-Turbo handles both)
+/// or a smaller faster model — the judge prompt is short + bounded so
+/// even a 7B model gives reasonable results. Default per spec: same as
+/// the extraction model.
+pub const JudgeContext = struct {
+    provider: providers.Provider,
+    model_name: []const u8,
 };
 
 /// Predicate blacklist — same list as compaction.zig prompt's
@@ -301,33 +330,35 @@ fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
 /// LLM (today's primary path), agent tool writes, or the classifier
 /// when those land. Each fact passes through:
 ///   1. predicate blacklist (defense-in-depth against meta-narrative)
-///   2. write via state_mgr.upsertMemoryWithMetadata with V1.6 metadata
+///   2. MD5 content_hash dedup pre-filter (V1.6 5b.3 — exact-byte match)
+///   3. **V1.6 commit 6**: contradiction LLM judge when `judge` provided
+///      a. duplicate detected → skip (treat as semantic-dup of existing row)
+///      b. contradicted older facts → close out via setMemoryInvalidation
+///   4. Write via state_mgr.upsertMemoryWithMetadata with V1.6 metadata
 ///
-/// Future enhancements (tracked, not blocking):
-///   - MD5 content_hash dedup before write (gap #13 from audit)
-///   - Cosine dedup vs recent rows in same session (D4 mitigation)
+/// `judge == null` means LLM judging is disabled — the call still works
+/// (MD5 still guards), it just doesn't catch semantic duplicates or
+/// resolve contradictions. Use null for non-LLM call sites (agent tool
+/// writes today, V1.7 classifier writes tomorrow).
 ///
-/// Both are deferred to a follow-up commit because they require state
-/// not yet plumbed (recent-rows snapshot for cosine, hash-keyed lookup
-/// for MD5). For 5b.2 minimum-viable: rely on the LLM not emitting
-/// duplicates within one extraction batch + the upsert ON CONFLICT
-/// behavior keying on (user_id, key) which gives unique extraction
-/// keys naturally.
-///
-/// Per-fact failures emit log.warn but don't abort the batch — one
-/// bad fact shouldn't kill the run.
+/// Per-fact failures emit log.warn but don't abort the batch — one bad
+/// fact shouldn't kill the run. Judge LLM failures are non-fatal: they
+/// degrade to MD5-only behavior for that fact.
 pub fn persistExtracted(
     allocator: std.mem.Allocator,
     state_mgr: *zaki_state.Manager,
     user_id: i64,
     session_id: ?[]const u8,
     memories: []const ExtractedMemory,
+    judge: ?JudgeContext,
 ) !PersistResult {
     var result = PersistResult{
         .written_count = 0,
         .skipped_blacklist = 0,
         .skipped_md5_dup = 0,
         .skipped_cosine_dup = 0,
+        .skipped_semantic_dup = 0,
+        .contradictions_resolved = 0,
         .failed_count = 0,
     };
 
@@ -364,7 +395,104 @@ pub fn persistExtracted(
             continue;
         }
 
-        // Step 3-5 — derive key + metadata + write
+        // Step 3 (V1.6 commit 6): contradiction LLM judge.
+        //
+        // Fetches two candidate lists per Graphiti spec:
+        //   - related: same-subject extraction-classifier memories (dedup-eligible)
+        //   - broader: hybrid BM25+key recall results (contradiction-eligible only)
+        //
+        // Runs only when caller provided a JudgeContext. Without it, this
+        // step short-circuits and persistence falls back to MD5-only
+        // semantics (same as V1.6 commit 5b.3 behavior).
+        //
+        // Failure mode: any error in candidate fetch OR judge call → log
+        // + proceed to write. Better one extra duplicate than a lost fact.
+        if (judge) |j| {
+            const empty_entries: []memory_root.MemoryEntry = &.{};
+            const related: []memory_root.MemoryEntry = state_mgr.findRelatedExtractedMemories(
+                allocator,
+                user_id,
+                m.subject,
+                edge_resolution.MAX_RELATED_CANDIDATES,
+            ) catch |err| blk: {
+                log.warn("extraction.related_fetch_failed err={s} subject={s}", .{
+                    @errorName(err), m.subject,
+                });
+                break :blk empty_entries;
+            };
+            defer freeMemoryEntries(allocator, related);
+
+            const broader: []memory_root.MemoryEntry = state_mgr.recallMemories(
+                allocator,
+                user_id,
+                m.text,
+                edge_resolution.MAX_BROADER_CANDIDATES,
+                null,
+            ) catch |err| blk: {
+                log.warn("extraction.broader_fetch_failed err={s}", .{@errorName(err)});
+                break :blk empty_entries;
+            };
+            defer freeMemoryEntries(allocator, broader);
+
+            // De-overlap: filter broader candidates whose keys also appear
+            // in related, so the judge's idx range stays semantically
+            // distinct (per Graphiti spec, related is dedup+contradiction,
+            // broader is contradiction-only — same row in both ranges
+            // would let dup_facts hit at idx >= related.len, which the
+            // judge then rejects per the constraint comment, wasting
+            // a candidate slot).
+            const broader_filtered: []memory_root.MemoryEntry = filterOverlap(allocator, broader, related) catch |err| blk: {
+                log.warn("extraction.dedup_filter_failed err={s}", .{@errorName(err)});
+                break :blk empty_entries;
+            };
+            defer allocator.free(broader_filtered);
+
+            const outcome = edge_resolution.resolveOne(
+                allocator,
+                j.provider,
+                j.model_name,
+                m,
+                related,
+                broader_filtered,
+            ) catch |err| blk: {
+                log.warn("extraction.judge_failed err={s} subject={s} predicate={s}", .{
+                    @errorName(err), m.subject, m.predicate,
+                });
+                break :blk edge_resolution.ResolveOutcome{
+                    .is_duplicate = false,
+                    .contradictions = &.{},
+                };
+            };
+            defer outcome.deinit(allocator);
+
+            if (outcome.is_duplicate) {
+                log.info("extraction.semantic_dup_skipped subject={s} predicate={s}", .{
+                    m.subject, m.predicate,
+                });
+                result.skipped_semantic_dup += 1;
+                continue;
+            }
+
+            // Apply contradictions BEFORE writing the new fact so that
+            // hybrid recall in the next iteration of this same batch
+            // doesn't see the about-to-be-superseded rows. Since
+            // applyContradictions is idempotent + the new fact's hash
+            // is different from any existing row's, this ordering is
+            // safe even if the new write fails afterward.
+            if (outcome.contradictions.len > 0) {
+                const applied = edge_resolution.applyContradictions(
+                    state_mgr,
+                    user_id,
+                    outcome.contradictions,
+                );
+                result.contradictions_resolved += applied;
+                log.info("extraction.contradictions_applied count={d} new_subject={s} new_predicate={s}", .{
+                    applied, m.subject, m.predicate,
+                });
+            }
+        }
+
+        // Step 4-5 — derive key + metadata + write
         const key = deriveExtractionKey(allocator) catch |err| {
             log.warn("extraction.key_derivation_failed err={s}", .{@errorName(err)});
             result.failed_count += 1;
@@ -401,6 +529,33 @@ pub fn persistExtracted(
     }
 
     return result;
+}
+
+/// V1.6 commit 6 helper — drop entries from `xs` whose key appears in
+/// `ys`. O(N*M) but candidate caps (12 + 8 = 20) keep it negligible.
+/// Returned slice is allocator-owned; entries are NOT cloned (they
+/// remain owned by the original `xs` slice — caller must keep `xs`
+/// alive until the filtered slice is consumed).
+fn filterOverlap(
+    allocator: std.mem.Allocator,
+    xs: []const memory_root.MemoryEntry,
+    ys: []const memory_root.MemoryEntry,
+) ![]memory_root.MemoryEntry {
+    var out: std.ArrayListUnmanaged(memory_root.MemoryEntry) = .{};
+    errdefer out.deinit(allocator);
+    outer: for (xs) |x| {
+        for (ys) |y| {
+            if (std.mem.eql(u8, x.key, y.key)) continue :outer;
+        }
+        try out.append(allocator, x);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Free a slice of MemoryEntry returned by zaki_state readers.
+fn freeMemoryEntries(allocator: std.mem.Allocator, entries: []memory_root.MemoryEntry) void {
+    for (entries) |e| e.deinit(allocator);
+    allocator.free(entries);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
