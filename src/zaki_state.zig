@@ -2168,6 +2168,9 @@ const ManagerImpl = struct {
         // memory_store path. Without this, calling compose_memory on a promoted
         // key from a fresh session would clobber the promotion + spuriously fire
         // a conflict marker.
+        // V1.6 cmt6 × V1.7 integration fix (W-INT-01): same resurrect-on-upsert
+        // close-out column reset as upsertMemory above. See its comment for
+        // the zombie-row + dead-promote scenario this prevents.
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, metadata, lemmatized, updated_at) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW()) " ++
@@ -2176,6 +2179,10 @@ const ManagerImpl = struct {
                 "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
                 "memory_type = CASE WHEN {schema}.memories.memory_type = 'core' THEN 'core' ELSE EXCLUDED.memory_type END, " ++
                 "metadata = EXCLUDED.metadata, lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
+                "valid_to    = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.valid_to    ELSE NULL END, " ++
+                "invalid_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
+                "expired_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.expired_at  ELSE NULL END, " ++
+                "is_latest   = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.is_latest   ELSE TRUE END, " ++
                 "seen_in_session_count = CASE " ++
                 "  WHEN {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
                 "       AND EXCLUDED.session_id IS NOT NULL " ++
@@ -2447,6 +2454,18 @@ const ManagerImpl = struct {
         // for core rows — the CASE makes that branch a no-op — so the row
         // is updated only when content/content_hash/session actually
         // diverge from stored.
+        // V1.6 cmt6 × V1.7 integration fix (W-INT-01): resurrect-on-upsert
+        // for closed-out non-core rows. setMemoryInvalidation (V1.6 cmt6
+        // contradiction-judge close-out) writes valid_to/invalid_at/expired_at/
+        // is_latest=false but never resets them. Without these CASE-clears, a
+        // fresh upsert to the same key from a new session would land new
+        // content into a row that's still hidden by MEMORIES_VALIDITY_FILTER
+        // (zombie row). Worse: if seen_in_session_count reaches 2,
+        // promoteMemoryToCore would mark it core forever (immortal hidden
+        // zombie). The CASE-clears here say: "writing this key NOW supersedes
+        // any prior close-out". Core rows are exempt — their close-out state
+        // is preserved (a closed-out core row stays closed-out; explicit
+        // resurrection requires the V1.6 cmt8 demoteMemoryFromCore writer).
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, updated_at) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) " ++
@@ -2455,6 +2474,10 @@ const ManagerImpl = struct {
                 "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
                 "memory_type = CASE WHEN {schema}.memories.memory_type = 'core' THEN 'core' ELSE EXCLUDED.memory_type END, " ++
                 "lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
+                "valid_to    = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.valid_to    ELSE NULL END, " ++
+                "invalid_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
+                "expired_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.expired_at  ELSE NULL END, " ++
+                "is_latest   = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.is_latest   ELSE TRUE END, " ++
                 "seen_in_session_count = CASE " ++
                 "  WHEN {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
                 "       AND EXCLUDED.session_id IS NOT NULL " ++
@@ -2466,6 +2489,8 @@ const ManagerImpl = struct {
                 "OR {schema}.memories.content IS DISTINCT FROM EXCLUDED.content " ++
                 "OR {schema}.memories.content_hash IS DISTINCT FROM EXCLUDED.content_hash " ++
                 "OR {schema}.memories.memory_type IS DISTINCT FROM EXCLUDED.memory_type " ++
+                "OR {schema}.memories.valid_to IS NOT NULL " ++
+                "OR {schema}.memories.is_latest IS DISTINCT FROM TRUE " ++
                 "RETURNING id, seen_in_session_count, memory_type",
         );
         defer self.allocator.free(q);
@@ -2566,9 +2591,20 @@ const ManagerImpl = struct {
     /// memory_type='core', clears session_id (makes it global), and raises
     /// confidence_score to 0.9 to reflect multi-session corroboration.
     fn promoteMemoryToCore(self: *Self, user_id: i64, key: []const u8) !void {
+        // V1.6 cmt6 × V1.7 integration fix (W-INT-01 defensive guard): also
+        // gate on MEMORIES_VALIDITY_FILTER so a closed-out row (valid_to in
+        // past from V1.6 cmt6 contradiction-judge close-out) cannot be
+        // promoted to core. Without this guard, a closed-out non-core row
+        // that catches a fresh upsert + reaches seen_count >= 2 would become
+        // an immortal hidden core row (CASE-guard preserves core forever
+        // against subsequent writes; MEMORIES_VALIDITY_FILTER hides it from
+        // every retrieval). With the resurrect-on-upsert CASE-clears in
+        // upsertMemory + upsertMemoryWithMetadata, this branch is normally
+        // unreachable (the upsert clears valid_to before promote runs), but
+        // defense-in-depth — promote should never lift an invalid row.
         const q = try self.buildQuery(
             "UPDATE {schema}.memories SET memory_type = 'core', session_id = NULL, confidence_score = 0.9, updated_at = NOW() " ++
-                "WHERE user_id = $1 AND key = $2 AND memory_type != 'core'",
+                "WHERE user_id = $1 AND key = $2 AND memory_type != 'core' AND " ++ MEMORIES_VALIDITY_FILTER,
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -3115,9 +3151,16 @@ const ManagerImpl = struct {
         subject: []const u8,
         limit: usize,
     ) ![]memory_root.MemoryEntry {
+        // V1.6 cmt6 review (I-INT-02 fix): include `metadata ? 'subject'` so the
+        // PG planner reliably picks `idx_memories_metadata_subject` (a partial
+        // index WHERE metadata ? 'subject'). Without the matching predicate,
+        // the planner doesn't always recognize that `metadata->>'subject' = $2`
+        // implies the partial-index WHERE — falling back to seq-scan or the
+        // typed-column index (which is unpopulated by the JSONB upsert path).
         const q = try self.buildQuery(
             "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories " ++
                 "WHERE user_id = $1 " ++
+                "AND metadata ? 'subject' " ++
                 "AND metadata->>'subject' = $2 " ++
                 "AND metadata->>'attribution' = 'extraction_classifier' " ++
                 "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
@@ -6125,4 +6168,125 @@ test "V1.6 commit 6 findRelatedExtractedMemories scopes by subject + attribution
     try std.testing.expectEqual(@as(usize, 1), related.len);
     try std.testing.expectEqualStrings("ec_user_helix", related[0].key);
     try std.testing.expectEqualStrings("User uses Helix", related[0].content);
+}
+
+// V1.6 cmt6 × V1.7 integration regression test (W-INT-01).
+//
+// Scenario: a non-core extraction-classifier row gets closed-out by V1.6
+// commit 6's setMemoryInvalidation (e.g. via the contradiction judge). A
+// later session re-states a similar fact under the SAME key (escapes the
+// content_hash dedup because phrasing differs). Without the resurrect-on-
+// upsert CASE-clears in upsertMemoryWithMetadata, the row would update
+// content while remaining invisible (valid_to in past, is_latest=false) —
+// "zombie" row. Worse: a 2nd cross-session re-statement would trigger
+// promoteMemoryToCore on a closed-out row, marking it core forever +
+// permanently invisible.
+//
+// This test asserts: post-resurrect-upsert, the row is visible to
+// getMemory + findRelatedExtractedMemories, with valid_to=NULL and
+// is_latest=TRUE.
+test "V1.6 commit 6 × V1.7 W-INT-01 resurrect-on-upsert clears close-out cols" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Step 1: write extraction-classifier row from session A.
+    // Use `.daily` (non-core) to exercise the resurrect-on-upsert path —
+    // a `.core`-seeded row would hit the core-preserve branch instead,
+    // which is the OTHER axis tested in step 6 below.
+    try mgr.upsertMemoryWithMetadata(2, "extracted_resurrect_test",
+        "User prefers NeoVim editor",
+        .daily, "session-A",
+        \\{"subject":"user","predicate":"PREFERS","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
+    );
+
+    // ── Step 2: contradiction judge closes it out ─────────────────────
+    const close_ts: i64 = std.time.timestamp();
+    try mgr.setMemoryInvalidation(2, "extracted_resurrect_test", close_ts, close_ts);
+    {
+        const hidden = try mgr.getMemory(allocator, 2, "extracted_resurrect_test");
+        try std.testing.expect(hidden == null); // confirmed: validity filter hides it
+    }
+
+    // ── Step 3: fresh re-statement from session B, SAME key, different content
+    try mgr.upsertMemoryWithMetadata(2, "extracted_resurrect_test",
+        "User uses NeoVim as their primary editor",
+        .daily, "session-B",
+        \\{"subject":"user","predicate":"USES","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
+    );
+
+    // ── Step 4: row MUST be visible again, with cleared close-out columns
+    const resurrected = try mgr.getMemory(allocator, 2, "extracted_resurrect_test");
+    try std.testing.expect(resurrected != null);
+    var r = resurrected.?;
+    defer r.deinit(allocator);
+    try std.testing.expectEqualStrings("User uses NeoVim as their primary editor", r.content);
+    try std.testing.expect(r.valid_to == null); // CASE-cleared back to NULL
+
+    // Audit columns also reset
+    {
+        const audit_q = try std.fmt.allocPrint(allocator,
+            "SELECT valid_to, invalid_at, expired_at, is_latest FROM {s}.memories WHERE user_id = 2 AND key = 'extracted_resurrect_test'",
+            .{schema},
+        );
+        defer allocator.free(audit_q);
+        const result = try mgr.exec(audit_q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        // valid_to/invalid_at/expired_at all NULL after resurrect; is_latest = true.
+        try std.testing.expectEqual(@as(c_int, 1), c.PQgetisnull(result, 0, 0)); // valid_to NULL
+        try std.testing.expectEqual(@as(c_int, 1), c.PQgetisnull(result, 0, 1)); // invalid_at NULL
+        try std.testing.expectEqual(@as(c_int, 1), c.PQgetisnull(result, 0, 2)); // expired_at NULL
+        const is_latest_str = try dupeResultValue(allocator, result, 0, 3);
+        defer allocator.free(is_latest_str);
+        try std.testing.expectEqualStrings("t", is_latest_str);
+    }
+
+    // ── Step 5: findRelatedExtractedMemories also sees the resurrected row
+    const related = try mgr.findRelatedExtractedMemories(allocator, 2, "user", 8);
+    defer {
+        for (related) |e| e.deinit(allocator);
+        allocator.free(related);
+    }
+    try std.testing.expectEqual(@as(usize, 1), related.len);
+    try std.testing.expectEqualStrings("extracted_resurrect_test", related[0].key);
+
+    // ── Step 6: a CORE row that gets closed-out STAYS closed-out across upsert
+    // (resurrect is non-core only; explicit demote required for core).
+    try mgr.upsertMemory(2, "core_stays_closed", "core fact A", .core, "session-A");
+    try mgr.execParamsNoResult(
+        "UPDATE {schema}.memories SET memory_type = 'core', session_id = NULL WHERE user_id = $1 AND key = $2",
+        &.{ "2", "core_stays_closed" },
+        &.{ 1, @as(c_int, @intCast("core_stays_closed".len)) },
+    );
+    try mgr.setMemoryInvalidation(2, "core_stays_closed", close_ts, close_ts);
+    try mgr.upsertMemory(2, "core_stays_closed", "core fact B", .daily, "session-B");
+    {
+        const closed_core = try mgr.getMemory(allocator, 2, "core_stays_closed");
+        try std.testing.expect(closed_core == null); // still hidden — core close-out preserved
+    }
 }
