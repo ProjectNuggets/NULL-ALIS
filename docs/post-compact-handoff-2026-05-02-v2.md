@@ -4,14 +4,14 @@
 
 ## State at compaction
 
-- **Main HEAD:** `df48be7` (V1.7a-5 cmt9.10 + drift-guard tests — link_type rich wiring across LinkType enum + extraction predicate mapping + compose_memory + prompt vocabulary + brain endpoint surface + idempotent backfill)
-- **111+ commits ahead** of original V1.5 ship-ready handoff (`4d9e16f`)
+- **Main HEAD:** `3991c79` (V1.7a-5b — surface archived memories on /brain/memory drilldown, closes user-visible 404 noise + advances spec §4.9 valid_history conformance)
+- **112+ commits ahead** of original V1.5 ship-ready handoff (`4d9e16f`)
 - **V1.5 status:** SHIP-READY (deploy date deprioritized per Nova: ship when correct, not by date)
 - **V1.5.5 status:** GREEN — substrate validated (precision 0.92)
 - **V1.6 status:** SHIP-COMPLETE — 16/16 commits + cmt9.5 + ship-gate review fixes (`d50f5d1`); V1.6.1 polish landed in V1.7a-4 (cmt9.9 + review fixes a6f54b3 + parallel-review fixes 3524bf9 + all-review-findings-closed 02d40b1)
-- **V1.7 status:** 5 of 12 items shipped (V1.7a-1 cmt9.6 = Gap 3 closure; V1.7a-2 cmt9.7 = graph_expand → memory_recall consumer; V1.7a-3 cmt9.8 = brain graph perf swap; V1.7a-4 cmt9.9 = V1.6.1 polish; V1.7a-5 cmt9.10 = link_type rich wiring; ALL items dual-review-clean: self-pass + gsd-code-review)
+- **V1.7 status:** 5 of 12 items shipped + V1.7a-5b drilldown bugfix (V1.7a-1 cmt9.6 = Gap 3 closure; V1.7a-2 cmt9.7 = graph_expand → memory_recall consumer; V1.7a-3 cmt9.8 = brain graph perf swap; V1.7a-4 cmt9.9 = V1.6.1 polish; V1.7a-5 cmt9.10 = link_type rich wiring; V1.7a-5b 3991c79 = drilldown 404 fix; ALL items dual-review-clean)
 - **Branch:** `main`
-- **Tests:** 5954/5964 PG passed (+34 vs V1.5 baseline; 10 skipped). Only pre-existing `postgres_pool_releases_on_exec_error` baseline failure.
+- **Tests:** 5955/5965 PG passed (+35 vs V1.5 baseline; 10 skipped). Only pre-existing `postgres_pool_releases_on_exec_error` baseline failure.
 
 ## Trust mandate (do not forget)
 
