@@ -1115,6 +1115,20 @@ test "buildSystemPrompt includes core sections" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Scheduler authority") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "live `schedule` state is execution truth") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "ad-hoc) and is NOT drift") != null);
+
+    // V1.7a-5 self-review: drift guard for the link_type vocabulary block.
+    // Adding a new LinkType variant in memory_root.zig MUST update the
+    // prompt block too — otherwise the agent doesn't learn the new
+    // category. This loop FAILS if any LinkType.toString() value is
+    // missing from the rendered prompt.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Memory Link Types") != null);
+    inline for (memory_root.ALL_LINK_TYPES) |lt| {
+        const backticked = "`" ++ lt ++ "`";
+        if (std.mem.indexOf(u8, prompt, backticked) == null) {
+            std.debug.print("\nLinkType '{s}' missing from prompt's Memory Link Types section — drift detected\n", .{lt});
+            return error.LinkTypeVocabularyDriftDetected;
+        }
+    }
 }
 
 // Dump-helper: writes the assembled prompt to /tmp/nullalis_prompt_full.txt

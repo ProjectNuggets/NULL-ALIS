@@ -353,3 +353,22 @@ test "compose_memory: COMPOSE_KEY_PREFIX guards against arbitrary key writes" {
     try std.testing.expect(!std.mem.startsWith(u8, "Compose:abc", COMPOSE_KEY_PREFIX));
     try std.testing.expect(!std.mem.startsWith(u8, "memory:foo", COMPOSE_KEY_PREFIX));
 }
+
+test "compose_memory: tool_params link_type enum mirrors LinkType (V1.7a-5 drift guard)" {
+    // V1.7a-5 self-review: tool_params is a hand-written JSON-string
+    // schema. If a future commit adds a new LinkType variant in
+    // memory_root.zig, the LLM-side hint AND this enum constraint must
+    // update too — otherwise the model won't know about the new value.
+    // This test FAILS if the enum drifts from ALL_LINK_TYPES.
+    inline for (mem_root.ALL_LINK_TYPES) |lt| {
+        // Tool params must contain the literal string "<lt>" (quoted) inside
+        // the link_type field's enum array. Defensive bracketed check so we
+        // don't false-positive against substrings of category descriptions.
+        const quoted = "\"" ++ lt ++ "\"";
+        const pos = std.mem.indexOf(u8, ComposeMemoryTool.tool_params, quoted);
+        if (pos == null) {
+            std.debug.print("\nLinkType '{s}' missing from compose_memory.tool_params enum — drift detected\n", .{lt});
+            return error.LinkTypeEnumDriftDetected;
+        }
+    }
+}
