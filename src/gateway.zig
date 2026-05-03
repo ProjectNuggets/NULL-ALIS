@@ -11435,6 +11435,14 @@ fn handleBrainGraph(
     const since_param = parseQueryParam(target, "since");
     const max_nodes_param = parseQueryParam(target, "max_nodes");
     const node_kinds_csv = parseQueryParam(target, "node_kinds");
+    // V1.7a-8b filter extension — all three optional, AND-combined.
+    const search_param = parseQueryParam(target, "search");
+    const link_types_csv = parseQueryParam(target, "link_types");
+    const exclude_orphans_param = parseQueryParam(target, "exclude_orphans");
+    const exclude_orphans: bool = if (exclude_orphans_param) |s|
+        (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1"))
+    else
+        false;
 
     const since: ?i64 = if (since_param) |s| std.fmt.parseInt(i64, s, 10) catch null else null;
     var max_nodes: u32 = if (max_nodes_param) |s|
@@ -11455,7 +11463,74 @@ fn handleBrainGraph(
     };
     defer memory_mod.freeEntries(allocator, all_entries);
 
-    // ── Filter (since + node_kinds) ───────────────────────────────
+    // ── V1.7a-8b: search keep-set ─────────────────────────────────
+    // When ?search= is present, intersect filter with recallMemories
+    // (BM25 + key + content) — same DSL as /brain/search so the FE can
+    // re-use the search box semantics. Built once before the filter loop.
+    var search_keep_set: ?std.StringHashMapUnmanaged(void) = null;
+    var search_seeds: ?[]memory_mod.MemoryEntry = null;
+    defer if (search_seeds) |s| memory_mod.freeEntries(allocator, s);
+    defer if (search_keep_set) |*s| s.deinit(allocator);
+    if (search_param) |q| {
+        if (q.len > 0 and q.len <= 512) {
+            // Fetch a generous overshoot so the keep-set covers the corpus
+            // before max_nodes cap. Bounded by BRAIN_MAX_MAX_NODES * 2.
+            const overshoot: usize = @as(usize, BRAIN_MAX_MAX_NODES) * 2;
+            if (state_mgr.recallMemories(allocator, numeric_user_id, q, overshoot, null)) |seeds| {
+                search_seeds = seeds;
+                var ks: std.StringHashMapUnmanaged(void) = .{};
+                for (seeds) |e| ks.put(allocator, e.key, {}) catch break;
+                search_keep_set = ks;
+            } else |_| {
+                // Search degrades to "no matches" — empty result. Better
+                // than returning unfiltered (which would mislead the FE).
+                search_keep_set = .{};
+            }
+        }
+    }
+
+    // ── V1.7a-8b: link_type set ──────────────────────────────────
+    // Parse CSV like "preference,attribute" via parseLinkTypesCsv (helper
+    // for unit-testability). Unknown tokens silently dropped; empty set
+    // after parse means "filter to nothing" — fail closed to avoid the
+    // surprise of an unknown filter string returning everything.
+    var link_types_set: ?std.StringHashMapUnmanaged(void) = null;
+    defer if (link_types_set) |*s| s.deinit(allocator);
+    if (link_types_csv) |csv| {
+        if (csv.len > 0) link_types_set = parseLinkTypesCsv(allocator, csv);
+    }
+
+    // ── V1.7a-8b: prefetch metadata for link_types filter ────────
+    // Fetch metadata for the ENTIRE visible corpus when link_types is
+    // active — we need it BEFORE the filter loop to decide which keys
+    // pass. Bounded by V1's per-user corpus size; the existing post-cap
+    // metadata fetch (lines below) stays for display-side concerns.
+    var prefilter_metadata: ?std.StringHashMapUnmanaged([]u8) = null;
+    defer if (prefilter_metadata) |*m| {
+        var mit = m.iterator();
+        while (mit.next()) |kv| {
+            allocator.free(kv.key_ptr.*);
+            allocator.free(kv.value_ptr.*);
+        }
+        m.deinit(allocator);
+    };
+    if (link_types_set != null) {
+        if (allocator.alloc([]const u8, all_entries.len)) |keys_for_prefilter| {
+            defer allocator.free(keys_for_prefilter);
+            for (all_entries, 0..) |e, i| keys_for_prefilter[i] = e.key;
+            if (state_mgr.listMemoriesMetadata(allocator, numeric_user_id, keys_for_prefilter)) |m| {
+                prefilter_metadata = m;
+            } else |_| {
+                // No metadata → link_types filter degrades to "no matches"
+                // (consistent with search degradation: don't silently bypass).
+            }
+        } else |_| {
+            // OOM on the prefilter key buffer — leave prefilter_metadata
+            // null so the link_types filter degrades to fail-closed below.
+        }
+    }
+
+    // ── Filter (since + node_kinds + search + link_types) ─────────
     var filtered_indices: std.ArrayListUnmanaged(usize) = .{};
     defer filtered_indices.deinit(allocator);
 
@@ -11466,6 +11541,24 @@ fn handleBrainGraph(
         }
         const kind = entry.category.toString();
         if (!brainKindAllowed(node_kinds_csv, kind)) continue;
+        // V1.7a-8b: search filter (intersection with recallMemories).
+        if (search_keep_set) |ks| {
+            if (!ks.contains(entry.key)) continue;
+        }
+        // V1.7a-8b: link_types filter (NODE-level; the source memory's
+        // own categorization). Drops rows whose metadata.link_type isn't
+        // in the requested set. When metadata is unavailable, drops the
+        // row (fail-closed). Edge-level color-by-type is V-infinity FE
+        // work — node-filter is the V1.7a parity move.
+        if (link_types_set) |lts| {
+            const md_opt = if (prefilter_metadata) |m| m.get(entry.key) else null;
+            const lt_opt = extractLinkTypeFromMetadata(allocator, md_opt);
+            if (lt_opt) |lt_str| {
+                if (!lts.contains(lt_str)) continue;
+            } else {
+                continue;
+            }
+        }
         filtered_indices.append(allocator, idx) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
         };
@@ -11622,6 +11715,12 @@ fn handleBrainGraph(
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
     };
     defer allocator.free(importance_scores);
+    // V1.7a-8b: visibility gate consumed by JSON emission below. Populated
+    // inside the degree block (where `degree` is in scope). Behavior:
+    //   exclude_orphans=true  → only nodes with degree > 0 are added
+    //   exclude_orphans=false → every visible node is added (no-op gate)
+    var displayed_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer displayed_keys.deinit(allocator);
     {
         // Count incident edges per node-key in O(E + N) via hashmap pass.
         var degree: std.StringHashMapUnmanaged(usize) = .{};
@@ -11666,6 +11765,20 @@ fn handleBrainGraph(
             const edge_count: usize = if (degree.get(n.key)) |d| d else 0;
             importance_scores[i] = importance_mod.computeImportance(n.created_at, now, edge_count);
         }
+        // V1.7a-8b — displayed_keys gates BOTH nodes and edges in the
+        // JSON emission below. When exclude_orphans=true, a node with
+        // degree=0 (after all edge-type filters above) is excluded and
+        // edges with either endpoint excluded are also dropped (no
+        // dangling). When exclude_orphans=false (default), every visible
+        // node is in the set — the gate becomes a tautology and behavior
+        // matches the pre-V1.7a-8b shape.
+        for (nodes) |n| {
+            if (exclude_orphans) {
+                const deg: usize = if (degree.get(n.key)) |d| d else 0;
+                if (deg == 0) continue;
+            }
+            displayed_keys.put(allocator, n.key, {}) catch {};
+        }
     }
 
     // ── Build JSON response ──────────────────────────────────────
@@ -11674,8 +11787,12 @@ fn handleBrainGraph(
     const w = out.writer(allocator);
 
     w.writeAll("{\"nodes\":[") catch return response_build_err;
+    var first_node_emitted = true;
     for (nodes, 0..) |n, i| {
-        if (i > 0) w.writeAll(",") catch return response_build_err;
+        // V1.7a-8b: orphan filter (no-op when exclude_orphans=false).
+        if (!displayed_keys.contains(n.key)) continue;
+        if (!first_node_emitted) w.writeAll(",") catch return response_build_err;
+        first_node_emitted = false;
         w.writeAll("{\"id\":\"") catch return response_build_err;
         jsonEscapeInto(w, n.key) catch return response_build_err;
         w.writeAll("\",\"kind\":\"") catch return response_build_err;
@@ -11740,6 +11857,8 @@ fn handleBrainGraph(
     w.writeAll("],\"edges\":[") catch return response_build_err;
     var emitted_first_edge = true;
     for (session_edges) |e| {
+        // V1.7a-8b: drop dangling edges when orphan filter excluded an endpoint.
+        if (!displayed_keys.contains(e.source) or !displayed_keys.contains(e.target)) continue;
         if (!emitted_first_edge) w.writeAll(",") catch return response_build_err;
         emitted_first_edge = false;
         w.writeAll("{\"type\":\"session\",\"source\":\"") catch return response_build_err;
@@ -11749,6 +11868,7 @@ fn handleBrainGraph(
         w.writeAll("\"}") catch return response_build_err;
     }
     for (semantic_edges) |e| {
+        if (!displayed_keys.contains(e.source_key) or !displayed_keys.contains(e.target_key)) continue;
         if (!emitted_first_edge) w.writeAll(",") catch return response_build_err;
         emitted_first_edge = false;
         w.writeAll("{\"type\":\"semantic\",\"source\":\"") catch return response_build_err;
@@ -11758,6 +11878,7 @@ fn handleBrainGraph(
         w.print("\",\"weight\":{d:.4}}}", .{e.similarity}) catch return response_build_err;
     }
     for (ref_edges) |e| {
+        if (!displayed_keys.contains(e.source) or !displayed_keys.contains(e.target)) continue;
         if (!emitted_first_edge) w.writeAll(",") catch return response_build_err;
         emitted_first_edge = false;
         w.writeAll("{\"type\":\"reference\",\"source\":\"") catch return response_build_err;
@@ -11770,6 +11891,7 @@ fn handleBrainGraph(
     // label. FE renders the predicate as the edge label (e.g.,
     // "PREFERS", "DEPLOYS_TO") so the user sees the relationship type.
     for (typed_edges) |e| {
+        if (!displayed_keys.contains(e.source) or !displayed_keys.contains(e.target)) continue;
         if (!emitted_first_edge) w.writeAll(",") catch return response_build_err;
         emitted_first_edge = false;
         w.writeAll("{\"type\":\"typed\",\"source\":\"") catch return response_build_err;
@@ -12863,6 +12985,32 @@ fn parseIsoDateUtc(s: []const u8) ?i64 {
     const doe: u64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     const days: i64 = era * 146097 + @as(i64, @intCast(doe)) - 719468;
     return days * 86400;
+}
+
+/// V1.7a-8b — parse a comma-separated `link_types=` query value into a
+/// set of canonical LinkType strings. Tokens are trimmed of surrounding
+/// whitespace; case-insensitive (delegated to `LinkType.fromString`).
+/// Unknown tokens silently dropped; duplicates collapse via the set.
+///
+/// Returns an EMPTY set (not null) when the CSV has no recognized
+/// tokens — caller treats empty as "filter to nothing matched" so an
+/// unknown filter string fails closed instead of bypassing the filter
+/// (consistent with the search filter degradation).
+///
+/// Stored values are static slices from `LinkType.toString()` (string
+/// literals) — no per-key heap allocation; only the hashmap header
+/// allocates. Caller deinits the hashmap.
+fn parseLinkTypesCsv(allocator: std.mem.Allocator, csv: []const u8) std.StringHashMapUnmanaged(void) {
+    var s: std.StringHashMapUnmanaged(void) = .{};
+    var it = std.mem.tokenizeScalar(u8, csv, ',');
+    while (it.next()) |tok| {
+        const trimmed = std.mem.trim(u8, tok, " \t");
+        if (trimmed.len == 0) continue;
+        if (memory_mod.LinkType.fromString(trimmed)) |lt| {
+            s.put(allocator, lt.toString(), {}) catch break;
+        }
+    }
+    return s;
 }
 
 /// Best-effort link_type extraction from a row's metadata JSONB.
@@ -25199,6 +25347,67 @@ test "handleBrainTimeline rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainTimeline(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/timeline", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+// ── /brain/graph filter extension — V1.7a-8b unit tests ───────────────
+
+test "parseLinkTypesCsv — valid + invalid + whitespace + empty" {
+    const allocator = std.testing.allocator;
+
+    // Single valid token
+    {
+        var s = parseLinkTypesCsv(allocator, "preference");
+        defer s.deinit(allocator);
+        try std.testing.expect(s.contains("preference"));
+        try std.testing.expectEqual(@as(usize, 1), s.count());
+    }
+    // Multiple valid tokens with surrounding whitespace
+    {
+        var s = parseLinkTypesCsv(allocator, " preference , attribute , supersession ");
+        defer s.deinit(allocator);
+        try std.testing.expect(s.contains("preference"));
+        try std.testing.expect(s.contains("attribute"));
+        try std.testing.expect(s.contains("supersession"));
+        try std.testing.expectEqual(@as(usize, 3), s.count());
+    }
+    // Mix of valid + invalid tokens — invalid silently dropped (V1.7a-8b
+    // contract: unknown tokens neither error nor expand the keep-set;
+    // they just don't add to it. Combined with fail-closed empty-set
+    // semantics in the caller, this means a typo'd filter produces no
+    // matches rather than bypassing the filter entirely.)
+    {
+        var s = parseLinkTypesCsv(allocator, "preference,not_a_real_type,attribute");
+        defer s.deinit(allocator);
+        try std.testing.expect(s.contains("preference"));
+        try std.testing.expect(s.contains("attribute"));
+        try std.testing.expect(!s.contains("not_a_real_type"));
+        try std.testing.expectEqual(@as(usize, 2), s.count());
+    }
+    // Case-insensitive (delegated to LinkType.fromString)
+    {
+        var s = parseLinkTypesCsv(allocator, "PREFERENCE,Attribute");
+        defer s.deinit(allocator);
+        try std.testing.expect(s.contains("preference")); // canonical lowercase
+        try std.testing.expect(s.contains("attribute"));
+    }
+    // Empty CSV → empty set (caller treats as fail-closed)
+    {
+        var s = parseLinkTypesCsv(allocator, "");
+        defer s.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), s.count());
+    }
+    // All-invalid CSV → empty set
+    {
+        var s = parseLinkTypesCsv(allocator, "foo,bar,baz");
+        defer s.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), s.count());
+    }
+    // Duplicates collapse via the set
+    {
+        var s = parseLinkTypesCsv(allocator, "preference,preference,preference");
+        defer s.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), s.count());
+    }
 }
 
 // ── /brain/orphans — V1.7a-8a unit tests ──────────────────────────────
