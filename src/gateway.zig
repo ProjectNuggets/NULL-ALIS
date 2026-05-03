@@ -12629,6 +12629,7 @@ fn handleBrainTimeline(
 // provider to produce real names without changing the endpoint shape.
 
 const community_pipeline = @import("agent/community_pipeline.zig");
+const community_llm_namer = @import("agent/community_llm_namer.zig");
 
 fn handleBrainCommunities(
     allocator: std.mem.Allocator,
@@ -12681,6 +12682,7 @@ fn handleBrainCommunitiesRecompute(
     allocator: std.mem.Allocator,
     method: []const u8,
     user_id: []const u8,
+    tenant_runtime: ?*TenantRuntime,
     state: *GatewayState,
 ) RouteResponse {
     if (!std.mem.eql(u8, method, "POST")) {
@@ -12705,15 +12707,40 @@ fn handleBrainCommunitiesRecompute(
     }
     defer state.community_recompute_mutex.unlock();
 
-    // V1: NULL namer → fallback "Cluster <id>" names. Real LLM-naming
-    // wiring is a clean follow-up that constructs an LlmNamer from
-    // gateway state's provider router; the pipeline interface is
-    // stable so wiring it later doesn't change this endpoint's shape.
+    // V1.7-ship S1: build LlmNamer from the tenant runtime's provider
+    // bundle. Sidecar (cheap-and-fast model designated for narration /
+    // compaction / extraction) preferred; falls back to primary.
+    // When tenant_runtime is null (PG-only test paths, cold-start, or
+    // pre-tenant boot), pass null namer → pipeline writes fallback
+    // "Cluster <id>" names (V1.7a-9c contract).
+    var namer_ctx_storage: community_llm_namer.NamerCtx = undefined;
+    var namer: ?community_pipeline.LlmNamer = null;
+    if (tenant_runtime) |rt| {
+        if (rt.provider_bundle.sidecarProvider()) |sidecar| {
+            namer_ctx_storage = .{
+                .provider = sidecar,
+                .model = rt.provider_bundle.sidecarModelName(),
+            };
+            namer = community_llm_namer.make(&namer_ctx_storage);
+        } else {
+            namer_ctx_storage = .{
+                .provider = rt.provider_bundle.provider(),
+                .model = rt.config.default_model orelse "",
+            };
+            // Skip namer construction when default_model is empty — the
+            // chatWithSystem call would fail; better to ship fallback
+            // names than waste a round trip.
+            if (namer_ctx_storage.model.len > 0) {
+                namer = community_llm_namer.make(&namer_ctx_storage);
+            }
+        }
+    }
+
     const stats = community_pipeline.recomputeCommunitiesForUser(
         allocator,
         state_mgr,
         numeric_user_id,
-        null,
+        namer,
         .{ .now_unix = std.time.timestamp() },
     ) catch |err| {
         log.warn("brain.communities.recompute_failed user={d} err={s}", .{ numeric_user_id, @errorName(err) });
@@ -15005,13 +15032,28 @@ fn handleApiRoute(
     // ── /brain/communities — V1.7a-9d ────────────────────────────────────
     // GET  /api/v1/users/{id}/brain/communities             — list summaries
     // POST /api/v1/users/{id}/brain/communities/recompute   — manual trigger
-    // V1 ships with NULL LlmNamer; every community gets a fallback
-    // "Cluster <id>" name. Real LLM-naming wiring is a clean follow-up.
+    // V1.7-ship S1: recompute now wires the agent's sidecar provider as
+    // the LlmNamer (replacing the V1 fallback "Cluster <id>" names with
+    // real "Engineering work" / "Daily routines" / etc.). When tenant
+    // runtime cannot be resolved (PG-only test paths, pre-tenant boot),
+    // we pass null and the pipeline degrades to fallback names — same
+    // behavior as V1.7a-9d shipped.
     if (std.mem.eql(u8, parsed.subpath, "brain/communities")) {
         return handleBrainCommunities(req_allocator, method, scoped_user_id, state);
     }
     if (std.mem.eql(u8, parsed.subpath, "brain/communities/recompute")) {
-        return handleBrainCommunitiesRecompute(req_allocator, method, scoped_user_id, state);
+        const tenant_runtime: ?*TenantRuntime = blk: {
+            if (config_opt) |cfg| {
+                if (getTenantRuntime(state, cfg, &user_ctx)) |rt| {
+                    break :blk rt;
+                } else |err| {
+                    log.warn("brain.communities.recompute_tenant_lookup_failed user={s} err={s} — falling back to NULL namer", .{ user_ctx.user_id, @errorName(err) });
+                    break :blk null;
+                }
+            }
+            break :blk null;
+        };
+        return handleBrainCommunitiesRecompute(req_allocator, method, scoped_user_id, tenant_runtime, state);
     }
 
     // ── /brain/memory/{key} — V1.6 commit 13 (M3) ────────────────────────
@@ -25615,13 +25657,13 @@ test "handleBrainCommunities rejects invalid user_id" {
 
 test "handleBrainCommunitiesRecompute rejects non-POST methods" {
     var dummy_state: GatewayState = undefined;
-    const resp = handleBrainCommunitiesRecompute(std.testing.allocator, "GET", "1", &dummy_state);
+    const resp = handleBrainCommunitiesRecompute(std.testing.allocator, "GET", "1", null, &dummy_state);
     try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
 }
 
 test "handleBrainCommunitiesRecompute rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
-    const resp = handleBrainCommunitiesRecompute(std.testing.allocator, "POST", "abc", &dummy_state);
+    const resp = handleBrainCommunitiesRecompute(std.testing.allocator, "POST", "abc", null, &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
 }
 

@@ -18,4 +18,6 @@ test {
     _ = @import("agent/communities.zig");
     // V1.7a-9c — pipeline orchestration tests (FNV stable-id + helpers).
     _ = @import("agent/community_pipeline.zig");
+    // V1.7-ship S1 — concrete LlmNamer wiring tests (cleanName helper).
+    _ = @import("agent/community_llm_namer.zig");
 }
