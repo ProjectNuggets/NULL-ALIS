@@ -382,6 +382,25 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listOrphanMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
+    /// V1.7a-9a — stubs for non-postgres builds. Communities feature
+    /// degrades to "no communities yet" — every node has community_id=null
+    /// on /brain/graph, /brain/communities returns empty, recompute is a
+    /// no-op. The FE renders with the no-clusters fallback path.
+    pub fn listMemoryEdgesForCommunityCompute(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]memory_root.CommunityEdge {
+        return allocator.alloc(memory_root.CommunityEdge, 0);
+    }
+    pub fn setMemoryCommunityIds(_: *@This(), _: i64, _: []const memory_root.CommunityAssignment) !void {
+        return;
+    }
+    pub fn setCommunityName(_: *@This(), _: i64, _: i32, _: []const u8, _: []const u8, _: u32, _: []const u8) !void {
+        return;
+    }
+    pub fn getCommunityName(_: *@This(), _: std.mem.Allocator, _: i64, _: i32) !?memory_root.CommunityName {
+        return null;
+    }
+    pub fn listCommunities(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]memory_root.CommunitySummary {
+        return allocator.alloc(memory_root.CommunitySummary, 0);
+    }
     /// V1.5 day-4 — stub for non-postgres builds; traversal logging
     /// silently no-ops.
     pub fn insertTraversalEvent(_: *@This(), _: i64, _: []const u8) !void {
@@ -1454,6 +1473,37 @@ const ManagerImpl = struct {
             \\)
             ,
             "INSERT INTO {schema}.schema_migrations (version, name) VALUES (1, '0001_initial_schema') ON CONFLICT (version) DO NOTHING",
+
+            // ── V1.7a-9a — Communities (label-propagation auto-clustering) ──
+            //
+            // community_id on memories table:
+            //   - Nullable INTEGER. NULL = unassigned (new memories before
+            //     first recompute, OR archived memories — recompute leaves
+            //     them as-was for historical record).
+            //   - Stable across recomputes via hash of top-K-importance
+            //     member keys (computed in src/agent/communities.zig).
+            //
+            // memory_communities table: per-(user, community) name + counts.
+            //   - name_source distinguishes 'llm' vs 'fallback' for telemetry
+            //     and FE styling (e.g. dim auto-fallback names).
+            //   - generated_at enables stale-name detection on next recompute.
+            //   - member_set_hash gates LLM re-call: only re-name when the
+            //     top-K member set changes (cost control).
+            "ALTER TABLE {schema}.memories ADD COLUMN IF NOT EXISTS community_id INTEGER",
+            // Partial index on the live + brain-visible subset matches the
+            // typical /brain/graph + /brain/communities query shape.
+            "CREATE INDEX IF NOT EXISTS idx_memories_community ON {schema}.memories(user_id, community_id) WHERE is_latest AND community_id IS NOT NULL",
+            \\CREATE TABLE IF NOT EXISTS {schema}.memory_communities (
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    community_id INTEGER NOT NULL,
+            \\    name TEXT,
+            \\    name_source TEXT,
+            \\    member_count INTEGER NOT NULL DEFAULT 0,
+            \\    member_set_hash TEXT,
+            \\    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            \\    PRIMARY KEY (user_id, community_id)
+            \\)
+            ,
         };
 
         for (statements) |template| {
@@ -3666,6 +3716,316 @@ const ManagerImpl = struct {
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
         return try decodeMemoryRows(allocator, result, false);
+    }
+
+    /// V1.7a-9a — pull edges enriched with the metadata the LPA needs:
+    /// weight (vote magnitude), attribution (user-vs-auto multiplier),
+    /// valid_from (recency decay). Filters to LIVE bi-temporal edges
+    /// (`is_latest`) and live memories on BOTH endpoints (subquery so
+    /// dangling-edge garbage doesn't poison the algorithm). Brain-
+    /// hygiene NOT applied here — it's applied at the consumer level
+    /// when emitting community_id on /brain/graph.
+    ///
+    /// Caller frees each CommunityEdge + the slice via
+    /// `memory_root.freeCommunityEdges`.
+    pub fn listMemoryEdgesForCommunityCompute(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+    ) ![]memory_root.CommunityEdge {
+        const q = try self.buildQuery(
+            "SELECT e.source_key, e.target_key, " ++
+                "COALESCE(e.weight, 1.0), " ++
+                "COALESCE(e.attribution, 'extraction_classifier'), " ++
+                "COALESCE(e.valid_from, 0) " ++
+                "FROM {schema}.memory_edges e " ++
+                "WHERE e.user_id = $1 AND e.is_latest " ++
+                "AND EXISTS (SELECT 1 FROM {schema}.memories m " ++
+                "    WHERE m.user_id = $1 AND m.key = e.source_key " ++
+                "    AND " ++ MEMORIES_VALIDITY_FILTER ++ ") " ++
+                "AND EXISTS (SELECT 1 FROM {schema}.memories m " ++
+                "    WHERE m.user_id = $1 AND m.key = e.target_key " ++
+                "    AND " ++ MEMORIES_VALIDITY_FILTER ++ ")",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const nrows: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc(memory_root.CommunityEdge, nrows);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*e| e.deinit(allocator);
+            allocator.free(out);
+        }
+        var i: usize = 0;
+        while (i < nrows) : (i += 1) {
+            const row: c_int = @intCast(i);
+            const src = try dupeResultValue(allocator, result, row, 0);
+            errdefer allocator.free(src);
+            const tgt = try dupeResultValue(allocator, result, row, 1);
+            errdefer allocator.free(tgt);
+            const w_str = try dupeResultValue(allocator, result, row, 2);
+            defer allocator.free(w_str);
+            const attr = try dupeResultValue(allocator, result, row, 3);
+            errdefer allocator.free(attr);
+            const vf_str = try dupeResultValue(allocator, result, row, 4);
+            defer allocator.free(vf_str);
+            const weight = std.fmt.parseFloat(f64, w_str) catch 1.0;
+            const valid_from = std.fmt.parseInt(i64, vf_str, 10) catch 0;
+            out[i] = .{
+                .source_key = src,
+                .target_key = tgt,
+                .weight = weight,
+                .attribution = attr,
+                .valid_from_unix = valid_from,
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    /// V1.7a-9a — batch-write community_id for a set of memory keys.
+    /// Single round trip via UNNEST against two text + int arrays. NULL-
+    /// safe: callers may pass an empty slice (no-op). Memories not in
+    /// the assignment list are NOT touched (caller decides whether to
+    /// pre-clear via setMemoryCommunityIds with NULL ids).
+    ///
+    /// Idempotent: re-applying the same assignment is a no-op write
+    /// (UPDATE matches by key; same value means PG NoOp). Cross-tenant
+    /// scoping enforced by `WHERE user_id = $1`.
+    pub fn setMemoryCommunityIds(
+        self: *Self,
+        user_id: i64,
+        assignments: []const memory_root.CommunityAssignment,
+    ) !void {
+        if (assignments.len == 0) return;
+
+        // Build two PG arrays: keys (text[]) and ids (int[]). Same
+        // escape pattern as listMemoriesMetadata for the keys.
+        var keys_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer keys_buf.deinit(self.allocator);
+        try keys_buf.append(self.allocator, '{');
+        var ids_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer ids_buf.deinit(self.allocator);
+        try ids_buf.append(self.allocator, '{');
+        for (assignments, 0..) |a, i| {
+            if (i > 0) {
+                try keys_buf.append(self.allocator, ',');
+                try ids_buf.append(self.allocator, ',');
+            }
+            try keys_buf.append(self.allocator, '"');
+            for (a.key) |ch| {
+                switch (ch) {
+                    '"' => try keys_buf.appendSlice(self.allocator, "\\\""),
+                    '\\' => try keys_buf.appendSlice(self.allocator, "\\\\"),
+                    else => try keys_buf.append(self.allocator, ch),
+                }
+            }
+            try keys_buf.append(self.allocator, '"');
+            try ids_buf.writer(self.allocator).print("{d}", .{a.community_id});
+        }
+        try keys_buf.append(self.allocator, '}');
+        try ids_buf.append(self.allocator, '}');
+        const keys_z = try self.allocator.dupeZ(u8, keys_buf.items);
+        defer self.allocator.free(keys_z);
+        const ids_z = try self.allocator.dupeZ(u8, ids_buf.items);
+        defer self.allocator.free(ids_z);
+
+        const q = try self.buildQuery(
+            "UPDATE {schema}.memories AS m SET community_id = u.cid " ++
+                "FROM (SELECT UNNEST($2::text[]) AS k, UNNEST($3::int[]) AS cid) AS u " ++
+                "WHERE m.user_id = $1 AND m.key = u.k",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{ user_s.ptr, keys_z.ptr, ids_z.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(keys_buf.items.len), @intCast(ids_buf.items.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    /// V1.7a-9a — upsert a community's name + member-count + cache key.
+    /// `name_source` is 'llm' or 'fallback' for telemetry / FE styling.
+    /// `member_set_hash` is the cache key the pipeline checks before
+    /// re-calling the LLM (only re-name when membership changes).
+    pub fn setCommunityName(
+        self: *Self,
+        user_id: i64,
+        community_id: i32,
+        name: []const u8,
+        name_source: []const u8,
+        member_count: u32,
+        member_set_hash: []const u8,
+    ) !void {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.memory_communities " ++
+                "(user_id, community_id, name, name_source, member_count, member_set_hash, generated_at) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, NOW()) " ++
+                "ON CONFLICT (user_id, community_id) DO UPDATE SET " ++
+                "name = EXCLUDED.name, " ++
+                "name_source = EXCLUDED.name_source, " ++
+                "member_count = EXCLUDED.member_count, " ++
+                "member_set_hash = EXCLUDED.member_set_hash, " ++
+                "generated_at = NOW()",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var cid_buf: [16]u8 = undefined;
+        const cid_s = try std.fmt.bufPrintZ(&cid_buf, "{d}", .{community_id});
+        var mc_buf: [16]u8 = undefined;
+        const mc_s = try std.fmt.bufPrintZ(&mc_buf, "{d}", .{member_count});
+        const name_z = try self.allocator.dupeZ(u8, name);
+        defer self.allocator.free(name_z);
+        const src_z = try self.allocator.dupeZ(u8, name_source);
+        defer self.allocator.free(src_z);
+        const hash_z = try self.allocator.dupeZ(u8, member_set_hash);
+        defer self.allocator.free(hash_z);
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, cid_s.ptr, name_z, src_z, mc_s.ptr, hash_z };
+        const lengths = [_]c_int{
+            @intCast(user_s.len), @intCast(cid_s.len), @intCast(name.len),
+            @intCast(name_source.len), @intCast(mc_s.len), @intCast(member_set_hash.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    /// V1.7a-9a — fetch one community's name + cache metadata. Returns
+    /// null when the community has no row in memory_communities (i.e.,
+    /// LPA assigned it but LLM naming hasn't run yet). Caller frees via
+    /// CommunityName.deinit.
+    pub fn getCommunityName(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        community_id: i32,
+    ) !?memory_root.CommunityName {
+        const q = try self.buildQuery(
+            "SELECT name, name_source, member_count, member_set_hash, " ++
+                "EXTRACT(EPOCH FROM generated_at)::bigint " ++
+                "FROM {schema}.memory_communities " ++
+                "WHERE user_id = $1 AND community_id = $2",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var cid_buf: [16]u8 = undefined;
+        const cid_s = try std.fmt.bufPrintZ(&cid_buf, "{d}", .{community_id});
+        const params = [_]?[*:0]const u8{ user_s.ptr, cid_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(cid_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+
+        const name = try dupeResultValue(allocator, result, 0, 0);
+        errdefer allocator.free(name);
+        const src = try dupeResultValue(allocator, result, 0, 1);
+        errdefer allocator.free(src);
+        const mc_str = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(mc_str);
+        const hash = try dupeResultValue(allocator, result, 0, 3);
+        errdefer allocator.free(hash);
+        const gen_str = try dupeResultValue(allocator, result, 0, 4);
+        defer allocator.free(gen_str);
+        const member_count = std.fmt.parseInt(u32, mc_str, 10) catch 0;
+        const generated_at = std.fmt.parseInt(i64, gen_str, 10) catch 0;
+        return .{
+            .name = name,
+            .name_source = src,
+            .member_count = member_count,
+            .member_set_hash = hash,
+            .generated_at_unix = generated_at,
+        };
+    }
+
+    /// V1.7a-9a — list communities (id + name + counts) for the user.
+    /// Joins memory_communities with a live-member-count subquery so the
+    /// member_count reflects CURRENT membership (not the value cached at
+    /// last LLM-name time — which can be stale). Sorted by member_count
+    /// DESC so the FE legend leads with the largest clusters.
+    /// Caller frees via memory_root.freeCommunitySummaries.
+    pub fn listCommunities(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+    ) ![]memory_root.CommunitySummary {
+        const q = try self.buildQuery(
+            "SELECT mc.community_id, mc.name, mc.name_source, " ++
+                "COALESCE(live.cnt, 0) AS member_count, " ++
+                "EXTRACT(EPOCH FROM mc.generated_at)::bigint " ++
+                "FROM {schema}.memory_communities mc " ++
+                "LEFT JOIN (" ++
+                "    SELECT community_id, COUNT(*)::int AS cnt " ++
+                "    FROM {schema}.memories " ++
+                "    WHERE user_id = $1 AND community_id IS NOT NULL " ++
+                "    AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "    GROUP BY community_id" ++
+                ") live ON live.community_id = mc.community_id " ++
+                "WHERE mc.user_id = $1 " ++
+                "ORDER BY member_count DESC, mc.community_id ASC",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const nrows: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc(memory_root.CommunitySummary, nrows);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*s| s.deinit(allocator);
+            allocator.free(out);
+        }
+        var i: usize = 0;
+        while (i < nrows) : (i += 1) {
+            const row: c_int = @intCast(i);
+            const cid_str = try dupeResultValue(allocator, result, row, 0);
+            defer allocator.free(cid_str);
+            const cid = std.fmt.parseInt(i32, cid_str, 10) catch 0;
+            // PG NULL → empty string via dupeResultValue. Convert to null Option.
+            const name_str = try dupeResultValue(allocator, result, row, 1);
+            const name_opt: ?[]u8 = if (name_str.len == 0) blk: {
+                allocator.free(name_str);
+                break :blk null;
+            } else name_str;
+            errdefer if (name_opt) |n| allocator.free(n);
+            const src_str = try dupeResultValue(allocator, result, row, 2);
+            const src_opt: ?[]u8 = if (src_str.len == 0) blk: {
+                allocator.free(src_str);
+                break :blk null;
+            } else src_str;
+            errdefer if (src_opt) |s| allocator.free(s);
+            const mc_str = try dupeResultValue(allocator, result, row, 3);
+            defer allocator.free(mc_str);
+            const mc = std.fmt.parseInt(u32, mc_str, 10) catch 0;
+            const gen_str = try dupeResultValue(allocator, result, row, 4);
+            defer allocator.free(gen_str);
+            const gen = std.fmt.parseInt(i64, gen_str, 10) catch 0;
+            out[i] = .{
+                .community_id = cid,
+                .name = name_opt,
+                .name_source = src_opt,
+                .member_count = mc,
+                .generated_at_unix = gen,
+            };
+            initialized += 1;
+        }
+        return out;
     }
 
     pub fn forgetMemory(self: *Self, user_id: i64, key: []const u8) !bool {
@@ -9129,6 +9489,166 @@ test "V1.7a-8a listOrphanMemories — orphans + edge-loss + hygiene + scoping" {
         const wrong = try mgr.listOrphanMemories(allocator, 99, 100);
         defer memory_root.freeEntries(allocator, wrong);
         try std.testing.expectEqual(@as(usize, 0), wrong.len);
+    }
+}
+
+// V1.7a-9a — Communities storage primitives:
+//   - listMemoryEdgesForCommunityCompute (edges with weight + attribution)
+//   - setMemoryCommunityIds (batch UPDATE)
+//   - setCommunityName + getCommunityName (upsert + lookup)
+//   - listCommunities (LEFT JOIN with live member-count subquery)
+test "V1.7a-9a community storage primitives — round-trip + cross-tenant + idempotency" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_v17a9a_comm_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-v17a9a-comm/workspace");
+
+    // ── Seed: memories + edges (with various weights + attributions) ─
+    try mgr.upsertMemory(2, "k_a", "fact A", .core, "session-A");
+    try mgr.upsertMemory(2, "k_b", "fact B", .core, "session-A");
+    try mgr.upsertMemory(2, "k_c", "fact C", .core, "session-A");
+    try mgr.upsertMemory(2, "k_archived", "old fact", .core, "session-A");
+    // Archive one memory — its edges must NOT appear in compute fetch
+    // (live-endpoint requirement).
+    _ = try mgr.demoteMemoryFromCore(2, "k_archived", "test_close");
+    const close_ts: i64 = std.time.timestamp() - 60;
+    try mgr.setMemoryInvalidation(2, "k_archived", close_ts, close_ts);
+
+    try mgr.upsertMemoryEdge(2, "k_a", "k_b", "relates_to", "extraction_classifier", null);
+    try mgr.upsertMemoryEdge(2, "k_b", "k_c", "relates_to", "compose_memory", null);
+    // Edge to archived memory — must be filtered (live-endpoint check)
+    try mgr.upsertMemoryEdge(2, "k_a", "k_archived", "relates_to", "extraction_classifier", null);
+
+    // ── (1) listMemoryEdgesForCommunityCompute ─────────────────────
+    {
+        const edges = try mgr.listMemoryEdgesForCommunityCompute(allocator, 2);
+        defer memory_root.freeCommunityEdges(allocator, edges);
+        // Expect: k_a→k_b + k_b→k_c. The k_a→k_archived edge is filtered
+        // because k_archived is no longer a live memory.
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+        var saw_ab = false;
+        var saw_bc = false;
+        for (edges) |e| {
+            try std.testing.expect(e.weight > 0); // default 1.0 from upsert
+            try std.testing.expect(e.attribution.len > 0);
+            try std.testing.expect(e.valid_from_unix > 0);
+            if (std.mem.eql(u8, e.source_key, "k_a") and std.mem.eql(u8, e.target_key, "k_b")) {
+                saw_ab = true;
+                try std.testing.expectEqualStrings("extraction_classifier", e.attribution);
+            }
+            if (std.mem.eql(u8, e.source_key, "k_b") and std.mem.eql(u8, e.target_key, "k_c")) {
+                saw_bc = true;
+                try std.testing.expectEqualStrings("compose_memory", e.attribution);
+            }
+        }
+        try std.testing.expect(saw_ab);
+        try std.testing.expect(saw_bc);
+    }
+
+    // ── (2) setMemoryCommunityIds — batch UPDATE round-trip ────────
+    {
+        const assignments = [_]memory_root.CommunityAssignment{
+            .{ .key = "k_a", .community_id = 100 },
+            .{ .key = "k_b", .community_id = 100 },
+            .{ .key = "k_c", .community_id = 200 },
+        };
+        try mgr.setMemoryCommunityIds(2, &assignments);
+
+        // Verify via raw SELECT
+        const verify_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT key, community_id FROM {s}.memories " ++
+                "WHERE user_id = 2 AND community_id IS NOT NULL ORDER BY key",
+            .{schema},
+        );
+        defer allocator.free(verify_q);
+        const r = try mgr.exec(verify_q);
+        defer c.PQclear(r);
+        try std.testing.expectEqual(@as(c_int, 3), c.PQntuples(r));
+        // Idempotency: re-apply same assignments → same final state
+        try mgr.setMemoryCommunityIds(2, &assignments);
+        const r2 = try mgr.exec(verify_q);
+        defer c.PQclear(r2);
+        try std.testing.expectEqual(@as(c_int, 3), c.PQntuples(r2));
+    }
+
+    // ── (3) Empty assignment slice → no-op (no error) ──────────────
+    {
+        const empty: [0]memory_root.CommunityAssignment = .{};
+        try mgr.setMemoryCommunityIds(2, &empty);
+    }
+
+    // ── (4) setCommunityName + getCommunityName (upsert) ───────────
+    {
+        try mgr.setCommunityName(2, 100, "Work projects", "llm", 2, "hash_v1");
+        const fetched = try mgr.getCommunityName(allocator, 2, 100);
+        try std.testing.expect(fetched != null);
+        if (fetched) |n| {
+            defer n.deinit(allocator);
+            try std.testing.expectEqualStrings("Work projects", n.name);
+            try std.testing.expectEqualStrings("llm", n.name_source);
+            try std.testing.expectEqual(@as(u32, 2), n.member_count);
+            try std.testing.expectEqualStrings("hash_v1", n.member_set_hash);
+        }
+        // Upsert: same community_id, new name → row updated
+        try mgr.setCommunityName(2, 100, "Engineering work", "llm", 2, "hash_v2");
+        const fetched2 = try mgr.getCommunityName(allocator, 2, 100);
+        try std.testing.expect(fetched2 != null);
+        if (fetched2) |n| {
+            defer n.deinit(allocator);
+            try std.testing.expectEqualStrings("Engineering work", n.name);
+            try std.testing.expectEqualStrings("hash_v2", n.member_set_hash);
+        }
+        // Non-existent community → null
+        const missing = try mgr.getCommunityName(allocator, 2, 999);
+        try std.testing.expect(missing == null);
+    }
+
+    // ── (5) listCommunities — LEFT JOIN with live member counts ────
+    {
+        // Add a name for community 200 too so we have two summaries.
+        try mgr.setCommunityName(2, 200, "Daily routines", "fallback", 1, "hash_x");
+        const summaries = try mgr.listCommunities(allocator, 2);
+        defer memory_root.freeCommunitySummaries(allocator, summaries);
+        try std.testing.expectEqual(@as(usize, 2), summaries.len);
+        // Sorted by member_count DESC: 100 (2 members) then 200 (1 member)
+        try std.testing.expectEqual(@as(i32, 100), summaries[0].community_id);
+        try std.testing.expectEqual(@as(u32, 2), summaries[0].member_count);
+        try std.testing.expect(summaries[0].name != null);
+        if (summaries[0].name) |n| try std.testing.expectEqualStrings("Engineering work", n);
+        try std.testing.expectEqual(@as(i32, 200), summaries[1].community_id);
+        try std.testing.expectEqual(@as(u32, 1), summaries[1].member_count);
+    }
+
+    // ── (6) Cross-tenant scoping: user 99 sees nothing ─────────────
+    {
+        const edges = try mgr.listMemoryEdgesForCommunityCompute(allocator, 99);
+        defer memory_root.freeCommunityEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+        const summaries = try mgr.listCommunities(allocator, 99);
+        defer memory_root.freeCommunitySummaries(allocator, summaries);
+        try std.testing.expectEqual(@as(usize, 0), summaries.len);
+        const missing = try mgr.getCommunityName(allocator, 99, 100);
+        try std.testing.expect(missing == null);
     }
 }
 

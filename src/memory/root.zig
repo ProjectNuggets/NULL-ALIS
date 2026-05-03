@@ -541,6 +541,77 @@ pub const EntityRow = struct {
     }
 };
 
+/// V1.7a-9a — edge row enriched with the metadata needed by the
+/// communities label-propagation algorithm. Returned by
+/// `listMemoryEdgesForCommunityCompute`. Mirrors `TypedEdge` plus the
+/// `attribution` column (drives the user-vs-auto vote weighting per
+/// 2026-05-03 graph-memory research synthesis: user-declared edges
+/// vote more than auto-extracted ones).
+///
+/// `valid_from_unix` is the bigint event-time of edge creation; the
+/// algorithm applies a recency decay to vote weight using it.
+pub const CommunityEdge = struct {
+    source_key: []const u8,
+    target_key: []const u8,
+    weight: f64,
+    attribution: []const u8, // 'extraction_classifier' | 'compose_memory' | 'agent_tool' | ...
+    valid_from_unix: i64,
+
+    pub fn deinit(self: *const CommunityEdge, allocator: std.mem.Allocator) void {
+        allocator.free(self.source_key);
+        allocator.free(self.target_key);
+        allocator.free(self.attribution);
+    }
+};
+
+pub fn freeCommunityEdges(allocator: std.mem.Allocator, edges: []CommunityEdge) void {
+    for (edges) |*e| e.deinit(allocator);
+    allocator.free(edges);
+}
+
+/// V1.7a-9a — one (key → community_id) assignment for batch-write via
+/// `setMemoryCommunityIds`. Borrowed key — caller owns; PG uses it as
+/// a parameter, no lifetime escapes the call.
+pub const CommunityAssignment = struct {
+    key: []const u8,
+    community_id: i32,
+};
+
+/// V1.7a-9a — owned community-name lookup row.
+pub const CommunityName = struct {
+    name: []u8,
+    name_source: []u8, // 'llm' | 'fallback'
+    member_count: u32,
+    member_set_hash: []u8,
+    generated_at_unix: i64,
+
+    pub fn deinit(self: *const CommunityName, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.name_source);
+        allocator.free(self.member_set_hash);
+    }
+};
+
+/// V1.7a-9a — one row from listCommunities. Surfaces enough for the FE
+/// to render a cluster legend without further round trips.
+pub const CommunitySummary = struct {
+    community_id: i32,
+    name: ?[]u8, // null when not yet named
+    name_source: ?[]u8, // 'llm' | 'fallback' | null
+    member_count: u32,
+    generated_at_unix: i64,
+
+    pub fn deinit(self: *const CommunitySummary, allocator: std.mem.Allocator) void {
+        if (self.name) |n| allocator.free(n);
+        if (self.name_source) |s| allocator.free(s);
+    }
+};
+
+pub fn freeCommunitySummaries(allocator: std.mem.Allocator, summaries: []CommunitySummary) void {
+    for (summaries) |*s| s.deinit(allocator);
+    allocator.free(summaries);
+}
+
 /// V1.6 commit 13 — single row in memory_events as returned by
 /// listEventsForMemoryKey. Powers the /brain/memory/{key} drilldown's
 /// chronological event timeline. `payload_json` is the raw JSONB string
