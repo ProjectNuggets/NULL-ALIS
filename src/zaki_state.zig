@@ -3738,6 +3738,14 @@ const ManagerImpl = struct {
         allocator: std.mem.Allocator,
         user_id: i64,
     ) ![]memory_root.CommunityEdge {
+        // V1.7a-9 review WR-05: also apply BRAIN_USER_KEY_FILTER so
+        // hidden-key memories (continuity summaries, autosaves, system
+        // bookkeeping) don't leak into the LPA computation. Without this,
+        // a hidden key (e.g. `cache.foo`) could become the lowest-string
+        // "leader" of a community whose other members are user-visible —
+        // user gets a community_id pointing at a key they can never see
+        // in /brain/graph. Filter at the edge endpoint subqueries so the
+        // entire hidden-key universe is invisible to the algorithm.
         const q = try self.buildQuery(
             "SELECT e.source_key, e.target_key, " ++
                 "COALESCE(e.weight, 1.0), " ++
@@ -3747,10 +3755,12 @@ const ManagerImpl = struct {
                 "WHERE e.user_id = $1 AND e.is_latest " ++
                 "AND EXISTS (SELECT 1 FROM {schema}.memories m " ++
                 "    WHERE m.user_id = $1 AND m.key = e.source_key " ++
-                "    AND " ++ MEMORIES_VALIDITY_FILTER ++ ") " ++
+                "    AND " ++ MEMORIES_VALIDITY_FILTER ++
+                "    AND " ++ BRAIN_USER_KEY_FILTER ++ ") " ++
                 "AND EXISTS (SELECT 1 FROM {schema}.memories m " ++
                 "    WHERE m.user_id = $1 AND m.key = e.target_key " ++
-                "    AND " ++ MEMORIES_VALIDITY_FILTER ++ ")",
+                "    AND " ++ MEMORIES_VALIDITY_FILTER ++
+                "    AND " ++ BRAIN_USER_KEY_FILTER ++ ")",
         );
         defer self.allocator.free(q);
 
@@ -4002,18 +4012,15 @@ const ManagerImpl = struct {
             const cid_str = try dupeResultValue(allocator, result, row, 0);
             defer allocator.free(cid_str);
             const cid = std.fmt.parseInt(i32, cid_str, 10) catch 0;
-            // PG NULL → empty string via dupeResultValue. Convert to null Option.
-            const name_str = try dupeResultValue(allocator, result, row, 1);
-            const name_opt: ?[]u8 = if (name_str.len == 0) blk: {
-                allocator.free(name_str);
-                break :blk null;
-            } else name_str;
+            // V1.7a-9 review WR-06: use dupeNullableResultValue so a
+            // legitimate empty-string name (misbehaving LLM returns "")
+            // doesn't get conflated with PG NULL → silently disappear from
+            // the FE legend. Now PG NULL → null Option, empty string →
+            // Some("") which the FE can render distinctly (or filter
+            // upstream in setCommunityName, future hardening).
+            const name_opt = try dupeNullableResultValue(allocator, result, row, 1);
             errdefer if (name_opt) |n| allocator.free(n);
-            const src_str = try dupeResultValue(allocator, result, row, 2);
-            const src_opt: ?[]u8 = if (src_str.len == 0) blk: {
-                allocator.free(src_str);
-                break :blk null;
-            } else src_str;
+            const src_opt = try dupeNullableResultValue(allocator, result, row, 2);
             errdefer if (src_opt) |s| allocator.free(s);
             const mc_str = try dupeResultValue(allocator, result, row, 3);
             defer allocator.free(mc_str);

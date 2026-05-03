@@ -608,6 +608,13 @@ pub const CommunitySummary = struct {
 };
 
 pub fn freeCommunitySummaries(allocator: std.mem.Allocator, summaries: []CommunitySummary) void {
+    // V1.7a-9 review WR-07: defensive guard for empty-literal slices
+    // (`&.{}`). The /brain/graph handler initializes
+    // `community_summaries: []CommunitySummary = &.{}` and only
+    // re-assigns on success; the always-fires defer would otherwise
+    // call `allocator.free(empty_slice)`. Most allocators tolerate
+    // this; some (e.g. fixed-buffer) panic. Cheap to guard here.
+    if (summaries.len == 0) return;
     for (summaries) |*s| s.deinit(allocator);
     allocator.free(summaries);
 }

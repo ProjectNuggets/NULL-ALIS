@@ -822,6 +822,13 @@ pub const GatewayState = struct {
     /// subsequent PUT/DELETE on the same key. In-memory, 5-min TTL,
     /// single-use. See `src/gateway/secret_vault.zig`.
     secret_tokens: secret_vault.TokenStore,
+    /// V1.7a-9 review WR-03 — concurrency guard for
+    /// `/brain/communities/recompute`. Single global mutex serializes
+    /// recompute calls process-wide; concurrent POSTs return 409 Conflict
+    /// without blocking. Acceptable for V1 (manual trigger, not high
+    /// frequency). For V1.7b multi-process scheduler, upgrade to per-user
+    /// PG advisory lock.
+    community_recompute_mutex: std.Thread.Mutex = .{},
     whatsapp_verify_token: []const u8,
     whatsapp_app_secret: []const u8,
     whatsapp_access_token: []const u8,
@@ -12685,6 +12692,18 @@ fn handleBrainCommunitiesRecompute(
     const state_mgr = state.zaki_state orelse {
         return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
     };
+
+    // V1.7a-9 review WR-03 — concurrency guard. Two parallel POSTs would
+    // double-do work + race on writes; mid-pipeline ingest churn could
+    // produce internally-inconsistent community_ids. tryLock + 409 fast-
+    // fails the second caller; first caller proceeds normally. Global
+    // serialization is V1-acceptable (manual trigger, low frequency);
+    // V1.7b multi-process scheduler can upgrade to per-user PG advisory
+    // lock without changing the endpoint shape.
+    if (!state.community_recompute_mutex.tryLock()) {
+        return .{ .status = "409 Conflict", .body = "{\"error\":\"recompute_in_progress\"}" };
+    }
+    defer state.community_recompute_mutex.unlock();
 
     // V1: NULL namer → fallback "Cluster <id>" names. Real LLM-naming
     // wiring is a clean follow-up that constructs an LlmNamer from

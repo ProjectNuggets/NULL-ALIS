@@ -115,9 +115,20 @@ pub fn recomputeCommunitiesForUser(
     state_mgr: *zaki_state.Manager,
     user_id: i64,
     namer: ?LlmNamer,
-    config: RecomputeConfig,
+    config_in: RecomputeConfig,
 ) !RecomputeStats {
     var stats: RecomputeStats = .{};
+
+    // V1.7a-9 review WR-04: substitute wall clock when caller forgot to
+    // set now_unix. Without this, a future caller (e.g. the planned V1.7b
+    // nightly scheduler) that defaults `now_unix=0` would silently
+    // produce degenerate top-K importance scores (recencyDecay clamps to
+    // 1.0 for "future timestamp" path → top-K becomes pure-degree →
+    // alphabetical tie-break dominates → wrong members anchor the
+    // stable_id). Make 0 mean "use wall clock"; explicit non-zero values
+    // (test fixtures) pass through unchanged.
+    var config = config_in;
+    if (config.now_unix == 0) config.now_unix = std.time.timestamp();
 
     // ── 1. Pull edges ──────────────────────────────────────────────
     const edges = try state_mgr.listMemoryEdgesForCommunityCompute(allocator, user_id);
@@ -207,17 +218,21 @@ pub fn recomputeCommunitiesForUser(
             stats.members_assigned += 1;
         }
 
-        // Compute member_set_hash for cache check
+        // V1.7a-9 review WR-02: simplified cache check.
+        //
+        // Original design wrote a separate `member_set_hash` and compared
+        // it to the cached value. Review surfaced that hash and stable_id
+        // both derive from the SAME FNV input — when the row exists, the
+        // hash by construction matches. The cache is functionally
+        // `cached != null`, so use that directly. Hash is still written
+        // for future use (e.g. a different second-hash function on
+        // membership change for collision-detection in a later commit).
         const set_hash = try computeMemberSetHash(allocator, top_k);
         defer allocator.free(set_hash);
 
-        // Cache lookup: re-name only when membership changed
         const cached = try state_mgr.getCommunityName(allocator, user_id, stable_id);
         defer if (cached) |c| c.deinit(allocator);
-        const needs_naming = if (cached) |c|
-            !std.mem.eql(u8, c.member_set_hash, set_hash)
-        else
-            true;
+        const needs_naming = (cached == null);
 
         if (!needs_naming) continue;
 
@@ -346,7 +361,13 @@ fn computeStableCommunityId(top_k_keys: []const []const u8) i32 {
     // top_k_keys is already in importance-sorted order; sort by key for
     // stability across runs that produced the same set in different
     // importance order (rare but possible with score ties).
+    //
+    // V1.7a-9 review WR-01: assert top_k bounded by stack buf so a future
+    // bump of `RecomputeConfig.top_k_members` past 128 panics in dev/test
+    // instead of silently truncating + producing input-order-sensitive
+    // collisions. 128 is generous (V1 default = 5).
     var sorted_buf: [128][]const u8 = undefined;
+    std.debug.assert(top_k_keys.len <= sorted_buf.len);
     const n = @min(top_k_keys.len, sorted_buf.len);
     for (top_k_keys[0..n], 0..) |k, i| sorted_buf[i] = k;
     std.mem.sort([]const u8, sorted_buf[0..n], {}, struct {
