@@ -4,14 +4,14 @@
 
 ## State at compaction
 
-- **Main HEAD:** `ab93bd4` (V1.7 cmt9.8 + review fixes — perf swap to findEdgesByKeys, constant rename, sort-tiebreak test, cmt16 backfill docs)
-- **99+ commits ahead** of original V1.5 ship-ready handoff (`4d9e16f`)
+- **Main HEAD:** `d8715da` (V1.7 cmt9.9 — V1.6.1 polish: closed WR-02 Unicode lowercase + SE-V17-01 list-scope tool desc + SE-V17-02 pending_conflicts marker)
+- **103+ commits ahead** of original V1.5 ship-ready handoff (`4d9e16f`)
 - **V1.5 status:** SHIP-READY (deploy date deprioritized per Nova: ship when correct, not by date)
 - **V1.5.5 status:** GREEN — substrate validated (precision 0.92)
-- **V1.6 status:** SHIP-COMPLETE — 16/16 commits + cmt9.5 + ship-gate review fixes (`d50f5d1`)
-- **V1.7 status:** 3 of 12 items shipped (V1.7a-1 cmt9.6 = Gap 3 closure; V1.7a-2 cmt9.7 = graph_expand → memory_recall consumer; V1.7a-3 cmt9.8 = brain graph perf swap, all review-clean)
+- **V1.6 status:** SHIP-COMPLETE — 16/16 commits + cmt9.5 + ship-gate review fixes (`d50f5d1`); V1.6.1 polish landed in V1.7a-4 (cmt9.9)
+- **V1.7 status:** 4 of 12 items shipped (V1.7a-1 cmt9.6 = Gap 3 closure; V1.7a-2 cmt9.7 = graph_expand → memory_recall consumer; V1.7a-3 cmt9.8 = brain graph perf swap; V1.7a-4 cmt9.9 = V1.6.1 polish; all review-clean)
 - **Branch:** `main`
-- **Tests:** 5924/5934 PG passed (+4 vs V1.5 baseline; 10 skipped). Only pre-existing `postgres_pool_releases_on_exec_error` baseline failure.
+- **Tests:** 5935/5945 PG passed (+15 vs V1.5 baseline; 10 skipped). Only pre-existing `postgres_pool_releases_on_exec_error` baseline failure.
 
 ## Trust mandate (do not forget)
 
@@ -36,8 +36,8 @@ Nova also said: *"the parallel agent working on memory has stopped working, all 
 | 1 | Full Gap 3 closure (cmt9.6) | ✅ SHIPPED `032086d` | My closure |
 | 2 | graph_expand → memory_recall consumer wire (cmt9.7) | ✅ SHIPPED `df030d3` (+ review fixes `454934e`) | My closure |
 | 3 | Brain graph perf swap (JSONB → findEdgesByKeys) (cmt9.8) | ✅ SHIPPED `8171166` (+ review fixes `ab93bd4`: swapped initial listEdgesForUser → findEdgesByKeys for visible-node-scoped scan; renamed cap constant; added sort-tiebreak test; cmt16 backfill docs) | My closure |
-| 4 | V1.6.1 polish (WR-02 Unicode lowercase, SE-V17-01 list-scope-session-core, SE-V17-02 pending_conflicts text) | ⏳ NEXT | My closure (V1.6 backlog) |
-| 5 | Spec seam 3: `link_type` rich wiring (compose_memory + agent prompt) | ⏳ | Spec §5 |
+| 4 | V1.6.1 polish (WR-02 Unicode lowercase, SE-V17-01 list-scope tool desc, SE-V17-02 pending_conflicts text) (cmt9.9) | ✅ SHIPPED `d8715da` (Unicode-aware `lowerForEntityKey` covering ASCII + Latin-1 Supplement; SQL backfill aligned to PG `lower()`; tool desc + marker text rewrites; 11 new unit tests) | My closure (V1.6 backlog) |
+| 5 | Spec seam 3: `link_type` rich wiring (compose_memory + agent prompt) | ⏳ NEXT | Spec §5 |
 | 6 | Spec seam 8: `/brain/diff?date=` endpoint | ⏳ | Spec §5 |
 
 ### V1.7b — depth/quality (spec completion; ships after V1.7a)
