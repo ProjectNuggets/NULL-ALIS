@@ -734,16 +734,21 @@ fn deriveEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
 /// `lower(...)` (Unicode-aware) on the same input, so all three paths
 /// produce byte-identical hashes for the same surface form.
 ///
-/// Coverage:
+/// Coverage (matches PG `lower(...)` in standard UTF-8 locales for these ranges):
 ///   - ASCII A-Z → a-z
-///   - Latin-1 Supplement uppercase (À-Þ excluding ×) → lowercase
-///   - All other codepoints pass through unchanged (matches PG `lower()`
-///     for the C locale; for UTF-8 locales PG covers wider ranges that
-///     this helper does not. Documented divergence — extraction surface
-///     forms are overwhelmingly ASCII + Latin-1; if real workloads start
-///     producing Cyrillic/Greek/CJK uppercase entity names this helper
-///     can extend its mapping table without changing the hash for the
-///     existing covered ranges).
+///   - Latin-1 Supplement uppercase (À..Þ excluding ×) → lowercase
+///   - Cyrillic Capital (А..Я, U+0410..U+042F) → lowercase (а..я)
+///   - Greek Capital (Α..Ω, U+0391..U+03A9) → lowercase (α..ω; Σ → σ)
+///   - All other codepoints pass through unchanged. CJK has no case so
+///     this is correct; some Latin Extended-A pairs (Ā/ā etc.) are NOT
+///     covered — rare in entity surface forms, defer until profiling
+///     shows convergence loss.
+///
+/// **Deployment caveat:** PG `lower(...)` behavior depends on the database
+/// LC_COLLATE setting. Production deployments use `en_US.UTF-8` (or
+/// equivalent UTF-8 locale) where this helper converges with PG. Under
+/// the C locale, PG `lower()` is ASCII-only and would diverge from this
+/// helper for any Latin-1+ input — DO NOT run nullalis prod on C locale.
 ///
 /// Returns an allocator-owned slice. Caller frees.
 pub fn lowerForEntityKey(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -791,6 +796,17 @@ fn mapCodepointToLower(cp: u21) u21 {
     // Latin-1 Supplement uppercase: À..Þ (U+00C0..U+00DE), excluding × (U+00D7).
     // Lowercase mirrors at U+00E0..U+00FE excluding ÷ (U+00F7), offset +0x20.
     if (cp >= 0x00C0 and cp <= 0x00DE and cp != 0x00D7) return cp + 0x20;
+    // V1.7a-4 review fix WR-6 — Cyrillic Capital (А..Я, U+0410..U+042F) →
+    // lowercase (а..я, U+0430..U+044F). PG `lower()` handles Cyrillic in
+    // UTF-8 locales; without this branch a tenant with Cyrillic uppercase
+    // entity surface forms would diverge between Zig hash and SQL backfill.
+    if (cp >= 0x0410 and cp <= 0x042F) return cp + 0x20;
+    // V1.7a-4 review fix WR-6 — Greek Capital (Α..Ω, U+0391..U+03A9) →
+    // lowercase (α..ω, U+03B1..U+03C9). Same rationale as Cyrillic. Note
+    // that Σ has TWO lowercase forms (σ and ς depending on word position);
+    // we map to σ (U+03C3) which matches PG `lower(...)` default behavior
+    // (PG does not contextually choose final-sigma in lower()).
+    if (cp >= 0x0391 and cp <= 0x03A9) return cp + 0x20;
     return cp;
 }
 
@@ -973,14 +989,31 @@ test "lowerForEntityKey: × (U+00D7) is NOT a letter — passes unchanged" {
     try std.testing.expectEqualStrings("5×3", out);
 }
 
-test "lowerForEntityKey: out-of-range codepoints pass through (Cyrillic)" {
+test "lowerForEntityKey: Cyrillic Capital → lowercase (V1.7a-4 review WR-6)" {
     const allocator = std.testing.allocator;
-    // Cyrillic uppercase ПРИВЕТ stays as-is (helper does not cover Cyrillic;
-    // documented divergence from PG lower() in UTF-8 locales — acceptable
-    // because extraction targets are overwhelmingly Latin script).
+    // Cyrillic uppercase ПРИВЕТ → привет (matches PG lower() in UTF-8
+    // locales — convergence with the SQL backfill side).
     const out = try lowerForEntityKey(allocator, "ПРИВЕТ");
     defer allocator.free(out);
-    try std.testing.expectEqualStrings("ПРИВЕТ", out);
+    try std.testing.expectEqualStrings("привет", out);
+}
+
+test "lowerForEntityKey: Greek Capital → lowercase (V1.7a-4 review WR-6)" {
+    const allocator = std.testing.allocator;
+    // Greek uppercase ΑΛΦΑΒΗΤΟΣ → αλφαβητοσ (Σ → σ; we map to default
+    // sigma, not contextual final-sigma ς, matching PG lower() default).
+    const out = try lowerForEntityKey(allocator, "ΑΛΦΑΒΗΤΟΣ");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("αλφαβητοσ", out);
+}
+
+test "lowerForEntityKey: truly out-of-range codepoints pass through (CJK)" {
+    const allocator = std.testing.allocator;
+    // CJK chars (here: Chinese 你好) have no upper/lower distinction.
+    // PG lower() leaves them unchanged too. Convergence verified.
+    const out = try lowerForEntityKey(allocator, "你好");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("你好", out);
 }
 
 test "lowerForEntityKey: invalid UTF-8 lead byte preserved (lossless on bad input)" {

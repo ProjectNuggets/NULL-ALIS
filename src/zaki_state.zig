@@ -1230,14 +1230,24 @@ const ManagerImpl = struct {
             // (extraction_persist.deriveEntityKey + commands.deriveSessionEndEntityKey)
             // now route through extraction_persist.lowerForEntityKey, a
             // Unicode-aware helper covering ASCII A-Z + Latin-1 Supplement
-            // uppercase → lowercase. PG's `lower(...)` does the same in
-            // UTF-8 locales (the production deployment target) AND a strict
-            // superset in C-locale (which only lowercases ASCII anyway).
-            // Both paths now produce identical entity_<hash> keys for any
-            // surface form in the covered range. Pre-V1.7a-4 tenants with
-            // already-extracted non-ASCII uppercase entity names will see
-            // a one-time entity-key shift on next backfill run (rare —
-            // extraction prompt emits canonical lowercase by design).
+            // + Cyrillic + Greek uppercase → lowercase. PG's `lower(...)`
+            // matches this in standard UTF-8 locales (en_US.UTF-8 etc. —
+            // the production deployment target) for those ranges. C-locale
+            // PG would lowercase ASCII ONLY and diverge for everything else,
+            // so production MUST run a UTF-8 locale (`SHOW lc_collate`
+            // should not be 'C' or 'POSIX').
+            //
+            // **Migration note:** the cmt16 backfill is INSERT...ON CONFLICT
+            // DO NOTHING. It does NOT rewrite already-existing memory_edges
+            // rows. So pre-V1.7a-4 tenants with non-ASCII uppercase entity
+            // names retain their old ASCII-only-keyed rows. The shift to
+            // the new Unicode-folded key only happens when a NEW write for
+            // the same surface form arrives — extraction_persist creates a
+            // new entity_<unicode_hash> row, leaving the old ASCII row
+            // orphaned. Manual cleanup recommended for tenants with
+            // high-volume non-ASCII entity history (a one-shot UPDATE that
+            // recomputes target_key for affected rows). Rare in practice —
+            // extraction prompt emits canonical lowercase by design.
             "INSERT INTO {schema}.memory_edges (user_id, source_key, target_key, predicate, attribution, confidence, valid_from) " ++
                 "SELECT user_id, key AS source_key, " ++
                 "'entity_' || substring(encode(digest(lower(metadata->>'object'), 'sha256'), 'hex') from 1 for 16) AS target_key, " ++
@@ -8036,6 +8046,119 @@ test "V1.6 commit 16 backfill populates memory_edges from JSONB triples" {
     {
         const after = try mgr.countEdgesForSource(2, "legacy_archived");
         try std.testing.expectEqual(@as(usize, 0), after); // skipped — closed-out
+    }
+}
+
+// V1.7a-4 review fix WR-12 — Zig deriveEntityKey + SQL backfill convergence.
+//
+// The whole correctness argument for WR-02 closure (cmt9.9) is that
+// extraction_persist.deriveEntityKey (Zig, via lowerForEntityKey) and the
+// cmt16 backfill SQL (`lower(metadata->>'object')`) produce IDENTICAL
+// `entity_<hash>` keys for the same input surface form. This test verifies
+// that empirically by inserting metadata with several inputs (ASCII, Latin-1,
+// Cyrillic, Greek, lowercase-already), running the backfill, and asserting
+// each SQL-produced target_key equals the Zig-side deriveEntityKey output.
+test "V1.7a-4 entity-key Zig/SQL convergence — backfill target_key == deriveEntityKey(object)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const extraction_persist = @import("agent/extraction_persist.zig");
+
+    // Seed memories with metadata covering each lowering range. Use distinct
+    // source keys so we can read each edge back individually.
+    const Case = struct {
+        source_key: []const u8,
+        object: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .source_key = "row_ascii_upper", .object = "HELIX" },
+        .{ .source_key = "row_ascii_lower", .object = "helix" },
+        .{ .source_key = "row_latin1_upper", .object = "CAFÉ" },
+        .{ .source_key = "row_latin1_lower", .object = "café" },
+        .{ .source_key = "row_cyrillic_upper", .object = "ПРИВЕТ" },
+        .{ .source_key = "row_greek_upper", .object = "ΑΛΦΑ" },
+    };
+
+    for (cases) |cs| {
+        const meta = try std.fmt.allocPrint(
+            allocator,
+            "{{\"subject\":\"user\",\"predicate\":\"PREFERS\",\"object\":\"{s}\",\"attributed_to\":\"user\",\"attribution\":\"extraction_classifier\",\"confidence\":0.9}}",
+            .{cs.object},
+        );
+        defer allocator.free(meta);
+        try mgr.upsertMemoryWithMetadata(2, cs.source_key, "fact content", .core, "session-A", meta);
+    }
+
+    // Run backfill via migrate() — populates memory_edges with SQL-side
+    // hashed target_keys.
+    try mgr.migrate();
+
+    // For each case: read the backfilled edge target_key, compute the Zig-
+    // side deriveEntityKey for the same object, assert byte-identical.
+    for (cases) |cs| {
+        const edges = try mgr.findEdgesByKeys(allocator, 2, &[_][]const u8{cs.source_key});
+        defer memory_root.freeTypedEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+
+        // Zig-side derivation. Note: deriveEntityKey is private in
+        // extraction_persist; use the public lowerForEntityKey + manual hash
+        // to mirror the same derivation. (Avoids exposing deriveEntityKey
+        // just for tests.)
+        const lower = try extraction_persist.lowerForEntityKey(allocator, cs.object);
+        defer allocator.free(lower);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(lower);
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        const hex_chars = "0123456789abcdef";
+        var hex_buf: [16]u8 = undefined;
+        for (digest[0..8], 0..) |b, idx| {
+            hex_buf[idx * 2] = hex_chars[b >> 4];
+            hex_buf[idx * 2 + 1] = hex_chars[b & 0x0f];
+        }
+        const expected = try std.fmt.allocPrint(allocator, "entity_{s}", .{hex_buf});
+        defer allocator.free(expected);
+
+        try std.testing.expectEqualStrings(expected, edges[0].target_key);
+    }
+
+    // Cross-case convergence: HELIX and helix must produce the SAME entity key
+    // (case unification through the convergence pipeline, end-to-end).
+    {
+        const e_upper = try mgr.findEdgesByKeys(allocator, 2, &[_][]const u8{"row_ascii_upper"});
+        defer memory_root.freeTypedEdges(allocator, e_upper);
+        const e_lower = try mgr.findEdgesByKeys(allocator, 2, &[_][]const u8{"row_ascii_lower"});
+        defer memory_root.freeTypedEdges(allocator, e_lower);
+        try std.testing.expectEqualStrings(e_upper[0].target_key, e_lower[0].target_key);
+    }
+    // Same for CAFÉ vs café (Latin-1 case unification through both paths).
+    {
+        const e_upper = try mgr.findEdgesByKeys(allocator, 2, &[_][]const u8{"row_latin1_upper"});
+        defer memory_root.freeTypedEdges(allocator, e_upper);
+        const e_lower = try mgr.findEdgesByKeys(allocator, 2, &[_][]const u8{"row_latin1_lower"});
+        defer memory_root.freeTypedEdges(allocator, e_lower);
+        try std.testing.expectEqualStrings(e_upper[0].target_key, e_lower[0].target_key);
     }
 }
 
