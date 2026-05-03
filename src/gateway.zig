@@ -12432,6 +12432,121 @@ fn handleBrainTimeline(
     return finalizeJsonBuf(allocator, &out);
 }
 
+// ── /brain/orphans — V1.7a-8a ───────────────────────────────────────
+//
+// GET /api/v1/users/:user_id/brain/orphans[?limit=N]
+//
+// Lists brain-visible memories with NO active edges (incoming OR
+// outgoing). Powers Obsidian's "show orphans" affordance — the rail
+// next to the graph view that surfaces lost notes the user never
+// connected to anything.
+//
+// Bi-temporal: applies validity filter to BOTH the memories table AND
+// the memory_edges subquery. A row that LOST all its edges via
+// supersession SHOULD appear here (it IS an orphan in the present,
+// even if it had connections last week).
+//
+// Hygiene contract identical to /brain/graph.
+//
+// Response shape:
+//   {
+//     "orphans": [{"id", "key", "kind", "created_at", "session_id",
+//                  "summary", "valid_to", "link_type"}],
+//     "stats":   {"orphans": N, "limit": N}
+//   }
+
+const BRAIN_ORPHANS_DEFAULT_LIMIT: u32 = 200;
+const BRAIN_ORPHANS_MAX_LIMIT: u32 = 1000;
+const BRAIN_ORPHANS_SUMMARY_CHARS: usize = 200;
+
+fn handleBrainOrphans(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    target: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    var limit: u32 = if (parseQueryParam(target, "limit")) |s|
+        std.fmt.parseInt(u32, s, 10) catch BRAIN_ORPHANS_DEFAULT_LIMIT
+    else
+        BRAIN_ORPHANS_DEFAULT_LIMIT;
+    if (limit == 0) limit = BRAIN_ORPHANS_DEFAULT_LIMIT;
+    if (limit > BRAIN_ORPHANS_MAX_LIMIT) limit = BRAIN_ORPHANS_MAX_LIMIT;
+
+    const orphans = state_mgr.listOrphanMemories(allocator, numeric_user_id, limit) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"orphans_query_failed\"}" };
+    };
+    defer memory_mod.freeEntries(allocator, orphans);
+
+    // ── Batched metadata fetch for link_type surface ──────────────
+    var keys_buf: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keys_buf.deinit(allocator);
+    for (orphans) |e| keys_buf.append(allocator, e.key) catch {};
+
+    var metadata_map = state_mgr.listMemoriesMetadata(allocator, numeric_user_id, keys_buf.items) catch std.StringHashMapUnmanaged([]u8){};
+    defer {
+        var mit = metadata_map.iterator();
+        while (mit.next()) |kv| {
+            allocator.free(kv.key_ptr.*);
+            allocator.free(kv.value_ptr.*);
+        }
+        metadata_map.deinit(allocator);
+    }
+
+    // ── Build JSON ───────────────────────────────────────────────
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    w.writeAll("{\"orphans\":[") catch return response_build_err;
+    for (orphans, 0..) |entry, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        const created_at = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0;
+        const summary_len = brainTruncateUtf8Boundary(entry.content, BRAIN_ORPHANS_SUMMARY_CHARS);
+        w.writeAll("{\"id\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.id) catch return response_build_err;
+        w.writeAll(",\"key\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.key) catch return response_build_err;
+        w.writeAll(",\"kind\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.category.toString()) catch return response_build_err;
+        w.print(",\"created_at\":{d},\"session_id\":", .{created_at}) catch return response_build_err;
+        if (entry.session_id) |sid| {
+            json_util.appendJsonString(&out, allocator, sid) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll(",\"summary\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.content[0..summary_len]) catch return response_build_err;
+        w.writeAll(",\"valid_to\":") catch return response_build_err;
+        if (entry.valid_to) |vt| {
+            w.print("{d}", .{vt}) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll(",\"link_type\":") catch return response_build_err;
+        const md = if (metadata_map.get(entry.key)) |m| @as(?[]const u8, m) else null;
+        if (extractLinkTypeFromMetadata(allocator, md)) |lt| {
+            json_util.appendJsonString(&out, allocator, lt) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.print("],\"stats\":{{\"orphans\":{d},\"limit\":{d}}}}}", .{ orphans.len, limit }) catch return response_build_err;
+
+    return finalizeJsonBuf(allocator, &out);
+}
+
 // ── /brain/local-graph — V1.7a-7 ────────────────────────────────────
 //
 // GET /api/v1/users/:user_id/brain/local-graph?center_key=<key>&depth=N[&max_nodes=M]
@@ -14549,6 +14664,17 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "brain/local-graph")) {
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainLocalGraph(req_allocator, method, scoped_user_id, brain_target, state);
+    }
+
+    // ── /brain/orphans — V1.7a-8a ────────────────────────────────────────
+    // GET /api/v1/users/{id}/brain/orphans[?limit=N]
+    // Brain-visible memories with NO active edges. Powers the FE orphan
+    // rail. Bi-temporal: applies validity filter to BOTH memories and
+    // memory_edges so a row that LOST all its edges via supersession
+    // surfaces as an orphan in the present.
+    if (std.mem.eql(u8, parsed.subpath, "brain/orphans")) {
+        const brain_target = extractRequestTarget(raw_request) orelse base_path;
+        return handleBrainOrphans(req_allocator, method, scoped_user_id, brain_target, state);
     }
 
     // ── /brain/memory/{key} — V1.6 commit 13 (M3) ────────────────────────
@@ -25072,6 +25198,20 @@ test "handleBrainTimeline rejects non-GET methods" {
 test "handleBrainTimeline rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainTimeline(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/timeline", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+// ── /brain/orphans — V1.7a-8a unit tests ──────────────────────────────
+
+test "handleBrainOrphans rejects non-GET methods" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainOrphans(std.testing.allocator, "POST", "1", "/api/v1/users/1/brain/orphans", &dummy_state);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleBrainOrphans rejects invalid user_id" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainOrphans(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/orphans", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
 }
 

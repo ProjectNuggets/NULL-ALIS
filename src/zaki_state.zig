@@ -377,6 +377,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn getMemoriesByKeys(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
+    /// V1.7a-8a — stub for non-postgres builds; `/brain/orphans` degrades
+    /// to empty so the FE still renders the orphan rail without erroring.
+    pub fn listOrphanMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
     /// V1.5 day-4 — stub for non-postgres builds; traversal logging
     /// silently no-ops.
     pub fn insertTraversalEvent(_: *@This(), _: i64, _: []const u8) !void {
@@ -3605,6 +3610,59 @@ const ManagerImpl = struct {
 
         const params = [_]?[*:0]const u8{ user_s.ptr, from_s.ptr, to_s.ptr, lim_s.ptr };
         const lengths = [_]c_int{ @intCast(user_s.len), @intCast(from_s.len), @intCast(to_s.len), @intCast(lim_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        return try decodeMemoryRows(allocator, result, false);
+    }
+
+    /// V1.7a-8a — Orphan memories: brain-visible, currently-live rows that
+    /// have NO active edges (neither incoming nor outgoing). Powers
+    /// `/brain/orphans` — Obsidian's "show orphans" affordance for finding
+    /// lost notes that never connected to anything.
+    ///
+    /// Bi-temporal correctness: applies MEMORIES_VALIDITY_FILTER to the
+    /// memories row AND `is_latest` to the memory_edges subquery. We
+    /// want "currently has no LIVE edges", not "never had any edges" —
+    /// a row that LOST all its edges via supersession SHOULD show up as
+    /// an orphan today (it is one, in the present).
+    ///
+    /// Hygiene: BRAIN_USER_KEY_FILTER excludes continuity / autosave /
+    /// tombstone keys (the agent's bookkeeping rows are always orphans
+    /// by design — surfacing them would drown out the real orphans).
+    ///
+    /// Performance: NOT EXISTS subquery on (user_id, source_key) and
+    /// (user_id, target_key) — both covered by the partial indexes
+    /// `idx_edges_source` and `idx_edges_target` (`WHERE is_latest`).
+    /// Index-only scan possible on small corpora; bounded by `limit`.
+    ///
+    /// Caller frees each MemoryEntry + the slice via `freeEntries`.
+    pub fn listOrphanMemories(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        limit: u32,
+    ) ![]memory_root.MemoryEntry {
+        const q = try self.buildQuery(
+            "SELECT id, key, content, memory_type, " ++
+                "COALESCE((EXTRACT(EPOCH FROM created_at))::bigint::text, '0'), " ++
+                "session_id, valid_to FROM {schema}.memories m " ++
+                "WHERE user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "AND " ++ BRAIN_USER_KEY_FILTER ++ " " ++
+                "AND NOT EXISTS (" ++
+                "    SELECT 1 FROM {schema}.memory_edges e " ++
+                "    WHERE e.user_id = $1 AND e.is_latest " ++
+                "    AND (e.source_key = m.key OR e.target_key = m.key)" ++
+                ") ORDER BY created_at DESC, id DESC LIMIT $2::int",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var lim_buf: [16]u8 = undefined;
+        const lim_s = try std.fmt.bufPrintZ(&lim_buf, "{d}", .{limit});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, lim_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(lim_s.len) };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
         return try decodeMemoryRows(allocator, result, false);
@@ -8969,6 +9027,108 @@ test "V1.7a-7 getMemoriesByKeys — batch fetch + validity + scoping + escape" {
         try std.testing.expectEqual(@as(usize, 1), rows.len);
         try std.testing.expectEqualStrings("weird\"key\\with\"chars", rows[0].key);
         try std.testing.expectEqualStrings("fact W", rows[0].content);
+    }
+}
+
+// V1.7a-8a — listOrphanMemories: brain-visible rows with NO active edges.
+// Acceptance:
+//   1. Memory with no edges → returned as orphan
+//   2. Memory with outgoing edge → NOT orphan (excluded)
+//   3. Memory with incoming edge → NOT orphan (excluded)
+//   4. Hidden-key (continuity summary) with no edges → filtered (NOT
+//      returned — agent bookkeeping rows are always orphans by design)
+//   5. Memory whose edges were ALL closed (is_latest=FALSE) → orphan
+//      in the present (validity-aware on the edge subquery)
+//   6. Superseded memory (validity-filtered) → NOT returned even with
+//      no edges (must be currently live)
+//   7. Cross-tenant: user 99 sees nothing of user 2's data
+test "V1.7a-8a listOrphanMemories — orphans + edge-loss + hygiene + scoping" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_v17a8a_orphans_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-v17a8a-orphans/workspace");
+
+    // ── Seed memories ─────────────────────────────────────────────
+    try mgr.upsertMemory(2, "mem_orphan", "lonely fact", .core, "session-A");
+    try mgr.upsertMemory(2, "mem_with_outgoing", "has a target", .core, "session-A");
+    try mgr.upsertMemory(2, "mem_target", "is targeted", .core, "session-A");
+    try mgr.upsertMemory(2, "mem_lost_edge", "edge will be closed", .core, "session-A");
+    try mgr.upsertMemory(2, "mem_lost_partner", "partner of lost-edge", .core, "session-A");
+    // Hidden-key orphan (continuity summary with no edges)
+    try mgr.upsertMemory(2, "summary_latest/agent:zaki-bot:user:7:thread:main", "type=summary_latest", .daily, "session-A");
+    // Superseded orphan (no edges + valid_to in past)
+    try mgr.upsertMemory(2, "mem_superseded_orphan", "old fact", .core, "session-A");
+    _ = try mgr.demoteMemoryFromCore(2, "mem_superseded_orphan", "test_close");
+    const close_ts: i64 = std.time.timestamp() - 60;
+    try mgr.setMemoryInvalidation(2, "mem_superseded_orphan", close_ts, close_ts);
+
+    // ── Seed edges ────────────────────────────────────────────────
+    try mgr.upsertMemoryEdge(2, "mem_with_outgoing", "mem_target", "relates_to", "test", null);
+    try mgr.upsertMemoryEdge(2, "mem_lost_edge", "mem_lost_partner", "relates_to", "test", null);
+    // Manually close the lost-edge by flipping is_latest (simulates the
+    // cascade-on-supersession path without invoking the cascade itself,
+    // so we test the edge-validity filter in isolation).
+    {
+        const close_q = try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.memory_edges SET is_latest = FALSE " ++
+                "WHERE user_id = 2 AND source_key = 'mem_lost_edge'",
+            .{schema},
+        );
+        defer allocator.free(close_q);
+        const r = try mgr.exec(close_q);
+        c.PQclear(r);
+    }
+
+    // ── Acceptance: orphan list ───────────────────────────────────
+    {
+        const orphans = try mgr.listOrphanMemories(allocator, 2, 100);
+        defer memory_root.freeEntries(allocator, orphans);
+
+        var seen_orphan = false;
+        var seen_lost_edge = false;
+        var seen_lost_partner = false;
+        for (orphans) |e| {
+            try std.testing.expect(memory_root.isBrainVisibleKey(e.key));
+            if (std.mem.eql(u8, e.key, "mem_orphan")) seen_orphan = true;
+            if (std.mem.eql(u8, e.key, "mem_lost_edge")) seen_lost_edge = true;
+            if (std.mem.eql(u8, e.key, "mem_lost_partner")) seen_lost_partner = true;
+            // Negative checks
+            try std.testing.expect(!std.mem.eql(u8, e.key, "mem_with_outgoing"));
+            try std.testing.expect(!std.mem.eql(u8, e.key, "mem_target"));
+            try std.testing.expect(!std.mem.eql(u8, e.key, "mem_superseded_orphan"));
+            try std.testing.expect(!std.mem.startsWith(u8, e.key, "summary_latest/"));
+        }
+        try std.testing.expect(seen_orphan); // (1) no-edge orphan returned
+        try std.testing.expect(seen_lost_edge); // (5) edge-loss surfaces both
+        try std.testing.expect(seen_lost_partner); //     endpoints as orphans
+        try std.testing.expectEqual(@as(usize, 3), orphans.len);
+    }
+
+    // ── Cross-tenant ──────────────────────────────────────────────
+    {
+        const wrong = try mgr.listOrphanMemories(allocator, 99, 100);
+        defer memory_root.freeEntries(allocator, wrong);
+        try std.testing.expectEqual(@as(usize, 0), wrong.len);
     }
 }
 
