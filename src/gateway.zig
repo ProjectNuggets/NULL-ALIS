@@ -12039,19 +12039,33 @@ fn handleBrainMemoryDetail(
     };
 
     // ── Fetch the memory row ─────────────────────────────────────
-    // getMemory respects MEMORIES_VALIDITY_FILTER (hides archived).
-    // For the drilldown UI we WANT to surface archived rows too —
-    // direct SQL via state_mgr.getMemoryAnyValidity would be cleaner,
-    // but doesn't exist yet. For cmt13 minimum-viable: getMemory hides
-    // archived; "archived" stays a follow-up enhancement when V1.6
-    // cmt8 soft-delete UI lands actual archived browsing.
+    // V1.7a-5b: closes the prior TODO ("getMemoryAnyValidity ... doesn't
+    // exist yet"). First try the validity-filtered path (live row); on
+    // null, fall back to `getMemoryAnyValidity` which surfaces superseded
+    // rows. This closes a real user-visible bug — when extraction's
+    // contradiction judge invalidates a row mid-browse, the brain graph
+    // already serialized the key into the FE state but `getMemory`
+    // filters it out → drilldown 404. With the fallback the drilldown
+    // returns 200 + the row + populated `valid_to` so the FE renders
+    // it as archived rather than missing. Also advances spec §4.9
+    // conformance toward the `valid_history` surface.
+    //
+    // Distinguish live vs archived via `memory.valid_to`: null=live,
+    // non-null=archived/superseded. Only true-not-found returns 404.
+    var archived: bool = false;
     const mem_opt = state_mgr.getMemory(allocator, numeric_user_id, key) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"memory_query_failed\"}" };
     };
-    if (mem_opt == null) {
-        return .{ .status = "404 Not Found", .body = "{\"error\":\"memory_not_found\"}" };
-    }
-    var memory = mem_opt.?;
+    var memory = mem_opt orelse blk: {
+        const fallback = state_mgr.getMemoryAnyValidity(allocator, numeric_user_id, key) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"memory_query_failed\"}" };
+        };
+        const m = fallback orelse {
+            return .{ .status = "404 Not Found", .body = "{\"error\":\"memory_not_found\"}" };
+        };
+        archived = true;
+        break :blk m;
+    };
     defer memory.deinit(allocator);
 
     // ── Fetch metadata (subject/predicate/object) for the structured surface
@@ -12110,6 +12124,12 @@ fn handleBrainMemoryDetail(
     } else {
         w.writeAll(",\"valid_to\":null") catch return response_build_err;
     }
+    // V1.7a-5b — explicit `archived` flag complements `valid_to` for FE
+    // convenience. True when the row was returned via the
+    // `getMemoryAnyValidity` fallback (validity-filter would have hidden it).
+    // FE uses this to render an "archived" badge / dimmer styling rather
+    // than treating the drilldown as missing-data.
+    w.print(",\"archived\":{s}", .{if (archived) "true" else "false"}) catch return response_build_err;
     if (metadata_json) |m| {
         w.print(",\"metadata\":{s}", .{m}) catch return response_build_err;
     } else {

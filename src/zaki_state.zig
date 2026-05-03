@@ -312,6 +312,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn getMemory(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?memory_root.MemoryEntry {
         return error.PostgresNotEnabled;
     }
+    /// V1.7a-5b — stub for non-postgres builds. Mirrors getMemory shape;
+    /// caller treats null as "key not found" identically.
+    pub fn getMemoryAnyValidity(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?memory_root.MemoryEntry {
+        return error.PostgresNotEnabled;
+    }
     /// V1.6 commit 5b.3 (WR-1): stub for non-postgres builds. Returns
     /// null so extraction-persist's MD5 dedup degrades to "every fact
     /// is unique" — extraction may produce duplicates without postgres
@@ -2974,6 +2979,42 @@ const ManagerImpl = struct {
         defer c.PQclear(result);
         if (c.PQntuples(result) == 0) return null;
         try self.bumpMemoryAccess(user_id, key);
+        return try decodeMemoryEntry(allocator, result, 0);
+    }
+
+    /// V1.7a-5b — getMemory variant WITHOUT MEMORIES_VALIDITY_FILTER.
+    ///
+    /// Surfaces a memory row by key regardless of whether `valid_to` has
+    /// passed. Used by `/brain/memory/{key}` drilldown to surface superseded
+    /// memories per spec §4.9 (the `valid_history` requirement) AND to
+    /// close a real user-visible bug: when extraction's contradiction judge
+    /// invalidates a row mid-browse, the brain graph already serialized the
+    /// key into the FE state but `getMemory` filters it out → drilldown 404.
+    /// With this helper, the drilldown returns 200 + the row + a populated
+    /// `valid_to` field so the FE renders it as archived rather than missing.
+    ///
+    /// Caller distinguishes live vs archived via the returned `valid_to`
+    /// field (NULL → live; non-NULL → archived/superseded). Does NOT call
+    /// `bumpMemoryAccess` — accessing an archived row shouldn't promote it.
+    ///
+    /// Returns null only when the key truly doesn't exist for `user_id`
+    /// (cross-tenant scoping is preserved). Caller frees the entry.
+    pub fn getMemoryAnyValidity(self: *Self, allocator: std.mem.Allocator, user_id: i64, key: []const u8) !?memory_root.MemoryEntry {
+        const q = try self.buildQuery(
+            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND key = $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, key_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+        // Intentionally NO bumpMemoryAccess — surfacing an archived row
+        // for the drilldown UI shouldn't refresh its access timestamp.
         return try decodeMemoryEntry(allocator, result, 0);
     }
 
@@ -8397,6 +8438,106 @@ test "V1.7a-5 link_type rich wiring — column populated from metadata + backfil
         const lt = try dupeResultValue(allocator, result, 0, 0);
         defer allocator.free(lt);
         try std.testing.expectEqualStrings("preference", lt); // PREFERS → preference
+    }
+}
+
+// V1.7a-5b — getMemoryAnyValidity: surface superseded rows for /brain drilldown.
+//
+// Acceptance:
+//   1. Live row (valid_to=NULL) is returned by BOTH getMemory AND
+//      getMemoryAnyValidity
+//   2. Superseded row (valid_to=past timestamp) is HIDDEN by getMemory
+//      (returns null) but SURFACED by getMemoryAnyValidity (returns the row
+//      with valid_to populated)
+//   3. Truly non-existent key returns null from BOTH paths (cross-tenant
+//      scoping preserved — wrong user_id also returns null)
+//   4. getMemoryAnyValidity does NOT bump access counters (archived rows
+//      shouldn't be promoted by drilldown viewing)
+test "V1.7a-5b getMemoryAnyValidity — surfaces archived rows + scoping preserved" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_v17a5b_anyvalidity_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-v17a5b-anyvalidity/workspace");
+
+    // ── (1) Live row: getMemory returns it, getMemoryAnyValidity also returns
+    try mgr.upsertMemory(2, "live_fact", "User uses Helix", .core, "session-A");
+    {
+        const live = try mgr.getMemory(allocator, 2, "live_fact");
+        try std.testing.expect(live != null);
+        if (live) |row| {
+            defer row.deinit(allocator);
+            try std.testing.expect(row.valid_to == null);
+            try std.testing.expectEqualStrings("User uses Helix", row.content);
+        }
+    }
+    {
+        const any = try mgr.getMemoryAnyValidity(allocator, 2, "live_fact");
+        try std.testing.expect(any != null);
+        if (any) |row| {
+            defer row.deinit(allocator);
+            try std.testing.expect(row.valid_to == null);
+        }
+    }
+
+    // ── (2) Insert a row, archive it via setMemoryInvalidation, verify
+    //       getMemory hides it but getMemoryAnyValidity surfaces it.
+    try mgr.upsertMemory(2, "archived_fact", "User used to use NeoVim", .core, "session-A");
+    // Demote first so setMemoryInvalidation can close it (core rows are
+    // immortal until demoted — V1.6 cmt11 guard).
+    _ = try mgr.demoteMemoryFromCore(2, "archived_fact", "test_close");
+    const close_ts: i64 = std.time.timestamp() - 60; // 60s in the past
+    try mgr.setMemoryInvalidation(2, "archived_fact", close_ts, close_ts);
+
+    {
+        const live = try mgr.getMemory(allocator, 2, "archived_fact");
+        // getMemory must hide archived rows (validity filter)
+        try std.testing.expect(live == null);
+    }
+    {
+        const any = try mgr.getMemoryAnyValidity(allocator, 2, "archived_fact");
+        try std.testing.expect(any != null);
+        if (any) |row| {
+            defer row.deinit(allocator);
+            try std.testing.expect(row.valid_to != null);
+            try std.testing.expectEqual(close_ts, row.valid_to.?);
+            try std.testing.expectEqualStrings("User used to use NeoVim", row.content);
+        }
+    }
+
+    // ── (3) Non-existent key returns null from both paths
+    {
+        const live = try mgr.getMemory(allocator, 2, "no_such_key_anywhere");
+        try std.testing.expect(live == null);
+        const any = try mgr.getMemoryAnyValidity(allocator, 2, "no_such_key_anywhere");
+        try std.testing.expect(any == null);
+    }
+
+    // ── (4) Cross-tenant scoping: row exists for user 2, query as user 99
+    //       must return null (not leak across users). No provisionUser
+    //       call needed — getMemoryAnyValidity just runs a SELECT and the
+    //       WHERE user_id=$1 filter alone enforces isolation.
+    {
+        const wrong_user = try mgr.getMemoryAnyValidity(allocator, 99, "live_fact");
+        try std.testing.expect(wrong_user == null);
     }
 }
 
