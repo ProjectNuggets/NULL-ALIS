@@ -16,4 +16,6 @@ test {
     // module is consumed at run-time by community_pipeline.zig (9c)
     // and the /brain/communities/recompute endpoint (9d).
     _ = @import("agent/communities.zig");
+    // V1.7a-9c — pipeline orchestration tests (FNV stable-id + helpers).
+    _ = @import("agent/community_pipeline.zig");
 }

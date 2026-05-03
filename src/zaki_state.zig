@@ -9652,3 +9652,181 @@ test "V1.7a-9a community storage primitives — round-trip + cross-tenant + idem
     }
 }
 
+// V1.7a-9c — End-to-end pipeline: pull edges → LPA → assign IDs → name.
+// Acceptance:
+//   1. Two-component corpus (3-clique + 2-clique) produces 2 communities;
+//      each member gets the SAME community_id as its component peers
+//   2. Idempotency: re-running on unchanged corpus produces the same
+//      community_ids + same names (caller observes same final state)
+//   3. Mock LLM namer is called once per qualifying community; fallback
+//      "Cluster N" used when namer is null
+//   4. member_set_hash cache: 2nd recompute with same membership skips
+//      LLM (cache hit); only re-names when membership changes
+//   5. Cross-tenant: recompute for user 99 sees nothing (no edges)
+test "V1.7a-9c recomputeCommunitiesForUser — end-to-end pipeline + namer + cache" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    const community_pipeline = @import("agent/community_pipeline.zig");
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_v17a9c_pipeline_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-v17a9c-pipeline/workspace");
+
+    // ── Seed: two components ───────────────────────────────────────
+    // Component A: 3-clique (a, b, c)
+    // Component B: 2-clique (x, y)
+    try mgr.upsertMemory(2, "a", "fact A", .core, "session-A");
+    try mgr.upsertMemory(2, "b", "fact B", .core, "session-A");
+    try mgr.upsertMemory(2, "c", "fact C", .core, "session-A");
+    try mgr.upsertMemory(2, "x", "fact X", .core, "session-A");
+    try mgr.upsertMemory(2, "y", "fact Y", .core, "session-A");
+    try mgr.upsertMemoryEdge(2, "a", "b", "rel", "extraction_classifier", null);
+    try mgr.upsertMemoryEdge(2, "b", "c", "rel", "extraction_classifier", null);
+    try mgr.upsertMemoryEdge(2, "a", "c", "rel", "extraction_classifier", null);
+    try mgr.upsertMemoryEdge(2, "x", "y", "rel", "extraction_classifier", null);
+
+    // ── Mock LLM namer: returns deterministic name based on top member ─
+    const MockNamerCtx = struct {
+        call_count: u32 = 0,
+    };
+    const mock_namer_fn = struct {
+        fn name_fn(ctx: *anyopaque, members: []const community_pipeline.NamerMember, alloc: std.mem.Allocator) anyerror![]u8 {
+            const c_ctx: *MockNamerCtx = @ptrCast(@alignCast(ctx));
+            c_ctx.call_count += 1;
+            const top = if (members.len > 0) members[0].key else "empty";
+            return std.fmt.allocPrint(alloc, "Cluster of {s}", .{top});
+        }
+    }.name_fn;
+    var mock_ctx: MockNamerCtx = .{};
+    const namer: community_pipeline.LlmNamer = .{
+        .ctx = @ptrCast(&mock_ctx),
+        .name_fn = mock_namer_fn,
+    };
+
+    // ── (1) First recompute ────────────────────────────────────────
+    {
+        const stats = try community_pipeline.recomputeCommunitiesForUser(
+            allocator,
+            &mgr,
+            2,
+            namer,
+            .{ .now_unix = std.time.timestamp() },
+        );
+        try std.testing.expectEqual(@as(usize, 4), stats.edges_loaded); // 3 + 1
+        try std.testing.expectEqual(@as(usize, 5), stats.nodes_in_lpa);
+        try std.testing.expectEqual(@as(usize, 2), stats.communities_found);
+        try std.testing.expectEqual(@as(usize, 5), stats.members_assigned);
+        // Both communities are >= min_size_for_llm_name (2) → 2 LLM calls
+        try std.testing.expectEqual(@as(u32, 2), stats.llm_calls_succeeded);
+        try std.testing.expectEqual(@as(u32, 2), mock_ctx.call_count);
+    }
+
+    // ── (2) Verify same community_id for component peers via PG ───
+    {
+        const verify_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT key, community_id FROM {s}.memories WHERE user_id = 2 AND community_id IS NOT NULL ORDER BY key",
+            .{schema},
+        );
+        defer allocator.free(verify_q);
+        const r = try mgr.exec(verify_q);
+        defer c.PQclear(r);
+        try std.testing.expectEqual(@as(c_int, 5), c.PQntuples(r));
+
+        // Build map key → community_id
+        var key_to_cid: std.StringHashMapUnmanaged(i32) = .{};
+        defer {
+            var it = key_to_cid.keyIterator();
+            while (it.next()) |k| allocator.free(k.*);
+            key_to_cid.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < 5) : (i += 1) {
+            const k = try dupeResultValue(allocator, r, i, 0);
+            errdefer allocator.free(k);
+            const cid_str = try dupeResultValue(allocator, r, i, 1);
+            defer allocator.free(cid_str);
+            const cid = try std.fmt.parseInt(i32, cid_str, 10);
+            try key_to_cid.put(allocator, k, cid);
+        }
+        // a, b, c share one id; x, y share another; the two ids differ.
+        const cid_a = key_to_cid.get("a").?;
+        try std.testing.expectEqual(cid_a, key_to_cid.get("b").?);
+        try std.testing.expectEqual(cid_a, key_to_cid.get("c").?);
+        const cid_x = key_to_cid.get("x").?;
+        try std.testing.expectEqual(cid_x, key_to_cid.get("y").?);
+        try std.testing.expect(cid_a != cid_x);
+    }
+
+    // ── (3) member_set_hash cache: 2nd recompute → no LLM calls ───
+    {
+        mock_ctx.call_count = 0;
+        const stats = try community_pipeline.recomputeCommunitiesForUser(
+            allocator,
+            &mgr,
+            2,
+            namer,
+            .{ .now_unix = std.time.timestamp() },
+        );
+        // Same membership → cache hit on member_set_hash → 0 LLM calls
+        try std.testing.expectEqual(@as(u32, 0), stats.llm_calls_succeeded);
+        try std.testing.expectEqual(@as(u32, 0), mock_ctx.call_count);
+        try std.testing.expectEqual(@as(usize, 2), stats.communities_found);
+    }
+
+    // ── (4) Null namer → fallback names for all communities ───────
+    {
+        // Drop the cached names so the next recompute is forced to re-name.
+        const reset_q = try std.fmt.allocPrint(
+            allocator,
+            "DELETE FROM {s}.memory_communities WHERE user_id = 2",
+            .{schema},
+        );
+        defer allocator.free(reset_q);
+        const r = try mgr.exec(reset_q);
+        c.PQclear(r);
+
+        const stats = try community_pipeline.recomputeCommunitiesForUser(
+            allocator,
+            &mgr,
+            2,
+            null, // no namer
+            .{ .now_unix = std.time.timestamp() },
+        );
+        try std.testing.expectEqual(@as(u32, 0), stats.llm_calls_succeeded);
+        try std.testing.expectEqual(@as(u32, 0), stats.llm_calls_failed);
+        try std.testing.expectEqual(@as(u32, 2), stats.fallback_names_written);
+    }
+
+    // ── (5) Cross-tenant: user 99 has no edges → no-op ────────────
+    {
+        const stats = try community_pipeline.recomputeCommunitiesForUser(
+            allocator,
+            &mgr,
+            99,
+            null,
+            .{ .now_unix = std.time.timestamp() },
+        );
+        try std.testing.expectEqual(@as(usize, 0), stats.edges_loaded);
+        try std.testing.expectEqual(@as(usize, 0), stats.communities_found);
+    }
+}
+
