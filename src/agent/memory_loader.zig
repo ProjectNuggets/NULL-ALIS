@@ -987,8 +987,6 @@ fn buildGraphNeighborsBlock(
     try w.writeAll("<graph_neighbors source=\"graph_expand\" hops=\"");
     try w.print("{d}", .{max_hops});
     try w.writeAll("\">\n");
-    const header_bytes = buf.items.len;
-
     var emitted: usize = 0;
     for (recall.neighborhood.nodes) |node| {
         if (node.hop_distance == 0) continue; // seeds covered elsewhere
@@ -1044,7 +1042,11 @@ fn buildGraphNeighborsBlock(
 
     try w.writeAll("</graph_neighbors>\n");
     out_stats.neighbor_count = emitted;
-    out_stats.appended_bytes = buf.items.len - header_bytes; // body bytes
+    // Telemetry intent: "how many bytes did graph mode add to the volatile
+    // prompt slot?" — full block (header + body + closing tag) is the
+    // honest answer. Earlier draft subtracted a body-only cursor and
+    // undercounted by ~70B which broke downstream prompt-cache budgeting.
+    out_stats.appended_bytes = buf.items.len;
     out_stats.appended = true;
     return buf.toOwnedSlice(allocator);
 }

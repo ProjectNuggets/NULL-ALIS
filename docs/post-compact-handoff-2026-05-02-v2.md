@@ -4,14 +4,14 @@
 
 ## State at compaction
 
-- **Main HEAD:** `032086d` (V1.7 cmt9.6 — full Gap 3 closure)
-- **97 commits ahead** of original V1.5 ship-ready handoff (`4d9e16f`)
+- **Main HEAD:** `df030d3` + cmt9.7 review fixes (post-cmt9.7 review pass)
+- **97+ commits ahead** of original V1.5 ship-ready handoff (`4d9e16f`)
 - **V1.5 status:** SHIP-READY (deploy date deprioritized per Nova: ship when correct, not by date)
 - **V1.5.5 status:** GREEN — substrate validated (precision 0.92)
 - **V1.6 status:** SHIP-COMPLETE — 16/16 commits + cmt9.5 + ship-gate review fixes (`d50f5d1`)
-- **V1.7 status:** 1 of 12 items shipped (V1.7a-1 = cmt9.6 = Gap 3 closure)
+- **V1.7 status:** 2 of 12 items shipped (V1.7a-1 = cmt9.6 = Gap 3 closure; V1.7a-2 = cmt9.7 = graph_expand → memory_recall consumer)
 - **Branch:** `main`
-- **Tests:** 5920/5930 PG passed (10 skipped). Only pre-existing `postgres_pool_releases_on_exec_error` baseline failure.
+- **Tests:** 5921/5931 PG passed (+1 vs V1.5 baseline; 10 skipped). Only pre-existing `postgres_pool_releases_on_exec_error` baseline failure.
 
 ## Trust mandate (do not forget)
 
@@ -34,8 +34,8 @@ Nova also said: *"the parallel agent working on memory has stopped working, all 
 | # | Item | Status | Source |
 |---|------|--------|--------|
 | 1 | Full Gap 3 closure (cmt9.6) | ✅ SHIPPED `032086d` | My closure |
-| 2 | graph_expand → memory_recall consumer wire | ⏳ NEXT | My closure |
-| 3 | Brain graph perf swap (JSONB → listEdgesForUser) | ⏳ | My closure |
+| 2 | graph_expand → memory_recall consumer wire (cmt9.7) | ✅ SHIPPED `df030d3` (+ review fixes) | My closure |
+| 3 | Brain graph perf swap (JSONB → listEdgesForUser) | ⏳ NEXT | My closure |
 | 4 | V1.6.1 polish (WR-02 Unicode lowercase, SE-V17-01 list-scope-session-core, SE-V17-02 pending_conflicts text) | ⏳ | My closure (V1.6 backlog) |
 | 5 | Spec seam 3: `link_type` rich wiring (compose_memory + agent prompt) | ⏳ | Spec §5 |
 | 6 | Spec seam 8: `/brain/diff?date=` endpoint | ⏳ | Spec §5 |

@@ -7713,14 +7713,22 @@ test "V1.6 commit 10 graph-expand — 3-node chain expansion" {
 // V1.7a-2 — recallMemoriesAsGraph end-to-end + getMemoryTimestamps batch lookup.
 //
 // Acceptance:
-//   1. recallMemories returns user_helix as the seed (key ILIKE %helix%)
-//   2. expandFromSeeds reaches user_neovim (1 hop via REPLACES) +
-//      helix_brain (1 hop via USED_FOR)
-//   3. Re-scoring with REAL created_at via getMemoryTimestamps changes
-//      scores from the bare placeholder (we set user_neovim's row to a
-//      30-day-old created_at; recency drops materially)
+//   1. recallMemories returns user_helix as a seed (key ILIKE %helix%)
+//   2. expandFromSeeds reaches user_neovim (1 hop via REPLACES) — user_neovim's
+//      content has no "helix" string, so legacy keyword/vector recall would
+//      MISS it; graph mode catches it via the REPLACES edge. This is the
+//      core value-add the consumer wire-up exists for.
+//   3. Re-score path runs without error (getMemoryTimestamps returns real
+//      created_at for inserted rows; placeholder-fallback path covers
+//      missing keys without erroring). The test does NOT backdate rows —
+//      validating actual recency-driven score deltas would require raw SQL
+//      time-shifting and is deferred to a focused unit test on
+//      scoreFromComponents directly.
 //   4. max_hops=0 short-circuits to seeds-only with empty neighborhood
-//   5. getMemoryTimestamps returns null for keys that don't exist
+//   5. getMemoryTimestamps batch contract: aligned slice, null for
+//      non-existent keys, real timestamps within last hour for fresh inserts
+//   6. NUL-safety guard rejects keys with embedded NUL (matches findEdgesByKeys)
+//   7. Unrelated rows (user_zsh + user_terminal) MUST NOT appear — scoping bound
 test "V1.7a-2 recallMemoriesAsGraph — seeds + 1-hop neighbors + real created_at re-score" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
