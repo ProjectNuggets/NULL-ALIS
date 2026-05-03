@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # T6 nullalis Contract Freeze
 
 Date: 2026-03-14  

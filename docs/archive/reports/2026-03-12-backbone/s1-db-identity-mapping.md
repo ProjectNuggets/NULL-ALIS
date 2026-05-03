@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # S1 DB Identity Mapping Core (2026-03-12)
 
 ## Objective

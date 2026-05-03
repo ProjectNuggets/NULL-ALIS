@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # T6 ZAKI Prod Execution Handoff
 
 Date: 2026-03-14  

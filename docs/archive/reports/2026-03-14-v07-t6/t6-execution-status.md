@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # T6 Execution Status (Step-by-Step)
 
 Date: 2026-03-14  

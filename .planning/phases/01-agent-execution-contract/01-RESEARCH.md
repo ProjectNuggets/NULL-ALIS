@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Phase 1: Agent Execution Contract - Research
 
 **Researched:** 2026-04-10

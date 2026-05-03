@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Per-User Cell Pod Architecture v0.2
 
 Status: proposed hosted `v0.2` architecture  

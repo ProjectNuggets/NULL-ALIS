@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Session Lock Latency Investigation (T8 Input)
 
 Date: 2026-03-15  

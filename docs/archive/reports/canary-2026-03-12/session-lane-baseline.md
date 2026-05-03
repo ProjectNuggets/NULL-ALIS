@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Session-Lane Baseline Freeze (v0.1.1)
 
 Date: 2026-03-12  

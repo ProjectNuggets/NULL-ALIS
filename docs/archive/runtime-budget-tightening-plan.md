@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Runtime Budget Tightening Plan (v0.2 Discussion Draft)
 
 ## Goal

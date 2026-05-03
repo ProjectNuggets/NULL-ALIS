@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V1 Closure + Second-Brain Differentiator Plan
 
 **Opened:** 2026-04-26 (post-S14 close, main HEAD `002a337`)

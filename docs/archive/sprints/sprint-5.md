@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 5 — Architectural Correctness — CLOSED 6/8 (S5.1 → D17, S5.2 → D18)
 
 **Branch:** `repair/sprint-5-architectural-correctness` (off `main` tip `3acf82a`)

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Phase 3: Canonical Session and Context Runtime — Research
 
 **Researched:** 2026-04-11

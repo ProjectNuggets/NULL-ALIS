@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V0.7-T7 Safety Probe Report
 
 Date: 2026-03-14  

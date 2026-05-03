@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Session 3 — zaki-prod BFF companion PR
 
 **Copy the block below into a fresh Claude Code session at the zaki-prod repo root.**

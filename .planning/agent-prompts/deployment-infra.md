@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Deployment Agent — Phase 3.9 Release
 
 Copy this prompt to the deployment/infra agent:

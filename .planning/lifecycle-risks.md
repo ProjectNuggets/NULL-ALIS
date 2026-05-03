@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Agent Lifecycle — Known Risks (Post Phase 3.9)
 
 ## Fixed in Phase 3.9

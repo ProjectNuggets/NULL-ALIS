@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 4 — Silent-Catch Sweep — CLOSED (13/14 in-repo, S4.14 → D16)
 
 **Branch:** `repair/sprint-4-silent-catch` (off `main` tip `3acf82a`)

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V1 Ship-Readiness Criteria (2026-04-27)
 
 **Purpose:** explicit checklist for "V1 done." Prevents scope creep AND prevents premature ship.

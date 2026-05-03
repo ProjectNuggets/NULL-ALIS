@@ -21,6 +21,7 @@ findings:
   info: 8
   total: 15
 status: issues_found
+tags: [prose, prose/planning]
 ---
 
 # V1.7a-9 Communities — Independent Code Review

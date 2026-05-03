@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Lock UX Baseline — 2026-03-14
 
 - Branch: `v0.7-lock-ux-hardening`

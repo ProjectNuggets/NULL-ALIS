@@ -13,6 +13,7 @@ findings:
   info: 2
   total: 5
 status: issues_found
+tags: [prose, prose/planning]
 ---
 
 # Phase 3.5: Session CRUD Handlers Code Review Report

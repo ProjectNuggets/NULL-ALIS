@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Release Validation Investigation Findings
 
 Date: 2026-03-17  

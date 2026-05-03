@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # First Canary Run Report (v0.2 Baseline Activation)
 
 Date: 2026-03-11  

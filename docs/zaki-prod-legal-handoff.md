@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # zaki-prod legal hygiene handoff (chatzaki.com)
 
 **Paste the block below into a fresh Claude Code session at the zaki-prod repo root.**

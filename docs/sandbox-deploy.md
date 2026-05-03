@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sandbox deployment guide (V1.5)
 
 **Audience:** operators deploying nullalis to production Linux hosts.

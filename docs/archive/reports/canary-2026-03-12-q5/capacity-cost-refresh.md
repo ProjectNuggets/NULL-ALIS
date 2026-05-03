@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Capacity + Cost Refresh (No LLM Cost) — 2026-03-12
 
 Source artifacts:

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # QA/QS Fix Baseline — 2026-03-13
 
 ## Baseline Snapshot

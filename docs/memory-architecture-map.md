@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Memory Architecture Map
 
 Last updated: 2026-04-05

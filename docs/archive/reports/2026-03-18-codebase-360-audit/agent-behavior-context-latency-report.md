@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Agent Behavior, Context Loading, and Turn Latency Audit
 
 Date: 2026-03-18

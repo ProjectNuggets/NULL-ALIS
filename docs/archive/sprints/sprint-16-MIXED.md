@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 16 — V1 Gaps Not In Prior Sprints — MIXED status (2026-04-26)
 
 **Branch:** `sprint/closure-pending-docs` (off `main` tip `a7a2ec8`)

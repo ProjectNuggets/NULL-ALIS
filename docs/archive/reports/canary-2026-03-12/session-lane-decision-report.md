@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Session-Lane Concurrency Decision Report (50% Canary)
 
 Date: 2026-03-12  

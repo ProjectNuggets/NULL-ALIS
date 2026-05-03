@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V1 Frontend Activation List — nullalis backend capabilities dormant pending zaki-prod wiring
 
 **Date:** 2026-04-28 (baseline) — UPDATE 2026-04-30 banner below

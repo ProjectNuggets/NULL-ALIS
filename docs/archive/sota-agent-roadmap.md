@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # SOTA Agent Roadmap
 
 Status: active planning — source of truth for execution

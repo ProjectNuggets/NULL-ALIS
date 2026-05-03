@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V1 — Ready Declaration
 
 **Date:** 2026-04-30

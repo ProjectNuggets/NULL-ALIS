@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # SOTA Agent Feature Map
 
 ## Goal

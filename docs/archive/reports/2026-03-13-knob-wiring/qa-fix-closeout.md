@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # QA/QS Fix Closeout — Session Safety + Knob Semantics
 
 Date: 2026-03-13  

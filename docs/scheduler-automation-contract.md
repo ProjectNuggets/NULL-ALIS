@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Scheduler Automation Contract
 
 This document defines the durable automation model for Nullalis.

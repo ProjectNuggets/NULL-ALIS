@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 2 — Revenue Loop — CLOSED
 
 **Branch:** `repair/sprint-2-revenue-loop` (branched off `92ebd59` at Sprint 1 tip)

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Rollout Decision Report (Isolation-Probe Rerun)
 
 Date: 2026-03-13  

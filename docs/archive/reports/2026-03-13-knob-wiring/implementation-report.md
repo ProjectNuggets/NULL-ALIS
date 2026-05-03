@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Knob Wiring Program Report (STT-First + Inert Knob Activation)
 
 Date: 2026-03-13  

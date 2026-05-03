@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Self-Improvement Loops for nullalis
 ## Research & Implementation Strategy
 *Based on: Hyperagents (Meta AI), MemPO (arXiv:2603.00680), ACE Pattern (Aegis Memory), MetaCognition (Zylos Research)*

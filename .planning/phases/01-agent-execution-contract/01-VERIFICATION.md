@@ -19,7 +19,7 @@ gaps:
 deferred:
   - truth: "Abort and interrupt propagation from API/CLI/channel to active work"
     addressed_in: "Phase 1 task 01-05"
-    evidence: "ROADMAP Phase 1 lists '01-05: Abort and interrupt (src/agent/abort.zig)' as an explicit task item, suggesting wiring was intentionally deferred"
+    evidence: "ROADMAP Phase 1 lists '01-05: Abort and interrupt (src/agent/abort.zig)' as an explicit task item, suggesting wiring was intentionally deferred"tags: [prose, prose/planning]
 ---
 
 # Phase 1: Agent Execution Contract Verification Report

@@ -108,6 +108,12 @@ def render_card(
     rel_to_repo = pathlib.Path("src") / rel_to_src
     title = str(rel_to_src)
 
+    # Top-level dir → tag for color-group / filter (e.g. agent/communities.zig
+    # → tag `code/agent`). Lets Nova distinguish code-reality from prose-
+    # reality in graph view via `tag:#code-graph` (paint all code cards) +
+    # `tag:#code/agent` (highlight one subsystem). Tags persist in the file
+    # frontmatter; resilient to Obsidian state overwrites.
+    top_dir = rel_to_src.parts[0] if len(rel_to_src.parts) > 1 else "root"
     # Frontmatter
     lines = [
         "---",
@@ -117,6 +123,7 @@ def render_card(
         f"public_consts: {len(symbols['const'])}",
         f"public_vars: {len(symbols['var'])}",
         f"imports: {len(imports)}",
+        f"tags: [code-graph, code/{top_dir}]",
         "---",
         "",
         f"# {title}",

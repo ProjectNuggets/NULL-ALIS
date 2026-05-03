@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Session 2 — D11 residual: DB-backed integration tests for the secret vault
 
 **Copy the block below into a fresh Claude Code session at `/Users/nova/Desktop/nullalis`, with the `d8/secret-vault-api` branch checked out.**

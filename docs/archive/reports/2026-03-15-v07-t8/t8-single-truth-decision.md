@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V0.7-T8 Single-Truth Proactivity Decision
 
 Date: 2026-03-15  

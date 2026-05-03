@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Reliability Ops Runbook
 
 ## Scope

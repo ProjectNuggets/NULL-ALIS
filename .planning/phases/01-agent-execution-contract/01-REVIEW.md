@@ -19,6 +19,7 @@ findings:
   info: 2
   total: 6
 status: issues_found
+tags: [prose, prose/planning]
 ---
 
 # Phase 1: Code Review Report

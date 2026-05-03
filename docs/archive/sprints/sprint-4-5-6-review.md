@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 4 / 5 / 6 consolidated self-review
 
 Post-hoc review of PRs #15 (Sprint 4 — Silent-Catch), #16 (Sprint 5 —

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 8 — Design Decisions — CLOSED 6/6 (2026-04-24)
 
 **Branch:** `repair/sprint-8-design-decisions` (off `main` tip `31e812f`)

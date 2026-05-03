@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # S4 — Daemon + Polling + Bus Canonicalization Wiring
 
 ## Objective

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # S0 Baseline Report — v0.2 Backbone Foundation
 
 Date: 2026-03-12  

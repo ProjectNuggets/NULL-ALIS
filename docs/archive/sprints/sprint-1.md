@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 1 — Visibility + Stop Bleeds — CLOSED
 
 **Branch:** `repair/sprint-1-visibility`

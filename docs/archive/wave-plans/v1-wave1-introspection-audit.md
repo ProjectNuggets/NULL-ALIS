@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V1 Wave 1 Introspection Truthfulness Audit (W1.8)
 
 Status: findings for Wave 2 to act on. Temporary artifact, not a canonical architecture doc.

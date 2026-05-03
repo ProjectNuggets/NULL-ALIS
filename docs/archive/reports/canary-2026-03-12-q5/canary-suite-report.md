@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Canary Suite Report — 2026-03-12 (Q5 Stage)
 
 Environment:

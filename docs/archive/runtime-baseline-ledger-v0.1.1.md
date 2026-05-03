@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Runtime Baseline Ledger (v0.1.1)
 
 Date: 2026-03-11  

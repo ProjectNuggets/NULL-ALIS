@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # S6 — User-Scoped Binding CRUD API
 
 ## Objective

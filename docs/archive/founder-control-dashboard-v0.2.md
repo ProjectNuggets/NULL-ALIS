@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Founder Control Dashboard (v0.2)
 
 Date: 2026-03-12  

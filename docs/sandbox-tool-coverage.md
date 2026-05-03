@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sandbox tool coverage (per-tool isolation audit)
 
 **Audience:** operators auditing the trust model. Engineers asking "is tool X sandboxed?"

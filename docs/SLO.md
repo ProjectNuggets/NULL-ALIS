@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # nullalis Service Level Objectives (SLO)
 
 **Status:** initial draft (2026-04-26). Targets are operator-validated proposals; tighten or loosen based on real customer expectations once first paying multi-user lands.

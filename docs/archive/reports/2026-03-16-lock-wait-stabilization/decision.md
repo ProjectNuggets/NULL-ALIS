@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Lock-Wait Stabilization Decision
 
 Date: 2026-03-16  

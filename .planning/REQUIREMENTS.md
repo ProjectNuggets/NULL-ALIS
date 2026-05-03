@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Requirements — SOTA Agent Program
 
 ## V1 (This Program)

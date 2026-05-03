@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # zaki-prod handoff — sandbox + policy relaxation (V1.5)
 
 **Audience:** zaki-prod frontend agent / engineer

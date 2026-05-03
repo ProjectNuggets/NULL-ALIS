@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Post-Compaction Handoff (2026-05-04 v3 — V1.7a-Obsidian-parity COMPLETE)
 
 **Purpose:** survive a compact mid-V1.7. Self-contained context for post-compact me.

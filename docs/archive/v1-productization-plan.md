@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # v1 Productization Plan (Multi-User, User-Facing BOT)
 
 Status: implementation-ready  

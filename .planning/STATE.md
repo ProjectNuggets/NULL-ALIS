@@ -10,6 +10,7 @@ progress:
   total_plans: 23
   completed_plans: 17
   percent: 74
+tags: [prose, prose/planning]
 ---
 
 # State — SOTA Agent Program

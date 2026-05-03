@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Control Plane Authority Map
 
 This document is the canonical contract for who owns each class of config and which API or deploy surface is allowed to write it.

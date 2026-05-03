@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Second Confirmatory Canary Report (50% Rollout)
 
 Date: 2026-03-11  

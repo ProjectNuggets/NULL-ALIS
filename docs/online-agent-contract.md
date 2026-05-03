@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Agent Runtime Event Contract
 
 > Transport-agnostic event grammar for the nullalis agent runtime.

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Frontend Vision Brief — for Claude design
 
 **Date:** 2026-04-30

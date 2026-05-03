@@ -5,6 +5,7 @@ status: draft
 nyquist_compliant: false
 wave_0_complete: false
 created: 2026-04-11
+tags: [prose, prose/planning]
 ---
 
 # Phase 03 — Validation Strategy

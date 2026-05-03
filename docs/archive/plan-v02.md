@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # nullALIS / ZAKI BOT Plan v02
 
 Status: Proposed execution baseline  

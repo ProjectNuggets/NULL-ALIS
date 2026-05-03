@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V0.7-T7 Verification Matrix
 
 Scope: safety-minimum verification for queue and rate-limit behavior with objective evidence mapping.

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Silent-catch policy (D16, post-Sprint-8 codebase)
 
 **Single source of truth for when `catch {}` is acceptable in nullalis,

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # D8 — Secret Vault API (S2.12–S2.16) — BREAKING API CHANGE
 
 **Branch:** `d8/secret-vault-api` (off `main`)

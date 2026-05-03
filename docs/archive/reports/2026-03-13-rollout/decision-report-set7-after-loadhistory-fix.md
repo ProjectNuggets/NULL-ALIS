@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Decision Report (Set7 After `Agent.loadHistory` Safety Patch)
 
 Date: 2026-03-13  

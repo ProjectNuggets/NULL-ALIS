@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V0.7-T5 Closeout
 
 Date: 2026-03-14  

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Execution Cell Contract
 
 Status: proposed contract for hosted execution isolation  

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Graph + Memory ecosystem research — consolidated reference
 
 **Date:** 2026-04-30

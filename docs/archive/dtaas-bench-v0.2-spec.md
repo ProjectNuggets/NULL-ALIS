@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # DTaaS-Bench v0.2 Specification
 
 Status: Draft for implementation  

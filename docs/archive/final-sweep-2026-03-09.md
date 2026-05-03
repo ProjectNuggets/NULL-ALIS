@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # v0.1 Final Sweep — 2026-03-09
 
 > Update (March 12, 2026): `wake` and `proactive` origins are now wired in active daemon paths. The origin status notes below are historical for the March 9 sweep.

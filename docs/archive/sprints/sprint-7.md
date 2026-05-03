@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 7 — User-Value Completion — CLOSED 15/15 (split 7A polish / 7B GDPR / 7C channel-locality)
 
 **Branches:**

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # S7 — Runtime Truth Alignment for Identity Mapping
 
 ## Objective

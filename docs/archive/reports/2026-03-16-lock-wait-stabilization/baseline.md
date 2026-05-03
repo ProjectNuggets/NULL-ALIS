@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Lock-Wait Stabilization Baseline
 
 Date (UTC): 2026-03-16T11:19:47Z

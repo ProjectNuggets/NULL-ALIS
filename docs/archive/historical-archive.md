@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Historical Archive Note
 
 This repository keeps rollout, canary, audit, and deployment reports as

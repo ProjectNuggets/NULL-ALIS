@@ -7,6 +7,7 @@ tests_added: 26
 tests_total: 5045
 tests_skipped: 31
 tests_failed: 0
+tags: [prose, prose/planning]
 ---
 
 # Plan 00-01 Summary: Baseline Evals and Characterization Tests

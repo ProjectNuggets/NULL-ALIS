@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Deploy Blockers Baseline — 2026-03-15
 
 ## Snapshot

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Regression-Safe S-Tier Refactor Plan
 
 Status: parked for later execution

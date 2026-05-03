@@ -4,6 +4,7 @@ plan: "00-02"
 status: "complete"
 commit: "60471d9"
 runtime_changes: false
+tags: [prose, prose/planning]
 ---
 
 # Plan 00-02 Summary: Online Agent Contract Documentation

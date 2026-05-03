@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # T8 Fix Decision Report (Core Proactivity Stabilization)
 
 Date: 2026-03-15  

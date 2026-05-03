@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # S8 Stage 2A Report — Slack Strict
 
 Date: 2026-03-12  

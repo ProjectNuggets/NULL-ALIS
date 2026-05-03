@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 13 — Observability Full — PARKED operator-pending (2026-04-26)
 
 **Branch:** `sprint/closure-pending-docs` (off `main` tip `a7a2ec8`)

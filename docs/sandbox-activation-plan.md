@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sandbox Activation Plan — `tool_sandbox_v1`
 
 **Audit date:** 2026-04-28

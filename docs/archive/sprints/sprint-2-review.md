@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 2 — self-review
 
 **Reviewer:** Claude Opus 4.7 (owning review per Nova directive "you own code review too and continue")

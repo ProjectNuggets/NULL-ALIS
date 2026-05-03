@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Agent Lifecycle Specification
 
 > Task and session lifecycle contract for the nullalis agent runtime.

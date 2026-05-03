@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # P-DB1 / P-PGV1 Pooling Smoke Report
 
 Date: 2026-03-13  

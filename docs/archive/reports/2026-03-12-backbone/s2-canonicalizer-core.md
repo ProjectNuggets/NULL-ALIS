@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # S2 Canonicalizer Core (2026-03-12)
 
 ## Objective

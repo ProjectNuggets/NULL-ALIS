@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # State Source-of-Truth Matrix
 
 Date: 2026-03-17  

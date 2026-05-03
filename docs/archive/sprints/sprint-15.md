@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 15 — Minor + Park Items — CLOSED 2/4 in-repo, 2/4 parked-with-reason (2026-04-26)
 
 **Branch:** `sprint/s15-minor-park` (off `main` tip `8396291`)

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Security Hardening Plan (Next Sprint)
 
 Date: 2026-03-16

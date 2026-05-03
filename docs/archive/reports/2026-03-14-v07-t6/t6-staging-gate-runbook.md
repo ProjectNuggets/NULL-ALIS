@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # T6 Staging Gate Runbook
 
 Date: 2026-03-14  

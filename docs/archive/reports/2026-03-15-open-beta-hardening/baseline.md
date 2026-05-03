@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Open Beta Hardening Baseline (2026-03-15)
 
 ## Scope Lock

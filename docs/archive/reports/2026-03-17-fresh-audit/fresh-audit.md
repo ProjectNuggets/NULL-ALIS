@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Fresh Audit
 
 Date: 2026-03-17

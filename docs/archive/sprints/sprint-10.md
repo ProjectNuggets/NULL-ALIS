@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 10 — Data Durability Full — CLOSED 4/6 in-repo (2026-04-26)
 
 **Branch:** `sprint/s10-data-durability` (off `main` tip `bd6248b`)

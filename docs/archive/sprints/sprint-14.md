@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 14 — Out-of-Code — CLOSED 5/10 in-repo + 1 self-found bug fix + 4 operator-pending (2026-04-26)
 
 **Branch:** `sprint/s14-out-of-code` (off `main` tip `224bea5`)

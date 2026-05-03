@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 3 — CI + Deploy Safety — NULLALIS SIDE CLOSED
 
 **Branch:** `sprint-3/ci-deploy-safety` (off `main`; independent of Sprint 2 + D8)

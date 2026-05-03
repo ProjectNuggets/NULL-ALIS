@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V1 Frontend Consumption Prompt (for zaki-prod agent session)
 
 Paste the block below into your zaki-prod agent session. It covers all the backend capabilities nullalis shipped during the 2026-04-18 V1 push: reasoning display, system_notice chrome, PowerUserSheet data endpoints.

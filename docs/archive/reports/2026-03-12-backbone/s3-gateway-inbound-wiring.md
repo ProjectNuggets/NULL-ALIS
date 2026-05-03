@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # S3 Gateway Inbound Wiring (Telegram First) — 2026-03-12
 
 ## Objective

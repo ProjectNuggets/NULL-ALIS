@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # P2 Telegram Strict-Ingress Canary (Precondition Fix Slice)
 
 Date: 2026-03-12  

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Sprint 6 — Dead Code Removal — CLOSED 5/7 (S6.1b → D19, S6.2 → D20, S6.4 → D21)
 
 **Branch:** `repair/sprint-6-dead-code` (off `main` tip `3acf82a`)

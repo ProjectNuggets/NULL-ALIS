@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # T6 Frontend-Agnostic API Audit
 
 Date: 2026-03-14  

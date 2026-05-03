@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V2 Runner Architecture (Design Only)
 
 Status: design document for next execution slice  

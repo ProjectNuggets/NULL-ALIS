@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # DTaaS Evolution Ledger (Post-v0.7)
 
 ## Purpose

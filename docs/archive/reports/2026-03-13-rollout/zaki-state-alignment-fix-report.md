@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # State Alignment Panic Fix Report (`zaki_state`)
 
 Date: 2026-03-13  

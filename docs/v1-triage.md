@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V1 Deferral Triage (2026-04-26, HEAD `9e8fb40`)
 
 **Purpose:** Before the LLM researcher pass, classify every open deferral + parked-sprint item into V1-must / V1-nice / V1.5-defer. Prevents wasted parenting on items that don't move V1 readiness.

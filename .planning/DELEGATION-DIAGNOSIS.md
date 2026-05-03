@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Sub-agent Result Delivery — Diagnosis
 
 **Date:** 2026-04-17

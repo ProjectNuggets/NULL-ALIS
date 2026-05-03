@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # P2-2 DNS Closure Runbook (Internal Staging)
 
 Date: 2026-03-18  

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # S8 Stage 1 Confirm Soak (Two-Track)
 
 Date: 2026-03-12  

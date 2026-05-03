@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Session Key Policy (Client + Gateway Enforced)
 
 ## Goal

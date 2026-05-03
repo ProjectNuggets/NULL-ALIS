@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Per-User Cell Pod Delivery Plan v0.2
 
 Status: proposed delivery plan  

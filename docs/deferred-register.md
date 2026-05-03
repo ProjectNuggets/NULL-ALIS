@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Deferred-items register
 
 **Single source of truth for every item that was explicitly deferred

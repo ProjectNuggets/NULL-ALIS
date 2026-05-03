@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V1 Wave 3 — zaki-prod Execution Prompt
 
 This is the copy-paste prompt for your zaki-prod agent session. It covers Wave 3 of the Nullalis V1 Convergence Plan — the frontend/BFF work for the web app.

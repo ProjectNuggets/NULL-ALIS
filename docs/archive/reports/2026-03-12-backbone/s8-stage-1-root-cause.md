@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # S8 Stage 1 Root-Cause Isolation — 2026-03-12
 
 Date: 2026-03-12  

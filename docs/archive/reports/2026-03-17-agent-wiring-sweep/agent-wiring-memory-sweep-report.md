@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Agent Wiring + Memory Sweep Report (No Code Changes)
 
 Date: 2026-03-17  

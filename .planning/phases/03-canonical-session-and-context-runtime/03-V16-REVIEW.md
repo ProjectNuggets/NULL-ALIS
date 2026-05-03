@@ -41,6 +41,7 @@ findings:
   info: 4
   total: 9
 status: issues_found
+tags: [prose, prose/planning]
 ---
 
 # Phase 03: Code Review Report — V1.6 Sprint

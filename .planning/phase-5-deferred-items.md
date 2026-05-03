@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Phase 5 SOTA — Remaining Items
 
 ## Completed in Phase 3.9 (moved out of deferred)

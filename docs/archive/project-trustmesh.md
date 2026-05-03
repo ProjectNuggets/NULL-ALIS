@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Project TrustMesh
 
 Status: strategy document  

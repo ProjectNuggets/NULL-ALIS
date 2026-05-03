@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Rollout Decision Report (Single Set Only: Set6)
 
 Date: 2026-03-13  

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Next Implementation Plan (From Sweep Findings)
 
 ## Objective

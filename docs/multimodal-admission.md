@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V1 Multimodal Admission Matrix (W2.7)
 
 Status: binding verdicts. W2.7 is strictly an **admission gate**, not a build project.

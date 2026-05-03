@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Cross-repo companion PR — zaki-prod team prompt
 
 **Hand this to whoever owns the zaki-prod BFF.** Three independent companion changes need to land on zaki-prod before the matching nullalis PRs reach production. They can ship as one PR or three — your call, but the first two (S2.1 + S2.7) must ship together with nullalis PR #10, and the third (D8 migration) must ship BEFORE nullalis PR #11 reaches prod.

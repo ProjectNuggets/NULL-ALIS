@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Final Pass Sequence Report (20 + 100 + 100 Confirm + Fresh 100)
 
 Date: 2026-03-13  

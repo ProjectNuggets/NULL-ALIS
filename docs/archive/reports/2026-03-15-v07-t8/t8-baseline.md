@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # V0.7-T8 Baseline
 
 Date: 2026-03-15  

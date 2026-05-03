@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Phase 3: Canonical Session and Context Runtime - Discussion Log (Assumptions Mode)
 
 > **Audit trail only.** Do not use as input to planning, research, or execution agents.

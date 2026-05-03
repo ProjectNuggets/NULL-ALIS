@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Phase 3: Canonical Session and Context Runtime - Context
 
 **Gathered:** 2026-04-11 (assumptions mode)

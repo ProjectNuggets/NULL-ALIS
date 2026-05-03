@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Roadmap — SOTA Agent Program
 
 ## Milestone: v1.0-sota

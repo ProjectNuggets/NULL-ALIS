@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # v1 User Onboarding Flow (Settings + Channels)
 
 ## Goal

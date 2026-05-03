@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # T6 Product API Contract (BFF Surface)
 
 Date: 2026-03-14  

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # T6 Handoff — BFF Integration Readiness
 
 ## What is now available in nullalis

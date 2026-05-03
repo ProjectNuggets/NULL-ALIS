@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Session 1 — `.spike/run.sh` benchmark gate
 
 **Copy the block below into a fresh Claude Code session at `/Users/nova/Desktop/nullalis`.**

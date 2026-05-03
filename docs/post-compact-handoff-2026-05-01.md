@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Post-Compaction Handoff (2026-05-01)
 
 **Purpose:** survive a compact. Self-contained context for the post-compact me.

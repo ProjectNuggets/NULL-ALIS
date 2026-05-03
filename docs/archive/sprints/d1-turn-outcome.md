@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # D1 Sprint — Agent Turn (TurnOutcome refactor + SOTA uplift)
 
 **Opened:** 2026-04-25 (post-D28 close, post-Sprint-9 park)

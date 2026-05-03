@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Transport Crash Fix Report (Embedding Path)
 
 Date: 2026-03-13  

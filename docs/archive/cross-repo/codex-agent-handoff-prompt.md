@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Codex agent handoff — zaki-prod BFF companion PRs
 
 **Paste this into a fresh Codex-with-GSD session. Self-contained — the agent has no memory of the nullalis-side work.**

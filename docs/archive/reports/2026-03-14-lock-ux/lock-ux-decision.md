@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Lock UX Hardening Decision — 2026-03-14
 
 ## Scope

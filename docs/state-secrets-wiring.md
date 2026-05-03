@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # State Secrets Wiring
 
 ## Purpose

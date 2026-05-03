@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Multi-Instance Deployment Guide
 
 This guide covers running multiple `nullalis` instances for tenant scale-out.

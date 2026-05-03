@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Composio Re-Test Matrix — 2026-03-15
 
 ## Goal

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Slash Commands — Backend Catalog + Frontend UX Spec (V1)
 
 **Source of truth:** `src/agent/commands.zig` HELP_TEXT (line 38) + isSlashName dispatch sites.

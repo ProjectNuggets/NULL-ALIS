@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Migrations Policy
 
 **S10.3** — written guidance for the `src/migrations.zig` framework.

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # Rollout Increase Decision Report (Two Consecutive Canary Sets)
 
 Date: 2026-03-13  

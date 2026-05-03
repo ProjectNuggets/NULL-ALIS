@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/planning]
+---
+
 # Phase 3.9 Execution Plan — Step by Step
 
 ## Methodology

@@ -1,3 +1,7 @@
+---
+tags: [prose, prose/docs]
+---
+
 # ZAKI Nullalis Runtime Contract
 
 This document defines the production runtime contract for running Nullalis as the
