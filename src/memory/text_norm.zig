@@ -20,27 +20,56 @@
 
 const std = @import("std");
 
-/// V1.7a-4 review fix WR-01 / IN-01 — single source of truth for UTF-8-safe
-/// length-bounded truncation. Replaces three diverged copies that lived in
-/// `agent/extraction_persist.zig`, `agent/memory_loader.zig`, and
-/// `agent/commands.zig` (all subtly identical, but easy to drift). Returns
-/// a borrowed slice of `s` (no allocation), at most `max_len` bytes,
-/// guaranteed not to split a multi-byte UTF-8 codepoint mid-sequence by
-/// backing up over trailing 0x80..0xBF continuation bytes.
+/// V1.7a-4 review fix WR-01 / IN-01 + V1.6 review fix WR-03 — single source
+/// of truth for UTF-8-safe length-bounded truncation. Replaces three diverged
+/// copies that lived in `agent/extraction_persist.zig`,
+/// `agent/memory_loader.zig`, and `agent/commands.zig`.
+///
+/// Returns a borrowed slice of `s` (no allocation), at most `max_len` bytes,
+/// guaranteed to land on a UTF-8 codepoint boundary so the result is always
+/// valid UTF-8 (never a dangling lead byte without its continuation bytes).
+///
+/// **Algorithm (two-step robust form):**
+///   1. While `s[end-1]` is a continuation byte (0x80..0xBF), back up — we
+///      know we're inside a multi-byte codepoint mid-sequence.
+///   2. After step 1, `s[end-1]` is either ASCII (<0x80) or a lead byte
+///      (>=0xC0). If it's a lead byte, the codepoint started but its
+///      continuation bytes were truncated → drop the lead byte too.
+///
+/// The earlier draft of this helper checked `s[end] & 0xC0 == 0x80` (the
+/// byte AFTER the cut). That was correct because `if (s.len <= max_len)
+/// return s;` guaranteed `s[max_len]` was in-bounds, but it was fragile:
+/// any future caller that managed to skip the early-return guard would
+/// trigger a one-past-the-end read. The reviewer's suggested patch
+/// (`s[end - 1] & 0xC0 == 0x80`) was safer against OOB but produced
+/// INVALID UTF-8 by leaving trailing lead bytes (e.g., truncating "café"
+/// to 4 bytes would return "caf" + 0xC3 — a lead byte without its 0xA9
+/// continuation). The two-step form here is both safe AND correct.
 ///
 /// Edge cases:
-///   - `s.len <= max_len` → returns `s` unchanged
-///   - `max_len == 0` → returns `s[0..0]` (empty slice, never indexes `s`)
-///   - All trailing bytes are continuations (truncating mid-codepoint into
-///     a string that's all continuation bytes from byte 0) → `end` walks
-///     down to 0 and returns `s[0..0]`
+///   - `s.len <= max_len` → returns `s` unchanged (early exit)
+///   - `max_len == 0` → returns `s[0..0]` (loop guard `end > 0` blocks any read)
+///   - All preceding bytes are continuations (impossible in valid UTF-8) →
+///     `end` walks to 0 and returns `s[0..0]`
+///   - Truncation mid-multi-byte codepoint → returns the slice ending just
+///     BEFORE that codepoint's lead byte
 pub fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
     if (s.len <= max_len) return s;
     var end: usize = max_len;
-    // Loop invariant: end > 0 protects against indexing s[-1]; the
-    // continuation-byte check ensures we land BEFORE a continuation byte
-    // (i.e., on a codepoint boundary or at end=0).
-    while (end > 0 and s[end] & 0xC0 == 0x80) end -= 1;
+
+    // Step 1: back up over trailing continuation bytes. This catches the
+    // case where the cut lands inside a multi-byte sequence between the
+    // lead byte and any of its continuations.
+    while (end > 0 and (s[end - 1] & 0xC0) == 0x80) end -= 1;
+
+    // Step 2: if `s[end - 1]` is a lead byte (high bit set, NOT a
+    // continuation), the codepoint started but its continuations were
+    // truncated. Back up past the lead too — leaving it would emit
+    // invalid UTF-8 (an isolated lead byte).
+    if (end > 0 and (s[end - 1] & 0x80) != 0) {
+        end -= 1;
+    }
+
     return s[0..end];
 }
 
@@ -54,8 +83,17 @@ test "truncateUtf8: ASCII truncation at exact boundary" {
 
 test "truncateUtf8: backs up over UTF-8 continuation byte" {
     // "café" = 'c' (0x63) 'a' (0x61) 'f' (0x66) 'é' (0xC3 0xA9)
-    // max_len=4 lands on 0xA9 (continuation); backs up to 3.
+    // max_len=4: end=4, s[3]=0xC3 (lead byte, NOT continuation) — step 1
+    // exits. Step 2: 0xC3 has high bit set, drop it. end=3 → "caf".
     try std.testing.expectEqualStrings("caf", truncateUtf8("café", 4));
+}
+
+test "truncateUtf8: backs up across continuation bytes (V1.6/V1.7 review WR fix)" {
+    // "🎉" = 0xF0 0x9F 0x8E 0x89 (4-byte). max_len=3: end=3, s[2]=0x8E
+    // (continuation), back up. end=2, s[1]=0x9F (continuation), back up.
+    // end=1, s[0]=0xF0 (lead, NOT continuation), step 1 exits. Step 2:
+    // 0xF0 has high bit, drop. end=0 → "".
+    try std.testing.expectEqualStrings("", truncateUtf8("🎉", 3));
 }
 
 test "truncateUtf8: max_len==0 returns empty without indexing" {
@@ -63,21 +101,25 @@ test "truncateUtf8: max_len==0 returns empty without indexing" {
 }
 
 test "truncateUtf8: 4-byte codepoint backed up cleanly" {
-    // "🎉" = 0xF0 0x9F 0x8E 0x89 (4-byte UTF-8). max_len=2 lands on
-    // 0x8E (continuation), backs up to 1 (still continuation 0x9F),
-    // backs up to 0 (lead byte 0xF0 is NOT a continuation; loop stops).
-    // Returns empty (we'd need at least 4 bytes for one codepoint).
     try std.testing.expectEqualStrings("", truncateUtf8("🎉", 2));
     try std.testing.expectEqualStrings("🎉", truncateUtf8("🎉", 4));
 }
 
-test "truncateUtf8: mixed ASCII + multibyte" {
-    // "ab🎉cd" = 'a' 'b' 0xF0 0x9F 0x8E 0x89 'c' 'd'  (8 bytes)
-    // max_len=4 lands on 0x8E (continuation). Backs up to 2 (lead 0xF0 is
-    // not continuation, but bytes after 0xF0 ARE — wait, 0xF0 itself
-    // isn't a continuation; loop stops at end=2 since s[2]=0xF0 with
-    // 0xF0 & 0xC0 == 0xC0, NOT 0x80). So returns "ab".
+test "truncateUtf8: mixed ASCII + multibyte (V1.6 WR-03 — never emits dangling lead)" {
+    // "ab🎉cd" = 'a' 'b' 0xF0 0x9F 0x8E 0x89 'c' 'd' (8 bytes), max_len=4:
+    // end=4, s[3]=0x9F (continuation), step 1 backs up. end=3, s[2]=0xF0
+    // (lead, NOT continuation), step 1 exits. Step 2: 0xF0 has high bit,
+    // drop. end=2 → "ab". The PREVIOUS reviewer-suggested form (`s[end-1]`
+    // alone, no step 2) would have left end=3 → "ab\xF0" which is INVALID
+    // UTF-8 (lead byte without continuations). The two-step form prevents this.
     try std.testing.expectEqualStrings("ab", truncateUtf8("ab🎉cd", 4));
+}
+
+test "truncateUtf8: ASCII byte at boundary preserved (no step-2 drop)" {
+    // "hello" max_len=4: end=4, s[3]='l'=0x6C (ASCII, high bit clear).
+    // Step 1: 0x6C & 0xC0 = 0x40, not 0x80, exit. Step 2: 0x6C & 0x80 = 0,
+    // no drop. Return "hell". Verifies step 2 doesn't over-truncate ASCII.
+    try std.testing.expectEqualStrings("hell", truncateUtf8("hello", 4));
 }
 
 // Top common English stopwords. Ordered by approximate frequency. Conservative

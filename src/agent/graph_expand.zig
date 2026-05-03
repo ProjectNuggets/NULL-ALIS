@@ -169,21 +169,32 @@ pub fn expandFromSeeds(
             break;
         };
 
-        // V1.7a-4 review fix WR-02 — partial-move leak hardening.
+        // V1.7a-4 review fix WR-02 + V1.6 review fix WR-05 — partial-move
+        // leak hardening AND ownership-contract documentation.
         //
-        // Each TypedEdge in hop_edges owns 3 strings (source_key, target_key,
-        // predicate). The loop below MOVES edges one-by-one into all_edges
+        // **Contract assumed of `findEdgesByKeys`:** each returned TypedEdge
+        // is INDEPENDENTLY ALLOCATED — its three string fields
+        // (source_key, target_key, predicate) point into separately-allocated
+        // heap regions, NOT into a shared arena/slab. The current Postgres
+        // backend honors this (libpq row pattern: each PQgetvalue returns
+        // a separate copy via dupeResultValue). If a future backend (e.g.
+        // arena-style) violated this, the per-edge `e.deinit(allocator)`
+        // calls below would either no-op or fault — the contract is
+        // load-bearing.
+        //
+        // **Partial-move leak guard:** each TypedEdge in hop_edges owns
+        // 3 strings. The loop below MOVES edges one-by-one into all_edges
         // via `try ... append(...)`. If append fails mid-loop (OOM during
-        // ArrayList growth), the moved tail is now owned by all_edges
-        // (cleaned by the outer errdefer) but the NOT-YET-MOVED edges
-        // [moved_count..] are still in hop_edges with their owned strings.
-        // The bare `defer allocator.free(hop_edges)` only frees the slice
-        // header — the per-edge strings would leak.
+        // ArrayList growth), the moved prefix is now owned by all_edges
+        // (cleaned by the outer errdefer) but the NOT-YET-MOVED tail
+        // [moved_count..] is still in hop_edges with its owned strings.
+        // A bare `defer allocator.free(hop_edges)` would only free the
+        // slice header — the per-edge strings would leak.
         //
         // Track moved_count and have the defer deinit the unmoved tail
-        // before freeing the slice. On normal completion, moved_count ==
-        // hop_edges.len, the tail is empty, and only the slice header gets
-        // freed (no double-deinit).
+        // before freeing the outer slice. On normal completion,
+        // moved_count == hop_edges.len, the tail is empty, and only the
+        // slice header gets freed (no double-deinit).
         var moved_count: usize = 0;
         defer {
             for (hop_edges[moved_count..]) |*e| e.deinit(allocator);

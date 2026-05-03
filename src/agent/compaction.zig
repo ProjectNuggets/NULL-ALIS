@@ -183,19 +183,25 @@ pub fn tokenEstimate(history: []const OwnedMessage) u64 {
     return (total_chars + 3) / 4;
 }
 
-/// Auto-compact history using a multi-pass strategy:
+/// Auto-compact history using a multi-pass strategy.
 ///
-/// Pass A (60% of context): Cheap dedup + placeholder substitution.
+/// V1.7a-4 review fix (V1.6 IN-01): docstring previously listed stale
+/// 60/75/85 thresholds. Authoritative values match `TokenBudgetPolicy`
+/// at lines 133-138 (70% Pass A, 90% Pass C); Pass B was deleted in iter28.
+///
+/// Pass A (70% of context): Cheap dedup + placeholder substitution.
 ///   - Replace tool results older than `keep_recent` turns with short placeholders
 ///   - Deduplicate consecutive identical tool outputs
 ///   - Zero LLM cost — pure string operations
 ///
-/// Pass C (85% of context): Full LLM summarization.
+/// Pass B: deleted (iter28). Was a structured-extraction sidecar plan that
+/// never landed; the work merged into Pass C's dual-output JSON tail.
+///
+/// Pass C (90% of context): Full LLM summarization.
 ///   - Summarize older messages via the provider (existing logic)
 ///   - For large histories (>10 messages): splits into halves, summarizes each
-///
-/// Pass B (75%, structured extraction via cheap model) is planned but requires
-/// sidecar provider infrastructure — will be wired with narration sidecar.
+///   - Optional V1.6 dual-output: emits a JSON tail of structured atomic
+///     facts that `extraction_persist` consumes for the typed-edge graph
 ///
 /// Returns true if any compaction was performed.
 pub fn autoCompactHistory(
@@ -374,8 +380,14 @@ fn compactHistoryKeepingRecent(
     // Split-half branches don't capture extraction tail (acceptable V1.6
     // simplification — merging two batches' extracted facts adds complexity
     // for a rare path; deferred to V1.7 if measurably valuable).
-    var extraction_tail: []u8 = &.{};
-    defer if (extraction_tail.len > 0) allocator.free(extraction_tail);
+    // V1.7a-4 review fix (V1.6 IN-03) — start with `null` so the defer
+    // unconditionally frees once `summarizeSlice` populates a heap slice
+    // (even a zero-length `try allocator.dupe(u8, "")` allocation needs
+    // freeing under the testing allocator). Prior shape used a sentinel
+    // empty slice + `if (extraction_tail.len > 0)` guard, which leaked
+    // any zero-length heap allocation.
+    var extraction_tail: ?[]u8 = null;
+    defer if (extraction_tail) |t| allocator.free(t);
     const summary = if (compact_count > 10) blk: {
         const mid = start + compact_count / 2;
 
@@ -404,7 +416,16 @@ fn compactHistoryKeepingRecent(
         break :blk merged;
         // V1.6 commit 5b.2: single-call branch captures extraction tail
         // for downstream persist via extraction_persist.persistExtracted.
-    } else try summarizeSlice(allocator, provider, model_name, history.items, start, compact_end, config, &extraction_tail);
+        // V1.7a-4 review fix (V1.6 IN-03) — capture into a local then
+        // transfer to the optional so the defer above always frees the
+        // tail (summarizeSlice's success path ALWAYS dupes a slice into
+        // tail_local, even when the JSON tail is empty).
+    } else blk: {
+        var tail_local: []u8 = &.{};
+        const s = try summarizeSlice(allocator, provider, model_name, history.items, start, compact_end, config, &tail_local);
+        extraction_tail = tail_local;
+        break :blk s;
+    };
     defer allocator.free(summary);
 
     const workspace_context = try readWorkspaceContextForSummary(allocator, config.workspace_dir);
@@ -442,72 +463,81 @@ fn compactHistoryKeepingRecent(
     // already logs per-fact failures + returns counts. A failed
     // extraction does NOT abort the compaction (the prose summary
     // already archived above is preserved).
+    // V1.7a-4 review fix (V1.6 WR-04) — re-indented inner block so visual
+    // structure matches logical structure (zig-fmt compliant). Was an
+    // outdented inner block hiding 60+ lines under `if (extraction_tail...)`.
     if (config.extraction_state_mgr) |state_mgr| {
         if (config.extraction_user_id) |uid| {
-            if (extraction_tail.len > 0) {
-            const session_id_for_extract: ?[]const u8 = config.archive_session_id;
-            const empty_slice: []extraction_persist.ExtractedMemory = &.{};
-            const extracted = extraction_persist.parseExtractedJson(allocator, extraction_tail) catch |err| blk: {
-                log.warn("compaction: extraction parse failed err={s} tail_len={d}", .{ @errorName(err), extraction_tail.len });
-                break :blk empty_slice;
-            };
-            defer if (extracted.len > 0) extraction_persist.freeExtractedMemories(allocator, extracted);
-
-            if (extracted.len > 0) {
-                // V1.6 commit 6: build the contradiction-judge context.
-                // Prefers explicit `extraction_judge_*` fields when set
-                // (lets a future sidecar judge model override). Otherwise
-                // falls back to the active summarization provider +
-                // model_name — already in scope, already authenticated,
-                // already configured; saves wiring two fields up through
-                // SessionManager / Agent / TenantRuntime.
-                const judge_provider: providers.Provider = config.extraction_judge_provider orelse provider;
-                const judge_model: []const u8 = config.extraction_judge_model_name orelse model_name;
-                const judge_ctx: ?extraction_persist.JudgeContext =
-                    extraction_persist.JudgeContext{
-                        .provider = judge_provider,
-                        .model_name = judge_model,
-                    };
-
-                // V1.6 cmt8: coref context wraps the runtime embedding
-                // provider when configured. Mem0's 0.95 cosine threshold.
-                const coref_ctx: ?extraction_persist.EntityResolution =
-                    if (config.extraction_coref_embed) |ep|
-                        extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
-                    else
-                        null;
-
-                const persist_result = extraction_persist.persistExtracted(
-                    allocator,
-                    state_mgr,
-                    uid,
-                    session_id_for_extract,
-                    extracted,
-                    judge_ctx,
-                    coref_ctx,
-                ) catch |err| blk: {
-                    log.warn("compaction: extraction persist failed err={s}", .{@errorName(err)});
-                    break :blk extraction_persist.PersistResult{
-                        .written_count = 0,
-                        .skipped_blacklist = 0,
-                        .skipped_md5_dup = 0,
-                        .skipped_cosine_dup = 0,
-                        .skipped_semantic_dup = 0,
-                        .contradictions_resolved = 0,
-                        .failed_count = 0,
-                    };
+            if (extraction_tail) |tail_bytes| if (tail_bytes.len > 0) {
+                const session_id_for_extract: ?[]const u8 = config.archive_session_id;
+                const empty_slice: []extraction_persist.ExtractedMemory = &.{};
+                const extracted = extraction_persist.parseExtractedJson(allocator, tail_bytes) catch |err| blk: {
+                    log.warn("compaction: extraction parse failed err={s} tail_len={d}", .{ @errorName(err), tail_bytes.len });
+                    break :blk empty_slice;
                 };
-                log.info("compaction.extraction parsed={d} written={d} skipped_blacklist={d} skipped_md5_dup={d} skipped_semantic_dup={d} contradictions_resolved={d} failed={d}", .{
-                    extracted.len,
-                    persist_result.written_count,
-                    persist_result.skipped_blacklist,
-                    persist_result.skipped_md5_dup,
-                    persist_result.skipped_semantic_dup,
-                    persist_result.contradictions_resolved,
-                    persist_result.failed_count,
-                });
-            }
-            }
+                // V1.7a-4 review fix (V1.6 WR-02) — drop the `if (extracted.len > 0)`
+                // guard. `freeExtractedMemories` handles empty slices safely
+                // (the for-loop is a no-op and `allocator.free` on a zero-
+                // length slice is defined). The prior guard leaked the
+                // zero-length heap allocation `parseExtractedJson` returns
+                // when the LLM emitted `[]`.
+                defer extraction_persist.freeExtractedMemories(allocator, extracted);
+
+                if (extracted.len > 0) {
+                    // V1.6 commit 6: build the contradiction-judge context.
+                    // Prefers explicit `extraction_judge_*` fields when set
+                    // (lets a future sidecar judge model override). Otherwise
+                    // falls back to the active summarization provider +
+                    // model_name — already in scope, already authenticated,
+                    // already configured; saves wiring two fields up through
+                    // SessionManager / Agent / TenantRuntime.
+                    const judge_provider: providers.Provider = config.extraction_judge_provider orelse provider;
+                    const judge_model: []const u8 = config.extraction_judge_model_name orelse model_name;
+                    const judge_ctx: ?extraction_persist.JudgeContext =
+                        extraction_persist.JudgeContext{
+                            .provider = judge_provider,
+                            .model_name = judge_model,
+                        };
+
+                    // V1.6 cmt8: coref context wraps the runtime embedding
+                    // provider when configured. Mem0's 0.95 cosine threshold.
+                    const coref_ctx: ?extraction_persist.EntityResolution =
+                        if (config.extraction_coref_embed) |ep|
+                            extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
+                        else
+                            null;
+
+                    const persist_result = extraction_persist.persistExtracted(
+                        allocator,
+                        state_mgr,
+                        uid,
+                        session_id_for_extract,
+                        extracted,
+                        judge_ctx,
+                        coref_ctx,
+                    ) catch |err| blk: {
+                        log.warn("compaction: extraction persist failed err={s}", .{@errorName(err)});
+                        break :blk extraction_persist.PersistResult{
+                            .written_count = 0,
+                            .skipped_blacklist = 0,
+                            .skipped_md5_dup = 0,
+                            .skipped_cosine_dup = 0,
+                            .skipped_semantic_dup = 0,
+                            .contradictions_resolved = 0,
+                            .failed_count = 0,
+                        };
+                    };
+                    log.info("compaction.extraction parsed={d} written={d} skipped_blacklist={d} skipped_md5_dup={d} skipped_semantic_dup={d} contradictions_resolved={d} failed={d}", .{
+                        extracted.len,
+                        persist_result.written_count,
+                        persist_result.skipped_blacklist,
+                        persist_result.skipped_md5_dup,
+                        persist_result.skipped_semantic_dup,
+                        persist_result.contradictions_resolved,
+                        persist_result.failed_count,
+                    });
+                }
+            };
         }
     }
 

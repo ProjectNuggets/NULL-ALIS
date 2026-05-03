@@ -39,6 +39,13 @@ pub const NostrChannel = struct {
     /// Recently-seen inner rumor IDs (kind:14 event id → arrival unix timestamp).
     /// Suppresses duplicate deliveries when the same rumor arrives via multiple relays.
     seen_rumor_ids: std.StringHashMapUnmanaged(i64),
+    /// V1.7a-4 review fix (V1.6 review WR-01) — guard `seen_rumor_ids` for
+    /// concurrent access. The reader thread (`readerLoop`) reads + writes it,
+    /// and a future outbound path or test could race with it. Without this
+    /// mutex, concurrent `StringHashMapUnmanaged` mutation would corrupt
+    /// internal bucket pointers → segfault. `deinit` runs after
+    /// `reader_thread.join()` so it doesn't need the lock.
+    seen_rumor_ids_mu: std.Thread.Mutex,
     /// Discard events with created_at before this timestamp.
     listen_start_at: i64,
     /// Whether the channel has been started.
@@ -56,6 +63,7 @@ pub const NostrChannel = struct {
             .sender_protocols = .empty,
             .sender_protocols_mu = .{},
             .seen_rumor_ids = .empty,
+            .seen_rumor_ids_mu = .{},
             .listen_start_at = 0,
             .started = false,
         };
@@ -586,13 +594,22 @@ pub const NostrChannel = struct {
     pub const RUMOR_DEDUP_WINDOW_SECS: i64 = 600;
 
     /// Check if a rumor ID has been seen recently.
-    pub fn isSeenRumor(self: *const NostrChannel, rumor_id: []const u8) bool {
+    /// V1.7a-4 review fix (V1.6 WR-01) — takes a mutable receiver to acquire
+    /// `seen_rumor_ids_mu` (the `*const` receiver in the prior version meant
+    /// the lock could not be taken; concurrent reads/writes would race).
+    pub fn isSeenRumor(self: *NostrChannel, rumor_id: []const u8) bool {
+        self.seen_rumor_ids_mu.lock();
+        defer self.seen_rumor_ids_mu.unlock();
         return self.seen_rumor_ids.contains(rumor_id);
     }
 
     /// Record a rumor ID as seen at `now`, evicting stale entries first.
     /// Best-effort: caller should ignore errors (dedup is non-critical).
+    /// V1.7a-4 review fix (V1.6 WR-01) — guarded by `seen_rumor_ids_mu`.
     pub fn recordSeenRumor(self: *NostrChannel, rumor_id: []const u8, now: i64) !void {
+        self.seen_rumor_ids_mu.lock();
+        defer self.seen_rumor_ids_mu.unlock();
+
         // Collect stale keys (can't remove during iteration).
         var stale = std.ArrayListUnmanaged([]const u8){};
         defer stale.deinit(self.allocator);

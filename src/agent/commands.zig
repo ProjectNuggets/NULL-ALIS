@@ -1378,13 +1378,26 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             uid,
                             session_id,
                             &mems,
-                            null, // judge_ctx — TODO V1.7 follow-up
+                            // judge_ctx intentionally null — the contradiction
+                            // judge needs an LLM provider in scope, but
+                            // commands.zig session-end runs without one
+                            // (no compaction-style provider plumbed here).
+                            // Tracked V1.7 follow-up: route via
+                            // extraction_state_mgr-adjacent provider bundle
+                            // once `provider_bundle.primaryModelName()`
+                            // accessor lands. Until then session-end
+                            // extraction skips contradiction detection +
+                            // semantic dedup; only MD5 dedup applies.
+                            // V1.7a-4 review fix V1.7-IN-03: surface the
+                            // gap in traces so observability shows it.
+                            null,
                             coref_ctx,
                         ) catch |err| {
                             log.warn("session_end persistExtracted failed key={s} err={s}", .{
                                 fact_key, @errorName(err),
                             });
                         };
+                        log.info("session_end.persistExtracted judge_ctx=null reason=no_provider_in_scope key={s}", .{fact_key});
                     }
                 }
             }
