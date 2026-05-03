@@ -9,7 +9,7 @@
 - **V1.5 status:** SHIP-READY (deploy date deprioritized per Nova: ship when correct, not by date)
 - **V1.5.5 status:** GREEN — substrate validated (precision 0.92)
 - **V1.6 status:** SHIP-COMPLETE — 16/16 commits + cmt9.5 + ship-gate review fixes (`d50f5d1`); V1.6.1 polish landed in V1.7a-4 (cmt9.9 + review fixes a6f54b3 + parallel-review fixes 3524bf9 + all-review-findings-closed 02d40b1)
-- **V1.7 status:** 5 of 12 items shipped + V1.7a-5b drilldown bugfix (V1.7a-1 cmt9.6 = Gap 3 closure; V1.7a-2 cmt9.7 = graph_expand → memory_recall consumer; V1.7a-3 cmt9.8 = brain graph perf swap; V1.7a-4 cmt9.9 = V1.6.1 polish; V1.7a-5 cmt9.10 = link_type rich wiring; V1.7a-5b 3991c79 = drilldown 404 fix; ALL items dual-review-clean)
+- **V1.7 status:** 5 of 12 items shipped + V1.7a-5b drilldown bugfix; **sprint reshaped 2026-05-03 per Obsidian-parity research** — V1.7a expanded from 6 → 9 items (added local-graph, orphans, filter-extensions; promoted communities from V1.7b); V1.7b demoted to 4 depth/quality items. **See `docs/v1.7-brain-parity-sprint.md` for the full reshape rationale.**
 - **Branch:** `main`
 - **Tests:** 5955/5965 PG passed (+35 vs V1.5 baseline; 10 skipped). Only pre-existing `postgres_pool_releases_on_exec_error` baseline failure.
 
