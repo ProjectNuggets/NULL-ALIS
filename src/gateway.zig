@@ -12430,6 +12430,299 @@ fn handleBrainTimeline(
     return finalizeJsonBuf(allocator, &out);
 }
 
+// ── /brain/diff — V1.7a-6 ──────────────────────────────────────────
+//
+// GET /api/v1/users/:user_id/brain/diff
+//   ?date=YYYY-MM-DD                — UX form, midnight-to-midnight UTC
+//   [&window_days=N]                — extends the window forward N days (default 1, cap 90)
+//   ?from=<unix>&to=<unix>          — canonical form, half-open [from, to)
+//
+// Eleanor Konik's #1 obsidian-graph use case ("what changed on date X?").
+// Two independent event streams over the same window:
+//
+//   births = memories whose `created_at` ∈ [from, to). NO validity filter
+//            applied — a memory born and superseded inside the same
+//            window appears here AND in deaths (the timeline is the
+//            event log, not the row state).
+//   deaths = memories whose `valid_to` ∈ [from, to) AND `valid_to IS NOT
+//            NULL`. NO validity filter applied — we WANT archived rows
+//            here (mirrors V1.7a-5b drilldown insight: surfacing what
+//            *was* known is what makes diff useful).
+//
+// Both surfaces use BRAIN_USER_KEY_FILTER so agent bookkeeping (continuity
+// summaries, autosaves, tombstones) stays hidden — same hygiene contract
+// as /brain/graph.
+//
+// Response shape:
+//   {
+//     "window": {"from": <unix>, "to": <unix>, "date": "YYYY-MM-DD" | null,
+//                "window_days": N},
+//     "births": [{"id", "key", "kind", "created_at", "session_id",
+//                 "summary", "valid_to", "link_type"}, ...],
+//     "deaths": [{"id", "key", "kind", "valid_to", "session_id",
+//                 "summary", "link_type"}, ...],
+//     "stats":  {"births": N, "deaths": M}
+//   }
+
+const BRAIN_DIFF_MAX_WINDOW_DAYS: u32 = 90;
+const BRAIN_DIFF_DEFAULT_WINDOW_DAYS: u32 = 1;
+const BRAIN_DIFF_ROW_CAP: u32 = 500;
+const BRAIN_DIFF_SUMMARY_CHARS: usize = 200;
+
+/// Parse YYYY-MM-DD into the unix-second of midnight UTC on that date.
+/// Returns null on any parse / validation error. Algorithm: Howard
+/// Hinnant's days_from_civil (proleptic Gregorian, no DST/TZ math).
+/// Range: 1970-01-01 .. 9999-12-31. Validates month-length per
+/// Gregorian rules including leap years (Feb 29 only valid in leap
+/// years; April/June/Sept/Nov capped at 30).
+fn parseIsoDateUtc(s: []const u8) ?i64 {
+    if (s.len != 10) return null;
+    if (s[4] != '-' or s[7] != '-') return null;
+    const y = std.fmt.parseInt(u32, s[0..4], 10) catch return null;
+    const m = std.fmt.parseInt(u8, s[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(u8, s[8..10], 10) catch return null;
+    if (y < 1970 or y > 9999) return null;
+    if (m < 1 or m > 12) return null;
+    if (d < 1 or d > 31) return null;
+    // Validate day-of-month against Gregorian month length.
+    const is_leap = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+    const days_in_month: u8 = switch (m) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (is_leap) 29 else 28,
+        else => unreachable,
+    };
+    if (d > days_in_month) return null;
+    // Howard Hinnant days_from_civil — Gregorian, no DST/TZ.
+    const yy: i64 = if (m <= 2) @as(i64, y) - 1 else @as(i64, y);
+    const era: i64 = @divFloor(if (yy >= 0) yy else yy - 399, 400);
+    const yoe: u64 = @intCast(yy - era * 400);
+    const mp: u64 = if (m > 2) @as(u64, m) - 3 else @as(u64, m) + 9;
+    const doy: u64 = (153 * mp + 2) / 5 + @as(u64, d) - 1;
+    const doe: u64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const days: i64 = era * 146097 + @as(i64, @intCast(doe)) - 719468;
+    return days * 86400;
+}
+
+/// Best-effort link_type extraction from a row's metadata JSONB.
+/// Returns the canonical lowercase enum string, or null if absent /
+/// malformed / not a known LinkType. Mirrors the same parse used in
+/// handleBrainMemoryDetail at the top-level `link_type` field — keeping
+/// both surfaces canonical via memory_mod.LinkType.fromString.
+fn extractLinkTypeFromMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8) ?[]const u8 {
+    const m = metadata_json orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, m, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const lt_val = parsed.value.object.get("link_type") orelse return null;
+    if (lt_val != .string) return null;
+    const lt = memory_mod.LinkType.fromString(lt_val.string) orelse return null;
+    return lt.toString();
+}
+
+fn handleBrainDiff(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    target: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    // ── Resolve window ────────────────────────────────────────────
+    // Priority: explicit from+to > date+window_days > today UTC.
+    const date_param = parseQueryParam(target, "date");
+    const window_days_param = parseQueryParam(target, "window_days");
+    const from_param = parseQueryParam(target, "from");
+    const to_param = parseQueryParam(target, "to");
+
+    var window_days: u32 = if (window_days_param) |s|
+        std.fmt.parseInt(u32, s, 10) catch BRAIN_DIFF_DEFAULT_WINDOW_DAYS
+    else
+        BRAIN_DIFF_DEFAULT_WINDOW_DAYS;
+    if (window_days == 0) window_days = BRAIN_DIFF_DEFAULT_WINDOW_DAYS;
+    if (window_days > BRAIN_DIFF_MAX_WINDOW_DAYS) window_days = BRAIN_DIFF_MAX_WINDOW_DAYS;
+
+    var window_from: i64 = 0;
+    var window_to: i64 = 0;
+    var window_date_echo: ?[]const u8 = null;
+
+    if (from_param != null and to_param != null) {
+        const fp = std.fmt.parseInt(i64, from_param.?, 10) catch {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_from\"}" };
+        };
+        const tp = std.fmt.parseInt(i64, to_param.?, 10) catch {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_to\"}" };
+        };
+        if (tp <= fp) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"to_must_exceed_from\"}" };
+        }
+        // Cap canonical window to BRAIN_DIFF_MAX_WINDOW_DAYS to mirror the
+        // date+window_days path — otherwise a malicious caller could
+        // request decades of rows in one shot.
+        const max_span: i64 = @as(i64, BRAIN_DIFF_MAX_WINDOW_DAYS) * 86400;
+        if ((tp - fp) > max_span) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"window_too_large\"}" };
+        }
+        window_from = fp;
+        window_to = tp;
+        // window_days reported as derived rounded count (display-only).
+        window_days = @intCast(@divTrunc(tp - fp + 86399, 86400));
+    } else if (date_param) |dp| {
+        const midnight = parseIsoDateUtc(dp) orelse {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_date_format\"}" };
+        };
+        window_from = midnight;
+        window_to = midnight + @as(i64, window_days) * 86400;
+        window_date_echo = dp;
+    } else {
+        // Default: today UTC. Compute midnight UTC of std.time.timestamp().
+        const now: i64 = std.time.timestamp();
+        const today_midnight = @divFloor(now, 86400) * 86400;
+        window_from = today_midnight;
+        window_to = today_midnight + @as(i64, window_days) * 86400;
+    }
+
+    // ── Fetch births + deaths ─────────────────────────────────────
+    const births = state_mgr.listMemoryBirthsInWindow(
+        allocator,
+        numeric_user_id,
+        window_from,
+        window_to,
+        BRAIN_DIFF_ROW_CAP,
+    ) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"births_query_failed\"}" };
+    };
+    defer memory_mod.freeEntries(allocator, births);
+
+    const deaths = state_mgr.listMemoryDeathsInWindow(
+        allocator,
+        numeric_user_id,
+        window_from,
+        window_to,
+        BRAIN_DIFF_ROW_CAP,
+    ) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"deaths_query_failed\"}" };
+    };
+    defer memory_mod.freeEntries(allocator, deaths);
+
+    // ── Batch-fetch metadata for link_type surface ────────────────
+    // One round trip covering both surfaces (births ∪ deaths key set).
+    var key_set: std.StringHashMapUnmanaged(void) = .{};
+    defer key_set.deinit(allocator);
+    for (births) |e| key_set.put(allocator, e.key, {}) catch {};
+    for (deaths) |e| key_set.put(allocator, e.key, {}) catch {};
+
+    var keys_buf: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keys_buf.deinit(allocator);
+    {
+        var it = key_set.keyIterator();
+        while (it.next()) |k| keys_buf.append(allocator, k.*) catch {};
+    }
+
+    var metadata_map = state_mgr.listMemoriesMetadata(allocator, numeric_user_id, keys_buf.items) catch std.StringHashMapUnmanaged([]u8){};
+    defer {
+        var mit = metadata_map.iterator();
+        while (mit.next()) |kv| {
+            allocator.free(kv.key_ptr.*);
+            allocator.free(kv.value_ptr.*);
+        }
+        metadata_map.deinit(allocator);
+    }
+
+    // ── Build JSON response ───────────────────────────────────────
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    w.print("{{\"window\":{{\"from\":{d},\"to\":{d},\"window_days\":{d},\"date\":", .{ window_from, window_to, window_days }) catch return response_build_err;
+    if (window_date_echo) |dp| {
+        json_util.appendJsonString(&out, allocator, dp) catch return response_build_err;
+    } else {
+        w.writeAll("null") catch return response_build_err;
+    }
+    w.writeAll("},\"births\":[") catch return response_build_err;
+    for (births, 0..) |entry, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        const created_at = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0;
+        const summary_len = brainTruncateUtf8Boundary(entry.content, BRAIN_DIFF_SUMMARY_CHARS);
+        const summary = entry.content[0..summary_len];
+        w.writeAll("{\"id\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.id) catch return response_build_err;
+        w.writeAll(",\"key\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.key) catch return response_build_err;
+        w.writeAll(",\"kind\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.category.toString()) catch return response_build_err;
+        w.print(",\"created_at\":{d},\"session_id\":", .{created_at}) catch return response_build_err;
+        if (entry.session_id) |sid| {
+            json_util.appendJsonString(&out, allocator, sid) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll(",\"summary\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, summary) catch return response_build_err;
+        w.writeAll(",\"valid_to\":") catch return response_build_err;
+        if (entry.valid_to) |vt| {
+            w.print("{d}", .{vt}) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll(",\"link_type\":") catch return response_build_err;
+        const md = if (metadata_map.get(entry.key)) |m| @as(?[]const u8, m) else null;
+        if (extractLinkTypeFromMetadata(allocator, md)) |lt| {
+            json_util.appendJsonString(&out, allocator, lt) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.writeAll("],\"deaths\":[") catch return response_build_err;
+    for (deaths, 0..) |entry, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        const summary_len = brainTruncateUtf8Boundary(entry.content, BRAIN_DIFF_SUMMARY_CHARS);
+        const summary = entry.content[0..summary_len];
+        w.writeAll("{\"id\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.id) catch return response_build_err;
+        w.writeAll(",\"key\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.key) catch return response_build_err;
+        w.writeAll(",\"kind\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, entry.category.toString()) catch return response_build_err;
+        w.writeAll(",\"valid_to\":") catch return response_build_err;
+        if (entry.valid_to) |vt| {
+            w.print("{d}", .{vt}) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll(",\"session_id\":") catch return response_build_err;
+        if (entry.session_id) |sid| {
+            json_util.appendJsonString(&out, allocator, sid) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll(",\"summary\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, summary) catch return response_build_err;
+        w.writeAll(",\"link_type\":") catch return response_build_err;
+        const md = if (metadata_map.get(entry.key)) |m| @as(?[]const u8, m) else null;
+        if (extractLinkTypeFromMetadata(allocator, md)) |lt| {
+            json_util.appendJsonString(&out, allocator, lt) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.print("],\"stats\":{{\"births\":{d},\"deaths\":{d}}}}}", .{ births.len, deaths.len }) catch return response_build_err;
+
+    return finalizeJsonBuf(allocator, &out);
+}
+
 // ── /brain/compose — V1.5 day-3 chunk 3C ────────────────────────────
 //
 // POST /api/v1/users/:user_id/brain/compose
@@ -13978,6 +14271,18 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "brain/documents")) {
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainDocuments(req_allocator, method, scoped_user_id, brain_target, state);
+    }
+
+    // ── /brain/diff — V1.7a-6 ────────────────────────────────────────────
+    // GET /api/v1/users/{id}/brain/diff?date=YYYY-MM-DD[&window_days=N]
+    // GET /api/v1/users/{id}/brain/diff?from=<unix>&to=<unix>
+    // Temporal evolution surface (Eleanor Konik's #1 obsidian-graph use
+    // case). Returns births (created_at in window) + deaths (valid_to in
+    // window) as two independent event streams, with link_type surfaced
+    // per-row. Same hygiene contract as /brain/graph.
+    if (std.mem.eql(u8, parsed.subpath, "brain/diff")) {
+        const brain_target = extractRequestTarget(raw_request) orelse base_path;
+        return handleBrainDiff(req_allocator, method, scoped_user_id, brain_target, state);
     }
 
     // ── /brain/memory/{key} — V1.6 commit 13 (M3) ────────────────────────
@@ -24502,6 +24807,47 @@ test "handleBrainTimeline rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainTimeline(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/timeline", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+// ── /brain/diff — V1.7a-6 unit tests ──────────────────────────────────
+
+test "handleBrainDiff rejects non-GET methods" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainDiff(std.testing.allocator, "POST", "1", "/api/v1/users/1/brain/diff", &dummy_state);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleBrainDiff rejects invalid user_id" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainDiff(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/diff", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "parseIsoDateUtc — valid + invalid + leap-year edge" {
+    // Epoch midnight
+    try std.testing.expectEqual(@as(?i64, 0), parseIsoDateUtc("1970-01-01"));
+    // Day 1 = 86400
+    try std.testing.expectEqual(@as(?i64, 86400), parseIsoDateUtc("1970-01-02"));
+    // Known anchor: 2024-01-01 = 1704067200
+    try std.testing.expectEqual(@as(?i64, 1704067200), parseIsoDateUtc("2024-01-01"));
+    // Leap year: 2024-02-29 is valid (2024 % 4 == 0, % 100 != 0)
+    try std.testing.expect(parseIsoDateUtc("2024-02-29") != null);
+    // Non-leap year: 2023-02-29 must reject
+    try std.testing.expectEqual(@as(?i64, null), parseIsoDateUtc("2023-02-29"));
+    // Century non-leap: 1900 was NOT a leap year (% 100 == 0 and % 400 != 0)
+    try std.testing.expectEqual(@as(?i64, null), parseIsoDateUtc("1900-02-29"));
+    // Century leap: 2000 WAS a leap year (% 400 == 0)
+    try std.testing.expect(parseIsoDateUtc("2000-02-29") != null);
+    // Bad month
+    try std.testing.expectEqual(@as(?i64, null), parseIsoDateUtc("2024-13-01"));
+    // Bad day
+    try std.testing.expectEqual(@as(?i64, null), parseIsoDateUtc("2024-04-31"));
+    // Bad format
+    try std.testing.expectEqual(@as(?i64, null), parseIsoDateUtc("2024/01/01"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoDateUtc("not-a-date"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoDateUtc(""));
+    // Out-of-range
+    try std.testing.expectEqual(@as(?i64, null), parseIsoDateUtc("1969-12-31"));
 }
 
 // ── /brain/compose handler tests — V1.5 day-3 chunk 3C ────────────────

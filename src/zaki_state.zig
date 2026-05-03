@@ -351,6 +351,15 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listMemoriesTimeline(_: *@This(), allocator: std.mem.Allocator, _: i64, _: ?i64, _: ?[]const u8, _: u32, _: ?i64, _: ?i64) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
+    /// V1.7a-6 — stubs for non-postgres builds; `/brain/diff` degrades
+    /// to empty births/deaths so the FE still renders the window header
+    /// without erroring when the state manager is the disabled variant.
+    pub fn listMemoryBirthsInWindow(_: *@This(), allocator: std.mem.Allocator, _: i64, _: i64, _: i64, _: u32) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
+    pub fn listMemoryDeathsInWindow(_: *@This(), allocator: std.mem.Allocator, _: i64, _: i64, _: i64, _: u32) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
     /// V1.5 day-3 — stubs for non-postgres builds; compose path silently
     /// degrades when state manager is the disabled variant.
     pub fn upsertMemoryWithMetadata(_: *@This(), _: i64, _: []const u8, _: []const u8, _: memory_root.MemoryCategory, _: ?[]const u8, _: []const u8) !void {
@@ -3439,6 +3448,98 @@ const ManagerImpl = struct {
         n_params += 1;
 
         const result = try self.execParams(q, params[0..n_params], lengths[0..n_params]);
+        defer c.PQclear(result);
+        return try decodeMemoryRows(allocator, result, false);
+    }
+
+    /// V1.7a-6 — Births surface for `/brain/diff?date=`. Returns memory
+    /// rows whose `created_at` falls in `[from, to)` AND whose key is
+    /// brain-visible. NO validity filter is applied — a memory born and
+    /// then superseded inside the same window must still appear here
+    /// (and will ALSO appear in the deaths surface). The two lists are
+    /// independent event streams over the same window.
+    ///
+    /// `MemoryEntry.timestamp` is set to the unix-second of `created_at`
+    /// (mirroring `listMemoriesTimeline` so the FE shares one date axis).
+    /// Newest first; capped at `limit`.
+    pub fn listMemoryBirthsInWindow(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        from: i64,
+        to: i64,
+        limit: u32,
+    ) ![]memory_root.MemoryEntry {
+        const q = try self.buildQuery(
+            "SELECT id, key, content, memory_type, " ++
+                "COALESCE((EXTRACT(EPOCH FROM created_at))::bigint::text, '0'), " ++
+                "session_id, valid_to FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND " ++ BRAIN_USER_KEY_FILTER ++ " " ++
+                "AND (EXTRACT(EPOCH FROM created_at))::bigint >= $2::bigint " ++
+                "AND (EXTRACT(EPOCH FROM created_at))::bigint <  $3::bigint " ++
+                "ORDER BY created_at DESC, id DESC LIMIT $4::int",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var from_buf: [32]u8 = undefined;
+        const from_s = try std.fmt.bufPrintZ(&from_buf, "{d}", .{from});
+        var to_buf: [32]u8 = undefined;
+        const to_s = try std.fmt.bufPrintZ(&to_buf, "{d}", .{to});
+        var lim_buf: [16]u8 = undefined;
+        const lim_s = try std.fmt.bufPrintZ(&lim_buf, "{d}", .{limit});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, from_s.ptr, to_s.ptr, lim_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(from_s.len), @intCast(to_s.len), @intCast(lim_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        return try decodeMemoryRows(allocator, result, false);
+    }
+
+    /// V1.7a-6 — Deaths surface for `/brain/diff?date=`. Returns memory
+    /// rows whose `valid_to` falls in `[from, to)` AND whose key is
+    /// brain-visible. Reads include archived/superseded rows by design
+    /// (mirrors V1.7a-5b's `getMemoryAnyValidity` insight: drilldown
+    /// surfaces what *was* known, not just what is currently active).
+    ///
+    /// Excludes rows where `valid_to IS NULL` (still-live memories don't
+    /// have a death event in any window). `MemoryEntry.timestamp` is set
+    /// to the unix-second of `valid_to` so the FE can render the death
+    /// date directly without a second decode. Ordered death-newest-first;
+    /// capped at `limit`.
+    pub fn listMemoryDeathsInWindow(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        from: i64,
+        to: i64,
+        limit: u32,
+    ) ![]memory_root.MemoryEntry {
+        // valid_to is bigint unix-seconds (same shape as MEMORIES_VALIDITY_FILTER).
+        const q = try self.buildQuery(
+            "SELECT id, key, content, memory_type, " ++
+                "COALESCE(valid_to::text, '0'), " ++
+                "session_id, valid_to FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND " ++ BRAIN_USER_KEY_FILTER ++ " " ++
+                "AND valid_to IS NOT NULL " ++
+                "AND valid_to >= $2::bigint AND valid_to < $3::bigint " ++
+                "ORDER BY valid_to DESC, id DESC LIMIT $4::int",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var from_buf: [32]u8 = undefined;
+        const from_s = try std.fmt.bufPrintZ(&from_buf, "{d}", .{from});
+        var to_buf: [32]u8 = undefined;
+        const to_s = try std.fmt.bufPrintZ(&to_buf, "{d}", .{to});
+        var lim_buf: [16]u8 = undefined;
+        const lim_s = try std.fmt.bufPrintZ(&lim_buf, "{d}", .{limit});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, from_s.ptr, to_s.ptr, lim_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(from_s.len), @intCast(to_s.len), @intCast(lim_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
         return try decodeMemoryRows(allocator, result, false);
     }
@@ -8538,6 +8639,160 @@ test "V1.7a-5b getMemoryAnyValidity — surfaces archived rows + scoping preserv
     {
         const wrong_user = try mgr.getMemoryAnyValidity(allocator, 99, "live_fact");
         try std.testing.expect(wrong_user == null);
+    }
+}
+
+// V1.7a-6 — listMemoryBirthsInWindow + listMemoryDeathsInWindow:
+// independent event streams over a [from, to) window. Acceptance:
+//   1. Birth IN window appears in births
+//   2. Death IN window appears in deaths (even when superseded)
+//   3. Same memory born+died inside window appears in BOTH (events ≠ row state)
+//   4. Birth/death OUTSIDE window does NOT appear
+//   5. Hidden-key filter (BRAIN_USER_KEY_FILTER) drops continuity / autosave
+//   6. Cross-tenant scoping: user 99 sees nothing of user 2's data
+test "V1.7a-6 listMemory{Births,Deaths}InWindow — event streams over [from, to)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_v17a6_diff_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-v17a6-diff/workspace");
+
+    // ── Window setup: [today_midnight_utc, today_midnight_utc + 86400s) ─
+    // Computed against PG's clock to avoid local-vs-PG drift.
+    const window_q = try std.fmt.allocPrint(
+        allocator,
+        "SELECT (date_trunc('day', (now() AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC') " ++
+            "::timestamptz, " ++
+            "(EXTRACT(EPOCH FROM (date_trunc('day', (now() AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC')))::bigint",
+        .{},
+    );
+    defer allocator.free(window_q);
+    const wres = try mgr.exec(window_q);
+    defer c.PQclear(wres);
+    try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(wres));
+    const today_midnight_text = try dupeResultValue(allocator, wres, 0, 1);
+    defer allocator.free(today_midnight_text);
+    const today_midnight = try std.fmt.parseInt(i64, today_midnight_text, 10);
+    const window_from = today_midnight;
+    const window_to = today_midnight + 86400;
+
+    // ── Seed memories ────────────────────────────────────────────────
+    // (a) Born today, still live → birth IN, no death
+    try mgr.upsertMemory(2, "mem_born_today", "fact A", .core, "session-A");
+    // (b) Born today, archived today → birth IN, death IN (in BOTH lists)
+    try mgr.upsertMemory(2, "mem_born_died_today", "fact B", .core, "session-A");
+    _ = try mgr.demoteMemoryFromCore(2, "mem_born_died_today", "test_close");
+    const close_ts_today = today_midnight + 3600; // 1AM UTC today
+    try mgr.setMemoryInvalidation(2, "mem_born_died_today", close_ts_today, close_ts_today);
+    // (c) Born yesterday, archived today → birth NOT in, death IN
+    try mgr.upsertMemory(2, "mem_born_yesterday", "fact C", .core, "session-A");
+    {
+        // Backdate created_at to yesterday via raw UPDATE (the public API
+        // uses NOW() — we need precise control for the window test).
+        const yesterday_set = try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.memories SET created_at = to_timestamp({d}::bigint) " ++
+                "WHERE user_id = 2 AND key = 'mem_born_yesterday'",
+            .{ schema, today_midnight - 3600 }, // 1h before window start
+        );
+        defer allocator.free(yesterday_set);
+        const r = try mgr.exec(yesterday_set);
+        c.PQclear(r);
+    }
+    _ = try mgr.demoteMemoryFromCore(2, "mem_born_yesterday", "test_close");
+    try mgr.setMemoryInvalidation(2, "mem_born_yesterday", close_ts_today, close_ts_today);
+
+    // (d) Born yesterday, archived yesterday → both OUTSIDE window
+    try mgr.upsertMemory(2, "mem_outside_window", "fact D", .core, "session-A");
+    {
+        const old_set = try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.memories SET created_at = to_timestamp({d}::bigint) " ++
+                "WHERE user_id = 2 AND key = 'mem_outside_window'",
+            .{ schema, today_midnight - 7200 }, // 2h before window start
+        );
+        defer allocator.free(old_set);
+        const r = try mgr.exec(old_set);
+        c.PQclear(r);
+    }
+    _ = try mgr.demoteMemoryFromCore(2, "mem_outside_window", "test_close");
+    try mgr.setMemoryInvalidation(2, "mem_outside_window", today_midnight - 1800, today_midnight - 1800);
+
+    // (e) Hidden-key sentinel: born today, must be filtered out of BOTH lists
+    try mgr.upsertMemory(2, "summary_latest/agent:zaki-bot:user:7:thread:main", "type=summary_latest", .daily, "session-A");
+
+    // ── Births surface ──────────────────────────────────────────────
+    {
+        const births = try mgr.listMemoryBirthsInWindow(allocator, 2, window_from, window_to, 100);
+        defer memory_root.freeEntries(allocator, births);
+        // Expected: mem_born_today + mem_born_died_today (2 rows). Hidden
+        // continuity summary is filtered. Yesterday-born rows excluded.
+        var seen_a = false;
+        var seen_b = false;
+        for (births) |e| {
+            try std.testing.expect(memory_root.isBrainVisibleKey(e.key));
+            if (std.mem.eql(u8, e.key, "mem_born_today")) seen_a = true;
+            if (std.mem.eql(u8, e.key, "mem_born_died_today")) seen_b = true;
+            try std.testing.expect(!std.mem.eql(u8, e.key, "mem_born_yesterday"));
+            try std.testing.expect(!std.mem.eql(u8, e.key, "mem_outside_window"));
+        }
+        try std.testing.expect(seen_a);
+        try std.testing.expect(seen_b);
+        try std.testing.expectEqual(@as(usize, 2), births.len);
+    }
+
+    // ── Deaths surface ──────────────────────────────────────────────
+    {
+        const deaths = try mgr.listMemoryDeathsInWindow(allocator, 2, window_from, window_to, 100);
+        defer memory_root.freeEntries(allocator, deaths);
+        // Expected: mem_born_died_today + mem_born_yesterday (2 rows).
+        // Out-of-window death excluded. Hidden continuity summary filtered.
+        var seen_b = false;
+        var seen_c = false;
+        for (deaths) |e| {
+            try std.testing.expect(memory_root.isBrainVisibleKey(e.key));
+            try std.testing.expect(e.valid_to != null);
+            if (std.mem.eql(u8, e.key, "mem_born_died_today")) seen_b = true;
+            if (std.mem.eql(u8, e.key, "mem_born_yesterday")) seen_c = true;
+            try std.testing.expect(!std.mem.eql(u8, e.key, "mem_born_today"));
+            try std.testing.expect(!std.mem.eql(u8, e.key, "mem_outside_window"));
+        }
+        try std.testing.expect(seen_b);
+        try std.testing.expect(seen_c);
+        try std.testing.expectEqual(@as(usize, 2), deaths.len);
+    }
+
+    // ── Independence: born+died-today appears in BOTH lists ─────────
+    // Already verified above (seen_b in births AND deaths). The contract
+    // is that births/deaths are independent event streams over the same
+    // window — a row that experienced both events shows up twice.
+
+    // ── Cross-tenant scoping ────────────────────────────────────────
+    {
+        const wrong_births = try mgr.listMemoryBirthsInWindow(allocator, 99, window_from, window_to, 100);
+        defer memory_root.freeEntries(allocator, wrong_births);
+        try std.testing.expectEqual(@as(usize, 0), wrong_births.len);
+        const wrong_deaths = try mgr.listMemoryDeathsInWindow(allocator, 99, window_from, window_to, 100);
+        defer memory_root.freeEntries(allocator, wrong_deaths);
+        try std.testing.expectEqual(@as(usize, 0), wrong_deaths.len);
     }
 }
 
