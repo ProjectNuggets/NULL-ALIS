@@ -716,11 +716,8 @@ fn resolveEntityKey(
 }
 
 fn deriveEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
-    var lower_buf: [256]u8 = undefined;
-    const lower = if (object.len <= lower_buf.len) blk: {
-        for (object, 0..) |ch, i| lower_buf[i] = std.ascii.toLower(ch);
-        break :blk lower_buf[0..object.len];
-    } else object;
+    const lower = try lowerForEntityKey(allocator, object);
+    defer allocator.free(lower);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(lower);
     var digest: [32]u8 = undefined;
@@ -728,6 +725,73 @@ fn deriveEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
     var hex_buf: [16]u8 = undefined;
     _ = security_secrets.hexEncode(digest[0..8], &hex_buf);
     return std.fmt.allocPrint(allocator, "entity_{s}", .{hex_buf});
+}
+
+/// V1.7a-4 (closes V1.6 ship-review WR-02) — canonicalization helper for
+/// entity-key hashing. Both `extraction_persist.deriveEntityKey` and
+/// `commands.deriveSessionEndEntityKey` route every `object` string through
+/// this before SHA-256. The PG cmt16 backfill SQL must also call PG's
+/// `lower(...)` (Unicode-aware) on the same input, so all three paths
+/// produce byte-identical hashes for the same surface form.
+///
+/// Coverage:
+///   - ASCII A-Z → a-z
+///   - Latin-1 Supplement uppercase (À-Þ excluding ×) → lowercase
+///   - All other codepoints pass through unchanged (matches PG `lower()`
+///     for the C locale; for UTF-8 locales PG covers wider ranges that
+///     this helper does not. Documented divergence — extraction surface
+///     forms are overwhelmingly ASCII + Latin-1; if real workloads start
+///     producing Cyrillic/Greek/CJK uppercase entity names this helper
+///     can extend its mapping table without changing the hash for the
+///     existing covered ranges).
+///
+/// Returns an allocator-owned slice. Caller frees.
+pub fn lowerForEntityKey(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    errdefer buf.deinit(allocator);
+    try buf.ensureTotalCapacity(allocator, s.len);
+
+    var i: usize = 0;
+    while (i < s.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+            // Invalid UTF-8 lead byte — pass through unchanged
+            // (lossless on bad input rather than failing hash derivation).
+            try buf.append(allocator, s[i]);
+            i += 1;
+            continue;
+        };
+        if (i + cp_len > s.len) {
+            // Truncated UTF-8 sequence at end — preserve remaining bytes.
+            try buf.appendSlice(allocator, s[i..]);
+            break;
+        }
+        const cp = std.unicode.utf8Decode(s[i .. i + cp_len]) catch {
+            // Decode failed despite valid lead byte length — preserve raw bytes.
+            try buf.appendSlice(allocator, s[i .. i + cp_len]);
+            i += cp_len;
+            continue;
+        };
+        const mapped = mapCodepointToLower(cp);
+        if (mapped == cp) {
+            // No change — copy original bytes (faster than re-encoding).
+            try buf.appendSlice(allocator, s[i .. i + cp_len]);
+        } else {
+            var enc_buf: [4]u8 = undefined;
+            const enc_len = std.unicode.utf8Encode(mapped, &enc_buf) catch unreachable;
+            try buf.appendSlice(allocator, enc_buf[0..enc_len]);
+        }
+        i += cp_len;
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+fn mapCodepointToLower(cp: u21) u21 {
+    // ASCII A-Z → a-z
+    if (cp >= 'A' and cp <= 'Z') return cp + 32;
+    // Latin-1 Supplement uppercase: À..Þ (U+00C0..U+00DE), excluding × (U+00D7).
+    // Lowercase mirrors at U+00E0..U+00FE excluding ÷ (U+00F7), offset +0x20.
+    if (cp >= 0x00C0 and cp <= 0x00DE and cp != 0x00D7) return cp + 0x20;
+    return cp;
 }
 
 /// V1.6 commit 6 helper — drop entries from `xs` whose key appears in
@@ -865,4 +929,111 @@ test "parseExtractedJson handles confidence as integer" {
     defer freeExtractedMemories(allocator, out);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), out[0].confidence, 0.001);
+}
+
+// V1.7a-4 (closes V1.6 ship-review WR-02) — lowerForEntityKey unit tests.
+// Both Zig sites + the SQL backfill (lower(...) post-V1.7a-4) must
+// produce byte-identical lowercased input for any covered surface form.
+
+test "lowerForEntityKey: ASCII A-Z → a-z" {
+    const allocator = std.testing.allocator;
+    const out = try lowerForEntityKey(allocator, "HELIX EDITOR");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("helix editor", out);
+}
+
+test "lowerForEntityKey: already-lowercase passes through unchanged" {
+    const allocator = std.testing.allocator;
+    const out = try lowerForEntityKey(allocator, "helix editor");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("helix editor", out);
+}
+
+test "lowerForEntityKey: Latin-1 Supplement uppercase → lowercase" {
+    const allocator = std.testing.allocator;
+    // À É Ñ Ö Ü Þ → à é ñ ö ü þ (all in U+00C0..U+00DE except U+00D7)
+    const out = try lowerForEntityKey(allocator, "ÀÉÑÖÜÞ");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("àéñöüþ", out);
+}
+
+test "lowerForEntityKey: mixed ASCII + Latin-1 (CAFÉ → café)" {
+    const allocator = std.testing.allocator;
+    const out = try lowerForEntityKey(allocator, "CAFÉ");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("café", out);
+}
+
+test "lowerForEntityKey: × (U+00D7) is NOT a letter — passes unchanged" {
+    const allocator = std.testing.allocator;
+    // U+00D7 (multiplication sign) sits in the Latin-1 uppercase range
+    // numerically but is not a letter; PG lower() leaves it alone.
+    const out = try lowerForEntityKey(allocator, "5×3");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("5×3", out);
+}
+
+test "lowerForEntityKey: out-of-range codepoints pass through (Cyrillic)" {
+    const allocator = std.testing.allocator;
+    // Cyrillic uppercase ПРИВЕТ stays as-is (helper does not cover Cyrillic;
+    // documented divergence from PG lower() in UTF-8 locales — acceptable
+    // because extraction targets are overwhelmingly Latin script).
+    const out = try lowerForEntityKey(allocator, "ПРИВЕТ");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("ПРИВЕТ", out);
+}
+
+test "lowerForEntityKey: invalid UTF-8 lead byte preserved (lossless on bad input)" {
+    const allocator = std.testing.allocator;
+    // 0xFF is never a valid UTF-8 lead byte. Helper passes it through
+    // rather than failing — entity-key derivation must always succeed
+    // even on garbage input (otherwise extraction pipeline crashes).
+    const input = [_]u8{ 'a', 0xFF, 'b' };
+    const out = try lowerForEntityKey(allocator, &input);
+    defer allocator.free(out);
+    try std.testing.expectEqualSlices(u8, &input, out);
+}
+
+test "lowerForEntityKey: truncated UTF-8 sequence at end preserved" {
+    const allocator = std.testing.allocator;
+    // 0xC3 is a 2-byte UTF-8 lead but no continuation follows. Helper
+    // emits the partial bytes rather than reading past end-of-buffer.
+    const input = [_]u8{ 'a', 0xC3 };
+    const out = try lowerForEntityKey(allocator, &input);
+    defer allocator.free(out);
+    try std.testing.expectEqualSlices(u8, &input, out);
+}
+
+test "lowerForEntityKey: empty string returns empty allocation" {
+    const allocator = std.testing.allocator;
+    const out = try lowerForEntityKey(allocator, "");
+    defer allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "lowerForEntityKey: deriveEntityKey produces stable key for case variants" {
+    const allocator = std.testing.allocator;
+    const k1 = try deriveEntityKey(allocator, "Helix");
+    defer allocator.free(k1);
+    const k2 = try deriveEntityKey(allocator, "HELIX");
+    defer allocator.free(k2);
+    const k3 = try deriveEntityKey(allocator, "helix");
+    defer allocator.free(k3);
+    // All three surface forms must hash to the same entity_<...> key.
+    try std.testing.expectEqualStrings(k1, k2);
+    try std.testing.expectEqualStrings(k2, k3);
+}
+
+test "lowerForEntityKey: deriveEntityKey unifies Latin-1 case variants (Café/CAFÉ/café)" {
+    const allocator = std.testing.allocator;
+    const k1 = try deriveEntityKey(allocator, "Café");
+    defer allocator.free(k1);
+    const k2 = try deriveEntityKey(allocator, "CAFÉ");
+    defer allocator.free(k2);
+    const k3 = try deriveEntityKey(allocator, "café");
+    defer allocator.free(k3);
+    // Pre-V1.7a-4 these would have produced 3 different entity rows;
+    // post-fix they collapse to one.
+    try std.testing.expectEqualStrings(k1, k2);
+    try std.testing.expectEqualStrings(k2, k3);
 }

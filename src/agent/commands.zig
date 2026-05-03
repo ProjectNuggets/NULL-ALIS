@@ -151,15 +151,16 @@ fn memoryRuntimePtr(self: anytype) ?*memory_mod.MemoryRuntime {
 /// mirroring extraction_persist.deriveEntityKey shape so session-end edges
 /// land on the SAME entity nodes that compaction Pass C extraction creates.
 /// `entity_<sha256(lower(object))[0..16]>`. Lowercase normalizes capitalization
-/// variance ("Helix" vs "helix"). Cmt8 entity coreference (cosine ≥0.95) is
-/// not plumbed here — commands.zig has no embedding provider in scope; full
+/// variance ("Helix" vs "helix"). V1.7a-4 (closes ship-review WR-02): the
+/// canonicalization helper is now `extraction_persist.lowerForEntityKey`
+/// (Unicode-aware over ASCII + Latin-1 Supplement) — single source of truth
+/// for both Zig sites and matched server-side by PG `lower(...)` in the
+/// cmt16 backfill SQL. Cmt8 entity coreference (cosine ≥0.95) is not
+/// plumbed here — commands.zig has no embedding provider in scope; full
 /// coref requires routing through extraction_persist (cmt9.6 follow-up).
 fn deriveSessionEndEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
-    var lower_buf: [256]u8 = undefined;
-    const lower = if (object.len <= lower_buf.len) blk: {
-        for (object, 0..) |ch, i| lower_buf[i] = std.ascii.toLower(ch);
-        break :blk lower_buf[0..object.len];
-    } else object;
+    const lower = try extraction_persist.lowerForEntityKey(allocator, object);
+    defer allocator.free(lower);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(lower);
     var digest: [32]u8 = undefined;

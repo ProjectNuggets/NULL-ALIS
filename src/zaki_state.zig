@@ -1226,21 +1226,21 @@ const ManagerImpl = struct {
             // Cost: O(N) over rows with metadata.subject populated. On
             // Nova's user_id=1 dev DB this is a small number; production
             // scale will run during a maintenance window.
-            // V1.6 ship review WR-02: align SQL lowercasing with the Zig
-            // path's std.ascii.toLower (ASCII-only). PG's `lower()` is
-            // locale-aware and lowercases non-ASCII (e.g. "CAFÉ" → "café"),
-            // which would diverge from extraction_persist.deriveEntityKey
-            // and commands.deriveSessionEndEntityKey for non-ASCII names.
-            // `translate()` with explicit ASCII A-Z → a-z mapping matches
-            // the Zig-side semantic exactly. Forward-write paths producing
-            // non-ASCII entity names (rare but possible) still hash to the
-            // same `entity_<hash>` whether they go through the Zig or SQL
-            // path. A future commit can move both paths to Unicode-aware
-            // lowercasing if real workloads need it; aligning to the
-            // existing Zig semantic is the safe-now move.
+            // V1.7a-4 (closes V1.6 ship-review WR-02): both Zig sites
+            // (extraction_persist.deriveEntityKey + commands.deriveSessionEndEntityKey)
+            // now route through extraction_persist.lowerForEntityKey, a
+            // Unicode-aware helper covering ASCII A-Z + Latin-1 Supplement
+            // uppercase → lowercase. PG's `lower(...)` does the same in
+            // UTF-8 locales (the production deployment target) AND a strict
+            // superset in C-locale (which only lowercases ASCII anyway).
+            // Both paths now produce identical entity_<hash> keys for any
+            // surface form in the covered range. Pre-V1.7a-4 tenants with
+            // already-extracted non-ASCII uppercase entity names will see
+            // a one-time entity-key shift on next backfill run (rare —
+            // extraction prompt emits canonical lowercase by design).
             "INSERT INTO {schema}.memory_edges (user_id, source_key, target_key, predicate, attribution, confidence, valid_from) " ++
                 "SELECT user_id, key AS source_key, " ++
-                "'entity_' || substring(encode(digest(translate(metadata->>'object', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sha256'), 'hex') from 1 for 16) AS target_key, " ++
+                "'entity_' || substring(encode(digest(lower(metadata->>'object'), 'sha256'), 'hex') from 1 for 16) AS target_key, " ++
                 "metadata->>'predicate' AS predicate, " ++
                 "COALESCE(metadata->>'attribution', 'extraction_classifier') AS attribution, " ++
                 "COALESCE((metadata->>'confidence')::float, 1.0) AS confidence, " ++
@@ -2789,7 +2789,7 @@ const ManagerImpl = struct {
         const now_s = std.time.timestamp();
         const content = try std.fmt.allocPrint(
             self.allocator,
-            "type=pending_conflicts\nkey={s}\nsession={s}\nat={d}\ninstruction=One or more facts you know were updated from a new session. Verify with the user which value is correct for the key shown, then call memory_store to update it and memory_forget(\"pending_conflicts\") to clear this flag. Note: only the most recent conflicted key is shown here.\n",
+            "type=pending_conflicts\nkey={s}\nsession={s}\nat={d}\ninstruction=A fact you know was updated from a new session. The conflicted memory key is the value of the `key=` field above (NOT the literal string \"pending_conflicts\"). Steps: (1) verify with the user which value is correct for the conflicted key, (2) call memory_store(key=<conflicted-key-from-above>, content=<corrected-value>) to update the conflicted fact, (3) call memory_forget(key=\"pending_conflicts\") to clear this flag. Note: only the most recent conflicted key is shown — older conflicts were overwritten.\n",
             .{ key, session_id, now_s },
         );
         defer self.allocator.free(content);
