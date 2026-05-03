@@ -879,10 +879,27 @@ pub fn loadTurnMemorySlot(
     result.stats.graph_recall_appended_bytes = graph_stats.appended_bytes;
     result.stats.graph_recall_max_hops = graph_stats.max_hops_resolved;
 
-    // If both legacy + graph are empty, return empty slot (no fence).
+    // ── V1.7-ship S2b: warm <active_communities> block ─────────────────
+    // Append top-3 communities by member_count when state_mgr + user_id
+    // are bound AND at least one community exists. Cost: 1 PG call per
+    // turn (listCommunities, bounded by per-user community count which
+    // is typically 5-20). Block size: ~80-150 bytes. Falls back silently
+    // on any error or cold-start (no recompute yet); legacy + graph
+    // blocks are unaffected.
+    var community_block: ?[]u8 = null;
+    if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
+        community_block = buildActiveCommunitiesBlock(allocator, sm, uid) catch |err| blk: {
+            log.warn("active_communities.append_failed err={s} — skipping community context", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+    defer if (community_block) |c| allocator.free(c);
+
+    // If everything is empty, return empty slot (no fence).
     const has_legacy = result.context.len > 0;
     const has_graph = if (graph_block) |g| g.len > 0 else false;
-    if (!has_legacy and !has_graph) {
+    const has_community = if (community_block) |c| c.len > 0 else false;
+    if (!has_legacy and !has_graph and !has_community) {
         allocator.free(result.context);
         return .{
             .fenced_content = try allocator.dupe(u8, ""),
@@ -892,22 +909,70 @@ pub fn loadTurnMemorySlot(
 
     defer allocator.free(result.context);
     const graph_payload: []const u8 = if (graph_block) |g| g else "";
-    const fenced = if (has_graph)
-        try std.fmt.allocPrint(
-            allocator,
-            "<memory_for_turn>\n{s}{s}</memory_for_turn>\n",
-            .{ result.context, graph_payload },
-        )
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "<memory_for_turn>\n{s}</memory_for_turn>\n",
-            .{result.context},
-        );
+    const community_payload: []const u8 = if (community_block) |c| c else "";
+    const fenced = try std.fmt.allocPrint(
+        allocator,
+        "<memory_for_turn>\n{s}{s}{s}</memory_for_turn>\n",
+        .{ result.context, graph_payload, community_payload },
+    );
     return .{
         .fenced_content = fenced,
         .stats = result.stats,
     };
+}
+
+/// V1.7-ship S2b — emit the top-3 communities by member_count as warm
+/// always-on context. Gives the agent visibility into the user's
+/// highest-level brain structure on every memory-touching turn without
+/// requiring an explicit `brain_graph` tool call.
+///
+/// Format:
+///   <active_communities source="lpa">
+///   community_name (N members), community_name2 (M members), community_name3 (K members)
+///   </active_communities>
+///
+/// Returns empty slice when:
+///   - No communities computed yet (cold start, never recomputed) — this
+///     is the common case before the first /brain/communities/recompute
+///     POST or nightly scheduler run
+///   - Every community has only an unnamed fallback (no useful signal)
+///
+/// listCommunities already returns rows sorted by member_count DESC (and
+/// applies MEMORIES_VALIDITY_FILTER on the live count subquery), so we
+/// just take the prefix.
+fn buildActiveCommunitiesBlock(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+) !?[]u8 {
+    const summaries = try state_mgr.listCommunities(allocator, user_id);
+    defer memory_mod.freeCommunitySummaries(allocator, summaries);
+    if (summaries.len == 0) return null;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("<active_communities source=\"lpa\">\n");
+    var emitted: usize = 0;
+    for (summaries) |s| {
+        if (emitted >= 3) break;
+        // Skip unnamed (still being computed) communities so the agent
+        // doesn't see "Cluster 47312" noise. Named-only is the high-
+        // signal subset.
+        const name = s.name orelse continue;
+        if (name.len == 0) continue;
+        if (emitted > 0) try w.writeAll(", ");
+        try w.print("{s} ({d} members)", .{ name, s.member_count });
+        emitted += 1;
+    }
+    if (emitted == 0) {
+        // No NAMED communities yet (all fallbacks pending real LLM names).
+        // Drop the block rather than emit an empty header.
+        buf.deinit(allocator);
+        return null;
+    }
+    try w.writeAll("\n</active_communities>\n");
+    return try buf.toOwnedSlice(allocator);
 }
 
 // ── V1.7a-2 graph-expand recall consumer helpers ──────────────────────────

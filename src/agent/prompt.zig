@@ -697,7 +697,14 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("- \"Run command\", \"check commit\", \"list files\", \"git log\", \"show me output\": `shell` FIRST.\n");
     try w.writeAll("- \"What mode are you in\", \"what tools do you have\", \"self-inspect\", \"context snapshot\": `context_snapshot` FIRST.\n");
     try w.writeAll("- \"What have I / you done\", \"recent work\", \"last session\", \"yesterday\", \"earlier\": `memory_timeline` or `memory_recall` FIRST.\n");
-    try w.writeAll("- \"Fetch this URL\", \"what's at link X\": `web_fetch` FIRST.\n\n");
+    try w.writeAll("- \"Fetch this URL\", \"what's at link X\": `web_fetch` FIRST.\n");
+    // V1.7-ship S2c — graph-shape questions route to brain_graph, not memory_recall.
+    // memory_recall is text retrieval (good for content of a fact); brain_graph
+    // is structural retrieval (good for shape of relations / clusters / time).
+    try w.writeAll("- \"What CONNECTS to X\", \"who works at Y\", \"what's adjacent to memory K\": `brain_graph` action=\"local_graph\" with center_key from a prior `memory_recall` hit.\n");
+    try w.writeAll("- \"What TOPICS am I focused on\", \"what clusters are in my brain\", \"what themes recur\": `brain_graph` action=\"communities\".\n");
+    try w.writeAll("- \"What did I save but never link\", \"isolated facts\", \"forgotten notes\": `brain_graph` action=\"orphans\".\n");
+    try w.writeAll("- \"What CHANGED in my brain on DATE\", \"what did I learn yesterday\", \"births and deaths\": `brain_graph` action=\"diff\" with date=YYYY-MM-DD.\n\n");
     try w.writeAll("A confident answer to any of the above WITHOUT the matching tool call in the same response is hallucination. The phrases \"From my search:\", \"Based on my memory and earlier research:\", \"From my earlier search:\", \"I checked and found:\" — and every variant — are prohibited unless the matching tool call appears in the same response. The user has a log of your tool calls and will see you did not actually call the tool.\n\n");
     try w.writeAll("Concrete example you must follow:\n\n");
     try w.writeAll("  User: \"Tell me about Widget Co.\"\n");
