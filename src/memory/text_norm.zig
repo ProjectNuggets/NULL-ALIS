@@ -20,6 +20,66 @@
 
 const std = @import("std");
 
+/// V1.7a-4 review fix WR-01 / IN-01 — single source of truth for UTF-8-safe
+/// length-bounded truncation. Replaces three diverged copies that lived in
+/// `agent/extraction_persist.zig`, `agent/memory_loader.zig`, and
+/// `agent/commands.zig` (all subtly identical, but easy to drift). Returns
+/// a borrowed slice of `s` (no allocation), at most `max_len` bytes,
+/// guaranteed not to split a multi-byte UTF-8 codepoint mid-sequence by
+/// backing up over trailing 0x80..0xBF continuation bytes.
+///
+/// Edge cases:
+///   - `s.len <= max_len` → returns `s` unchanged
+///   - `max_len == 0` → returns `s[0..0]` (empty slice, never indexes `s`)
+///   - All trailing bytes are continuations (truncating mid-codepoint into
+///     a string that's all continuation bytes from byte 0) → `end` walks
+///     down to 0 and returns `s[0..0]`
+pub fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
+    if (s.len <= max_len) return s;
+    var end: usize = max_len;
+    // Loop invariant: end > 0 protects against indexing s[-1]; the
+    // continuation-byte check ensures we land BEFORE a continuation byte
+    // (i.e., on a codepoint boundary or at end=0).
+    while (end > 0 and s[end] & 0xC0 == 0x80) end -= 1;
+    return s[0..end];
+}
+
+test "truncateUtf8: returns input when shorter than max" {
+    try std.testing.expectEqualStrings("abc", truncateUtf8("abc", 10));
+}
+
+test "truncateUtf8: ASCII truncation at exact boundary" {
+    try std.testing.expectEqualStrings("abc", truncateUtf8("abcdef", 3));
+}
+
+test "truncateUtf8: backs up over UTF-8 continuation byte" {
+    // "café" = 'c' (0x63) 'a' (0x61) 'f' (0x66) 'é' (0xC3 0xA9)
+    // max_len=4 lands on 0xA9 (continuation); backs up to 3.
+    try std.testing.expectEqualStrings("caf", truncateUtf8("café", 4));
+}
+
+test "truncateUtf8: max_len==0 returns empty without indexing" {
+    try std.testing.expectEqualStrings("", truncateUtf8("café", 0));
+}
+
+test "truncateUtf8: 4-byte codepoint backed up cleanly" {
+    // "🎉" = 0xF0 0x9F 0x8E 0x89 (4-byte UTF-8). max_len=2 lands on
+    // 0x8E (continuation), backs up to 1 (still continuation 0x9F),
+    // backs up to 0 (lead byte 0xF0 is NOT a continuation; loop stops).
+    // Returns empty (we'd need at least 4 bytes for one codepoint).
+    try std.testing.expectEqualStrings("", truncateUtf8("🎉", 2));
+    try std.testing.expectEqualStrings("🎉", truncateUtf8("🎉", 4));
+}
+
+test "truncateUtf8: mixed ASCII + multibyte" {
+    // "ab🎉cd" = 'a' 'b' 0xF0 0x9F 0x8E 0x89 'c' 'd'  (8 bytes)
+    // max_len=4 lands on 0x8E (continuation). Backs up to 2 (lead 0xF0 is
+    // not continuation, but bytes after 0xF0 ARE — wait, 0xF0 itself
+    // isn't a continuation; loop stops at end=2 since s[2]=0xF0 with
+    // 0xF0 & 0xC0 == 0xC0, NOT 0x80). So returns "ab".
+    try std.testing.expectEqualStrings("ab", truncateUtf8("ab🎉cd", 4));
+}
+
 // Top common English stopwords. Ordered by approximate frequency. Conservative
 // set — keeps semantic content like "the", "a", "is", "and" out of the index
 // without stripping anything that might carry meaning ("not", "no" stay).

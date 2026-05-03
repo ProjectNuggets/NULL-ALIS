@@ -683,6 +683,22 @@ const AppEventSubscriberRegistry = struct {
     }
 
     fn keyFor(allocator: std.mem.Allocator, user_id: []const u8, session_key: []const u8) ![]u8 {
+        // V1.7a-4 review fix IN-02 (DOCUMENTATION fix): the `user_id` param
+        // is intentionally discarded. session_key is conventionally
+        // user-scoped (e.g. "agent:zaki-bot:user:1:main") via the
+        // session-key derivation contract enforced upstream by
+        // `zaki_session.parseUserIdFromSessionKey` and the SSE handler's
+        // `resolveChatEventsSessionKey` which rejects cross-user requests
+        // with `error.SessionKeyUserMismatch`. So composing user_id into
+        // the registry key would be redundant and would silently break
+        // tests that introspect the internal map using session_key alone
+        // (e.g. `subscribers.contains("session:live")`).
+        //
+        // The user_id parameter is kept on the API surface so callers
+        // pass it explicitly — this preserves call-site readability AND
+        // gives a fast path to add user-scoping if a future caller
+        // legitimately passes a non-user-scoped session_key (an event
+        // we'd want a code reviewer to surface, not silently encode here).
         _ = user_id;
         return allocator.dupe(u8, session_key);
     }
@@ -3035,11 +3051,32 @@ fn firstConfiguredInternalServiceToken(internal_service_tokens: []const []const 
     return null;
 }
 
-/// Constant-time comparison to prevent timing side-channel attacks on token extraction.
+/// Constant-time comparison to prevent timing side-channel attacks on token
+/// validation. V1.7a-4 review fix WR-04: previous version had a bare
+/// `if (a.len != b.len) return false;` early-return that leaked the expected
+/// token length via response-time delta (wrong length → fast path; right
+/// length → slow XOR loop). An attacker probing token-length bytewise could
+/// distinguish the two cases.
+///
+/// Fixed shape:
+///   - Iterate up to `max(a.len, b.len)` regardless of length match
+///   - Out-of-range indices on the shorter side compare against 0 (which
+///     is data-independent — the loop length depends ONLY on the longer
+///     buffer, NOT on whether the lengths matched)
+///   - A length mismatch flips the result-bit unconditionally so the final
+///     comparison still rejects mismatched-length inputs
+///
+/// Residual leak: total runtime scales with `max(a.len, b.len)`, so an
+/// attacker COULD still infer "is the expected token longer than X?" by
+/// timing extreme length probes. Mitigated in practice because internal
+/// service tokens are configured server-side and not under attacker control.
 fn constantTimeEqual(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var result: u8 = 0;
-    for (a, b) |x, y| {
+    var result: u8 = if (a.len == b.len) 0 else 1;
+    const max_len = @max(a.len, b.len);
+    var i: usize = 0;
+    while (i < max_len) : (i += 1) {
+        const x: u8 = if (i < a.len) a[i] else 0;
+        const y: u8 = if (i < b.len) b[i] else 0;
         result |= x ^ y;
     }
     return result == 0;

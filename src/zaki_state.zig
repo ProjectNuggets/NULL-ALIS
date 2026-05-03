@@ -67,13 +67,20 @@ pub const BRAIN_USER_KEY_FILTER = blk: {
     var s: []const u8 = "key !~ '^(";
     for (memory_root.BRAIN_HIDDEN_PREFIXES, 0..) |prefix, i| {
         if (i > 0) s = s ++ "|";
-        // Postgres regex meta-character escaping. Our prefix list only
-        // contains `.` as a meta-char (in `__bootstrap.prompt.`); other
-        // chars (`_`, `/`, alphanumeric) are literal in regex. Add new
-        // escapes here if a future prefix introduces other meta-chars.
+        // V1.7a-4 review fix IN-05: previously only escaped `.` because
+        // that was the only meta-char in the existing prefix list. A
+        // future addition like `cache.[v1]` or `tmp.(seq).` would have
+        // produced malformed SQL silently — `[`, `]`, `(`, `)`, `*`,
+        // `+`, `?`, `|`, `^`, `$`, `\` are ALL PG POSIX-regex meta-chars
+        // that need backslash-escaping when used as literals. Cover the
+        // full set now so adding a new prefix can't break the filter.
         for (prefix) |ch| {
-            if (ch == '.') {
-                s = s ++ "\\.";
+            const is_meta = switch (ch) {
+                '.', '\\', '(', ')', '[', ']', '{', '}', '*', '+', '?', '|', '^', '$' => true,
+                else => false,
+            };
+            if (is_meta) {
+                s = s ++ "\\" ++ &[_]u8{ch};
             } else {
                 s = s ++ &[_]u8{ch};
             }

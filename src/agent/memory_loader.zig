@@ -4,10 +4,17 @@ const memory_mod = @import("../memory/root.zig");
 const multimodal = @import("../multimodal.zig");
 const zaki_state = @import("../zaki_state.zig");
 const graph_expand = @import("graph_expand.zig");
+const text_norm = @import("../memory/text_norm.zig");
 const Memory = memory_mod.Memory;
 const MemoryEntry = memory_mod.MemoryEntry;
 const MemoryRuntime = memory_mod.MemoryRuntime;
 const log = std.log.scoped(.memory_loader);
+
+/// V1.7a-4 review fix WR-01: alias the consolidated UTF-8 truncation
+/// helper so existing call sites in this file don't need to change. The
+/// shared implementation lives in `memory/text_norm.zig` (one source of
+/// truth across the 3 prior diverged copies).
+const truncateUtf8 = text_norm.truncateUtf8;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Memory Loader — inject relevant memory context into user messages
@@ -103,14 +110,10 @@ pub const MemorySlot = struct {
     stats: SelectionStats,
 };
 
-/// Truncate a UTF-8 slice to at most `max_len` bytes without splitting
-/// a multi-byte sequence. Backs up over trailing continuation bytes (0x80..0xBF).
-fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
-    if (s.len <= max_len) return s;
-    var end: usize = max_len;
-    while (end > 0 and s[end] & 0xC0 == 0x80) end -= 1;
-    return s[0..end];
-}
+// truncateUtf8 helper has moved to memory/text_norm.zig — single source of
+// truth (V1.7a-4 review fix WR-01). The local alias `const truncateUtf8 =
+// text_norm.truncateUtf8;` near the top of this file preserves all existing
+// call sites without code change.
 
 fn containsKey(entries: []const MemoryEntry, key: []const u8) bool {
     for (entries) |entry| {

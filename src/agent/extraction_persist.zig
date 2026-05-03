@@ -50,6 +50,7 @@ const security_secrets = @import("../security/secrets.zig");
 const providers = @import("../providers/root.zig");
 const edge_resolution = @import("edge_resolution.zig");
 const memory_embeddings = @import("../memory/vector/embeddings.zig");
+const text_norm = @import("../memory/text_norm.zig");
 
 /// One atomic fact extracted from a conversation. Mirrors the JSON
 /// schema specified in compaction.zig::summarizer_system. Produced by
@@ -585,14 +586,10 @@ pub fn persistExtracted(
         // is already written; missing source attribution degrades the
         // drilldown UX but preserves the fact.
         const SNIPPET_CAP: usize = 256;
-        const snippet: ?[]const u8 = blk: {
-            if (m.text.len == 0) break :blk null;
-            if (m.text.len <= SNIPPET_CAP) break :blk m.text;
-            // UTF-8-safe truncation: back up over continuation bytes.
-            var end: usize = SNIPPET_CAP;
-            while (end > 0 and m.text[end] & 0xC0 == 0x80) end -= 1;
-            break :blk m.text[0..end];
-        };
+        // V1.7a-4 review fix WR-01: route through the consolidated UTF-8
+        // truncation helper in `memory/text_norm.zig`. Was an inline copy
+        // of the same logic — single source of truth eliminates drift.
+        const snippet: ?[]const u8 = if (m.text.len == 0) null else text_norm.truncateUtf8(m.text, SNIPPET_CAP);
         state_mgr.setMemorySource(user_id, key, session_id, snippet) catch |err| {
             log.warn("extraction.source_set_failed key={s} err={s}", .{ key, @errorName(err) });
         };

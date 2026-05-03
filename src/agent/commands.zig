@@ -4,6 +4,7 @@ const learning = @import("learning.zig");
 const prompt_mod = @import("prompt.zig");
 const providers = @import("../providers/root.zig");
 const extraction_persist = @import("extraction_persist.zig");
+const text_norm = @import("../memory/text_norm.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
@@ -615,12 +616,10 @@ fn findToolByName(self: anytype, name: []const u8) ?Tool {
     return null;
 }
 
-fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
-    if (s.len <= max_len) return s;
-    var end: usize = max_len;
-    while (end > 0 and s[end] & 0xC0 == 0x80) end -= 1;
-    return s[0..end];
-}
+// V1.7a-4 review fix WR-01: alias the consolidated UTF-8 truncation helper
+// from `memory/text_norm.zig` so existing call sites in this file stay
+// untouched. One source of truth across all 3 prior diverged copies.
+const truncateUtf8 = text_norm.truncateUtf8;
 
 fn stripMemoryContextPrefix(text: []const u8) []const u8 {
     const prefix = "[Memory context]\n";

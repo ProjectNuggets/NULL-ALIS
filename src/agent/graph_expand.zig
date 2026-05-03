@@ -168,7 +168,27 @@ pub fn expandFromSeeds(
             });
             break;
         };
-        defer allocator.free(hop_edges); // we move entries into all_edges
+
+        // V1.7a-4 review fix WR-02 — partial-move leak hardening.
+        //
+        // Each TypedEdge in hop_edges owns 3 strings (source_key, target_key,
+        // predicate). The loop below MOVES edges one-by-one into all_edges
+        // via `try ... append(...)`. If append fails mid-loop (OOM during
+        // ArrayList growth), the moved tail is now owned by all_edges
+        // (cleaned by the outer errdefer) but the NOT-YET-MOVED edges
+        // [moved_count..] are still in hop_edges with their owned strings.
+        // The bare `defer allocator.free(hop_edges)` only frees the slice
+        // header — the per-edge strings would leak.
+        //
+        // Track moved_count and have the defer deinit the unmoved tail
+        // before freeing the slice. On normal completion, moved_count ==
+        // hop_edges.len, the tail is empty, and only the slice header gets
+        // freed (no double-deinit).
+        var moved_count: usize = 0;
+        defer {
+            for (hop_edges[moved_count..]) |*e| e.deinit(allocator);
+            allocator.free(hop_edges);
+        }
 
         // Sort by weight DESC so the cap drops the weakest edges first.
         std.sort.pdq(memory_root.TypedEdge, hop_edges, {}, edgeWeightDesc);
@@ -181,6 +201,7 @@ pub fn expandFromSeeds(
         for (hop_edges) |e| {
             // Take ownership of edge into all_edges, regardless of admission.
             try all_edges.append(allocator, e);
+            moved_count += 1;
 
             if (admitted >= config.max_nodes_per_hop) continue;
 
