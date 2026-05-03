@@ -12562,12 +12562,21 @@ fn handleBrainDiff(
         const tp = std.fmt.parseInt(i64, to_param.?, 10) catch {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_to\"}" };
         };
+        // Reject pre-epoch values: the entire memory model is post-1970,
+        // and validating non-negative is the cheapest way to make the
+        // subsequent `tp - fp` subtraction overflow-proof under hostile
+        // input (i64.min - i64.max would wrap silently).
+        if (fp < 0 or tp < 0) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"window_pre_epoch\"}" };
+        }
         if (tp <= fp) {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"to_must_exceed_from\"}" };
         }
         // Cap canonical window to BRAIN_DIFF_MAX_WINDOW_DAYS to mirror the
         // date+window_days path — otherwise a malicious caller could
-        // request decades of rows in one shot.
+        // request decades of rows in one shot. With both operands ≥ 0
+        // (validated above), `tp - fp` is in [0, i64.max] and cannot
+        // overflow.
         const max_span: i64 = @as(i64, BRAIN_DIFF_MAX_WINDOW_DAYS) * 86400;
         if ((tp - fp) > max_span) {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"window_too_large\"}" };
