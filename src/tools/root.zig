@@ -86,6 +86,7 @@ pub const memory_purge_topic = @import("memory_purge_topic.zig");
 pub const schedule = @import("schedule.zig");
 pub const todo = @import("todo.zig");
 pub const compose_memory = @import("compose_memory.zig");
+pub const brain_graph = @import("brain_graph.zig");
 pub const delegate = @import("delegate.zig");
 pub const browser = @import("browser.zig");
 pub const image = @import("image.zig");
@@ -474,6 +475,16 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // dangling references are filtered at /brain/graph render time.
         .name = compose_memory.ComposeMemoryTool.tool_name,
         .flags = .{ .mutating = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        // V1.7-ship S2a — read-only graph navigation tool. Wraps
+        // V1.7a-Obsidian-parity primitives (local_graph, communities,
+        // orphans, diff). No writes; one or two PG round trips per
+        // call; bounded payloads. Safe + cheap.
+        .name = brain_graph.BrainGraphTool.tool_name,
+        .flags = .{},
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -1119,6 +1130,15 @@ pub fn allTools(
     cmt.* = .{};
     try list.append(allocator, cmt.tool());
 
+    // V1.7-ship S2a — brain_graph tool (graph navigation: local subgraph,
+    // communities, orphans, diff). Tenant binding via bindStateMgrTenant
+    // pass below. Falls back to clear "state manager not bound" failure
+    // when postgres isn't configured (so the agent's prompt-time tool
+    // listing always succeeds; runtime gracefully reports the gap).
+    const bgt = try allocator.create(brain_graph.BrainGraphTool);
+    bgt.* = .{};
+    try list.append(allocator, bgt.tool());
+
     // Cron tools + push notifications
     const cat = try allocator.create(cron_add.CronAddTool);
     cat.* = .{ .config = opts.config };
@@ -1728,6 +1748,14 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;
             mt.user_id = user_id;
+        } else if (t.vtable == &brain_graph.BrainGraphTool.vtable) {
+            // V1.7-ship S2a — read-only graph navigation. Same tenant
+            // binding as the writers above. With state_mgr=null (sqlite
+            // build / pre-tenant), execute() returns a clean failure
+            // rather than crashing.
+            const bt: *brain_graph.BrainGraphTool = @ptrCast(@alignCast(t.ptr));
+            bt.state_mgr = state_mgr;
+            bt.user_id = user_id;
         }
     }
 }
@@ -2211,8 +2239,8 @@ test "all tools includes extras when enabled" {
     // +1 for V1.5 day-3 compose_memory; +1 calculator + 1 file_read_hashed
     // + 1 file_edit_hashed from nullclaw cherry-pick; +1 memory_archive
     // + 1 memory_demote from V1.6 cmt11) + http_request + web_fetch +
-    // web_search + browser = 40.
-    try std.testing.expectEqual(@as(usize, 40), tools.len);
+    // web_search + browser + brain_graph (V1.7-ship S2a) = 41.
+    try std.testing.expectEqual(@as(usize, 41), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2230,8 +2258,8 @@ test "all tools excludes extras when disabled" {
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
     // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot
     // + calculator + file_read_hashed + file_edit_hashed (nullclaw cherry-pick)
-    // + memory_archive + memory_demote (V1.6 cmt11) = 36
-    try std.testing.expectEqual(@as(usize, 36), tools.len);
+    // + memory_archive + memory_demote (V1.6 cmt11) + brain_graph (V1.7-ship S2a) = 37
+    try std.testing.expectEqual(@as(usize, 37), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2361,7 +2389,8 @@ test "all tools includes message when event bus is available" {
     // cherry-pick added calculator + file_read_hashed + file_edit_hashed;
     // V1.6 cmt11 added memory_archive + memory_demote);
     // delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT.
-    try std.testing.expectEqual(@as(usize, 36), tools.len);
+    // V1.7-ship S2a added brain_graph → 37.
+    try std.testing.expectEqual(@as(usize, 37), tools.len);
 
     var found_message = false;
     for (tools) |t| {
