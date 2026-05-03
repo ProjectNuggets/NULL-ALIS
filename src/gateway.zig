@@ -12115,6 +12115,37 @@ fn handleBrainMemoryDetail(
     } else {
         w.writeAll(",\"metadata\":null") catch return response_build_err;
     }
+    // V1.7a-5 (spec seam 3) — surface link_type as a TOP-LEVEL field per
+    // spec §4.9. Already lives inside metadata JSONB but lifting it to
+    // the top of the memory object lets the FE render the category badge
+    // without parsing metadata. Best-effort parse: if metadata is absent
+    // or has no link_type key, emit null. Validates against the LinkType
+    // enum so a malformed metadata blob can't inject an arbitrary string.
+    {
+        var link_type_str: ?[]const u8 = null;
+        if (metadata_json) |m| {
+            const parsed_meta = std.json.parseFromSlice(std.json.Value, allocator, m, .{}) catch null;
+            defer if (parsed_meta) |p| p.deinit();
+            if (parsed_meta) |p| {
+                if (p.value == .object) {
+                    if (p.value.object.get("link_type")) |lt_val| {
+                        if (lt_val == .string) {
+                            // Validate via enum — only emit if it's a known LinkType.
+                            if (memory_mod.LinkType.fromString(lt_val.string)) |lt| {
+                                link_type_str = lt.toString(); // canonical lowercase form
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (link_type_str) |s| {
+            w.writeAll(",\"link_type\":") catch return response_build_err;
+            json_util.appendJsonString(&out, allocator, s) catch return response_build_err;
+        } else {
+            w.writeAll(",\"link_type\":null") catch return response_build_err;
+        }
+    }
     // V1.6 cmt14 (M4) source attribution surface
     if (source_opt) |s| {
         w.writeAll(",\"source\":{") catch return response_build_err;

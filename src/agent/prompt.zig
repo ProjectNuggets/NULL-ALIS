@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const memory_root = @import("../memory/root.zig");
 const c_time = @cImport({
     @cInclude("time.h");
 });
@@ -317,6 +318,14 @@ pub fn buildStableSystemPrompt(
 
     // Tools section
     try buildToolsSection(w, ctx.tools);
+
+    // V1.7a-5 (spec seam 3) — link_type vocabulary. Placed immediately after
+    // the tools catalog because compose_memory takes an optional `link_type`
+    // arg and the agent reasons about extracted-memory categories when
+    // synthesizing or correcting facts. Bytes are comptime-derived from the
+    // memory_root.ALL_LINK_TYPES single source of truth so this block
+    // CANNOT drift from the enum it documents.
+    try buildLinkTypeSection(w);
 
     // Response protocol — tool-first dispatch rules. Placed immediately after
     // Tools so the model sees the tool catalog and the rules that govern its
@@ -649,6 +658,32 @@ fn buildToolsSection(w: anytype, tools: anytype) !void {
         });
     }
     try w.writeAll("\n");
+}
+
+/// V1.7a-5 (spec seam 3) — emit the link_type vocabulary block.
+///
+/// Lists the 7 LinkType categories used across the brain: extraction
+/// auto-classifies extracted facts via predicate→link_type mapping;
+/// compose_memory takes an optional explicit link_type arg; /brain/memory
+/// surfaces it on every drilldown. The agent reads this block to know
+/// (a) the vocabulary it can pass to compose_memory and (b) what each
+/// category MEANS so it reasons about extracted memories correctly.
+///
+/// The category list is comptime-derived from `memory_root.ALL_LINK_TYPES`
+/// — the single source of truth — so this prompt block CANNOT drift
+/// from the LinkType enum. Adding a new LinkType variant updates both
+/// places automatically.
+fn buildLinkTypeSection(w: anytype) !void {
+    try w.writeAll("## Memory Link Types\n\n");
+    try w.writeAll("Every extracted/composed memory carries a `link_type` — a high-level category for the relationship. Use these when calling `compose_memory(link_type=...)` and when reasoning about the brain:\n\n");
+    try w.writeAll("- `preference` — likes/dislikes/values (PREFERS, LIKES, HATES, AVOIDS, FAVORS)\n");
+    try w.writeAll("- `attribute` — descriptive properties (BIRTHDAY, LIVES_IN, WORKS_AT, IS, HAS). Default for unmapped facts.\n");
+    try w.writeAll("- `supersession` — this fact replaces another (REPLACES, USED_TO_BE, FORMERLY)\n");
+    try w.writeAll("- `relationship` — entity↔entity links (KNOWS, WORKS_WITH, MARRIED_TO, MANAGES)\n");
+    try w.writeAll("- `usage` — uses/owns/consumes (USED_FOR, OWNS, USES, DEPENDS_ON)\n");
+    try w.writeAll("- `synthesis` — compose_memory output (default when you call compose_memory)\n");
+    try w.writeAll("- `episode` — event-shaped facts (HAPPENED_ON, ATTENDED, OCCURRED_AT)\n\n");
+    try w.writeAll("Pick the category that matches the relationship's shape. Compose-output is `synthesis` unless your consolidation expresses a different shape (e.g. `preference` when consolidating preferences across sources).\n\n");
 }
 
 /// Emit the response protocol — tool-first dispatch rules.

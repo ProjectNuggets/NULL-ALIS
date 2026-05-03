@@ -78,6 +78,7 @@ pub const ComposeMemoryTool = struct {
         \\"content":{"type":"string","description":"The synthesis text — pure consolidated fact, no boilerplate. References are stored in metadata, not content."},
         \\"references":{"type":"array","items":{"type":"string"},"description":"Memory keys this synthesis is composed from (min 2, max 50). These appear as reference edges on /brain/graph."},
         \\"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category. Default 'core' — synthesized facts are usually evergreen."},
+        \\"link_type":{"type":"string","enum":["preference","attribute","supersession","relationship","usage","synthesis","episode"],"description":"V1.7a-5 — relationship category. Defaults to 'synthesis' for compose_memory output. Set explicitly when the synthesis represents a different semantic shape (e.g. 'preference' for a consolidated preference list, 'relationship' for a synthesized people-graph node)."},
         \\"key":{"type":"string","description":"Optional explicit key for the synthesized memory. If omitted, auto-generated as 'compose:<random_hex>'."}
         \\},"required":["action","title","content","references"]}
     ;
@@ -180,6 +181,27 @@ fn executeCreate(
         return ToolResult{ .success = false, .output = "", .error_msg = msg };
     };
 
+    // ── link_type (V1.7a-5 — spec seam 3) ──
+    // Optional. Default `.synthesis` matches compose_memory's natural
+    // shape: consolidating multiple sources INTO one fact. Agents should
+    // override only when the consolidation expresses a different
+    // relationship category (e.g. `.preference` when the synthesis is
+    // "user prefers X across these sources").
+    const link_type: mem_root.LinkType = blk_lt: {
+        const lt_str = root.getString(args, "link_type") orelse break :blk_lt .synthesis;
+        const trimmed_lt = std.mem.trim(u8, lt_str, " \t\r\n");
+        if (trimmed_lt.len == 0) break :blk_lt .synthesis;
+        const parsed = mem_root.LinkType.fromString(trimmed_lt) orelse {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "Unknown link_type '{s}' — must be one of: preference, attribute, supersession, relationship, usage, synthesis, episode",
+                .{trimmed_lt},
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+        break :blk_lt parsed;
+    };
+
     // ── key (auto-generated when not provided) ──
     // V1.5 day-3 review fix: user-provided keys MUST start with the
     // compose: prefix. Without this guard, a caller could overwrite an
@@ -209,7 +231,10 @@ fn executeCreate(
     defer allocator.free(memory_key);
 
     // ── Build metadata JSON ──
-    // Shape: {"synthesized_by":"agent","references":["k1","k2"],"composed_at":<unix>}
+    // V1.7a-5 (spec seam 3): metadata now carries `link_type` so the
+    // SQL-side `(metadata->>'link_type')` extraction populates the
+    // memory row's link_type column atomically with the metadata write.
+    // Shape: {"synthesized_by":"agent","references":[...],"composed_at":<unix>,"title":"...","link_type":"..."}
     var meta_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer meta_buf.deinit(allocator);
     const mw = meta_buf.writer(allocator);
@@ -220,6 +245,8 @@ fn executeCreate(
     }
     try mw.print("],\"composed_at\":{d},\"title\":", .{std.time.timestamp()});
     try writeJsonString(mw, trimmed_title);
+    try mw.writeAll(",\"link_type\":");
+    try writeJsonString(mw, link_type.toString());
     try mw.writeAll("}");
 
     // ── Write via storeWithMetadata ──
@@ -245,6 +272,8 @@ fn executeCreate(
     try w.print("{d}", .{refs.len});
     try w.writeAll(",\"category\":");
     try writeJsonString(w, cat_str);
+    try w.writeAll(",\"link_type\":");
+    try writeJsonString(w, link_type.toString());
     try w.writeAll(",\"composed_at\":");
     try w.print("{d}", .{std.time.timestamp()});
     try w.writeAll("}");

@@ -266,6 +266,113 @@ pub const MemoryCategory = union(enum) {
     }
 };
 
+// ── Link types ─────────────────────────────────────────────────────
+//
+// V1.7a-5 (spec seam 3) — high-level RELATIONSHIP CATEGORY for a memory's
+// edge to its referenced entity/object. Distinct from `predicate` (the
+// specific verb like REPLACES/PREFERS/USED_FOR). A small fixed vocabulary
+// makes link_type machine-validatable + FE-renderable (color/icon coding,
+// filtering, grouping).
+//
+// Single source of truth — used by:
+//   - extraction_persist.linkTypeForPredicate (auto-classifies extracted facts)
+//   - tools/compose_memory (optional explicit link_type arg)
+//   - zaki_state SQL-side population (`metadata->>'link_type'` → column)
+//   - zaki_state cmt16-style backfill for legacy rows
+//   - agent prompt (renders the vocabulary block)
+//   - gateway brain/memory/{key} surface
+//
+// Default for unknown predicates is `.attribute` — the broadest category;
+// observability via `log.info` lets us grow the mapping when production
+// surface forms reveal gaps.
+
+pub const LinkType = enum {
+    /// User likes/dislikes/values: PREFERS, LIKES, HATES, AVOIDS, FAVORS
+    preference,
+    /// Descriptive properties: BIRTHDAY, LIVES_IN, WORKS_AT, IS, HAS, AGE,
+    /// CONTACT, ROLE. The default category for any predicate not otherwise mapped.
+    attribute,
+    /// This fact replaces/supersedes another: REPLACES, USED_TO_BE, FORMERLY,
+    /// PREVIOUSLY. Pairs with V1.6 bi-temporal close-out.
+    supersession,
+    /// Entity↔entity: KNOWS, WORKS_WITH, MARRIED_TO, FRIENDS_WITH, MANAGES,
+    /// REPORTS_TO, COLLABORATES_WITH.
+    relationship,
+    /// Uses/owns/consumes: USED_FOR, OWNS, USES, DEPENDS_ON, BUILDS_WITH.
+    usage,
+    /// compose_memory output — synthesized memory consolidating multiple sources.
+    synthesis,
+    /// Event-shaped memories: HAPPENED_ON, ATTENDED, OCCURRED_AT, JOINED.
+    episode,
+
+    pub fn toString(self: LinkType) []const u8 {
+        return switch (self) {
+            .preference => "preference",
+            .attribute => "attribute",
+            .supersession => "supersession",
+            .relationship => "relationship",
+            .usage => "usage",
+            .synthesis => "synthesis",
+            .episode => "episode",
+        };
+    }
+
+    /// Parse a link_type string (case-insensitive on ASCII). Returns null
+    /// for unknown values. Caller decides default-fallback policy.
+    pub fn fromString(s: []const u8) ?LinkType {
+        if (s.len == 0) return null;
+        // Case-insensitive ASCII compare so agent inputs like "Preference"
+        // or "PREFERENCE" parse correctly. Bounded buffer (longest enum
+        // name is 12 chars: "supersession"/"relationship") so stack-only.
+        var buf: [16]u8 = undefined;
+        if (s.len > buf.len) return null;
+        for (s, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+        const norm = buf[0..s.len];
+        if (std.mem.eql(u8, norm, "preference")) return .preference;
+        if (std.mem.eql(u8, norm, "attribute")) return .attribute;
+        if (std.mem.eql(u8, norm, "supersession")) return .supersession;
+        if (std.mem.eql(u8, norm, "relationship")) return .relationship;
+        if (std.mem.eql(u8, norm, "usage")) return .usage;
+        if (std.mem.eql(u8, norm, "synthesis")) return .synthesis;
+        if (std.mem.eql(u8, norm, "episode")) return .episode;
+        return null;
+    }
+};
+
+/// Comptime-derivable list of all LinkType values as strings — used by
+/// the agent prompt's `<link_types>` block, the compose_memory tool's
+/// JSON-schema `enum` constraint, and the tool-description rendering.
+pub const ALL_LINK_TYPES = [_][]const u8{
+    "preference",
+    "attribute",
+    "supersession",
+    "relationship",
+    "usage",
+    "synthesis",
+    "episode",
+};
+
+test "LinkType.toString round-trips through fromString" {
+    inline for (ALL_LINK_TYPES) |s| {
+        const parsed = LinkType.fromString(s) orelse return error.UnexpectedNull;
+        try std.testing.expectEqualStrings(s, parsed.toString());
+    }
+}
+
+test "LinkType.fromString handles case insensitivity" {
+    try std.testing.expectEqual(LinkType.preference, LinkType.fromString("PREFERENCE").?);
+    try std.testing.expectEqual(LinkType.preference, LinkType.fromString("Preference").?);
+    try std.testing.expectEqual(LinkType.attribute, LinkType.fromString("aTTRibute").?);
+}
+
+test "LinkType.fromString returns null for unknowns" {
+    try std.testing.expect(LinkType.fromString("") == null);
+    try std.testing.expect(LinkType.fromString("unknown") == null);
+    try std.testing.expect(LinkType.fromString("preferences") == null); // typo: trailing s
+    // Longer than buf size — must reject without panic
+    try std.testing.expect(LinkType.fromString("aaaaaaaaaaaaaaaaaaa") == null);
+}
+
 // ── Memory entry ───────────────────────────────────────────────────
 
 pub const MemoryEntry = struct {

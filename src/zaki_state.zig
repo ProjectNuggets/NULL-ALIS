@@ -1124,6 +1124,21 @@ const ManagerImpl = struct {
             // capture at write time.
             "UPDATE {schema}.memories SET lemmatized = lower(content) WHERE lemmatized IS NULL",
 
+            // V1.7a-5 (spec seam 3) — link_type column backfill from metadata.
+            //
+            // The link_type TEXT column was added in V1.6 cmt5 schema migration
+            // (line 1062) but never populated by writers until V1.7a-5. Existing
+            // memories with metadata containing "link_type" need a one-shot
+            // backfill so /brain/memory/{key} drilldown surfaces consistent
+            // values across pre/post-V1.7a-5 rows. Idempotent: WHERE
+            // link_type IS NULL ensures re-running migrate() only touches
+            // unbackfilled rows. Skips rows whose metadata never had
+            // link_type at all (those stay NULL — the FE renders them
+            // without the category badge, same as legacy non-extracted memories).
+            "UPDATE {schema}.memories SET link_type = (metadata->>'link_type') " ++
+                "WHERE link_type IS NULL AND metadata IS NOT NULL " ++
+                "AND metadata ? 'link_type'",
+
             // ── V1.7 schema ────────────────────────────────────────────────
             //
             // seen_in_session_count: incremented each time the same key is
@@ -2350,14 +2365,26 @@ const ManagerImpl = struct {
         // V1.6 cmt6 × V1.7 integration fix (W-INT-01): same resurrect-on-upsert
         // close-out column reset as upsertMemory above. See its comment for
         // the zombie-row + dead-promote scenario this prevents.
+        // V1.7a-5 (spec seam 3) — link_type column populated atomically from
+        // metadata.link_type on the JSONB write. extraction_persist +
+        // compose_memory both emit "link_type":"<value>" in their metadata
+        // JSON; the SQL `(metadata->>'link_type')` extraction lifts it
+        // into the typed column without requiring callers to thread a
+        // separate parameter. NULL when metadata omits the field.
         const q = try self.buildQuery(
-            "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, metadata, lemmatized, updated_at) " ++
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW()) " ++
+            "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, metadata, lemmatized, link_type, updated_at) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, ($8::jsonb)->>'link_type', NOW()) " ++
                 "ON CONFLICT (user_id, key) DO UPDATE SET " ++
                 "session_id = CASE WHEN {schema}.memories.memory_type = 'core' THEN NULL ELSE EXCLUDED.session_id END, " ++
                 "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
                 "memory_type = CASE WHEN {schema}.memories.memory_type = 'core' THEN 'core' ELSE EXCLUDED.memory_type END, " ++
-                "metadata = EXCLUDED.metadata, lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
+                "metadata = EXCLUDED.metadata, lemmatized = EXCLUDED.lemmatized, " ++
+                // V1.7a-5: refresh link_type from the new metadata's value.
+                // COALESCE with the existing value so omitting link_type in
+                // an update doesn't accidentally null out a previously-set
+                // category (defensive — current callers always emit it).
+                "link_type = COALESCE((EXCLUDED.metadata)->>'link_type', {schema}.memories.link_type), " ++
+                "updated_at = NOW(), " ++
                 "valid_to    = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.valid_to    ELSE NULL END, " ++
                 "invalid_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
                 "expired_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.expired_at  ELSE NULL END, " ++
@@ -8166,6 +8193,210 @@ test "V1.7a-4 entity-key Zig/SQL convergence — backfill target_key == deriveEn
         const e_lower = try mgr.findEdgesByKeys(allocator, 2, &[_][]const u8{"row_latin1_lower"});
         defer memory_root.freeTypedEdges(allocator, e_lower);
         try std.testing.expectEqualStrings(e_upper[0].target_key, e_lower[0].target_key);
+    }
+}
+
+// V1.7a-5 (spec seam 3) — link_type rich wiring end-to-end.
+//
+// Acceptance:
+//   1. upsertMemoryWithMetadata populates the link_type column from
+//      metadata.link_type atomically with the JSONB write
+//   2. ON CONFLICT update preserves link_type via COALESCE when the new
+//      metadata omits it (defensive — current writers always emit)
+//   3. Backfill SQL populates link_type for legacy rows whose metadata
+//      already has it but column is NULL
+//   4. Backfill is idempotent: re-running migrate() doesn't disturb
+//      already-populated rows
+//   5. Rows without metadata.link_type stay link_type=NULL after backfill
+//      (no spurious defaults assigned to legacy non-extracted memories)
+test "V1.7a-5 link_type rich wiring — column populated from metadata + backfill idempotent" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_v17a5_link_type_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-v17a5-link-type/workspace");
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    // ── (1) Fresh write: metadata with link_type → column populated ────
+    try mgr.upsertMemoryWithMetadata(
+        2,
+        "extracted_user_helix",
+        "User prefers Helix",
+        .core,
+        "session-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"Helix","attributed_to":"user","link_type":"preference","confidence":0.9}
+        ,
+    );
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT link_type FROM {s}.memories WHERE key = 'extracted_user_helix'", .{schema_q});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        const lt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(lt);
+        try std.testing.expectEqualStrings("preference", lt);
+    }
+
+    // ── (2) Update with new metadata that has link_type — column refreshes
+    try mgr.upsertMemoryWithMetadata(
+        2,
+        "extracted_user_helix",
+        "User prefers Helix (updated)",
+        .core,
+        "session-B",
+        \\{"subject":"user","predicate":"PREFERS","object":"Helix","attributed_to":"user","link_type":"preference","confidence":0.95}
+        ,
+    );
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT link_type FROM {s}.memories WHERE key = 'extracted_user_helix'", .{schema_q});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const lt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(lt);
+        try std.testing.expectEqualStrings("preference", lt);
+    }
+
+    // ── (3) Update with metadata that OMITS link_type — COALESCE preserves
+    try mgr.upsertMemoryWithMetadata(
+        2,
+        "extracted_user_helix",
+        "User prefers Helix (no link_type in update)",
+        .core,
+        "session-C",
+        \\{"subject":"user","predicate":"PREFERS","object":"Helix","attributed_to":"user","confidence":0.99}
+        ,
+    );
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT link_type FROM {s}.memories WHERE key = 'extracted_user_helix'", .{schema_q});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const lt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(lt);
+        try std.testing.expectEqualStrings("preference", lt); // preserved by COALESCE
+    }
+
+    // ── (4) Simulate a "legacy" row: metadata HAS link_type but column NULL.
+    //       (Pre-V1.7a-5 writes followed this shape — column stayed NULL until backfill.)
+    //
+    // Build the SQL via ArrayList writeAll instead of std.fmt.allocPrint so
+    // the literal `{` and `}` in the JSON metadata don't get misparsed by
+    // Zig's format-string interpreter.
+    {
+        var seed_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer seed_buf.deinit(allocator);
+        const sw = seed_buf.writer(allocator);
+        try sw.writeAll("INSERT INTO ");
+        try sw.writeAll(schema_q);
+        try sw.writeAll(".memories (id, user_id, key, content, content_hash, memory_type, metadata, lemmatized, link_type, updated_at) ");
+        try sw.writeAll("VALUES ('legacyhash00001', 2, 'legacy_extracted_zsh', 'User uses zsh', 'lhash01', 'core', ");
+        try sw.writeAll("$$" ++ "{\"subject\":\"user\",\"predicate\":\"USES\",\"object\":\"zsh\",\"link_type\":\"usage\"}" ++ "$$" ++ "::jsonb, ");
+        try sw.writeAll("'user uses zsh', NULL, NOW())");
+        const result = try mgr.exec(seed_buf.items);
+        c.PQclear(result);
+    }
+    // Verify pre-backfill: column is NULL even though metadata has link_type.
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT link_type FROM {s}.memories WHERE key = 'legacy_extracted_zsh'", .{schema_q});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        // PG NULL maps to empty string via PQgetvalue; check via PQgetisnull.
+        try std.testing.expect(c.PQgetisnull(result, 0, 0) == 1);
+    }
+
+    // ── (5) Run migrate() again — backfill triggers, populates legacy row.
+    try mgr.migrate();
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT link_type FROM {s}.memories WHERE key = 'legacy_extracted_zsh'", .{schema_q});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expect(c.PQgetisnull(result, 0, 0) == 0);
+        const lt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(lt);
+        try std.testing.expectEqualStrings("usage", lt);
+    }
+
+    // ── (6) Idempotency: a subsequent migrate() doesn't disturb populated rows.
+    try mgr.migrate();
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT link_type FROM {s}.memories WHERE key = 'legacy_extracted_zsh'", .{schema_q});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const lt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(lt);
+        try std.testing.expectEqualStrings("usage", lt);
+    }
+
+    // ── (7) Rows without metadata.link_type stay NULL after backfill.
+    try mgr.upsertMemory(2, "ad_hoc_no_metadata_row", "ad-hoc fact", .core, null);
+    try mgr.migrate(); // backfill again — must skip this row
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT link_type FROM {s}.memories WHERE key = 'ad_hoc_no_metadata_row'", .{schema_q});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expect(c.PQgetisnull(result, 0, 0) == 1);
+    }
+
+    // ── (8) End-to-end via extraction_persist: predicate maps to category,
+    //       metadata gets it, column reflects it.
+    const extraction_persist = @import("agent/extraction_persist.zig");
+    const mems = [_]extraction_persist.ExtractedMemory{.{
+        .text = "User uses Helix as primary editor",
+        .subject = "user",
+        .predicate = "PREFERS",
+        .object = "Helix",
+        .attributed_to = "user",
+        .confidence = 0.9,
+    }};
+    const persist_result = try extraction_persist.persistExtracted(
+        allocator,
+        &mgr,
+        2,
+        "session-extraction-test",
+        &mems,
+        null,
+        null,
+    );
+    try std.testing.expect(persist_result.written_count == 1);
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT link_type FROM {s}.memories WHERE key LIKE 'extracted_%' AND content = 'User uses Helix as primary editor'",
+            .{schema_q},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expect(c.PQntuples(result) >= 1);
+        const lt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(lt);
+        try std.testing.expectEqualStrings("preference", lt); // PREFERS → preference
     }
 }
 

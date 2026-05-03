@@ -343,6 +343,7 @@ fn buildExtractionMetadata(
     var buf: std.ArrayListUnmanaged(u8) = .{};
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
+    const link_type = linkTypeForPredicate(mem.predicate);
     try w.writeAll("{\"subject\":\"");
     try writeJsonEscaped(w, mem.subject);
     try w.writeAll("\",\"predicate\":\"");
@@ -352,10 +353,114 @@ fn buildExtractionMetadata(
     try w.writeAll("\",\"attributed_to\":\"");
     try writeJsonEscaped(w, mem.attributed_to);
     try w.writeAll("\",\"attribution\":\"extraction_classifier\"");
+    // V1.7a-5 (spec seam 3) — emit link_type derived from predicate so
+    // SQL-side population (`metadata->>'link_type'`) populates the column
+    // atomically with the metadata write. SQL backfill for legacy rows
+    // (zaki_state migrate) covers pre-V1.7a-5 data.
+    try w.writeAll(",\"link_type\":\"");
+    try writeJsonEscaped(w, link_type.toString());
+    try w.writeAll("\"");
     try w.print(",\"confidence\":{d:.3}", .{mem.confidence});
     try w.print(",\"extracted_at\":{d}", .{std.time.timestamp()});
     try w.writeAll("}");
     return buf.toOwnedSlice(allocator);
+}
+
+/// V1.7a-5 (spec seam 3) — map an extraction-time `predicate` (the SVO
+/// triple verb, e.g. PREFERS, REPLACES, USED_FOR) to its high-level
+/// `LinkType` category for FE rendering + agent-side reasoning.
+///
+/// The mapping is OPINIONATED but conservative: predicates we recognize
+/// route to specific categories; unrecognized predicates default to
+/// `.attribute` (the broadest category) AND log an info so production
+/// telemetry surfaces gaps in our vocabulary. Adding a new predicate
+/// to a category is a one-line patch in this function.
+///
+/// Single source of truth — every extraction write routes through here.
+/// Comparison is case-INsensitive on ASCII so `"PREFERS"`, `"prefers"`,
+/// and `"Prefers"` all map identically.
+pub fn linkTypeForPredicate(predicate: []const u8) memory_root.LinkType {
+    // Normalize to uppercase for compare. Bounded buffer matches longest
+    // expected predicate (~32 chars; predicates with COMPLEX_NAMES_LIKE_THIS
+    // top out around 24 chars in practice). Longer → fall through to default.
+    var buf: [64]u8 = undefined;
+    if (predicate.len > buf.len) {
+        log.info("extraction.linktype_map_default predicate_len={d} fallback=attribute", .{predicate.len});
+        return .attribute;
+    }
+    for (predicate, 0..) |ch, i| buf[i] = std.ascii.toUpper(ch);
+    const norm = buf[0..predicate.len];
+
+    // Preference (likes/dislikes/values)
+    if (std.mem.eql(u8, norm, "PREFERS")) return .preference;
+    if (std.mem.eql(u8, norm, "LIKES")) return .preference;
+    if (std.mem.eql(u8, norm, "HATES")) return .preference;
+    if (std.mem.eql(u8, norm, "AVOIDS")) return .preference;
+    if (std.mem.eql(u8, norm, "FAVORS")) return .preference;
+    if (std.mem.eql(u8, norm, "DISLIKES")) return .preference;
+    if (std.mem.eql(u8, norm, "ENJOYS")) return .preference;
+    if (std.mem.eql(u8, norm, "VALUES")) return .preference;
+
+    // Supersession (this fact replaces another)
+    if (std.mem.eql(u8, norm, "REPLACES")) return .supersession;
+    if (std.mem.eql(u8, norm, "USED_TO_BE")) return .supersession;
+    if (std.mem.eql(u8, norm, "FORMERLY")) return .supersession;
+    if (std.mem.eql(u8, norm, "PREVIOUSLY")) return .supersession;
+    if (std.mem.eql(u8, norm, "USED_TO_PREFER")) return .supersession;
+    if (std.mem.eql(u8, norm, "USED_TO_USE")) return .supersession;
+
+    // Relationship (entity↔entity)
+    if (std.mem.eql(u8, norm, "KNOWS")) return .relationship;
+    if (std.mem.eql(u8, norm, "WORKS_WITH")) return .relationship;
+    if (std.mem.eql(u8, norm, "MARRIED_TO")) return .relationship;
+    if (std.mem.eql(u8, norm, "FRIENDS_WITH")) return .relationship;
+    if (std.mem.eql(u8, norm, "MANAGES")) return .relationship;
+    if (std.mem.eql(u8, norm, "REPORTS_TO")) return .relationship;
+    if (std.mem.eql(u8, norm, "COLLABORATES_WITH")) return .relationship;
+    if (std.mem.eql(u8, norm, "RELATED_TO")) return .relationship;
+
+    // Usage (uses/owns/consumes)
+    if (std.mem.eql(u8, norm, "USED_FOR")) return .usage;
+    if (std.mem.eql(u8, norm, "USES")) return .usage;
+    if (std.mem.eql(u8, norm, "OWNS")) return .usage;
+    if (std.mem.eql(u8, norm, "DEPENDS_ON")) return .usage;
+    if (std.mem.eql(u8, norm, "BUILDS_WITH")) return .usage;
+    if (std.mem.eql(u8, norm, "DEPLOYS_TO")) return .usage;
+
+    // Episode (event-shaped)
+    if (std.mem.eql(u8, norm, "HAPPENED_ON")) return .episode;
+    if (std.mem.eql(u8, norm, "ATTENDED")) return .episode;
+    if (std.mem.eql(u8, norm, "OCCURRED_AT")) return .episode;
+    if (std.mem.eql(u8, norm, "JOINED")) return .episode;
+    if (std.mem.eql(u8, norm, "VISITED")) return .episode;
+
+    // Default: .attribute (descriptive properties — BIRTHDAY, LIVES_IN,
+    // WORKS_AT, IS, HAS, etc.). Log so we can grow the mapping when
+    // production reveals new predicate surface forms.
+    log.info("extraction.linktype_map_default predicate={s} fallback=attribute", .{predicate});
+    return .attribute;
+}
+
+test "linkTypeForPredicate maps known predicates correctly" {
+    try std.testing.expectEqual(memory_root.LinkType.preference, linkTypeForPredicate("PREFERS"));
+    try std.testing.expectEqual(memory_root.LinkType.preference, linkTypeForPredicate("prefers"));
+    try std.testing.expectEqual(memory_root.LinkType.supersession, linkTypeForPredicate("REPLACES"));
+    try std.testing.expectEqual(memory_root.LinkType.supersession, linkTypeForPredicate("USED_TO_BE"));
+    try std.testing.expectEqual(memory_root.LinkType.relationship, linkTypeForPredicate("KNOWS"));
+    try std.testing.expectEqual(memory_root.LinkType.usage, linkTypeForPredicate("USED_FOR"));
+    try std.testing.expectEqual(memory_root.LinkType.episode, linkTypeForPredicate("ATTENDED"));
+}
+
+test "linkTypeForPredicate defaults unknown predicates to .attribute" {
+    try std.testing.expectEqual(memory_root.LinkType.attribute, linkTypeForPredicate("BIRTHDAY"));
+    try std.testing.expectEqual(memory_root.LinkType.attribute, linkTypeForPredicate("UNKNOWN_VERB"));
+    try std.testing.expectEqual(memory_root.LinkType.attribute, linkTypeForPredicate(""));
+}
+
+test "linkTypeForPredicate handles oversize input without panic" {
+    // 65 chars — exceeds 64-byte normalize buffer; falls through to default.
+    const huge = "A" ** 65;
+    try std.testing.expectEqual(memory_root.LinkType.attribute, linkTypeForPredicate(huge));
 }
 
 fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
