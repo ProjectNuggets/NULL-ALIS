@@ -371,6 +371,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn existsMemoryKeys(_: *@This(), _: std.mem.Allocator, _: i64, _: []const []const u8) !std.StringHashMapUnmanaged(void) {
         return .{};
     }
+    /// V1.7a-7 — stub for non-postgres builds; `/brain/local-graph`
+    /// degrades to empty so the FE still renders the center-node header
+    /// without erroring when the state manager is the disabled variant.
+    pub fn getMemoriesByKeys(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
     /// V1.5 day-4 — stub for non-postgres builds; traversal logging
     /// silently no-ops.
     pub fn insertTraversalEvent(_: *@This(), _: i64, _: []const u8) !void {
@@ -2638,6 +2644,66 @@ const ManagerImpl = struct {
             try out.put(allocator, k, metadata);
         }
         return out;
+    }
+
+    /// V1.7a-7 — batch-fetch full memory rows by key set, validity-filtered.
+    /// One round trip via `key = ANY($2::text[])`; mirrors the array-text
+    /// formatting used by `listMemoriesMetadata` and `existsMemoryKeys`.
+    /// Used by `/brain/local-graph` to materialize content + category for
+    /// the BFS-discovered neighborhood without N+1 single-key fetches.
+    ///
+    /// MEMORIES_VALIDITY_FILTER applied — superseded rows are NOT returned
+    /// (matches /brain/graph semantics: local-graph shows live structure,
+    /// not history). Caller frees each MemoryEntry + the slice via
+    /// `memory_root.freeEntries`.
+    ///
+    /// Result ordering is NOT guaranteed (PG SELECT without ORDER BY);
+    /// caller indexes by key, not position.
+    pub fn getMemoriesByKeys(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        keys: []const []const u8,
+    ) ![]memory_root.MemoryEntry {
+        if (keys.len == 0) return allocator.alloc(memory_root.MemoryEntry, 0);
+
+        // Format keys as postgres text array; reuse the pattern from
+        // listMemoriesMetadata (escapes `"` and `\`).
+        var keys_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer keys_buf.deinit(self.allocator);
+        try keys_buf.append(self.allocator, '{');
+        for (keys, 0..) |k, i| {
+            if (i > 0) try keys_buf.append(self.allocator, ',');
+            try keys_buf.append(self.allocator, '"');
+            for (k) |ch| {
+                switch (ch) {
+                    '"' => try keys_buf.appendSlice(self.allocator, "\\\""),
+                    '\\' => try keys_buf.appendSlice(self.allocator, "\\\\"),
+                    else => try keys_buf.append(self.allocator, ch),
+                }
+            }
+            try keys_buf.append(self.allocator, '"');
+        }
+        try keys_buf.append(self.allocator, '}');
+        const keys_z = try self.allocator.dupeZ(u8, keys_buf.items);
+        defer self.allocator.free(keys_z);
+
+        const q = try self.buildQuery(
+            "SELECT id, key, content, memory_type, " ++
+                "COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), " ++
+                "session_id, valid_to FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND key = ANY($2::text[]) AND " ++ MEMORIES_VALIDITY_FILTER,
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, keys_z.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(keys_buf.items.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        return try decodeMemoryRows(allocator, result, false);
     }
 
     pub fn upsertMemory(self: *Self, user_id: i64, key: []const u8, content: []const u8, category: memory_root.MemoryCategory, session_id: ?[]const u8) !void {
@@ -8793,6 +8859,116 @@ test "V1.7a-6 listMemory{Births,Deaths}InWindow — event streams over [from, to
         const wrong_deaths = try mgr.listMemoryDeathsInWindow(allocator, 99, window_from, window_to, 100);
         defer memory_root.freeEntries(allocator, wrong_deaths);
         try std.testing.expectEqual(@as(usize, 0), wrong_deaths.len);
+    }
+}
+
+// V1.7a-7 — getMemoriesByKeys: batch-fetch full rows by key set.
+// Acceptance:
+//   1. Multi-key fetch returns rows for ALL requested keys (validity-filtered)
+//   2. Empty key set returns empty slice (no SQL)
+//   3. Superseded rows are HIDDEN (validity filter applied)
+//   4. Cross-tenant scoping: user 99 sees nothing of user 2's data
+//   5. Non-existent key in mixed set is silently absent (not an error)
+//   6. Special-character keys round-trip cleanly through PG text-array escape
+test "V1.7a-7 getMemoriesByKeys — batch fetch + validity + scoping + escape" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_v17a7_bykeys_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-v17a7-bykeys/workspace");
+
+    // ── Seed: live + archived + special-char key ────────────────────
+    try mgr.upsertMemory(2, "alpha", "fact A", .core, "session-A");
+    try mgr.upsertMemory(2, "beta", "fact B", .daily, "session-A");
+    try mgr.upsertMemory(2, "gamma", "fact C", .core, "session-B");
+    // Archive gamma — must be hidden by validity filter.
+    _ = try mgr.demoteMemoryFromCore(2, "gamma", "test_close");
+    const close_ts: i64 = std.time.timestamp() - 60;
+    try mgr.setMemoryInvalidation(2, "gamma", close_ts, close_ts);
+    // Special-char key — quote + backslash. Tests array-escape correctness.
+    try mgr.upsertMemory(2, "weird\"key\\with\"chars", "fact W", .core, "session-A");
+
+    // ── (1) Multi-key fetch returns ALL live keys ───────────────────
+    {
+        const keys = [_][]const u8{ "alpha", "beta" };
+        const rows = try mgr.getMemoriesByKeys(allocator, 2, &keys);
+        defer memory_root.freeEntries(allocator, rows);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        var seen_a = false;
+        var seen_b = false;
+        for (rows) |r| {
+            if (std.mem.eql(u8, r.key, "alpha")) {
+                seen_a = true;
+                try std.testing.expectEqualStrings("fact A", r.content);
+            }
+            if (std.mem.eql(u8, r.key, "beta")) {
+                seen_b = true;
+                try std.testing.expectEqualStrings("fact B", r.content);
+            }
+        }
+        try std.testing.expect(seen_a);
+        try std.testing.expect(seen_b);
+    }
+
+    // ── (2) Empty key set returns empty (no SQL) ───────────────────
+    {
+        const empty: [0][]const u8 = .{};
+        const rows = try mgr.getMemoriesByKeys(allocator, 2, &empty);
+        defer memory_root.freeEntries(allocator, rows);
+        try std.testing.expectEqual(@as(usize, 0), rows.len);
+    }
+
+    // ── (3) Superseded row is HIDDEN by validity filter ────────────
+    {
+        const keys = [_][]const u8{"gamma"};
+        const rows = try mgr.getMemoriesByKeys(allocator, 2, &keys);
+        defer memory_root.freeEntries(allocator, rows);
+        try std.testing.expectEqual(@as(usize, 0), rows.len);
+    }
+
+    // ── (4) Cross-tenant scoping: user 99 sees nothing ─────────────
+    {
+        const keys = [_][]const u8{ "alpha", "beta" };
+        const rows = try mgr.getMemoriesByKeys(allocator, 99, &keys);
+        defer memory_root.freeEntries(allocator, rows);
+        try std.testing.expectEqual(@as(usize, 0), rows.len);
+    }
+
+    // ── (5) Mixed live + non-existent: non-existent silently absent
+    {
+        const keys = [_][]const u8{ "alpha", "no_such_key" };
+        const rows = try mgr.getMemoriesByKeys(allocator, 2, &keys);
+        defer memory_root.freeEntries(allocator, rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings("alpha", rows[0].key);
+    }
+
+    // ── (6) Special-character key round-trips through array escape ─
+    {
+        const keys = [_][]const u8{"weird\"key\\with\"chars"};
+        const rows = try mgr.getMemoriesByKeys(allocator, 2, &keys);
+        defer memory_root.freeEntries(allocator, rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings("weird\"key\\with\"chars", rows[0].key);
+        try std.testing.expectEqualStrings("fact W", rows[0].content);
     }
 }
 

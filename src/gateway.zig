@@ -59,6 +59,8 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const agent_routing = @import("agent_routing.zig");
 const agent_prompt = @import("agent/prompt.zig");
+const graph_expand = @import("agent/graph_expand.zig");
+const extraction_persist = @import("agent/extraction_persist.zig");
 const security = @import("security/policy.zig");
 const security_secrets_mod = @import("security/secrets.zig");
 const http_util = @import("http_util.zig");
@@ -12430,6 +12432,250 @@ fn handleBrainTimeline(
     return finalizeJsonBuf(allocator, &out);
 }
 
+// ── /brain/local-graph — V1.7a-7 ────────────────────────────────────
+//
+// GET /api/v1/users/:user_id/brain/local-graph?center_key=<key>&depth=N[&max_nodes=M]
+//
+// N-hop local graph view from a center node — the half of Obsidian's
+// graph value people actually use day-to-day. Wraps the existing
+// `graph_expand.expandFromSeeds` BFS primitive (V1.6 cmt10) with one
+// seed (the center_key) and emits a /brain/graph-compatible response
+// shape so the FE renders with the same code (just a smaller subgraph).
+//
+// Validation:
+//   - center_key required (400 missing_center_key)
+//   - center_key must be brain-visible (400 hidden_center_key)
+//   - center_key must exist as a live memory for this user (404
+//     center_not_found) — uses validity-filtered getMemory; archived
+//     center nodes don't make sense for "neighborhood right now"
+//   - depth in [1, BRAIN_LOCAL_GRAPH_MAX_DEPTH (3)] — clamped, not 400
+//   - max_nodes default 50, capped 200 (matches /brain/graph)
+//
+// Same hygiene contract as /brain/graph: post-filter neighborhood by
+// `memory_root.isBrainVisibleKey` so continuity / autosave / tombstones
+// never appear, AND drop edges whose endpoints aren't both brain-visible
+// (no dangling edges into hidden bookkeeping).
+//
+// Response shape (subset of /brain/graph for FE re-use):
+//   {
+//     "center_key": "<key>",
+//     "depth": N,
+//     "nodes": [{"key", "kind", "hop_distance", "score", "summary",
+//                "valid_to", "session_id", "link_type"}],
+//     "edges": [{"source", "target", "predicate", "link_type", "weight"}],
+//     "stats": {"nodes": N, "edges": M}
+//   }
+
+const BRAIN_LOCAL_GRAPH_MAX_DEPTH: u8 = 3;
+const BRAIN_LOCAL_GRAPH_DEFAULT_DEPTH: u8 = 1;
+const BRAIN_LOCAL_GRAPH_DEFAULT_MAX_NODES: usize = 50;
+const BRAIN_LOCAL_GRAPH_MAX_MAX_NODES: usize = 200;
+const BRAIN_LOCAL_GRAPH_SUMMARY_CHARS: usize = 200;
+
+fn handleBrainLocalGraph(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    target: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    // ── Parse + validate params ───────────────────────────────────
+    const center_key = parseQueryParam(target, "center_key") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_center_key\"}" };
+    };
+    if (center_key.len == 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"empty_center_key\"}" };
+    }
+    if (center_key.len > 256) {
+        // Defense: cap key length matching the schema's `key TEXT` and
+        // typical fact_key (extracted_<16hex> = 27 chars).
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"center_key_too_long\"}" };
+    }
+    if (!memory_mod.isBrainVisibleKey(center_key)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"hidden_center_key\"}" };
+    }
+
+    var depth: u8 = if (parseQueryParam(target, "depth")) |s|
+        std.fmt.parseInt(u8, s, 10) catch BRAIN_LOCAL_GRAPH_DEFAULT_DEPTH
+    else
+        BRAIN_LOCAL_GRAPH_DEFAULT_DEPTH;
+    if (depth == 0) depth = BRAIN_LOCAL_GRAPH_DEFAULT_DEPTH;
+    if (depth > BRAIN_LOCAL_GRAPH_MAX_DEPTH) depth = BRAIN_LOCAL_GRAPH_MAX_DEPTH;
+
+    var max_nodes: usize = if (parseQueryParam(target, "max_nodes")) |s|
+        std.fmt.parseInt(usize, s, 10) catch BRAIN_LOCAL_GRAPH_DEFAULT_MAX_NODES
+    else
+        BRAIN_LOCAL_GRAPH_DEFAULT_MAX_NODES;
+    if (max_nodes == 0) max_nodes = BRAIN_LOCAL_GRAPH_DEFAULT_MAX_NODES;
+    if (max_nodes > BRAIN_LOCAL_GRAPH_MAX_MAX_NODES) max_nodes = BRAIN_LOCAL_GRAPH_MAX_MAX_NODES;
+
+    // ── Verify center exists + is live ───────────────────────────
+    {
+        const center_row = state_mgr.getMemory(allocator, numeric_user_id, center_key) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"center_lookup_failed\"}" };
+        };
+        if (center_row) |row| {
+            row.deinit(allocator);
+        } else {
+            return .{ .status = "404 Not Found", .body = "{\"error\":\"center_not_found\"}" };
+        }
+    }
+
+    // ── BFS expansion via the existing graph_expand primitive ────
+    const seed_keys = [_][]const u8{center_key};
+    const expand_config: graph_expand.ExpandConfig = .{
+        .max_hops = depth,
+        .max_nodes_per_hop = max_nodes,
+    };
+    var neighborhood = graph_expand.expandFromSeeds(
+        allocator,
+        state_mgr,
+        numeric_user_id,
+        &seed_keys,
+        expand_config,
+    ) catch |err| {
+        log.warn("brain.local_graph.expand_failed user={d} center={s} depth={d} err={s}", .{
+            numeric_user_id, center_key, depth, @errorName(err),
+        });
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"expand_failed\"}" };
+    };
+    defer neighborhood.deinit(allocator);
+
+    // ── Filter out hidden-key nodes / edges (hygiene contract) ───
+    var visible_keys: std.StringHashMapUnmanaged(void) = .{};
+    defer visible_keys.deinit(allocator);
+    for (neighborhood.nodes) |n| {
+        if (memory_mod.isBrainVisibleKey(n.key)) {
+            visible_keys.put(allocator, n.key, {}) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+            };
+        }
+    }
+
+    // ── Materialize content + category for visible nodes (1 SQL) ─
+    var keys_for_fetch: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keys_for_fetch.deinit(allocator);
+    {
+        var it = visible_keys.keyIterator();
+        while (it.next()) |k| keys_for_fetch.append(allocator, k.*) catch {};
+    }
+
+    const node_rows = state_mgr.getMemoriesByKeys(allocator, numeric_user_id, keys_for_fetch.items) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"node_fetch_failed\"}" };
+    };
+    defer memory_mod.freeEntries(allocator, node_rows);
+
+    // Index by key for O(1) lookup during emission.
+    var rows_by_key: std.StringHashMapUnmanaged(*const memory_mod.MemoryEntry) = .{};
+    defer rows_by_key.deinit(allocator);
+    for (node_rows) |*r| rows_by_key.put(allocator, r.key, r) catch {};
+
+    // ── Batched metadata fetch for link_type surface ─────────────
+    var metadata_map = state_mgr.listMemoriesMetadata(allocator, numeric_user_id, keys_for_fetch.items) catch std.StringHashMapUnmanaged([]u8){};
+    defer {
+        var mit = metadata_map.iterator();
+        while (mit.next()) |kv| {
+            allocator.free(kv.key_ptr.*);
+            allocator.free(kv.value_ptr.*);
+        }
+        metadata_map.deinit(allocator);
+    }
+
+    // ── Build JSON ───────────────────────────────────────────────
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    w.writeAll("{\"center_key\":") catch return response_build_err;
+    json_util.appendJsonString(&out, allocator, center_key) catch return response_build_err;
+    w.print(",\"depth\":{d},\"nodes\":[", .{depth}) catch return response_build_err;
+
+    var emitted_nodes: usize = 0;
+    for (neighborhood.nodes) |n| {
+        if (!visible_keys.contains(n.key)) continue;
+        if (emitted_nodes > 0) w.writeAll(",") catch return response_build_err;
+        emitted_nodes += 1;
+
+        const row_opt = rows_by_key.get(n.key);
+        w.writeAll("{\"key\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, n.key) catch return response_build_err;
+        w.print(",\"hop_distance\":{d},\"score\":{d:.3}", .{ n.hop_distance, n.score }) catch return response_build_err;
+        if (row_opt) |row| {
+            w.writeAll(",\"kind\":") catch return response_build_err;
+            json_util.appendJsonString(&out, allocator, row.category.toString()) catch return response_build_err;
+            const summary_len = brainTruncateUtf8Boundary(row.content, BRAIN_LOCAL_GRAPH_SUMMARY_CHARS);
+            w.writeAll(",\"summary\":") catch return response_build_err;
+            json_util.appendJsonString(&out, allocator, row.content[0..summary_len]) catch return response_build_err;
+            w.writeAll(",\"session_id\":") catch return response_build_err;
+            if (row.session_id) |sid| {
+                json_util.appendJsonString(&out, allocator, sid) catch return response_build_err;
+            } else {
+                w.writeAll("null") catch return response_build_err;
+            }
+            w.writeAll(",\"valid_to\":") catch return response_build_err;
+            if (row.valid_to) |vt| {
+                w.print("{d}", .{vt}) catch return response_build_err;
+            } else {
+                w.writeAll("null") catch return response_build_err;
+            }
+        } else {
+            // Node was in BFS but row wasn't returned by getMemoriesByKeys
+            // (e.g. validity-filtered). Emit minimal shape with nulls.
+            w.writeAll(",\"kind\":null,\"summary\":null,\"session_id\":null,\"valid_to\":null") catch return response_build_err;
+        }
+        w.writeAll(",\"link_type\":") catch return response_build_err;
+        const md = if (metadata_map.get(n.key)) |m| @as(?[]const u8, m) else null;
+        if (extractLinkTypeFromMetadata(allocator, md)) |lt| {
+            json_util.appendJsonString(&out, allocator, lt) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll("}") catch return response_build_err;
+    }
+
+    w.writeAll("],\"edges\":[") catch return response_build_err;
+    var emitted_edges: usize = 0;
+    for (neighborhood.edges) |e| {
+        // Drop dangling edges (either endpoint hidden) — same hygiene
+        // contract as /brain/graph: never surface an edge that points to
+        // a node we filtered out.
+        if (!visible_keys.contains(e.source_key)) continue;
+        if (!visible_keys.contains(e.target_key)) continue;
+        if (emitted_edges > 0) w.writeAll(",") catch return response_build_err;
+        emitted_edges += 1;
+
+        w.writeAll("{\"source\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, e.source_key) catch return response_build_err;
+        w.writeAll(",\"target\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, e.target_key) catch return response_build_err;
+        w.writeAll(",\"predicate\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, e.predicate) catch return response_build_err;
+        w.print(",\"weight\":{d:.3}", .{e.weight}) catch return response_build_err;
+        // Edge-level link_type derived from predicate via the canonical
+        // extraction_persist mapping (same predicate→7-category lookup
+        // used at write time in V1.7a-5). Keeps the FE link_type surface
+        // consistent across nodes (metadata-derived) and edges (predicate-
+        // derived) — both flow through memory_mod.LinkType.toString().
+        const edge_lt = extraction_persist.linkTypeForPredicate(e.predicate);
+        w.writeAll(",\"link_type\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, edge_lt.toString()) catch return response_build_err;
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.print("],\"stats\":{{\"nodes\":{d},\"edges\":{d}}}}}", .{ emitted_nodes, emitted_edges }) catch return response_build_err;
+
+    return finalizeJsonBuf(allocator, &out);
+}
+
 // ── /brain/diff — V1.7a-6 ──────────────────────────────────────────
 //
 // GET /api/v1/users/:user_id/brain/diff
@@ -14292,6 +14538,17 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "brain/diff")) {
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainDiff(req_allocator, method, scoped_user_id, brain_target, state);
+    }
+
+    // ── /brain/local-graph — V1.7a-7 ─────────────────────────────────────
+    // GET /api/v1/users/{id}/brain/local-graph?center_key=<key>&depth=N[&max_nodes=M]
+    // N-hop local subgraph from a center node — wraps the existing
+    // graph_expand BFS (V1.6 cmt10) with one seed and emits a /brain/graph-
+    // compatible response shape so the FE renders with the same code.
+    // Same hygiene contract as /brain/graph; rejects archived center.
+    if (std.mem.eql(u8, parsed.subpath, "brain/local-graph")) {
+        const brain_target = extractRequestTarget(raw_request) orelse base_path;
+        return handleBrainLocalGraph(req_allocator, method, scoped_user_id, brain_target, state);
     }
 
     // ── /brain/memory/{key} — V1.6 commit 13 (M3) ────────────────────────
@@ -24815,6 +25072,20 @@ test "handleBrainTimeline rejects non-GET methods" {
 test "handleBrainTimeline rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainTimeline(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/timeline", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+// ── /brain/local-graph — V1.7a-7 unit tests ───────────────────────────
+
+test "handleBrainLocalGraph rejects non-GET methods" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainLocalGraph(std.testing.allocator, "POST", "1", "/api/v1/users/1/brain/local-graph", &dummy_state);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleBrainLocalGraph rejects invalid user_id" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainLocalGraph(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/local-graph", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
 }
 
