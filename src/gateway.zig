@@ -11140,68 +11140,61 @@ fn buildBrainReferenceEdges(
     return edges.toOwnedSlice(allocator);
 }
 
-/// V1.6 commit 5b.3 (WR-2) — typed-edge builder.
+/// V1.7a-3 — typed-edge builder, materialized-table variant.
 ///
-/// Reads `metadata.subject` + `metadata.predicate` from each node's
-/// metadata JSONB (loaded into `metadata_map` by handleBrainGraph).
-/// Memories that share a subject get connected pairwise (chain pattern
-/// matching session edges) with the predicate of one as the edge label.
+/// Reads typed edges from the canonical `memory_edges` table via
+/// `state_mgr.listEdgesForUser` (V1.6 cmt7 + cmt16 backfill). Filters
+/// the result to only include edges where BOTH endpoints are in the
+/// `nodes[]` set the FE is rendering this turn. This is the perf swap
+/// the V1.6 → V1.7 handoff called for: one indexed SQL read with
+/// `is_latest` filter instead of fetch-all-metadata + per-node JSON
+/// parse + pairwise grouping.
 ///
-/// Bounds: `BRAIN_TYPED_EDGE_CAP_PER_SUBJECT` per subject group to
-/// prevent dense clusters from dominating the graph.
+/// Why the swap matters:
+///   - **Correctness:** edges come from extraction-time SVO triples
+///     (real subject → object relations) instead of inferred-by-shared-
+///     subject pairwise grouping. The old path could connect facts that
+///     happened to share a subject string but weren't actually related;
+///     the new path uses the actual edges extraction wrote.
+///   - **Cost:** N × JSON-parse → 1 × SELECT. memory_edges has indexes
+///     on (user_id, is_latest) so the scan is bounded by the user's
+///     active edge count, not the visible-node count × parse work.
+///   - **Single source of truth:** /brain/graph + agent retrieval +
+///     graph_expand BFS now all read from the same materialized edges.
+///
+/// Bounds: keeps the same per-source cap (`BRAIN_TYPED_EDGE_CAP_PER_SUBJECT`)
+/// to prevent hub nodes from dominating the rendered graph. Edges past
+/// the cap for a given source-key are dropped (lowest-weight first since
+/// listEdgesForUser already returns weight-DESC, the cap drops the least
+/// salient edges of an over-connected source).
+///
+/// Defense-in-depth: rejected predicates filtered here too. extraction_persist
+/// already filters at write time, but future write paths could bypass it.
 ///
 /// Caller owns the returned slice; free via `freeBrainTypedEdges`.
 fn buildBrainTypedEdges(
     allocator: std.mem.Allocator,
     nodes: []const BrainNode,
-    metadata_map: *std.StringHashMapUnmanaged([]u8),
+    state_mgr: *zaki_state_mod.Manager,
+    user_id: i64,
 ) ![]BrainTypedEdge {
-    // Group node indices by metadata.subject value.
-    // subject_key → list of (node_idx, predicate)
-    const NodeMeta = struct { idx: usize, predicate: []const u8 };
-    var by_subject: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeMeta)) = .{};
-    defer {
-        var it = by_subject.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
-        by_subject.deinit(allocator);
-    }
-    // Per-subject parsed JSON arenas — keep them alive across the
-    // grouping pass so subject/predicate slices into the parsed tree
-    // remain valid.
-    var parsed_keepalive: std.ArrayListUnmanaged(std.json.Parsed(std.json.Value)) = .{};
-    defer {
-        for (parsed_keepalive.items) |*p| p.deinit();
-        parsed_keepalive.deinit(allocator);
-    }
+    // ── Fetch all active edges for this user (one SQL round trip) ────
+    const all_edges = try state_mgr.listEdgesForUser(allocator, user_id);
+    defer memory_mod.freeTypedEdges(allocator, all_edges);
 
-    for (nodes, 0..) |n, idx| {
-        const md_blob = metadata_map.get(n.key) orelse continue;
-        if (md_blob.len == 0) continue;
+    if (all_edges.len == 0) return allocator.alloc(BrainTypedEdge, 0);
 
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, md_blob, .{}) catch continue;
-        if (parsed.value != .object) {
-            parsed.deinit();
-            continue;
-        }
-        try parsed_keepalive.append(allocator, parsed);
+    // ── Build visible-key set from rendered nodes ───────────────────
+    var visible: std.StringHashMapUnmanaged(void) = .{};
+    defer visible.deinit(allocator);
+    try visible.ensureTotalCapacity(allocator, @intCast(nodes.len));
+    for (nodes) |n| try visible.put(allocator, n.key, {});
 
-        const subject_v = parsed.value.object.get("subject") orelse continue;
-        const predicate_v = parsed.value.object.get("predicate") orelse continue;
-        if (subject_v != .string or predicate_v != .string) continue;
-        if (subject_v.string.len == 0 or predicate_v.string.len == 0) continue;
-
-        // Skip rejected predicates (defense-in-depth — extraction_persist
-        // already filters at write time, but a future write path bypassing
-        // extraction_persist could leak a meta-predicate. Don't render them
-        // as edges.)
-        if (isRejectedExtractionPredicate(predicate_v.string)) continue;
-
-        const list_entry = try by_subject.getOrPut(allocator, subject_v.string);
-        if (!list_entry.found_existing) {
-            list_entry.value_ptr.* = .{};
-        }
-        try list_entry.value_ptr.append(allocator, .{ .idx = idx, .predicate = predicate_v.string });
-    }
+    // ── Per-source cap counter so a hub doesn't dominate ─────────────
+    // listEdgesForUser already orders weight DESC, so iterating in that
+    // order means the FIRST `cap` edges per source are the strongest.
+    var per_source_count: std.StringHashMapUnmanaged(usize) = .{};
+    defer per_source_count.deinit(allocator);
 
     var edges: std.ArrayListUnmanaged(BrainTypedEdge) = .{};
     errdefer {
@@ -11209,29 +11202,38 @@ fn buildBrainTypedEdges(
         edges.deinit(allocator);
     }
 
-    var sub_it = by_subject.iterator();
-    while (sub_it.next()) |entry| {
-        const group = entry.value_ptr.*.items;
-        if (group.len < 2) continue;
-        const cap = if (group.len > BRAIN_TYPED_EDGE_CAP_PER_SUBJECT) BRAIN_TYPED_EDGE_CAP_PER_SUBJECT else group.len - 1;
-        var i: usize = 0;
-        while (i < cap and i + 1 < group.len) : (i += 1) {
-            const a = group[i];
-            const b = group[i + 1];
-            try edges.append(allocator, .{
-                .source = try allocator.dupe(u8, nodes[a.idx].key),
-                .target = try allocator.dupe(u8, nodes[b.idx].key),
-                .predicate = try allocator.dupe(u8, a.predicate),
-            });
-        }
+    for (all_edges) |e| {
+        // Both endpoints must be in the rendered node set; otherwise
+        // the edge would dangle off-graph.
+        if (!visible.contains(e.source_key)) continue;
+        if (!visible.contains(e.target_key)) continue;
+
+        // Defense-in-depth predicate filter (matches old JSONB path).
+        if (isRejectedExtractionPredicate(e.predicate)) continue;
+
+        // Per-source cap. We index by source_key — a node showing up as
+        // target of N edges is allowed; only its outbound edges get capped.
+        const slot = try per_source_count.getOrPut(allocator, e.source_key);
+        if (!slot.found_existing) slot.value_ptr.* = 0;
+        if (slot.value_ptr.* >= BRAIN_TYPED_EDGE_CAP_PER_SUBJECT) continue;
+        slot.value_ptr.* += 1;
+
+        try edges.append(allocator, .{
+            .source = try allocator.dupe(u8, e.source_key),
+            .target = try allocator.dupe(u8, e.target_key),
+            .predicate = try allocator.dupe(u8, e.predicate),
+        });
     }
 
-    // Deterministic ordering: sort by (source, target) for stable JSON
+    // Deterministic ordering: sort by (source, target, predicate) for stable
+    // JSON output across requests with the same underlying edge set.
     std.mem.sort(BrainTypedEdge, edges.items, {}, struct {
         fn lt(_: void, x: BrainTypedEdge, y: BrainTypedEdge) bool {
             const cmp_src = std.mem.order(u8, x.source, y.source);
             if (cmp_src != .eq) return cmp_src == .lt;
-            return std.mem.order(u8, x.target, y.target) == .lt;
+            const cmp_tgt = std.mem.order(u8, x.target, y.target);
+            if (cmp_tgt != .eq) return cmp_tgt == .lt;
+            return std.mem.order(u8, x.predicate, y.predicate) == .lt;
         }
     }.lt);
 
@@ -11512,12 +11514,15 @@ fn handleBrainGraph(
     };
     defer allocator.free(ref_edges);
 
-    // V1.6 commit 5b.3 (WR-2) — typed atomic-fact edges. Reads
-    // metadata.subject + metadata.predicate from each node and connects
-    // memories that share a subject. Empty when no nodes have V1.6
-    // extraction metadata (graceful degradation pre-extraction-rollout).
+    // V1.7a-3 — typed atomic-fact edges from the materialized
+    // memory_edges table (V1.6 cmt7 + cmt16 backfill). Was: parse JSONB
+    // metadata per visible node and pairwise-group by subject. Now: one
+    // SQL fetch + visibility filter + per-source cap. Same single-source-
+    // of-truth as agent retrieval and graph_expand BFS.
+    // Empty result when no edges exist for the user (graceful degrade for
+    // tenants with no V1.6 extraction history yet).
     const empty_typed: []BrainTypedEdge = &.{};
-    const typed_edges = buildBrainTypedEdges(allocator, nodes, &metadata_map) catch empty_typed;
+    const typed_edges = buildBrainTypedEdges(allocator, nodes, state_mgr, numeric_user_id) catch empty_typed;
     defer freeBrainTypedEdges(allocator, typed_edges);
 
     // ── V1.6 commit 4 — compute per-node importance score ────────────
@@ -24091,6 +24096,142 @@ test "brain: buildBrainReferenceEdges metadata path skips self-references" {
     const edges = try buildBrainReferenceEdges(std.testing.allocator, &nodes, &contents, &node_keys, &metadata_map);
     defer std.testing.allocator.free(edges);
 
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+// V1.7a-3 — buildBrainTypedEdges (materialized memory_edges path).
+//
+// Acceptance:
+//   1. Edges to off-graph keys (not in `nodes` set) are filtered out
+//   2. Rejected predicates (e.g. GREETED) are dropped (defense-in-depth)
+//   3. Per-source cap enforces BRAIN_TYPED_EDGE_CAP_PER_SUBJECT
+//   4. Output is deterministically sorted by (source, target, predicate)
+//   5. Empty user (no edges) returns empty slice
+test "brain: buildBrainTypedEdges (V1.7a-3) materialized path filters + caps + sorts" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_brain_typed_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+    try mgr.provisionUser(2, "/tmp/nullalis-brain-typed-test-user-2/workspace");
+
+    // ── Insert 4 nodes + 5 edges ───────────────────────────────────────
+    try mgr.upsertMemory(2, "node_a", "Fact A", .core, null);
+    try mgr.upsertMemory(2, "node_b", "Fact B", .core, null);
+    try mgr.upsertMemory(2, "node_c", "Fact C", .core, null);
+    try mgr.upsertMemory(2, "node_d", "Fact D", .core, null);
+
+    // Edges across the visible set
+    try mgr.upsertMemoryEdge(2, "node_a", "node_b", "RELATES_TO", "extraction", 0.9);
+    try mgr.upsertMemoryEdge(2, "node_a", "node_c", "MENTIONS_BOTH", "extraction", 0.8);
+    // Edge with a rejected predicate — must be dropped
+    try mgr.upsertMemoryEdge(2, "node_b", "node_c", "GREETED", "extraction", 0.7);
+    // Edge to an off-graph key — must be filtered (target not in visible set)
+    try mgr.upsertMemoryEdge(2, "node_a", "node_GHOST", "POINTS_TO", "extraction", 0.6);
+    // Edge from off-graph to visible — also filtered (source not in visible set)
+    try mgr.upsertMemoryEdge(2, "node_OFFSCREEN", "node_d", "OBSERVED", "extraction", 0.5);
+
+    // ── Build BrainNode list with only the in-graph nodes ──────────────
+    const nodes = [_]BrainNode{
+        .{ .key = "node_a", .kind = "core", .session_id = null, .created_at = 0, .summary = "", .valid_to = null },
+        .{ .key = "node_b", .kind = "core", .session_id = null, .created_at = 0, .summary = "", .valid_to = null },
+        .{ .key = "node_c", .kind = "core", .session_id = null, .created_at = 0, .summary = "", .valid_to = null },
+        .{ .key = "node_d", .kind = "core", .session_id = null, .created_at = 0, .summary = "", .valid_to = null },
+    };
+
+    const edges = try buildBrainTypedEdges(allocator, &nodes, &mgr, 2);
+    defer freeBrainTypedEdges(allocator, edges);
+
+    // Expected: only (node_a, node_b, RELATES_TO) + (node_a, node_c, MENTIONS_BOTH).
+    // Dropped: GREETED (rejected predicate), node_GHOST (off-graph target),
+    // node_OFFSCREEN (off-graph source).
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+
+    // Deterministic order: (node_a, node_b) < (node_a, node_c)
+    try std.testing.expectEqualStrings("node_a", edges[0].source);
+    try std.testing.expectEqualStrings("node_b", edges[0].target);
+    try std.testing.expectEqualStrings("RELATES_TO", edges[0].predicate);
+    try std.testing.expectEqualStrings("node_a", edges[1].source);
+    try std.testing.expectEqualStrings("node_c", edges[1].target);
+    try std.testing.expectEqualStrings("MENTIONS_BOTH", edges[1].predicate);
+
+    // ── Per-source cap: insert (cap+5) edges from node_d to N targets ─
+    // BRAIN_TYPED_EDGE_CAP_PER_SUBJECT = 20 today; insert 25 to verify cap.
+    {
+        var i: usize = 0;
+        while (i < BRAIN_TYPED_EDGE_CAP_PER_SUBJECT + 5) : (i += 1) {
+            var key_buf: [32]u8 = undefined;
+            const tgt_key = try std.fmt.bufPrint(&key_buf, "hub_target_{d}", .{i});
+            try mgr.upsertMemory(2, tgt_key, "hub fact", .core, null);
+            // Weight slightly higher for earlier indexes so listEdgesForUser
+            // returns them in a stable order; cap drops the lowest-weight
+            // edges first.
+            const weight: f64 = 0.9 - @as(f64, @floatFromInt(i)) * 0.001;
+            try mgr.upsertMemoryEdge(2, "node_d", tgt_key, "HUB_REL", "extraction", weight);
+        }
+    }
+
+    // Build a node set with node_d + all 25 hub targets.
+    var hub_nodes: std.ArrayListUnmanaged(BrainNode) = .{};
+    defer hub_nodes.deinit(allocator);
+    try hub_nodes.append(allocator, .{ .key = "node_d", .kind = "core", .session_id = null, .created_at = 0, .summary = "", .valid_to = null });
+    var hub_target_keys: std.ArrayListUnmanaged([]u8) = .{};
+    defer {
+        for (hub_target_keys.items) |k| allocator.free(k);
+        hub_target_keys.deinit(allocator);
+    }
+    {
+        var i: usize = 0;
+        while (i < BRAIN_TYPED_EDGE_CAP_PER_SUBJECT + 5) : (i += 1) {
+            const k = try std.fmt.allocPrint(allocator, "hub_target_{d}", .{i});
+            try hub_target_keys.append(allocator, k);
+            try hub_nodes.append(allocator, .{ .key = k, .kind = "core", .session_id = null, .created_at = 0, .summary = "", .valid_to = null });
+        }
+    }
+
+    const hub_edges = try buildBrainTypedEdges(allocator, hub_nodes.items, &mgr, 2);
+    defer freeBrainTypedEdges(allocator, hub_edges);
+
+    // Count edges where source = node_d. Must be EXACTLY the cap.
+    var node_d_edge_count: usize = 0;
+    for (hub_edges) |e| {
+        if (std.mem.eql(u8, e.source, "node_d")) node_d_edge_count += 1;
+    }
+    try std.testing.expectEqual(BRAIN_TYPED_EDGE_CAP_PER_SUBJECT, node_d_edge_count);
+}
+
+test "brain: buildBrainTypedEdges (V1.7a-3) returns empty for user with no edges" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_brain_typed_empty_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+    try mgr.provisionUser(2, "/tmp/nullalis-brain-typed-empty-user-2/workspace");
+
+    // No edges inserted. Build with a single node.
+    const nodes = [_]BrainNode{
+        .{ .key = "node_lonely", .kind = "core", .session_id = null, .created_at = 0, .summary = "", .valid_to = null },
+    };
+    const edges = try buildBrainTypedEdges(allocator, &nodes, &mgr, 2);
+    defer freeBrainTypedEdges(allocator, edges);
     try std.testing.expectEqual(@as(usize, 0), edges.len);
 }
 
