@@ -11,4 +11,9 @@ pub const ConversationContext = prompt_mod.ConversationContext;
 
 test {
     _ = agent_root;
+    // V1.7a-9b — pull communities.zig into test discovery so its
+    // pure-data LPA tests run with the rest of the agent suite. The
+    // module is consumed at run-time by community_pipeline.zig (9c)
+    // and the /brain/communities/recompute endpoint (9d).
+    _ = @import("agent/communities.zig");
 }
