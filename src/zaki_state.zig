@@ -401,6 +401,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listCommunities(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]memory_root.CommunitySummary {
         return allocator.alloc(memory_root.CommunitySummary, 0);
     }
+    /// V1.7a-9d — stub for non-postgres builds. /brain/graph nodes
+    /// degrade to community_id=null when state manager is disabled.
+    pub fn getMemoryCommunityIds(_: *@This(), _: std.mem.Allocator, _: i64, _: []const []const u8) !std.StringHashMapUnmanaged(i32) {
+        return .{};
+    }
     /// V1.5 day-4 — stub for non-postgres builds; traversal logging
     /// silently no-ops.
     pub fn insertTraversalEvent(_: *@This(), _: i64, _: []const u8) !void {
@@ -4024,6 +4029,73 @@ const ManagerImpl = struct {
                 .generated_at_unix = gen,
             };
             initialized += 1;
+        }
+        return out;
+    }
+
+    /// V1.7a-9d — batch fetch community_id for a key set. Single round
+    /// trip via `key = ANY($2::text[])`. Keys with NULL community_id
+    /// (unassigned, archived) are absent from the result map; caller
+    /// treats absence as "no community". Caller deinits the map; keys
+    /// in the map are owned (allocator.dupe).
+    pub fn getMemoryCommunityIds(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        keys: []const []const u8,
+    ) !std.StringHashMapUnmanaged(i32) {
+        var out: std.StringHashMapUnmanaged(i32) = .{};
+        errdefer {
+            var it = out.keyIterator();
+            while (it.next()) |k| allocator.free(k.*);
+            out.deinit(allocator);
+        }
+        if (keys.len == 0) return out;
+
+        // Build PG text[] literal (same escape pattern as listMemoriesMetadata).
+        var keys_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer keys_buf.deinit(self.allocator);
+        try keys_buf.append(self.allocator, '{');
+        for (keys, 0..) |k, i| {
+            if (i > 0) try keys_buf.append(self.allocator, ',');
+            try keys_buf.append(self.allocator, '"');
+            for (k) |ch| {
+                switch (ch) {
+                    '"' => try keys_buf.appendSlice(self.allocator, "\\\""),
+                    '\\' => try keys_buf.appendSlice(self.allocator, "\\\\"),
+                    else => try keys_buf.append(self.allocator, ch),
+                }
+            }
+            try keys_buf.append(self.allocator, '"');
+        }
+        try keys_buf.append(self.allocator, '}');
+        const keys_z = try self.allocator.dupeZ(u8, keys_buf.items);
+        defer self.allocator.free(keys_z);
+
+        const q = try self.buildQuery(
+            "SELECT key, community_id FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND key = ANY($2::text[]) " ++
+                "AND community_id IS NOT NULL",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{ user_s.ptr, keys_z.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(keys_buf.items.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const nrows: usize = @intCast(c.PQntuples(result));
+        var i: usize = 0;
+        while (i < nrows) : (i += 1) {
+            const row: c_int = @intCast(i);
+            const k = try dupeResultValue(allocator, result, row, 0);
+            errdefer allocator.free(k);
+            const cid_str = try dupeResultValue(allocator, result, row, 1);
+            defer allocator.free(cid_str);
+            const cid = std.fmt.parseInt(i32, cid_str, 10) catch continue;
+            try out.put(allocator, k, cid);
         }
         return out;
     }

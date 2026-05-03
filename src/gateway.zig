@@ -11694,6 +11694,40 @@ fn handleBrainGraph(
     };
     defer allocator.free(ref_edges);
 
+    // ── V1.7a-9d: per-node community_id + community_name lookup ────
+    // Two batched fetches (cheap): (1) per-node community_id from
+    // memories.community_id, (2) per-id name from memory_communities.
+    // Both DEGRADE gracefully — if either fails, nodes emit
+    // community_id:null + community_name:null and the FE falls back to
+    // un-clustered rendering. Communities require a recompute via
+    // POST /brain/communities/recompute (or scheduled background job)
+    // to populate; cold-start tenants with no recompute yet see all-null.
+    const community_keys = allocator.alloc([]const u8, node_count) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"oom\"}" };
+    };
+    defer allocator.free(community_keys);
+    for (nodes, 0..) |n, i| community_keys[i] = n.key;
+    var community_id_map = state_mgr.getMemoryCommunityIds(allocator, numeric_user_id, community_keys) catch std.StringHashMapUnmanaged(i32){};
+    defer {
+        var cit = community_id_map.keyIterator();
+        while (cit.next()) |k| allocator.free(k.*);
+        community_id_map.deinit(allocator);
+    }
+    // Build community_id → name map from listCommunities (one round trip
+    // covers all clusters; cheap at typical 5-20 communities per user).
+    var community_name_map: std.AutoHashMapUnmanaged(i32, []const u8) = .{};
+    defer community_name_map.deinit(allocator);
+    var community_summaries: []memory_mod.CommunitySummary = &.{};
+    defer memory_mod.freeCommunitySummaries(allocator, community_summaries);
+    if (state_mgr.listCommunities(allocator, numeric_user_id)) |summaries| {
+        community_summaries = summaries;
+        for (community_summaries) |s| {
+            if (s.name) |n| community_name_map.put(allocator, s.community_id, n) catch {};
+        }
+    } else |_| {
+        // Names degrade to null; community_id still emits.
+    }
+
     // V1.7a-3 — typed atomic-fact edges from the materialized
     // memory_edges table (V1.6 cmt7 + cmt16 backfill). Was: parse JSONB
     // metadata per visible node and pairwise-group by subject. Now: one
@@ -11850,6 +11884,22 @@ fn handleBrainGraph(
                     // display_label; FE falls back to using key as label
                 }
             }
+        }
+        // V1.7a-9d — community_id + community_name (both nullable). FE
+        // colors nodes by community_id and shows the name in the cluster
+        // legend. Cold-start tenants (no recompute yet) emit null/null
+        // and the FE renders un-clustered.
+        w.writeAll(",\"community_id\":") catch return response_build_err;
+        if (community_id_map.get(n.key)) |cid| {
+            w.print("{d}", .{cid}) catch return response_build_err;
+            w.writeAll(",\"community_name\":") catch return response_build_err;
+            if (community_name_map.get(cid)) |name| {
+                json_util.appendJsonString(&out, allocator, name) catch return response_build_err;
+            } else {
+                w.writeAll("null") catch return response_build_err;
+            }
+        } else {
+            w.writeAll("null,\"community_name\":null") catch return response_build_err;
         }
         w.writeAll("}") catch return response_build_err;
     }
@@ -12551,6 +12601,114 @@ fn handleBrainTimeline(
         log.warn("brain/timeline traversal log failed user={d} err={s}", .{ numeric_user_id, @errorName(err) });
     };
 
+    return finalizeJsonBuf(allocator, &out);
+}
+
+// ── /brain/communities — V1.7a-9d ───────────────────────────────────
+//
+// GET /api/v1/users/:user_id/brain/communities
+//
+// Lists community summaries for the user — one row per cluster with
+// id, name (nullable when not yet named), source ('llm' or 'fallback'),
+// member_count (live count, not stale cache value), and generated_at.
+// Powers the FE cluster legend / community-rail UI.
+//
+// POST /api/v1/users/:user_id/brain/communities/recompute
+//
+// Manual trigger for community recompute. Synchronous (sub-2s for V1
+// corpora). Returns RecomputeStats so the FE can show "5 clusters
+// detected" toast. V1 ships with NULL LlmNamer (every community gets
+// fallback "Cluster <id>"); a future commit wires the agent's LLM
+// provider to produce real names without changing the endpoint shape.
+
+const community_pipeline = @import("agent/community_pipeline.zig");
+
+fn handleBrainCommunities(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    const summaries = state_mgr.listCommunities(allocator, numeric_user_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"communities_query_failed\"}" };
+    };
+    defer memory_mod.freeCommunitySummaries(allocator, summaries);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"communities\":[") catch return response_build_err;
+    for (summaries, 0..) |s, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        w.print("{{\"community_id\":{d},\"member_count\":{d},\"generated_at\":{d},\"name\":", .{
+            s.community_id, s.member_count, s.generated_at_unix,
+        }) catch return response_build_err;
+        if (s.name) |n| {
+            json_util.appendJsonString(&out, allocator, n) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll(",\"name_source\":") catch return response_build_err;
+        if (s.name_source) |src| {
+            json_util.appendJsonString(&out, allocator, src) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.print("],\"stats\":{{\"communities\":{d}}}}}", .{summaries.len}) catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn handleBrainCommunitiesRecompute(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    // V1: NULL namer → fallback "Cluster <id>" names. Real LLM-naming
+    // wiring is a clean follow-up that constructs an LlmNamer from
+    // gateway state's provider router; the pipeline interface is
+    // stable so wiring it later doesn't change this endpoint's shape.
+    const stats = community_pipeline.recomputeCommunitiesForUser(
+        allocator,
+        state_mgr,
+        numeric_user_id,
+        null,
+        .{ .now_unix = std.time.timestamp() },
+    ) catch |err| {
+        log.warn("brain.communities.recompute_failed user={d} err={s}", .{ numeric_user_id, @errorName(err) });
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"recompute_failed\"}" };
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.print("{{\"stats\":{{\"edges_loaded\":{d},\"nodes_in_lpa\":{d},\"communities_found\":{d},\"members_assigned\":{d},\"llm_calls_succeeded\":{d},\"llm_calls_failed\":{d},\"fallback_names_written\":{d}}}}}", .{
+        stats.edges_loaded, stats.nodes_in_lpa, stats.communities_found,
+        stats.members_assigned, stats.llm_calls_succeeded, stats.llm_calls_failed,
+        stats.fallback_names_written,
+    }) catch return response_build_err;
     return finalizeJsonBuf(allocator, &out);
 }
 
@@ -14823,6 +14981,18 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "brain/orphans")) {
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainOrphans(req_allocator, method, scoped_user_id, brain_target, state);
+    }
+
+    // ── /brain/communities — V1.7a-9d ────────────────────────────────────
+    // GET  /api/v1/users/{id}/brain/communities             — list summaries
+    // POST /api/v1/users/{id}/brain/communities/recompute   — manual trigger
+    // V1 ships with NULL LlmNamer; every community gets a fallback
+    // "Cluster <id>" name. Real LLM-naming wiring is a clean follow-up.
+    if (std.mem.eql(u8, parsed.subpath, "brain/communities")) {
+        return handleBrainCommunities(req_allocator, method, scoped_user_id, state);
+    }
+    if (std.mem.eql(u8, parsed.subpath, "brain/communities/recompute")) {
+        return handleBrainCommunitiesRecompute(req_allocator, method, scoped_user_id, state);
     }
 
     // ── /brain/memory/{key} — V1.6 commit 13 (M3) ────────────────────────
@@ -25408,6 +25578,32 @@ test "parseLinkTypesCsv — valid + invalid + whitespace + empty" {
         defer s.deinit(allocator);
         try std.testing.expectEqual(@as(usize, 1), s.count());
     }
+}
+
+// ── /brain/communities — V1.7a-9d unit tests ──────────────────────────
+
+test "handleBrainCommunities rejects non-GET methods" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainCommunities(std.testing.allocator, "POST", "1", &dummy_state);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleBrainCommunities rejects invalid user_id" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainCommunities(std.testing.allocator, "GET", "abc", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "handleBrainCommunitiesRecompute rejects non-POST methods" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainCommunitiesRecompute(std.testing.allocator, "GET", "1", &dummy_state);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "handleBrainCommunitiesRecompute rejects invalid user_id" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainCommunitiesRecompute(std.testing.allocator, "POST", "abc", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
 }
 
 // ── /brain/orphans — V1.7a-8a unit tests ──────────────────────────────
