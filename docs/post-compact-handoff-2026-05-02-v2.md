@@ -4,14 +4,14 @@
 
 ## State at compaction
 
-- **Main HEAD:** `02d40b1` (closes ALL remaining V1.7 + V1.6 review findings: robust truncateUtf8 (correct + safe), Nostr seen_rumor_ids mutex, parseExtractedJson empty-alloc leak, compaction indentation, graph_expand ownership contract documented, autoCompactHistory docstring, extraction_tail leak, judge_ctx log.info)
-- **109+ commits ahead** of original V1.5 ship-ready handoff (`4d9e16f`)
+- **Main HEAD:** `df48be7` (V1.7a-5 cmt9.10 + drift-guard tests — link_type rich wiring across LinkType enum + extraction predicate mapping + compose_memory + prompt vocabulary + brain endpoint surface + idempotent backfill)
+- **111+ commits ahead** of original V1.5 ship-ready handoff (`4d9e16f`)
 - **V1.5 status:** SHIP-READY (deploy date deprioritized per Nova: ship when correct, not by date)
 - **V1.5.5 status:** GREEN — substrate validated (precision 0.92)
 - **V1.6 status:** SHIP-COMPLETE — 16/16 commits + cmt9.5 + ship-gate review fixes (`d50f5d1`); V1.6.1 polish landed in V1.7a-4 (cmt9.9 + review fixes a6f54b3 + parallel-review fixes 3524bf9 + all-review-findings-closed 02d40b1)
-- **V1.7 status:** 4 of 12 items shipped (V1.7a-1 cmt9.6 = Gap 3 closure; V1.7a-2 cmt9.7 = graph_expand → memory_recall consumer; V1.7a-3 cmt9.8 = brain graph perf swap; V1.7a-4 cmt9.9 = V1.6.1 polish; ALL items pass dual-review-clean: self-pass + gsd-code-review)
+- **V1.7 status:** 5 of 12 items shipped (V1.7a-1 cmt9.6 = Gap 3 closure; V1.7a-2 cmt9.7 = graph_expand → memory_recall consumer; V1.7a-3 cmt9.8 = brain graph perf swap; V1.7a-4 cmt9.9 = V1.6.1 polish; V1.7a-5 cmt9.10 = link_type rich wiring; ALL items dual-review-clean: self-pass + gsd-code-review)
 - **Branch:** `main`
-- **Tests:** 5946/5956 PG passed (+26 vs V1.5 baseline; 10 skipped). Only pre-existing `postgres_pool_releases_on_exec_error` baseline failure.
+- **Tests:** 5954/5964 PG passed (+34 vs V1.5 baseline; 10 skipped). Only pre-existing `postgres_pool_releases_on_exec_error` baseline failure.
 
 ## Trust mandate (do not forget)
 
@@ -37,8 +37,8 @@ Nova also said: *"the parallel agent working on memory has stopped working, all 
 | 2 | graph_expand → memory_recall consumer wire (cmt9.7) | ✅ SHIPPED `df030d3` (+ review fixes `454934e`) | My closure |
 | 3 | Brain graph perf swap (JSONB → findEdgesByKeys) (cmt9.8) | ✅ SHIPPED `8171166` (+ review fixes `ab93bd4`: swapped initial listEdgesForUser → findEdgesByKeys for visible-node-scoped scan; renamed cap constant; added sort-tiebreak test; cmt16 backfill docs) | My closure |
 | 4 | V1.6.1 polish (WR-02 Unicode lowercase, SE-V17-01 list-scope tool desc, SE-V17-02 pending_conflicts text) (cmt9.9) | ✅ SHIPPED `d8715da` + review fixes `a6f54b3` (Unicode-aware `lowerForEntityKey` covering ASCII + Latin-1 Supplement + Cyrillic + Greek; SQL backfill aligned to PG `lower()`; tool desc + marker text rewrites; 14 unit tests + Zig/SQL convergence PG smoke test) | My closure (V1.6 backlog) |
-| 5 | Spec seam 3: `link_type` rich wiring (compose_memory + agent prompt) | ⏳ NEXT | Spec §5 |
-| 6 | Spec seam 8: `/brain/diff?date=` endpoint | ⏳ | Spec §5 |
+| 5 | Spec seam 3: `link_type` rich wiring (compose_memory + agent prompt) (cmt9.10) | ✅ SHIPPED `8cd7d35` + drift guards `df48be7` (LinkType enum + extraction predicate mapping + compose_memory optional arg + prompt vocabulary block + brain/memory/{key} top-level field + idempotent column backfill; 7 unit + 1 PG-smoke + 1 drift-guard test) | Spec §5 |
+| 6 | Spec seam 8: `/brain/diff?date=` endpoint | ⏳ NEXT | Spec §5 |
 
 ### V1.7b — depth/quality (spec completion; ships after V1.7a)
 
