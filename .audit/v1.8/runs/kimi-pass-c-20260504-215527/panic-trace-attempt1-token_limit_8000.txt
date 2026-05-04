@@ -1,0 +1,33 @@
+panic ret_addr=0x10150b0a0
+panic error return trace:
+thread 290713698 panic: reached unreachable code
+/opt/homebrew/Cellar/zig/0.15.2/lib/zig/std/debug.zig:559:14: 0x10150b09f in assert (nullalis)
+    if (!ok) unreachable; // assertion failure
+             ^
+/opt/homebrew/Cellar/zig/0.15.2/lib/zig/std/hash_map.zig:873:19: 0x101e751b3 in putAssumeCapacityNoClobberContext (nullalis)
+            assert(!self.containsContext(key, ctx));
+                  ^
+/opt/homebrew/Cellar/zig/0.15.2/lib/zig/std/hash_map.zig:1449:58: 0x101d76f77 in grow (nullalis)
+                    map.putAssumeCapacityNoClobberContext(k, v, ctx);
+                                                         ^
+/opt/homebrew/Cellar/zig/0.15.2/lib/zig/std/hash_map.zig:1296:30: 0x101c5aa0b in growIfNeeded (nullalis)
+                try self.grow(allocator, capacityForSize(self.load() + new_count), ctx);
+                             ^
+/opt/homebrew/Cellar/zig/0.15.2/lib/zig/std/hash_map.zig:1115:34: 0x1019db6fb in getOrPutContextAdapted__anon_125959 (nullalis)
+                self.growIfNeeded(allocator, 1, ctx) catch |err| {
+                                 ^
+/opt/homebrew/Cellar/zig/0.15.2/lib/zig/std/hash_map.zig:1100:56: 0x1018e24ab in getOrPutContext (nullalis)
+            const gop = try self.getOrPutContextAdapted(allocator, key, ctx, ctx);
+                                                       ^
+/opt/homebrew/Cellar/zig/0.15.2/lib/zig/std/hash_map.zig:1026:52: 0x1018e1987 in putContext (nullalis)
+            const result = try self.getOrPutContext(allocator, key, ctx);
+                                                   ^
+/opt/homebrew/Cellar/zig/0.15.2/lib/zig/std/hash_map.zig:1023:35: 0x101725153 in put (nullalis)
+            return self.putContext(allocator, key, value, undefined);
+                                  ^
+/Users/nova/Desktop/nullalis/src/memory/engines/markdown.zig:546:39: 0x101d317ab in readAllEntries (nullalis)
+                    try tombstoned.put(allocator, target_key, {});
+                                      ^
+/Users/nova/Desktop/nullalis/src/memory/engines/markdown.zig:750:45: 0x101d34ceb in implCount (nullalis)
+        const all = try self_.readAllEntries(scratch_allocator);
+                                            ^
