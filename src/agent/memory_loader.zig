@@ -962,7 +962,17 @@ fn buildActiveCommunitiesBlock(
         const name = s.name orelse continue;
         if (name.len == 0) continue;
         if (emitted > 0) try w.writeAll(", ");
-        try w.print("{s} ({d} members)", .{ name, s.member_count });
+        // V1.7-ship review WR-1 belt-and-suspenders: defense-in-depth
+        // escape of `<` / `>` / `\n` even though community_llm_namer's
+        // cleanName positively filters to `[A-Za-z0-9 ./&'_-]` + UTF-8.
+        // If the cleaning ever regresses (or a future writer skips it),
+        // this emission still cannot inject XML/structural chars into
+        // the system prompt.
+        for (name) |ch| {
+            if (ch == '<' or ch == '>' or ch == '\n' or ch == '\r') continue;
+            try w.writeByte(ch);
+        }
+        try w.print(" ({d} members)", .{s.member_count});
         emitted += 1;
     }
     if (emitted == 0) {

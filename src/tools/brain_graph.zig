@@ -116,8 +116,7 @@ pub const BrainGraphTool = struct {
         const center_key = root.getString(args, "center_key") orelse
             return ToolResult.fail("action=local_graph requires 'center_key'. Use a key returned by memory_recall.");
         const depth_raw = root.getInt(args, "depth") orelse 1;
-        var depth: u8 = if (depth_raw > 0 and depth_raw <= 3) @intCast(depth_raw) else 1;
-        _ = &depth;
+        const depth: u8 = if (depth_raw > 0 and depth_raw <= 3) @intCast(depth_raw) else 1;
 
         // Verify center exists + is brain-visible. Same gate as
         // /brain/local-graph endpoint (V1.7a-7).
@@ -126,7 +125,7 @@ pub const BrainGraphTool = struct {
         }
         const center_row = sm.getMemory(allocator, uid, center_key) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to verify center: {s}", .{@errorName(err)});
-            return .{ .success = false, .output = msg };
+            return .{ .success = false, .output = "", .error_msg = msg };
         };
         if (center_row) |row| {
             row.deinit(allocator);
@@ -140,7 +139,7 @@ pub const BrainGraphTool = struct {
             .max_nodes_per_hop = 20,
         }) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Graph expansion failed: {s}", .{@errorName(err)});
-            return .{ .success = false, .output = msg };
+            return .{ .success = false, .output = "", .error_msg = msg };
         };
         defer nb.deinit(allocator);
 
@@ -192,7 +191,7 @@ pub const BrainGraphTool = struct {
 
         const summaries = sm.listCommunities(allocator, uid) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Communities query failed: {s}", .{@errorName(err)});
-            return .{ .success = false, .output = msg };
+            return .{ .success = false, .output = "", .error_msg = msg };
         };
         defer mem_root.freeCommunitySummaries(allocator, summaries);
 
@@ -240,7 +239,7 @@ pub const BrainGraphTool = struct {
 
         const orphans = sm.listOrphanMemories(allocator, uid, limit) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Orphans query failed: {s}", .{@errorName(err)});
-            return .{ .success = false, .output = msg };
+            return .{ .success = false, .output = "", .error_msg = msg };
         };
         defer mem_root.freeEntries(allocator, orphans);
 
@@ -287,13 +286,13 @@ pub const BrainGraphTool = struct {
 
         const births = sm.listMemoryBirthsInWindow(allocator, uid, window_from, window_to, 30) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Births query failed: {s}", .{@errorName(err)});
-            return .{ .success = false, .output = msg };
+            return .{ .success = false, .output = "", .error_msg = msg };
         };
         defer mem_root.freeEntries(allocator, births);
 
         const deaths = sm.listMemoryDeathsInWindow(allocator, uid, window_from, window_to, 30) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Deaths query failed: {s}", .{@errorName(err)});
-            return .{ .success = false, .output = msg };
+            return .{ .success = false, .output = "", .error_msg = msg };
         };
         defer mem_root.freeEntries(allocator, deaths);
 
@@ -418,4 +417,21 @@ test "BrainGraphTool — invalid action returns clear failure" {
     try std.testing.expect(!result.success);
     try std.testing.expect(result.error_msg != null);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid 'action'") != null);
+}
+
+test "BrainGraphTool — bound state, unbound user_id returns clear failure (WR-3)" {
+    // V1.7-ship review WR-3: explicit coverage for the user_id=null branch.
+    // Previously only state_mgr=null was tested; the orelse on user_id was
+    // unverified. This catches a regression that would silently 0-out the
+    // tenant scope on a partially-bound tool.
+    const allocator = std.testing.allocator;
+    var stub_mgr: zaki_state.Manager = undefined;
+    var t = BrainGraphTool{ .state_mgr = &stub_mgr }; // user_id intentionally null
+    var args = std.json.ObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("action", .{ .string = "communities" });
+    const result = try t.execute(allocator, args);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "user_id not bound") != null);
 }
