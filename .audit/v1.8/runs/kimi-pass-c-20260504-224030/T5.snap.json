@@ -1,0 +1,192 @@
+{
+  "ts": "2026-05-04T20:57:39Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 48,
+    "memories_live": 76,
+    "memories_archived": 0,
+    "entities": 9,
+    "edges_active": 10,
+    "edges_total": 10,
+    "communities": 0,
+    "events": 123
+  },
+  "by_category": {
+    "conversation": 49,
+    "core": 16,
+    "daily": 11
+  },
+  "by_attribution": {
+    "extraction_classifier": 3,
+    "none": 73
+  },
+  "by_predicate": {
+    "HAS_ACTIVE_CONTRACT": 1,
+    "HAS_DEADLINE": 3,
+    "PREFERS": 2,
+    "STAKEHOLDER_OF": 2,
+    "WORKS_AT": 1,
+    "WORKS_WITH": 1
+  },
+  "by_edge_attribution": {
+    "extraction_classifier": 10
+  },
+  "recent_memories": [
+    {
+      "key": "autosave_assistant_1777928258796782000",
+      "content_head": "# Transformer Attention — The Mathematics\n\n## The Problem Attention Solves\n\nA sequence of tokens arr",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777928259
+    },
+    {
+      "key": "autosave_user_1777928112796139000",
+      "content_head": "Now switch to a totally different topic: explain how a transformer attention mechanism works mathema",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777928113
+    },
+    {
+      "key": "autosave_assistant_1777928112142991000",
+      "content_head": "# PostgreSQL MVCC Under the Hood\n\nPostgreSQL implements MVCC through a **tuple-versioning** model. E",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777928112
+    },
+    {
+      "key": "autosave_assistant_1777927777732630000",
+      "content_head": "# The Consensus Problem\n\n## What We're Actually Solving\n\nYou have N nodes. Each proposes values. The",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927778
+    },
+    {
+      "key": "autosave_user_1777927778385359000",
+      "content_head": "Explain how Postgres MVCC works under the hood. Cover tuple visibility, vacuum, the xid wraparound p",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927778
+    },
+    {
+      "key": "autosave_user_1777927644483445000",
+      "content_head": "Walk me through the consensus problem in distributed systems. Compare Paxos, Raft, and PBFT. Which w",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927644
+    },
+    {
+      "key": "autosave_assistant_1777927643784984000",
+      "content_head": "Here's the contrast across the four dimensions you asked about.\n\n---\n\n## 1. Debuggability\n\n### Monol",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927644
+    },
+    {
+      "key": "autosave_user_1777927448555554000",
+      "content_head": "Now contrast that with a monolithic architecture using REST APIs and a single relational database. W",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927449
+    }
+  ],
+  "recent_edges": [
+    {
+      "source_key": "extracted_70e786fee3d7b511",
+      "target_key": "e12722a7a93721bfd36c3866571405e6",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_041535a9e15f9b8e",
+      "target_key": "b00d640a72b2e9e8a7bdc51c43d2ab57",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_fa2190f6ca46407a",
+      "target_key": "be87c283acebbaf53c4737ba37117e8a",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_ed3319179619c1c3",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_288a758930697150",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_9bd07c3f39263a04",
+      "target_key": "4e2aebecaff96f9c4bacc2d874b84ea1",
+      "predicate": "HAS_ACTIVE_CONTRACT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908892
+    },
+    {
+      "source_key": "extracted_ede39e522920e3d1",
+      "target_key": "850793e849d543321ab073f8a48585f0",
+      "predicate": "WORKS_WITH",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    },
+    {
+      "source_key": "extracted_7cfdca9a8e53f1c9",
+      "target_key": "ff51467a475be384a79e67ae9f41c28f",
+      "predicate": "WORKS_AT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    }
+  ],
+  "recent_messages": [
+    {
+      "role": "user",
+      "preview": "Now switch to a totally different topic: explain how a transformer attention mec",
+      "created_at": 1777928259,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    },
+    {
+      "role": "assistant",
+      "preview": "# Transformer Attention — The Mathematics\n\n## The Problem Attention Solves\n\nA se",
+      "created_at": 1777928259,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    },
+    {
+      "role": "user",
+      "preview": "Explain how Postgres MVCC works under the hood. Cover tuple visibility, vacuum, ",
+      "created_at": 1777928112,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    },
+    {
+      "role": "assistant",
+      "preview": "# PostgreSQL MVCC Under the Hood\n\nPostgreSQL implements MVCC through a **tuple-v",
+      "created_at": 1777928112,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    }
+  ]
+}

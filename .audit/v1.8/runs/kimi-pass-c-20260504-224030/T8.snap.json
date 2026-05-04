@@ -1,0 +1,192 @@
+{
+  "ts": "2026-05-04T22:03:05Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 54,
+    "memories_live": 84,
+    "memories_archived": 0,
+    "entities": 9,
+    "edges_active": 10,
+    "edges_total": 10,
+    "communities": 0,
+    "events": 132
+  },
+  "by_category": {
+    "conversation": 55,
+    "core": 16,
+    "daily": 13
+  },
+  "by_attribution": {
+    "extraction_classifier": 3,
+    "none": 81
+  },
+  "by_predicate": {
+    "HAS_ACTIVE_CONTRACT": 1,
+    "HAS_DEADLINE": 3,
+    "PREFERS": 2,
+    "STAKEHOLDER_OF": 2,
+    "WORKS_AT": 1,
+    "WORKS_WITH": 1
+  },
+  "by_edge_attribution": {
+    "extraction_classifier": 10
+  },
+  "recent_memories": [
+    {
+      "key": "autosave_assistant_1777932185172033000",
+      "content_head": "Here are all 7 technical topics, 5 bullet points each.\n\n---\n\n## 1. Event-Sourced Microservices with ",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777932185
+    },
+    {
+      "key": "timeline_summary/agent:zaki-bot:user:7777:thread:kimi-passc-1777927230/1777932185",
+      "content_head": "origin_channel=zaki_app\norigin_lane=thread\norigin_chat_id=agent:zaki-bot:user:7777:thread:kimi-passc",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777932185
+    },
+    {
+      "key": "session_checkpoint_1777932185",
+      "content_head": "type=session_checkpoint\nreason=shutdown\nsession=agent:zaki-bot:user:7777:thread:kimi-passc-177792723",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777932185
+    },
+    {
+      "key": "autosave_user_1777928543095815000",
+      "content_head": "Summarize everything we discussed across all 8 of these prompts in 5 bullet points each. Be thorough",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777928543
+    },
+    {
+      "key": "autosave_assistant_1777928542421838000",
+      "content_head": "# Zig's `comptime` — Compile-Time Metaprogramming as a First-Class Language Feature\n\n---\n\n## 1. What",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777928542
+    },
+    {
+      "key": "autosave_user_1777928413973542000",
+      "content_head": "Tell me about the Zig language's comptime feature. Walk through what makes it different from C macro",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777928414
+    },
+    {
+      "key": "autosave_assistant_1777928413352211000",
+      "content_head": "# The Completely Fair Scheduler (CFS)\n\n---\n\n## 1. The Philosophy\n\nCFS doesn't think in timeslices. I",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777928413
+    },
+    {
+      "key": "autosave_user_1777928259568132000",
+      "content_head": "Describe the Linux kernel scheduler CFS in detail. Cover red-black trees for runqueue, vruntime, nic",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777928260
+    }
+  ],
+  "recent_edges": [
+    {
+      "source_key": "extracted_70e786fee3d7b511",
+      "target_key": "e12722a7a93721bfd36c3866571405e6",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_041535a9e15f9b8e",
+      "target_key": "b00d640a72b2e9e8a7bdc51c43d2ab57",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_fa2190f6ca46407a",
+      "target_key": "be87c283acebbaf53c4737ba37117e8a",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_ed3319179619c1c3",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_288a758930697150",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_9bd07c3f39263a04",
+      "target_key": "4e2aebecaff96f9c4bacc2d874b84ea1",
+      "predicate": "HAS_ACTIVE_CONTRACT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908892
+    },
+    {
+      "source_key": "extracted_ede39e522920e3d1",
+      "target_key": "850793e849d543321ab073f8a48585f0",
+      "predicate": "WORKS_WITH",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    },
+    {
+      "source_key": "extracted_7cfdca9a8e53f1c9",
+      "target_key": "ff51467a475be384a79e67ae9f41c28f",
+      "predicate": "WORKS_AT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    }
+  ],
+  "recent_messages": [
+    {
+      "role": "user",
+      "preview": "Summarize everything we discussed across all 8 of these prompts in 5 bullet poin",
+      "created_at": 1777932185,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    },
+    {
+      "role": "assistant",
+      "preview": "Here are all 7 technical topics, 5 bullet points each.\n\n---\n\n## 1. Event-Sourced",
+      "created_at": 1777932185,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    },
+    {
+      "role": "user",
+      "preview": "Tell me about the Zig language's comptime feature. Walk through what makes it di",
+      "created_at": 1777928542,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    },
+    {
+      "role": "assistant",
+      "preview": "# Zig's `comptime` — Compile-Time Metaprogramming as a First-Class Language Feat",
+      "created_at": 1777928542,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    }
+  ]
+}

@@ -1,0 +1,2898 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: progress
+data: {"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777927448516-2"}
+
+event: progress
+data: {"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":39,"run_id":"r-1777927448516-2"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777927448516-2"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":0,"run_id":"r-1777927448516-2"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":30787,"run_id":"r-1777927448516-2"}
+
+event: token
+data: {"delta":"Here's the ","content":"Here's the ","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"contrast across the four","content":"contrast across the four","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" dimensions you","content":" dimensions you","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" asked a","content":" asked a","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"bout.\n\n--","content":"bout.\n\n--","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"-\n\n## 1. Deb","content":"-\n\n## 1. Deb","seq":5,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"uggabilit","content":"uggabilit","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"y\n\n### M","content":"y\n\n### M","seq":7,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"onolith","content":"onolith","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" (REST + ","content":" (REST + ","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Single DB)\n\nYou ","content":"Single DB)\n\nYou ","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"have ","content":"have ","seq":11,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"a **singl","content":"a **singl","seq":12,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e ","content":"e ","seq":13,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"call stack**. A","content":"call stack**. A","seq":14,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" ","content":" ","seq":15,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"request","content":"request","seq":16,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" enters, passes thro","content":" enters, passes thro","seq":17,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ugh ","content":"ugh ","seq":18,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"controllers → services ","content":"controllers → services ","seq":19,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"→ repos","content":"→ repos","seq":20,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"itories ","content":"itories ","seq":21,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"→ the databas","content":"→ the databas","seq":22,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e, an","content":"e, an","seq":23,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d returns. When s","content":"d returns. When s","seq":24,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"omet","content":"omet","seq":25,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hing b","content":"hing b","seq":26,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"reaks:\n\n- S","content":"reaks:\n\n- S","seq":27,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tack tr","content":"tack tr","seq":28,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"aces are linear","content":"aces are linear","seq":29,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" and complete.\n-","content":" and complete.\n-","seq":30,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" You can","content":" You can","seq":31,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" attac","content":" attac","seq":32,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"h a ","content":"h a ","seq":33,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"debugger to ","content":"debugger to ","seq":34,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"one process and step thr","content":"one process and step thr","seq":35,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ough the e","content":"ough the e","seq":36,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ntire flow.\n- A datab","content":"ntire flow.\n- A datab","seq":37,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ase tr","content":"ase tr","seq":38,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ansaction wraps","content":"ansaction wraps","seq":39,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" ev","content":" ev","seq":40,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"erything — i","content":"erything — i","seq":41,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"f it fails, ","content":"f it fails, ","seq":42,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"the whole th","content":"the whole th","seq":43,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ing rolls back. You ","content":"ing rolls back. You ","seq":44,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"can","content":"can","seq":45,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" inspect the ","content":" inspect the ","seq":46,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"D","content":"D","seq":47,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"B state be","content":"B state be","seq":48,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"fore/af","content":"fore/af","seq":49,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ter wi","content":"ter wi","seq":50,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"th si","content":"th si","seq":51,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"m","content":"m","seq":52,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ple SQL","content":"ple SQL","seq":53,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":".\n- Logs a","content":".\n- Logs a","seq":54,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"re in one pla","content":"re in one pla","seq":55,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ce.","content":"ce.","seq":56,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" Correla","content":" Correla","seq":57,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t","content":"t","seq":58,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ion ","content":"ion ","seq":59,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"is trivial: ","content":"is trivial: ","seq":60,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"one requ","content":"one requ","seq":61,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"est ID,","content":"est ID,","seq":62,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" one log","content":" one log","seq":63,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" stream.","content":" stream.","seq":64,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n\n**The","content":"\n\n**The","seq":65,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" cost:** you'r","content":" cost:** you'r","seq":66,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e de","content":"e de","seq":67,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"bugging","content":"bugging","seq":68,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" one","content":" one","seq":69,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" big ","content":" big ","seq":70,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"thing.","content":"thing.","seq":71,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" But tha","content":" But tha","seq":72,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t thing is *com","content":"t thing is *com","seq":73,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"prehensible","content":"prehensible","seq":74,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"*.\n\n### Event-Sourced ","content":"*.\n\n### Event-Sourced ","seq":75,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Mic","content":"Mic","seq":76,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ros","content":"ros","seq":77,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ervices\n\nYou","content":"ervices\n\nYou","seq":78,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"'re debugging a","content":"'re debugging a","seq":79,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" **distributed, asy","content":" **distributed, asy","seq":80,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nchronous ","content":"nchronous ","seq":81,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"chain o","content":"chain o","seq":82,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"f events","content":"f events","seq":83,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"**. Th","content":"**. Th","seq":84,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e fail","content":"e fail","seq":85,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ure ","content":"ure ","seq":86,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"might be:\n\n","content":"might be:\n\n","seq":87,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"- An event tha","content":"- An event tha","seq":88,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t was published but","content":"t was published but","seq":89,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" never con","content":" never con","seq":90,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"sumed","content":"sumed","seq":91,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" (consu","content":" (consu","seq":92,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"mer lag, poison ","content":"mer lag, poison ","seq":93,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"pil","content":"pil","seq":94,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l, part","content":"l, part","seq":95,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ition ","content":"ition ","seq":96,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rebalance).\n- A pr","content":"rebalance).\n- A pr","seq":97,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ojection t","content":"ojection t","seq":98,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hat's sta","content":"hat's sta","seq":99,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"le — the r","content":"le — the r","seq":100,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ead model ","content":"ead model ","seq":101,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"doesn't reflect ","content":"doesn't reflect ","seq":102,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"the w","content":"the w","seq":103,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rite mod","content":"rite mod","seq":104,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"el yet, an","content":"el yet, an","seq":105,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d the ","content":"d the ","seq":106,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"user se","content":"user se","seq":107,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"es ","content":"es ","seq":108,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"wrong data","content":"wrong data","seq":109,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":".\n","content":".\n","seq":110,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"- A saga t","content":"- A saga t","seq":111,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hat's s","content":"hat's s","seq":112,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tuck mid-","content":"tuck mid-","seq":113,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"flig","content":"flig","seq":114,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ht — step 3's co","content":"ht — step 3's co","seq":115,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"mpensation ","content":"mpensation ","seq":116,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ran, bu","content":"ran, bu","seq":117,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t s","content":"t s","seq":118,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tep 2's ","content":"tep 2's ","seq":119,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"didn't, and","content":"didn't, and","seq":120,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" now t","content":" now t","seq":121,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"he system is","content":"he system is","seq":122,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" in a half-co","content":" in a half-co","seq":123,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"mpe","content":"mpe","seq":124,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nsated","content":"nsated","seq":125,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" state.\n\n","content":" state.\n\n","seq":126,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"**W","content":"**W","seq":127,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hat yo","content":"hat yo","seq":128,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"u ","content":"u ","seq":129,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"need to trace a sing","content":"need to trace a sing","seq":130,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"le r","content":"le r","seq":131,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"equest:","content":"equest:","seq":132,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"**\n\n```","content":"**\n\n```","seq":133,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\nRequest","content":"\nRequest","seq":134,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" ID ","content":" ID ","seq":135,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"→ Comma","content":"→ Comma","seq":136,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nd → Event ","content":"nd → Event ","seq":137,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ID → C","content":"ID → C","seq":138,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"onsumer o","content":"onsumer o","seq":139,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ffs","content":"ffs","seq":140,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ets → Saga ID ","content":"ets → Saga ID ","seq":141,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"→ Com","content":"→ Com","seq":142,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"pensat","content":"pensat","seq":143,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ion ","content":"ion ","seq":144,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"chai","content":"chai","seq":145,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n\n```\n\nEac","content":"n\n```\n\nEac","seq":146,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"h hop cr","content":"h hop cr","seq":147,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"osses a process ","content":"osses a process ","seq":148,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"boundary. ","content":"boundary. ","seq":149,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Tools like Op","content":"Tools like Op","seq":150,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"enTelemetry and distri","content":"enTelemetry and distri","seq":151,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"bu","content":"bu","seq":152,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ted t","content":"ted t","seq":153,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"racing","content":"racing","seq":154,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" (Jae","content":" (Jae","seq":155,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ger, Ho","content":"ger, Ho","seq":156,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"neycomb) b","content":"neycomb) b","seq":157,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ecome mandatory","content":"ecome mandatory","seq":158,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", not optional","content":", not optional","seq":159,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":". You're c","content":". You're c","seq":160,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"orrelatin","content":"orrelatin","seq":161,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g logs across N serv","content":"g logs across N serv","seq":162,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ices, each wit","content":"ices, each wit","seq":163,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"h its","content":"h its","seq":164,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" own clo","content":" own clo","seq":165,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ck ske","content":"ck ske","seq":166,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"w.\n","content":"w.\n","seq":167,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n**The tr","content":"\n**The tr","seq":168,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ade:** you ","content":"ade:** you ","seq":169,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ga","content":"ga","seq":170,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"i","content":"i","seq":171,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n resi","content":"n resi","seq":172,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lience ","content":"lience ","seq":173,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"(a crash","content":"(a crash","seq":174,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" in the paymen","content":" in the paymen","seq":175,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t servi","content":"t servi","seq":176,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ce do","content":"ce do","seq":177,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"esn't ","content":"esn't ","seq":178,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"take dow","content":"take dow","seq":179,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n order ","content":"n order ","seq":180,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hi","content":"hi","seq":181,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"story queries), b","content":"story queries), b","seq":182,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ut you lose the a","content":"ut you lose the a","seq":183,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"bility ","content":"bility ","seq":184,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"to poi","content":"to poi","seq":185,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nt at on","content":"nt at on","seq":186,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e pla","content":"e pla","seq":187,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ce and say \"","content":"ce and say \"","seq":188,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"the bug is ","content":"the bug is ","seq":189,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"here.\"\n","content":"here.\"\n","seq":190,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n---\n\n## ","content":"\n---\n\n## ","seq":191,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"2. Latency\n","content":"2. Latency\n","seq":192,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":193,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"### Mono","content":"### Mono","seq":194,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lith\n\nA typical reque","content":"lith\n\nA typical reque","seq":195,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"st lifecyc","content":"st lifecyc","seq":196,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"le:\n\n`","content":"le:\n\n`","seq":197,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"`","content":"`","seq":198,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"`\nC","content":"`\nC","seq":199,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lient → [2ms]","content":"lient → [2ms]","seq":200,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" → Co","content":" → Co","seq":201,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ntrol","content":"ntrol","seq":202,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ler → [0.5","content":"ler → [0.5","seq":203,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ms] →","content":"ms] →","seq":204,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" Service ","content":" Service ","seq":205,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"→ [1ms] ","content":"→ [1ms] ","seq":206,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"→ ","content":"→ ","seq":207,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"DB query → [1m","content":"DB query → [1m","seq":208,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s] →","content":"s] →","seq":209,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" Response","content":" Response","seq":210,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n```\n\n","content":"\n```\n\n","seq":211,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Total: **single-digit ","content":"Total: **single-digit ","seq":212,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"milliseconds**. Th","content":"milliseconds**. Th","seq":213,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e database ","content":"e database ","seq":214,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"call is usually","content":"call is usually","seq":215,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" ","content":" ","seq":216,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"the bot","content":"the bot","seq":217,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"tlenec","content":"tlenec","seq":218,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"k, and it's one ","content":"k, and it's one ","seq":219,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hop. ","content":"hop. ","seq":220,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Everything ","content":"Everything ","seq":221,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"runs","content":"runs","seq":222,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" in-proces","content":" in-proces","seq":223,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s — no seriali","content":"s — no seriali","seq":224,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"zation overhead, n","content":"zation overhead, n","seq":225,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o network roun","content":"o network roun","seq":226,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d-trips be","content":"d-trips be","seq":227,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tween ser","content":"tween ser","seq":228,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"vices","content":"vices","seq":229,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", no queue ","content":", no queue ","seq":230,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"bufferin","content":"bufferin","seq":231,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g.\n\n### Even","content":"g.\n\n### Even","seq":232,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t-Sourced Mic","content":"t-Sourced Mic","seq":233,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"roservices\n\nTh","content":"roservices\n\nTh","seq":234,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e same busines","content":"e same busines","seq":235,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s operati","content":"s operati","seq":236,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"on now spa","content":"on now spa","seq":237,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ns:\n\n```\nCli","content":"ns:\n\n```\nCli","seq":238,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ent ","content":"ent ","seq":239,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"→ Com","content":"→ Com","seq":240,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"mand A","content":"mand A","seq":241,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"PI [2ms]\n    ","content":"PI [2ms]\n    ","seq":242,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"  ","content":"  ","seq":243,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" → Va","content":" → Va","seq":244,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lidate + ","content":"lidate + ","seq":245,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"append event [","content":"append event [","seq":246,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"2ms]\n       ","content":"2ms]\n       ","seq":247,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"→ K","content":"→ K","seq":248,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"a","content":"a","seq":249,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"fka pr","content":"fka pr","seq":250,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"oduce [5-50ms]\n    ","content":"oduce [5-50ms]\n    ","seq":251,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"   ","content":"   ","seq":252,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"→ ","content":"→ ","seq":253,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"C","content":"C","seq":254,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"onsumer poll ","content":"onsumer poll ","seq":255,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"(batc","content":"(batc","seq":256,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hing del","content":"hing del","seq":257,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ay) [10-100ms]\n   ","content":"ay) [10-100ms]\n   ","seq":258,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"   ","content":"   ","seq":259,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" → Project t","content":" → Project t","seq":260,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o read model [","content":"o read model [","seq":261,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"5ms]\n ","content":"5ms]\n ","seq":262,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"     ","content":"     ","seq":263,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" → Quer","content":" → Quer","seq":264,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"y read model [","content":"y read model [","seq":265,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"2ms]\n     ","content":"2ms]\n     ","seq":266,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"  → R","content":"  → R","seq":267,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"esp","content":"esp","seq":268,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"onse\n``","content":"onse\n``","seq":269,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"`\n","content":"`\n","seq":270,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n**","content":"\n**","seq":271,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"End","content":"End","seq":272,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"-to-e","content":"-to-e","seq":273,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nd: 50-500","content":"nd: 50-500","seq":274,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ms**, dom","content":"ms**, dom","seq":275,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"inat","content":"inat","seq":276,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ed by Kafka","content":"ed by Kafka","seq":277,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"'s ba","content":"'s ba","seq":278,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tching and poll","content":"tching and poll","seq":279,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" inte","content":" inte","seq":280,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rvals.","content":"rvals.","seq":281,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" And that's th","content":" And that's th","seq":282,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e *happ","content":"e *happ","seq":283,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"y pat","content":"y pat","seq":284,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"h*. If the ","content":"h*. If the ","seq":285,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"read mode","content":"read mode","seq":286,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l hasn't","content":"l hasn't","seq":287,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" caught up ","content":" caught up ","seq":288,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"when the clie","content":"when the clie","seq":289,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nt queries,","content":"nt queries,","seq":290,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" you e","content":" you e","seq":291,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ithe","content":"ithe","seq":292,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r:\n\n-","content":"r:\n\n-","seq":293,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" Bloc","content":" Bloc","seq":294,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"k and wait (","content":"k and wait (","seq":295,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"adds lat","content":"adds lat","seq":296,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ency).\n- Re","content":"ency).\n- Re","seq":297,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"turn st","content":"turn st","seq":298,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ale dat","content":"ale dat","seq":299,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"a (wrong ","content":"a (wrong ","seq":300,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"answer).\n- Read","content":"answer).\n- Read","seq":301,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" from the write","content":" from the write","seq":302,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" mode","content":" mode","seq":303,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l directly (defe","content":"l directly (defe","seq":304,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ats the ","content":"ats the ","seq":305,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"purpose o","content":"purpose o","seq":306,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"f CQRS).\n","content":"f CQRS).\n","seq":307,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n**The t","content":"\n**The t","seq":308,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rade:*","content":"rade:*","seq":309,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"*","content":"*","seq":310,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" you ","content":" you ","seq":311,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"get asyn","content":"get asyn","seq":312,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"c, fire-an","content":"c, fire-an","seq":313,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d-forget ","content":"d-forget ","seq":314,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"writes that ca","content":"writes that ca","seq":315,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n absorb ","content":"n absorb ","seq":316,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"burst","content":"burst","seq":317,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s, but you give","content":"s, but you give","seq":318,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" up synchrono","content":" up synchrono","seq":319,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"us confirm","content":"us confirm","seq":320,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ation. ","content":"ation. ","seq":321,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"The user clic","content":"The user clic","seq":322,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ks \"Place ","content":"ks \"Place ","seq":323,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Order\" and","content":"Order\" and","seq":324,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" sees a ","content":" sees a ","seq":325,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"spinner ","content":"spinner ","seq":326,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— not bec","content":"— not bec","seq":327,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ause the ","content":"ause the ","seq":328,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"system is slow","content":"system is slow","seq":329,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", but because *co","content":", but because *co","seq":330,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nsiste","content":"nsiste","seq":331,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ncy take","content":"ncy take","seq":332,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s t","content":"s t","seq":333,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ime*.\n\n---\n\n## 3. Deploy","content":"ime*.\n\n---\n\n## 3. Deploy","seq":334,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ment ","content":"ment ","seq":335,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Complexity\n","content":"Complexity\n","seq":336,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n### Monolith\n\n```\n┌───────────","content":"\n### Monolith\n\n```\n┌───────────","seq":337,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"────────","content":"────────","seq":338,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"──","content":"──","seq":339,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"───","content":"───","seq":340,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─┐\n│  One art","content":"─┐\n│  One art","seq":341,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ifact","content":"ifact","seq":342,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"        ","content":"        ","seq":343,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"   │\n│  One pro","content":"   │\n│  One pro","seq":344,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"cess ","content":"cess ","seq":345,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"    ","content":"    ","seq":346,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"       │\n│  One databas","content":"       │\n│  One databas","seq":347,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e migrati","content":"e migrati","seq":348,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"on │\n│  One hea","content":"on │\n│  One hea","seq":349,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lth c","content":"lth c","seq":350,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"heck       │\n└───────────","content":"heck       │\n└───────────","seq":351,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─────────","content":"─────────","seq":352,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"───","content":"───","seq":353,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"──┘\n```","content":"──┘\n```","seq":354,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":355,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\nDeplo","content":"\nDeplo","seq":356,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"yment is","content":"yment is","seq":357,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":": build →","content":": build →","seq":358,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" run migrati","content":" run migrati","seq":359,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ons ","content":"ons ","seq":360,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"→ restart the pr","content":"→ restart the pr","seq":361,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ocess. Roll","content":"ocess. Roll","seq":362,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"bac","content":"bac","seq":363,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"k is restarting the pr","content":"k is restarting the pr","seq":364,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ev","content":"ev","seq":365,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"iou","content":"iou","seq":366,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s artifact","content":"s artifact","seq":367,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" (and reversin","content":" (and reversin","seq":368,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g mi","content":"g mi","seq":369,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"grations if the","content":"grations if the","seq":370,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" sche","content":" sche","seq":371,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ma changed).","content":"ma changed).","seq":372,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" CI/C","content":" CI/C","seq":373,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"D pipeline ","content":"D pipeline ","seq":374,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"is a ","content":"is a ","seq":375,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"single job.\n\n**Oper","content":"single job.\n\n**Oper","seq":376,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ati","content":"ati","seq":377,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"onal surface","content":"onal surface","seq":378,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":":**","content":":**","seq":379,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" one process to monito","content":" one process to monito","seq":380,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r, ","content":"r, ","seq":381,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"one datab","content":"one datab","seq":382,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ase to b","content":"ase to b","seq":383,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ack up, one se","content":"ack up, one se","seq":384,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t of connectio","content":"t of connectio","seq":385,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n pools to t","content":"n pools to t","seq":386,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"une.\n\n### Even","content":"une.\n\n### Even","seq":387,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"t-Sourced ","content":"t-Sourced ","seq":388,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Microservices\n\n```\n┌───","content":"Microservices\n\n```\n┌───","seq":389,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"──","content":"──","seq":390,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─","content":"─","seq":391,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"────┐ ┌─────","content":"────┐ ┌─────","seq":392,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─","content":"─","seq":393,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"────┐ ┌─────","content":"────┐ ┌─────","seq":394,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─","content":"─","seq":395,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"────┐ ┌───","content":"────┐ ┌───","seq":396,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"───","content":"───","seq":397,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"───","content":"───","seq":398,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─┐\n│ O","content":"─┐\n│ O","seq":399,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rder    ","content":"rder    ","seq":400,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ │ Payment  ","content":"│ │ Payment  ","seq":401,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ │ Inventory","content":"│ │ Inventory","seq":402,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ ","content":"│ ","seq":403,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ Shipping ","content":"│ Shipping ","seq":404,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│\n│ S","content":"│\n│ S","seq":405,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ervice  ","content":"ervice  ","seq":406,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ │ Service  ","content":"│ │ Service  ","seq":407,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ │ Service  ","content":"│ │ Service  ","seq":408,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ │ S","content":"│ │ S","seq":409,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"er","content":"er","seq":410,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"vi","content":"vi","seq":411,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ce","content":"ce","seq":412,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"  ","content":"  ","seq":413,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│\n│ (v1","content":"│\n│ (v1","seq":414,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":".4","content":".4","seq":415,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":".2","content":".2","seq":416,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":") ","content":") ","seq":417,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ │ (v2","content":"│ │ (v2","seq":418,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":".1.0","content":".1.0","seq":419,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":") ","content":") ","seq":420,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ ","content":"│ ","seq":421,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ (v1","content":"│ (v1","seq":422,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":".9.1","content":".9.1","seq":423,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":") ","content":") ","seq":424,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│ │ (","content":"│ │ (","seq":425,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"v3.0.0) │\n└──────","content":"v3.0.0) │\n└──────","seq":426,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─","content":"─","seq":427,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"───┘ └──────","content":"───┘ └──────","seq":428,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"────┘ └───","content":"────┘ └───","seq":429,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"───","content":"───","seq":430,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"────┘ └─────","content":"────┘ └─────","seq":431,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"───","content":"───","seq":432,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"──┘\n     ","content":"──┘\n     ","seq":433,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" │            │           ","content":" │            │           ","seq":434,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" │          ","content":" │          ","seq":435,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"  │\n      ▼","content":"  │\n      ▼","seq":436,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"            ▼            ▼","content":"            ▼            ▼","seq":437,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"            ▼\n┌───────────","content":"            ▼\n┌───────────","seq":438,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─────────────────────────────────","content":"─────────────────────────────────","seq":439,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─","content":"─","seq":440,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─","content":"─","seq":441,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"───┐\n│  ","content":"───┐\n│  ","seq":442,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Ka","content":"Ka","seq":443,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"fka cluster (","content":"fka cluster (","seq":444,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"3+ broke","content":"3+ broke","seq":445,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rs, Z","content":"rs, Z","seq":446,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ooKeeper","content":"ooKeeper","seq":447,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"/KRaft)    ","content":"/KRaft)    ","seq":448,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"│\n│  Schema Registry                 ","content":"│\n│  Schema Registry                 ","seq":449,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"         ","content":"         ","seq":450,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"     ","content":"     ","seq":451,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"  │\n│","content":"  │\n│","seq":452,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"  Each ","content":"  Each ","seq":453,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"servi","content":"servi","seq":454,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ce: own DB,","content":"ce: own DB,","seq":455,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" own ","content":" own ","seq":456,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"migra","content":"migra","seq":457,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tions,","content":"tions,","seq":458,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" ow","content":" ow","seq":459,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n pool  │\n└────────────────────────────────────────────","content":"n pool  │\n└────────────────────────────────────────────","seq":460,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"─","content":"─","seq":461,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"────","content":"────","seq":462,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"┘\n```\n\n","content":"┘\n```\n\n","seq":463,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"You n","content":"You n","seq":464,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ow have:\n\n-","content":"ow have:\n\n-","seq":465,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" **N deployme","content":" **N deployme","seq":466,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nt pipelines**","content":"nt pipelines**","seq":467,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", each with its ","content":", each with its ","seq":468,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"own build, test","content":"own build, test","seq":469,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", and","content":", and","seq":470,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" promo","content":" promo","seq":471,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tion path.\n- **Sch","content":"tion path.\n- **Sch","seq":472,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ema evo","content":"ema evo","seq":473,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lution**","content":"lution**","seq":474,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" across service bound","content":" across service bound","seq":475,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"aries. Ch","content":"aries. Ch","seq":476,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"anging an event ","content":"anging an event ","seq":477,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"schema require","content":"schema require","seq":478,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s coordi","content":"s coordi","seq":479,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nation: up","content":"nation: up","seq":480,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"grade co","content":"grade co","seq":481,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nsum","content":"nsum","seq":482,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"ers first","content":"ers first","seq":483,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" (th","content":" (th","seq":484,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ey tolerate ne","content":"ey tolerate ne","seq":485,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"w fields), ","content":"w fields), ","seq":486,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"the","content":"the","seq":487,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n p","content":"n p","seq":488,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"roducers","content":"roducers","seq":489,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":". ","content":". ","seq":490,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Av","content":"Av","seq":491,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ro/Protobuf + a sch","content":"ro/Protobuf + a sch","seq":492,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ema registry enforce","content":"ema registry enforce","seq":493,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s compat","content":"s compat","seq":494,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ibi","content":"ibi","seq":495,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lity rules (FO","content":"lity rules (FO","seq":496,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"RWARD, ","content":"RWARD, ","seq":497,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"BACKWARD","content":"BACKWARD","seq":498,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", FULL) — get","content":", FULL) — get","seq":499,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" this wro","content":" this wro","seq":500,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ng and","content":"ng and","seq":501,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" you have a deseria","content":" you have a deseria","seq":502,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"li","content":"li","seq":503,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"zatio","content":"zatio","seq":504,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n outage.\n- **Depe","content":"n outage.\n- **Depe","seq":505,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nde","content":"nde","seq":506,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ncy orderin","content":"ncy orderin","seq":507,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g.","content":"g.","seq":508,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"** If Ser","content":"** If Ser","seq":509,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"vice B ","content":"vice B ","seq":510,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"consumes events ","content":"consumes events ","seq":511,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"from Ser","content":"from Ser","seq":512,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"vice A, and you","content":"vice A, and you","seq":513,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" need to deploy a b","content":" need to deploy a b","seq":514,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"reaking change,","content":"reaking change,","seq":515,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" you're staging a multi-","content":" you're staging a multi-","seq":516,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"service r","content":"service r","seq":517,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ollout.\n- **Infrastructu","content":"ollout.\n- **Infrastructu","seq":518,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"re dependencies.","content":"re dependencies.","seq":519,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"** Ka","content":"** Ka","seq":520,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"fka itself is a distrib","content":"fka itself is a distrib","seq":521,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"uted","content":"uted","seq":522,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" system you ","content":" system you ","seq":523,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"now operat","content":"now operat","seq":524,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e ","content":"e ","seq":525,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— partiti","content":"— partiti","seq":526,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"on ","content":"on ","seq":527,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"reb","content":"reb","seq":528,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"alancin","content":"alancin","seq":529,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g, ISR (","content":"g, ISR (","seq":530,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"in-sync","content":"in-sync","seq":531,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" repli","content":" repli","seq":532,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ca) dri","content":"ca) dri","seq":533,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ft, ","content":"ft, ","seq":534,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"disk sizing for re","content":"disk sizing for re","seq":535,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tention wi","content":"tention wi","seq":536,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ndows,","content":"ndows,","seq":537,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" consumer group lag ","content":" consumer group lag ","seq":538,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"monitorin","content":"monitorin","seq":539,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g.\n\n**T","content":"g.\n\n**T","seq":540,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"he trade:** you","content":"he trade:** you","seq":541,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" can deplo","content":" can deplo","seq":542,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"y the inven","content":"y the inven","seq":543,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"to","content":"to","seq":544,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ry service at 3 ","content":"ry service at 3 ","seq":545,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"PM on a Tuesday w","content":"PM on a Tuesday w","seq":546,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ithout to","content":"ithout to","seq":547,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"uching any","content":"uching any","seq":548,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"thing e","content":"thing e","seq":549,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lse. But ","content":"lse. But ","seq":550,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"you'","content":"you'","seq":551,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ve repl","content":"ve repl","seq":552,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"aced one deplo","content":"aced one deplo","seq":553,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"y butto","content":"y butto","seq":554,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n with a matrix o","content":"n with a matrix o","seq":555,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"f compatibil","content":"f compatibil","seq":556,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ity constraints and","content":"ity constraints and","seq":557,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" infr","content":" infr","seq":558,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"astruct","content":"astruct","seq":559,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ure that it","content":"ure that it","seq":560,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"self needs c","content":"self needs c","seq":561,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"are and fe","content":"are and fe","seq":562,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"eding.\n\n","content":"eding.\n\n","seq":563,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"---\n\n## 4. Team S","content":"---\n\n## 4. Team S","seq":564,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"caling\n\n##","content":"caling\n\n##","seq":565,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"# Monoli","content":"# Monoli","seq":566,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"th\n\nTh","content":"th\n\nTh","seq":567,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e scaling model","content":"e scaling model","seq":568,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" is con","content":" is con","seq":569,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"strained ","content":"strained ","seq":570,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"by t","content":"by t","seq":571,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"he c","content":"he c","seq":572,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"od","content":"od","seq":573,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ebase:\n\n- **~5-15 ","content":"ebase:\n\n- **~5-15 ","seq":574,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"engineers** c","content":"engineers** c","seq":575,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"an work ","content":"an work ","seq":576,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"product","content":"product","seq":577,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ively in a well-struc","content":"ively in a well-struc","seq":578,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tured m","content":"tured m","seq":579,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"onolith. Bey","content":"onolith. Bey","seq":580,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ond that, merge conflict","content":"ond that, merge conflict","seq":581,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s, coordination overhead","content":"s, coordination overhead","seq":582,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", and co","content":", and co","seq":583,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"gnitive l","content":"gnitive l","seq":584,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"oad on the code","content":"oad on the code","seq":585,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"base become the bott","content":"base become the bott","seq":586,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"lene","content":"lene","seq":587,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ck.\n- Team","content":"ck.\n- Team","seq":588,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s are o","content":"s are o","seq":589,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rgani","content":"rgani","seq":590,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"zed ","content":"zed ","seq":591,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"around *layers*","content":"around *layers*","seq":592,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" (frontend team","content":" (frontend team","seq":593,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", ","content":", ","seq":594,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"bac","content":"bac","seq":595,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"kend team, DB","content":"kend team, DB","seq":596,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"A) or *f","content":"A) or *f","seq":597,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"eatu","content":"eatu","seq":598,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"res* withi","content":"res* withi","seq":599,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n the same re","content":"n the same re","seq":600,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"po.\n- Own","content":"po.\n- Own","seq":601,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ersh","content":"ersh","seq":602,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ip i","content":"ip i","seq":603,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s ","content":"s ","seq":604,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"fuzz","content":"fuzz","seq":605,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"y — the `Use","content":"y — the `Use","seq":606,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rService` c","content":"rService` c","seq":607,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lass is touch","content":"lass is touch","seq":608,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ed by e","content":"ed by e","seq":609,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"veryone","content":"veryone","seq":610,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", and no ","content":", and no ","seq":611,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"single ","content":"single ","seq":612,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"team can evolve it ","content":"team can evolve it ","seq":613,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"inde","content":"inde","seq":614,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"pendently.\n- O","content":"pendently.\n- O","seq":615,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nboarding mean","content":"nboarding mean","seq":616,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s understa","content":"s understa","seq":617,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nding t","content":"nding t","seq":618,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"he","content":"he","seq":619,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" whole syst","content":" whole syst","seq":620,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"em (or at leas","content":"em (or at leas","seq":621,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t a large ","content":"t a large ","seq":622,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"sli","content":"sli","seq":623,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ce of ","content":"ce of ","seq":624,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"it).\n\nT","content":"it).\n\nT","seq":625,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"he limit is no","content":"he limit is no","seq":626,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t technical ","content":"t technical ","seq":627,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— it's","content":"— it's","seq":628,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" socia","content":" socia","seq":629,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l. Conway'","content":"l. Conway'","seq":630,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s Law","content":"s Law","seq":631,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" in a","content":" in a","seq":632,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ction: one ","content":"ction: one ","seq":633,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"codebase ","content":"codebase ","seq":634,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"fo","content":"fo","seq":635,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rces one t","content":"rces one t","seq":636,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"eam (or tigh","content":"eam (or tigh","seq":637,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tly coordi","content":"tly coordi","seq":638,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nated tea","content":"nated tea","seq":639,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ms).\n\n### Even","content":"ms).\n\n### Even","seq":640,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t-Sourced Microservic","content":"t-Sourced Microservic","seq":641,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"es\n\nThe scaling mo","content":"es\n\nThe scaling mo","seq":642,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"del ","content":"del ","seq":643,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"is ","content":"is ","seq":644,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"desig","content":"desig","seq":645,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ned for **organiz","content":"ned for **organiz","seq":646,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ational s","content":"ational s","seq":647,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"caling**:","content":"caling**:","seq":648,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n\n- **Tea","content":"\n\n- **Tea","seq":649,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ms own serv","content":"ms own serv","seq":650,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ices en","content":"ices en","seq":651,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d-to-end.","content":"d-to-end.","seq":652,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"** The Pay","content":"** The Pay","seq":653,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ments team o","content":"ments team o","seq":654,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"wns the payme","content":"wns the payme","seq":655,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nt servic","content":"nt servic","seq":656,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e, it","content":"e, it","seq":657,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s data","content":"s data","seq":658,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"base,","content":"base,","seq":659,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" its","content":" its","seq":660,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" event sc","content":" event sc","seq":661,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hemas, ","content":"hemas, ","seq":662,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"its r","content":"its r","seq":663,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ead","content":"ead","seq":664,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" models,","content":" models,","seq":665,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" its","content":" its","seq":666,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" SLAs. T","content":" SLAs. T","seq":667,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hey","content":"hey","seq":668,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" can ","content":" can ","seq":669,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rewrite it in a different l","content":"rewrite it in a different l","seq":670,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"anguage","content":"anguage","seq":671,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" without as","content":" without as","seq":672,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"king p","content":"king p","seq":673,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ermission.\n","content":"ermission.\n","seq":674,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"- **Indep","content":"- **Indep","seq":675,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"endent v","content":"endent v","seq":676,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"elocity.**","content":"elocity.**","seq":677,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" Each ","content":" Each ","seq":678,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"team d","content":"team d","seq":679,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"eploys on the","content":"eploys on the","seq":680,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ir own cadence. The Inven","content":"ir own cadence. The Inven","seq":681,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tory te","content":"tory te","seq":682,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"am doesn't wai","content":"am doesn't wai","seq":683,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t for t","content":"t for t","seq":684,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"he Order team'","content":"he Order team'","seq":685,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s relea","content":"s relea","seq":686,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"se train.\n- **","content":"se train.\n- **","seq":687,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Bounded co","content":"Bounded co","seq":688,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ntext alignm","content":"ntext alignm","seq":689,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ent.** ","content":"ent.** ","seq":690,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Services map","content":"Services map","seq":691,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" to DDD bound","content":" to DDD bound","seq":692,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ed c","content":"ed c","seq":693,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ontex","content":"ontex","seq":694,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ts — the ","content":"ts — the ","seq":695,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"same bounda","content":"same bounda","seq":696,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ries that exist ","content":"ries that exist ","seq":697,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"in the busin","content":"in the busin","seq":698,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ess domain. The Payments t","content":"ess domain. The Payments t","seq":699,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"eam under","content":"eam under","seq":700,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"stands ","content":"stands ","seq":701,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"paym","content":"paym","seq":702,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ents deeply and ","content":"ents deeply and ","seq":703,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"doesn","content":"doesn","seq":704,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"'t need to kn","content":"'t need to kn","seq":705,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ow how s","content":"ow how s","seq":706,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hippin","content":"hippin","seq":707,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g works.\n- **O","content":"g works.\n- **O","seq":708,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nboardi","content":"nboardi","seq":709,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ng is scoped.**","content":"ng is scoped.**","seq":710,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" A ","content":" A ","seq":711,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"new engineer on the Payme","content":"new engineer on the Payme","seq":712,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nts ","content":"nts ","seq":713,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"team lear","content":"team lear","seq":714,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ns one service,","content":"ns one service,","seq":715,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" not th","content":" not th","seq":716,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e entire","content":"e entire","seq":717,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" system.","content":" system.","seq":718,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n\n**The","content":"\n\n**The","seq":719,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" cost:** you","content":" cost:** you","seq":720,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"'ve trade","content":"'ve trade","seq":721,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d code ","content":"d code ","seq":722,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"coupling for **organiza","content":"coupling for **organiza","seq":723,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tional co","content":"tional co","seq":724,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"upling**. Te","content":"upling**. Te","seq":725,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ams now need","content":"ams now need","seq":726,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":":\n\n- **C","content":":\n\n- **C","seq":727,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ontrac","content":"ontrac","seq":728,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t te","content":"t te","seq":729,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"sting*","content":"sting*","seq":730,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"* — th","content":"* — th","seq":731,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e Order service publi","content":"e Order service publi","seq":732,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"shes eve","content":"shes eve","seq":733,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nts the Payment ","content":"nts the Payment ","seq":734,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"servic","content":"servic","seq":735,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e e","content":"e e","seq":736,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"xpects. Pact o","content":"xpects. Pact o","seq":737,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r similar tools bec","content":"r similar tools bec","seq":738,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ome man","content":"ome man","seq":739,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d","content":"d","seq":740,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"atory.\n- **API/event sc","content":"atory.\n- **API/event sc","seq":741,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hema gover","content":"hema gover","seq":742,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nance** — w","content":"nance** — w","seq":743,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ho","content":"ho","seq":744,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" decide","content":" decide","seq":745,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s wha","content":"s wha","seq":746,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t `OrderPlac","content":"t `OrderPlac","seq":747,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ed` looks like","content":"ed` looks like","seq":748,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"? The prod","content":"? The prod","seq":749,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ucing team? The ","content":"ucing team? The ","seq":750,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"consuming t","content":"consuming t","seq":751,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"eams? A","content":"eams? A","seq":752,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" central","content":" central","seq":753,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" schema ","content":" schema ","seq":754,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"working g","content":"working g","seq":755,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"roup?","content":"roup?","seq":756,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n- **Cross","content":"\n- **Cross","seq":757,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"-team debug","content":"-team debug","seq":758,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ging** ","content":"ging** ","seq":759,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— whe","content":"— whe","seq":760,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n an or","content":"n an or","seq":761,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"der ","content":"der ","seq":762,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"gets ","content":"gets ","seq":763,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"stuck, who owns th","content":"stuck, who owns th","seq":764,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e incident?","content":"e incident?","seq":765,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" The ","content":" The ","seq":766,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Orde","content":"Orde","seq":767,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r team says \"w","content":"r team says \"w","seq":768,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e publis","content":"e publis","seq":769,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hed the event.\" T","content":"hed the event.\" T","seq":770,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"he Paym","content":"he Paym","seq":771,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ent team says \"we","content":"ent team says \"we","seq":772,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" never received","content":" never received","seq":773,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" it.\" The Kafka","content":" it.\" The Kafka","seq":774,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" team ","content":" team ","seq":775,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"says \"the top","content":"says \"the top","seq":776,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ic i","content":"ic i","seq":777,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s heal","content":"s heal","seq":778,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"thy.\" The","content":"thy.\" The","seq":779,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" blame","content":" blame","seq":780,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" game now spans","content":" game now spans","seq":781,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" organizatio","content":" organizatio","seq":782,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nal boundaries, no","content":"nal boundaries, no","seq":783,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t just functio","content":"t just functio","seq":784,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n calls.\n\n","content":"n calls.\n\n","seq":785,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"---\n\n## S","content":"---\n\n## S","seq":786,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ummary Table\n\n| ","content":"ummary Table\n\n| ","seq":787,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Dimensi","content":"Dimensi","seq":788,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"on | Mon","content":"on | Mon","seq":789,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"olith | Event-Source","content":"olith | Event-Source","seq":790,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d Mi","content":"d Mi","seq":791,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"croservices |\n|-------","content":"croservices |\n|-------","seq":792,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"----|----------|---------","content":"----|----------|---------","seq":793,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"---------","content":"---------","seq":794,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"---","content":"---","seq":795,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"------|\n| **De","content":"------|\n| **De","seq":796,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"buggability**","content":"buggability**","seq":797,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" | Linear st","content":" | Linear st","seq":798,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ack trac","content":"ack trac","seq":799,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"es, o","content":"es, o","seq":800,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ne process, one","content":"ne process, one","seq":801,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" D","content":" D","seq":802,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"B transactio","content":"B transactio","seq":803,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n | Distributed t","content":"n | Distributed t","seq":804,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"racing ","content":"racing ","seq":805,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"required","content":"required","seq":806,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", async failur","content":", async failur","seq":807,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e cha","content":"e cha","seq":808,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ins, stale ","content":"ins, stale ","seq":809,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"read m","content":"read m","seq":810,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"odels ","content":"odels ","seq":811,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"|\n|","content":"|\n|","seq":812,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" **Lat","content":" **Lat","seq":813,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"en","content":"en","seq":814,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"cy (p5","content":"cy (p5","seq":815,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"0)**","content":"0)**","seq":816,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" | 5-20","content":" | 5-20","seq":817,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ms ","content":"ms ","seq":818,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"| 50-500ms (dom","content":"| 50-500ms (dom","seq":819,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"inated by","content":"inated by","seq":820,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" que","content":" que","seq":821,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ue batching and eventu","content":"ue batching and eventu","seq":822,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"al cons","content":"al cons","seq":823,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"istency) |\n|","content":"istency) |\n|","seq":824,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" **Dep","content":" **Dep","seq":825,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"loyment** ","content":"loyment** ","seq":826,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"| One artifac","content":"| One artifac","seq":827,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t, on","content":"t, on","seq":828,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e pipeline","content":"e pipeline","seq":829,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", on","content":", on","seq":830,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e migration","content":"e migration","seq":831,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" | N pipelines, schema compa","content":" | N pipelines, schema compa","seq":832,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tibilit","content":"tibilit","seq":833,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"y matrix, K","content":"y matrix, K","seq":834,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"a","content":"a","seq":835,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"fka opera","content":"fka opera","seq":836,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tions, contract","content":"tions, contract","seq":837,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" testing |\n| *","content":" testing |\n| *","seq":838,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"*Team s","content":"*Team s","seq":839,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"caling*","content":"caling*","seq":840,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"* | Caps at","content":"* | Caps at","seq":841,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" ~15 e","content":" ~15 e","seq":842,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ngineers; fu","content":"ngineers; fu","seq":843,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"zzy own","content":"zzy own","seq":844,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ersh","content":"ersh","seq":845,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ip","content":"ip","seq":846,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" |","content":" |","seq":847,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" Scale","content":" Scale","seq":848,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s to 50+","content":"s to 50+","seq":849,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"; clear ser","content":"; clear ser","seq":850,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"vice owne","content":"vice owne","seq":851,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rship; requires cross-","content":"rship; requires cross-","seq":852,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tea","content":"tea","seq":853,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"m governanc","content":"m governanc","seq":854,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e |\n| ","content":"e |\n| ","seq":855,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"**Failure blast","content":"**Failure blast","seq":856,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" radiu","content":" radiu","seq":857,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s** | ","content":"s** | ","seq":858,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"One crash takes ev","content":"One crash takes ev","seq":859,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"erything","content":"erything","seq":860,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" down | Payment serv","content":" down | Payment serv","seq":861,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ice crash doesn","content":"ice crash doesn","seq":862,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"'t affect o","content":"'t affect o","seq":863,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rder his","content":"rder his","seq":864,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tory |\n| **D","content":"tory |\n| **D","seq":865,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ata con","content":"ata con","seq":866,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"sistency** | AC","content":"sistency** | AC","seq":867,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ID transactions, str","content":"ID transactions, str","seq":868,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ong cons","content":"ong cons","seq":869,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"istency | Event","content":"istency | Event","seq":870,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ual consistenc","content":"ual consistenc","seq":871,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"y, c","content":"y, c","seq":872,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"omp","content":"omp","seq":873,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ens","content":"ens","seq":874,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ating","content":"ating","seq":875,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" sa","content":" sa","seq":876,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"gas, idempotent con","content":"gas, idempotent con","seq":877,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"sum","content":"sum","seq":878,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ers |\n\n","content":"ers |\n\n","seq":879,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"---\n\nThe","content":"---\n\nThe","seq":880,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" ho","content":" ho","seq":881,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ne","content":"ne","seq":882,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"st answer: **neither","content":"st answer: **neither","seq":883,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" is univ","content":" is univ","seq":884,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ersal","content":"ersal","seq":885,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ly correct.** ","content":"ly correct.** ","seq":886,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"A mono","content":"A mono","seq":887,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lith wi","content":"lith wi","seq":888,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"th clean module ","content":"th clean module ","seq":889,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"boundaries gets y","content":"boundaries gets y","seq":890,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ou surpr","content":"ou surpr","seq":891,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"isingly","content":"isingly","seq":892,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" far — ","content":" far — ","seq":893,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Amazon, Shop","content":"Amazon, Shop","seq":894,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ify, and GitHub","content":"ify, and GitHub","seq":895,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" all ran on","content":" all ran on","seq":896,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" monolith","content":" monolith","seq":897,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s well past ","content":"s well past ","seq":898,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"the point whe","content":"the point whe","seq":899,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"re conventio","content":"re conventio","seq":900,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nal wisdom s","content":"nal wisdom s","seq":901,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"aid they sh","content":"aid they sh","seq":902,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ould have s","content":"ould have s","seq":903,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"plit. Th","content":"plit. Th","seq":904,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e event-sourced microservic","content":"e event-sourced microservic","seq":905,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"es ar","content":"es ar","seq":906,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"chitectur","content":"chitectur","seq":907,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e pays of","content":"e pays of","seq":908,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"f when you","content":"f when you","seq":909,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" have *multi","content":" have *multi","seq":910,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ple inde","content":"ple inde","seq":911,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"pe","content":"pe","seq":912,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nde","content":"nde","seq":913,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nt teams*, *genu","content":"nt teams*, *genu","seq":914,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"inely different scali","content":"inely different scali","seq":915,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ng r","content":"ng r","seq":916,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"equiremen","content":"equiremen","seq":917,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ts for re","content":"ts for re","seq":918,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ads vs w","content":"ads vs w","seq":919,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rites*, or *regulatory r","content":"rites*, or *regulatory r","seq":920,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"equir","content":"equir","seq":921,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ements for full","content":"ements for full","seq":922,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" aud","content":" aud","seq":923,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"it","content":"it","seq":924,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" trails*. For a ","content":" trails*. For a ","seq":925,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s","content":"s","seq":926,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ingle team","content":"ingle team","seq":927,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" of ","content":" of ","seq":928,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"5 engineer","content":"5 engineer","seq":929,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s, it's usua","content":"s, it's usua","seq":930,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lly over-engin","content":"lly over-engin","seq":931,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e","content":"e","seq":932,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ered suffering.","content":"ered suffering.","seq":933,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":195223,"run_id":"r-1777927448516-2"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777927448516-2"}
+
+event: progress
+data: {"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":0,"duration_ms":0,"run_id":"r-1777927448516-2"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":0,"duration_ms":10,"run_id":"r-1777927448516-2"}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:thread:kimi-passc-1777927230","message_id":"1777927643992"}
+

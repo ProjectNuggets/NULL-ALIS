@@ -1,0 +1,986 @@
+{"type":"statusResponse","content":"Processing request"}
+{"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+{"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777928112724-5"}
+{"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":71,"run_id":"r-1777928112724-5"}
+{"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777928112724-5"}
+{"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":6,"run_id":"r-1777928112724-5"}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":10748,"run_id":"r-1777928112724-5"}
+{"delta":"# Transf","content":"# Transf","seq":0,"stream_kind":"final_reply","live":false}
+{"delta":"orme","content":"orme","seq":1,"stream_kind":"final_reply","live":false}
+{"delta":"r Attention — Th","content":"r Attention — Th","seq":2,"stream_kind":"final_reply","live":false}
+{"delta":"e ","content":"e ","seq":3,"stream_kind":"final_reply","live":false}
+{"delta":"Math","content":"Math","seq":4,"stream_kind":"final_reply","live":false}
+{"delta":"ematics\n","content":"ematics\n","seq":5,"stream_kind":"final_reply","live":false}
+{"delta":"\n## The Pr","content":"\n## The Pr","seq":6,"stream_kind":"final_reply","live":false}
+{"delta":"oble","content":"oble","seq":7,"stream_kind":"final_reply","live":false}
+{"delta":"m Atte","content":"m Atte","seq":8,"stream_kind":"final_reply","live":false}
+{"delta":"ntion Solves","content":"ntion Solves","seq":9,"stream_kind":"final_reply","live":false}
+{"delta":"\n\nA sequence of","content":"\n\nA sequence of","seq":10,"stream_kind":"final_reply","live":false}
+{"delta":" tokens arri","content":" tokens arri","seq":11,"stream_kind":"final_reply","live":false}
+{"delta":"ves. Each t","content":"ves. Each t","seq":12,"stream_kind":"final_reply","live":false}
+{"delta":"oken","content":"oken","seq":13,"stream_kind":"final_reply","live":false}
+{"delta":" ne","content":" ne","seq":14,"stream_kind":"final_reply","live":false}
+{"delta":"eds to \"look at\" ev","content":"eds to \"look at\" ev","seq":15,"stream_kind":"final_reply","live":false}
+{"delta":"ery ","content":"ery ","seq":16,"stream_kind":"final_reply","live":false}
+{"delta":"other token","content":"other token","seq":17,"stream_kind":"final_reply","live":false}
+{"delta":" and decide h","content":" and decide h","seq":18,"stream_kind":"final_reply","live":false}
+{"delta":"o","content":"o","seq":19,"stream_kind":"final_reply","live":false}
+{"delta":"w much to care","content":"w much to care","seq":20,"stream_kind":"final_reply","live":false}
+{"delta":". The","content":". The","seq":21,"stream_kind":"final_reply","live":false}
+{"delta":" mecha","content":" mecha","seq":22,"stream_kind":"final_reply","live":false}
+{"delta":"nism must be","content":"nism must be","seq":23,"stream_kind":"final_reply","live":false}
+{"delta":":\n\n- **Parallel","content":":\n\n- **Parallel","seq":24,"stream_kind":"final_reply","live":false}
+{"delta":"izable** ","content":"izable** ","seq":25,"stream_kind":"final_reply","live":false}
+{"delta":"— no sequential ","content":"— no sequential ","seq":26,"stream_kind":"final_reply","live":false}
+{"delta":"dep","content":"dep","seq":27,"stream_kind":"final_reply","live":false}
+{"delta":"endenc","content":"endenc","seq":28,"stream_kind":"final_reply","live":false}
+{"delta":"y li","content":"y li","seq":29,"stream_kind":"final_reply","live":false}
+{"delta":"ke an RNN.\n- **D","content":"ke an RNN.\n- **D","seq":30,"stream_kind":"final_reply","live":false}
+{"delta":"ifferentia","content":"ifferentia","seq":31,"stream_kind":"final_reply","live":false}
+{"delta":"ble** ","content":"ble** ","seq":32,"stream_kind":"final_reply","live":false}
+{"delta":"— trainable ","content":"— trainable ","seq":33,"stream_kind":"final_reply","live":false}
+{"delta":"end-to-en","content":"end-to-en","seq":34,"stream_kind":"final_reply","live":false}
+{"delta":"d with gradien","content":"d with gradien","seq":35,"stream_kind":"final_reply","live":false}
+{"delta":"t desce","content":"t desce","seq":36,"stream_kind":"final_reply","live":false}
+{"delta":"nt.\n- **Content-aware*","content":"nt.\n- **Content-aware*","seq":37,"stream_kind":"final_reply","live":false}
+{"delta":"* — re","content":"* — re","seq":38,"stream_kind":"final_reply","live":false}
+{"delta":"leva","content":"leva","seq":39,"stream_kind":"final_reply","live":false}
+{"delta":"nce between two tokens ","content":"nce between two tokens ","seq":40,"stream_kind":"final_reply","live":false}
+{"delta":"depends on ","content":"depends on ","seq":41,"stream_kind":"final_reply","live":false}
+{"delta":"what they *","content":"what they *","seq":42,"stream_kind":"final_reply","live":false}
+{"delta":"mean*, not just their po","content":"mean*, not just their po","seq":43,"stream_kind":"final_reply","live":false}
+{"delta":"sit","content":"sit","seq":44,"stream_kind":"final_reply","live":false}
+{"delta":"ions.\n","content":"ions.\n","seq":45,"stream_kind":"final_reply","live":false}
+{"delta":"\n---","content":"\n---","seq":46,"stream_kind":"final_reply","live":false}
+{"delta":"\n\n## 1. Th","content":"\n\n## 1. Th","seq":47,"stream_kind":"final_reply","live":false}
+{"delta":"e Q/K/V Pro","content":"e Q/K/V Pro","seq":48,"stream_kind":"final_reply","live":false}
+{"delta":"jectio","content":"jectio","seq":49,"stream_kind":"final_reply","live":false}
+{"delta":"ns\n\nEvery ","content":"ns\n\nEvery ","seq":50,"stream_kind":"final_reply","live":false}
+{"delta":"tok","content":"tok","seq":51,"stream_kind":"final_reply","live":false}
+{"delta":"en e","content":"en e","seq":52,"stream_kind":"final_reply","live":false}
+{"delta":"mbed","content":"mbed","seq":53,"stream_kind":"final_reply","live":false}
+{"delta":"d","content":"d","seq":54,"stream_kind":"final_reply","live":false}
+{"delta":"ing **xᵢ","content":"ing **xᵢ","seq":55,"stream_kind":"final_reply","live":false}
+{"delta":"*","content":"*","seq":56,"stream_kind":"final_reply","live":false}
+{"delta":"* (a ve","content":"* (a ve","seq":57,"stream_kind":"final_reply","live":false}
+{"delta":"cto","content":"cto","seq":58,"stream_kind":"final_reply","live":false}
+{"delta":"r i","content":"r i","seq":59,"stream_kind":"final_reply","live":false}
+{"delta":"n ","content":"n ","seq":60,"stream_kind":"final_reply","live":false}
+{"delta":"ℝ","content":"ℝ","seq":61,"stream_kind":"final_reply","live":false}
+{"delta":"ᵈ_","content":"ᵈ_","seq":62,"stream_kind":"final_reply","live":false}
+{"delta":"ᵐᵒᵈᵉ","content":"ᵐᵒᵈᵉ","seq":63,"stream_kind":"final_reply","live":false}
+{"delta":"ˡ) is projected into","content":"ˡ) is projected into","seq":64,"stream_kind":"final_reply","live":false}
+{"delta":" three dis","content":" three dis","seq":65,"stream_kind":"final_reply","live":false}
+{"delta":"tinct","content":"tinct","seq":66,"stream_kind":"final_reply","live":false}
+{"delta":" sp","content":" sp","seq":67,"stream_kind":"final_reply","live":false}
+{"delta":"aces","content":"aces","seq":68,"stream_kind":"final_reply","live":false}
+{"delta":":\n\n","content":":\n\n","seq":69,"stream_kind":"final_reply","live":false}
+{"delta":"```\nq","content":"```\nq","seq":70,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ = ","content":"ᵢ = ","seq":71,"stream_kind":"final_reply","live":false}
+{"delta":"xᵢ ·","content":"xᵢ ·","seq":72,"stream_kind":"final_reply","live":false}
+{"delta":" ","content":" ","seq":73,"stream_kind":"final_reply","live":false}
+{"delta":"W^Q ","content":"W^Q ","seq":74,"stream_kind":"final_reply","live":false}
+{"delta":"    ","content":"    ","seq":75,"stream_kind":"final_reply","live":false}
+{"delta":"(Query:   \"Wh","content":"(Query:   \"Wh","seq":76,"stream_kind":"final_reply","live":false}
+{"delta":"at am I ","content":"at am I ","seq":77,"stream_kind":"final_reply","live":false}
+{"delta":"lookin","content":"lookin","seq":78,"stream_kind":"final_reply","live":false}
+{"delta":"g for","content":"g for","seq":79,"stream_kind":"final_reply","live":false}
+{"delta":"?\")\nk","content":"?\")\nk","seq":80,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ = xᵢ ","content":"ᵢ = xᵢ ","seq":81,"stream_kind":"final_reply","live":false}
+{"delta":"· W^","content":"· W^","seq":82,"stream_kind":"final_reply","live":false}
+{"delta":"K     (Ke","content":"K     (Ke","seq":83,"stream_kind":"final_reply","live":false}
+{"delta":"y:     \"Wha","content":"y:     \"Wha","seq":84,"stream_kind":"final_reply","live":false}
+{"delta":"t do","content":"t do","seq":85,"stream_kind":"final_reply","live":false}
+{"delta":" I ","content":" I ","seq":86,"stream_kind":"final_reply","live":false}
+{"delta":"con","content":"con","seq":87,"stream_kind":"final_reply","live":false}
+{"delta":"tain?\")","content":"tain?\")","seq":88,"stream_kind":"final_reply","live":false}
+{"delta":"\nvᵢ = ","content":"\nvᵢ = ","seq":89,"stream_kind":"final_reply","live":false}
+{"delta":"xᵢ · W^","content":"xᵢ · W^","seq":90,"stream_kind":"final_reply","live":false}
+{"delta":"V     (Value:   \"W","content":"V     (Value:   \"W","seq":91,"stream_kind":"final_reply","live":false}
+{"delta":"hat informa","content":"hat informa","seq":92,"stream_kind":"final_reply","live":false}
+{"delta":"t","content":"t","seq":93,"stream_kind":"final_reply","live":false}
+{"delta":"ion do I offe","content":"ion do I offe","seq":94,"stream_kind":"final_reply","live":false}
+{"delta":"r?\"","content":"r?\"","seq":95,"stream_kind":"final_reply","live":false}
+{"delta":")\n`","content":")\n`","seq":96,"stream_kind":"final_reply","live":false}
+{"delta":"``\n\n","content":"``\n\n","seq":97,"stream_kind":"final_reply","live":false}
+{"delta":"Where","content":"Where","seq":98,"stream_kind":"final_reply","live":false}
+{"delta":":\n- ","content":":\n- ","seq":99,"stream_kind":"final_reply","live":false}
+{"delta":"**W^Q,","content":"**W^Q,","seq":100,"stream_kind":"final_reply","live":false}
+{"delta":" W^K, W^V** are","content":" W^K, W^V** are","seq":101,"stream_kind":"final_reply","live":false}
+{"delta":" learned wei","content":" learned wei","seq":102,"stream_kind":"final_reply","live":false}
+{"delta":"ght ma","content":"ght ma","seq":103,"stream_kind":"final_reply","live":false}
+{"delta":"trices of","content":"trices of","seq":104,"stream_kind":"final_reply","live":false}
+{"delta":" ","content":" ","seq":105,"stream_kind":"final_reply","live":false}
+{"delta":"shap","content":"shap","seq":106,"stream_kind":"final_reply","live":false}
+{"delta":"e","content":"e","seq":107,"stream_kind":"final_reply","live":false}
+{"delta":" (d_mo","content":" (d_mo","seq":108,"stream_kind":"final_reply","live":false}
+{"delta":"del, d_k) f","content":"del, d_k) f","seq":109,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"or Q and ","content":"or Q and ","seq":110,"stream_kind":"final_reply","live":false}
+{"delta":"K, an","content":"K, an","seq":111,"stream_kind":"final_reply","live":false}
+{"delta":"d (d_mo","content":"d (d_mo","seq":112,"stream_kind":"final_reply","live":false}
+{"delta":"del, d","content":"del, d","seq":113,"stream_kind":"final_reply","live":false}
+{"delta":"_v) for ","content":"_v) for ","seq":114,"stream_kind":"final_reply","live":false}
+{"delta":"V.\n- **d_k","content":"V.\n- **d_k","seq":115,"stream_kind":"final_reply","live":false}
+{"delta":"**","content":"**","seq":116,"stream_kind":"final_reply","live":false}
+{"delta":" is typicall","content":" is typicall","seq":117,"stream_kind":"final_reply","live":false}
+{"delta":"y d_mode","content":"y d_mode","seq":118,"stream_kind":"final_reply","live":false}
+{"delta":"l / n","content":"l / n","seq":119,"stream_kind":"final_reply","live":false}
+{"delta":"um_h","content":"um_h","seq":120,"stream_kind":"final_reply","live":false}
+{"delta":"ea","content":"ea","seq":121,"stream_kind":"final_reply","live":false}
+{"delta":"ds (","content":"ds (","seq":122,"stream_kind":"final_reply","live":false}
+{"delta":"e.g., 5","content":"e.g., 5","seq":123,"stream_kind":"final_reply","live":false}
+{"delta":"12 ","content":"12 ","seq":124,"stream_kind":"final_reply","live":false}
+{"delta":"/ 8 = 64).","content":"/ 8 = 64).","seq":125,"stream_kind":"final_reply","live":false}
+{"delta":"\n\n### Wh","content":"\n\n### Wh","seq":126,"stream_kind":"final_reply","live":false}
+{"delta":"y Three Pr","content":"y Three Pr","seq":127,"stream_kind":"final_reply","live":false}
+{"delta":"ojections?\n","content":"ojections?\n","seq":128,"stream_kind":"final_reply","live":false}
+{"delta":"\nThe se","content":"\nThe se","seq":129,"stream_kind":"final_reply","live":false}
+{"delta":"paration is no","content":"paration is no","seq":130,"stream_kind":"final_reply","live":false}
+{"delta":"t arbitrary","content":"t arbitrary","seq":131,"stream_kind":"final_reply","live":false}
+{"delta":" ","content":" ","seq":132,"stream_kind":"final_reply","live":false}
+{"delta":"— it mirrors **informat","content":"— it mirrors **informat","seq":133,"stream_kind":"final_reply","live":false}
+{"delta":"ion ret","content":"ion ret","seq":134,"stream_kind":"final_reply","live":false}
+{"delta":"rieval**:\n\n```\n┌───────────","content":"rieval**:\n\n```\n┌───────────","seq":135,"stream_kind":"final_reply","live":false}
+{"delta":"────────────────────────────────────","content":"────────────────────────────────────","seq":136,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":137,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":138,"stream_kind":"final_reply","live":false}
+{"delta":"───","content":"───","seq":139,"stream_kind":"final_reply","live":false}
+{"delta":"┐\n│  D","content":"┐\n│  D","seq":140,"stream_kind":"final_reply","live":false}
+{"delta":"atabase analogy:                  ","content":"atabase analogy:                  ","seq":141,"stream_kind":"final_reply","live":false}
+{"delta":"                │\n│                                     ","content":"                │\n│                                     ","seq":142,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":143,"stream_kind":"final_reply","live":false}
+{"delta":"       ","content":"       ","seq":144,"stream_kind":"final_reply","live":false}
+{"delta":"│\n│","content":"│\n│","seq":145,"stream_kind":"final_reply","live":false}
+{"delta":"  Query  = your search terms         ","content":"  Query  = your search terms         ","seq":146,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":147,"stream_kind":"final_reply","live":false}
+{"delta":"       ","content":"       ","seq":148,"stream_kind":"final_reply","live":false}
+{"delta":"│\n","content":"│\n","seq":149,"stream_kind":"final_reply","live":false}
+{"delta":"│  Key   ","content":"│  Key   ","seq":150,"stream_kind":"final_reply","live":false}
+{"delta":" = the index o","content":" = the index o","seq":151,"stream_kind":"final_reply","live":false}
+{"delta":"n each document        ","content":"n each document        ","seq":152,"stream_kind":"final_reply","live":false}
+{"delta":"        ","content":"        ","seq":153,"stream_kind":"final_reply","live":false}
+{"delta":"│\n│  Value ","content":"│\n│  Value ","seq":154,"stream_kind":"final_reply","live":false}
+{"delta":" = the document content itsel","content":" = the document content itsel","seq":155,"stream_kind":"final_reply","live":false}
+{"delta":"f               │\n│                                     ","content":"f               │\n│                                     ","seq":156,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":157,"stream_kind":"final_reply","live":false}
+{"delta":"       │","content":"       │","seq":158,"stream_kind":"final_reply","live":false}
+{"delta":"\n│  You match Que","content":"\n│  You match Que","seq":159,"stream_kind":"final_reply","live":false}
+{"delta":"ry against Keys t","content":"ry against Keys t","seq":160,"stream_kind":"final_reply","live":false}
+{"delta":"o find releva","content":"o find releva","seq":161,"stream_kind":"final_reply","live":false}
+{"delta":"nt      │","content":"nt      │","seq":162,"stream_kind":"final_reply","live":false}
+{"delta":"\n│  ","content":"\n│  ","seq":163,"stream_kind":"final_reply","live":false}
+{"delta":"documents, then","content":"documents, then","seq":164,"stream_kind":"final_reply","live":false}
+{"delta":" retrieve their Valu","content":" retrieve their Valu","seq":165,"stream_kind":"final_reply","live":false}
+{"delta":"e","content":"e","seq":166,"stream_kind":"final_reply","live":false}
+{"delta":"s.             │\n└───────────","content":"s.             │\n└───────────","seq":167,"stream_kind":"final_reply","live":false}
+{"delta":"────────────────────────────────────","content":"────────────────────────────────────","seq":168,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":169,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":170,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":171,"stream_kind":"final_reply","live":false}
+{"delta":"┘\n```\n\nIn ","content":"┘\n```\n\nIn ","seq":172,"stream_kind":"final_reply","live":false}
+{"delta":"self-attention, ev","content":"self-attention, ev","seq":173,"stream_kind":"final_reply","live":false}
+{"delta":"ery token plays all three roles","content":"ery token plays all three roles","seq":174,"stream_kind":"final_reply","live":false}
+{"delta":" simultane","content":" simultane","seq":175,"stream_kind":"final_reply","live":false}
+{"delta":"ously.","content":"ously.","seq":176,"stream_kind":"final_reply","live":false}
+{"delta":" The word","content":" The word","seq":177,"stream_kind":"final_reply","live":false}
+{"delta":" \"ba","content":" \"ba","seq":178,"stream_kind":"final_reply","live":false}
+{"delta":"nk\" queries ","content":"nk\" queries ","seq":179,"stream_kind":"final_reply","live":false}
+{"delta":"the rest of ","content":"the rest of ","seq":180,"stream_kind":"final_reply","live":false}
+{"delta":"the ","content":"the ","seq":181,"stream_kind":"final_reply","live":false}
+{"delta":"sentence","content":"sentence","seq":182,"stream_kind":"final_reply","live":false}
+{"delta":" (\"what co","content":" (\"what co","seq":183,"stream_kind":"final_reply","live":false}
+{"delta":"ntext clari","content":"ntext clari","seq":184,"stream_kind":"final_reply","live":false}
+{"delta":"fies my m","content":"fies my m","seq":185,"stream_kind":"final_reply","live":false}
+{"delta":"eaning?","content":"eaning?","seq":186,"stream_kind":"final_reply","live":false}
+{"delta":"\"),","content":"\"),","seq":187,"stream_kind":"final_reply","live":false}
+{"delta":" key","content":" key","seq":188,"stream_kind":"final_reply","live":false}
+{"delta":"s itsel","content":"s itsel","seq":189,"stream_kind":"final_reply","live":false}
+{"delta":"f (\"here's w","content":"f (\"here's w","seq":190,"stream_kind":"final_reply","live":false}
+{"delta":"hat I represen","content":"hat I represen","seq":191,"stream_kind":"final_reply","live":false}
+{"delta":"t\"), and value","content":"t\"), and value","seq":192,"stream_kind":"final_reply","live":false}
+{"delta":"s itself (\"here's my s","content":"s itself (\"here's my s","seq":193,"stream_kind":"final_reply","live":false}
+{"delta":"emantic cont","content":"emantic cont","seq":194,"stream_kind":"final_reply","live":false}
+{"delta":"ent\").","content":"ent\").","seq":195,"stream_kind":"final_reply","live":false}
+{"delta":"\n\n---\n\n#","content":"\n\n---\n\n#","seq":196,"stream_kind":"final_reply","live":false}
+{"delta":"# 2. Sca","content":"# 2. Sca","seq":197,"stream_kind":"final_reply","live":false}
+{"delta":"led Dot-Product","content":"led Dot-Product","seq":198,"stream_kind":"final_reply","live":false}
+{"delta":" Attentio","content":" Attentio","seq":199,"stream_kind":"final_reply","live":false}
+{"delta":"n\n\n### The Core ","content":"n\n\n### The Core ","seq":200,"stream_kind":"final_reply","live":false}
+{"delta":"Operation\n\n`","content":"Operation\n\n`","seq":201,"stream_kind":"final_reply","live":false}
+{"delta":"``\nAt","content":"``\nAt","seq":202,"stream_kind":"final_reply","live":false}
+{"delta":"tention(","content":"tention(","seq":203,"stream_kind":"final_reply","live":false}
+{"delta":"Q, K","content":"Q, K","seq":204,"stream_kind":"final_reply","live":false}
+{"delta":", V) ","content":", V) ","seq":205,"stream_kind":"final_reply","live":false}
+{"delta":"= so","content":"= so","seq":206,"stream_kind":"final_reply","live":false}
+{"delta":"ftmax( Q ","content":"ftmax( Q ","seq":207,"stream_kind":"final_reply","live":false}
+{"delta":"· K^","content":"· K^","seq":208,"stream_kind":"final_reply","live":false}
+{"delta":"T / √d_k ) · V\n      ","content":"T / √d_k ) · V\n      ","seq":209,"stream_kind":"final_reply","live":false}
+{"delta":"    ","content":"    ","seq":210,"stream_kind":"final_reply","live":false}
+{"delta":"            └───","content":"            └───","seq":211,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":212,"stream_kind":"final_reply","live":false}
+{"delta":"─────┬─────","content":"─────┬─────","seq":213,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":214,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":215,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":216,"stream_kind":"final_reply","live":false}
+{"delta":"┘    └┬┘\n         ","content":"┘    └┬┘\n         ","seq":217,"stream_kind":"final_reply","live":false}
+{"delta":"          ","content":"          ","seq":218,"stream_kind":"final_reply","live":false}
+{"delta":"      attenti","content":"      attenti","seq":219,"stream_kind":"final_reply","live":false}
+{"delta":"on scores ","content":"on scores ","seq":220,"stream_kind":"final_reply","live":false}
+{"delta":"      weighted\n         ","content":"      weighted\n         ","seq":221,"stream_kind":"final_reply","live":false}
+{"delta":"   ","content":"   ","seq":222,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":223,"stream_kind":"final_reply","live":false}
+{"delta":"        (N × N ","content":"        (N × N ","seq":224,"stream_kind":"final_reply","live":false}
+{"delta":"matrix)       ","content":"matrix)       ","seq":225,"stream_kind":"final_reply","live":false}
+{"delta":"  sum ","content":"  sum ","seq":226,"stream_kind":"final_reply","live":false}
+{"delta":"of value","content":"of value","seq":227,"stream_kind":"final_reply","live":false}
+{"delta":"s\n```\n\nB","content":"s\n```\n\nB","seq":228,"stream_kind":"final_reply","live":false}
+{"delta":"reaking it do","content":"reaking it do","seq":229,"stream_kind":"final_reply","live":false}
+{"delta":"wn step by ","content":"wn step by ","seq":230,"stream_kind":"final_reply","live":false}
+{"delta":"step:\n\n### ","content":"step:\n\n### ","seq":231,"stream_kind":"final_reply","live":false}
+{"delta":"Step 1: Com","content":"Step 1: Com","seq":232,"stream_kind":"final_reply","live":false}
+{"delta":"pute Ra","content":"pute Ra","seq":233,"stream_kind":"final_reply","live":false}
+{"delta":"w Sc","content":"w Sc","seq":234,"stream_kind":"final_reply","live":false}
+{"delta":"ores\n\n","content":"ores\n\n","seq":235,"stream_kind":"final_reply","live":false}
+{"delta":"```","content":"```","seq":236,"stream_kind":"final_reply","live":false}
+{"delta":"\nS ","content":"\nS ","seq":237,"stream_kind":"final_reply","live":false}
+{"delta":"= ","content":"= ","seq":238,"stream_kind":"final_reply","live":false}
+{"delta":"Q · K","content":"Q · K","seq":239,"stream_kind":"final_reply","live":false}
+{"delta":"^T\n","content":"^T\n","seq":240,"stream_kind":"final_reply","live":false}
+{"delta":"\nS[i","content":"\nS[i","seq":241,"stream_kind":"final_reply","live":false}
+{"delta":"][j]","content":"][j]","seq":242,"stream_kind":"final_reply","live":false}
+{"delta":" = q","content":" = q","seq":243,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ ·","content":"ᵢ ·","seq":244,"stream_kind":"final_reply","live":false}
+{"delta":" k","content":" k","seq":245,"stream_kind":"final_reply","live":false}
+{"delta":"ⱼ = ","content":"ⱼ = ","seq":246,"stream_kind":"final_reply","live":false}
+{"delta":"Σ","content":"Σ","seq":247,"stream_kind":"final_reply","live":false}
+{"delta":"ₘ q","content":"ₘ q","seq":248,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ[ₘ","content":"ᵢ[ₘ","seq":249,"stream_kind":"final_reply","live":false}
+{"delta":"] · kⱼ","content":"] · kⱼ","seq":250,"stream_kind":"final_reply","live":false}
+{"delta":"[ₘ]\n`","content":"[ₘ]\n`","seq":251,"stream_kind":"final_reply","live":false}
+{"delta":"``\n\n","content":"``\n\n","seq":252,"stream_kind":"final_reply","live":false}
+{"delta":"This is the dot ","content":"This is the dot ","seq":253,"stream_kind":"final_reply","live":false}
+{"delta":"produc","content":"produc","seq":254,"stream_kind":"final_reply","live":false}
+{"delta":"t between ","content":"t between ","seq":255,"stream_kind":"final_reply","live":false}
+{"delta":"token i's ","content":"token i's ","seq":256,"stream_kind":"final_reply","live":false}
+{"delta":"query an","content":"query an","seq":257,"stream_kind":"final_reply","live":false}
+{"delta":"d to","content":"d to","seq":258,"stream_kind":"final_reply","live":false}
+{"delta":"ke","content":"ke","seq":259,"stream_kind":"final_reply","live":false}
+{"delta":"n j","content":"n j","seq":260,"stream_kind":"final_reply","live":false}
+{"delta":"'s key","content":"'s key","seq":261,"stream_kind":"final_reply","live":false}
+{"delta":". I","content":". I","seq":262,"stream_kind":"final_reply","live":false}
+{"delta":"f qᵢ","content":"f qᵢ","seq":263,"stream_kind":"final_reply","live":false}
+{"delta":" and kⱼ p","content":" and kⱼ p","seq":264,"stream_kind":"final_reply","live":false}
+{"delta":"oint in similar ","content":"oint in similar ","seq":265,"stream_kind":"final_reply","live":false}
+{"delta":"direct","content":"direct","seq":266,"stream_kind":"final_reply","live":false}
+{"delta":"ions, th","content":"ions, th","seq":267,"stream_kind":"final_reply","live":false}
+{"delta":"e sc","content":"e sc","seq":268,"stream_kind":"final_reply","live":false}
+{"delta":"ore is high — to","content":"ore is high — to","seq":269,"stream_kind":"final_reply","live":false}
+{"delta":"ken i considers t","content":"ken i considers t","seq":270,"stream_kind":"final_reply","live":false}
+{"delta":"oken j","content":"oken j","seq":271,"stream_kind":"final_reply","live":false}
+{"delta":" relevant.","content":" relevant.","seq":272,"stream_kind":"final_reply","live":false}
+{"delta":"\n\nThe r","content":"\n\nThe r","seq":273,"stream_kind":"final_reply","live":false}
+{"delta":"esult is an ","content":"esult is an ","seq":274,"stream_kind":"final_reply","live":false}
+{"delta":"**N × N matr","content":"**N × N matr","seq":275,"stream_kind":"final_reply","live":false}
+{"delta":"ix** where N is the s","content":"ix** where N is the s","seq":276,"stream_kind":"final_reply","live":false}
+{"delta":"equence len","content":"equence len","seq":277,"stream_kind":"final_reply","live":false}
+{"delta":"gth. Each","content":"gth. Each","seq":278,"stream_kind":"final_reply","live":false}
+{"delta":" row i","content":" row i","seq":279,"stream_kind":"final_reply","live":false}
+{"delta":" contain","content":" contain","seq":280,"stream_kind":"final_reply","live":false}
+{"delta":"s token i's raw r","content":"s token i's raw r","seq":281,"stream_kind":"final_reply","live":false}
+{"delta":"elevance s","content":"elevance s","seq":282,"stream_kind":"final_reply","live":false}
+{"delta":"cores ","content":"cores ","seq":283,"stream_kind":"final_reply","live":false}
+{"delta":"for every tok","content":"for every tok","seq":284,"stream_kind":"final_reply","live":false}
+{"delta":"en j.\n\n##","content":"en j.\n\n##","seq":285,"stream_kind":"final_reply","live":false}
+{"delta":"# Step","content":"# Step","seq":286,"stream_kind":"final_reply","live":false}
+{"delta":" 2: ","content":" 2: ","seq":287,"stream_kind":"final_reply","live":false}
+{"delta":"Scale\n\n`","content":"Scale\n\n`","seq":288,"stream_kind":"final_reply","live":false}
+{"delta":"``\nS_s","content":"``\nS_s","seq":289,"stream_kind":"final_reply","live":false}
+{"delta":"cale","content":"cale","seq":290,"stream_kind":"final_reply","live":false}
+{"delta":"d = S / ","content":"d = S / ","seq":291,"stream_kind":"final_reply","live":false}
+{"delta":"√d_k\n`","content":"√d_k\n`","seq":292,"stream_kind":"final_reply","live":false}
+{"delta":"``\n\n### St","content":"``\n\n### St","seq":293,"stream_kind":"final_reply","live":false}
+{"delta":"ep ","content":"ep ","seq":294,"stream_kind":"final_reply","live":false}
+{"delta":"3: Softm","content":"3: Softm","seq":295,"stream_kind":"final_reply","live":false}
+{"delta":"ax (r","content":"ax (r","seq":296,"stream_kind":"final_reply","live":false}
+{"delta":"ow","content":"ow","seq":297,"stream_kind":"final_reply","live":false}
+{"delta":"-wise)\n\n``","content":"-wise)\n\n``","seq":298,"stream_kind":"final_reply","live":false}
+{"delta":"`\nA = soft","content":"`\nA = soft","seq":299,"stream_kind":"final_reply","live":false}
+{"delta":"max(S_","content":"max(S_","seq":300,"stream_kind":"final_reply","live":false}
+{"delta":"scaled)","content":"scaled)","seq":301,"stream_kind":"final_reply","live":false}
+{"delta":"\n\nA[i","content":"\n\nA[i","seq":302,"stream_kind":"final_reply","live":false}
+{"delta":"][j] = ex","content":"][j] = ex","seq":303,"stream_kind":"final_reply","live":false}
+{"delta":"p(S_sca","content":"p(S_sca","seq":304,"stream_kind":"final_reply","live":false}
+{"delta":"led","content":"led","seq":305,"stream_kind":"final_reply","live":false}
+{"delta":"[i][j]) / Σ","content":"[i][j]) / Σ","seq":306,"stream_kind":"final_reply","live":false}
+{"delta":"ₖ ex","content":"ₖ ex","seq":307,"stream_kind":"final_reply","live":false}
+{"delta":"p(S_scaled[i","content":"p(S_scaled[i","seq":308,"stream_kind":"final_reply","live":false}
+{"delta":"][k])\n```\n\nE","content":"][k])\n```\n\nE","seq":309,"stream_kind":"final_reply","live":false}
+{"delta":"ach row becomes a probabili","content":"ach row becomes a probabili","seq":310,"stream_kind":"final_reply","live":false}
+{"delta":"t","content":"t","seq":311,"stream_kind":"final_reply","live":false}
+{"delta":"y","content":"y","seq":312,"stream_kind":"final_reply","live":false}
+{"delta":" dist","content":" dist","seq":313,"stream_kind":"final_reply","live":false}
+{"delta":"ributio","content":"ributio","seq":314,"stream_kind":"final_reply","live":false}
+{"delta":"n: Σ","content":"n: Σ","seq":315,"stream_kind":"final_reply","live":false}
+{"delta":"ⱼ A[i","content":"ⱼ A[i","seq":316,"stream_kind":"final_reply","live":false}
+{"delta":"][j] =","content":"][j] =","seq":317,"stream_kind":"final_reply","live":false}
+{"delta":" 1. ","content":" 1. ","seq":318,"stream_kind":"final_reply","live":false}
+{"delta":"Toke","content":"Toke","seq":319,"stream_kind":"final_reply","live":false}
+{"delta":"n ","content":"n ","seq":320,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"i now has a \"r","content":"i now has a \"r","seq":321,"stream_kind":"final_reply","live":false}
+{"delta":"eleva","content":"eleva","seq":322,"stream_kind":"final_reply","live":false}
+{"delta":"nce weight\" ","content":"nce weight\" ","seq":323,"stream_kind":"final_reply","live":false}
+{"delta":"for every","content":"for every","seq":324,"stream_kind":"final_reply","live":false}
+{"delta":" other tok","content":" other tok","seq":325,"stream_kind":"final_reply","live":false}
+{"delta":"en.\n\n###","content":"en.\n\n###","seq":326,"stream_kind":"final_reply","live":false}
+{"delta":" Step ","content":" Step ","seq":327,"stream_kind":"final_reply","live":false}
+{"delta":"4: Weighted ","content":"4: Weighted ","seq":328,"stream_kind":"final_reply","live":false}
+{"delta":"Su","content":"Su","seq":329,"stream_kind":"final_reply","live":false}
+{"delta":"m\n\n```","content":"m\n\n```","seq":330,"stream_kind":"final_reply","live":false}
+{"delta":"\nOu","content":"\nOu","seq":331,"stream_kind":"final_reply","live":false}
+{"delta":"tput[i]","content":"tput[i]","seq":332,"stream_kind":"final_reply","live":false}
+{"delta":" = Σ","content":" = Σ","seq":333,"stream_kind":"final_reply","live":false}
+{"delta":"ⱼ ","content":"ⱼ ","seq":334,"stream_kind":"final_reply","live":false}
+{"delta":"A[i][j] · ","content":"A[i][j] · ","seq":335,"stream_kind":"final_reply","live":false}
+{"delta":"vⱼ\n```\n\nToke","content":"vⱼ\n```\n\nToke","seq":336,"stream_kind":"final_reply","live":false}
+{"delta":"n ","content":"n ","seq":337,"stream_kind":"final_reply","live":false}
+{"delta":"i's output is a weigh","content":"i's output is a weigh","seq":338,"stream_kind":"final_reply","live":false}
+{"delta":"ted com","content":"ted com","seq":339,"stream_kind":"final_reply","live":false}
+{"delta":"bination","content":"bination","seq":340,"stream_kind":"final_reply","live":false}
+{"delta":" of all values, where ","content":" of all values, where ","seq":341,"stream_kind":"final_reply","live":false}
+{"delta":"the weights are the attentio","content":"the weights are the attentio","seq":342,"stream_kind":"final_reply","live":false}
+{"delta":"n pr","content":"n pr","seq":343,"stream_kind":"final_reply","live":false}
+{"delta":"obabilities. If ","content":"obabilities. If ","seq":344,"stream_kind":"final_reply","live":false}
+{"delta":"token i a","content":"token i a","seq":345,"stream_kind":"final_reply","live":false}
+{"delta":"ttends stro","content":"ttends stro","seq":346,"stream_kind":"final_reply","live":false}
+{"delta":"n","content":"n","seq":347,"stream_kind":"final_reply","live":false}
+{"delta":"gl","content":"gl","seq":348,"stream_kind":"final_reply","live":false}
+{"delta":"y t","content":"y t","seq":349,"stream_kind":"final_reply","live":false}
+{"delta":"o token j, vⱼ domin","content":"o token j, vⱼ domin","seq":350,"stream_kind":"final_reply","live":false}
+{"delta":"ates the ou","content":"ates the ou","seq":351,"stream_kind":"final_reply","live":false}
+{"delta":"tput.\n\n---\n\n#","content":"tput.\n\n---\n\n#","seq":352,"stream_kind":"final_reply","live":false}
+{"delta":"# 3. Why","content":"# 3. Why","seq":353,"stream_kind":"final_reply","live":false}
+{"delta":" Divi","content":" Divi","seq":354,"stream_kind":"final_reply","live":false}
+{"delta":"de by √d_k?\n\nT","content":"de by √d_k?\n\nT","seq":355,"stream_kind":"final_reply","live":false}
+{"delta":"his is the most frequentl","content":"his is the most frequentl","seq":356,"stream_kind":"final_reply","live":false}
+{"delta":"y misund","content":"y misund","seq":357,"stream_kind":"final_reply","live":false}
+{"delta":"erstood det","content":"erstood det","seq":358,"stream_kind":"final_reply","live":false}
+{"delta":"ail. T","content":"ail. T","seq":359,"stream_kind":"final_reply","live":false}
+{"delta":"he answer is **v","content":"he answer is **v","seq":360,"stream_kind":"final_reply","live":false}
+{"delta":"ariance cont","content":"ariance cont","seq":361,"stream_kind":"final_reply","live":false}
+{"delta":"rol**.\n\n### The ","content":"rol**.\n\n### The ","seq":362,"stream_kind":"final_reply","live":false}
+{"delta":"Problem Without ","content":"Problem Without ","seq":363,"stream_kind":"final_reply","live":false}
+{"delta":"Sc","content":"Sc","seq":364,"stream_kind":"final_reply","live":false}
+{"delta":"aling\n\nAss","content":"aling\n\nAss","seq":365,"stream_kind":"final_reply","live":false}
+{"delta":"ume q an","content":"ume q an","seq":366,"stream_kind":"final_reply","live":false}
+{"delta":"d k","content":"d k","seq":367,"stream_kind":"final_reply","live":false}
+{"delta":" are vectors of independent r","content":" are vectors of independent r","seq":368,"stream_kind":"final_reply","live":false}
+{"delta":"andom vari","content":"andom vari","seq":369,"stream_kind":"final_reply","live":false}
+{"delta":"ables with mean","content":"ables with mean","seq":370,"stream_kind":"final_reply","live":false}
+{"delta":" 0 ","content":" 0 ","seq":371,"stream_kind":"final_reply","live":false}
+{"delta":"and va","content":"and va","seq":372,"stream_kind":"final_reply","live":false}
+{"delta":"riance 1. Their","content":"riance 1. Their","seq":373,"stream_kind":"final_reply","live":false}
+{"delta":" dot ","content":" dot ","seq":374,"stream_kind":"final_reply","live":false}
+{"delta":"pro","content":"pro","seq":375,"stream_kind":"final_reply","live":false}
+{"delta":"duct:\n","content":"duct:\n","seq":376,"stream_kind":"final_reply","live":false}
+{"delta":"\n```","content":"\n```","seq":377,"stream_kind":"final_reply","live":false}
+{"delta":"\nq ·","content":"\nq ·","seq":378,"stream_kind":"final_reply","live":false}
+{"delta":" k = q","content":" k = q","seq":379,"stream_kind":"final_reply","live":false}
+{"delta":"₁k","content":"₁k","seq":380,"stream_kind":"final_reply","live":false}
+{"delta":"₁ + q","content":"₁ + q","seq":381,"stream_kind":"final_reply","live":false}
+{"delta":"₂k","content":"₂k","seq":382,"stream_kind":"final_reply","live":false}
+{"delta":"₂ ","content":"₂ ","seq":383,"stream_kind":"final_reply","live":false}
+{"delta":"+ ... + q","content":"+ ... + q","seq":384,"stream_kind":"final_reply","live":false}
+{"delta":"_dk_d\n`","content":"_dk_d\n`","seq":385,"stream_kind":"final_reply","live":false}
+{"delta":"``\n\n","content":"``\n\n","seq":386,"stream_kind":"final_reply","live":false}
+{"delta":"Each te","content":"Each te","seq":387,"stream_kind":"final_reply","live":false}
+{"delta":"rm qₘk","content":"rm qₘk","seq":388,"stream_kind":"final_reply","live":false}
+{"delta":"ₘ ","content":"ₘ ","seq":389,"stream_kind":"final_reply","live":false}
+{"delta":"has variance:","content":"has variance:","seq":390,"stream_kind":"final_reply","live":false}
+{"delta":"\n\n``","content":"\n\n``","seq":391,"stream_kind":"final_reply","live":false}
+{"delta":"`\nVar(q","content":"`\nVar(q","seq":392,"stream_kind":"final_reply","live":false}
+{"delta":"ₘk","content":"ₘk","seq":393,"stream_kind":"final_reply","live":false}
+{"delta":"ₘ) ","content":"ₘ) ","seq":394,"stream_kind":"final_reply","live":false}
+{"delta":"= Var(q","content":"= Var(q","seq":395,"stream_kind":"final_reply","live":false}
+{"delta":"ₘ) ","content":"ₘ) ","seq":396,"stream_kind":"final_reply","live":false}
+{"delta":"· Var(k","content":"· Var(k","seq":397,"stream_kind":"final_reply","live":false}
+{"delta":"ₘ) = 1","content":"ₘ) = 1","seq":398,"stream_kind":"final_reply","live":false}
+{"delta":" · 1 =","content":" · 1 =","seq":399,"stream_kind":"final_reply","live":false}
+{"delta":" 1\n``","content":" 1\n``","seq":400,"stream_kind":"final_reply","live":false}
+{"delta":"`\n\nThe sum of d_k in","content":"`\n\nThe sum of d_k in","seq":401,"stream_kind":"final_reply","live":false}
+{"delta":"dependent ter","content":"dependent ter","seq":402,"stream_kind":"final_reply","live":false}
+{"delta":"ms has var","content":"ms has var","seq":403,"stream_kind":"final_reply","live":false}
+{"delta":"iance:\n","content":"iance:\n","seq":404,"stream_kind":"final_reply","live":false}
+{"delta":"\n```\n","content":"\n```\n","seq":405,"stream_kind":"final_reply","live":false}
+{"delta":"Var(q ","content":"Var(q ","seq":406,"stream_kind":"final_reply","live":false}
+{"delta":"· k) = ","content":"· k) = ","seq":407,"stream_kind":"final_reply","live":false}
+{"delta":"d_k · 1","content":"d_k · 1","seq":408,"stream_kind":"final_reply","live":false}
+{"delta":" = d_k\n```\n\nAnd standard d","content":" = d_k\n```\n\nAnd standard d","seq":409,"stream_kind":"final_reply","live":false}
+{"delta":"eviation:","content":"eviation:","seq":410,"stream_kind":"final_reply","live":false}
+{"delta":"\n\n```\n","content":"\n\n```\n","seq":411,"stream_kind":"final_reply","live":false}
+{"delta":"σ(q ","content":"σ(q ","seq":412,"stream_kind":"final_reply","live":false}
+{"delta":"· k) =","content":"· k) =","seq":413,"stream_kind":"final_reply","live":false}
+{"delta":" ","content":" ","seq":414,"stream_kind":"final_reply","live":false}
+{"delta":"√d_k\n```\n\nSo","content":"√d_k\n```\n\nSo","seq":415,"stream_kind":"final_reply","live":false}
+{"delta":" as d","content":" as d","seq":416,"stream_kind":"final_reply","live":false}
+{"delta":"_k","content":"_k","seq":417,"stream_kind":"final_reply","live":false}
+{"delta":" grows ","content":" grows ","seq":418,"stream_kind":"final_reply","live":false}
+{"delta":"(e.","content":"(e.","seq":419,"stream_kind":"final_reply","live":false}
+{"delta":"g., d_k = ","content":"g., d_k = ","seq":420,"stream_kind":"final_reply","live":false}
+{"delta":"64 or 128), the raw do","content":"64 or 128), the raw do","seq":421,"stream_kind":"final_reply","live":false}
+{"delta":"t product","content":"t product","seq":422,"stream_kind":"final_reply","live":false}
+{"delta":"s have standar","content":"s have standar","seq":423,"stream_kind":"final_reply","live":false}
+{"delta":"d","content":"d","seq":424,"stream_kind":"final_reply","live":false}
+{"delta":" de","content":" de","seq":425,"stream_kind":"final_reply","live":false}
+{"delta":"viat","content":"viat","seq":426,"stream_kind":"final_reply","live":false}
+{"delta":"ion √d_k. The ","content":"ion √d_k. The ","seq":427,"stream_kind":"final_reply","live":false}
+{"delta":"values entering ","content":"values entering ","seq":428,"stream_kind":"final_reply","live":false}
+{"delta":"the softmax ar","content":"the softmax ar","seq":429,"stream_kind":"final_reply","live":false}
+{"delta":"e spr","content":"e spr","seq":430,"stream_kind":"final_reply","live":false}
+{"delta":"ead across a **","content":"ead across a **","seq":431,"stream_kind":"final_reply","live":false}
+{"delta":"wide ra","content":"wide ra","seq":432,"stream_kind":"final_reply","live":false}
+{"delta":"nge**","content":"nge**","seq":433,"stream_kind":"final_reply","live":false}
+{"delta":".\n","content":".\n","seq":434,"stream_kind":"final_reply","live":false}
+{"delta":"\n### Why Wi","content":"\n### Why Wi","seq":435,"stream_kind":"final_reply","live":false}
+{"delta":"de Ranges ","content":"de Ranges ","seq":436,"stream_kind":"final_reply","live":false}
+{"delta":"Break So","content":"Break So","seq":437,"stream_kind":"final_reply","live":false}
+{"delta":"ftma","content":"ftma","seq":438,"stream_kind":"final_reply","live":false}
+{"delta":"x\n\nConsi","content":"x\n\nConsi","seq":439,"stream_kind":"final_reply","live":false}
+{"delta":"der two ex","content":"der two ex","seq":440,"stream_kind":"final_reply","live":false}
+{"delta":"treme s","content":"treme s","seq":441,"stream_kind":"final_reply","live":false}
+{"delta":"cenari","content":"cenari","seq":442,"stream_kind":"final_reply","live":false}
+{"delta":"os:\n\n`","content":"os:\n\n`","seq":443,"stream_kind":"final_reply","live":false}
+{"delta":"``","content":"``","seq":444,"stream_kind":"final_reply","live":false}
+{"delta":"\n","content":"\n","seq":445,"stream_kind":"final_reply","live":false}
+{"delta":"d_k ","content":"d_k ","seq":446,"stream_kind":"final_reply","live":false}
+{"delta":"= 64, σ = ","content":"= 64, σ = ","seq":447,"stream_kind":"final_reply","live":false}
+{"delta":"8:\n","content":"8:\n","seq":448,"stream_kind":"final_reply","live":false}
+{"delta":"\nRaw s","content":"\nRaw s","seq":449,"stream_kind":"final_reply","live":false}
+{"delta":"c","content":"c","seq":450,"stream_kind":"final_reply","live":false}
+{"delta":"ores:","content":"ores:","seq":451,"stream_kind":"final_reply","live":false}
+{"delta":"    [ -1","content":"    [ -1","seq":452,"stream_kind":"final_reply","live":false}
+{"delta":"6,  ","content":"6,  ","seq":453,"stream_kind":"final_reply","live":false}
+{"delta":"-8, ","content":"-8, ","seq":454,"stream_kind":"final_reply","live":false}
+{"delta":"  0","content":"  0","seq":455,"stream_kind":"final_reply","live":false}
+{"delta":",   8,  16 ]   ","content":",   8,  16 ]   ","seq":456,"stream_kind":"final_reply","live":false}
+{"delta":" ← reasonab","content":" ← reasonab","seq":457,"stream_kind":"final_reply","live":false}
+{"delta":"le spread","content":"le spread","seq":458,"stream_kind":"final_reply","live":false}
+{"delta":"\nAf","content":"\nAf","seq":459,"stream_kind":"final_reply","live":false}
+{"delta":"ter","content":"ter","seq":460,"stream_kind":"final_reply","live":false}
+{"delta":" sof","content":" sof","seq":461,"stream_kind":"final_reply","live":false}
+{"delta":"tm","content":"tm","seq":462,"stream_kind":"final_reply","live":false}
+{"delta":"ax: ","content":"ax: ","seq":463,"stream_kind":"final_reply","live":false}
+{"delta":"[0.01","content":"[0.01","seq":464,"stream_kind":"final_reply","live":false}
+{"delta":", 0","content":", 0","seq":465,"stream_kind":"final_reply","live":false}
+{"delta":".05,","content":".05,","seq":466,"stream_kind":"final_reply","live":false}
+{"delta":" 0.20, ","content":" 0.20, ","seq":467,"stream_kind":"final_reply","live":false}
+{"delta":"0.35, 0.39] ","content":"0.35, 0.39] ","seq":468,"stream_kind":"final_reply","live":false}
+{"delta":"← distribu","content":"← distribu","seq":469,"stream_kind":"final_reply","live":false}
+{"delta":"ted at","content":"ted at","seq":470,"stream_kind":"final_reply","live":false}
+{"delta":"ten","content":"ten","seq":471,"stream_kind":"final_reply","live":false}
+{"delta":"tion\n","content":"tion\n","seq":472,"stream_kind":"final_reply","live":false}
+{"delta":"\nd_k ","content":"\nd_k ","seq":473,"stream_kind":"final_reply","live":false}
+{"delta":"= 1024, σ = 3","content":"= 1024, σ = 3","seq":474,"stream_kind":"final_reply","live":false}
+{"delta":"2:\n\nR","content":"2:\n\nR","seq":475,"stream_kind":"final_reply","live":false}
+{"delta":"aw scor","content":"aw scor","seq":476,"stream_kind":"final_reply","live":false}
+{"delta":"es:   ","content":"es:   ","seq":477,"stream_kind":"final_reply","live":false}
+{"delta":" [ -","content":" [ -","seq":478,"stream_kind":"final_reply","live":false}
+{"delta":"64, -","content":"64, -","seq":479,"stream_kind":"final_reply","live":false}
+{"delta":"32, ","content":"32, ","seq":480,"stream_kind":"final_reply","live":false}
+{"delta":"  0,  32,  6","content":"  0,  32,  6","seq":481,"stream_kind":"final_reply","live":false}
+{"delta":"4 ]    ← very wi","content":"4 ]    ← very wi","seq":482,"stream_kind":"final_reply","live":false}
+{"delta":"de spread","content":"de spread","seq":483,"stream_kind":"final_reply","live":false}
+{"delta":"\nAfter","content":"\nAfter","seq":484,"stream_kind":"final_reply","live":false}
+{"delta":" sof","content":" sof","seq":485,"stream_kind":"final_reply","live":false}
+{"delta":"tmax:","content":"tmax:","seq":486,"stream_kind":"final_reply","live":false}
+{"delta":" [0","content":" [0","seq":487,"stream_kind":"final_reply","live":false}
+{"delta":".00,","content":".00,","seq":488,"stream_kind":"final_reply","live":false}
+{"delta":" 0","content":" 0","seq":489,"stream_kind":"final_reply","live":false}
+{"delta":".00,","content":".00,","seq":490,"stream_kind":"final_reply","live":false}
+{"delta":" 0.00, ","content":" 0.00, ","seq":491,"stream_kind":"final_reply","live":false}
+{"delta":"0.02, 0","content":"0.02, 0","seq":492,"stream_kind":"final_reply","live":false}
+{"delta":".98]","content":".98]","seq":493,"stream_kind":"final_reply","live":false}
+{"delta":" ← ","content":" ← ","seq":494,"stream_kind":"final_reply","live":false}
+{"delta":"nearly on","content":"nearly on","seq":495,"stream_kind":"final_reply","live":false}
+{"delta":"e-hot\n`","content":"e-hot\n`","seq":496,"stream_kind":"final_reply","live":false}
+{"delta":"``\n\nW","content":"``\n\nW","seq":497,"stream_kind":"final_reply","live":false}
+{"delta":"hen sc","content":"hen sc","seq":498,"stream_kind":"final_reply","live":false}
+{"delta":"ores have ","content":"ores have ","seq":499,"stream_kind":"final_reply","live":false}
+{"delta":"large variance, ","content":"large variance, ","seq":500,"stream_kind":"final_reply","live":false}
+{"delta":"the softma","content":"the softma","seq":501,"stream_kind":"final_reply","live":false}
+{"delta":"x saturate","content":"x saturate","seq":502,"stream_kind":"final_reply","live":false}
+{"delta":"s — it pushe","content":"s — it pushe","seq":503,"stream_kind":"final_reply","live":false}
+{"delta":"s probab","content":"s probab","seq":504,"stream_kind":"final_reply","live":false}
+{"delta":"iliti","content":"iliti","seq":505,"stream_kind":"final_reply","live":false}
+{"delta":"es toward 0 or ","content":"es toward 0 or ","seq":506,"stream_kind":"final_reply","live":false}
+{"delta":"1. ","content":"1. ","seq":507,"stream_kind":"final_reply","live":false}
+{"delta":"The gradient ","content":"The gradient ","seq":508,"stream_kind":"final_reply","live":false}
+{"delta":"of softmax nea","content":"of softmax nea","seq":509,"stream_kind":"final_reply","live":false}
+{"delta":"r saturati","content":"r saturati","seq":510,"stream_kind":"final_reply","live":false}
+{"delta":"o","content":"o","seq":511,"stream_kind":"final_reply","live":false}
+{"delta":"n is:\n\n``","content":"n is:\n\n``","seq":512,"stream_kind":"final_reply","live":false}
+{"delta":"`","content":"`","seq":513,"stream_kind":"final_reply","live":false}
+{"delta":"\n","content":"\n","seq":514,"stream_kind":"final_reply","live":false}
+{"delta":"∂(softma","content":"∂(softma","seq":515,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"x(z","content":"x(z","seq":516,"stream_kind":"final_reply","live":false}
+{"delta":")ᵢ) /","content":")ᵢ) /","seq":517,"stream_kind":"final_reply","live":false}
+{"delta":" ∂z","content":" ∂z","seq":518,"stream_kind":"final_reply","live":false}
+{"delta":"ⱼ ","content":"ⱼ ","seq":519,"stream_kind":"final_reply","live":false}
+{"delta":"= so","content":"= so","seq":520,"stream_kind":"final_reply","live":false}
+{"delta":"ftmax(","content":"ftmax(","seq":521,"stream_kind":"final_reply","live":false}
+{"delta":"z)","content":"z)","seq":522,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ · (δᵢ","content":"ᵢ · (δᵢ","seq":523,"stream_kind":"final_reply","live":false}
+{"delta":"ⱼ ","content":"ⱼ ","seq":524,"stream_kind":"final_reply","live":false}
+{"delta":"- softmax(z","content":"- softmax(z","seq":525,"stream_kind":"final_reply","live":false}
+{"delta":")","content":")","seq":526,"stream_kind":"final_reply","live":false}
+{"delta":"ⱼ)\n```\n\n","content":"ⱼ)\n```\n\n","seq":527,"stream_kind":"final_reply","live":false}
+{"delta":"When","content":"When","seq":528,"stream_kind":"final_reply","live":false}
+{"delta":" `softm","content":" `softm","seq":529,"stream_kind":"final_reply","live":false}
+{"delta":"ax(z)ᵢ ≈","content":"ax(z)ᵢ ≈","seq":530,"stream_kind":"final_reply","live":false}
+{"delta":" 0` or `so","content":" 0` or `so","seq":531,"stream_kind":"final_reply","live":false}
+{"delta":"ftmax(z)","content":"ftmax(z)","seq":532,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ ≈ 1`, this grad","content":"ᵢ ≈ 1`, this grad","seq":533,"stream_kind":"final_reply","live":false}
+{"delta":"ient ap","content":"ient ap","seq":534,"stream_kind":"final_reply","live":false}
+{"delta":"proaches **zero","content":"proaches **zero","seq":535,"stream_kind":"final_reply","live":false}
+{"delta":"**. The network st","content":"**. The network st","seq":536,"stream_kind":"final_reply","live":false}
+{"delta":"ops lea","content":"ops lea","seq":537,"stream_kind":"final_reply","live":false}
+{"delta":"rning.\n\n###","content":"rning.\n\n###","seq":538,"stream_kind":"final_reply","live":false}
+{"delta":" The Fix\n\n","content":" The Fix\n\n","seq":539,"stream_kind":"final_reply","live":false}
+{"delta":"Dividing b","content":"Dividing b","seq":540,"stream_kind":"final_reply","live":false}
+{"delta":"y √d_k normaliz","content":"y √d_k normaliz","seq":541,"stream_kind":"final_reply","live":false}
+{"delta":"es th","content":"es th","seq":542,"stream_kind":"final_reply","live":false}
+{"delta":"e varian","content":"e varian","seq":543,"stream_kind":"final_reply","live":false}
+{"delta":"ce back","content":"ce back","seq":544,"stream_kind":"final_reply","live":false}
+{"delta":" to 1","content":" to 1","seq":545,"stream_kind":"final_reply","live":false}
+{"delta":":\n\n`","content":":\n\n`","seq":546,"stream_kind":"final_reply","live":false}
+{"delta":"``\nVar(","content":"``\nVar(","seq":547,"stream_kind":"final_reply","live":false}
+{"delta":"q · k ","content":"q · k ","seq":548,"stream_kind":"final_reply","live":false}
+{"delta":"/ √d_","content":"/ √d_","seq":549,"stream_kind":"final_reply","live":false}
+{"delta":"k) = ","content":"k) = ","seq":550,"stream_kind":"final_reply","live":false}
+{"delta":"Var(q ","content":"Var(q ","seq":551,"stream_kind":"final_reply","live":false}
+{"delta":"· k) / ","content":"· k) / ","seq":552,"stream_kind":"final_reply","live":false}
+{"delta":"d_k ","content":"d_k ","seq":553,"stream_kind":"final_reply","live":false}
+{"delta":"= d_k / d","content":"= d_k / d","seq":554,"stream_kind":"final_reply","live":false}
+{"delta":"_k = 1\n```\n\nNow the ","content":"_k = 1\n```\n\nNow the ","seq":555,"stream_kind":"final_reply","live":false}
+{"delta":"raw scores have standar","content":"raw scores have standar","seq":556,"stream_kind":"final_reply","live":false}
+{"delta":"d deviation ","content":"d deviation ","seq":557,"stream_kind":"final_reply","live":false}
+{"delta":"≈ 1 ","content":"≈ 1 ","seq":558,"stream_kind":"final_reply","live":false}
+{"delta":"reg","content":"reg","seq":559,"stream_kind":"final_reply","live":false}
+{"delta":"ardless of d_k. The s","content":"ardless of d_k. The s","seq":560,"stream_kind":"final_reply","live":false}
+{"delta":"oftmax ","content":"oftmax ","seq":561,"stream_kind":"final_reply","live":false}
+{"delta":"operates ","content":"operates ","seq":562,"stream_kind":"final_reply","live":false}
+{"delta":"in its **","content":"in its **","seq":563,"stream_kind":"final_reply","live":false}
+{"delta":"linear regime** where","content":"linear regime** where","seq":564,"stream_kind":"final_reply","live":false}
+{"delta":" gradie","content":" gradie","seq":565,"stream_kind":"final_reply","live":false}
+{"delta":"nts fl","content":"nts fl","seq":566,"stream_kind":"final_reply","live":false}
+{"delta":"ow freel","content":"ow freel","seq":567,"stream_kind":"final_reply","live":false}
+{"delta":"y.\n\n###","content":"y.\n\n###","seq":568,"stream_kind":"final_reply","live":false}
+{"delta":" Why Not D","content":" Why Not D","seq":569,"stream_kind":"final_reply","live":false}
+{"delta":"ivide","content":"ivide","seq":570,"stream_kind":"final_reply","live":false}
+{"delta":" by d_","content":" by d_","seq":571,"stream_kind":"final_reply","live":false}
+{"delta":"k?\n\nDi","content":"k?\n\nDi","seq":572,"stream_kind":"final_reply","live":false}
+{"delta":"viding ","content":"viding ","seq":573,"stream_kind":"final_reply","live":false}
+{"delta":"by d_k (in","content":"by d_k (in","seq":574,"stream_kind":"final_reply","live":false}
+{"delta":"stead of √","content":"stead of √","seq":575,"stream_kind":"final_reply","live":false}
+{"delta":"d_k) would","content":"d_k) would","seq":576,"stream_kind":"final_reply","live":false}
+{"delta":" give var","content":" give var","seq":577,"stream_kind":"final_reply","live":false}
+{"delta":"ianc","content":"ianc","seq":578,"stream_kind":"final_reply","live":false}
+{"delta":"e 1/d_k — the ","content":"e 1/d_k — the ","seq":579,"stream_kind":"final_reply","live":false}
+{"delta":"scores would be ","content":"scores would be ","seq":580,"stream_kind":"final_reply","live":false}
+{"delta":"too com","content":"too com","seq":581,"stream_kind":"final_reply","live":false}
+{"delta":"pressed, making the","content":"pressed, making the","seq":582,"stream_kind":"final_reply","live":false}
+{"delta":" softmax n","content":" softmax n","seq":583,"stream_kind":"final_reply","live":false}
+{"delta":"early unif","content":"early unif","seq":584,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"orm ","content":"orm ","seq":585,"stream_kind":"final_reply","live":false}
+{"delta":"(all tokens get eq","content":"(all tokens get eq","seq":586,"stream_kind":"final_reply","live":false}
+{"delta":"ual attentio","content":"ual attentio","seq":587,"stream_kind":"final_reply","live":false}
+{"delta":"n). Th","content":"n). Th","seq":588,"stream_kind":"final_reply","live":false}
+{"delta":"e network lo","content":"e network lo","seq":589,"stream_kind":"final_reply","live":false}
+{"delta":"ses s","content":"ses s","seq":590,"stream_kind":"final_reply","live":false}
+{"delta":"electi","content":"electi","seq":591,"stream_kind":"final_reply","live":false}
+{"delta":"vity. √","content":"vity. √","seq":592,"stream_kind":"final_reply","live":false}
+{"delta":"d_k is the G","content":"d_k is the G","seq":593,"stream_kind":"final_reply","live":false}
+{"delta":"oldilocks ","content":"oldilocks ","seq":594,"stream_kind":"final_reply","live":false}
+{"delta":"va","content":"va","seq":595,"stream_kind":"final_reply","live":false}
+{"delta":"lue","content":"lue","seq":596,"stream_kind":"final_reply","live":false}
+{"delta":": variance","content":": variance","seq":597,"stream_kind":"final_reply","live":false}
+{"delta":" = 1, gr","content":" = 1, gr","seq":598,"stream_kind":"final_reply","live":false}
+{"delta":"a","content":"a","seq":599,"stream_kind":"final_reply","live":false}
+{"delta":"dients healthy, atte","content":"dients healthy, atte","seq":600,"stream_kind":"final_reply","live":false}
+{"delta":"ntion sele","content":"ntion sele","seq":601,"stream_kind":"final_reply","live":false}
+{"delta":"cti","content":"cti","seq":602,"stream_kind":"final_reply","live":false}
+{"delta":"ve.\n\n---\n\n#","content":"ve.\n\n---\n\n#","seq":603,"stream_kind":"final_reply","live":false}
+{"delta":"# 4. Multi-He","content":"# 4. Multi-He","seq":604,"stream_kind":"final_reply","live":false}
+{"delta":"ad Attention\n\nA single","content":"ad Attention\n\nA single","seq":605,"stream_kind":"final_reply","live":false}
+{"delta":" att","content":" att","seq":606,"stream_kind":"final_reply","live":false}
+{"delta":"ention head can o","content":"ention head can o","seq":607,"stream_kind":"final_reply","live":false}
+{"delta":"nly capture one type o","content":"nly capture one type o","seq":608,"stream_kind":"final_reply","live":false}
+{"delta":"f relationship. Multi","content":"f relationship. Multi","seq":609,"stream_kind":"final_reply","live":false}
+{"delta":"-head at","content":"-head at","seq":610,"stream_kind":"final_reply","live":false}
+{"delta":"tention ru","content":"tention ru","seq":611,"stream_kind":"final_reply","live":false}
+{"delta":"ns **h parallel atten","content":"ns **h parallel atten","seq":612,"stream_kind":"final_reply","live":false}
+{"delta":"tion o","content":"tion o","seq":613,"stream_kind":"final_reply","live":false}
+{"delta":"perations** and c","content":"perations** and c","seq":614,"stream_kind":"final_reply","live":false}
+{"delta":"oncatenates the resu","content":"oncatenates the resu","seq":615,"stream_kind":"final_reply","live":false}
+{"delta":"lts:\n\n","content":"lts:\n\n","seq":616,"stream_kind":"final_reply","live":false}
+{"delta":"```","content":"```","seq":617,"stream_kind":"final_reply","live":false}
+{"delta":"\nMul","content":"\nMul","seq":618,"stream_kind":"final_reply","live":false}
+{"delta":"tiHead","content":"tiHead","seq":619,"stream_kind":"final_reply","live":false}
+{"delta":"(Q, K, V","content":"(Q, K, V","seq":620,"stream_kind":"final_reply","live":false}
+{"delta":") = Conca","content":") = Conca","seq":621,"stream_kind":"final_reply","live":false}
+{"delta":"t(head","content":"t(head","seq":622,"stream_kind":"final_reply","live":false}
+{"delta":"₁, ..","content":"₁, ..","seq":623,"stream_kind":"final_reply","live":false}
+{"delta":"., h","content":"., h","seq":624,"stream_kind":"final_reply","live":false}
+{"delta":"ead_h) · ","content":"ead_h) · ","seq":625,"stream_kind":"final_reply","live":false}
+{"delta":"W^O","content":"W^O","seq":626,"stream_kind":"final_reply","live":false}
+{"delta":"\n\nwhere headᵢ =","content":"\n\nwhere headᵢ =","seq":627,"stream_kind":"final_reply","live":false}
+{"delta":" ","content":" ","seq":628,"stream_kind":"final_reply","live":false}
+{"delta":"Atte","content":"Atte","seq":629,"stream_kind":"final_reply","live":false}
+{"delta":"nti","content":"nti","seq":630,"stream_kind":"final_reply","live":false}
+{"delta":"on(Q ·","content":"on(Q ·","seq":631,"stream_kind":"final_reply","live":false}
+{"delta":" W","content":" W","seq":632,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ^","content":"ᵢ^","seq":633,"stream_kind":"final_reply","live":false}
+{"delta":"Q, K ·","content":"Q, K ·","seq":634,"stream_kind":"final_reply","live":false}
+{"delta":" W","content":" W","seq":635,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ^K","content":"ᵢ^K","seq":636,"stream_kind":"final_reply","live":false}
+{"delta":", V · Wᵢ^V)\n```","content":", V · Wᵢ^V)\n```","seq":637,"stream_kind":"final_reply","live":false}
+{"delta":"\n\nEach head has its","content":"\n\nEach head has its","seq":638,"stream_kind":"final_reply","live":false}
+{"delta":" own proje","content":" own proje","seq":639,"stream_kind":"final_reply","live":false}
+{"delta":"cti","content":"cti","seq":640,"stream_kind":"final_reply","live":false}
+{"delta":"on ma","content":"on ma","seq":641,"stream_kind":"final_reply","live":false}
+{"delta":"trices, so each","content":"trices, so each","seq":642,"stream_kind":"final_reply","live":false}
+{"delta":" head learns to atte","content":" head learns to atte","seq":643,"stream_kind":"final_reply","live":false}
+{"delta":"nd to differ","content":"nd to differ","seq":644,"stream_kind":"final_reply","live":false}
+{"delta":"ent patt","content":"ent patt","seq":645,"stream_kind":"final_reply","live":false}
+{"delta":"erns:\n\n```\nHe","content":"erns:\n\n```\nHe","seq":646,"stream_kind":"final_reply","live":false}
+{"delta":"ad 1: syntact","content":"ad 1: syntact","seq":647,"stream_kind":"final_reply","live":false}
+{"delta":"i","content":"i","seq":648,"stream_kind":"final_reply","live":false}
+{"delta":"c depend","content":"c depend","seq":649,"stream_kind":"final_reply","live":false}
+{"delta":"encies  ","content":"encies  ","seq":650,"stream_kind":"final_reply","live":false}
+{"delta":"(\"bank\" at","content":"(\"bank\" at","seq":651,"stream_kind":"final_reply","live":false}
+{"delta":"tends to ","content":"tends to ","seq":652,"stream_kind":"final_reply","live":false}
+{"delta":"\"river","content":"\"river","seq":653,"stream_kind":"final_reply","live":false}
+{"delta":"\")\nHead 2: corefer","content":"\")\nHead 2: corefer","seq":654,"stream_kind":"final_reply","live":false}
+{"delta":"ence r","content":"ence r","seq":655,"stream_kind":"final_reply","live":false}
+{"delta":"esolution  (\"i","content":"esolution  (\"i","seq":656,"stream_kind":"final_reply","live":false}
+{"delta":"t\" attends to \"the","content":"t\" attends to \"the","seq":657,"stream_kind":"final_reply","live":false}
+{"delta":" company\")\nHea","content":" company\")\nHea","seq":658,"stream_kind":"final_reply","live":false}
+{"delta":"d 3: posi","content":"d 3: posi","seq":659,"stream_kind":"final_reply","live":false}
+{"delta":"tional","content":"tional","seq":660,"stream_kind":"final_reply","live":false}
+{"delta":" pat","content":" pat","seq":661,"stream_kind":"final_reply","live":false}
+{"delta":"terns     (","content":"terns     (","seq":662,"stream_kind":"final_reply","live":false}
+{"delta":"nearby","content":"nearby","seq":663,"stream_kind":"final_reply","live":false}
+{"delta":" tokens)\nH","content":" tokens)\nH","seq":664,"stream_kind":"final_reply","live":false}
+{"delta":"ead 4: semanti","content":"ead 4: semanti","seq":665,"stream_kind":"final_reply","live":false}
+{"delta":"c relatio","content":"c relatio","seq":666,"stream_kind":"final_reply","live":false}
+{"delta":"nships  (","content":"nships  (","seq":667,"stream_kind":"final_reply","live":false}
+{"delta":"\"money\" atte","content":"\"money\" atte","seq":668,"stream_kind":"final_reply","live":false}
+{"delta":"nds to \"bank","content":"nds to \"bank","seq":669,"stream_kind":"final_reply","live":false}
+{"delta":"\")\n...\n`","content":"\")\n...\n`","seq":670,"stream_kind":"final_reply","live":false}
+{"delta":"``\n\nThe outputs are con","content":"``\n\nThe outputs are con","seq":671,"stream_kind":"final_reply","live":false}
+{"delta":"catena","content":"catena","seq":672,"stream_kind":"final_reply","live":false}
+{"delta":"te","content":"te","seq":673,"stream_kind":"final_reply","live":false}
+{"delta":"d along the d_","content":"d along the d_","seq":674,"stream_kind":"final_reply","live":false}
+{"delta":"v dimension and","content":"v dimension and","seq":675,"stream_kind":"final_reply","live":false}
+{"delta":" proj","content":" proj","seq":676,"stream_kind":"final_reply","live":false}
+{"delta":"ected back","content":"ected back","seq":677,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":" to","content":" to","seq":678,"stream_kind":"final_reply","live":false}
+{"delta":" d","content":" d","seq":679,"stream_kind":"final_reply","live":false}
+{"delta":"_mo","content":"_mo","seq":680,"stream_kind":"final_reply","live":false}
+{"delta":"de","content":"de","seq":681,"stream_kind":"final_reply","live":false}
+{"delta":"l ","content":"l ","seq":682,"stream_kind":"final_reply","live":false}
+{"delta":"via W^","content":"via W^","seq":683,"stream_kind":"final_reply","live":false}
+{"delta":"O. I","content":"O. I","seq":684,"stream_kind":"final_reply","live":false}
+{"delta":"f h =","content":"f h =","seq":685,"stream_kind":"final_reply","live":false}
+{"delta":" 8 and d_v = 64, t","content":" 8 and d_v = 64, t","seq":686,"stream_kind":"final_reply","live":false}
+{"delta":"he concaten","content":"he concaten","seq":687,"stream_kind":"final_reply","live":false}
+{"delta":"ated output is ","content":"ated output is ","seq":688,"stream_kind":"final_reply","live":false}
+{"delta":"512-dimens","content":"512-dimens","seq":689,"stream_kind":"final_reply","live":false}
+{"delta":"iona","content":"iona","seq":690,"stream_kind":"final_reply","live":false}
+{"delta":"l, matching the original","content":"l, matching the original","seq":691,"stream_kind":"final_reply","live":false}
+{"delta":" embedding ","content":" embedding ","seq":692,"stream_kind":"final_reply","live":false}
+{"delta":"size.\n","content":"size.\n","seq":693,"stream_kind":"final_reply","live":false}
+{"delta":"\n---\n\n## 5. T","content":"\n---\n\n## 5. T","seq":694,"stream_kind":"final_reply","live":false}
+{"delta":"he Full For","content":"he Full For","seq":695,"stream_kind":"final_reply","live":false}
+{"delta":"ward Pass","content":"ward Pass","seq":696,"stream_kind":"final_reply","live":false}
+{"delta":"\n\n```\nIn","content":"\n\n```\nIn","seq":697,"stream_kind":"final_reply","live":false}
+{"delta":"put:  ","content":"put:  ","seq":698,"stream_kind":"final_reply","live":false}
+{"delta":"X ∈ ℝ^(N ","content":"X ∈ ℝ^(N ","seq":699,"stream_kind":"final_reply","live":false}
+{"delta":"× ","content":"× ","seq":700,"stream_kind":"final_reply","live":false}
+{"delta":"d_model)","content":"d_model)","seq":701,"stream_kind":"final_reply","live":false}
+{"delta":"     (N","content":"     (N","seq":702,"stream_kind":"final_reply","live":false}
+{"delta":" tokens, each d_mo","content":" tokens, each d_mo","seq":703,"stream_kind":"final_reply","live":false}
+{"delta":"del-di","content":"del-di","seq":704,"stream_kind":"final_reply","live":false}
+{"delta":"mensional)\n\n","content":"mensional)\n\n","seq":705,"stream_kind":"final_reply","live":false}
+{"delta":"For","content":"For","seq":706,"stream_kind":"final_reply","live":false}
+{"delta":" each","content":" each","seq":707,"stream_kind":"final_reply","live":false}
+{"delta":" hea","content":" hea","seq":708,"stream_kind":"final_reply","live":false}
+{"delta":"d i (","content":"d i (","seq":709,"stream_kind":"final_reply","live":false}
+{"delta":"1 t","content":"1 t","seq":710,"stream_kind":"final_reply","live":false}
+{"delta":"o h):\n\n","content":"o h):\n\n","seq":711,"stream_kind":"final_reply","live":false}
+{"delta":"    Q","content":"    Q","seq":712,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ = X · Wᵢ^","content":"ᵢ = X · Wᵢ^","seq":713,"stream_kind":"final_reply","live":false}
+{"delta":"Q  ","content":"Q  ","seq":714,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":715,"stream_kind":"final_reply","live":false}
+{"delta":"        (","content":"        (","seq":716,"stream_kind":"final_reply","live":false}
+{"delta":"N ","content":"N ","seq":717,"stream_kind":"final_reply","live":false}
+{"delta":"× d_k)\n","content":"× d_k)\n","seq":718,"stream_kind":"final_reply","live":false}
+{"delta":"    K","content":"    K","seq":719,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ = X · Wᵢ^","content":"ᵢ = X · Wᵢ^","seq":720,"stream_kind":"final_reply","live":false}
+{"delta":"K       ","content":"K       ","seq":721,"stream_kind":"final_reply","live":false}
+{"delta":"        (","content":"        (","seq":722,"stream_kind":"final_reply","live":false}
+{"delta":"N ","content":"N ","seq":723,"stream_kind":"final_reply","live":false}
+{"delta":"× d_k)\n  ","content":"× d_k)\n  ","seq":724,"stream_kind":"final_reply","live":false}
+{"delta":"  V","content":"  V","seq":725,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ = X · Wᵢ^","content":"ᵢ = X · Wᵢ^","seq":726,"stream_kind":"final_reply","live":false}
+{"delta":"V     ","content":"V     ","seq":727,"stream_kind":"final_reply","live":false}
+{"delta":"       ","content":"       ","seq":728,"stream_kind":"final_reply","live":false}
+{"delta":"   (N","content":"   (N","seq":729,"stream_kind":"final_reply","live":false}
+{"delta":" ×","content":" ×","seq":730,"stream_kind":"final_reply","live":false}
+{"delta":" d_","content":" d_","seq":731,"stream_kind":"final_reply","live":false}
+{"delta":"v)\n\n   ","content":"v)\n\n   ","seq":732,"stream_kind":"final_reply","live":false}
+{"delta":" Sᵢ","content":" Sᵢ","seq":733,"stream_kind":"final_reply","live":false}
+{"delta":" = Q","content":" = Q","seq":734,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ ","content":"ᵢ ","seq":735,"stream_kind":"final_reply","live":false}
+{"delta":"· Kᵢ^T","content":"· Kᵢ^T","seq":736,"stream_kind":"final_reply","live":false}
+{"delta":" / √","content":" / √","seq":737,"stream_kind":"final_reply","live":false}
+{"delta":"d_k     ","content":"d_k     ","seq":738,"stream_kind":"final_reply","live":false}
+{"delta":"  (N × N)  ← a","content":"  (N × N)  ← a","seq":739,"stream_kind":"final_reply","live":false}
+{"delta":"ttenti","content":"ttenti","seq":740,"stream_kind":"final_reply","live":false}
+{"delta":"on ","content":"on ","seq":741,"stream_kind":"final_reply","live":false}
+{"delta":"scores\n","content":"scores\n","seq":742,"stream_kind":"final_reply","live":false}
+{"delta":"    Aᵢ","content":"    Aᵢ","seq":743,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":" = softmax(S","content":" = softmax(S","seq":744,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ)   ","content":"ᵢ)   ","seq":745,"stream_kind":"final_reply","live":false}
+{"delta":"   ","content":"   ","seq":746,"stream_kind":"final_reply","live":false}
+{"delta":"       (N × N)","content":"       (N × N)","seq":747,"stream_kind":"final_reply","live":false}
+{"delta":"  ← attentio","content":"  ← attentio","seq":748,"stream_kind":"final_reply","live":false}
+{"delta":"n w","content":"n w","seq":749,"stream_kind":"final_reply","live":false}
+{"delta":"eigh","content":"eigh","seq":750,"stream_kind":"final_reply","live":false}
+{"delta":"ts\n","content":"ts\n","seq":751,"stream_kind":"final_reply","live":false}
+{"delta":"    ","content":"    ","seq":752,"stream_kind":"final_reply","live":false}
+{"delta":"Oᵢ = Aᵢ · Vᵢ","content":"Oᵢ = Aᵢ · Vᵢ","seq":753,"stream_kind":"final_reply","live":false}
+{"delta":"        ","content":"        ","seq":754,"stream_kind":"final_reply","live":false}
+{"delta":"       ","content":"       ","seq":755,"stream_kind":"final_reply","live":false}
+{"delta":" (N ","content":" (N ","seq":756,"stream_kind":"final_reply","live":false}
+{"delta":"× d_v) ","content":"× d_v) ","seq":757,"stream_kind":"final_reply","live":false}
+{"delta":"← h","content":"← h","seq":758,"stream_kind":"final_reply","live":false}
+{"delta":"ead ","content":"ead ","seq":759,"stream_kind":"final_reply","live":false}
+{"delta":"output\n","content":"output\n","seq":760,"stream_kind":"final_reply","live":false}
+{"delta":"\nConc","content":"\nConc","seq":761,"stream_kind":"final_reply","live":false}
+{"delta":"at: O = [O","content":"at: O = [O","seq":762,"stream_kind":"final_reply","live":false}
+{"delta":"₁ | O","content":"₁ | O","seq":763,"stream_kind":"final_reply","live":false}
+{"delta":"₂ | ... ","content":"₂ | ... ","seq":764,"stream_kind":"final_reply","live":false}
+{"delta":"| O_h","content":"| O_h","seq":765,"stream_kind":"final_reply","live":false}
+{"delta":"] ","content":"] ","seq":766,"stream_kind":"final_reply","live":false}
+{"delta":" (N ×","content":" (N ×","seq":767,"stream_kind":"final_reply","live":false}
+{"delta":" h·","content":" h·","seq":768,"stream_kind":"final_reply","live":false}
+{"delta":"d_v)\nOu","content":"d_v)\nOu","seq":769,"stream_kind":"final_reply","live":false}
+{"delta":"tpu","content":"tpu","seq":770,"stream_kind":"final_reply","live":false}
+{"delta":"t:  Y = O · W^O  ","content":"t:  Y = O · W^O  ","seq":771,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":772,"stream_kind":"final_reply","live":false}
+{"delta":"        ","content":"        ","seq":773,"stream_kind":"final_reply","live":false}
+{"delta":"(N × d_","content":"(N × d_","seq":774,"stream_kind":"final_reply","live":false}
+{"delta":"mo","content":"mo","seq":775,"stream_kind":"final_reply","live":false}
+{"delta":"del)\n```\n\n###","content":"del)\n```\n\n###","seq":776,"stream_kind":"final_reply","live":false}
+{"delta":" Causal M","content":" Causal M","seq":777,"stream_kind":"final_reply","live":false}
+{"delta":"askin","content":"askin","seq":778,"stream_kind":"final_reply","live":false}
+{"delta":"g ","content":"g ","seq":779,"stream_kind":"final_reply","live":false}
+{"delta":"(for","content":"(for","seq":780,"stream_kind":"final_reply","live":false}
+{"delta":" Deco","content":" Deco","seq":781,"stream_kind":"final_reply","live":false}
+{"delta":"ders / GPT)\n\nIn autore","content":"ders / GPT)\n\nIn autore","seq":782,"stream_kind":"final_reply","live":false}
+{"delta":"gressiv","content":"gressiv","seq":783,"stream_kind":"final_reply","live":false}
+{"delta":"e models, token i c","content":"e models, token i c","seq":784,"stream_kind":"final_reply","live":false}
+{"delta":"annot atten","content":"annot atten","seq":785,"stream_kind":"final_reply","live":false}
+{"delta":"d to tok","content":"d to tok","seq":786,"stream_kind":"final_reply","live":false}
+{"delta":"en","content":"en","seq":787,"stream_kind":"final_reply","live":false}
+{"delta":" j if","content":" j if","seq":788,"stream_kind":"final_reply","live":false}
+{"delta":" j > i ","content":" j > i ","seq":789,"stream_kind":"final_reply","live":false}
+{"delta":"(it hasn't bee","content":"(it hasn't bee","seq":790,"stream_kind":"final_reply","live":false}
+{"delta":"n ge","content":"n ge","seq":791,"stream_kind":"final_reply","live":false}
+{"delta":"nerated yet). A ","content":"nerated yet). A ","seq":792,"stream_kind":"final_reply","live":false}
+{"delta":"mask is appl","content":"mask is appl","seq":793,"stream_kind":"final_reply","live":false}
+{"delta":"ied before","content":"ied before","seq":794,"stream_kind":"final_reply","live":false}
+{"delta":" so","content":" so","seq":795,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"ftmax:\n","content":"ftmax:\n","seq":796,"stream_kind":"final_reply","live":false}
+{"delta":"\n```","content":"\n```","seq":797,"stream_kind":"final_reply","live":false}
+{"delta":"\nS_mas","content":"\nS_mas","seq":798,"stream_kind":"final_reply","live":false}
+{"delta":"ked[","content":"ked[","seq":799,"stream_kind":"final_reply","live":false}
+{"delta":"i][j] = S[","content":"i][j] = S[","seq":800,"stream_kind":"final_reply","live":false}
+{"delta":"i][","content":"i][","seq":801,"stream_kind":"final_reply","live":false}
+{"delta":"j]  if j ≤ i\n   ","content":"j]  if j ≤ i\n   ","seq":802,"stream_kind":"final_reply","live":false}
+{"delta":"          ","content":"          ","seq":803,"stream_kind":"final_reply","live":false}
+{"delta":"    -","content":"    -","seq":804,"stream_kind":"final_reply","live":false}
+{"delta":"∞       ","content":"∞       ","seq":805,"stream_kind":"final_reply","live":false}
+{"delta":" if j","content":" if j","seq":806,"stream_kind":"final_reply","live":false}
+{"delta":" > i\n\nso","content":" > i\n\nso","seq":807,"stream_kind":"final_reply","live":false}
+{"delta":"ftm","content":"ftm","seq":808,"stream_kind":"final_reply","live":false}
+{"delta":"ax(-∞) ","content":"ax(-∞) ","seq":809,"stream_kind":"final_reply","live":false}
+{"delta":"→ 0\n`","content":"→ 0\n`","seq":810,"stream_kind":"final_reply","live":false}
+{"delta":"``\n\nThis f","content":"``\n\nThis f","seq":811,"stream_kind":"final_reply","live":false}
+{"delta":"orces the","content":"orces the","seq":812,"stream_kind":"final_reply","live":false}
+{"delta":" upper triangle o","content":" upper triangle o","seq":813,"stream_kind":"final_reply","live":false}
+{"delta":"f the attention","content":"f the attention","seq":814,"stream_kind":"final_reply","live":false}
+{"delta":" matrix to z","content":" matrix to z","seq":815,"stream_kind":"final_reply","live":false}
+{"delta":"ero, prese","content":"ero, prese","seq":816,"stream_kind":"final_reply","live":false}
+{"delta":"rving ca","content":"rving ca","seq":817,"stream_kind":"final_reply","live":false}
+{"delta":"usa","content":"usa","seq":818,"stream_kind":"final_reply","live":false}
+{"delta":"lity.\n\n---\n\n## 6. Computati","content":"lity.\n\n---\n\n## 6. Computati","seq":819,"stream_kind":"final_reply","live":false}
+{"delta":"onal C","content":"onal C","seq":820,"stream_kind":"final_reply","live":false}
+{"delta":"o","content":"o","seq":821,"stream_kind":"final_reply","live":false}
+{"delta":"mp","content":"mp","seq":822,"stream_kind":"final_reply","live":false}
+{"delta":"le","content":"le","seq":823,"stream_kind":"final_reply","live":false}
+{"delta":"xi","content":"xi","seq":824,"stream_kind":"final_reply","live":false}
+{"delta":"ty","content":"ty","seq":825,"stream_kind":"final_reply","live":false}
+{"delta":"\n\n","content":"\n\n","seq":826,"stream_kind":"final_reply","live":false}
+{"delta":"```\n","content":"```\n","seq":827,"stream_kind":"final_reply","live":false}
+{"delta":"Q·K^","content":"Q·K^","seq":828,"stream_kind":"final_reply","live":false}
+{"delta":"T:   O(","content":"T:   O(","seq":829,"stream_kind":"final_reply","live":false}
+{"delta":"N² · d","content":"N² · d","seq":830,"stream_kind":"final_reply","live":false}
+{"delta":"_k)     ←","content":"_k)     ←","seq":831,"stream_kind":"final_reply","live":false}
+{"delta":" t","content":" t","seq":832,"stream_kind":"final_reply","live":false}
+{"delta":"he bottl","content":"he bottl","seq":833,"stream_kind":"final_reply","live":false}
+{"delta":"eneck\n","content":"eneck\n","seq":834,"stream_kind":"final_reply","live":false}
+{"delta":"A·V:  ","content":"A·V:  ","seq":835,"stream_kind":"final_reply","live":false}
+{"delta":"   ","content":"   ","seq":836,"stream_kind":"final_reply","live":false}
+{"delta":"O(N² ·","content":"O(N² ·","seq":837,"stream_kind":"final_reply","live":false}
+{"delta":" d_v)\n","content":" d_v)\n","seq":838,"stream_kind":"final_reply","live":false}
+{"delta":"\nTotal:   O(","content":"\nTotal:   O(","seq":839,"stream_kind":"final_reply","live":false}
+{"delta":"N² ","content":"N² ","seq":840,"stream_kind":"final_reply","live":false}
+{"delta":"· d_m","content":"· d_m","seq":841,"stream_kind":"final_reply","live":false}
+{"delta":"od","content":"od","seq":842,"stream_kind":"final_reply","live":false}
+{"delta":"el) ","content":"el) ","seq":843,"stream_kind":"final_reply","live":false}
+{"delta":"per h","content":"per h","seq":844,"stream_kind":"final_reply","live":false}
+{"delta":"ead, O(N² ","content":"ead, O(N² ","seq":845,"stream_kind":"final_reply","live":false}
+{"delta":"· d_mo","content":"· d_mo","seq":846,"stream_kind":"final_reply","live":false}
+{"delta":"del · h)","content":"del · h)","seq":847,"stream_kind":"final_reply","live":false}
+{"delta":" total\n```\n\nThe quadr","content":" total\n```\n\nThe quadr","seq":848,"stream_kind":"final_reply","live":false}
+{"delta":"atic dep","content":"atic dep","seq":849,"stream_kind":"final_reply","live":false}
+{"delta":"ende","content":"ende","seq":850,"stream_kind":"final_reply","live":false}
+{"delta":"nce on N","content":"nce on N","seq":851,"stream_kind":"final_reply","live":false}
+{"delta":" is why context length","content":" is why context length","seq":852,"stream_kind":"final_reply","live":false}
+{"delta":" is the bindin","content":" is the bindin","seq":853,"stream_kind":"final_reply","live":false}
+{"delta":"g constraint ","content":"g constraint ","seq":854,"stream_kind":"final_reply","live":false}
+{"delta":"on tran","content":"on tran","seq":855,"stream_kind":"final_reply","live":false}
+{"delta":"sformers. Ever","content":"sformers. Ever","seq":856,"stream_kind":"final_reply","live":false}
+{"delta":"y token attends","content":"y token attends","seq":857,"stream_kind":"final_reply","live":false}
+{"delta":" to every oth","content":" to every oth","seq":858,"stream_kind":"final_reply","live":false}
+{"delta":"er token. Fla","content":"er token. Fla","seq":859,"stream_kind":"final_reply","live":false}
+{"delta":"shAtten","content":"shAtten","seq":860,"stream_kind":"final_reply","live":false}
+{"delta":"tion and sparse att","content":"tion and sparse att","seq":861,"stream_kind":"final_reply","live":false}
+{"delta":"en","content":"en","seq":862,"stream_kind":"final_reply","live":false}
+{"delta":"ti","content":"ti","seq":863,"stream_kind":"final_reply","live":false}
+{"delta":"on patterns ","content":"on patterns ","seq":864,"stream_kind":"final_reply","live":false}
+{"delta":"(sliding ","content":"(sliding ","seq":865,"stream_kind":"final_reply","live":false}
+{"delta":"window, dilate","content":"window, dilate","seq":866,"stream_kind":"final_reply","live":false}
+{"delta":"d) are attempts","content":"d) are attempts","seq":867,"stream_kind":"final_reply","live":false}
+{"delta":" to redu","content":" to redu","seq":868,"stream_kind":"final_reply","live":false}
+{"delta":"ce this","content":"ce this","seq":869,"stream_kind":"final_reply","live":false}
+{"delta":" witho","content":" witho","seq":870,"stream_kind":"final_reply","live":false}
+{"delta":"ut losing model qu","content":"ut losing model qu","seq":871,"stream_kind":"final_reply","live":false}
+{"delta":"ality.\n\n---\n\n#","content":"ality.\n\n---\n\n#","seq":872,"stream_kind":"final_reply","live":false}
+{"delta":"#","content":"#","seq":873,"stream_kind":"final_reply","live":false}
+{"delta":" Su","content":" Su","seq":874,"stream_kind":"final_reply","live":false}
+{"delta":"m","content":"m","seq":875,"stream_kind":"final_reply","live":false}
+{"delta":"mary\n\n","content":"mary\n\n","seq":876,"stream_kind":"final_reply","live":false}
+{"delta":"```\nx","content":"```\nx","seq":877,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ ─","content":"ᵢ ─","seq":878,"stream_kind":"final_reply","live":false}
+{"delta":"─→","content":"─→","seq":879,"stream_kind":"final_reply","live":false}
+{"delta":" W^Q ","content":" W^Q ","seq":880,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":881,"stream_kind":"final_reply","live":false}
+{"delta":"→ ","content":"→ ","seq":882,"stream_kind":"final_reply","live":false}
+{"delta":"qᵢ","content":"qᵢ","seq":883,"stream_kind":"final_reply","live":false}
+{"delta":" ──","content":" ──","seq":884,"stream_kind":"final_reply","live":false}
+{"delta":"┐\nx","content":"┐\nx","seq":885,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ","content":"ᵢ","seq":886,"stream_kind":"final_reply","live":false}
+{"delta":" ──","content":" ──","seq":887,"stream_kind":"final_reply","live":false}
+{"delta":"→ W^K","content":"→ W^K","seq":888,"stream_kind":"final_reply","live":false}
+{"delta":" ──","content":" ──","seq":889,"stream_kind":"final_reply","live":false}
+{"delta":"→ ","content":"→ ","seq":890,"stream_kind":"final_reply","live":false}
+{"delta":"kᵢ","content":"kᵢ","seq":891,"stream_kind":"final_reply","live":false}
+{"delta":" ──","content":" ──","seq":892,"stream_kind":"final_reply","live":false}
+{"delta":"┤\nx","content":"┤\nx","seq":893,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ","content":"ᵢ","seq":894,"stream_kind":"final_reply","live":false}
+{"delta":" ──","content":" ──","seq":895,"stream_kind":"final_reply","live":false}
+{"delta":"→ W^V","content":"→ W^V","seq":896,"stream_kind":"final_reply","live":false}
+{"delta":" ──","content":" ──","seq":897,"stream_kind":"final_reply","live":false}
+{"delta":"→ ","content":"→ ","seq":898,"stream_kind":"final_reply","live":false}
+{"delta":"vᵢ ──┤\n                     ","content":"vᵢ ──┤\n                     ","seq":899,"stream_kind":"final_reply","live":false}
+{"delta":"  │","content":"  │","seq":900,"stream_kind":"final_reply","live":false}
+{"delta":"\n   ","content":"\n   ","seq":901,"stream_kind":"final_reply","live":false}
+{"delta":"       q","content":"       q","seq":902,"stream_kind":"final_reply","live":false}
+{"delta":"ᵢ ·","content":"ᵢ ·","seq":903,"stream_kind":"final_reply","live":false}
+{"delta":" kⱼ      │\n          ","content":" kⱼ      │\n          ","seq":904,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":905,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":906,"stream_kind":"final_reply","live":false}
+{"delta":"─── ","content":"─── ","seq":907,"stream_kind":"final_reply","live":false}
+{"delta":" ──→","content":" ──→","seq":908,"stream_kind":"final_reply","live":false}
+{"delta":" softm","content":" softm","seq":909,"stream_kind":"final_reply","live":false}
+{"delta":"ax","content":"ax","seq":910,"stream_kind":"final_reply","live":false}
+{"delta":" ","content":" ","seq":911,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":912,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":913,"stream_kind":"final_reply","live":false}
+{"delta":"→ Σ","content":"→ Σ","seq":914,"stream_kind":"final_reply","live":false}
+{"delta":" A[i][","content":" A[i][","seq":915,"stream_kind":"final_reply","live":false}
+{"delta":"j]·","content":"j]·","seq":916,"stream_kind":"final_reply","live":false}
+{"delta":"vⱼ ─","content":"vⱼ ─","seq":917,"stream_kind":"final_reply","live":false}
+{"delta":"─→ outpu","content":"─→ outpu","seq":918,"stream_kind":"final_reply","live":false}
+{"delta":"tᵢ\n","content":"tᵢ\n","seq":919,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":920,"stream_kind":"final_reply","live":false}
+{"delta":"  √d_k        │\n           ","content":"  √d_k        │\n           ","seq":921,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":922,"stream_kind":"final_reply","live":false}
+{"delta":"  ","content":"  ","seq":923,"stream_kind":"final_reply","live":false}
+{"delta":" │\n    ","content":" │\n    ","seq":924,"stream_kind":"final_reply","live":false}
+{"delta":"  ","content":"  ","seq":925,"stream_kind":"final_reply","live":false}
+{"delta":"   (fo","content":"   (fo","seq":926,"stream_kind":"final_reply","live":false}
+{"delta":"r all j) ","content":"r all j) ","seq":927,"stream_kind":"final_reply","live":false}
+{"delta":"──┘\n```","content":"──┘\n```","seq":928,"stream_kind":"final_reply","live":false}
+{"delta":"\n\nThe mech","content":"\n\nThe mech","seq":929,"stream_kind":"final_reply","live":false}
+{"delta":"anism is si","content":"anism is si","seq":930,"stream_kind":"final_reply","live":false}
+{"delta":"mple","content":"mple","seq":931,"stream_kind":"final_reply","live":false}
+{"delta":" in conce","content":" in conce","seq":932,"stream_kind":"final_reply","live":false}
+{"delta":"pt — weig","content":"pt — weig","seq":933,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"hted averag","content":"hted averag","seq":934,"stream_kind":"final_reply","live":false}
+{"delta":"e of values — ","content":"e of values — ","seq":935,"stream_kind":"final_reply","live":false}
+{"delta":"but the","content":"but the","seq":936,"stream_kind":"final_reply","live":false}
+{"delta":" ","content":" ","seq":937,"stream_kind":"final_reply","live":false}
+{"delta":"detail","content":"detail","seq":938,"stream_kind":"final_reply","live":false}
+{"delta":"s matter: three p","content":"s matter: three p","seq":939,"stream_kind":"final_reply","live":false}
+{"delta":"rojections","content":"rojections","seq":940,"stream_kind":"final_reply","live":false}
+{"delta":" give th","content":" give th","seq":941,"stream_kind":"final_reply","live":false}
+{"delta":"e model degree","content":"e model degree","seq":942,"stream_kind":"final_reply","live":false}
+{"delta":"s of freedom t","content":"s of freedom t","seq":943,"stream_kind":"final_reply","live":false}
+{"delta":"o learn complex ret","content":"o learn complex ret","seq":944,"stream_kind":"final_reply","live":false}
+{"delta":"rieval pa","content":"rieval pa","seq":945,"stream_kind":"final_reply","live":false}
+{"delta":"tterns, sc","content":"tterns, sc","seq":946,"stream_kind":"final_reply","live":false}
+{"delta":"aling ","content":"aling ","seq":947,"stream_kind":"final_reply","live":false}
+{"delta":"by √d_k keeps ","content":"by √d_k keeps ","seq":948,"stream_kind":"final_reply","live":false}
+{"delta":"gradien","content":"gradien","seq":949,"stream_kind":"final_reply","live":false}
+{"delta":"ts alive during trai","content":"ts alive during trai","seq":950,"stream_kind":"final_reply","live":false}
+{"delta":"ning, and multi-h","content":"ning, and multi-h","seq":951,"stream_kind":"final_reply","live":false}
+{"delta":"ead p","content":"ead p","seq":952,"stream_kind":"final_reply","live":false}
+{"delta":"arallelism lets t","content":"arallelism lets t","seq":953,"stream_kind":"final_reply","live":false}
+{"delta":"he model atte","content":"he model atte","seq":954,"stream_kind":"final_reply","live":false}
+{"delta":"nd to differe","content":"nd to differe","seq":955,"stream_kind":"final_reply","live":false}
+{"delta":"nt relationship types","content":"nt relationship types","seq":956,"stream_kind":"final_reply","live":false}
+{"delta":" ","content":" ","seq":957,"stream_kind":"final_reply","live":false}
+{"delta":"simultaneously.","content":"simultaneously.","seq":958,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":145988,"run_id":"r-1777928112724-5"}
+{"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777928112724-5"}
+{"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":0,"duration_ms":0,"run_id":"r-1777928112724-5"}
+{"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+{"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":0,"duration_ms":13,"run_id":"r-1777928112724-5"}
+{"type":"done","session_id":"agent:zaki-bot:user:7777:thread:kimi-passc-1777927230","message_id":"1777928259022"}

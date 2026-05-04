@@ -1,0 +1,192 @@
+{
+  "ts": "2026-05-04T20:49:37Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 44,
+    "memories_live": 72,
+    "memories_archived": 0,
+    "entities": 9,
+    "edges_active": 10,
+    "edges_total": 10,
+    "communities": 0,
+    "events": 119
+  },
+  "by_category": {
+    "conversation": 45,
+    "core": 16,
+    "daily": 11
+  },
+  "by_attribution": {
+    "extraction_classifier": 3,
+    "none": 69
+  },
+  "by_predicate": {
+    "HAS_ACTIVE_CONTRACT": 1,
+    "HAS_DEADLINE": 3,
+    "PREFERS": 2,
+    "STAKEHOLDER_OF": 2,
+    "WORKS_AT": 1,
+    "WORKS_WITH": 1
+  },
+  "by_edge_attribution": {
+    "extraction_classifier": 10
+  },
+  "recent_memories": [
+    {
+      "key": "autosave_assistant_1777927777732630000",
+      "content_head": "# The Consensus Problem\n\n## What We're Actually Solving\n\nYou have N nodes. Each proposes values. The",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927778
+    },
+    {
+      "key": "autosave_assistant_1777927643784984000",
+      "content_head": "Here's the contrast across the four dimensions you asked about.\n\n---\n\n## 1. Debuggability\n\n### Monol",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927644
+    },
+    {
+      "key": "autosave_user_1777927644483445000",
+      "content_head": "Walk me through the consensus problem in distributed systems. Compare Paxos, Raft, and PBFT. Which w",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927644
+    },
+    {
+      "key": "autosave_user_1777927448555554000",
+      "content_head": "Now contrast that with a monolithic architecture using REST APIs and a single relational database. W",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927449
+    },
+    {
+      "key": "autosave_assistant_1777927447915477000",
+      "content_head": "# Event-Sourced Microservices with CQRS\n\nHere's the architecture broken down across the four layers ",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927448
+    },
+    {
+      "key": "summary_latest/agent:zaki-bot:user:7777:thread:kimi-passc-1777927230",
+      "content_head": "type=summary_latest\nsession=agent:zaki-bot:user:7777:thread:kimi-passc-1777927230\nchannel=zaki_app\nl",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927448
+    },
+    {
+      "key": "timeline_summary/agent:zaki-bot:user:7777:thread:kimi-passc-1777927230/1777927446",
+      "content_head": "origin_channel=zaki_app\norigin_lane=thread\norigin_chat_id=agent:zaki-bot:user:7777:thread:kimi-passc",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927447
+    },
+    {
+      "key": "session_checkpoint_1777927446",
+      "content_head": "type=session_checkpoint\nreason=summary_seed:auto\nsession=agent:zaki-bot:user:7777:thread:kimi-passc-",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777927447
+    }
+  ],
+  "recent_edges": [
+    {
+      "source_key": "extracted_70e786fee3d7b511",
+      "target_key": "e12722a7a93721bfd36c3866571405e6",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_041535a9e15f9b8e",
+      "target_key": "b00d640a72b2e9e8a7bdc51c43d2ab57",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_fa2190f6ca46407a",
+      "target_key": "be87c283acebbaf53c4737ba37117e8a",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_ed3319179619c1c3",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_288a758930697150",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_9bd07c3f39263a04",
+      "target_key": "4e2aebecaff96f9c4bacc2d874b84ea1",
+      "predicate": "HAS_ACTIVE_CONTRACT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908892
+    },
+    {
+      "source_key": "extracted_ede39e522920e3d1",
+      "target_key": "850793e849d543321ab073f8a48585f0",
+      "predicate": "WORKS_WITH",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    },
+    {
+      "source_key": "extracted_7cfdca9a8e53f1c9",
+      "target_key": "ff51467a475be384a79e67ae9f41c28f",
+      "predicate": "WORKS_AT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    }
+  ],
+  "recent_messages": [
+    {
+      "role": "user",
+      "preview": "Walk me through the consensus problem in distributed systems. Compare Paxos, Raf",
+      "created_at": 1777927778,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    },
+    {
+      "role": "assistant",
+      "preview": "# The Consensus Problem\n\n## What We're Actually Solving\n\nYou have N nodes. Each ",
+      "created_at": 1777927778,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    },
+    {
+      "role": "user",
+      "preview": "Now contrast that with a monolithic architecture using REST APIs and a single re",
+      "created_at": 1777927644,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    },
+    {
+      "role": "assistant",
+      "preview": "Here's the contrast across the four dimensions you asked about.\n\n---\n\n## 1. Debu",
+      "created_at": 1777927644,
+      "session_id": "agent:zaki-bot:user:7777:thread:kimi-passc-1777927230"
+    }
+  ]
+}

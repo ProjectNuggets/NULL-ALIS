@@ -1,0 +1,902 @@
+{"type":"statusResponse","content":"Processing request"}
+{"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+{"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777927261184-1"}
+{"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":25,"run_id":"r-1777927261184-1"}
+{"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777927261184-1"}
+{"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":0,"run_id":"r-1777927261184-1"}
+{"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":5022,"run_id":"r-1777927261184-1"}
+{"delta":"# Even","content":"# Even","seq":0,"stream_kind":"final_reply","live":false}
+{"delta":"t-Sourced Micro","content":"t-Sourced Micro","seq":1,"stream_kind":"final_reply","live":false}
+{"delta":"servi","content":"servi","seq":2,"stream_kind":"final_reply","live":false}
+{"delta":"ces ","content":"ces ","seq":3,"stream_kind":"final_reply","live":false}
+{"delta":"with C","content":"with C","seq":4,"stream_kind":"final_reply","live":false}
+{"delta":"QRS\n\nHere's the arch","content":"QRS\n\nHere's the arch","seq":5,"stream_kind":"final_reply","live":false}
+{"delta":"itecture bro","content":"itecture bro","seq":6,"stream_kind":"final_reply","live":false}
+{"delta":"ken down ","content":"ken down ","seq":7,"stream_kind":"final_reply","live":false}
+{"delta":"across the ","content":"across the ","seq":8,"stream_kind":"final_reply","live":false}
+{"delta":"four layers you","content":"four layers you","seq":9,"stream_kind":"final_reply","live":false}
+{"delta":" asked a","content":" asked a","seq":10,"stream_kind":"final_reply","live":false}
+{"delta":"bout.\n\n-","content":"bout.\n\n-","seq":11,"stream_kind":"final_reply","live":false}
+{"delta":"--","content":"--","seq":12,"stream_kind":"final_reply","live":false}
+{"delta":"\n\n## 1. E","content":"\n\n## 1. E","seq":13,"stream_kind":"final_reply","live":false}
+{"delta":"ven","content":"ven","seq":14,"stream_kind":"final_reply","live":false}
+{"delta":"t Sourcing (The Found","content":"t Sourcing (The Found","seq":15,"stream_kind":"final_reply","live":false}
+{"delta":"ation)\n\nIns","content":"ation)\n\nIns","seq":16,"stream_kind":"final_reply","live":false}
+{"delta":"te","content":"te","seq":17,"stream_kind":"final_reply","live":false}
+{"delta":"ad of storing ","content":"ad of storing ","seq":18,"stream_kind":"final_reply","live":false}
+{"delta":"*current state*","content":"*current state*","seq":19,"stream_kind":"final_reply","live":false}
+{"delta":" in a data","content":" in a data","seq":20,"stream_kind":"final_reply","live":false}
+{"delta":"base, ","content":"base, ","seq":21,"stream_kind":"final_reply","live":false}
+{"delta":"you store ","content":"you store ","seq":22,"stream_kind":"final_reply","live":false}
+{"delta":"an **immutable, ","content":"an **immutable, ","seq":23,"stream_kind":"final_reply","live":false}
+{"delta":"append-only log ","content":"append-only log ","seq":24,"stream_kind":"final_reply","live":false}
+{"delta":"of eve","content":"of eve","seq":25,"stream_kind":"final_reply","live":false}
+{"delta":"nts** ","content":"nts** ","seq":26,"stream_kind":"final_reply","live":false}
+{"delta":"— every","content":"— every","seq":27,"stream_kind":"final_reply","live":false}
+{"delta":" state-","content":" state-","seq":28,"stream_kind":"final_reply","live":false}
+{"delta":"chang","content":"chang","seq":29,"stream_kind":"final_reply","live":false}
+{"delta":"ing action that e","content":"ing action that e","seq":30,"stream_kind":"final_reply","live":false}
+{"delta":"ver happened.\n\n","content":"ver happened.\n\n","seq":31,"stream_kind":"final_reply","live":false}
+{"delta":"```\nTr","content":"```\nTr","seq":32,"stream_kind":"final_reply","live":false}
+{"delta":"aditional ","content":"aditional ","seq":33,"stream_kind":"final_reply","live":false}
+{"delta":"CRUD:   ","content":"CRUD:   ","seq":34,"stream_kind":"final_reply","live":false}
+{"delta":"        Event Sourcing:\n┌───","content":"        Event Sourcing:\n┌───","seq":35,"stream_kind":"final_reply","live":false}
+{"delta":"──────","content":"──────","seq":36,"stream_kind":"final_reply","live":false}
+{"delta":"────","content":"────","seq":37,"stream_kind":"final_reply","live":false}
+{"delta":"─┐            ┌───────────","content":"─┐            ┌───────────","seq":38,"stream_kind":"final_reply","live":false}
+{"delta":"─────────","content":"─────────","seq":39,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":40,"stream_kind":"final_reply","live":false}
+{"delta":"───┐\n","content":"───┐\n","seq":41,"stream_kind":"final_reply","live":false}
+{"delta":"│ orders table","content":"│ orders table","seq":42,"stream_kind":"final_reply","live":false}
+{"delta":" │       ","content":" │       ","seq":43,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":44,"stream_kind":"final_reply","live":false}
+{"delta":"│ events stream    ","content":"│ events stream    ","seq":45,"stream_kind":"final_reply","live":false}
+{"delta":"    ","content":"    ","seq":46,"stream_kind":"final_reply","live":false}
+{"delta":"  ","content":"  ","seq":47,"stream_kind":"final_reply","live":false}
+{"delta":"  │\n","content":"  │\n","seq":48,"stream_kind":"final_reply","live":false}
+{"delta":"│ id=42       ","content":"│ id=42       ","seq":49,"stream_kind":"final_reply","live":false}
+{"delta":" │      ","content":" │      ","seq":50,"stream_kind":"final_reply","live":false}
+{"delta":"      │ ","content":"      │ ","seq":51,"stream_kind":"final_reply","live":false}
+{"delta":"Orde","content":"Orde","seq":52,"stream_kind":"final_reply","live":false}
+{"delta":"rCreated(id=4","content":"rCreated(id=4","seq":53,"stream_kind":"final_reply","live":false}
+{"delta":"2)      ","content":"2)      ","seq":54,"stream_kind":"final_reply","live":false}
+{"delta":"│\n","content":"│\n","seq":55,"stream_kind":"final_reply","live":false}
+{"delta":"│ status=paid  │     ","content":"│ status=paid  │     ","seq":56,"stream_kind":"final_reply","live":false}
+{"delta":"       ","content":"       ","seq":57,"stream_kind":"final_reply","live":false}
+{"delta":"│ It","content":"│ It","seq":58,"stream_kind":"final_reply","live":false}
+{"delta":"emAdded(sku=","content":"emAdded(sku=","seq":59,"stream_kind":"final_reply","live":false}
+{"delta":"ABC)     ","content":"ABC)     ","seq":60,"stream_kind":"final_reply","live":false}
+{"delta":"  ","content":"  ","seq":61,"stream_kind":"final_reply","live":false}
+{"delta":"│\n","content":"│\n","seq":62,"stream_kind":"final_reply","live":false}
+{"delta":"│ total=19.95  │","content":"│ total=19.95  │","seq":63,"stream_kind":"final_reply","live":false}
+{"delta":"            ","content":"            ","seq":64,"stream_kind":"final_reply","live":false}
+{"delta":"│ Payme","content":"│ Payme","seq":65,"stream_kind":"final_reply","live":false}
+{"delta":"ntAuthor","content":"ntAuthor","seq":66,"stream_kind":"final_reply","live":false}
+{"delta":"ized(19.95) │\n└───","content":"ized(19.95) │\n└───","seq":67,"stream_kind":"final_reply","live":false}
+{"delta":"───────────┘      ","content":"───────────┘      ","seq":68,"stream_kind":"final_reply","live":false}
+{"delta":"      │","content":"      │","seq":69,"stream_kind":"final_reply","live":false}
+{"delta":" Order","content":" Order","seq":70,"stream_kind":"final_reply","live":false}
+{"delta":"Shipped(","content":"Shipped(","seq":71,"stream_kind":"final_reply","live":false}
+{"delta":"carrier=UPS)│\n            ","content":"carrier=UPS)│\n            ","seq":72,"stream_kind":"final_reply","live":false}
+{"delta":"                └───────────","content":"                └───────────","seq":73,"stream_kind":"final_reply","live":false}
+{"delta":"────────────","content":"────────────","seq":74,"stream_kind":"final_reply","live":false}
+{"delta":"──┘","content":"──┘","seq":75,"stream_kind":"final_reply","live":false}
+{"delta":"\n```\n\n**","content":"\n```\n\n**","seq":76,"stream_kind":"final_reply","live":false}
+{"delta":"Curre","content":"Curre","seq":77,"stream_kind":"final_reply","live":false}
+{"delta":"nt st","content":"nt st","seq":78,"stream_kind":"final_reply","live":false}
+{"delta":"ate** is a","content":"ate** is a","seq":79,"stream_kind":"final_reply","live":false}
+{"delta":" left-fold","content":" left-fold","seq":80,"stream_kind":"final_reply","live":false}
+{"delta":" over the e","content":" over the e","seq":81,"stream_kind":"final_reply","live":false}
+{"delta":"vent st","content":"vent st","seq":82,"stream_kind":"final_reply","live":false}
+{"delta":"ream","content":"ream","seq":83,"stream_kind":"final_reply","live":false}
+{"delta":" — replay ","content":" — replay ","seq":84,"stream_kind":"final_reply","live":false}
+{"delta":"all events fro","content":"all events fro","seq":85,"stream_kind":"final_reply","live":false}
+{"delta":"m t","content":"m t","seq":86,"stream_kind":"final_reply","live":false}
+{"delta":"he beginning","content":"he beginning","seq":87,"stream_kind":"final_reply","live":false}
+{"delta":" to reconstruc","content":" to reconstruc","seq":88,"stream_kind":"final_reply","live":false}
+{"delta":"t t","content":"t t","seq":89,"stream_kind":"final_reply","live":false}
+{"delta":"he aggregate ","content":"he aggregate ","seq":90,"stream_kind":"final_reply","live":false}
+{"delta":"at any poin","content":"at any poin","seq":91,"stream_kind":"final_reply","live":false}
+{"delta":"t in time. Th","content":"t in time. Th","seq":92,"stream_kind":"final_reply","live":false}
+{"delta":"is gives","content":"is gives","seq":93,"stream_kind":"final_reply","live":false}
+{"delta":" you:\n\n- **F","content":" you:\n\n- **F","seq":94,"stream_kind":"final_reply","live":false}
+{"delta":"ull audit trail** —","content":"ull audit trail** —","seq":95,"stream_kind":"final_reply","live":false}
+{"delta":" every mutat","content":" every mutat","seq":96,"stream_kind":"final_reply","live":false}
+{"delta":"i","content":"i","seq":97,"stream_kind":"final_reply","live":false}
+{"delta":"on is ca","content":"on is ca","seq":98,"stream_kind":"final_reply","live":false}
+{"delta":"ptured","content":"ptured","seq":99,"stream_kind":"final_reply","live":false}
+{"delta":", forever.\n- **T","content":", forever.\n- **T","seq":100,"stream_kind":"final_reply","live":false}
+{"delta":"emporal ","content":"emporal ","seq":101,"stream_kind":"final_reply","live":false}
+{"delta":"queries*","content":"queries*","seq":102,"stream_kind":"final_reply","live":false}
+{"delta":"* —","content":"* —","seq":103,"stream_kind":"final_reply","live":false}
+{"delta":" \"what did ","content":" \"what did ","seq":104,"stream_kind":"final_reply","live":false}
+{"delta":"this order","content":"this order","seq":105,"stream_kind":"final_reply","live":false}
+{"delta":" look like ","content":" look like ","seq":106,"stream_kind":"final_reply","live":false}
+{"delta":"last T","content":"last T","seq":107,"stream_kind":"final_reply","live":false}
+{"delta":"ues","content":"ues","seq":108,"stream_kind":"final_reply","live":false}
+{"delta":"day?\"\n- **N","content":"day?\"\n- **N","seq":109,"stream_kind":"final_reply","live":false}
+{"delta":"o ORM imped","content":"o ORM imped","seq":110,"stream_kind":"final_reply","live":false}
+{"delta":"ance mis","content":"ance mis","seq":111,"stream_kind":"final_reply","live":false}
+{"delta":"match** —","content":"match** —","seq":112,"stream_kind":"final_reply","live":false}
+{"delta":" you'r","content":" you'r","seq":113,"stream_kind":"final_reply","live":false}
+{"delta":"e wri","content":"e wri","seq":114,"stream_kind":"final_reply","live":false}
+{"delta":"ting fac","content":"ting fac","seq":115,"stream_kind":"final_reply","live":false}
+{"delta":"ts, not ","content":"ts, not ","seq":116,"stream_kind":"final_reply","live":false}
+{"delta":"map","content":"map","seq":117,"stream_kind":"final_reply","live":false}
+{"delta":"ping objects to t","content":"ping objects to t","seq":118,"stream_kind":"final_reply","live":false}
+{"delta":"ables","content":"ables","seq":119,"stream_kind":"final_reply","live":false}
+{"delta":".\n\n---\n","content":".\n\n---\n","seq":120,"stream_kind":"final_reply","live":false}
+{"delta":"\n## ","content":"\n## ","seq":121,"stream_kind":"final_reply","live":false}
+{"delta":"2. CQRS — ","content":"2. CQRS — ","seq":122,"stream_kind":"final_reply","live":false}
+{"delta":"Splitting Read","content":"Splitting Read","seq":123,"stream_kind":"final_reply","live":false}
+{"delta":"s","content":"s","seq":124,"stream_kind":"final_reply","live":false}
+{"delta":" from","content":" from","seq":125,"stream_kind":"final_reply","live":false}
+{"delta":" Writes\n\nCQRS (Command Query","content":" Writes\n\nCQRS (Command Query","seq":126,"stream_kind":"final_reply","live":false}
+{"delta":" Responsibility Segrega","content":" Responsibility Segrega","seq":127,"stream_kind":"final_reply","live":false}
+{"delta":"tion) ","content":"tion) ","seq":128,"stream_kind":"final_reply","live":false}
+{"delta":"separates th","content":"separates th","seq":129,"stream_kind":"final_reply","live":false}
+{"delta":"e *write mo","content":"e *write mo","seq":130,"stream_kind":"final_reply","live":false}
+{"delta":"del* from t","content":"del* from t","seq":131,"stream_kind":"final_reply","live":false}
+{"delta":"he *read model","content":"he *read model","seq":132,"stream_kind":"final_reply","live":false}
+{"delta":"*:\n\n```\n        ┌───","content":"*:\n\n```\n        ┌───","seq":133,"stream_kind":"final_reply","live":false}
+{"delta":"─────","content":"─────","seq":134,"stream_kind":"final_reply","live":false}
+{"delta":"──┐\n ","content":"──┐\n ","seq":135,"stream_kind":"final_reply","live":false}
+{"delta":"    ","content":"    ","seq":136,"stream_kind":"final_reply","live":false}
+{"delta":"   ","content":"   ","seq":137,"stream_kind":"final_reply","live":false}
+{"delta":"│ CO","content":"│ CO","seq":138,"stream_kind":"final_reply","live":false}
+{"delta":"MMAND  │  → val","content":"MMAND  │  → val","seq":139,"stream_kind":"final_reply","live":false}
+{"delta":"idates ","content":"idates ","seq":140,"stream_kind":"final_reply","live":false}
+{"delta":"business rules\n   ","content":"business rules\n   ","seq":141,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":142,"stream_kind":"final_reply","live":false}
+{"delta":"│  MODEL","content":"│  MODEL","seq":143,"stream_kind":"final_reply","live":false}
+{"delta":"   │  → ap","content":"   │  → ap","seq":144,"stream_kind":"final_reply","live":false}
+{"delta":"pends events to even","content":"pends events to even","seq":145,"stream_kind":"final_reply","live":false}
+{"delta":"t store\n        ","content":"t store\n        ","seq":146,"stream_kind":"final_reply","live":false}
+{"delta":"└────","content":"└────","seq":147,"stream_kind":"final_reply","live":false}
+{"delta":"┬─","content":"┬─","seq":148,"stream_kind":"final_reply","live":false}
+{"delta":"────","content":"────","seq":149,"stream_kind":"final_reply","live":false}
+{"delta":"┘\n        ","content":"┘\n        ","seq":150,"stream_kind":"final_reply","live":false}
+{"delta":"     │ e","content":"     │ e","seq":151,"stream_kind":"final_reply","live":false}
+{"delta":"vents publish","content":"vents publish","seq":152,"stream_kind":"final_reply","live":false}
+{"delta":"ed\n  ","content":"ed\n  ","seq":153,"stream_kind":"final_reply","live":false}
+{"delta":"           ▼\n    ┌───────────","content":"           ▼\n    ┌───────────","seq":154,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":155,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"──","content":"──","seq":156,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":157,"stream_kind":"final_reply","live":false}
+{"delta":"─┐\n    │","content":"─┐\n    │","seq":158,"stream_kind":"final_reply","live":false}
+{"delta":"  EVENT","content":"  EVENT","seq":159,"stream_kind":"final_reply","live":false}
+{"delta":" BUS   ","content":" BUS   ","seq":160,"stream_kind":"final_reply","live":false}
+{"delta":"  │  ","content":"  │  ","seq":161,"stream_kind":"final_reply","live":false}
+{"delta":"(Kafka","content":"(Kafka","seq":162,"stream_kind":"final_reply","live":false}
+{"delta":")\n    └───┬───","content":")\n    └───┬───","seq":163,"stream_kind":"final_reply","live":false}
+{"delta":"───","content":"───","seq":164,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":165,"stream_kind":"final_reply","live":false}
+{"delta":"┬───","content":"┬───","seq":166,"stream_kind":"final_reply","live":false}
+{"delta":"┘\n        ","content":"┘\n        ","seq":167,"stream_kind":"final_reply","live":false}
+{"delta":"│        ","content":"│        ","seq":168,"stream_kind":"final_reply","live":false}
+{"delta":"│\n        ","content":"│\n        ","seq":169,"stream_kind":"final_reply","live":false}
+{"delta":"▼        ▼\n   ┌───","content":"▼        ▼\n   ┌───","seq":170,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":171,"stream_kind":"final_reply","live":false}
+{"delta":"────┐ ┌───","content":"────┐ ┌───","seq":172,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":173,"stream_kind":"final_reply","live":false}
+{"delta":"───","content":"───","seq":174,"stream_kind":"final_reply","live":false}
+{"delta":"┐\n   │","content":"┐\n   │","seq":175,"stream_kind":"final_reply","live":false}
+{"delta":"OR","content":"OR","seq":176,"stream_kind":"final_reply","live":false}
+{"delta":"DER   │ ","content":"DER   │ ","seq":177,"stream_kind":"final_reply","live":false}
+{"delta":"│IN","content":"│IN","seq":178,"stream_kind":"final_reply","live":false}
+{"delta":"VENTO","content":"VENTO","seq":179,"stream_kind":"final_reply","live":false}
+{"delta":"RY│  ","content":"RY│  ","seq":180,"stream_kind":"final_reply","live":false}
+{"delta":"→ each s","content":"→ each s","seq":181,"stream_kind":"final_reply","live":false}
+{"delta":"erv","content":"erv","seq":182,"stream_kind":"final_reply","live":false}
+{"delta":"ice pro","content":"ice pro","seq":183,"stream_kind":"final_reply","live":false}
+{"delta":"j","content":"j","seq":184,"stream_kind":"final_reply","live":false}
+{"delta":"ect","content":"ect","seq":185,"stream_kind":"final_reply","live":false}
+{"delta":"s\n   │PRO","content":"s\n   │PRO","seq":186,"stream_kind":"final_reply","live":false}
+{"delta":"J.   │ ","content":"J.   │ ","seq":187,"stream_kind":"final_reply","live":false}
+{"delta":"│PROJ.    │    ","content":"│PROJ.    │    ","seq":188,"stream_kind":"final_reply","live":false}
+{"delta":"event","content":"event","seq":189,"stream_kind":"final_reply","live":false}
+{"delta":"s into","content":"s into","seq":190,"stream_kind":"final_reply","live":false}
+{"delta":" its o","content":" its o","seq":191,"stream_kind":"final_reply","live":false}
+{"delta":"wn\n   └───","content":"wn\n   └───","seq":192,"stream_kind":"final_reply","live":false}
+{"delta":"┬","content":"┬","seq":193,"stream_kind":"final_reply","live":false}
+{"delta":"───","content":"───","seq":194,"stream_kind":"final_reply","live":false}
+{"delta":"─┘ └───","content":"─┘ └───","seq":195,"stream_kind":"final_reply","live":false}
+{"delta":"┬──","content":"┬──","seq":196,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":197,"stream_kind":"final_reply","live":false}
+{"delta":"─┘    re","content":"─┘    re","seq":198,"stream_kind":"final_reply","live":false}
+{"delta":"ad-opti","content":"ad-opti","seq":199,"stream_kind":"final_reply","live":false}
+{"delta":"mized DB\n     ","content":"mized DB\n     ","seq":200,"stream_kind":"final_reply","live":false}
+{"delta":"  │      ","content":"  │      ","seq":201,"stream_kind":"final_reply","live":false}
+{"delta":"     │\n     ","content":"     │\n     ","seq":202,"stream_kind":"final_reply","live":false}
+{"delta":"  ▼  ","content":"  ▼  ","seq":203,"stream_kind":"final_reply","live":false}
+{"delta":"         ▼\n   ┌───────────","content":"         ▼\n   ┌───────────","seq":204,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":205,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":206,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":207,"stream_kind":"final_reply","live":false}
+{"delta":"──┐\n   ","content":"──┐\n   ","seq":208,"stream_kind":"final_reply","live":false}
+{"delta":"│ ","content":"│ ","seq":209,"stream_kind":"final_reply","live":false}
+{"delta":"  ","content":"  ","seq":210,"stream_kind":"final_reply","live":false}
+{"delta":"QUERY","content":"QUERY","seq":211,"stream_kind":"final_reply","live":false}
+{"delta":" MODEL(S)  ","content":" MODEL(S)  ","seq":212,"stream_kind":"final_reply","live":false}
+{"delta":"│  → mat","content":"│  → mat","seq":213,"stream_kind":"final_reply","live":false}
+{"delta":"erialized ","content":"erialized ","seq":214,"stream_kind":"final_reply","live":false}
+{"delta":"views,\n   ","content":"views,\n   ","seq":215,"stream_kind":"final_reply","live":false}
+{"delta":"│   (","content":"│   (","seq":216,"stream_kind":"final_reply","live":false}
+{"delta":"Postgres","content":"Postgres","seq":217,"stream_kind":"final_reply","live":false}
+{"delta":",       │   ","content":",       │   ","seq":218,"stream_kind":"final_reply","live":false}
+{"delta":"  denorm","content":"  denorm","seq":219,"stream_kind":"final_reply","live":false}
+{"delta":"ali","content":"ali","seq":220,"stream_kind":"final_reply","live":false}
+{"delta":"zed, in","content":"zed, in","seq":221,"stream_kind":"final_reply","live":false}
+{"delta":"dexed\n   │  ","content":"dexed\n   │  ","seq":222,"stream_kind":"final_reply","live":false}
+{"delta":"  ","content":"  ","seq":223,"stream_kind":"final_reply","live":false}
+{"delta":"Elastics","content":"Elastics","seq":224,"stream_kind":"final_reply","live":false}
+{"delta":"earch,  ","content":"earch,  ","seq":225,"stream_kind":"final_reply","live":false}
+{"delta":"│     for th","content":"│     for th","seq":226,"stream_kind":"final_reply","live":false}
+{"delta":"e exact qu","content":"e exact qu","seq":227,"stream_kind":"final_reply","live":false}
+{"delta":"eries\n ","content":"eries\n ","seq":228,"stream_kind":"final_reply","live":false}
+{"delta":"  │    Redis)  ","content":"  │    Redis)  ","seq":229,"stream_kind":"final_reply","live":false}
+{"delta":"        │  ","content":"        │  ","seq":230,"stream_kind":"final_reply","live":false}
+{"delta":"   t","content":"   t","seq":231,"stream_kind":"final_reply","live":false}
+{"delta":"he UI needs\n   └───────────","content":"he UI needs\n   └───────────","seq":232,"stream_kind":"final_reply","live":false}
+{"delta":"──────","content":"──────","seq":233,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":234,"stream_kind":"final_reply","live":false}
+{"delta":"─┘\n```\n\n**W","content":"─┘\n```\n\n**W","seq":235,"stream_kind":"final_reply","live":false}
+{"delta":"hy th","content":"hy th","seq":236,"stream_kind":"final_reply","live":false}
+{"delta":"is ma","content":"is ma","seq":237,"stream_kind":"final_reply","live":false}
+{"delta":"tters:","content":"tters:","seq":238,"stream_kind":"final_reply","live":false}
+{"delta":"**\n\n-","content":"**\n\n-","seq":239,"stream_kind":"final_reply","live":false}
+{"delta":" The w","content":" The w","seq":240,"stream_kind":"final_reply","live":false}
+{"delta":"rite s","content":"rite s","seq":241,"stream_kind":"final_reply","live":false}
+{"delta":"i","content":"i","seq":242,"stream_kind":"final_reply","live":false}
+{"delta":"de st","content":"de st","seq":243,"stream_kind":"final_reply","live":false}
+{"delta":"ays clean: pur","content":"ays clean: pur","seq":244,"stream_kind":"final_reply","live":false}
+{"delta":"e domain lo","content":"e domain lo","seq":245,"stream_kind":"final_reply","live":false}
+{"delta":"gic, no ","content":"gic, no ","seq":246,"stream_kind":"final_reply","live":false}
+{"delta":"conce","content":"conce","seq":247,"stream_kind":"final_reply","live":false}
+{"delta":"rn for how data","content":"rn for how data","seq":248,"stream_kind":"final_reply","live":false}
+{"delta":" gets d","content":" gets d","seq":249,"stream_kind":"final_reply","live":false}
+{"delta":"isplayed.\n- Th","content":"isplayed.\n- Th","seq":250,"stream_kind":"final_reply","live":false}
+{"delta":"e read side can ","content":"e read side can ","seq":251,"stream_kind":"final_reply","live":false}
+{"delta":"be de","content":"be de","seq":252,"stream_kind":"final_reply","live":false}
+{"delta":"n","content":"n","seq":253,"stream_kind":"final_reply","live":false}
+{"delta":"ormalized, pre","content":"ormalized, pre","seq":254,"stream_kind":"final_reply","live":false}
+{"delta":"-joined, cached ","content":"-joined, cached ","seq":255,"stream_kind":"final_reply","live":false}
+{"delta":"— whatever th","content":"— whatever th","seq":256,"stream_kind":"final_reply","live":false}
+{"delta":"e query pa","content":"e query pa","seq":257,"stream_kind":"final_reply","live":false}
+{"delta":"ttern demands.","content":"ttern demands.","seq":258,"stream_kind":"final_reply","live":false}
+{"delta":"\n-","content":"\n-","seq":259,"stream_kind":"final_reply","live":false}
+{"delta":" You can ","content":" You can ","seq":260,"stream_kind":"final_reply","live":false}
+{"delta":"have *multiple* read m","content":"have *multiple* read m","seq":261,"stream_kind":"final_reply","live":false}
+{"delta":"odels optimize","content":"odels optimize","seq":262,"stream_kind":"final_reply","live":false}
+{"delta":"d for diff","content":"d for diff","seq":263,"stream_kind":"final_reply","live":false}
+{"delta":"erent consu","content":"erent consu","seq":264,"stream_kind":"final_reply","live":false}
+{"delta":"mers (da","content":"mers (da","seq":265,"stream_kind":"final_reply","live":false}
+{"delta":"shboard, mobile","content":"shboard, mobile","seq":266,"stream_kind":"final_reply","live":false}
+{"delta":" app, rep","content":" app, rep","seq":267,"stream_kind":"final_reply","live":false}
+{"delta":"ort","content":"ort","seq":268,"stream_kind":"final_reply","live":false}
+{"delta":"ing).\n\n---","content":"ing).\n\n---","seq":269,"stream_kind":"final_reply","live":false}
+{"delta":"\n\n## 3.","content":"\n\n## 3.","seq":270,"stream_kind":"final_reply","live":false}
+{"delta":" Kafka's","content":" Kafka's","seq":271,"stream_kind":"final_reply","live":false}
+{"delta":" Role\n\n","content":" Role\n\n","seq":272,"stream_kind":"final_reply","live":false}
+{"delta":"Kafka is the **central n","content":"Kafka is the **central n","seq":273,"stream_kind":"final_reply","live":false}
+{"delta":"ervous s","content":"ervous s","seq":274,"stream_kind":"final_reply","live":false}
+{"delta":"ystem** of this a","content":"ystem** of this a","seq":275,"stream_kind":"final_reply","live":false}
+{"delta":"rchitecture. ","content":"rchitecture. ","seq":276,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"It serves three distinct ","content":"It serves three distinct ","seq":277,"stream_kind":"final_reply","live":false}
+{"delta":"fu","content":"fu","seq":278,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"nct","content":"nct","seq":279,"stream_kind":"final_reply","live":false}
+{"delta":"ions:\n\n### a) Dura","content":"ions:\n\n### a) Dura","seq":280,"stream_kind":"final_reply","live":false}
+{"delta":"ble Eve","content":"ble Eve","seq":281,"stream_kind":"final_reply","live":false}
+{"delta":"nt Store\nEvent","content":"nt Store\nEvent","seq":282,"stream_kind":"final_reply","live":false}
+{"delta":"s are published","content":"s are published","seq":283,"stream_kind":"final_reply","live":false}
+{"delta":" to partitio","content":" to partitio","seq":284,"stream_kind":"final_reply","live":false}
+{"delta":"ned, rep","content":"ned, rep","seq":285,"stream_kind":"final_reply","live":false}
+{"delta":"licated topics","content":"licated topics","seq":286,"stream_kind":"final_reply","live":false}
+{"delta":". Kaf","content":". Kaf","seq":287,"stream_kind":"final_reply","live":false}
+{"delta":"ka ret","content":"ka ret","seq":288,"stream_kind":"final_reply","live":false}
+{"delta":"ains them for a conf","content":"ains them for a conf","seq":289,"stream_kind":"final_reply","live":false}
+{"delta":"igurab","content":"igurab","seq":290,"stream_kind":"final_reply","live":false}
+{"delta":"l","content":"l","seq":291,"stream_kind":"final_reply","live":false}
+{"delta":"e window (","content":"e window (","seq":292,"stream_kind":"final_reply","live":false}
+{"delta":"days, weeks, ","content":"days, weeks, ","seq":293,"stream_kind":"final_reply","live":false}
+{"delta":"or indefinitely with co","content":"or indefinitely with co","seq":294,"stream_kind":"final_reply","live":false}
+{"delta":"mpa","content":"mpa","seq":295,"stream_kind":"final_reply","live":false}
+{"delta":"ction","content":"ction","seq":296,"stream_kind":"final_reply","live":false}
+{"delta":"). This i","content":"). This i","seq":297,"stream_kind":"final_reply","live":false}
+{"delta":"s your **so","content":"s your **so","seq":298,"stream_kind":"final_reply","live":false}
+{"delta":"urce of","content":"urce of","seq":299,"stream_kind":"final_reply","live":false}
+{"delta":" truth** — ","content":" truth** — ","seq":300,"stream_kind":"final_reply","live":false}
+{"delta":"if a proj","content":"if a proj","seq":301,"stream_kind":"final_reply","live":false}
+{"delta":"ection","content":"ection","seq":302,"stream_kind":"final_reply","live":false}
+{"delta":" data","content":" data","seq":303,"stream_kind":"final_reply","live":false}
+{"delta":"base ","content":"base ","seq":304,"stream_kind":"final_reply","live":false}
+{"delta":"burns down, you r","content":"burns down, you r","seq":305,"stream_kind":"final_reply","live":false}
+{"delta":"epl","content":"epl","seq":306,"stream_kind":"final_reply","live":false}
+{"delta":"ay th","content":"ay th","seq":307,"stream_kind":"final_reply","live":false}
+{"delta":"e top","content":"e top","seq":308,"stream_kind":"final_reply","live":false}
+{"delta":"ic.\n\n### b) Decouple","content":"ic.\n\n### b) Decouple","seq":309,"stream_kind":"final_reply","live":false}
+{"delta":"d Communi","content":"d Communi","seq":310,"stream_kind":"final_reply","live":false}
+{"delta":"cati","content":"cati","seq":311,"stream_kind":"final_reply","live":false}
+{"delta":"on\nServ","content":"on\nServ","seq":312,"stream_kind":"final_reply","live":false}
+{"delta":"ices don't call each ","content":"ices don't call each ","seq":313,"stream_kind":"final_reply","live":false}
+{"delta":"other directly. They pu","content":"other directly. They pu","seq":314,"stream_kind":"final_reply","live":false}
+{"delta":"blish to topics a","content":"blish to topics a","seq":315,"stream_kind":"final_reply","live":false}
+{"delta":"nd consume","content":"nd consume","seq":316,"stream_kind":"final_reply","live":false}
+{"delta":" from top","content":" from top","seq":317,"stream_kind":"final_reply","live":false}
+{"delta":"ics:\n\n``","content":"ics:\n\n``","seq":318,"stream_kind":"final_reply","live":false}
+{"delta":"`","content":"`","seq":319,"stream_kind":"final_reply","live":false}
+{"delta":"\nOrder","content":"\nOrder","seq":320,"stream_kind":"final_reply","live":false}
+{"delta":" Se","content":" Se","seq":321,"stream_kind":"final_reply","live":false}
+{"delta":"rv","content":"rv","seq":322,"stream_kind":"final_reply","live":false}
+{"delta":"ice ","content":"ice ","seq":323,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":324,"stream_kind":"final_reply","live":false}
+{"delta":"► [or","content":"► [or","seq":325,"stream_kind":"final_reply","live":false}
+{"delta":"ders topic] ","content":"ders topic] ","seq":326,"stream_kind":"final_reply","live":false}
+{"delta":"──► P","content":"──► P","seq":327,"stream_kind":"final_reply","live":false}
+{"delta":"ayment Service\n                  ","content":"ayment Service\n                  ","seq":328,"stream_kind":"final_reply","live":false}
+{"delta":" ","content":" ","seq":329,"stream_kind":"final_reply","live":false}
+{"delta":"               ─","content":"               ─","seq":330,"stream_kind":"final_reply","live":false}
+{"delta":"─► Inv","content":"─► Inv","seq":331,"stream_kind":"final_reply","live":false}
+{"delta":"entory Service\n                         ","content":"entory Service\n                         ","seq":332,"stream_kind":"final_reply","live":false}
+{"delta":"         ──","content":"         ──","seq":333,"stream_kind":"final_reply","live":false}
+{"delta":"► Notifi","content":"► Notifi","seq":334,"stream_kind":"final_reply","live":false}
+{"delta":"cation Service\n                         ","content":"cation Service\n                         ","seq":335,"stream_kind":"final_reply","live":false}
+{"delta":"         ─","content":"         ─","seq":336,"stream_kind":"final_reply","live":false}
+{"delta":"─► Ana","content":"─► Ana","seq":337,"stream_kind":"final_reply","live":false}
+{"delta":"lytics","content":"lytics","seq":338,"stream_kind":"final_reply","live":false}
+{"delta":" Service\n```\n\nA n","content":" Service\n```\n\nA n","seq":339,"stream_kind":"final_reply","live":false}
+{"delta":"ew co","content":"ew co","seq":340,"stream_kind":"final_reply","live":false}
+{"delta":"nsumer ","content":"nsumer ","seq":341,"stream_kind":"final_reply","live":false}
+{"delta":"can join at a","content":"can join at a","seq":342,"stream_kind":"final_reply","live":false}
+{"delta":"ny time without to","content":"ny time without to","seq":343,"stream_kind":"final_reply","live":false}
+{"delta":"uching exist","content":"uching exist","seq":344,"stream_kind":"final_reply","live":false}
+{"delta":"ing s","content":"ing s","seq":345,"stream_kind":"final_reply","live":false}
+{"delta":"ervices","content":"ervices","seq":346,"stream_kind":"final_reply","live":false}
+{"delta":".\n\n### c","content":".\n\n### c","seq":347,"stream_kind":"final_reply","live":false}
+{"delta":") Orde","content":") Orde","seq":348,"stream_kind":"final_reply","live":false}
+{"delta":"ring Gu","content":"ring Gu","seq":349,"stream_kind":"final_reply","live":false}
+{"delta":"arantees\nWit","content":"arantees\nWit","seq":350,"stream_kind":"final_reply","live":false}
+{"delta":"hin a partition, K","content":"hin a partition, K","seq":351,"stream_kind":"final_reply","live":false}
+{"delta":"afka gua","content":"afka gua","seq":352,"stream_kind":"final_reply","live":false}
+{"delta":"rantees *","content":"rantees *","seq":353,"stream_kind":"final_reply","live":false}
+{"delta":"*total","content":"*total","seq":354,"stream_kind":"final_reply","live":false}
+{"delta":" order**. Route","content":" order**. Route","seq":355,"stream_kind":"final_reply","live":false}
+{"delta":" all events for a ","content":" all events for a ","seq":356,"stream_kind":"final_reply","live":false}
+{"delta":"giv","content":"giv","seq":357,"stream_kind":"final_reply","live":false}
+{"delta":"en ","content":"en ","seq":358,"stream_kind":"final_reply","live":false}
+{"delta":"aggrega","content":"aggrega","seq":359,"stream_kind":"final_reply","live":false}
+{"delta":"te ","content":"te ","seq":360,"stream_kind":"final_reply","live":false}
+{"delta":"(e.g. `order-4","content":"(e.g. `order-4","seq":361,"stream_kind":"final_reply","live":false}
+{"delta":"2`) to the ","content":"2`) to the ","seq":362,"stream_kind":"final_reply","live":false}
+{"delta":"same parti","content":"same parti","seq":363,"stream_kind":"final_reply","live":false}
+{"delta":"tion, and ever","content":"tion, and ever","seq":364,"stream_kind":"final_reply","live":false}
+{"delta":"y cons","content":"y cons","seq":365,"stream_kind":"final_reply","live":false}
+{"delta":"umer sees thos","content":"umer sees thos","seq":366,"stream_kind":"final_reply","live":false}
+{"delta":"e events in the exac","content":"e events in the exac","seq":367,"stream_kind":"final_reply","live":false}
+{"delta":"t sequenc","content":"t sequenc","seq":368,"stream_kind":"final_reply","live":false}
+{"delta":"e they o","content":"e they o","seq":369,"stream_kind":"final_reply","live":false}
+{"delta":"ccurr","content":"ccurr","seq":370,"stream_kind":"final_reply","live":false}
+{"delta":"ed.\n\n---\n\n## 4. Event","content":"ed.\n\n---\n\n## 4. Event","seq":371,"stream_kind":"final_reply","live":false}
+{"delta":"ual Co","content":"ual Co","seq":372,"stream_kind":"final_reply","live":false}
+{"delta":"nsisten","content":"nsisten","seq":373,"stream_kind":"final_reply","live":false}
+{"delta":"cy\n\nTh","content":"cy\n\nTh","seq":374,"stream_kind":"final_reply","live":false}
+{"delta":"is is n","content":"is is n","seq":375,"stream_kind":"final_reply","live":false}
+{"delta":"ot a","content":"ot a","seq":376,"stream_kind":"final_reply","live":false}
+{"delta":" bug — it's a d","content":" bug — it's a d","seq":377,"stream_kind":"final_reply","live":false}
+{"delta":"eliberate t","content":"eliberate t","seq":378,"stream_kind":"final_reply","live":false}
+{"delta":"rade","content":"rade","seq":379,"stream_kind":"final_reply","live":false}
+{"delta":"-off.\n\nWhen the Order Se","content":"-off.\n\nWhen the Order Se","seq":380,"stream_kind":"final_reply","live":false}
+{"delta":"rvice p","content":"rvice p","seq":381,"stream_kind":"final_reply","live":false}
+{"delta":"ub","content":"ub","seq":382,"stream_kind":"final_reply","live":false}
+{"delta":"lishes","content":"lishes","seq":383,"stream_kind":"final_reply","live":false}
+{"delta":" `OrderPlaced`, the Invento","content":" `OrderPlaced`, the Invento","seq":384,"stream_kind":"final_reply","live":false}
+{"delta":"ry Service ","content":"ry Service ","seq":385,"stream_kind":"final_reply","live":false}
+{"delta":"hasn't reserved","content":"hasn't reserved","seq":386,"stream_kind":"final_reply","live":false}
+{"delta":" stock yet. The Payme","content":" stock yet. The Payme","seq":387,"stream_kind":"final_reply","live":false}
+{"delta":"nt Service","content":"nt Service","seq":388,"stream_kind":"final_reply","live":false}
+{"delta":" has","content":" has","seq":389,"stream_kind":"final_reply","live":false}
+{"delta":"n't charged th","content":"n't charged th","seq":390,"stream_kind":"final_reply","live":false}
+{"delta":"e car","content":"e car","seq":391,"stream_kind":"final_reply","live":false}
+{"delta":"d yet. Fo","content":"d yet. Fo","seq":392,"stream_kind":"final_reply","live":false}
+{"delta":"r some window (","content":"r some window (","seq":393,"stream_kind":"final_reply","live":false}
+{"delta":"milliseconds to secon","content":"milliseconds to secon","seq":394,"stream_kind":"final_reply","live":false}
+{"delta":"ds), t","content":"ds), t","seq":395,"stream_kind":"final_reply","live":false}
+{"delta":"he system is **in","content":"he system is **in","seq":396,"stream_kind":"final_reply","live":false}
+{"delta":"consiste","content":"consiste","seq":397,"stream_kind":"final_reply","live":false}
+{"delta":"nt**.\n\n```\nTime ────────────","content":"nt**.\n\n```\nTime ────────────","seq":398,"stream_kind":"final_reply","live":false}
+{"delta":"────────────────────────","content":"────────────────────────","seq":399,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":400,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":401,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":402,"stream_kind":"final_reply","live":false}
+{"delta":"─►\n\nOr","content":"─►\n\nOr","seq":403,"stream_kind":"final_reply","live":false}
+{"delta":"de","content":"de","seq":404,"stream_kind":"final_reply","live":false}
+{"delta":"r:    [placed] ────────────","content":"r:    [placed] ────────────","seq":405,"stream_kind":"final_reply","live":false}
+{"delta":"─────────────────","content":"─────────────────","seq":406,"stream_kind":"final_reply","live":false}
+{"delta":"── con","content":"── con","seq":407,"stream_kind":"final_reply","live":false}
+{"delta":"si","content":"si","seq":408,"stream_kind":"final_reply","live":false}
+{"delta":"stent\nPay","content":"stent\nPay","seq":409,"stream_kind":"final_reply","live":false}
+{"delta":"ment:  [unk","content":"ment:  [unk","seq":410,"stream_kind":"final_reply","live":false}
+{"delta":"no","content":"no","seq":411,"stream_kind":"final_reply","live":false}
+{"delta":"wn] ──","content":"wn] ──","seq":412,"stream_kind":"final_reply","live":false}
+{"delta":"─ [authorized] ───────────","content":"─ [authorized] ───────────","seq":413,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":414,"stream_kind":"final_reply","live":false}
+{"delta":"─ cons","content":"─ cons","seq":415,"stream_kind":"final_reply","live":false}
+{"delta":"is","content":"is","seq":416,"stream_kind":"final_reply","live":false}
+{"delta":"tent","content":"tent","seq":417,"stream_kind":"final_reply","live":false}
+{"delta":" (after ~50","content":" (after ~50","seq":418,"stream_kind":"final_reply","live":false}
+{"delta":"ms)\nInventor","content":"ms)\nInventor","seq":419,"stream_kind":"final_reply","live":false}
+{"delta":"y:[unkno","content":"y:[unkno","seq":420,"stream_kind":"final_reply","live":false}
+{"delta":"wn] ──","content":"wn] ──","seq":421,"stream_kind":"final_reply","live":false}
+{"delta":"─ [","content":"─ [","seq":422,"stream_kind":"final_reply","live":false}
+{"delta":"unkno","content":"unkno","seq":423,"stream_kind":"final_reply","live":false}
+{"delta":"wn] ──","content":"wn] ──","seq":424,"stream_kind":"final_reply","live":false}
+{"delta":" [reserved] ─","content":" [reserved] ─","seq":425,"stream_kind":"final_reply","live":false}
+{"delta":"─ consist","content":"─ consist","seq":426,"stream_kind":"final_reply","live":false}
+{"delta":"ent (afte","content":"ent (afte","seq":427,"stream_kind":"final_reply","live":false}
+{"delta":"r ","content":"r ","seq":428,"stream_kind":"final_reply","live":false}
+{"delta":"~20","content":"~20","seq":429,"stream_kind":"final_reply","live":false}
+{"delta":"0ms)","content":"0ms)","seq":430,"stream_kind":"final_reply","live":false}
+{"delta":"\n```\n\n*","content":"\n```\n\n*","seq":431,"stream_kind":"final_reply","live":false}
+{"delta":"*Ho","content":"*Ho","seq":432,"stream_kind":"final_reply","live":false}
+{"delta":"w you manag","content":"w you manag","seq":433,"stream_kind":"final_reply","live":false}
+{"delta":"e it:**\n","content":"e it:**\n","seq":434,"stream_kind":"final_reply","live":false}
+{"delta":"\n- **Idempot","content":"\n- **Idempot","seq":435,"stream_kind":"final_reply","live":false}
+{"delta":"ent consume","content":"ent consume","seq":436,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"rs** — replaying","content":"rs** — replaying","seq":437,"stream_kind":"final_reply","live":false}
+{"delta":" the s","content":" the s","seq":438,"stream_kind":"final_reply","live":false}
+{"delta":"ame event twice m","content":"ame event twice m","seq":439,"stream_kind":"final_reply","live":false}
+{"delta":"ust produce t","content":"ust produce t","seq":440,"stream_kind":"final_reply","live":false}
+{"delta":"he sa","content":"he sa","seq":441,"stream_kind":"final_reply","live":false}
+{"delta":"me out","content":"me out","seq":442,"stream_kind":"final_reply","live":false}
+{"delta":"come. Us","content":"come. Us","seq":443,"stream_kind":"final_reply","live":false}
+{"delta":"e event IDs fo","content":"e event IDs fo","seq":444,"stream_kind":"final_reply","live":false}
+{"delta":"r dedu","content":"r dedu","seq":445,"stream_kind":"final_reply","live":false}
+{"delta":"plica","content":"plica","seq":446,"stream_kind":"final_reply","live":false}
+{"delta":"tion.\n- ","content":"tion.\n- ","seq":447,"stream_kind":"final_reply","live":false}
+{"delta":"**Optimis","content":"**Optimis","seq":448,"stream_kind":"final_reply","live":false}
+{"delta":"tic UI patt","content":"tic UI patt","seq":449,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"erns","content":"erns","seq":450,"stream_kind":"final_reply","live":false}
+{"delta":"** — ","content":"** — ","seq":451,"stream_kind":"final_reply","live":false}
+{"delta":"show the u","content":"show the u","seq":452,"stream_kind":"final_reply","live":false}
+{"delta":"ser \"proc","content":"ser \"proc","seq":453,"stream_kind":"final_reply","live":false}
+{"delta":"essing...\" ","content":"essing...\" ","seq":454,"stream_kind":"final_reply","live":false}
+{"delta":"then transiti","content":"then transiti","seq":455,"stream_kind":"final_reply","live":false}
+{"delta":"on to confi","content":"on to confi","seq":456,"stream_kind":"final_reply","live":false}
+{"delta":"rmed stat","content":"rmed stat","seq":457,"stream_kind":"final_reply","live":false}
+{"delta":"e when the rea","content":"e when the rea","seq":458,"stream_kind":"final_reply","live":false}
+{"delta":"d model c","content":"d model c","seq":459,"stream_kind":"final_reply","live":false}
+{"delta":"atches up","content":"atches up","seq":460,"stream_kind":"final_reply","live":false}
+{"delta":".","content":".","seq":461,"stream_kind":"final_reply","live":false}
+{"delta":"\n- **Read-yo","content":"\n- **Read-yo","seq":462,"stream_kind":"final_reply","live":false}
+{"delta":"ur-own-wri","content":"ur-own-wri","seq":463,"stream_kind":"final_reply","live":false}
+{"delta":"tes** —","content":"tes** —","seq":464,"stream_kind":"final_reply","live":false}
+{"delta":" route the us","content":" route the us","seq":465,"stream_kind":"final_reply","live":false}
+{"delta":"er's subseque","content":"er's subseque","seq":466,"stream_kind":"final_reply","live":false}
+{"delta":"nt reads to t","content":"nt reads to t","seq":467,"stream_kind":"final_reply","live":false}
+{"delta":"he replica","content":"he replica","seq":468,"stream_kind":"final_reply","live":false}
+{"delta":" that ha","content":" that ha","seq":469,"stream_kind":"final_reply","live":false}
+{"delta":"s their","content":"s their","seq":470,"stream_kind":"final_reply","live":false}
+{"delta":" write (or fall ba","content":" write (or fall ba","seq":471,"stream_kind":"final_reply","live":false}
+{"delta":"ck to the ","content":"ck to the ","seq":472,"stream_kind":"final_reply","live":false}
+{"delta":"wr","content":"wr","seq":473,"stream_kind":"final_reply","live":false}
+{"delta":"ite mo","content":"ite mo","seq":474,"stream_kind":"final_reply","live":false}
+{"delta":"del for a grac","content":"del for a grac","seq":475,"stream_kind":"final_reply","live":false}
+{"delta":"e perio","content":"e perio","seq":476,"stream_kind":"final_reply","live":false}
+{"delta":"d).\n- **Compe","content":"d).\n- **Compe","seq":477,"stream_kind":"final_reply","live":false}
+{"delta":"nsatin","content":"nsatin","seq":478,"stream_kind":"final_reply","live":false}
+{"delta":"g act","content":"g act","seq":479,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"ions** — when ","content":"ions** — when ","seq":480,"stream_kind":"final_reply","live":false}
+{"delta":"something f","content":"something f","seq":481,"stream_kind":"final_reply","live":false}
+{"delta":"ails down","content":"ails down","seq":482,"stream_kind":"final_reply","live":false}
+{"delta":"stream,","content":"stream,","seq":483,"stream_kind":"final_reply","live":false}
+{"delta":" you do","content":" you do","seq":484,"stream_kind":"final_reply","live":false}
+{"delta":"n't roll back ","content":"n't roll back ","seq":485,"stream_kind":"final_reply","live":false}
+{"delta":"(y","content":"(y","seq":486,"stream_kind":"final_reply","live":false}
+{"delta":"ou can't undo a publis","content":"ou can't undo a publis","seq":487,"stream_kind":"final_reply","live":false}
+{"delta":"hed e","content":"hed e","seq":488,"stream_kind":"final_reply","live":false}
+{"delta":"vent","content":"vent","seq":489,"stream_kind":"final_reply","live":false}
+{"delta":"). You ","content":"). You ","seq":490,"stream_kind":"final_reply","live":false}
+{"delta":"emit a *comp","content":"emit a *comp","seq":491,"stream_kind":"final_reply","live":false}
+{"delta":"ensating e","content":"ensating e","seq":492,"stream_kind":"final_reply","live":false}
+{"delta":"vent*.\n\n","content":"vent*.\n\n","seq":493,"stream_kind":"final_reply","live":false}
+{"delta":"---\n\n## 5. Saga ","content":"---\n\n## 5. Saga ","seq":494,"stream_kind":"final_reply","live":false}
+{"delta":"O","content":"O","seq":495,"stream_kind":"final_reply","live":false}
+{"delta":"rchestrati","content":"rchestrati","seq":496,"stream_kind":"final_reply","live":false}
+{"delta":"on\n\nA","content":"on\n\nA","seq":497,"stream_kind":"final_reply","live":false}
+{"delta":" saga is","content":" saga is","seq":498,"stream_kind":"final_reply","live":false}
+{"delta":" a long-running t","content":" a long-running t","seq":499,"stream_kind":"final_reply","live":false}
+{"delta":"ransaction that","content":"ransaction that","seq":500,"stream_kind":"final_reply","live":false}
+{"delta":" spans multiple se","content":" spans multiple se","seq":501,"stream_kind":"final_reply","live":false}
+{"delta":"rvice","content":"rvice","seq":502,"stream_kind":"final_reply","live":false}
+{"delta":"s. Instead o","content":"s. Instead o","seq":503,"stream_kind":"final_reply","live":false}
+{"delta":"f a d","content":"f a d","seq":504,"stream_kind":"final_reply","live":false}
+{"delta":"ist","content":"ist","seq":505,"stream_kind":"final_reply","live":false}
+{"delta":"r","content":"r","seq":506,"stream_kind":"final_reply","live":false}
+{"delta":"ibute","content":"ibute","seq":507,"stream_kind":"final_reply","live":false}
+{"delta":"d lock or 2","content":"d lock or 2","seq":508,"stream_kind":"final_reply","live":false}
+{"delta":"PC (whic","content":"PC (whic","seq":509,"stream_kind":"final_reply","live":false}
+{"delta":"h doesn't sc","content":"h doesn't sc","seq":510,"stream_kind":"final_reply","live":false}
+{"delta":"ale), you bre","content":"ale), you bre","seq":511,"stream_kind":"final_reply","live":false}
+{"delta":"ak the b","content":"ak the b","seq":512,"stream_kind":"final_reply","live":false}
+{"delta":"usiness","content":"usiness","seq":513,"stream_kind":"final_reply","live":false}
+{"delta":" process into a","content":" process into a","seq":514,"stream_kind":"final_reply","live":false}
+{"delta":" sequence of **loc","content":" sequence of **loc","seq":515,"stream_kind":"final_reply","live":false}
+{"delta":"al ","content":"al ","seq":516,"stream_kind":"final_reply","live":false}
+{"delta":"transactions","content":"transactions","seq":517,"stream_kind":"final_reply","live":false}
+{"delta":"**, each","content":"**, each","seq":518,"stream_kind":"final_reply","live":false}
+{"delta":" with a defined","content":" with a defined","seq":519,"stream_kind":"final_reply","live":false}
+{"delta":" **compensatio","content":" **compensatio","seq":520,"stream_kind":"final_reply","live":false}
+{"delta":"n**.\n\n### Orch","content":"n**.\n\n### Orch","seq":521,"stream_kind":"final_reply","live":false}
+{"delta":"estration-","content":"estration-","seq":522,"stream_kind":"final_reply","live":false}
+{"delta":"based Sag","content":"based Sag","seq":523,"stream_kind":"final_reply","live":false}
+{"delta":"a (the domi","content":"a (the domi","seq":524,"stream_kind":"final_reply","live":false}
+{"delta":"n","content":"n","seq":525,"stream_kind":"final_reply","live":false}
+{"delta":"ant patter","content":"ant patter","seq":526,"stream_kind":"final_reply","live":false}
+{"delta":"n)\n\nA dedic","content":"n)\n\nA dedic","seq":527,"stream_kind":"final_reply","live":false}
+{"delta":"ated **o","content":"ated **o","seq":528,"stream_kind":"final_reply","live":false}
+{"delta":"rches","content":"rches","seq":529,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"trator**","content":"trator**","seq":530,"stream_kind":"final_reply","live":false}
+{"delta":" (often a s","content":" (often a s","seq":531,"stream_kind":"final_reply","live":false}
+{"delta":"tate","content":"tate","seq":532,"stream_kind":"final_reply","live":false}
+{"delta":" machine in i","content":" machine in i","seq":533,"stream_kind":"final_reply","live":false}
+{"delta":"ts own service) ","content":"ts own service) ","seq":534,"stream_kind":"final_reply","live":false}
+{"delta":"drives ","content":"drives ","seq":535,"stream_kind":"final_reply","live":false}
+{"delta":"the flow:\n\n```\n    ","content":"the flow:\n\n```\n    ","seq":536,"stream_kind":"final_reply","live":false}
+{"delta":"                ┌───","content":"                ┌───","seq":537,"stream_kind":"final_reply","live":false}
+{"delta":"───────","content":"───────","seq":538,"stream_kind":"final_reply","live":false}
+{"delta":"────┐\n        ","content":"────┐\n        ","seq":539,"stream_kind":"final_reply","live":false}
+{"delta":"  ","content":"  ","seq":540,"stream_kind":"final_reply","live":false}
+{"delta":"          ","content":"          ","seq":541,"stream_kind":"final_reply","live":false}
+{"delta":"│   SAGA       │\n        ","content":"│   SAGA       │\n        ","seq":542,"stream_kind":"final_reply","live":false}
+{"delta":"   ","content":"   ","seq":543,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":544,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"    │ O","content":"    │ O","seq":545,"stream_kind":"final_reply","live":false}
+{"delta":"RCHESTRATOR │\n        ","content":"RCHESTRATOR │\n        ","seq":546,"stream_kind":"final_reply","live":false}
+{"delta":"      ","content":"      ","seq":547,"stream_kind":"final_reply","live":false}
+{"delta":"      └","content":"      └","seq":548,"stream_kind":"final_reply","live":false}
+{"delta":"──┬──┬","content":"──┬──┬","seq":549,"stream_kind":"final_reply","live":false}
+{"delta":"──┬──┬──┘\n       ","content":"──┬──┬──┘\n       ","seq":550,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":551,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":552,"stream_kind":"final_reply","live":false}
+{"delta":"      │ ","content":"      │ ","seq":553,"stream_kind":"final_reply","live":false}
+{"delta":" │  │  │\n       ","content":" │  │  │\n       ","seq":554,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":555,"stream_kind":"final_reply","live":false}
+{"delta":"  com","content":"  com","seq":556,"stream_kind":"final_reply","live":false}
+{"delta":"mands │ ","content":"mands │ ","seq":557,"stream_kind":"final_reply","live":false}
+{"delta":" │  │","content":" │  │","seq":558,"stream_kind":"final_reply","live":false}
+{"delta":"  │  ","content":"  │  ","seq":559,"stream_kind":"final_reply","live":false}
+{"delta":"events (responses)\n       ","content":"events (responses)\n       ","seq":560,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":561,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":562,"stream_kind":"final_reply","live":false}
+{"delta":"  ▼ ","content":"  ▼ ","seq":563,"stream_kind":"final_reply","live":false}
+{"delta":" ▼  ▼  ▼\n    ","content":" ▼  ▼  ▼\n    ","seq":564,"stream_kind":"final_reply","live":false}
+{"delta":"                ┌───────","content":"                ┌───────","seq":565,"stream_kind":"final_reply","live":false}
+{"delta":"───","content":"───","seq":566,"stream_kind":"final_reply","live":false}
+{"delta":"────┐\n        ","content":"────┐\n        ","seq":567,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":568,"stream_kind":"final_reply","live":false}
+{"delta":"       ","content":"       ","seq":569,"stream_kind":"final_reply","live":false}
+{"delta":"│    KAFKA     │\n     ","content":"│    KAFKA     │\n     ","seq":570,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":571,"stream_kind":"final_reply","live":false}
+{"delta":"      └","content":"      └","seq":572,"stream_kind":"final_reply","live":false}
+{"delta":"──┬──┬","content":"──┬──┬","seq":573,"stream_kind":"final_reply","live":false}
+{"delta":"──┬──┬──┘\n       ","content":"──┬──┬──┘\n       ","seq":574,"stream_kind":"final_reply","live":false}
+{"delta":"    ","content":"    ","seq":575,"stream_kind":"final_reply","live":false}
+{"delta":"          ","content":"          ","seq":576,"stream_kind":"final_reply","live":false}
+{"delta":"  │  │  │  │\n       ","content":"  │  │  │  │\n       ","seq":577,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":578,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":579,"stream_kind":"final_reply","live":false}
+{"delta":"  ▼ ","content":"  ▼ ","seq":580,"stream_kind":"final_reply","live":false}
+{"delta":" ▼  ▼  ▼\n   ","content":" ▼  ▼  ▼\n   ","seq":581,"stream_kind":"final_reply","live":false}
+{"delta":"              ","content":"              ","seq":582,"stream_kind":"final_reply","live":false}
+{"delta":"  Order Payment Inv","content":"  Order Payment Inv","seq":583,"stream_kind":"final_reply","live":false}
+{"delta":"entory","content":"entory","seq":584,"stream_kind":"final_reply","live":false}
+{"delta":" Ship","content":" Ship","seq":585,"stream_kind":"final_reply","live":false}
+{"delta":"ping\n```\n\n**C","content":"ping\n```\n\n**C","seq":586,"stream_kind":"final_reply","live":false}
+{"delta":"oncret","content":"oncret","seq":587,"stream_kind":"final_reply","live":false}
+{"delta":"e example ","content":"e example ","seq":588,"stream_kind":"final_reply","live":false}
+{"delta":"— \"Place Or","content":"— \"Place Or","seq":589,"stream_kind":"final_reply","live":false}
+{"delta":"der\" saga:**\n\n","content":"der\" saga:**\n\n","seq":590,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"| Step | Action","content":"| Step | Action","seq":591,"stream_kind":"final_reply","live":false}
+{"delta":" |","content":" |","seq":592,"stream_kind":"final_reply","live":false}
+{"delta":" Compen","content":" Compen","seq":593,"stream_kind":"final_reply","live":false}
+{"delta":"sation (if t","content":"sation (if t","seq":594,"stream_kind":"final_reply","live":false}
+{"delta":"his step f","content":"his step f","seq":595,"stream_kind":"final_reply","live":false}
+{"delta":"ails) |\n|","content":"ails) |\n|","seq":596,"stream_kind":"final_reply","live":false}
+{"delta":"------|--------|-----------------","content":"------|--------|-----------------","seq":597,"stream_kind":"final_reply","live":false}
+{"delta":"-------","content":"-------","seq":598,"stream_kind":"final_reply","live":false}
+{"delta":"------","content":"------","seq":599,"stream_kind":"final_reply","live":false}
+{"delta":"-----|\n| 1 | **R","content":"-----|\n| 1 | **R","seq":600,"stream_kind":"final_reply","live":false}
+{"delta":"eser","content":"eser","seq":601,"stream_kind":"final_reply","live":false}
+{"delta":"veInvent","content":"veInvent","seq":602,"stream_kind":"final_reply","live":false}
+{"delta":"ory** | R","content":"ory** | R","seq":603,"stream_kind":"final_reply","live":false}
+{"delta":"elease","content":"elease","seq":604,"stream_kind":"final_reply","live":false}
+{"delta":"Inven","content":"Inven","seq":605,"stream_kind":"final_reply","live":false}
+{"delta":"tory |\n| 2 | **A","content":"tory |\n| 2 | **A","seq":606,"stream_kind":"final_reply","live":false}
+{"delta":"uthorize","content":"uthorize","seq":607,"stream_kind":"final_reply","live":false}
+{"delta":"Payment** | R","content":"Payment** | R","seq":608,"stream_kind":"final_reply","live":false}
+{"delta":"efund","content":"efund","seq":609,"stream_kind":"final_reply","live":false}
+{"delta":"Payment |\n| 3 | *","content":"Payment |\n| 3 | *","seq":610,"stream_kind":"final_reply","live":false}
+{"delta":"*ConfirmO","content":"*ConfirmO","seq":611,"stream_kind":"final_reply","live":false}
+{"delta":"rder** |","content":"rder** |","seq":612,"stream_kind":"final_reply","live":false}
+{"delta":" Canc","content":" Canc","seq":613,"stream_kind":"final_reply","live":false}
+{"delta":"elOrder |\n| ","content":"elOrder |\n| ","seq":614,"stream_kind":"final_reply","live":false}
+{"delta":"4 | **","content":"4 | **","seq":615,"stream_kind":"final_reply","live":false}
+{"delta":"ShipOrde","content":"ShipOrde","seq":616,"stream_kind":"final_reply","live":false}
+{"delta":"r** | (termin","content":"r** | (termin","seq":617,"stream_kind":"final_reply","live":false}
+{"delta":"al — es","content":"al — es","seq":618,"stream_kind":"final_reply","live":false}
+{"delta":"c","content":"c","seq":619,"stream_kind":"final_reply","live":false}
+{"delta":"alate ","content":"alate ","seq":620,"stream_kind":"final_reply","live":false}
+{"delta":"to hu","content":"to hu","seq":621,"stream_kind":"final_reply","live":false}
+{"delta":"man) |\n\nI","content":"man) |\n\nI","seq":622,"stream_kind":"final_reply","live":false}
+{"delta":"f step 3 fail","content":"f step 3 fail","seq":623,"stream_kind":"final_reply","live":false}
+{"delta":"s, the or","content":"s, the or","seq":624,"stream_kind":"final_reply","live":false}
+{"delta":"chestrator runs c","content":"chestrator runs c","seq":625,"stream_kind":"final_reply","live":false}
+{"delta":"omp","content":"omp","seq":626,"stream_kind":"final_reply","live":false}
+{"delta":"ensations in **r","content":"ensations in **r","seq":627,"stream_kind":"final_reply","live":false}
+{"delta":"everse order**: Re","content":"everse order**: Re","seq":628,"stream_kind":"final_reply","live":false}
+{"delta":"fundPayment → Re","content":"fundPayment → Re","seq":629,"stream_kind":"final_reply","live":false}
+{"delta":"lease","content":"lease","seq":630,"stream_kind":"final_reply","live":false}
+{"delta":"Inventory. Ea","content":"Inventory. Ea","seq":631,"stream_kind":"final_reply","live":false}
+{"delta":"ch compens","content":"ch compens","seq":632,"stream_kind":"final_reply","live":false}
+{"delta":"ati","content":"ati","seq":633,"stream_kind":"final_reply","live":false}
+{"delta":"on is itse","content":"on is itse","seq":634,"stream_kind":"final_reply","live":false}
+{"delta":"lf","content":"lf","seq":635,"stream_kind":"final_reply","live":false}
+{"delta":" an eve","content":" an eve","seq":636,"stream_kind":"final_reply","live":false}
+{"delta":"nt — `Pa","content":"nt — `Pa","seq":637,"stream_kind":"final_reply","live":false}
+{"delta":"ymentRefunded`, `In","content":"ymentRefunded`, `In","seq":638,"stream_kind":"final_reply","live":false}
+{"delta":"ventory","content":"ventory","seq":639,"stream_kind":"final_reply","live":false}
+{"delta":"Rele","content":"Rele","seq":640,"stream_kind":"final_reply","live":false}
+{"delta":"ased`.\n\n### Key d","content":"ased`.\n\n### Key d","seq":641,"stream_kind":"final_reply","live":false}
+{"delta":"esign","content":"esign","seq":642,"stream_kind":"final_reply","live":false}
+{"delta":" d","content":" d","seq":643,"stream_kind":"final_reply","live":false}
+{"delta":"ecisions:\n\n**O","content":"ecisions:\n\n**O","seq":644,"stream_kind":"final_reply","live":false}
+{"delta":"rchestration ","content":"rchestration ","seq":645,"stream_kind":"final_reply","live":false}
+{"delta":"vs Ch","content":"vs Ch","seq":646,"stream_kind":"final_reply","live":false}
+{"delta":"oreography:**\n- ","content":"oreography:**\n- ","seq":647,"stream_kind":"final_reply","live":false}
+{"delta":"**Orch","content":"**Orch","seq":648,"stream_kind":"final_reply","live":false}
+{"delta":"estration** — cent","content":"estration** — cent","seq":649,"stream_kind":"final_reply","live":false}
+{"delta":"ral co","content":"ral co","seq":650,"stream_kind":"final_reply","live":false}
+{"delta":"ordinator","content":"ordinator","seq":651,"stream_kind":"final_reply","live":false}
+{"delta":" know","content":" know","seq":652,"stream_kind":"final_reply","live":false}
+{"delta":"s the ","content":"s the ","seq":653,"stream_kind":"final_reply","live":false}
+{"delta":"flow. Easier t","content":"flow. Easier t","seq":654,"stream_kind":"final_reply","live":false}
+{"delta":"o rea","content":"o rea","seq":655,"stream_kind":"final_reply","live":false}
+{"delta":"son about, te","content":"son about, te","seq":656,"stream_kind":"final_reply","live":false}
+{"delta":"st, and ","content":"st, and ","seq":657,"stream_kind":"final_reply","live":false}
+{"delta":"monitor. Single","content":"monitor. Single","seq":658,"stream_kind":"final_reply","live":false}
+{"delta":" poin","content":" poin","seq":659,"stream_kind":"final_reply","live":false}
+{"delta":"t of log","content":"t of log","seq":660,"stream_kind":"final_reply","live":false}
+{"delta":"ic (not ","content":"ic (not ","seq":661,"stream_kind":"final_reply","live":false}
+{"delta":"failure — the orch","content":"failure — the orch","seq":662,"stream_kind":"final_reply","live":false}
+{"delta":"estr","content":"estr","seq":663,"stream_kind":"final_reply","live":false}
+{"delta":"ator itse","content":"ator itse","seq":664,"stream_kind":"final_reply","live":false}
+{"delta":"lf can be ev","content":"lf can be ev","seq":665,"stream_kind":"final_reply","live":false}
+{"delta":"ent-s","content":"ent-s","seq":666,"stream_kind":"final_reply","live":false}
+{"delta":"ourced a","content":"ourced a","seq":667,"stream_kind":"final_reply","live":false}
+{"delta":"nd res","content":"nd res","seq":668,"stream_kind":"final_reply","live":false}
+{"delta":"tarted).\n-","content":"tarted).\n-","seq":669,"stream_kind":"final_reply","live":false}
+{"delta":" **Choreogr","content":" **Choreogr","seq":670,"stream_kind":"final_reply","live":false}
+{"delta":"aphy** — eac","content":"aphy** — eac","seq":671,"stream_kind":"final_reply","live":false}
+{"delta":"h service k","content":"h service k","seq":672,"stream_kind":"final_reply","live":false}
+{"delta":"nows w","content":"nows w","seq":673,"stream_kind":"final_reply","live":false}
+{"delta":"hat t","content":"hat t","seq":674,"stream_kind":"final_reply","live":false}
+{"delta":"o do next, ","content":"o do next, ","seq":675,"stream_kind":"final_reply","live":false}
+{"delta":"fire-a","content":"fire-a","seq":676,"stream_kind":"final_reply","live":false}
+{"delta":"nd-for","content":"nd-for","seq":677,"stream_kind":"final_reply","live":false}
+{"delta":"get ","content":"get ","seq":678,"stream_kind":"final_reply","live":false}
+{"delta":"style. Mor","content":"style. Mor","seq":679,"stream_kind":"final_reply","live":false}
+{"delta":"e decoupled but harde","content":"e decoupled but harde","seq":680,"stream_kind":"final_reply","live":false}
+{"delta":"r to und","content":"r to und","seq":681,"stream_kind":"final_reply","live":false}
+{"delta":"erstand the ","content":"erstand the ","seq":682,"stream_kind":"final_reply","live":false}
+{"delta":"e","content":"e","seq":683,"stream_kind":"final_reply","live":false}
+{"delta":"nd-to","content":"nd-to","seq":684,"stream_kind":"final_reply","live":false}
+{"delta":"-end flow. ","content":"-end flow. ","seq":685,"stream_kind":"final_reply","live":false}
+{"delta":"Good fo","content":"Good fo","seq":686,"stream_kind":"final_reply","live":false}
+{"delta":"r","content":"r","seq":687,"stream_kind":"final_reply","live":false}
+{"delta":" simple ch","content":" simple ch","seq":688,"stream_kind":"final_reply","live":false}
+{"delta":"ains, danger","content":"ains, danger","seq":689,"stream_kind":"final_reply","live":false}
+{"delta":"ous for co","content":"ous for co","seq":690,"stream_kind":"final_reply","live":false}
+{"delta":"mplex ","content":"mplex ","seq":691,"stream_kind":"final_reply","live":false}
+{"delta":"processes.\n\n**","content":"processes.\n\n**","seq":692,"stream_kind":"final_reply","live":false}
+{"delta":"Saga gua","content":"Saga gua","seq":693,"stream_kind":"final_reply","live":false}
+{"delta":"rantees","content":"rantees","seq":694,"stream_kind":"final_reply","live":false}
+{"delta":":**\n- **F","content":":**\n- **F","seq":695,"stream_kind":"final_reply","live":false}
+{"delta":"orward","content":"orward","seq":696,"stream_kind":"final_reply","live":false}
+{"delta":" recovery**","content":" recovery**","seq":697,"stream_kind":"final_reply","live":false}
+{"delta":" — retry with e","content":" — retry with e","seq":698,"stream_kind":"final_reply","live":false}
+{"delta":"xpon","content":"xpon","seq":699,"stream_kind":"final_reply","live":false}
+{"delta":"ential backoff.","content":"ential backoff.","seq":700,"stream_kind":"final_reply","live":false}
+{"delta":" Most trans","content":" Most trans","seq":701,"stream_kind":"final_reply","live":false}
+{"delta":"ient failu","content":"ient failu","seq":702,"stream_kind":"final_reply","live":false}
+{"delta":"res ","content":"res ","seq":703,"stream_kind":"final_reply","live":false}
+{"delta":"(netw","content":"(netw","seq":704,"stream_kind":"final_reply","live":false}
+{"delta":"ork b","content":"ork b","seq":705,"stream_kind":"final_reply","live":false}
+{"delta":"lips, timeout","content":"lips, timeout","seq":706,"stream_kind":"final_reply","live":false}
+{"delta":"s) resolve","content":"s) resolve","seq":707,"stream_kind":"final_reply","live":false}
+{"delta":" this way.\n- **Ba","content":" this way.\n- **Ba","seq":708,"stream_kind":"final_reply","live":false}
+{"delta":"ckward rec","content":"ckward rec","seq":709,"stream_kind":"final_reply","live":false}
+{"delta":"overy** ","content":"overy** ","seq":710,"stream_kind":"final_reply","live":false}
+{"delta":"— run comp","content":"— run comp","seq":711,"stream_kind":"final_reply","live":false}
+{"delta":"ensa","content":"ensa","seq":712,"stream_kind":"final_reply","live":false}
+{"delta":"tions. Us","content":"tions. Us","seq":713,"stream_kind":"final_reply","live":false}
+{"delta":"ed for business ","content":"ed for business ","seq":714,"stream_kind":"final_reply","live":false}
+{"delta":"rule ","content":"rule ","seq":715,"stream_kind":"final_reply","live":false}
+{"delta":"violations (insuffi","content":"violations (insuffi","seq":716,"stream_kind":"final_reply","live":false}
+{"delta":"cient inve","content":"cient inve","seq":717,"stream_kind":"final_reply","live":false}
+{"delta":"ntory, decl","content":"ntory, decl","seq":718,"stream_kind":"final_reply","live":false}
+{"delta":"ined p","content":"ined p","seq":719,"stream_kind":"final_reply","live":false}
+{"delta":"ayment).\n","content":"ayment).\n","seq":720,"stream_kind":"final_reply","live":false}
+{"delta":"- **At-least","content":"- **At-least","seq":721,"stream_kind":"final_reply","live":false}
+{"delta":"-once ","content":"-once ","seq":722,"stream_kind":"final_reply","live":false}
+{"delta":"semant","content":"semant","seq":723,"stream_kind":"final_reply","live":false}
+{"delta":"ics**","content":"ics**","seq":724,"stream_kind":"final_reply","live":false}
+{"delta":" — every ","content":" — every ","seq":725,"stream_kind":"final_reply","live":false}
+{"delta":"step mus","content":"step mus","seq":726,"stream_kind":"final_reply","live":false}
+{"delta":"t be ","content":"t be ","seq":727,"stream_kind":"final_reply","live":false}
+{"delta":"idempotent. The o","content":"idempotent. The o","seq":728,"stream_kind":"final_reply","live":false}
+{"delta":"rchestra","content":"rchestra","seq":729,"stream_kind":"final_reply","live":false}
+{"delta":"tor may retry ","content":"tor may retry ","seq":730,"stream_kind":"final_reply","live":false}
+{"delta":"a command","content":"a command","seq":731,"stream_kind":"final_reply","live":false}
+{"delta":" whose re","content":" whose re","seq":732,"stream_kind":"final_reply","live":false}
+{"delta":"sponse was","content":"sponse was","seq":733,"stream_kind":"final_reply","live":false}
+{"delta":" los","content":" los","seq":734,"stream_kind":"final_reply","live":false}
+{"delta":"t.\n\n---\n\n## T","content":"t.\n\n---\n\n## T","seq":735,"stream_kind":"final_reply","live":false}
+{"delta":"he Ful","content":"he Ful","seq":736,"stream_kind":"final_reply","live":false}
+{"delta":"l Picture\n\n```\n          ","content":"l Picture\n\n```\n          ","seq":737,"stream_kind":"final_reply","live":false}
+{"delta":"                ┌───────────","content":"                ┌───────────","seq":738,"stream_kind":"final_reply","live":false}
+{"delta":"────","content":"────","seq":739,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":740,"stream_kind":"final_reply","live":false}
+{"delta":"────┐\n                ","content":"────┐\n                ","seq":741,"stream_kind":"final_reply","live":false}
+{"delta":"    ","content":"    ","seq":742,"stream_kind":"final_reply","live":false}
+{"delta":"      │   ","content":"      │   ","seq":743,"stream_kind":"final_reply","live":false}
+{"delta":"API","content":"API","seq":744,"stream_kind":"final_reply","live":false}
+{"delta":" Gateway / BFF  │\n           ","content":" Gateway / BFF  │\n           ","seq":745,"stream_kind":"final_reply","live":false}
+{"delta":"               ","content":"               ","seq":746,"stream_kind":"final_reply","live":false}
+{"delta":"└──────","content":"└──────","seq":747,"stream_kind":"final_reply","live":false}
+{"delta":"┬──────┬─","content":"┬──────┬─","seq":748,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":749,"stream_kind":"final_reply","live":false}
+{"delta":"────┘\n                 ","content":"────┘\n                 ","seq":750,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":751,"stream_kind":"final_reply","live":false}
+{"delta":"       │      │\n    ","content":"       │      │\n    ","seq":752,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":753,"stream_kind":"final_reply","live":false}
+{"delta":"       c","content":"       c","seq":754,"stream_kind":"final_reply","live":false}
+{"delta":"ommands  ","content":"ommands  ","seq":755,"stream_kind":"final_reply","live":false}
+{"delta":"   │    ","content":"   │    ","seq":756,"stream_kind":"final_reply","live":false}
+{"delta":"  │  queries\n                 ","content":"  │  queries\n                 ","seq":757,"stream_kind":"final_reply","live":false}
+{"delta":"    ","content":"    ","seq":758,"stream_kind":"final_reply","live":false}
+{"delta":"         ","content":"         ","seq":759,"stream_kind":"final_reply","live":false}
+{"delta":"   ▼      ▼\n┌───","content":"   ▼      ▼\n┌───","seq":760,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":761,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":762,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":763,"stream_kind":"final_reply","live":false}
+{"delta":"──┐  events  ┌───","content":"──┐  events  ┌───","seq":764,"stream_kind":"final_reply","live":false}
+{"delta":"───────","content":"───────","seq":765,"stream_kind":"final_reply","live":false}
+{"delta":"────┐  ┌───","content":"────┐  ┌───","seq":766,"stream_kind":"final_reply","live":false}
+{"delta":"───────","content":"───────","seq":767,"stream_kind":"final_reply","live":false}
+{"delta":"───","content":"───","seq":768,"stream_kind":"final_reply","live":false}
+{"delta":"─┐\n","content":"─┐\n","seq":769,"stream_kind":"final_reply","live":false}
+{"delta":"│  Order   │───","content":"│  Order   │───","seq":770,"stream_kind":"final_reply","live":false}
+{"delta":"───","content":"───","seq":771,"stream_kind":"final_reply","live":false}
+{"delta":"───►│   ","content":"───►│   ","seq":772,"stream_kind":"final_reply","live":false}
+{"delta":"      ","content":"      ","seq":773,"stream_kind":"final_reply","live":false}
+{"delta":"     │  │   ","content":"     │  │   ","seq":774,"stream_kind":"final_reply","live":false}
+{"delta":"Materialized","content":"Materialized","seq":775,"stream_kind":"final_reply","live":false}
+{"delta":"│\n│ Servic","content":"│\n│ Servic","seq":776,"stream_kind":"final_reply","live":false}
+{"delta":"e  │ ","content":"e  │ ","seq":777,"stream_kind":"final_reply","live":false}
+{"delta":"    ","content":"    ","seq":778,"stream_kind":"final_reply","live":false}
+{"delta":"     ","content":"     ","seq":779,"stream_kind":"final_reply","live":false}
+{"delta":"│    KAFKA","content":"│    KAFKA","seq":780,"stream_kind":"final_reply","live":false}
+{"delta":"     │  ","content":"     │  ","seq":781,"stream_kind":"final_reply","live":false}
+{"delta":"│   Views","content":"│   Views","seq":782,"stream_kind":"final_reply","live":false}
+{"delta":"       ","content":"       ","seq":783,"stream_kind":"final_reply","live":false}
+{"delta":"│\n│(write)   │◄────","content":"│\n│(write)   │◄────","seq":784,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":785,"stream_kind":"final_reply","live":false}
+{"delta":"────","content":"────","seq":786,"stream_kind":"final_reply","live":false}
+{"delta":"│  (","content":"│  (","seq":787,"stream_kind":"final_reply","live":false}
+{"delta":"event ","content":"event ","seq":788,"stream_kind":"final_reply","live":false}
+{"delta":"bus  ","content":"bus  ","seq":789,"stream_kind":"final_reply","live":false}
+{"delta":"│  │   (","content":"│  │   (","seq":790,"stream_kind":"final_reply","live":false}
+{"delta":"read)      │\n└─────","content":"read)      │\n└─────","seq":791,"stream_kind":"final_reply","live":false}
+{"delta":"────","content":"────","seq":792,"stream_kind":"final_reply","live":false}
+{"delta":"─┘","content":"─┘","seq":793,"stream_kind":"final_reply","live":false}
+{"delta":"        ","content":"        ","seq":794,"stream_kind":"final_reply","live":false}
+{"delta":"  ","content":"  ","seq":795,"stream_kind":"final_reply","live":false}
+{"delta":"│   ","content":"│   ","seq":796,"stream_kind":"final_reply","live":false}
+{"delta":"+ store)   │  └───","content":"+ store)   │  └───","seq":797,"stream_kind":"final_reply","live":false}
+{"delta":"───────────┘\n      ","content":"───────────┘\n      ","seq":798,"stream_kind":"final_reply","live":false}
+{"delta":"                ","content":"                ","seq":799,"stream_kind":"final_reply","live":false}
+{"delta":"│      ","content":"│      ","seq":800,"stream_kind":"final_reply","live":false}
+{"delta":"        │\n┌─────────","content":"        │\n┌─────────","seq":801,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":802,"stream_kind":"final_reply","live":false}
+{"delta":"┐          │    ","content":"┐          │    ","seq":803,"stream_kind":"final_reply","live":false}
+{"delta":"          │  ┌─────────","content":"          │  ┌─────────","seq":804,"stream_kind":"final_reply","live":false}
+{"delta":"─","content":"─","seq":805,"stream_kind":"final_reply","live":false}
+{"delta":"────","content":"────","seq":806,"stream_kind":"final_reply","live":false}
+{"delta":"┐\n│ Payment  │───","content":"┐\n│ Payment  │───","seq":807,"stream_kind":"final_reply","live":false}
+{"delta":"───","content":"───","seq":808,"stream_kind":"final_reply","live":false}
+{"delta":"───►│        ","content":"───►│        ","seq":809,"stream_kind":"final_reply","live":false}
+{"delta":"      │","content":"      │","seq":810,"stream_kind":"final_reply","live":false}
+{"delta":"──","content":"──","seq":811,"stream_kind":"final_reply","live":false}
+{"delta":"│  Saga         ","content":"│  Saga         ","seq":812,"stream_kind":"final_reply","live":false}
+{"delta":"│\n│ Service  ","content":"│\n│ Service  ","seq":813,"stream_kind":"final_reply","live":false}
+{"delta":"│          │       ","content":"│          │       ","seq":814,"stream_kind":"final_reply","live":false}
+{"delta":"       │  ","content":"       │  ","seq":815,"stream_kind":"final_reply","live":false}
+{"delta":"│","content":"│","seq":816,"stream_kind":"final_reply","live":false}
+{"delta":"  Orchestrator │\n└─────","content":"  Orchestrator │\n└─────","seq":817,"stream_kind":"final_reply","live":false}
+{"delta":"────","content":"────","seq":818,"stream_kind":"final_reply","live":false}
+{"delta":"─┘          └───","content":"─┘          └───","seq":819,"stream_kind":"final_reply","live":false}
+{"delta":"───────","content":"───────","seq":820,"stream_kind":"final_reply","live":false}
+{"delta":"────┘  └───","content":"────┘  └───","seq":821,"stream_kind":"final_reply","live":false}
+{"delta":"───────","content":"───────","seq":822,"stream_kind":"final_reply","live":false}
+{"delta":"───","content":"───","seq":823,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"─┘\n```\n\nThis arch","content":"─┘\n```\n\nThis arch","seq":824,"stream_kind":"final_reply","live":false}
+{"delta":"ite","content":"ite","seq":825,"stream_kind":"final_reply","live":false}
+{"delta":"cture ","content":"cture ","seq":826,"stream_kind":"final_reply","live":false}
+{"delta":"trades **strong ","content":"trades **strong ","seq":827,"stream_kind":"final_reply","live":false}
+{"delta":"consistency","content":"consistency","seq":828,"stream_kind":"final_reply","live":false}
+{"delta":" for resilien","content":" for resilien","seq":829,"stream_kind":"final_reply","live":false}
+{"delta":"ce, scalabi","content":"ce, scalabi","seq":830,"stream_kind":"final_reply","live":false}
+{"delta":"lity, and ","content":"lity, and ","seq":831,"stream_kind":"final_reply","live":false}
+{"delta":"auditabil","content":"auditabil","seq":832,"stream_kind":"final_reply","live":false}
+{"delta":"ity**. The cost","content":"ity**. The cost","seq":833,"stream_kind":"final_reply","live":false}
+{"delta":" is operational","content":" is operational","seq":834,"stream_kind":"final_reply","live":false}
+{"delta":" comple","content":" comple","seq":835,"stream_kind":"final_reply","live":false}
+{"delta":"xity —","content":"xity —","seq":836,"stream_kind":"final_reply","live":false}
+{"delta":" you're running ","content":" you're running ","seq":837,"stream_kind":"final_reply","live":false}
+{"delta":"Kafka","content":"Kafka","seq":838,"stream_kind":"final_reply","live":false}
+{"delta":", man","content":", man","seq":839,"stream_kind":"final_reply","live":false}
+{"delta":"aging","content":"aging","seq":840,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":" schemas (Avr","content":" schemas (Avr","seq":841,"stream_kind":"final_reply","live":false}
+{"delta":"o/","content":"o/","seq":842,"stream_kind":"final_reply","live":false}
+{"delta":"Protobuf with a schema regi","content":"Protobuf with a schema regi","seq":843,"stream_kind":"final_reply","live":false}
+{"delta":"stry), ","content":"stry), ","seq":844,"stream_kind":"final_reply","live":false}
+{"delta":"handling schema evolut","content":"handling schema evolut","seq":845,"stream_kind":"final_reply","live":false}
+{"delta":"ion, moni","content":"ion, moni","seq":846,"stream_kind":"final_reply","live":false}
+{"delta":"toring co","content":"toring co","seq":847,"stream_kind":"final_reply","live":false}
+{"delta":"nsumer lag, and debuggi","content":"nsumer lag, and debuggi","seq":848,"stream_kind":"final_reply","live":false}
+{"delta":"ng async","content":"ng async","seq":849,"stream_kind":"final_reply","live":false}
+{"delta":"hronous","content":"hronous","seq":850,"stream_kind":"final_reply","live":false}
+{"delta":" fail","content":" fail","seq":851,"stream_kind":"final_reply","live":false}
+{"delta":"ure chains. ","content":"ure chains. ","seq":852,"stream_kind":"final_reply","live":false}
+{"delta":"The payoff is a ","content":"The payoff is a ","seq":853,"stream_kind":"final_reply","live":false}
+{"delta":"system that can a","content":"system that can a","seq":854,"stream_kind":"final_reply","live":false}
+{"delta":"bsorb component ","content":"bsorb component ","seq":855,"stream_kind":"final_reply","live":false}
+{"delta":"failur","content":"failur","seq":856,"stream_kind":"final_reply","live":false}
+{"delta":"es, scale read","content":"es, scale read","seq":857,"stream_kind":"final_reply","live":false}
+{"delta":"s ind","content":"s ind","seq":858,"stream_kind":"final_reply","live":false}
+{"delta":"ependently from w","content":"ependently from w","seq":859,"stream_kind":"final_reply","live":false}
+{"delta":"rites,","content":"rites,","seq":860,"stream_kind":"final_reply","live":false}
+{"delta":" and give ","content":" and give ","seq":861,"stream_kind":"final_reply","live":false}
+{"delta":"you a c","content":"you a c","seq":862,"stream_kind":"final_reply","live":false}
+{"delta":"omplete, replayable h","content":"omplete, replayable h","seq":863,"stream_kind":"final_reply","live":false}
+{"delta":"istory of","content":"istory of","seq":864,"stream_kind":"final_reply","live":false}
+{"delta":" eve","content":" eve","seq":865,"stream_kind":"final_reply","live":false}
+{"delta":"ry decision ","content":"ry decision ","seq":866,"stream_kind":"final_reply","live":false}
+{"delta":"the sy","content":"the sy","seq":867,"stream_kind":"final_reply","live":false}
+{"delta":"stem ever made.","content":"stem ever made.","seq":868,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":185557,"run_id":"r-1777927261184-1"}
+{"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777927261184-1"}
+{"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":0,"duration_ms":0,"run_id":"r-1777927261184-1"}
+{"type":"progress","phase":"memory_lifecycle_summarizer","state":"update","label":"memory_lifecycle_summarizer","duration_ms":1138}
+{"type":"progress","phase":"continuity_refresh","state":"update","label":"Refreshing continuity","duration_ms":1145}
+{"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+{"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":0,"duration_ms":1154,"run_id":"r-1777927261184-1"}
+{"type":"done","session_id":"agent:zaki-bot:user:7777:thread:kimi-passc-1777927230","message_id":"1777927448078"}
