@@ -536,17 +536,42 @@ pub const MarkdownMemory = struct {
         }
         var mutable_positions: std.StringHashMapUnmanaged(usize) = .empty;
         defer mutable_positions.deinit(allocator);
+        // V1.8-0 fix: tombstoned stores OWNED keys (duped from entry.key slices).
+        // Without this, target_key — a slice into entry.key — outlives entry.deinit
+        // at the end of each iteration, leaving dangling key pointers in the hashmap.
+        // Subsequent puts then corrupt bucket invariants and a later grow rehash
+        // crashes with putAssumeCapacityNoClobberContext assertion failure.
+        // See .audit/v1.8/runs/kimi-pass-c-20260504-215527/FINDINGS.md
         var tombstoned: std.StringHashMapUnmanaged(void) = .empty;
-        defer tombstoned.deinit(allocator);
+        defer {
+            var it = tombstoned.keyIterator();
+            while (it.next()) |k_ptr| allocator.free(k_ptr.*);
+            tombstoned.deinit(allocator);
+        }
 
         for (all.items) |*entry_ptr| {
             var entry = entry_ptr.*;
             if (root.isTombstoneKey(entry.key)) {
-                if (root.tombstoneTargetKey(entry.key)) |target_key| {
-                    try tombstoned.put(allocator, target_key, {});
-                    if (mutable_positions.get(target_key)) |idx| {
+                if (root.tombstoneTargetKey(entry.key)) |target_key_slice| {
+                    // Dupe before tombstoned.put — target_key_slice points into
+                    // entry.key memory which is freed by entry.deinit below.
+                    const target_key = try allocator.dupe(u8, target_key_slice);
+                    const gop = try tombstoned.getOrPut(allocator, target_key);
+                    if (gop.found_existing) {
+                        // Same key tombstoned more than once — free the dupe,
+                        // existing entry already owns its key memory.
+                        allocator.free(target_key);
+                    }
+                    // Use target_key_slice for mutable_positions lookup since the
+                    // slice is still alive within this iteration step. (Either
+                    // pointer would byte-match; using the slice avoids relying on
+                    // the gop branch above.)
+                    if (mutable_positions.get(target_key_slice)) |idx| {
+                        // Order matters: remove from mutable_positions BEFORE
+                        // deinit'ing collapsed.items[idx] (whose key is the
+                        // pointer mutable_positions stored).
+                        _ = mutable_positions.remove(target_key_slice);
                         collapsed.items[idx].deinit(allocator);
-                        _ = mutable_positions.remove(target_key);
                         _ = collapsed.swapRemove(idx);
                         if (idx < collapsed.items.len) {
                             const moved_key = collapsed.items[idx].key;
