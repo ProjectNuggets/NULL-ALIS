@@ -1,0 +1,101 @@
+{"type":"statusResponse","content":"Processing request"}
+{"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+{"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":27,"run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":2,"run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":4205,"run_id":"r-1777908840176-5"}
+{"delta":"Let","content":"Let","seq":0,"stream_kind":"final_reply","live":false}
+{"delta":" me lock","content":" me lock","seq":1,"stream_kind":"final_reply","live":false}
+{"delta":" all","content":" all","seq":2,"stream_kind":"final_reply","live":false}
+{"delta":" of that in","content":" of that in","seq":3,"stream_kind":"final_reply","live":false}
+{"delta":" — an","content":" — an","seq":4,"stream_kind":"final_reply","live":false}
+{"delta":"d ground myself on","content":"d ground myself on","seq":5,"stream_kind":"final_reply","live":false}
+{"delta":" Widget","content":" Widget","seq":6,"stream_kind":"final_reply","live":false}
+{"delta":"Co whi","content":"Co whi","seq":7,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"le I'm at it.\n\n","content":"le I'm at it.\n\n","seq":8,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":48874,"run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777908840176-5"}
+{"type":"tool_start","tool":"web_search","tool_use_id":"call_119d0e47e4534b39b1f3e0c9","input_preview":"{\"query\": \"WidgetCo company\", \"count\": 5}","run_id":"r-1777908840176-5"}
+{"type":"tool_result","tool":"web_search","success":true,"duration_ms":1314,"tool_use_id":"call_119d0e47e4534b39b1f3e0c9","output_preview":"Results for: WidgetCo company\n\n1. WidgetCo - Buy Corks, Wood Plugs, Cork Underlayment, Stoppers & More\n   https://www.widgetco.com/\n   Official store for WidgetCo manufactured products. Buy the best corks, shelf pins, wood plugs, and hole plugs. Find all s","output_truncated":true,"result_summary":"completed","run_id":"r-1777908840176-5"}
+{"type":"tool_start","tool":"memory_store","tool_use_id":"call_36fba157e6e94afdbd86417c","input_preview":"{\"key\": \"nova-works-at-hrs\", \"content\": \"Nova works at HRS.\", \"category\": \"core\", \"scope\": \"global\", \"subject\": \"Nova\", \"predicate\": \"WORKS_AT\", \"object\": \"HRS\"}","run_id":"r-1777908840176-5"}
+{"type":"tool_result","tool":"memory_store","success":true,"duration_ms":274,"tool_use_id":"call_36fba157e6e94afdbd86417c","output_preview":"Memory stored: Nova WORKS_AT HRS (judge=off, coref=on, contradictions_resolved=0)","result_summary":"completed","run_id":"r-1777908840176-5"}
+{"type":"tool_start","tool":"memory_store","tool_use_id":"call_1e048437ee354d1fa2fcd99d","input_preview":"{\"key\": \"alex-colleague-at-hrs\", \"content\": \"Alex is Nova's colleague at HRS. They are working together on the MNDA contract for WidgetCo.\", \"category\": \"core\", \"scope\": \"global\", \"subject\": \"Alex\", \"predicate\": \"WORKS_WITH\", \"object\": \"Nova\"}","run_id":"r-1777908840176-5"}
+{"type":"tool_result","tool":"memory_store","success":true,"duration_ms":722,"tool_use_id":"call_1e048437ee354d1fa2fcd99d","output_preview":"Memory stored: Alex WORKS_WITH Nova (judge=off, coref=on, contradictions_resolved=0)","result_summary":"completed","run_id":"r-1777908840176-5"}
+{"type":"tool_start","tool":"memory_store","tool_use_id":"call_d7acb8485c31419c81b7fa2a","input_preview":"{\"key\": \"widgetco-mnda-contract\", \"content\": \"Nova and Alex are working on an MNDA (Mutual Non-Disclosure Agreement) contract for client WidgetCo at HRS.\", \"category\": \"core\", \"scope\": \"global\", \"subject\": \"WidgetCo\", \"predicate\": \"HAS_ACTIVE_CONTRACT\", \"object\": \"MNDA with HRS\"}","run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"tool_result","tool":"memory_store","success":true,"duration_ms":232,"tool_use_id":"call_d7acb8485c31419c81b7fa2a","output_preview":"Memory stored: WidgetCo HAS_ACTIVE_CONTRACT MNDA with HRS (judge=off, coref=on, contradictions_resolved=0)","result_summary":"completed","run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":0,"duration_ms":5,"run_id":"r-1777908840176-5"}
+{"type":"reasoning_summary","summary":"WidgetCo is a real company, and their website is at widgetco.com, where they sell various cork products. Next, I'll look up the MNDA contract specifics, likely stored in a file named something like 'widgetco_mnda_contract_details.txt', to get a better grasp of our client's requirements.","phase":"thinking"}
+{"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":0,"duration_ms":0,"run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":1,"duration_ms":3,"run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":1,"duration_ms":4190,"run_id":"r-1777908840176-5"}
+{"delta":"All thr","content":"All thr","seq":0,"stream_kind":"final_reply","live":false}
+{"delta":"ee sto","content":"ee sto","seq":1,"stream_kind":"final_reply","live":false}
+{"delta":"red. ","content":"red. ","seq":2,"stream_kind":"final_reply","live":false}
+{"delta":"Here's ","content":"Here's ","seq":3,"stream_kind":"final_reply","live":false}
+{"delta":"the ","content":"the ","seq":4,"stream_kind":"final_reply","live":false}
+{"delta":"rundow","content":"rundow","seq":5,"stream_kind":"final_reply","live":false}
+{"delta":"n:\n\n- *","content":"n:\n\n- *","seq":6,"stream_kind":"final_reply","live":false}
+{"delta":"*`nova-","content":"*`nova-","seq":7,"stream_kind":"final_reply","live":false}
+{"delta":"works-at-","content":"works-at-","seq":8,"stream_kind":"final_reply","live":false}
+{"delta":"hrs`** ","content":"hrs`** ","seq":9,"stream_kind":"final_reply","live":false}
+{"delta":"— Nov","content":"— Nov","seq":10,"stream_kind":"final_reply","live":false}
+{"delta":"a WO","content":"a WO","seq":11,"stream_kind":"final_reply","live":false}
+{"delta":"RKS_AT HR","content":"RKS_AT HR","seq":12,"stream_kind":"final_reply","live":false}
+{"delta":"S\n- **`al","content":"S\n- **`al","seq":13,"stream_kind":"final_reply","live":false}
+{"delta":"ex-coll","content":"ex-coll","seq":14,"stream_kind":"final_reply","live":false}
+{"delta":"eague-at-hrs`**","content":"eague-at-hrs`**","seq":15,"stream_kind":"final_reply","live":false}
+{"delta":" — Alex ","content":" — Alex ","seq":16,"stream_kind":"final_reply","live":false}
+{"delta":"WOR","content":"WOR","seq":17,"stream_kind":"final_reply","live":false}
+{"delta":"KS_WI","content":"KS_WI","seq":18,"stream_kind":"final_reply","live":false}
+{"delta":"TH Nova at HRS","content":"TH Nova at HRS","seq":19,"stream_kind":"final_reply","live":false}
+{"delta":", collaboratin","content":", collaboratin","seq":20,"stream_kind":"final_reply","live":false}
+{"delta":"g on th","content":"g on th","seq":21,"stream_kind":"final_reply","live":false}
+{"delta":"e Wid","content":"e Wid","seq":22,"stream_kind":"final_reply","live":false}
+{"delta":"getCo MNDA\n","content":"getCo MNDA\n","seq":23,"stream_kind":"final_reply","live":false}
+{"delta":"- **`wid","content":"- **`wid","seq":24,"stream_kind":"final_reply","live":false}
+{"delta":"getco-mnda-","content":"getco-mnda-","seq":25,"stream_kind":"final_reply","live":false}
+{"delta":"contract`** ","content":"contract`** ","seq":26,"stream_kind":"final_reply","live":false}
+{"delta":"— WidgetCo","content":"— WidgetCo","seq":27,"stream_kind":"final_reply","live":false}
+{"delta":" HAS_AC","content":" HAS_AC","seq":28,"stream_kind":"final_reply","live":false}
+{"delta":"TIVE_CON","content":"TIVE_CON","seq":29,"stream_kind":"final_reply","live":false}
+{"delta":"TRACT ","content":"TRACT ","seq":30,"stream_kind":"final_reply","live":false}
+{"delta":"MNDA with","content":"MNDA with","seq":31,"stream_kind":"final_reply","live":false}
+{"delta":" HRS\n\n","content":" HRS\n\n","seq":32,"stream_kind":"final_reply","live":false}
+{"delta":"On WidgetCo","content":"On WidgetCo","seq":33,"stream_kind":"final_reply","live":false}
+{"delta":" — the ","content":" — the ","seq":34,"stream_kind":"final_reply","live":false}
+{"delta":"search surfaced ","content":"search surfaced ","seq":35,"stream_kind":"final_reply","live":false}
+{"delta":"a few dif","content":"a few dif","seq":36,"stream_kind":"final_reply","live":false}
+{"delta":"ferent","content":"ferent","seq":37,"stream_kind":"final_reply","live":false}
+{"delta":" entities ","content":" entities ","seq":38,"stream_kind":"final_reply","live":false}
+{"delta":"und","content":"und","seq":39,"stream_kind":"final_reply","live":false}
+{"delta":"er th","content":"er th","seq":40,"stream_kind":"final_reply","live":false}
+{"delta":"a","content":"a","seq":41,"stream_kind":"final_reply","live":false}
+{"delta":"t name: a cork/wood produc","content":"t name: a cork/wood produc","seq":42,"stream_kind":"final_reply","live":false}
+{"delta":"ts manufac","content":"ts manufac","seq":43,"stream_kind":"final_reply","live":false}
+{"delta":"turer (widg","content":"turer (widg","seq":44,"stream_kind":"final_reply","live":false}
+{"delta":"etco.com), ","content":"etco.com), ","seq":45,"stream_kind":"final_reply","live":false}
+{"delta":"a TV/mobile","content":"a TV/mobile","seq":46,"stream_kind":"final_reply","live":false}
+{"delta":" app compan","content":" app compan","seq":47,"stream_kind":"final_reply","live":false}
+{"delta":"y on P","content":"y on P","seq":48,"stream_kind":"final_reply","live":false}
+{"delta":"itchBook, an","content":"itchBook, an","seq":49,"stream_kind":"final_reply","live":false}
+{"delta":"d a generic EPA r","content":"d a generic EPA r","seq":50,"stream_kind":"final_reply","live":false}
+{"delta":"eferenc","content":"eferenc","seq":51,"stream_kind":"final_reply","live":false}
+{"delta":"e. Whi","content":"e. Whi","seq":52,"stream_kind":"final_reply","live":false}
+{"delta":"ch WidgetCo ","content":"ch WidgetCo ","seq":53,"stream_kind":"final_reply","live":false}
+{"delta":"are yo","content":"are yo","seq":54,"stream_kind":"final_reply","live":false}
+{"delta":"u dealing","content":"u dealing","seq":55,"stream_kind":"final_reply","live":false}
+{"delta":" with? Or is it ","content":" with? Or is it ","seq":56,"stream_kind":"final_reply","live":false}
+{"delta":"a differen","content":"a differen","seq":57,"stream_kind":"final_reply","live":false}
+{"delta":"t one entirely?","content":"t one entirely?","seq":58,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":5920,"run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":1,"duration_ms":0,"run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":1,"duration_ms":0,"run_id":"r-1777908840176-5"}
+{"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+{"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":1,"duration_ms":13,"run_id":"r-1777908840176-5"}
+{"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777908897968"}

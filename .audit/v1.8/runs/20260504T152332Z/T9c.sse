@@ -1,0 +1,210 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: progress
+data: {"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":39,"run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":7,"run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":5428,"run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":5428,"run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777909149436-11"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_recall","tool_use_id":"call_c79ed3ccdcc14b8eb02ee98d","input_preview":"{\"query\": \"Cadence stakeholder platform team\", \"scope\": \"global\"}","run_id":"r-1777909149436-11"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_recall","success":true,"duration_ms":466,"tool_use_id":"call_c79ed3ccdcc14b8eb02ee98d","output_preview":"Found 4 memories:\n1. [q3-2026-budget-envelope] [vector] channel=unknown lane=unknown score=0.02: Nova's Q3 2026 engineering budget envelope across all three projects (Atlas, Borealis, Cadence) is 18% of Q3 engineering.\n2. [timeline_summary/agent:zaki-bot:u","output_truncated":true,"result_summary":"completed","run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":0,"duration_ms":4,"run_id":"r-1777909149436-11"}
+
+event: reasoning_summary
+data: {"type":"reasoning_summary","summary":"I just recalled that Project Borealis has a risk related to Cytoscape edge-bundling performance on large datasets with more than 5,000 nodes. \nNext, I'm going to look into the stakeholder platform team's Cadence project, specifically the Nova's Q3 2026 engineering budget envelope that was mentioned in one of the memories.","phase":"thinking"}
+
+event: progress
+data: {"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":0,"duration_ms":0,"run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":1,"duration_ms":7,"run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":1,"duration_ms":22508,"run_id":"r-1777909149436-11"}
+
+event: token
+data: {"delta":"Fr","content":"Fr","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"om memory (`","content":"om memory (`","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ext","content":"ext","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"racte","content":"racte","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d_fa","content":"d_fa","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"2190f","content":"2190f","seq":5,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"6ca","content":"6ca","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"46407a`): **You** ","content":"46407a`): **You** ","seq":7,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"work on Proj","content":"work on Proj","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ect Caden","content":"ect Caden","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ce — it's on","content":"ce — it's on","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e of your three paralle","content":"e of your three paralle","seq":11,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l projects th","content":"l projects th","seq":12,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"is quarter.","content":"is quarter.","seq":13,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" The **","content":" The **","seq":14,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"platfor","content":"platfor","seq":15,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"m team** is the","content":"m team** is the","seq":16,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" s","content":" s","seq":17,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"takeholder.\n\nS","content":"takeholder.\n\nS","seq":18,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o the b","content":"o the b","seq":19,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"reakdown acros","content":"reakdown acros","seq":20,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s all three:\n\n","content":"s all three:\n\n","seq":21,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"| Project | ","content":"| Project | ","seq":22,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Who work","content":"Who work","seq":23,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s on it | Stakeho","content":"s on it | Stakeho","seq":24,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lder |\n|---|-","content":"lder |\n|---|-","seq":25,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"--|---","content":"--|---","seq":26,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"|\n| Atl","content":"|\n| Atl","seq":27,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"as | You ","content":"as | You ","seq":28,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"| Alex","content":"| Alex","seq":29,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" |\n| B","content":" |\n| B","seq":30,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"orealis | You","content":"orealis | You","seq":31,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" | Sar","content":" | Sar","seq":32,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"a |\n| ","content":"a |\n| ","seq":33,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Cadence | You | Platf","content":"Cadence | You | Platf","seq":34,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"orm team |\n\nYo","content":"orm team |\n\nYo","seq":35,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"u're the common th","content":"u're the common th","seq":36,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"read acros","content":"read acros","seq":37,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s all three ","content":"s all three ","seq":38,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— wh","content":"— wh","seq":39,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ich makes s","content":"ich makes s","seq":40,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ense ","content":"ense ","seq":41,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"given the 18% Q3 bud","content":"given the 18% Q3 bud","seq":42,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"get envel","content":"get envel","seq":43,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ope is y","content":"ope is y","seq":44,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ours to manage.","content":"ours to manage.","seq":45,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":24141,"run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":1,"duration_ms":0,"run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":1,"duration_ms":0,"run_id":"r-1777909149436-11"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":1,"duration_ms":12,"run_id":"r-1777909149436-11"}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777909179812"}
+

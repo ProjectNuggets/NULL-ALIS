@@ -1,0 +1,189 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: progress
+data: {"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":736,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":3,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":7487,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token_upper_bound","state":"update","label":"Waiting for model","iteration":0,"duration_ms":7487,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777908763606-3"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_recall","tool_use_id":"call_7eae5063f51a45e29c80316c","input_preview":"{\"query\": \"editor preference Helix NeoVim\", \"scope\": \"global\"}","run_id":"r-1777908763606-3"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_recall","success":true,"duration_ms":305,"tool_use_id":"call_7eae5063f51a45e29c80316c","output_preview":"Found 2 memories:\n1. [timeline_summary/agent:zaki-bot:user:7777:main/1777908620] [vector] channel=zaki_app lane=main session=agent:zaki-bot:user:7777:main score=0.02: origin_channel=zaki_app\norigin_lane=main\norigin_chat_id=agent:zaki-bot:user:7777:main\n\nfo","output_truncated":true,"result_summary":"completed","run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":0,"duration_ms":3,"run_id":"r-1777908763606-3"}
+
+event: reasoning_summary
+data: {"type":"reasoning_summary","summary":"I recall that Nova prefers Helix over NeoVim for editing code, and I've stored that in core memory with a global scope. Next, I'll use that information to answer the user's question about their editor preference.","phase":"thinking"}
+
+event: progress
+data: {"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":0,"duration_ms":0,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":1,"duration_ms":1,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":1,"duration_ms":19895,"run_id":"r-1777908763606-3"}
+
+event: token
+data: {"delta":"The recall di","content":"The recall di","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"dn't su","content":"dn't su","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rface my store","content":"rface my store","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d fact directly","content":"d fact directly","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" ","content":" ","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— let","content":"— let","seq":5,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":" me dig a layer","content":" me dig a layer","seq":6,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":32280,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":1,"duration_ms":0,"run_id":"r-1777908763606-3"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_list","tool_use_id":"call_590a0bdf90d9484fa9b69c14","input_preview":"{\"scope\": \"global\", \"limit\": 10}","run_id":"r-1777908763606-3"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_list","success":true,"duration_ms":2,"tool_use_id":"call_590a0bdf90d9484fa9b69c14","output_preview":"Memory entries: showing 5/5\n  1. extracted_aa601076031a93d1 [core] role=user channel=unknown lane=unknown 1777908687\n     Nova prefers Helix over NeoVim for editing code. Switched last month (around April 2026).\n  2. durable_fact/behavior/9f4dc1e668b924e8 ","output_truncated":true,"result_summary":"completed","run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":1,"duration_ms":2,"run_id":"r-1777908763606-3"}
+
+event: reasoning_summary
+data: {"type":"reasoning_summary","summary":"I've confirmed that Nova prefers Helix over NeoVim, and I've stored this in core memory with a global scope. Now, I'm going to check the global memory list to see if this fact is reflected anywhere else, possibly in another memory entry.","phase":"thinking"}
+
+event: progress
+data: {"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":1,"duration_ms":0,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":2,"duration_ms":2,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":2,"duration_ms":6060,"run_id":"r-1777908763606-3"}
+
+event: token
+data: {"delta":"There it","content":"There it","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" is — en","content":" is — en","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"try `ext","content":"try `ext","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"racted","content":"racted","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"_a","content":"_a","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"a60","content":"a60","seq":5,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"10760","content":"10760","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"31a93d1` (co","content":"31a93d1` (co","seq":7,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"re, g","content":"re, g","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lobal): **\"N","content":"lobal): **\"N","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ova prefers","content":"ova prefers","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" Helix ","content":" Helix ","seq":11,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"over NeoVim fo","content":"over NeoVim fo","seq":12,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r editing code","content":"r editing code","seq":13,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":". Switched las","content":". Switched las","seq":14,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t month (ar","content":"t month (ar","seq":15,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ound Ap","content":"ound Ap","seq":16,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ril 20","content":"ril 20","seq":17,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"26).\"**\n\n","content":"26).\"**\n\n","seq":18,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Hel","content":"Hel","seq":19,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ix. Remembered.","content":"ix. Remembered.","seq":20,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":6722,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":2,"duration_ms":0,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":2,"duration_ms":0,"run_id":"r-1777908763606-3"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":2,"duration_ms":14,"run_id":"r-1777908763606-3"}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777908811851"}
+

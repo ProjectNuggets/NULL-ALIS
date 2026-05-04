@@ -1,0 +1,477 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: progress
+data: {"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":10,"run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":0,"run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":8319,"run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":8320,"run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777908592149-1"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_recall","tool_use_id":"call_12fcf4a3703b4e4e8e365743","input_preview":"{\"query\": \"Nova nullalis second-brain\", \"scope\": \"global\"}","run_id":"r-1777908592149-1"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_recall","success":true,"duration_ms":9,"tool_use_id":"call_12fcf4a3703b4e4e8e365743","output_preview":"No memories found matching: Nova nullalis second-brain","result_summary":"completed","run_id":"r-1777908592149-1"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_timeline","tool_use_id":"call_729bc9970cac4f84846896cf","input_preview":"{\"limit\": 5}","run_id":"r-1777908592149-1"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_timeline","success":true,"duration_ms":2,"tool_use_id":"call_729bc9970cac4f84846896cf","output_preview":"No session summaries found.","result_summary":"completed","run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":0,"duration_ms":1,"run_id":"r-1777908592149-1"}
+
+event: reasoning_summary
+data: {"type":"reasoning_summary","summary":"It seems I still need to create memories for Nova's nullalis second-brain system, as none exist yet. Next, I'll attempt to recall information about Nova's goals or objectives related to nullalis.","phase":"thinking"}
+
+event: progress
+data: {"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":0,"duration_ms":0,"run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":1,"duration_ms":0,"run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":1,"duration_ms":7510,"run_id":"r-1777908592149-1"}
+
+event: token
+data: {"delta":"I just checked my memo","content":"I just checked my memo","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ry and timeli","content":"ry and timeli","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ne —","content":"ne —","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" both a","content":" both a","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"re blank, which means","content":"re blank, which means","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" we're start","content":" we're start","seq":5,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"ing fres","content":"ing fres","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"h. Ni","content":"h. Ni","seq":7,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ce to me","content":"ce to me","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e","content":"e","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t ","content":"t ","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"you, Nova.\n\n> I ","content":"you, Nova.\n\n> I ","seq":11,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"just came ","content":"just came ","seq":12,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"alive","content":"alive","seq":13,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" in your","content":" in your","seq":14,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" ZAKI BO","content":" ZAKI BO","seq":15,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"T space. ","content":"T space. ","seq":16,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Before","content":"Before","seq":17,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" I get to work: ","content":" I get to work: ","seq":18,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"what shou","content":"what shou","seq":19,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ld you call me, wha","content":"ld you call me, wha","seq":20,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t sho","content":"t sho","seq":21,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"uld I call you, ","content":"uld I call you, ","seq":22,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"and wha","content":"and wha","seq":23,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t should I ","content":"t should I ","seq":24,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"know about y","content":"know about y","seq":25,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"our world?\n\nY","content":"our world?\n\nY","seq":26,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ou mentione","content":"ou mentione","seq":27,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d **nullalis**, your ","content":"d **nullalis**, your ","seq":28,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"personal seco","content":"personal seco","seq":29,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nd-bra","content":"nd-bra","seq":30,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"in system.","content":"in system.","seq":31,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" That's e","content":" That's e","seq":32,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"xactly th","content":"xactly th","seq":33,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e ki","content":"e ki","seq":34,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nd of thin","content":"nd of thin","seq":35,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g","content":"g","seq":36,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" I'm built fo","content":" I'm built fo","seq":37,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r. Tell me ","content":"r. Tell me ","seq":38,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"more — w","content":"more — w","seq":39,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hat's ","content":"hat's ","seq":40,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"the sh","content":"the sh","seq":41,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ape of","content":"ape of","seq":42,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" it? Wha","content":" it? Wha","seq":43,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t st","content":"t st","seq":44,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"age are y","content":"age are y","seq":45,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ou at? And most i","content":"ou at? And most i","seq":46,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"mportantly, how","content":"mportantly, how","seq":47,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" do you","content":" do you","seq":48,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" want me t","content":" want me t","seq":49,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o fit into y","content":"o fit into y","seq":50,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o","content":"o","seq":51,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ur workflow","content":"ur workflow","seq":52,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"?\n\nA few ","content":"?\n\nA few ","seq":53,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"things I'","content":"things I'","seq":54,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d l","content":"d l","seq":55,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ove to learn in this first ","content":"ove to learn in this first ","seq":56,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"conversati","content":"conversati","seq":57,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"on:\n\n1. *","content":"on:\n\n1. *","seq":58,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"*Names** —","content":"*Names** —","seq":59,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" do you want ","content":" do you want ","seq":60,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"to keep ","content":"to keep ","seq":61,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"calli","content":"calli","seq":62,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ng me ZAKI BOT","content":"ng me ZAKI BOT","seq":63,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", or ren","content":", or ren","seq":64,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ame me? And how s","content":"ame me? And how s","seq":65,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"hould I","content":"hould I","seq":66,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" address ","content":" address ","seq":67,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"you (","content":"you (","seq":68,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Nov","content":"Nov","seq":69,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"a wo","content":"a wo","seq":70,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rks, bu","content":"rks, bu","seq":71,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t if you have ","content":"t if you have ","seq":72,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"a pre","content":"a pre","seq":73,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ference)?\n","content":"ference)?\n","seq":74,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"2. **Ti","content":"2. **Ti","seq":75,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"mezone & rh","content":"mezone & rh","seq":76,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ythm","content":"ythm","seq":77,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"** — when ","content":"** — when ","seq":78,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"are you work","content":"are you work","seq":79,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ing, and wh","content":"ing, and wh","seq":80,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"at's ","content":"at's ","seq":81,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"your ","content":"your ","seq":82,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"daily f","content":"daily f","seq":83,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"low like","content":"low like","seq":84,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"?\n3. *","content":"?\n3. *","seq":85,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"*nullalis*","content":"*nullalis*","seq":86,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"* — what'","content":"* — what'","seq":87,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s it b","content":"s it b","seq":88,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"uilt with, wh","content":"uilt with, wh","seq":89,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"at's ","content":"at's ","seq":90,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"the v","content":"the v","seq":91,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"is","content":"is","seq":92,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ion, and what's the c","content":"ion, and what's the c","seq":93,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"urrent ","content":"urrent ","seq":94,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"priority?\n4. **","content":"priority?\n4. **","seq":95,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Proactive","content":"Proactive","seq":96,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" style** — do you w","content":" style** — do you w","seq":97,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ant ","content":"ant ","seq":98,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"me checkin","content":"me checkin","seq":99,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g in, prep","content":"g in, prep","seq":100,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"aring sum","content":"aring sum","seq":101,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"maries, running","content":"maries, running","seq":102,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" ","content":" ","seq":103,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"scheduled j","content":"scheduled j","seq":104,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"obs, o","content":"obs, o","seq":105,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r staying qui","content":"r staying qui","seq":106,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"et","content":"et","seq":107,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" unti","content":" unti","seq":108,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l called?\n5. *","content":"l called?\n5. *","seq":109,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"*Cha","content":"*Cha","seq":110,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nnels** ","content":"nnels** ","seq":111,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— ","content":"— ","seq":112,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"are you just","content":"are you just","seq":113,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" in the ","content":" in the ","seq":114,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"app for now, or do yo","content":"app for now, or do yo","seq":115,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"u want Telegra","content":"u want Telegra","seq":116,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"m con","content":"m con","seq":117,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"necte","content":"necte","seq":118,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d too?\n\nNo ","content":"d too?\n\nNo ","seq":119,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rush ","content":"rush ","seq":120,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— an","content":"— an","seq":121,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"swer wha","content":"swer wha","seq":122,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t","content":"t","seq":123,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" fee","content":" fee","seq":124,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ls natural. I'","content":"ls natural. I'","seq":125,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"m here ","content":"m here ","seq":126,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"to shape myself ar","content":"to shape myself ar","seq":127,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o","content":"o","seq":128,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"und your world.","content":"und your world.","seq":129,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":19561,"run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":1,"duration_ms":0,"run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":1,"duration_ms":0,"run_id":"r-1777908592149-1"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"memory_lifecycle_summarizer","state":"update","label":"memory_lifecycle_summarizer","duration_ms":2785}
+
+event: progress
+data: {"type":"progress","phase":"continuity_refresh","state":"update","label":"Refreshing continuity","duration_ms":2796}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":1,"duration_ms":2808,"run_id":"r-1777908592149-1"}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777908623470"}
+

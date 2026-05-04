@@ -1,0 +1,192 @@
+{
+  "ts": "2026-05-04T15:39:09Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 20,
+    "memories_live": 39,
+    "memories_archived": 0,
+    "entities": 9,
+    "edges_active": 10,
+    "edges_total": 10,
+    "communities": 0,
+    "events": 52
+  },
+  "by_category": {
+    "conversation": 20,
+    "core": 15,
+    "daily": 4
+  },
+  "by_attribution": {
+    "extraction_classifier": 10,
+    "none": 29
+  },
+  "by_predicate": {
+    "HAS_ACTIVE_CONTRACT": 1,
+    "HAS_DEADLINE": 3,
+    "PREFERS": 2,
+    "STAKEHOLDER_OF": 2,
+    "WORKS_AT": 1,
+    "WORKS_WITH": 1
+  },
+  "by_edge_attribution": {
+    "extraction_classifier": 10
+  },
+  "recent_memories": [
+    {
+      "key": "autosave_assistant_1777909148948326000",
+      "content_head": "From memory (`extracted_ed3319179619c1c3`): Project Borealis has one risk you're tracking — **Cytosc",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909149
+    },
+    {
+      "key": "autosave_user_1777909133648106000",
+      "content_head": "Here is some background context I want you to keep in mind. I am working on three parallel projects ",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909134
+    },
+    {
+      "key": "durable_fact/behavior/d4df28c24568c3ac",
+      "content_head": "Here is some background context I want you to keep in mind. I am working on three parallel projects ",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909134
+    },
+    {
+      "key": "autosave_assistant_1777909133122895000",
+      "content_head": "All six stored. Here's the full picture I now hold:\n\n| Project | Scope | Deadline | Stakeholder | Ke",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909133
+    },
+    {
+      "key": "extracted_041535a9e15f9b8e",
+      "content_head": "Alex is the stakeholder for Project Atlas at HRS.",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": "extraction_classifier",
+      "created_at": 1777909113
+    },
+    {
+      "key": "extracted_70e786fee3d7b511",
+      "content_head": "Sara is the stakeholder for Project Borealis at HRS.",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": "extraction_classifier",
+      "created_at": 1777909113
+    },
+    {
+      "key": "q3-2026-budget-envelope",
+      "content_head": "Nova's Q3 2026 engineering budget envelope across all three projects (Atlas, Borealis, Cadence) is 1",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909113
+    },
+    {
+      "key": "extracted_ed3319179619c1c3",
+      "content_head": "Project Borealis: Customer-facing dashboard rebuild using Cytoscape.js for the relational explorer. ",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": "extraction_classifier",
+      "created_at": 1777909112
+    }
+  ],
+  "recent_edges": [
+    {
+      "source_key": "extracted_70e786fee3d7b511",
+      "target_key": "e12722a7a93721bfd36c3866571405e6",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_041535a9e15f9b8e",
+      "target_key": "b00d640a72b2e9e8a7bdc51c43d2ab57",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_fa2190f6ca46407a",
+      "target_key": "be87c283acebbaf53c4737ba37117e8a",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_ed3319179619c1c3",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_288a758930697150",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_9bd07c3f39263a04",
+      "target_key": "4e2aebecaff96f9c4bacc2d874b84ea1",
+      "predicate": "HAS_ACTIVE_CONTRACT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908892
+    },
+    {
+      "source_key": "extracted_ede39e522920e3d1",
+      "target_key": "850793e849d543321ab073f8a48585f0",
+      "predicate": "WORKS_WITH",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    },
+    {
+      "source_key": "extracted_7cfdca9a8e53f1c9",
+      "target_key": "ff51467a475be384a79e67ae9f41c28f",
+      "predicate": "WORKS_AT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    }
+  ],
+  "recent_messages": [
+    {
+      "role": "user",
+      "preview": "Here is some background context I want you to keep in mind. I am working on thre",
+      "created_at": 1777909149,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "From memory (`extracted_ed3319179619c1c3`): Project Borealis has one risk you're",
+      "created_at": 1777909149,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "user",
+      "preview": "Here is some background context I want you to keep in mind. I am working on thre",
+      "created_at": 1777909133,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "All six stored. Here's the full picture I now hold:\n\n| Project | Scope | Deadlin",
+      "created_at": 1777909133,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    }
+  ]
+}

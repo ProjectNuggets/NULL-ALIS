@@ -1,0 +1,150 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: progress
+data: {"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":41,"run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":7,"run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":6407,"run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token_upper_bound","state":"update","label":"Waiting for model","iteration":0,"duration_ms":6407,"run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777909133605-10"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_recall","tool_use_id":"call_8baaa6771a6c409a9425571b","input_preview":"{\"query\": \"Borealis risk Cytoscape edge-bundling\", \"scope\": \"global\"}","run_id":"r-1777909133605-10"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_recall","success":true,"duration_ms":6,"tool_use_id":"call_8baaa6771a6c409a9425571b","output_preview":"Found 1 memory:\n1. [extracted_ed3319179619c1c3] [primary] channel=unknown lane=unknown score=0.02: Project Borealis: Customer-facing dashboard rebuild using Cytoscape.js for the relational explorer. Deadline: mid Q4 2026. Stakeholder: Sara. Risk: Cytoscape","output_truncated":true,"result_summary":"completed","run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":0,"duration_ms":1,"run_id":"r-1777909133605-10"}
+
+event: reasoning_summary
+data: {"type":"reasoning_summary","summary":"Project Atlas is a data-platform refresh for the HRS infrastructure team, with a deadline at the end of Q3 2026, and its key risk appears to be related to Postgres 16. Next, I'll try to recall any information about Project Borealis, specifically its risk assessment and any connections to Cytoscape edge-bundling.","phase":"thinking"}
+
+event: progress
+data: {"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":0,"duration_ms":0,"run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":1,"duration_ms":7,"run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":1,"duration_ms":7614,"run_id":"r-1777909133605-10"}
+
+event: token
+data: {"delta":"From memo","content":"From memo","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ry (`extrac","content":"ry (`extrac","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ted","content":"ted","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"_e","content":"_e","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d33","content":"d33","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"19179619","content":"19179619","seq":5,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"c1c3`): Proje","content":"c1c3`): Proje","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ct Boreal","content":"ct Boreal","seq":7,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"is h","content":"is h","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"as one risk you'","content":"as one risk you'","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"re tracki","content":"re tracki","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ng — *","content":"ng — *","seq":11,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"*Cytoscape edge-bundl","content":"*Cytoscape edge-bundl","seq":12,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ing p","content":"ing p","seq":13,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"erforman","content":"erforman","seq":14,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ce on >5k ","content":"ce on >5k ","seq":15,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nodes**.","content":"nodes**.","seq":16,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" That","content":" That","seq":17,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"'s the one ","content":"'s the one ","seq":18,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"that ","content":"that ","seq":19,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"could bite when the relationa","content":"could bite when the relationa","seq":20,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l exp","content":"l exp","seq":21,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lorer gets ","content":"lorer gets ","seq":22,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"real-wor","content":"real-wor","seq":23,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l","content":"l","seq":24,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"d data volumes.","content":"d data volumes.","seq":25,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":8515,"run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":1,"duration_ms":0,"run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":1,"duration_ms":0,"run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"post_turn_memory_nudge","state":"update","label":"post_turn_memory_nudge","iteration":1,"run_id":"r-1777909133605-10"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":1,"duration_ms":13,"run_id":"r-1777909133605-10"}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777909148995"}
+

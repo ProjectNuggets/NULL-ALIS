@@ -1,0 +1,192 @@
+{
+  "ts": "2026-05-04T15:40:09Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 24,
+    "memories_live": 45,
+    "memories_archived": 0,
+    "entities": 9,
+    "edges_active": 10,
+    "edges_total": 10,
+    "communities": 0,
+    "events": 58
+  },
+  "by_category": {
+    "conversation": 24,
+    "core": 17,
+    "daily": 4
+  },
+  "by_attribution": {
+    "extraction_classifier": 10,
+    "none": 35
+  },
+  "by_predicate": {
+    "HAS_ACTIVE_CONTRACT": 1,
+    "HAS_DEADLINE": 3,
+    "PREFERS": 2,
+    "STAKEHOLDER_OF": 2,
+    "WORKS_AT": 1,
+    "WORKS_WITH": 1
+  },
+  "by_edge_attribution": {
+    "extraction_classifier": 10
+  },
+  "recent_memories": [
+    {
+      "key": "autosave_assistant_1777909209186516000",
+      "content_head": "From memory (`q3-2026-budget-envelope`): **18% of Q3 engineering** — that's the envelope covering al",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909209
+    },
+    {
+      "key": "autosave_user_1777909180301678000",
+      "content_head": "Here is some background context I want you to keep in mind. I am working on three parallel projects ",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909180
+    },
+    {
+      "key": "durable_fact/behavior/320232b499c0d6fa",
+      "content_head": "Here is some background context I want you to keep in mind. I am working on three parallel projects ",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909180
+    },
+    {
+      "key": "autosave_assistant_1777909179797545000",
+      "content_head": "From memory (`extracted_fa2190f6ca46407a`): **You** work on Project Cadence — it's one of your three",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909180
+    },
+    {
+      "key": "autosave_assistant_1777909148948326000",
+      "content_head": "From memory (`extracted_ed3319179619c1c3`): Project Borealis has one risk you're tracking — **Cytosc",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909149
+    },
+    {
+      "key": "autosave_user_1777909149477211000",
+      "content_head": "Here is some background context I want you to keep in mind. I am working on three parallel projects ",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909149
+    },
+    {
+      "key": "durable_fact/behavior/119f1f1d5038a511",
+      "content_head": "Here is some background context I want you to keep in mind. I am working on three parallel projects ",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909149
+    },
+    {
+      "key": "autosave_user_1777909133648106000",
+      "content_head": "Here is some background context I want you to keep in mind. I am working on three parallel projects ",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909134
+    }
+  ],
+  "recent_edges": [
+    {
+      "source_key": "extracted_70e786fee3d7b511",
+      "target_key": "e12722a7a93721bfd36c3866571405e6",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_041535a9e15f9b8e",
+      "target_key": "b00d640a72b2e9e8a7bdc51c43d2ab57",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_fa2190f6ca46407a",
+      "target_key": "be87c283acebbaf53c4737ba37117e8a",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_ed3319179619c1c3",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_288a758930697150",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_9bd07c3f39263a04",
+      "target_key": "4e2aebecaff96f9c4bacc2d874b84ea1",
+      "predicate": "HAS_ACTIVE_CONTRACT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908892
+    },
+    {
+      "source_key": "extracted_ede39e522920e3d1",
+      "target_key": "850793e849d543321ab073f8a48585f0",
+      "predicate": "WORKS_WITH",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    },
+    {
+      "source_key": "extracted_7cfdca9a8e53f1c9",
+      "target_key": "ff51467a475be384a79e67ae9f41c28f",
+      "predicate": "WORKS_AT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    }
+  ],
+  "recent_messages": [
+    {
+      "role": "user",
+      "preview": "Here is some background context I want you to keep in mind. I am working on thre",
+      "created_at": 1777909209,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "From memory (`q3-2026-budget-envelope`): **18% of Q3 engineering** — that's the ",
+      "created_at": 1777909209,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "user",
+      "preview": "Here is some background context I want you to keep in mind. I am working on thre",
+      "created_at": 1777909180,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "From memory (`extracted_fa2190f6ca46407a`): **You** work on Project Cadence — it",
+      "created_at": 1777909180,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    }
+  ]
+}

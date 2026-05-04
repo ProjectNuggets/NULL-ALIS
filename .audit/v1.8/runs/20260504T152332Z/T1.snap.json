@@ -1,0 +1,97 @@
+{
+  "ts": "2026-05-04T15:30:23Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 2,
+    "memories_live": 7,
+    "memories_archived": 0,
+    "entities": 0,
+    "edges_active": 0,
+    "edges_total": 0,
+    "communities": 0,
+    "events": 8
+  },
+  "by_category": {
+    "conversation": 2,
+    "core": 3,
+    "daily": 2
+  },
+  "by_attribution": {
+    "none": 7
+  },
+  "by_predicate": null,
+  "by_edge_attribution": null,
+  "recent_memories": [
+    {
+      "key": "timeline_index/current",
+      "content_head": "{\"at\":\"2026-05-04T15:30:20Z\",\"session\":\"agent:zaki-bot:user:7777:main\",\"key\":\"timeline_summary/agent",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908623
+    },
+    {
+      "key": "context_anchor_current",
+      "content_head": "type=context_anchor\nlast_session=agent:zaki-bot:user:7777:main\nlast_channel=zaki_app\nlast_lane=main\n",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908623
+    },
+    {
+      "key": "autosave_assistant_1777908623276830000",
+      "content_head": "I just checked my memory and timeline — both are blank, which means we're starting fresh. Nice to me",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908623
+    },
+    {
+      "key": "summary_latest/agent:zaki-bot:user:7777:main",
+      "content_head": "type=summary_latest\nsession=agent:zaki-bot:user:7777:main\nchannel=zaki_app\nlane=main\norigin_channel=",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908621
+    },
+    {
+      "key": "session_checkpoint_1777908620",
+      "content_head": "type=session_checkpoint\nreason=summary_seed:auto\nsession=agent:zaki-bot:user:7777:main\nmodel=deepsee",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908620
+    },
+    {
+      "key": "timeline_summary/agent:zaki-bot:user:7777:main/1777908620",
+      "content_head": "origin_channel=zaki_app\norigin_lane=main\norigin_chat_id=agent:zaki-bot:user:7777:main\n\nfocus: I just",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908620
+    },
+    {
+      "key": "autosave_user_1777908592160647000",
+      "content_head": "My name is Nova. I'm building a personal second-brain system called nullalis.",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908592
+    }
+  ],
+  "recent_edges": null,
+  "recent_messages": [
+    {
+      "role": "assistant",
+      "preview": "I just checked my memory and timeline — both are blank, which means we're starti",
+      "created_at": 1777908623,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "user",
+      "preview": "My name is Nova. I'm building a personal second-brain system called nullalis.",
+      "created_at": 1777908623,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    }
+  ]
+}

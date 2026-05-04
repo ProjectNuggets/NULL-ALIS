@@ -1,0 +1,139 @@
+{
+  "ts": "2026-05-04T15:33:59Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 8,
+    "memories_live": 16,
+    "memories_archived": 0,
+    "entities": 2,
+    "edges_active": 2,
+    "edges_total": 2,
+    "communities": 0,
+    "events": 21
+  },
+  "by_category": {
+    "conversation": 8,
+    "core": 4,
+    "daily": 4
+  },
+  "by_attribution": {
+    "extraction_classifier": 2,
+    "none": 14
+  },
+  "by_predicate": {
+    "PREFERS": 2
+  },
+  "by_edge_attribution": {
+    "extraction_classifier": 2
+  },
+  "recent_memories": [
+    {
+      "key": "autosave_assistant_1777908839560330000",
+      "content_head": "Updated. Here's what happened:\n\n- **Demoted** the two old Helix entries (`extracted_aa601076031a93d1",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908840
+    },
+    {
+      "key": "extracted_f8bb5c03a477a6be",
+      "content_head": "Nova prefers NeoVim for editing code. Briefly tried Helix around April 2026 but switched back to Neo",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": "extraction_classifier",
+      "created_at": 1777908832
+    },
+    {
+      "key": "autosave_assistant_1777908811823501000",
+      "content_head": "There it is — entry `extracted_aa601076031a93d1` (core, global): **\"Nova prefers Helix over NeoVim f",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908812
+    },
+    {
+      "key": "autosave_user_1777908812307177000",
+      "content_head": "Actually, I switched back to NeoVim last week. Helix had too many bugs.",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908812
+    },
+    {
+      "key": "autosave_user_1777908764344373000",
+      "content_head": "What editor do I prefer?",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908764
+    },
+    {
+      "key": "autosave_assistant_1777908716309856000",
+      "content_head": "Got it — stored as `nova-prefers-helix`: **Nova PREFERS Helix** (core memory, global scope). That'll",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908716
+    },
+    {
+      "key": "extracted_aa601076031a93d1",
+      "content_head": "Nova prefers Helix over NeoVim for editing code. Switched last month (around April 2026).",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": "extraction_classifier",
+      "created_at": 1777908687
+    },
+    {
+      "key": "autosave_user_1777908676035004000",
+      "content_head": "I prefer Helix over NeoVim for editing code. I switched last month.",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908676
+    }
+  ],
+  "recent_edges": [
+    {
+      "source_key": "extracted_f8bb5c03a477a6be",
+      "target_key": "4069fc300dbb0602ccd5a3ee27719565",
+      "predicate": "PREFERS",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908833
+    },
+    {
+      "source_key": "extracted_aa601076031a93d1",
+      "target_key": "26c12d732c46b337059fbf0dab89f836",
+      "predicate": "PREFERS",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908687
+    }
+  ],
+  "recent_messages": [
+    {
+      "role": "assistant",
+      "preview": "Updated. Here's what happened:\n\n- **Demoted** the two old Helix entries (`extrac",
+      "created_at": 1777908840,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "user",
+      "preview": "Actually, I switched back to NeoVim last week. Helix had too many bugs.",
+      "created_at": 1777908840,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "There it is — entry `extracted_aa601076031a93d1` (core, global): **\"Nova prefers",
+      "created_at": 1777908812,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "user",
+      "preview": "What editor do I prefer?",
+      "created_at": 1777908812,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    }
+  ]
+}

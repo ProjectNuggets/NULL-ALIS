@@ -1,0 +1,38 @@
+{"type":"statusResponse","content":"Processing request"}
+{"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+{"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":49,"run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":7,"run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":18863,"run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"llm_first_token_upper_bound","state":"update","label":"Waiting for model","iteration":0,"duration_ms":18863,"run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777909180250-12"}
+{"type":"tool_start","tool":"memory_recall","tool_use_id":"call_6e70e35fec6c42f39d91543e","input_preview":"{\"query\": \"Q3 budget envelope engineering\", \"scope\": \"global\"}","run_id":"r-1777909180250-12"}
+{"type":"tool_result","tool":"memory_recall","success":true,"duration_ms":265,"tool_use_id":"call_6e70e35fec6c42f39d91543e","output_preview":"Found 4 memories:\n1. [q3-2026-budget-envelope] [primary] channel=unknown lane=unknown score=0.03: Nova's Q3 2026 engineering budget envelope across all three projects (Atlas, Borealis, Cadence) is 18% of Q3 engineering.\n2. [summary_latest/agent:zaki-bot:us","output_truncated":true,"result_summary":"completed","run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":0,"duration_ms":4,"run_id":"r-1777909180250-12"}
+{"type":"reasoning_summary","summary":"I recall that Project Cadence is one of my parallel projects this quarter, and it involves the platform team as stakeholders. I also remember that Nova's Q3 2026 engineering budget envelope is relevant to my work, and I should consider it for my current projects. Next, I'll look into the specifics of Project Cadence by recalling memories related to its goals, timelines, and requirements.","phase":"thinking"}
+{"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":0,"duration_ms":0,"run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":1,"duration_ms":7,"run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":1,"duration_ms":8936,"run_id":"r-1777909180250-12"}
+{"delta":"Fr","content":"Fr","seq":0,"stream_kind":"final_reply","live":false}
+{"delta":"om mem","content":"om mem","seq":1,"stream_kind":"final_reply","live":false}
+{"delta":"ory (`q3","content":"ory (`q3","seq":2,"stream_kind":"final_reply","live":false}
+{"delta":"-2026-bud","content":"-2026-bud","seq":3,"stream_kind":"final_reply","live":false}
+{"delta":"get-envel","content":"get-envel","seq":4,"stream_kind":"final_reply","live":false}
+{"delta":"ope`): **18% of","content":"ope`): **18% of","seq":5,"stream_kind":"final_reply","live":false}
+{"delta":" Q3 en","content":" Q3 en","seq":6,"stream_kind":"final_reply","live":false}
+{"delta":"gineeri","content":"gineeri","seq":7,"stream_kind":"final_reply","live":false}
+{"delta":"ng** — that's the en","content":"ng** — that's the en","seq":8,"stream_kind":"final_reply","live":false}
+{"delta":"velope covering all t","content":"velope covering all t","seq":9,"stream_kind":"final_reply","live":false}
+{"delta":"hree projec","content":"hree projec","seq":10,"stream_kind":"final_reply","live":false}
+{"delta":"ts (Atlas","content":"ts (Atlas","seq":11,"stream_kind":"final_reply","live":false}
+{"delta":", Bore","content":", Bore","seq":12,"stream_kind":"final_reply","live":false}
+{"delta":"alis, Cadence).","content":"alis, Cadence).","seq":13,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":9428,"run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":1,"duration_ms":0,"run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":1,"duration_ms":0,"run_id":"r-1777909180250-12"}
+{"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+{"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":1,"duration_ms":13,"run_id":"r-1777909180250-12"}
+{"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777909209293"}

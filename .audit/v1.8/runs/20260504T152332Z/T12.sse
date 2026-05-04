@@ -1,0 +1,405 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: progress
+data: {"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777909253684-13"}
+
+event: progress
+data: {"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":29,"run_id":"r-1777909253684-13"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777909253684-13"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":7,"run_id":"r-1777909253684-13"}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":9392,"run_id":"r-1777909253684-13"}
+
+event: token
+data: {"delta":"\n\nool_call>","content":"\n\nool_call>","seq":0,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":5,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":7,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"all>","content":"all>","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":11,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"all>","content":"all>","seq":12,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":13,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_cal","content":"ool_cal","seq":14,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l>\n","content":"l>\n","seq":15,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"all>","content":"all>","seq":16,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":17,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":18,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":19,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":20,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":21,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_cal","content":"ool_cal","seq":22,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l>\n","content":"l>\n","seq":23,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_cal","content":"ool_cal","seq":24,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l>\n","content":"l>\n","seq":25,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":26,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":27,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":28,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":29,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_cal","content":"ool_cal","seq":30,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l>\n","content":"l>\n","seq":31,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":32,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":33,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":34,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":35,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"all>","content":"all>","seq":36,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":37,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"all>\n","content":"all>\n","seq":38,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":39,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":40,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":41,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":42,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"all>","content":"all>","seq":43,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":44,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":45,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":46,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":47,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":48,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":49,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":50,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":51,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":52,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":53,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":54,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":55,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":56,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":57,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":58,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"all>","content":"all>","seq":59,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":60,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"all>","content":"all>","seq":61,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":62,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":63,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":64,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"all>","content":"all>","seq":65,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":66,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"all>","content":"all>","seq":67,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":68,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":69,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":70,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":71,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":72,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":73,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":74,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":75,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":76,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":77,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":78,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":79,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":80,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ool_call>","content":"ool_call>","seq":81,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"\n","content":"\n","seq":82,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":65476,"run_id":"r-1777909253684-13"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":2,"run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-0-memory_forget","input_preview":"{\"key\":\"extracted_7cfdca9a8e53f1c9\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":9,"tool_use_id":"local-0-0-memory_forget","output_preview":"Forgot memory: extracted_7cfdca9a8e53f1c9","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-1-memory_forget","input_preview":"{\"key\":\"nova-works-at-hrs\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":1,"tool_use_id":"local-0-1-memory_forget","output_preview":"No memory found with key: nova-works-at-hrs","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-2-memory_forget","input_preview":"{\"key\":\"durable_fact/behavior/97f54a7542a01ebc\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":false,"duration_ms":3,"tool_use_id":"local-0-2-memory_forget","output_preview":"Memory key is not deletable: durable_fact/behavior/97f54a7542a01ebc","result_summary":"failed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-3-memory_forget","input_preview":"{\"key\":\"durable_fact/behavior/d4df28c24568c3ac\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":false,"duration_ms":4,"tool_use_id":"local-0-3-memory_forget","output_preview":"Memory key is not deletable: durable_fact/behavior/d4df28c24568c3ac","result_summary":"failed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-4-memory_forget","input_preview":"{\"key\":\"durable_fact/behavior/119f1f1d5038a511\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":false,"duration_ms":3,"tool_use_id":"local-0-4-memory_forget","output_preview":"Memory key is not deletable: durable_fact/behavior/119f1f1d5038a511","result_summary":"failed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-5-memory_forget","input_preview":"{\"key\":\"durable_fact/behavior/320232b499c0d6fa\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":false,"duration_ms":2,"tool_use_id":"local-0-5-memory_forget","output_preview":"Memory key is not deletable: durable_fact/behavior/320232b499c0d6fa","result_summary":"failed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-6-memory_forget","input_preview":"{\"key\":\"alex-colleague-at-hrs\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":2,"tool_use_id":"local-0-6-memory_forget","output_preview":"No memory found with key: alex-colleague-at-hrs","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-7-memory_forget","input_preview":"{\"key\":\"extracted_ede39e522920e3d1\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":4,"tool_use_id":"local-0-7-memory_forget","output_preview":"Forgot memory: extracted_ede39e522920e3d1","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-8-memory_forget","input_preview":"{\"key\":\"widgetco-mnda-contract\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":0,"tool_use_id":"local-0-8-memory_forget","output_preview":"No memory found with key: widgetco-mnda-contract","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-9-memory_forget","input_preview":"{\"key\":\"extracted_9bd07c3f39263a04\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":3,"tool_use_id":"local-0-9-memory_forget","output_preview":"Forgot memory: extracted_9bd07c3f39263a04","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-10-memory_forget","input_preview":"{\"key\":\"project-atlas-overview\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":1,"tool_use_id":"local-0-10-memory_forget","output_preview":"No memory found with key: project-atlas-overview","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-11-memory_forget","input_preview":"{\"key\":\"extracted_288a758930697150\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":3,"tool_use_id":"local-0-11-memory_forget","output_preview":"Forgot memory: extracted_288a758930697150","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-12-memory_forget","input_preview":"{\"key\":\"project-borealis-overview\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":0,"tool_use_id":"local-0-12-memory_forget","output_preview":"No memory found with key: project-borealis-overview","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-13-memory_forget","input_preview":"{\"key\":\"extracted_ed3319179619c1c3\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":3,"tool_use_id":"local-0-13-memory_forget","output_preview":"Forgot memory: extracted_ed3319179619c1c3","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-14-memory_forget","input_preview":"{\"key\":\"project-cadence-overview\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":0,"tool_use_id":"local-0-14-memory_forget","output_preview":"No memory found with key: project-cadence-overview","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-15-memory_forget","input_preview":"{\"key\":\"extracted_fa2190f6ca46407a\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":4,"tool_use_id":"local-0-15-memory_forget","output_preview":"Forgot memory: extracted_fa2190f6ca46407a","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-16-memory_forget","input_preview":"{\"key\":\"q3-2026-budget-envelope\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":3,"tool_use_id":"local-0-16-memory_forget","output_preview":"Forgot memory: q3-2026-budget-envelope","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-17-memory_forget","input_preview":"{\"key\":\"alex-stakeholder-atlas\"}","run_id":"r-1777909253684-13"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_forget","success":true,"duration_ms":0,"tool_use_id":"local-0-17-memory_forget","output_preview":"No memory found with key: alex-stakeholder-atlas","result_summary":"completed","run_id":"r-1777909253684-13"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_forget","tool_use_id":"local-0-18-memory_forget","input_preview":"{\"key\":\"extracted_70e786fee3d7b511\"}","run_id":"r-1777909253684-13"}
+

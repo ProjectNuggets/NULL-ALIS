@@ -1,0 +1,192 @@
+{
+  "ts": "2026-05-04T15:40:53Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 26,
+    "memories_live": 50,
+    "memories_archived": 0,
+    "entities": 9,
+    "edges_active": 10,
+    "edges_total": 10,
+    "communities": 0,
+    "events": 66
+  },
+  "by_category": {
+    "conversation": 26,
+    "core": 18,
+    "daily": 6
+  },
+  "by_attribution": {
+    "extraction_classifier": 10,
+    "none": 40
+  },
+  "by_predicate": {
+    "HAS_ACTIVE_CONTRACT": 1,
+    "HAS_DEADLINE": 3,
+    "PREFERS": 2,
+    "STAKEHOLDER_OF": 2,
+    "WORKS_AT": 1,
+    "WORKS_WITH": 1
+  },
+  "by_edge_attribution": {
+    "extraction_classifier": 10
+  },
+  "recent_memories": [
+    {
+      "key": "autosave_assistant_1777909253157465000",
+      "content_head": "My `memory_recall` search for \"preferred editor\" came back empty, but your MEMORY.md has the answer ",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909253
+    },
+    {
+      "key": "summary_latest/agent:zaki-bot:user:7777:thread:audit-T11",
+      "content_head": "type=summary_latest\nsession=agent:zaki-bot:user:7777:thread:audit-T11\nchannel=zaki_app\nlane=thread\no",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909253
+    },
+    {
+      "key": "timeline_summary/agent:zaki-bot:user:7777:thread:audit-T11/1777909252",
+      "content_head": "origin_channel=zaki_app\norigin_lane=thread\norigin_chat_id=agent:zaki-bot:user:7777:thread:audit-T11\n",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909252
+    },
+    {
+      "key": "session_checkpoint_1777909252",
+      "content_head": "type=session_checkpoint\nreason=summary_seed:auto\nsession=agent:zaki-bot:user:7777:thread:audit-T11\nm",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909252
+    },
+    {
+      "key": "autosave_user_1777909224859939000",
+      "content_head": "What's my preferred editor?",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909225
+    },
+    {
+      "key": "autosave_assistant_1777909209186516000",
+      "content_head": "From memory (`q3-2026-budget-envelope`): **18% of Q3 engineering** — that's the envelope covering al",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909209
+    },
+    {
+      "key": "autosave_assistant_1777909179797545000",
+      "content_head": "From memory (`extracted_fa2190f6ca46407a`): **You** work on Project Cadence — it's one of your three",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909180
+    },
+    {
+      "key": "autosave_user_1777909180301678000",
+      "content_head": "Here is some background context I want you to keep in mind. I am working on three parallel projects ",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909180
+    }
+  ],
+  "recent_edges": [
+    {
+      "source_key": "extracted_70e786fee3d7b511",
+      "target_key": "e12722a7a93721bfd36c3866571405e6",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_041535a9e15f9b8e",
+      "target_key": "b00d640a72b2e9e8a7bdc51c43d2ab57",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_fa2190f6ca46407a",
+      "target_key": "be87c283acebbaf53c4737ba37117e8a",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_ed3319179619c1c3",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_288a758930697150",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_9bd07c3f39263a04",
+      "target_key": "4e2aebecaff96f9c4bacc2d874b84ea1",
+      "predicate": "HAS_ACTIVE_CONTRACT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908892
+    },
+    {
+      "source_key": "extracted_ede39e522920e3d1",
+      "target_key": "850793e849d543321ab073f8a48585f0",
+      "predicate": "WORKS_WITH",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    },
+    {
+      "source_key": "extracted_7cfdca9a8e53f1c9",
+      "target_key": "ff51467a475be384a79e67ae9f41c28f",
+      "predicate": "WORKS_AT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    }
+  ],
+  "recent_messages": [
+    {
+      "role": "user",
+      "preview": "What's my preferred editor?",
+      "created_at": 1777909253,
+      "session_id": "agent:zaki-bot:user:7777:thread:audit-T11"
+    },
+    {
+      "role": "assistant",
+      "preview": "My `memory_recall` search for \"preferred editor\" came back empty, but your MEMOR",
+      "created_at": 1777909253,
+      "session_id": "agent:zaki-bot:user:7777:thread:audit-T11"
+    },
+    {
+      "role": "user",
+      "preview": "Here is some background context I want you to keep in mind. I am working on thre",
+      "created_at": 1777909209,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "From memory (`q3-2026-budget-envelope`): **18% of Q3 engineering** — that's the ",
+      "created_at": 1777909209,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    }
+  ]
+}

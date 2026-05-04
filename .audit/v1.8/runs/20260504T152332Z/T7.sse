@@ -1,0 +1,276 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: progress
+data: {"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":413,"run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":5,"run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":50103,"run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":50104,"run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777908939935-7"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"brain_graph","tool_use_id":"call_1485c23b953844e48f9b7dc8","input_preview":"{\"action\": \"diff\", \"date\": \"2026-05-04\"}","run_id":"r-1777908939935-7"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"brain_graph","success":true,"duration_ms":6,"tool_use_id":"call_1485c23b953844e48f9b7dc8","output_preview":"{\"action\":\"diff\",\"window\":{\"from\":1777852800,\"to\":1777939200},\"births\":[{\"key\":\"extracted_9bd07c3f39263a04\",\"summary\":\"Nova and Alex are working on an MNDA (Mutual Non-Disclosure Agreement) contract for client WidgetCo \"},{\"key\":\"extracted_ede39e522920e3d1","output_truncated":true,"result_summary":"completed","run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":0,"duration_ms":1,"run_id":"r-1777908939935-7"}
+
+event: reasoning_summary
+data: {"type":"reasoning_summary","summary":"I just learned that the graph has a new birth, **Nova and Alex are working together on the new project**, which seems to be related to the WidgetCo MNDA. Now, I'm going to check the entire global graph to see if there are any other changes or updates since my last check.","phase":"thinking"}
+
+event: progress
+data: {"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":0,"duration_ms":0,"run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":1,"duration_ms":4,"run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":1,"duration_ms":5534,"run_id":"r-1777908939935-7"}
+
+event: token
+data: {"delta":"Today's b","content":"Today's b","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"rai","content":"rai","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n dif","content":"n dif","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"f shows **5 n","content":"f shows **5 n","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e","content":"e","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"w facts*","content":"w facts*","seq":5,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"* born, ","content":"* born, ","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"noth","content":"noth","seq":7,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ing ","content":"ing ","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"retir","content":"retir","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ed:\n\n| ","content":"ed:\n\n| ","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"# | Wha","content":"# | Wha","seq":11,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t landed |\n|--","content":"t landed |\n|--","seq":12,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"-|--","content":"-|--","seq":13,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"------","content":"------","seq":14,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"-----|\n| 1","content":"-----|\n| 1","seq":15,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" | **Nova","content":" | **Nova","seq":16,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" work","content":" work","seq":17,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s at HRS**","content":"s at HRS**","seq":18,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" |\n| 2 |","content":" |\n| 2 |","seq":19,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" **Alex is your","content":" **Alex is your","seq":20,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" colleague at HRS**","content":" colleague at HRS**","seq":21,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", collaboratin","content":", collaboratin","seq":22,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g on","content":"g on","seq":23,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" the W","content":" the W","seq":24,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"idget","content":"idget","seq":25,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Co MNDA |\n| 3","content":"Co MNDA |\n| 3","seq":26,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" | **WidgetC","content":" | **WidgetC","seq":27,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o MNDA","content":"o MNDA","seq":28,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" contract** — y","content":" contract** — y","seq":29,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ou and Alex ","content":"ou and Alex ","seq":30,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"are h","content":"are h","seq":31,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"andlin","content":"andlin","seq":32,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g i","content":"g i","seq":33,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t |\n| 4 | *","content":"t |\n| 4 | *","seq":34,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"*You ","content":"*You ","seq":35,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"prefer Neo","content":"prefer Neo","seq":36,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Vim** — ","content":"Vim** — ","seq":37,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"brie","content":"brie","seq":38,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"f Helix deto","content":"f Helix deto","seq":39,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ur, bac","content":"ur, bac","seq":40,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"k to NeoVim","content":"k to NeoVim","seq":41,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" due ","content":" due ","seq":42,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"to b","content":"to b","seq":43,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ugs |\n| 5 | The old H","content":"ugs |\n| 5 | The old H","seq":44,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"el","content":"el","seq":45,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ix ","content":"ix ","seq":46,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"preference (","content":"preference (","seq":47,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"now superseded","content":"now superseded","seq":48,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":", still vis","content":", still vis","seq":49,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ible as","content":"ible as","seq":50,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" histo","content":" histo","seq":51,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ry) ","content":"ry) ","seq":52,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"|\n\nSo today was abo","content":"|\n\nSo today was abo","seq":53,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ut establi","content":"ut establi","seq":54,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"shing your w","content":"shing your w","seq":55,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ork c","content":"ork c","seq":56,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ontext —","content":"ontext —","seq":57,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" HRS, Alex, th","content":" HRS, Alex, th","seq":58,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e Wi","content":"e Wi","seq":59,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"dgetCo deal ","content":"dgetCo deal ","seq":60,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— and settling the ","content":"— and settling the ","seq":61,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"edi","content":"edi","seq":62,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tor question. A so","content":"tor question. A so","seq":63,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lid foundation.","content":"lid foundation.","seq":64,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":7827,"run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":1,"duration_ms":0,"run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":1,"duration_ms":0,"run_id":"r-1777908939935-7"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":1,"duration_ms":13,"run_id":"r-1777908939935-7"}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777908998791"}
+

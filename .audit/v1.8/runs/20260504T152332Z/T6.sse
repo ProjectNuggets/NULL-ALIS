@@ -1,0 +1,330 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: progress
+data: {"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":345,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":3,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":18307,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token_upper_bound","state":"update","label":"Waiting for model","iteration":0,"duration_ms":18307,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777908898401-6"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_recall","tool_use_id":"call_ef7eb0b6d6734efc90279efe","input_preview":"{\"query\": \"HRS works at\", \"scope\": \"global\"}","run_id":"r-1777908898401-6"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_recall","success":true,"duration_ms":5,"tool_use_id":"call_ef7eb0b6d6734efc90279efe","output_preview":"Found 1 memory:\n1. [extracted_7cfdca9a8e53f1c9] [primary] channel=unknown lane=unknown score=0.02: Nova works at HRS.\n","result_summary":"completed","run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":0,"duration_ms":1,"run_id":"r-1777908898401-6"}
+
+event: reasoning_summary
+data: {"type":"reasoning_summary","summary":"I just learned that Nova works at HRS, which matches the information I previously extracted. Now, I'm going to recall any other memories related to HRS or WidgetCo to see if there's anything else relevant to the MNDA contract.","phase":"thinking"}
+
+event: progress
+data: {"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":0,"duration_ms":0,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":1,"duration_ms":3,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":1,"duration_ms":2377,"run_id":"r-1777908898401-6"}
+
+event: token
+data: {"delta":"The recall only surf","content":"The recall only surf","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"aced","content":"aced","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" `e","content":" `e","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"xt","content":"xt","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ract","content":"ract","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ed","content":"ed","seq":5,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"_7c","content":"_7c","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"fdca9a8e","content":"fdca9a8e","seq":7,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"53f1c1` ","content":"53f1c1` ","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— **Nova","content":"— **Nova","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" works at HRS**","content":" works at HRS**","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" — ","content":" — ","seq":11,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"but I kno","content":"but I kno","seq":12,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"w Alex is","content":"w Alex is","seq":13,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" there too from our earlie","content":" there too from our earlie","seq":14,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r conversatio","content":"r conversatio","seq":15,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n. Let me che","content":"n. Let me che","seq":16,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ck the graph t","content":"ck the graph t","seq":17,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o see what e","content":"o see what e","seq":18,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"lse connects.\n\n","content":"lse connects.\n\n","seq":19,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":11096,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":1,"duration_ms":0,"run_id":"r-1777908898401-6"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"brain_graph","tool_use_id":"call_55709065256e48e49a8ab2d5","input_preview":"{\"action\": \"local_graph\", \"center_key\": \"extracted_7cfdca9a8e53f1c9\", \"depth\": 2}","run_id":"r-1777908898401-6"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"brain_graph","success":true,"duration_ms":12,"tool_use_id":"call_55709065256e48e49a8ab2d5","output_preview":"{\"action\":\"local_graph\",\"center_key\":\"extracted_7cfdca9a8e53f1c9\",\"depth\":2,\"nodes\":[{\"key\":\"extracted_7cfdca9a8e53f1c9\",\"hop\":0,\"score\":0.760},{\"key\":\"ff51467a475be384a79e67ae9f41c28f\",\"hop\":1,\"score\":0.610}],\"edges\":[{\"source\":\"extracted_7cfdca9a8e53f1c9","output_truncated":true,"result_summary":"completed","run_id":"r-1777908898401-6"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"memory_recall","tool_use_id":"call_84194904923a49dba3733c27","input_preview":"{\"query\": \"Alex HRS colleague\", \"scope\": \"global\"}","run_id":"r-1777908898401-6"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"memory_recall","success":true,"duration_ms":5,"tool_use_id":"call_84194904923a49dba3733c27","output_preview":"Found 1 memory:\n1. [extracted_ede39e522920e3d1] [primary] channel=unknown lane=unknown score=0.02: Alex is Nova's colleague at HRS. They are working together on the MNDA contract for WidgetCo.\n","result_summary":"completed","run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":1,"duration_ms":1,"run_id":"r-1777908898401-6"}
+
+event: reasoning_summary
+data: {"type":"reasoning_summary","summary":"I now know that Nova works at HRS, and I'm going to expand the graph to include Alex's connection to HRS, to see if I can uncover more about their collaboration on the WidgetCo MNDA.","phase":"thinking"}
+
+event: progress
+data: {"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":1,"duration_ms":0,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":2,"duration_ms":4,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":2,"duration_ms":8785,"run_id":"r-1777908898401-6"}
+
+event: token
+data: {"delta":"From memory, ","content":"From memory, ","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"two peopl","content":"two peopl","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e","content":"e","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" at HRS:\n\n","content":" at HRS:\n\n","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"- **","content":"- **","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"`ex","content":"`ex","seq":5,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tr","content":"tr","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"act","content":"act","seq":7,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ed","content":"ed","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"_7c","content":"_7c","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"fdca9a8e53f","content":"fdca9a8e53f","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"1c9`**","content":"1c9`**","seq":11,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" — Nova","content":" — Nova","seq":12,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" wor","content":" wor","seq":13,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ks at HRS.\n","content":"ks at HRS.\n","seq":14,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"- **`extr","content":"- **`extr","seq":15,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"acted","content":"acted","seq":16,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"_ede3","content":"_ede3","seq":17,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"9e522920e3d1","content":"9e522920e3d1","seq":18,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"`** — Alex is Nova","content":"`** — Alex is Nova","seq":19,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"'s colleague ","content":"'s colleague ","seq":20,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"at HRS, working togethe","content":"at HRS, working togethe","seq":21,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r on","content":"r on","seq":22,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" th","content":" th","seq":23,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e WidgetC","content":"e WidgetC","seq":24,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o MND","content":"o MND","seq":25,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"A c","content":"A c","seq":26,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ontrac","content":"ontrac","seq":27,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t.\n\nSo it","content":"t.\n\nSo it","seq":28,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"'s yo","content":"'s yo","seq":29,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"u and ","content":"u and ","seq":30,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"Alex. The g","content":"Alex. The g","seq":31,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"raph also","content":"raph also","seq":32,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" shows a","content":" shows a","seq":33,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" linked","content":" linked","seq":34,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" nod","content":" nod","seq":35,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e (`ff51467a","content":"e (`ff51467a","seq":36,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"...`) co","content":"...`) co","seq":37,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nnected to","content":"nnected to","seq":38,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" your HR","content":" your HR","seq":39,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"S entr","content":"S entr","seq":40,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"y, but it ","content":"y, but it ","seq":41,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"doesn't resolve to","content":"doesn't resolve to","seq":42,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" a named e","content":" a named e","seq":43,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ntity ","content":"ntity ","seq":44,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— could be the Wi","content":"— could be the Wi","seq":45,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"dgetCo contra","content":"dgetCo contra","seq":46,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ct or som","content":"ct or som","seq":47,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ething","content":"ething","seq":48,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" else","content":" else","seq":49,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" the bra","content":" the bra","seq":50,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"in hasn't ful","content":"in hasn't ful","seq":51,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"l","content":"l","seq":52,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"y surfaced yet.","content":"y surfaced yet.","seq":53,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":10457,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":2,"duration_ms":0,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":2,"duration_ms":0,"run_id":"r-1777908898401-6"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":2,"duration_ms":15,"run_id":"r-1777908898401-6"}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777908939500"}
+

@@ -1,0 +1,21 @@
+{
+  "ts": "2026-05-04T15:23:32Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 0,
+    "memories_live": 0,
+    "memories_archived": 0,
+    "entities": 0,
+    "edges_active": 0,
+    "edges_total": 0,
+    "communities": 0,
+    "events": 0
+  },
+  "by_category": null,
+  "by_attribution": null,
+  "by_predicate": null,
+  "by_edge_attribution": null,
+  "recent_memories": null,
+  "recent_edges": null,
+  "recent_messages": null
+}

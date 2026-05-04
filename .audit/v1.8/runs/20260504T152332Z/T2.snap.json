@@ -1,0 +1,131 @@
+{
+  "ts": "2026-05-04T15:31:56Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 4,
+    "memories_live": 11,
+    "memories_archived": 0,
+    "entities": 1,
+    "edges_active": 1,
+    "edges_total": 1,
+    "communities": 0,
+    "events": 13
+  },
+  "by_category": {
+    "conversation": 4,
+    "core": 5,
+    "daily": 2
+  },
+  "by_attribution": {
+    "extraction_classifier": 1,
+    "none": 10
+  },
+  "by_predicate": {
+    "PREFERS": 1
+  },
+  "by_edge_attribution": {
+    "extraction_classifier": 1
+  },
+  "recent_memories": [
+    {
+      "key": "autosave_assistant_1777908716309856000",
+      "content_head": "Got it — stored as `nova-prefers-helix`: **Nova PREFERS Helix** (core memory, global scope). That'll",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908716
+    },
+    {
+      "key": "extracted_aa601076031a93d1",
+      "content_head": "Nova prefers Helix over NeoVim for editing code. Switched last month (around April 2026).",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": "extraction_classifier",
+      "created_at": 1777908687
+    },
+    {
+      "key": "autosave_user_1777908676035004000",
+      "content_head": "I prefer Helix over NeoVim for editing code. I switched last month.",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908676
+    },
+    {
+      "key": "durable_fact/behavior/9f4dc1e668b924e8",
+      "content_head": "I prefer Helix over NeoVim for editing code. I switched last month.",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908676
+    },
+    {
+      "key": "context_anchor_current",
+      "content_head": "type=context_anchor\nlast_session=agent:zaki-bot:user:7777:main\nlast_channel=zaki_app\nlast_lane=main\n",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908623
+    },
+    {
+      "key": "timeline_index/current",
+      "content_head": "{\"at\":\"2026-05-04T15:30:20Z\",\"session\":\"agent:zaki-bot:user:7777:main\",\"key\":\"timeline_summary/agent",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908623
+    },
+    {
+      "key": "autosave_assistant_1777908623276830000",
+      "content_head": "I just checked my memory and timeline — both are blank, which means we're starting fresh. Nice to me",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908623
+    },
+    {
+      "key": "summary_latest/agent:zaki-bot:user:7777:main",
+      "content_head": "type=summary_latest\nsession=agent:zaki-bot:user:7777:main\nchannel=zaki_app\nlane=main\norigin_channel=",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908621
+    }
+  ],
+  "recent_edges": [
+    {
+      "source_key": "extracted_aa601076031a93d1",
+      "target_key": "26c12d732c46b337059fbf0dab89f836",
+      "predicate": "PREFERS",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908687
+    }
+  ],
+  "recent_messages": [
+    {
+      "role": "assistant",
+      "preview": "Got it — stored as `nova-prefers-helix`: **Nova PREFERS Helix** (core memory, gl",
+      "created_at": 1777908716,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "user",
+      "preview": "I prefer Helix over NeoVim for editing code. I switched last month.",
+      "created_at": 1777908716,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "I just checked my memory and timeline — both are blank, which means we're starti",
+      "created_at": 1777908623,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "user",
+      "preview": "My name is Nova. I'm building a personal second-brain system called nullalis.",
+      "created_at": 1777908623,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    }
+  ]
+}

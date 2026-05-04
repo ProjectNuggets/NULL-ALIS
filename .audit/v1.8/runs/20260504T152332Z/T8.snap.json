@@ -1,0 +1,166 @@
+{
+  "ts": "2026-05-04T15:36:59Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 16,
+    "memories_live": 27,
+    "memories_archived": 0,
+    "entities": 5,
+    "edges_active": 5,
+    "edges_total": 5,
+    "communities": 0,
+    "events": 35
+  },
+  "by_category": {
+    "conversation": 16,
+    "core": 7,
+    "daily": 4
+  },
+  "by_attribution": {
+    "extraction_classifier": 5,
+    "none": 22
+  },
+  "by_predicate": {
+    "HAS_ACTIVE_CONTRACT": 1,
+    "PREFERS": 2,
+    "WORKS_AT": 1,
+    "WORKS_WITH": 1
+  },
+  "by_edge_attribution": {
+    "extraction_classifier": 5
+  },
+  "recent_memories": [
+    {
+      "key": "autosave_assistant_1777909019348077000",
+      "content_head": "No communities computed yet — the brain's still too fresh, and the clustering job hasn't run. But fr",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909019
+    },
+    {
+      "key": "autosave_user_1777908999939416000",
+      "content_head": "What topics am I focused on?",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777909000
+    },
+    {
+      "key": "autosave_assistant_1777908998626111000",
+      "content_head": "Today's brain diff shows **5 new facts** born, nothing retired:\n\n| # | What landed |\n|---|----------",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908999
+    },
+    {
+      "key": "autosave_user_1777908940350729000",
+      "content_head": "What did I learn about today?",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908940
+    },
+    {
+      "key": "autosave_assistant_1777908939253759000",
+      "content_head": "From memory, two people at HRS:\n\n- **`extracted_7cfdca9a8e53f1c9`** — Nova works at HRS.\n- **`extrac",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908939
+    },
+    {
+      "key": "autosave_user_1777908898747520000",
+      "content_head": "Who works at HRS?",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908899
+    },
+    {
+      "key": "autosave_assistant_1777908897829310000",
+      "content_head": "All three stored. Here's the rundown:\n\n- **`nova-works-at-hrs`** — Nova WORKS_AT HRS\n- **`alex-colle",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777908898
+    },
+    {
+      "key": "extracted_ede39e522920e3d1",
+      "content_head": "Alex is Nova's colleague at HRS. They are working together on the MNDA contract for WidgetCo.",
+      "memory_type": "core",
+      "valid_to": null,
+      "source": "extraction_classifier",
+      "created_at": 1777908891
+    }
+  ],
+  "recent_edges": [
+    {
+      "source_key": "extracted_9bd07c3f39263a04",
+      "target_key": "4e2aebecaff96f9c4bacc2d874b84ea1",
+      "predicate": "HAS_ACTIVE_CONTRACT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908892
+    },
+    {
+      "source_key": "extracted_ede39e522920e3d1",
+      "target_key": "850793e849d543321ab073f8a48585f0",
+      "predicate": "WORKS_WITH",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    },
+    {
+      "source_key": "extracted_7cfdca9a8e53f1c9",
+      "target_key": "ff51467a475be384a79e67ae9f41c28f",
+      "predicate": "WORKS_AT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    },
+    {
+      "source_key": "extracted_f8bb5c03a477a6be",
+      "target_key": "4069fc300dbb0602ccd5a3ee27719565",
+      "predicate": "PREFERS",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908833
+    },
+    {
+      "source_key": "extracted_aa601076031a93d1",
+      "target_key": "26c12d732c46b337059fbf0dab89f836",
+      "predicate": "PREFERS",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908687
+    }
+  ],
+  "recent_messages": [
+    {
+      "role": "user",
+      "preview": "What topics am I focused on?",
+      "created_at": 1777909019,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "No communities computed yet — the brain's still too fresh, and the clustering jo",
+      "created_at": 1777909019,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "user",
+      "preview": "What did I learn about today?",
+      "created_at": 1777908999,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "Today's brain diff shows **5 new facts** born, nothing retired:\n\n| # | What land",
+      "created_at": 1777908999,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    }
+  ]
+}

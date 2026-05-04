@@ -1,0 +1,252 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: progress
+data: {"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":723,"run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":5,"run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":9480,"run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":9911,"run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":1,"run_id":"r-1777908999214-8"}
+
+event: tool_start
+data: {"type":"tool_start","tool":"brain_graph","tool_use_id":"local-0-0-brain_graph","input_preview":"{\"action\":\"communities\"}","run_id":"r-1777908999214-8"}
+
+event: tool_result
+data: {"type":"tool_result","tool":"brain_graph","success":true,"duration_ms":1,"tool_use_id":"local-0-0-brain_graph","output_preview":"{\"action\":\"communities\",\"communities\":[],\"hint\":\"No communities yet. Suggest user POST /brain/communities/recompute (or wait for next nightly job) to populate cluster data.\"}","result_summary":"completed","run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"tool_reflection","state":"update","label":"Reflecting on results","iteration":0,"duration_ms":0,"run_id":"r-1777908999214-8"}
+
+event: reasoning_summary
+data: {"type":"reasoning_summary","summary":"I just learned that the brain diff showed 5 new facts born, including Nova working at HRS and Alex being a colleague of Nova's at HRS. Now I'm going to recompute communities for the brain, as the current result indicates there are none yet.","phase":"thinking"}
+
+event: progress
+data: {"type":"progress","phase":"history_maintenance_after_tools","state":"update","label":"Updating history","iteration":0,"duration_ms":0,"run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":1,"duration_ms":5,"run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":1,"duration_ms":7086,"run_id":"r-1777908999214-8"}
+
+event: token
+data: {"delta":"No commu","content":"No commu","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nities c","content":"nities c","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"omputed ye","content":"omputed ye","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t ","content":"t ","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"— th","content":"— th","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e br","content":"e br","seq":5,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ain's ","content":"ain's ","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s","content":"s","seq":7,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"till","content":"till","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" too fresh, and","content":" too fresh, and","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" the","content":" the","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" clustering ","content":" clustering ","seq":11,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"job hasn't run. B","content":"job hasn't run. B","seq":12,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ut from ","content":"ut from ","seq":13,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"the raw ","content":"the raw ","seq":14,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"f","content":"f","seq":15,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"acts ","content":"acts ","seq":16,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"I can see, yo","content":"I can see, yo","seq":17,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ur fo","content":"ur fo","seq":18,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"cus breaks","content":"cus breaks","seq":19,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" into two clear cl","content":" into two clear cl","seq":20,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"us","content":"us","seq":21,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ters","content":"ters","seq":22,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":":\n\n**Wor","content":":\n\n**Wor","seq":23,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"k @ H","content":"k @ H","seq":24,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"RS**\n- Y","content":"RS**\n- Y","seq":25,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ou work a","content":"ou work a","seq":26,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t HRS\n- Alex is ","content":"t HRS\n- Alex is ","seq":27,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"your col","content":"your col","seq":28,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"leag","content":"leag","seq":29,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ue\n- WidgetC","content":"ue\n- WidgetC","seq":30,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o MNDA contr","content":"o MNDA contr","seq":31,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"act is active\n\n**Tool","content":"act is active\n\n**Tool","seq":32,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ing pref","content":"ing pref","seq":33,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"erence","content":"erence","seq":34,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s**\n- NeoVim i","content":"s**\n- NeoVim i","seq":35,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"s you","content":"s you","seq":36,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r editor (Hel","content":"r editor (Hel","seq":37,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ix did","content":"ix did","seq":38,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"n't stic","content":"n't stic","seq":39,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"k)\n\nTw","content":"k)\n\nTw","seq":40,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"o domai","content":"o domai","seq":41,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ns, f","content":"ns, f","seq":42,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ive facts. O","content":"ive facts. O","seq":43,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"nce the nightly clus","content":"nce the nightly clus","seq":44,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"tering ","content":"tering ","seq":45,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"job runs, these ","content":"job runs, these ","seq":46,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"should crystall","content":"should crystall","seq":47,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ize in","content":"ize in","seq":48,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"to proper topic co","content":"to proper topic co","seq":49,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"mmunities.","content":"mmunities.","seq":50,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" Want me to di","content":" Want me to di","seq":51,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"g into an","content":"g into an","seq":52,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ythi","content":"ythi","seq":53,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ng specific — th","content":"ng specific — th","seq":54,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e W","content":"e W","seq":55,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"idgetCo de","content":"idgetCo de","seq":56,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"al, HRS contex","content":"al, HRS contex","seq":57,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"t, or you","content":"t, or you","seq":58,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r","content":"r","seq":59,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" tooling stack?","content":" tooling stack?","seq":60,"stream_kind":"final_reply","live":false}
+
+event: progress
+data: {"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":9229,"run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":1,"duration_ms":0,"run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":1,"duration_ms":0,"run_id":"r-1777908999214-8"}
+
+event: progress
+data: {"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+
+event: progress
+data: {"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":1,"duration_ms":12,"run_id":"r-1777908999214-8"}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777909019469"}
+
