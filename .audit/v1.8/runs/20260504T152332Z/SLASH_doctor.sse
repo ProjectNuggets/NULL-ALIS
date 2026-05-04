@@ -1,0 +1,45 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: token
+data: {"delta":"=== Memory Doctor ===\n\nBackend\n  name:    zaki_dual\n  healthy: true\n  entries: 57\n\nCapabilities\n","content":"=== Memory Doctor ===\n\nBackend\n  name:    zaki_dual\n  healthy: true\n  entries: 57\n\nCapabilities\n","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"  keyword_rank:    true\n  session_store:   false\n  transactions:    true\n  outbox:          fals","content":"  keyword_rank:    true\n  session_store:   false\n  transactions:    true\n  outbox:          fals","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e\n\nVector Plane\n  active:  true\n  vectors: 2620\n\nOutbox\n  active:  false\n  pending: n/a\n\nRespons","content":"e\n\nVector Plane\n  active:  true\n  vectors: 2620\n\nOutbox\n  active:  false\n  pending: n/a\n\nRespons","seq":2,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"e Cache\n  active: false\n\nSemantic Cache\n  active: false\n\nRetrieval\n  sources: 1\n  rollout: on\n  ","content":"e Cache\n  active: false\n\nSemantic Cache\n  active: false\n\nRetrieval\n  sources: 1\n  rollout: on\n  ","seq":3,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"effective: mode=hybrid provider=openai vector=pgvector\n  hybrid:  true\n\nContinuity\n  hot:   raw ","content":"effective: mode=hybrid provider=openai vector=pgvector\n  hybrid:  true\n\nContinuity\n  hot:   raw ","seq":4,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"last_n history only\n  warm:  summary_latest + context_anchor_current + semantic recall top_k=10 ","content":"last_n history only\n  warm:  summary_latest + context_anchor_current + semantic recall top_k=10 ","seq":5,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"+ timeline fallback (2) + durable facts\n  cold:  memory_recall (semantic), memory_timeline (sess","content":"+ timeline fallback (2) + durable facts\n  cold:  memory_recall (semantic), memory_timeline (sess","seq":6,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ion/timeline discovery via timeline_index), memory_list (raw records), autosave transcripts (exa","content":"ion/timeline discovery via timeline_index), memory_list (raw records), autosave transcripts (exa","seq":7,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ct-history deep dive)\n  transcript_retention: forever\n  compaction_refresh: summary-producing co","content":"ct-history deep dive)\n  transcript_retention: forever\n  compaction_refresh: summary-producing co","seq":8,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"mpaction writes durable continuity\n\nSession Store\n  active: false\n\nPipeline Stages\n  mmr:       ","content":"mpaction writes durable continuity\n\nSession Store\n  active: false\n\nPipeline Stages\n  mmr:       ","seq":9,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"       true\n  temporal_decay:   true\n  query_expansion:  false\n  adaptive:         true\n  llm_re","content":"       true\n  temporal_decay:   true\n  query_expansion:  false\n  adaptive:         true\n  llm_re","seq":10,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"ranker:     false\n  summarizer:       true\n  semantic_cache:   false\n","content":"ranker:     false\n  summarizer:       true\n  semantic_cache:   false\n","seq":11,"stream_kind":"final_reply","live":false}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777921655287"}
+

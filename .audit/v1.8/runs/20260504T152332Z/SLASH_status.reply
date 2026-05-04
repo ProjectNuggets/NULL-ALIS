@@ -1,0 +1,7 @@
+{"type":"statusResponse","content":"Processing request"}
+{"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+{"delta":"Model: deepseek-ai/DeepSeek-V4-Pro\nHistory: 43 messages\nTokens used: 0\nTools: 39 available\nThink","content":"Model: deepseek-ai/DeepSeek-V4-Pro\nHistory: 43 messages\nTokens used: 0\nTools: 39 available\nThink","seq":0,"stream_kind":"final_reply","live":false}
+{"delta":"ing: medium\nVerbose: off\nReasoning: off\nUsage: off\nExec: host=gateway security=allowlist ask=on-","content":"ing: medium\nVerbose: off\nReasoning: off\nUsage: off\nExec: host=gateway security=allowlist ask=on-","seq":1,"stream_kind":"final_reply","live":false}
+{"delta":"miss\nQueue: mode=serial debounce=0ms cap=12 drop=summarize\nTTS: mode=off provider=default\nActiva","content":"miss\nQueue: mode=serial debounce=0ms cap=12 drop=summarize\nTTS: mode=off provider=default\nActiva","seq":2,"stream_kind":"final_reply","live":false}
+{"delta":"tion: mention\nSend: inherit\nSession TTL: 1800s\n","content":"tion: mention\nSend: inherit\nSession TTL: 1800s\n","seq":3,"stream_kind":"final_reply","live":false}
+{"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777921656668"}

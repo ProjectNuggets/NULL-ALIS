@@ -1,0 +1,192 @@
+{
+  "ts": "2026-05-04T19:07:41Z",
+  "user_id": 7777,
+  "counts": {
+    "messages": 38,
+    "memories_live": 59,
+    "memories_archived": 0,
+    "entities": 9,
+    "edges_active": 10,
+    "edges_total": 10,
+    "communities": 0,
+    "events": 94
+  },
+  "by_category": {
+    "conversation": 39,
+    "core": 13,
+    "daily": 7
+  },
+  "by_attribution": {
+    "extraction_classifier": 3,
+    "none": 56
+  },
+  "by_predicate": {
+    "HAS_ACTIVE_CONTRACT": 1,
+    "HAS_DEADLINE": 3,
+    "PREFERS": 2,
+    "STAKEHOLDER_OF": 2,
+    "WORKS_AT": 1,
+    "WORKS_WITH": 1
+  },
+  "by_edge_attribution": {
+    "extraction_classifier": 10
+  },
+  "recent_memories": [
+    {
+      "key": "timeline_summary/agent:zaki-bot:user:7777:main/1777921660",
+      "content_head": "origin_channel=zaki_app\norigin_lane=main\norigin_chat_id=agent:zaki-bot:user:7777:main\n\nfocus: Earlie",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777921660
+    },
+    {
+      "key": "session_checkpoint_1777921660",
+      "content_head": "type=session_checkpoint\nreason=compaction:manual\nsession=agent:zaki-bot:user:7777:main\nmodel=deepsee",
+      "memory_type": "daily",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777921660
+    },
+    {
+      "key": "autosave_assistant_1777921583441548000",
+      "content_head": "From memory (`nullalis-product-overview`), here's how they connect:\n\n---\n\n**Cell-pod isolation is th",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777921583
+    },
+    {
+      "key": "autosave_user_1777921524268143000",
+      "content_head": "Background detail: I am the founder of nullalis, a personal-second-brain product for individual high",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777921524
+    },
+    {
+      "key": "autosave_assistant_1777921523682152000",
+      "content_head": "From the twelve pillars in memory (`nullalis-product-overview`), here are the three I'd bet on:\n\n---",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777921524
+    },
+    {
+      "key": "autosave_user_1777921388422578000",
+      "content_head": "Background detail: I am the founder of nullalis, a personal-second-brain product for individual high",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777921388
+    },
+    {
+      "key": "autosave_assistant_1777921387912128000",
+      "content_head": "Good question — let me reason through each pillar from first principles. I have all twelve in memory",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777921388
+    },
+    {
+      "key": "autosave_user_1777921228711792000",
+      "content_head": "Background detail: I am the founder of nullalis, a personal-second-brain product for individual high",
+      "memory_type": "conversation",
+      "valid_to": null,
+      "source": null,
+      "created_at": 1777921229
+    }
+  ],
+  "recent_edges": [
+    {
+      "source_key": "extracted_70e786fee3d7b511",
+      "target_key": "e12722a7a93721bfd36c3866571405e6",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_041535a9e15f9b8e",
+      "target_key": "b00d640a72b2e9e8a7bdc51c43d2ab57",
+      "predicate": "STAKEHOLDER_OF",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_fa2190f6ca46407a",
+      "target_key": "be87c283acebbaf53c4737ba37117e8a",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909113
+    },
+    {
+      "source_key": "extracted_ed3319179619c1c3",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_288a758930697150",
+      "target_key": "e851f045041389390442ca556f86c510",
+      "predicate": "HAS_DEADLINE",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777909112
+    },
+    {
+      "source_key": "extracted_9bd07c3f39263a04",
+      "target_key": "4e2aebecaff96f9c4bacc2d874b84ea1",
+      "predicate": "HAS_ACTIVE_CONTRACT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908892
+    },
+    {
+      "source_key": "extracted_ede39e522920e3d1",
+      "target_key": "850793e849d543321ab073f8a48585f0",
+      "predicate": "WORKS_WITH",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    },
+    {
+      "source_key": "extracted_7cfdca9a8e53f1c9",
+      "target_key": "ff51467a475be384a79e67ae9f41c28f",
+      "predicate": "WORKS_AT",
+      "attribution": "extraction_classifier",
+      "weight": 1,
+      "valid_from": 1777908891
+    }
+  ],
+  "recent_messages": [
+    {
+      "role": "user",
+      "preview": "Background detail: I am the founder of nullalis, a personal-second-brain product",
+      "created_at": 1777921583,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "From memory (`nullalis-product-overview`), here's how they connect:\n\n---\n\n**Cell",
+      "created_at": 1777921583,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "user",
+      "preview": "Background detail: I am the founder of nullalis, a personal-second-brain product",
+      "created_at": 1777921524,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    },
+    {
+      "role": "assistant",
+      "preview": "From the twelve pillars in memory (`nullalis-product-overview`), here are the th",
+      "created_at": 1777921524,
+      "session_id": "agent:zaki-bot:user:7777:main"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: token
+data: {"delta":"59","content":"59","seq":0,"stream_kind":"final_reply","live":false}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777921693006"}
+

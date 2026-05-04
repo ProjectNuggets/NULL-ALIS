@@ -1,0 +1,5 @@
+{"type":"statusResponse","content":"Processing request"}
+{"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+{"delta":"Usage: /memory <stats|status|reindex|count|search|get|list|drain-outbox>\n  /memory search <query","content":"Usage: /memory <stats|status|reindex|count|search|get|list|drain-outbox>\n  /memory search <query","seq":0,"stream_kind":"final_reply","live":false}
+{"delta":"> [--limit N]\n  /memory get <key>\n  /memory list [--category C] [--limit N] [--include-internal]","content":"> [--limit N]\n  /memory get <key>\n  /memory list [--category C] [--limit N] [--include-internal]","seq":1,"stream_kind":"final_reply","live":false}
+{"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777921657360"}

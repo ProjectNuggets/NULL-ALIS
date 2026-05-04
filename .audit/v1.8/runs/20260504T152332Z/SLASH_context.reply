@@ -1,0 +1,4 @@
+{"type":"statusResponse","content":"Processing request"}
+{"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+{"delta":"Context: messages=43, token_estimate=33771, tools=39, memory_enriched=0, last_turn_memory=yes","content":"Context: messages=43, token_estimate=33771, tools=39, memory_enriched=0, last_turn_memory=yes","seq":0,"stream_kind":"final_reply","live":false}
+{"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777921655980"}

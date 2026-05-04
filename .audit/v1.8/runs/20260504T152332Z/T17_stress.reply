@@ -1,0 +1,269 @@
+{"type":"statusResponse","content":"Processing request"}
+{"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+{"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777921388381-5"}
+{"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":40,"run_id":"r-1777921388381-5"}
+{"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777921388381-5"}
+{"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":7,"run_id":"r-1777921388381-5"}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":71781,"run_id":"r-1777921388381-5"}
+{"delta":"From the","content":"From the","seq":0,"stream_kind":"final_reply","live":false}
+{"delta":" twelve pi","content":" twelve pi","seq":1,"stream_kind":"final_reply","live":false}
+{"delta":"llars in me","content":"llars in me","seq":2,"stream_kind":"final_reply","live":false}
+{"delta":"mory (`nullalis-pr","content":"mory (`nullalis-pr","seq":3,"stream_kind":"final_reply","live":false}
+{"delta":"oduct-overv","content":"oduct-overv","seq":4,"stream_kind":"final_reply","live":false}
+{"delta":"iew`","content":"iew`","seq":5,"stream_kind":"final_reply","live":false}
+{"delta":"), here ","content":"), here ","seq":6,"stream_kind":"final_reply","live":false}
+{"delta":"are th","content":"are th","seq":7,"stream_kind":"final_reply","live":false}
+{"delta":"e thre","content":"e thre","seq":8,"stream_kind":"final_reply","live":false}
+{"delta":"e I'd be","content":"e I'd be","seq":9,"stream_kind":"final_reply","live":false}
+{"delta":"t on:\n\n---\n\n**1. C","content":"t on:\n\n---\n\n**1. C","seq":10,"stream_kind":"final_reply","live":false}
+{"delta":"omposing","content":"omposing","seq":11,"stream_kind":"final_reply","live":false}
+{"delta":" memory","content":" memory","seq":12,"stream_kind":"final_reply","live":false}
+{"delta":"**\n\nT","content":"**\n\nT","seq":13,"stream_kind":"final_reply","live":false}
+{"delta":"his is the soul ","content":"his is the soul ","seq":14,"stream_kind":"final_reply","live":false}
+{"delta":"of the p","content":"of the p","seq":15,"stream_kind":"final_reply","live":false}
+{"delta":"rodu","content":"rodu","seq":16,"stream_kind":"final_reply","live":false}
+{"delta":"ct. ","content":"ct. ","seq":17,"stream_kind":"final_reply","live":false}
+{"delta":"Witho","content":"Witho","seq":18,"stream_kind":"final_reply","live":false}
+{"delta":"ut it, ","content":"ut it, ","seq":19,"stream_kind":"final_reply","live":false}
+{"delta":"you hav","content":"you hav","seq":20,"stream_kind":"final_reply","live":false}
+{"delta":"e a very p","content":"e a very p","seq":21,"stream_kind":"final_reply","live":false}
+{"delta":"retty","content":"retty","seq":22,"stream_kind":"final_reply","live":false}
+{"delta":" databas","content":" databas","seq":23,"stream_kind":"final_reply","live":false}
+{"delta":"e. With it, you","content":"e. With it, you","seq":24,"stream_kind":"final_reply","live":false}
+{"delta":" have s","content":" have s","seq":25,"stream_kind":"final_reply","live":false}
+{"delta":"omething tha","content":"omething tha","seq":26,"stream_kind":"final_reply","live":false}
+{"delta":"t *unders","content":"t *unders","seq":27,"stream_kind":"final_reply","live":false}
+{"delta":"tands* ","content":"tands* ","seq":28,"stream_kind":"final_reply","live":false}
+{"delta":"— that not","content":"— that not","seq":29,"stream_kind":"final_reply","live":false}
+{"delta":"ices when ","content":"ices when ","seq":30,"stream_kind":"final_reply","live":false}
+{"delta":"three scatte","content":"three scatte","seq":31,"stream_kind":"final_reply","live":false}
+{"delta":"red fac","content":"red fac","seq":32,"stream_kind":"final_reply","live":false}
+{"delta":"ts about Wi","content":"ts about Wi","seq":33,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"dgetC","content":"dgetC","seq":34,"stream_kind":"final_reply","live":false}
+{"delta":"o actually","content":"o actually","seq":35,"stream_kind":"final_reply","live":false}
+{"delta":" form ","content":" form ","seq":36,"stream_kind":"final_reply","live":false}
+{"delta":"a pattern","content":"a pattern","seq":37,"stream_kind":"final_reply","live":false}
+{"delta":", tha","content":", tha","seq":38,"stream_kind":"final_reply","live":false}
+{"delta":"t connects your ed","content":"t connects your ed","seq":39,"stream_kind":"final_reply","live":false}
+{"delta":"itor pre","content":"itor pre","seq":40,"stream_kind":"final_reply","live":false}
+{"delta":"ference to your too","content":"ference to your too","seq":41,"stream_kind":"final_reply","live":false}
+{"delta":"ling p","content":"ling p","seq":42,"stream_kind":"final_reply","live":false}
+{"delta":"hilosophy, that surfa","content":"hilosophy, that surfa","seq":43,"stream_kind":"final_reply","live":false}
+{"delta":"ces conne","content":"ces conne","seq":44,"stream_kind":"final_reply","live":false}
+{"delta":"ctions you di","content":"ctions you di","seq":45,"stream_kind":"final_reply","live":false}
+{"delta":"dn't ","content":"dn't ","seq":46,"stream_kind":"final_reply","live":false}
+{"delta":"explicitly dr","content":"explicitly dr","seq":47,"stream_kind":"final_reply","live":false}
+{"delta":"aw.\n\nEver","content":"aw.\n\nEver","seq":48,"stream_kind":"final_reply","live":false}
+{"delta":"ything els","content":"ything els","seq":49,"stream_kind":"final_reply","live":false}
+{"delta":"e —","content":"e —","seq":50,"stream_kind":"final_reply","live":false}
+{"delta":" the graph, the ","content":" the graph, the ","seq":51,"stream_kind":"final_reply","live":false}
+{"delta":"embeddings, the bi-tempo","content":"embeddings, the bi-tempo","seq":52,"stream_kind":"final_reply","live":false}
+{"delta":"ral cor","content":"ral cor","seq":53,"stream_kind":"final_reply","live":false}
+{"delta":"rectness ","content":"rectness ","seq":54,"stream_kind":"final_reply","live":false}
+{"delta":"— i","content":"— i","seq":55,"stream_kind":"final_reply","live":false}
+{"delta":"s plumbing. Composin","content":"s plumbing. Composin","seq":56,"stream_kind":"final_reply","live":false}
+{"delta":"g memory ","content":"g memory ","seq":57,"stream_kind":"final_reply","live":false}
+{"delta":"is ","content":"is ","seq":58,"stream_kind":"final_reply","live":false}
+{"delta":"the w","content":"the w","seq":59,"stream_kind":"final_reply","live":false}
+{"delta":"ater.\n\n**2. Proactive","content":"ater.\n\n**2. Proactive","seq":60,"stream_kind":"final_reply","live":false}
+{"delta":" with re","content":" with re","seq":61,"stream_kind":"final_reply","live":false}
+{"delta":"straint","content":"straint","seq":62,"stream_kind":"final_reply","live":false}
+{"delta":"**\n\nThis","content":"**\n\nThis","seq":63,"stream_kind":"final_reply","live":false}
+{"delta":" is the","content":" is the","seq":64,"stream_kind":"final_reply","live":false}
+{"delta":" hardest one t","content":" hardest one t","seq":65,"stream_kind":"final_reply","live":false}
+{"delta":"o get ri","content":"o get ri","seq":66,"stream_kind":"final_reply","live":false}
+{"delta":"ght and the one ","content":"ght and the one ","seq":67,"stream_kind":"final_reply","live":false}
+{"delta":"that determine","content":"that determine","seq":68,"stream_kind":"final_reply","live":false}
+{"delta":"s whe","content":"s whe","seq":69,"stream_kind":"final_reply","live":false}
+{"delta":"t","content":"t","seq":70,"stream_kind":"final_reply","live":false}
+{"delta":"her ","content":"her ","seq":71,"stream_kind":"final_reply","live":false}
+{"delta":"users stay. ","content":"users stay. ","seq":72,"stream_kind":"final_reply","live":false}
+{"delta":"Too passi","content":"Too passi","seq":73,"stream_kind":"final_reply","live":false}
+{"delta":"ve a","content":"ve a","seq":74,"stream_kind":"final_reply","live":false}
+{"delta":"nd yo","content":"nd yo","seq":75,"stream_kind":"final_reply","live":false}
+{"delta":"u're a CLI w","content":"u're a CLI w","seq":76,"stream_kind":"final_reply","live":false}
+{"delta":"ith e","content":"ith e","seq":77,"stream_kind":"final_reply","live":false}
+{"delta":"xtra steps. Too agg","content":"xtra steps. Too agg","seq":78,"stream_kind":"final_reply","live":false}
+{"delta":"ressiv","content":"ressiv","seq":79,"stream_kind":"final_reply","live":false}
+{"delta":"e an","content":"e an","seq":80,"stream_kind":"final_reply","live":false}
+{"delta":"d you","content":"d you","seq":81,"stream_kind":"final_reply","live":false}
+{"delta":"'re Clippy. The","content":"'re Clippy. The","seq":82,"stream_kind":"final_reply","live":false}
+{"delta":" sweet spot ","content":" sweet spot ","seq":83,"stream_kind":"final_reply","live":false}
+{"delta":"— anticipating n","content":"— anticipating n","seq":84,"stream_kind":"final_reply","live":false}
+{"delta":"eeds, pr","content":"eeds, pr","seq":85,"stream_kind":"final_reply","live":false}
+{"delta":"eparin","content":"eparin","seq":86,"stream_kind":"final_reply","live":false}
+{"delta":"g context,","content":"g context,","seq":87,"stream_kind":"final_reply","live":false}
+{"delta":" ","content":" ","seq":88,"stream_kind":"final_reply","live":false}
+{"delta":"flagging r","content":"flagging r","seq":89,"stream_kind":"final_reply","live":false}
+{"delta":"isks, but","content":"isks, but","seq":90,"stream_kind":"final_reply","live":false}
+{"delta":" never assu","content":" never assu","seq":91,"stream_kind":"final_reply","live":false}
+{"delta":"ming permiss","content":"ming permiss","seq":92,"stream_kind":"final_reply","live":false}
+{"delta":"ion ","content":"ion ","seq":93,"stream_kind":"final_reply","live":false}
+{"delta":"— is what","content":"— is what","seq":94,"stream_kind":"final_reply","live":false}
+{"delta":" makes a se","content":" makes a se","seq":95,"stream_kind":"final_reply","live":false}
+{"delta":"cond-brain feel","content":"cond-brain feel","seq":96,"stream_kind":"final_reply","live":false}
+{"delta":" like a part","content":" like a part","seq":97,"stream_kind":"final_reply","live":false}
+{"delta":"ner rather","content":"ner rather","seq":98,"stream_kind":"final_reply","live":false}
+{"delta":" th","content":" th","seq":99,"stream_kind":"final_reply","live":false}
+{"delta":"an a tool.\n\nA","content":"an a tool.\n\nA","seq":100,"stream_kind":"final_reply","live":false}
+{"delta":"nd it","content":"nd it","seq":101,"stream_kind":"final_reply","live":false}
+{"delta":" compounds: the b","content":" compounds: the b","seq":102,"stream_kind":"final_reply","live":false}
+{"delta":"etter compos","content":"etter compos","seq":103,"stream_kind":"final_reply","live":false}
+{"delta":"ing memory","content":"ing memory","seq":104,"stream_kind":"final_reply","live":false}
+{"delta":" gets, the more useful proa","content":" gets, the more useful proa","seq":105,"stream_kind":"final_reply","live":false}
+{"delta":"ctive res","content":"ctive res","seq":106,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"traint becomes","content":"traint becomes","seq":107,"stream_kind":"final_reply","live":false}
+{"delta":", because ther","content":", because ther","seq":108,"stream_kind":"final_reply","live":false}
+{"delta":"e's mor","content":"e's mor","seq":109,"stream_kind":"final_reply","live":false}
+{"delta":"e sign","content":"e sign","seq":110,"stream_kind":"final_reply","live":false}
+{"delta":"al to act on.","content":"al to act on.","seq":111,"stream_kind":"final_reply","live":false}
+{"delta":"\n\n**3. Appr","content":"\n\n**3. Appr","seq":112,"stream_kind":"final_reply","live":false}
+{"delta":"oval as product ","content":"oval as product ","seq":113,"stream_kind":"final_reply","live":false}
+{"delta":"surface","content":"surface","seq":114,"stream_kind":"final_reply","live":false}
+{"delta":"**\n\nThis is t","content":"**\n\nThis is t","seq":115,"stream_kind":"final_reply","live":false}
+{"delta":"he tru","content":"he tru","seq":116,"stream_kind":"final_reply","live":false}
+{"delta":"st engine. Hi","content":"st engine. Hi","seq":117,"stream_kind":"final_reply","live":false}
+{"delta":"gh-agency users","content":"gh-agency users","seq":118,"stream_kind":"final_reply","live":false}
+{"delta":" don't","content":" don't","seq":119,"stream_kind":"final_reply","live":false}
+{"delta":" tolerate ","content":" tolerate ","seq":120,"stream_kind":"final_reply","live":false}
+{"delta":"black boxes","content":"black boxes","seq":121,"stream_kind":"final_reply","live":false}
+{"delta":". If ","content":". If ","seq":122,"stream_kind":"final_reply","live":false}
+{"delta":"the syste","content":"the syste","seq":123,"stream_kind":"final_reply","live":false}
+{"delta":"m acts on the","content":"m acts on the","seq":124,"stream_kind":"final_reply","live":false}
+{"delta":"ir behalf, th","content":"ir behalf, th","seq":125,"stream_kind":"final_reply","live":false}
+{"delta":"ey n","content":"ey n","seq":126,"stream_kind":"final_reply","live":false}
+{"delta":"eed to ","content":"eed to ","seq":127,"stream_kind":"final_reply","live":false}
+{"delta":"*see* it h","content":"*see* it h","seq":128,"stream_kind":"final_reply","live":false}
+{"delta":"appen and *fee","content":"appen and *fee","seq":129,"stream_kind":"final_reply","live":false}
+{"delta":"l* the decisio","content":"l* the decisio","seq":130,"stream_kind":"final_reply","live":false}
+{"delta":"n point.","content":"n point.","seq":131,"stream_kind":"final_reply","live":false}
+{"delta":" Making cons","content":" Making cons","seq":132,"stream_kind":"final_reply","live":false}
+{"delta":"ent the primary inte","content":"ent the primary inte","seq":133,"stream_kind":"final_reply","live":false}
+{"delta":"rface —","content":"rface —","seq":134,"stream_kind":"final_reply","live":false}
+{"delta":" not a ","content":" not a ","seq":135,"stream_kind":"final_reply","live":false}
+{"delta":"settings togg","content":"settings togg","seq":136,"stream_kind":"final_reply","live":false}
+{"delta":"le bur","content":"le bur","seq":137,"stream_kind":"final_reply","live":false}
+{"delta":"ied three menus","content":"ied three menus","seq":138,"stream_kind":"final_reply","live":false}
+{"delta":" deep — me","content":" deep — me","seq":139,"stream_kind":"final_reply","live":false}
+{"delta":"ans ","content":"ans ","seq":140,"stream_kind":"final_reply","live":false}
+{"delta":"the p","content":"the p","seq":141,"stream_kind":"final_reply","live":false}
+{"delta":"roduct can grow ","content":"roduct can grow ","seq":142,"stream_kind":"final_reply","live":false}
+{"delta":"more autonom","content":"more autonom","seq":143,"stream_kind":"final_reply","live":false}
+{"delta":"ous without the us","content":"ous without the us","seq":144,"stream_kind":"final_reply","live":false}
+{"delta":"er feeling like","content":"er feeling like","seq":145,"stream_kind":"final_reply","live":false}
+{"delta":" the","content":" the","seq":146,"stream_kind":"final_reply","live":false}
+{"delta":"y're losi","content":"y're losi","seq":147,"stream_kind":"final_reply","live":false}
+{"delta":"ng the stee","content":"ng the stee","seq":148,"stream_kind":"final_reply","live":false}
+{"delta":"ring wheel.","content":"ring wheel.","seq":149,"stream_kind":"final_reply","live":false}
+{"delta":"\n\nIt's also the pill","content":"\n\nIt's also the pill","seq":150,"stream_kind":"final_reply","live":false}
+{"delta":"ar that enable","content":"ar that enable","seq":151,"stream_kind":"final_reply","live":false}
+{"delta":"s the","content":"s the","seq":152,"stream_kind":"final_reply","live":false}
+{"delta":" other two. C","content":" other two. C","seq":153,"stream_kind":"final_reply","live":false}
+{"delta":"omposin","content":"omposin","seq":154,"stream_kind":"final_reply","live":false}
+{"delta":"g memory can be agg","content":"g memory can be agg","seq":155,"stream_kind":"final_reply","live":false}
+{"delta":"ressive b","content":"ressive b","seq":156,"stream_kind":"final_reply","live":false}
+{"delta":"ecause","content":"ecause","seq":157,"stream_kind":"final_reply","live":false}
+{"delta":" app","content":" app","seq":158,"stream_kind":"final_reply","live":false}
+{"delta":"roval gates ","content":"roval gates ","seq":159,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"the output","content":"the output","seq":160,"stream_kind":"final_reply","live":false}
+{"delta":". Proact","content":". Proact","seq":161,"stream_kind":"final_reply","live":false}
+{"delta":"ive can be b","content":"ive can be b","seq":162,"stream_kind":"final_reply","live":false}
+{"delta":"old because ","content":"old because ","seq":163,"stream_kind":"final_reply","live":false}
+{"delta":"the user always ha","content":"the user always ha","seq":164,"stream_kind":"final_reply","live":false}
+{"delta":"s the fina","content":"s the fina","seq":165,"stream_kind":"final_reply","live":false}
+{"delta":"l say.\n","content":"l say.\n","seq":166,"stream_kind":"final_reply","live":false}
+{"delta":"\n---\n\n**Why not t","content":"\n---\n\n**Why not t","seq":167,"stream_kind":"final_reply","live":false}
+{"delta":"he othe","content":"he othe","seq":168,"stream_kind":"final_reply","live":false}
+{"delta":"rs?*","content":"rs?*","seq":169,"stream_kind":"final_reply","live":false}
+{"delta":"*\n\n- **Cell-po","content":"*\n\n- **Cell-po","seq":170,"stream_kind":"final_reply","live":false}
+{"delta":"d mu","content":"d mu","seq":171,"stream_kind":"final_reply","live":false}
+{"delta":"lti-age","content":"lti-age","seq":172,"stream_kind":"final_reply","live":false}
+{"delta":"nt** and **self","content":"nt** and **self","seq":173,"stream_kind":"final_reply","live":false}
+{"delta":"-improvement o","content":"-improvement o","seq":174,"stream_kind":"final_reply","live":false}
+{"delta":"n a leash** are inf","content":"n a leash** are inf","seq":175,"stream_kind":"final_reply","live":false}
+{"delta":"rastructure","content":"rastructure","seq":176,"stream_kind":"final_reply","live":false}
+{"delta":" and safe","content":" and safe","seq":177,"stream_kind":"final_reply","live":false}
+{"delta":"ty — cri","content":"ty — cri","seq":178,"stream_kind":"final_reply","live":false}
+{"delta":"tical,","content":"tical,","seq":179,"stream_kind":"final_reply","live":false}
+{"delta":" but ","content":" but ","seq":180,"stream_kind":"final_reply","live":false}
+{"delta":"they ex","content":"they ex","seq":181,"stream_kind":"final_reply","live":false}
+{"delta":"ist to *","content":"ist to *","seq":182,"stream_kind":"final_reply","live":false}
+{"delta":"enable*","content":"enable*","seq":183,"stream_kind":"final_reply","live":false}
+{"delta":" the top t","content":" the top t","seq":184,"stream_kind":"final_reply","live":false}
+{"delta":"hree, not to be exper","content":"hree, not to be exper","seq":185,"stream_kind":"final_reply","live":false}
+{"delta":"ienced directly.","content":"ienced directly.","seq":186,"stream_kind":"final_reply","live":false}
+{"delta":"\n- **Continuous","content":"\n- **Continuous","seq":187,"stream_kind":"final_reply","live":false}
+{"delta":" presence*","content":" presence*","seq":188,"stream_kind":"final_reply","live":false}
+{"delta":"* and **ambient voice","content":"* and **ambient voice","seq":189,"stream_kind":"final_reply","live":false}
+{"delta":"** are de","content":"** are de","seq":190,"stream_kind":"final_reply","live":false}
+{"delta":"live","content":"live","seq":191,"stream_kind":"final_reply","live":false}
+{"delta":"ry surfaces ","content":"ry surfaces ","seq":192,"stream_kind":"final_reply","live":false}
+{"delta":"— t","content":"— t","seq":193,"stream_kind":"final_reply","live":false}
+{"delta":"hey matter","content":"hey matter","seq":194,"stream_kind":"final_reply","live":false}
+{"delta":" once ","content":" once ","seq":195,"stream_kind":"final_reply","live":false}
+{"delta":"t","content":"t","seq":196,"stream_kind":"final_reply","live":false}
+{"delta":"he brain wo","content":"he brain wo","seq":197,"stream_kind":"final_reply","live":false}
+{"delta":"rks, not b","content":"rks, not b","seq":198,"stream_kind":"final_reply","live":false}
+{"delta":"efore.\n- *","content":"efore.\n- *","seq":199,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"*Portabilit","content":"*Portabilit","seq":200,"stream_kind":"final_reply","live":false}
+{"delta":"y**, **end-user d","content":"y**, **end-user d","seq":201,"stream_kind":"final_reply","live":false}
+{"delta":"efensibility**, **o","content":"efensibility**, **o","seq":202,"stream_kind":"final_reply","live":false}
+{"delta":"pen ecosyst","content":"pen ecosyst","seq":203,"stream_kind":"final_reply","live":false}
+{"delta":"em** ar","content":"em** ar","seq":204,"stream_kind":"final_reply","live":false}
+{"delta":"e value","content":"e value","seq":205,"stream_kind":"final_reply","live":false}
+{"delta":"s and moat","content":"s and moat","seq":206,"stream_kind":"final_reply","live":false}
+{"delta":"s — ","content":"s — ","seq":207,"stream_kind":"final_reply","live":false}
+{"delta":"t","content":"t","seq":208,"stream_kind":"final_reply","live":false}
+{"delta":"hey keep user","content":"hey keep user","seq":209,"stream_kind":"final_reply","live":false}
+{"delta":"s, b","content":"s, b","seq":210,"stream_kind":"final_reply","live":false}
+{"delta":"ut ","content":"ut ","seq":211,"stream_kind":"final_reply","live":false}
+{"delta":"they ","content":"they ","seq":212,"stream_kind":"final_reply","live":false}
+{"delta":"don't *a","content":"don't *a","seq":213,"stream_kind":"final_reply","live":false}
+{"delta":"ttract* ","content":"ttract* ","seq":214,"stream_kind":"final_reply","live":false}
+{"delta":"th","content":"th","seq":215,"stream_kind":"final_reply","live":false}
+{"delta":"em on day ","content":"em on day ","seq":216,"stream_kind":"final_reply","live":false}
+{"delta":"one.\n- **Visual ","content":"one.\n- **Visual ","seq":217,"stream_kind":"final_reply","live":false}
+{"delta":"ingestion** and **","content":"ingestion** and **","seq":218,"stream_kind":"final_reply","live":false}
+{"delta":"connector de","content":"connector de","seq":219,"stream_kind":"final_reply","live":false}
+{"delta":"pth** ar","content":"pth** ar","seq":220,"stream_kind":"final_reply","live":false}
+{"delta":"e input breadt","content":"e input breadt","seq":221,"stream_kind":"final_reply","live":false}
+{"delta":"h — impor","content":"h — impor","seq":222,"stream_kind":"final_reply","live":false}
+{"delta":"tant, bu","content":"tant, bu","seq":223,"stream_kind":"final_reply","live":false}
+{"delta":"t input with","content":"t input with","seq":224,"stream_kind":"final_reply","live":false}
+{"delta":"out comp","content":"out comp","seq":225,"stream_kind":"final_reply","live":false}
+{"delta":"osi","content":"osi","seq":226,"stream_kind":"final_reply","live":false}
+{"delta":"tion is just hoard","content":"tion is just hoard","seq":227,"stream_kind":"final_reply","live":false}
+{"delta":"ing.\n\nThe","content":"ing.\n\nThe","seq":228,"stream_kind":"final_reply","live":false}
+{"delta":" three I pick","content":" three I pick","seq":229,"stream_kind":"final_reply","live":false}
+{"delta":"ed form a ti","content":"ed form a ti","seq":230,"stream_kind":"final_reply","live":false}
+{"delta":"ght loop: ","content":"ght loop: ","seq":231,"stream_kind":"final_reply","live":false}
+{"delta":"**comp","content":"**comp","seq":232,"stream_kind":"final_reply","live":false}
+{"delta":"ose** ","content":"ose** ","seq":233,"stream_kind":"final_reply","live":false}
+{"delta":"→ **propos","content":"→ **propos","seq":234,"stream_kind":"final_reply","live":false}
+{"delta":"e** ","content":"e** ","seq":235,"stream_kind":"final_reply","live":false}
+{"delta":"→ **approv","content":"→ **approv","seq":236,"stream_kind":"final_reply","live":false}
+{"delta":"e**. That's the ","content":"e**. That's the ","seq":237,"stream_kind":"final_reply","live":false}
+{"delta":"c","content":"c","seq":238,"stream_kind":"final_reply","live":false}
+{"delta":"ore experience. Everyt","content":"ore experience. Everyt","seq":239,"stream_kind":"final_reply","live":false}
+{"delta":"hing else ","content":"hing else ","seq":240,"stream_kind":"final_reply","live":false}
+{"delta":"w","content":"w","seq":241,"stream_kind":"final_reply","live":false}
+{"delta":"raps around it.","content":"raps around it.","seq":242,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":135244,"run_id":"r-1777921388381-5"}
+{"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777921388381-5"}
+{"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":0,"duration_ms":0,"run_id":"r-1777921388381-5"}
+{"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+{"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":0,"duration_ms":12,"run_id":"r-1777921388381-5"}
+{"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777921523782"}

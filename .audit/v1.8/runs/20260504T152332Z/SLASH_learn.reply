@@ -1,0 +1,4 @@
+{"type":"statusResponse","content":"Processing request"}
+{"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+{"delta":"No learned behavioral facts found.","content":"No learned behavioral facts found.","seq":0,"stream_kind":"final_reply","live":false}
+{"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777921658054"}

@@ -1,0 +1,18 @@
+event: status
+data: {"type":"statusResponse","content":"Processing request"}
+
+event: reply_start
+data: {"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+
+event: token
+data: {"delta":"Memory resolved config:\n  backend: zaki_dual\n  retrieval: hybrid\n  vector: pgvector\n  embedding:","content":"Memory resolved config:\n  backend: zaki_dual\n  retrieval: hybrid\n  vector: pgvector\n  embedding:","seq":0,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":" openai\n  rollout: on\n  sync: best_effort\n  sources: 1\n  fallback: degrade\n  entries: 59\n  vecto","content":" openai\n  rollout: on\n  sync: best_effort\n  sources: 1\n  fallback: degrade\n  entries: 59\n  vecto","seq":1,"stream_kind":"final_reply","live":false}
+
+event: token
+data: {"delta":"r_entries: 2621\n  outbox_pending: n/a\n","content":"r_entries: 2621\n  outbox_pending: n/a\n","seq":2,"stream_kind":"final_reply","live":false}
+
+event: done
+data: {"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777921692308"}
+

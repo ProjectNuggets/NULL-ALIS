@@ -1,0 +1,188 @@
+{"type":"statusResponse","content":"Processing request"}
+{"type":"reply_start","stream_kind":"final_reply","delivery_mode":"live","live":true}
+{"type":"progress","phase":"turn_start","state":"update","label":"Gathering context","run_id":"r-1777921524222-6"}
+{"type":"progress","phase":"memory_enrich","state":"update","label":"Retrieving memory","duration_ms":45,"run_id":"r-1777921524222-6"}
+{"type":"progress","phase":"thinking","state":"start","label":"Thinking","run_id":"r-1777921524222-6"}
+{"type":"progress","phase":"build_provider_messages","state":"update","label":"Preparing request","iteration":0,"duration_ms":5,"run_id":"r-1777921524222-6"}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"type":"progress","phase":"llm_first_token","state":"update","label":"Model responding","iteration":0,"duration_ms":35058,"run_id":"r-1777921524222-6"}
+{"delta":"From memory (`n","content":"From memory (`n","seq":0,"stream_kind":"final_reply","live":false}
+{"delta":"ullalis-prod","content":"ullalis-prod","seq":1,"stream_kind":"final_reply","live":false}
+{"delta":"uct-overvie","content":"uct-overvie","seq":2,"stream_kind":"final_reply","live":false}
+{"delta":"w`), ","content":"w`), ","seq":3,"stream_kind":"final_reply","live":false}
+{"delta":"here's how ","content":"here's how ","seq":4,"stream_kind":"final_reply","live":false}
+{"delta":"they connec","content":"they connec","seq":5,"stream_kind":"final_reply","live":false}
+{"delta":"t:\n\n---\n\n**Cel","content":"t:\n\n---\n\n**Cel","seq":6,"stream_kind":"final_reply","live":false}
+{"delta":"l-pod isolation is th","content":"l-pod isolation is th","seq":7,"stream_kind":"final_reply","live":false}
+{"delta":"e architec","content":"e architec","seq":8,"stream_kind":"final_reply","live":false}
+{"delta":"tural","content":"tural","seq":9,"stream_kind":"final_reply","live":false}
+{"delta":" guara","content":" guara","seq":10,"stream_kind":"final_reply","live":false}
+{"delta":"ntee that makes ","content":"ntee that makes ","seq":11,"stream_kind":"final_reply","live":false}
+{"delta":"end-user def","content":"end-user def","seq":12,"stream_kind":"final_reply","live":false}
+{"delta":"e","content":"e","seq":13,"stream_kind":"final_reply","live":false}
+{"delta":"nsibility real,","content":"nsibility real,","seq":14,"stream_kind":"final_reply","live":false}
+{"delta":" not rhe","content":" not rhe","seq":15,"stream_kind":"final_reply","live":false}
+{"delta":"torical.**\n\nEnd-user def","content":"torical.**\n\nEnd-user def","seq":16,"stream_kind":"final_reply","live":false}
+{"delta":"e","content":"e","seq":17,"stream_kind":"final_reply","live":false}
+{"delta":"nsibility says","content":"nsibility says","seq":18,"stream_kind":"final_reply","live":false}
+{"delta":": *you own","content":": *you own","seq":19,"stream_kind":"final_reply","live":false}
+{"delta":" your data, y","content":" your data, y","seq":20,"stream_kind":"final_reply","live":false}
+{"delta":"ou cont","content":"ou cont","seq":21,"stream_kind":"final_reply","live":false}
+{"delta":"rol your stack, no","content":"rol your stack, no","seq":22,"stream_kind":"final_reply","live":false}
+{"delta":" vendor hostage s","content":" vendor hostage s","seq":23,"stream_kind":"final_reply","live":false}
+{"delta":"ituation.* Cel","content":"ituation.* Cel","seq":24,"stream_kind":"final_reply","live":false}
+{"delta":"l-p","content":"l-p","seq":25,"stream_kind":"final_reply","live":false}
+{"delta":"od isolation i","content":"od isolation i","seq":26,"stream_kind":"final_reply","live":false}
+{"delta":"s the mechanis","content":"s the mechanis","seq":27,"stream_kind":"final_reply","live":false}
+{"delta":"m tha","content":"m tha","seq":28,"stream_kind":"final_reply","live":false}
+{"delta":"t delivers that at the","content":"t delivers that at the","seq":29,"stream_kind":"final_reply","live":false}
+{"delta":" infras","content":" infras","seq":30,"stream_kind":"final_reply","live":false}
+{"delta":"tructure le","content":"tructure le","seq":31,"stream_kind":"final_reply","live":false}
+{"delta":"vel. Here","content":"vel. Here","seq":32,"stream_kind":"final_reply","live":false}
+{"delta":"'s","content":"'s","seq":33,"stream_kind":"final_reply","live":false}
+{"delta":" the c","content":" the c","seq":34,"stream_kind":"final_reply","live":false}
+{"delta":"hain:\n\n","content":"hain:\n\n","seq":35,"stream_kind":"final_reply","live":false}
+{"delta":"**1. The pod I","content":"**1. The pod I","seq":36,"stream_kind":"final_reply","live":false}
+{"delta":"S the ownership b","content":"S the ownership b","seq":37,"stream_kind":"final_reply","live":false}
+{"delta":"oundary.**\n","content":"oundary.**\n","seq":38,"stream_kind":"final_reply","live":false}
+{"delta":"When every use","content":"When every use","seq":39,"stream_kind":"final_reply","live":false}
+{"delta":"r's brain lives in i","content":"r's brain lives in i","seq":40,"stream_kind":"final_reply","live":false}
+{"delta":"ts ow","content":"ts ow","seq":41,"stream_kind":"final_reply","live":false}
+{"delta":"n ","content":"n ","seq":42,"stream_kind":"final_reply","live":false}
+{"delta":"isol","content":"isol","seq":43,"stream_kind":"final_reply","live":false}
+{"delta":"ated pod, ","content":"ated pod, ","seq":44,"stream_kind":"final_reply","live":false}
+{"delta":"\"your data\" has a","content":"\"your data\" has a","seq":45,"stream_kind":"final_reply","live":false}
+{"delta":" clean","content":" clean","seq":46,"stream_kind":"final_reply","live":false}
+{"delta":" physica","content":" physica","seq":47,"stream_kind":"final_reply","live":false}
+{"delta":"l s","content":"l s","seq":48,"stream_kind":"final_reply","live":false}
+{"delta":"hape. Exp","content":"hape. Exp","seq":49,"stream_kind":"final_reply","live":false}
+{"delta":"ort it, migrat","content":"ort it, migrat","seq":50,"stream_kind":"final_reply","live":false}
+{"delta":"e it, de","content":"e it, de","seq":51,"stream_kind":"final_reply","live":false}
+{"delta":"lete it —","content":"lete it —","seq":52,"stream_kind":"final_reply","live":false}
+{"delta":" the pod is the unit","content":" the pod is the unit","seq":53,"stream_kind":"final_reply","live":false}
+{"delta":" of s","content":" of s","seq":54,"stream_kind":"final_reply","live":false}
+{"delta":"ove","content":"ove","seq":55,"stream_kind":"final_reply","live":false}
+{"delta":"reignty. You're ","content":"reignty. You're ","seq":56,"stream_kind":"final_reply","live":false}
+{"delta":"not n","content":"not n","seq":57,"stream_kind":"final_reply","live":false}
+{"delta":"egotiatin","content":"egotiatin","seq":58,"stream_kind":"final_reply","live":false}
+{"delta":"g with a sha","content":"g with a sha","seq":59,"stream_kind":"final_reply","live":false}
+{"delta":"red database ","content":"red database ","seq":60,"stream_kind":"final_reply","live":false}
+{"delta":"to ext","content":"to ext","seq":61,"stream_kind":"final_reply","live":false}
+{"delta":"ract your","content":"ract your","seq":62,"stream_kind":"final_reply","live":false}
+{"delta":" rows; you pick ","content":" rows; you pick ","seq":63,"stream_kind":"final_reply","live":false}
+{"delta":"up yo","content":"up yo","seq":64,"stream_kind":"final_reply","live":false}
+{"delta":"ur po","content":"ur po","seq":65,"stream_kind":"final_reply","live":false}
+{"delta":"d and walk.\n","content":"d and walk.\n","seq":66,"stream_kind":"final_reply","live":false}
+{"delta":"\n**","content":"\n**","seq":67,"stream_kind":"final_reply","live":false}
+{"delta":"2. Isolation","content":"2. Isolation","seq":68,"stream_kind":"final_reply","live":false}
+{"delta":" is the c","content":" is the c","seq":69,"stream_kind":"final_reply","live":false}
+{"delta":"onsent fire","content":"onsent fire","seq":70,"stream_kind":"final_reply","live":false}
+{"delta":"wall.**\nNothing crosses t","content":"wall.**\nNothing crosses t","seq":71,"stream_kind":"final_reply","live":false}
+{"delta":"he pod boundary w","content":"he pod boundary w","seq":72,"stream_kind":"final_reply","live":false}
+{"delta":"ithout explicit","content":"ithout explicit","seq":73,"stream_kind":"final_reply","live":false}
+{"delta":" appro","content":" appro","seq":74,"stream_kind":"final_reply","live":false}
+{"delta":"val. Th","content":"val. Th","seq":75,"stream_kind":"final_reply","live":false}
+{"delta":"is mak","content":"is mak","seq":76,"stream_kind":"final_reply","live":false}
+{"delta":"es \"approval as p","content":"es \"approval as p","seq":77,"stream_kind":"final_reply","live":false}
+{"delta":"roduct surface\" ","content":"roduct surface\" ","seq":78,"stream_kind":"final_reply","live":false}
+{"delta":"enforceable ","content":"enforceable ","seq":79,"stream_kind":"final_reply","live":false}
+{"delta":"— the po","content":"— the po","seq":80,"stream_kind":"final_reply","live":false}
+{"delta":"d wall is wher","content":"d wall is wher","seq":81,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"e cons","content":"e cons","seq":82,"stream_kind":"final_reply","live":false}
+{"delta":"ent lives","content":"ent lives","seq":83,"stream_kind":"final_reply","live":false}
+{"delta":". Your data can","content":". Your data can","seq":84,"stream_kind":"final_reply","live":false}
+{"delta":"'t accidentally leak","content":"'t accidentally leak","seq":85,"stream_kind":"final_reply","live":false}
+{"delta":" into anal","content":" into anal","seq":86,"stream_kind":"final_reply","live":false}
+{"delta":"ytics, tra","content":"ytics, tra","seq":87,"stream_kind":"final_reply","live":false}
+{"delta":"ining pipeli","content":"ining pipeli","seq":88,"stream_kind":"final_reply","live":false}
+{"delta":"nes, or another","content":"nes, or another","seq":89,"stream_kind":"final_reply","live":false}
+{"delta":" user's context because t","content":" user's context because t","seq":90,"stream_kind":"final_reply","live":false}
+{"delta":"he a","content":"he a","seq":91,"stream_kind":"final_reply","live":false}
+{"delta":"rchite","content":"rchite","seq":92,"stream_kind":"final_reply","live":false}
+{"delta":"cture won","content":"cture won","seq":93,"stream_kind":"final_reply","live":false}
+{"delta":"'t let","content":"'t let","seq":94,"stream_kind":"final_reply","live":false}
+{"delta":" it.\n\n**3. P","content":" it.\n\n**3. P","seq":95,"stream_kind":"final_reply","live":false}
+{"delta":"orta","content":"orta","seq":96,"stream_kind":"final_reply","live":false}
+{"delta":"bility is a p","content":"bility is a p","seq":97,"stream_kind":"final_reply","live":false}
+{"delta":"od property.**","content":"od property.**","seq":98,"stream_kind":"final_reply","live":false}
+{"delta":"\nIf you want to se","content":"\nIf you want to se","seq":99,"stream_kind":"final_reply","live":false}
+{"delta":"lf-host, switc","content":"lf-host, switc","seq":100,"stream_kind":"final_reply","live":false}
+{"delta":"h pr","content":"h pr","seq":101,"stream_kind":"final_reply","live":false}
+{"delta":"oviders, ","content":"oviders, ","seq":102,"stream_kind":"final_reply","live":false}
+{"delta":"or run offline,","content":"or run offline,","seq":103,"stream_kind":"final_reply","live":false}
+{"delta":" the pod is t","content":" the pod is t","seq":104,"stream_kind":"final_reply","live":false}
+{"delta":"he natural unit of tran","content":"he natural unit of tran","seq":105,"stream_kind":"final_reply","live":false}
+{"delta":"sfer. Isola","content":"sfer. Isola","seq":106,"stream_kind":"final_reply","live":false}
+{"delta":"tion m","content":"tion m","seq":107,"stream_kind":"final_reply","live":false}
+{"delta":"eans your brai","content":"eans your brai","seq":108,"stream_kind":"final_reply","live":false}
+{"delta":"n isn","content":"n isn","seq":109,"stream_kind":"final_reply","live":false}
+{"delta":"'t tang","content":"'t tang","seq":110,"stream_kind":"final_reply","live":false}
+{"delta":"led with anyone else's inf","content":"led with anyone else's inf","seq":111,"stream_kind":"final_reply","live":false}
+{"delta":"rastruc","content":"rastruc","seq":112,"stream_kind":"final_reply","live":false}
+{"delta":"ture — it's a","content":"ture — it's a","seq":113,"stream_kind":"final_reply","live":false}
+{"delta":" clean a","content":" clean a","seq":114,"stream_kind":"final_reply","live":false}
+{"delta":"rtifact you","content":"rtifact you","seq":115,"stream_kind":"final_reply","live":false}
+{"delta":" can mo","content":" can mo","seq":116,"stream_kind":"final_reply","live":false}
+{"delta":"ve.\n\n**4. Stack","content":"ve.\n\n**4. Stack","seq":117,"stream_kind":"final_reply","live":false}
+{"delta":" control sta","content":" control sta","seq":118,"stream_kind":"final_reply","live":false}
+{"delta":"rts at ","content":"rts at ","seq":119,"stream_kind":"final_reply","live":false}
+{"delta":"the pod.","content":"the pod.","seq":120,"stream_kind":"final_reply","live":false}
+{"delta":"**\nEach pod h","content":"**\nEach pod h","seq":121,"stream_kind":"final_reply","live":false}
+{"delta":"as its","content":"as its","seq":122,"stream_kind":"final_reply","live":false}
+{"delta":" own Postg","content":" own Postg","seq":123,"stream_kind":"final_reply","live":false}
+{"delta":"res (or log","content":"res (or log","seq":124,"stream_kind":"final_reply","live":false}
+{"delta":"ical e","content":"ical e","seq":125,"stream_kind":"final_reply","live":false}
+{"delta":"quivalent),","content":"quivalent),","seq":126,"stream_kind":"final_reply","live":false}
+{"delta":" its own ve","content":" its own ve","seq":127,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"thinking","state":"update","label":"Still working on the reply","heartbeat":true}
+{"delta":"ctor store","content":"ctor store","seq":128,"stream_kind":"final_reply","live":false}
+{"delta":", its","content":", its","seq":129,"stream_kind":"final_reply","live":false}
+{"delta":" own graph. You can ","content":" own graph. You can ","seq":130,"stream_kind":"final_reply","live":false}
+{"delta":"insp","content":"insp","seq":131,"stream_kind":"final_reply","live":false}
+{"delta":"ect, modify, or replace co","content":"ect, modify, or replace co","seq":132,"stream_kind":"final_reply","live":false}
+{"delta":"mponents inside y","content":"mponents inside y","seq":133,"stream_kind":"final_reply","live":false}
+{"delta":"our pod wi","content":"our pod wi","seq":134,"stream_kind":"final_reply","live":false}
+{"delta":"thout affecting ","content":"thout affecting ","seq":135,"stream_kind":"final_reply","live":false}
+{"delta":"the platform or ot","content":"the platform or ot","seq":136,"stream_kind":"final_reply","live":false}
+{"delta":"her users. That's d","content":"her users. That's d","seq":137,"stream_kind":"final_reply","live":false}
+{"delta":"efensibil","content":"efensibil","seq":138,"stream_kind":"final_reply","live":false}
+{"delta":"ity at ","content":"ity at ","seq":139,"stream_kind":"final_reply","live":false}
+{"delta":"the code leve","content":"the code leve","seq":140,"stream_kind":"final_reply","live":false}
+{"delta":"l, not just the dat","content":"l, not just the dat","seq":141,"stream_kind":"final_reply","live":false}
+{"delta":"a l","content":"a l","seq":142,"stream_kind":"final_reply","live":false}
+{"delta":"evel.\n","content":"evel.\n","seq":143,"stream_kind":"final_reply","live":false}
+{"delta":"\n---\n\nThe sh","content":"\n---\n\nThe sh","seq":144,"stream_kind":"final_reply","live":false}
+{"delta":"ort vers","content":"ort vers","seq":145,"stream_kind":"final_reply","live":false}
+{"delta":"ion: **end-user d","content":"ion: **end-user d","seq":146,"stream_kind":"final_reply","live":false}
+{"delta":"efensibility ","content":"efensibility ","seq":147,"stream_kind":"final_reply","live":false}
+{"delta":"is the promise. Cel","content":"is the promise. Cel","seq":148,"stream_kind":"final_reply","live":false}
+{"delta":"l-pod i","content":"l-pod i","seq":149,"stream_kind":"final_reply","live":false}
+{"delta":"solation ","content":"solation ","seq":150,"stream_kind":"final_reply","live":false}
+{"delta":"is how","content":"is how","seq":151,"stream_kind":"final_reply","live":false}
+{"delta":" you keep it.** Wi","content":" you keep it.** Wi","seq":152,"stream_kind":"final_reply","live":false}
+{"delta":"thout is","content":"thout is","seq":153,"stream_kind":"final_reply","live":false}
+{"delta":"olation, def","content":"olation, def","seq":154,"stream_kind":"final_reply","live":false}
+{"delta":"ensibi","content":"ensibi","seq":155,"stream_kind":"final_reply","live":false}
+{"delta":"lit","content":"lit","seq":156,"stream_kind":"final_reply","live":false}
+{"delta":"y is a terms-of-se","content":"y is a terms-of-se","seq":157,"stream_kind":"final_reply","live":false}
+{"delta":"rvice ","content":"rvice ","seq":158,"stream_kind":"final_reply","live":false}
+{"delta":"para","content":"para","seq":159,"stream_kind":"final_reply","live":false}
+{"delta":"graph. ","content":"graph. ","seq":160,"stream_kind":"final_reply","live":false}
+{"delta":"With it, def","content":"With it, def","seq":161,"stream_kind":"final_reply","live":false}
+{"delta":"ensibility is a property of t","content":"ensibility is a property of t","seq":162,"stream_kind":"final_reply","live":false}
+{"delta":"he a","content":"he a","seq":163,"stream_kind":"final_reply","live":false}
+{"delta":"rchitecture —","content":"rchitecture —","seq":164,"stream_kind":"final_reply","live":false}
+{"delta":" the p","content":" the p","seq":165,"stream_kind":"final_reply","live":false}
+{"delta":"latform *ca","content":"latform *ca","seq":166,"stream_kind":"final_reply","live":false}
+{"delta":"n't* violate it ev","content":"n't* violate it ev","seq":167,"stream_kind":"final_reply","live":false}
+{"delta":"en i","content":"en i","seq":168,"stream_kind":"final_reply","live":false}
+{"delta":"f it wanted to.","content":"f it wanted to.","seq":169,"stream_kind":"final_reply","live":false}
+{"type":"progress","phase":"compose","state":"update","label":"Model response received","duration_ms":59160,"run_id":"r-1777921524222-6"}
+{"type":"progress","phase":"parse_provider_response","state":"update","label":"Processing response","iteration":0,"duration_ms":0,"run_id":"r-1777921524222-6"}
+{"type":"progress","phase":"compose_final_reply","state":"update","label":"Preparing reply","iteration":0,"duration_ms":0,"run_id":"r-1777921524222-6"}
+{"type":"progress","phase":"finalize","state":"done","label":"Response ready"}
+{"type":"progress","phase":"finalize_no_tools","state":"update","label":"Finalizing reply","iteration":0,"duration_ms":12,"run_id":"r-1777921524222-6"}
+{"type":"done","session_id":"agent:zaki-bot:user:7777:main","message_id":"1777921583507"}
