@@ -1372,26 +1372,32 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                                 extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
                             else
                                 null;
+                        // V1.9-6: judge_ctx now wired. V1.7-IN-03 closed.
+                        // Mirrors the gateway's V1.8-1 wiring of
+                        // memory_store + compaction Pass C — same provider,
+                        // same model, same JudgeContext shape. Closes
+                        // ZAKI's "MNDA blocked vs signed coexist" pain
+                        // class (his stress-test letter named this) where
+                        // session-end durable_fact writes accumulated
+                        // contradictory states because the judge never ran.
+                        const judge_ctx: ?extraction_persist.JudgeContext = blk: {
+                            if (self.extraction_judge_provider) |jp| {
+                                if (self.extraction_judge_model_name.len > 0) {
+                                    break :blk extraction_persist.JudgeContext{
+                                        .provider = jp,
+                                        .model_name = self.extraction_judge_model_name,
+                                    };
+                                }
+                            }
+                            break :blk null;
+                        };
                         _ = extraction_persist.persistExtracted(
                             self.allocator,
                             smgr,
                             uid,
                             session_id,
                             &mems,
-                            // judge_ctx intentionally null — the contradiction
-                            // judge needs an LLM provider in scope, but
-                            // commands.zig session-end runs without one
-                            // (no compaction-style provider plumbed here).
-                            // V1.8-2 mem_rt is appended after coref_ctx below.
-                            // Tracked V1.7 follow-up: route via
-                            // extraction_state_mgr-adjacent provider bundle
-                            // once `provider_bundle.primaryModelName()`
-                            // accessor lands. Until then session-end
-                            // extraction skips contradiction detection +
-                            // semantic dedup; only MD5 dedup applies.
-                            // V1.7a-4 review fix V1.7-IN-03: surface the
-                            // gap in traces so observability shows it.
-                            null,
+                            judge_ctx,
                             coref_ctx,
                             self.mem_rt, // V1.8-2: vector coverage on session-end
                         ) catch |err| {
@@ -1399,7 +1405,10 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                                 fact_key, @errorName(err),
                             });
                         };
-                        log.info("session_end.persistExtracted judge_ctx=null reason=no_provider_in_scope key={s}", .{fact_key});
+                        log.info("session_end.persistExtracted judge_ctx={s} key={s}", .{
+                            if (judge_ctx != null) "wired" else "null",
+                            fact_key,
+                        });
                     }
                 }
             }

@@ -377,6 +377,16 @@ pub const Agent = struct {
     /// cosine ≥0.95 (Mem0 threshold). Without it, falls back to
     /// hash-based entity_<sha256(lower(object))> from V1.6 cmt7.
     extraction_coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider = null,
+    /// V1.9-6 — LLM provider + model for the contradiction judge on the
+    /// session-end summarizer path. V1.8-1 wired the judge for
+    /// memory_store + Pass C; this closes the third callsite (commands.zig
+    /// session-end summarizer → durable_fact/* writes routed through
+    /// extraction_persist.persistExtracted). When set, contradictions are
+    /// applied + dedup'd against existing memory state. Without it, the
+    /// legacy V1.7-cmt9.6 behavior runs (judge_ctx=null at the call site;
+    /// MD5 dedup only, no semantic contradiction detection).
+    extraction_judge_provider: ?providers.Provider = null,
+    extraction_judge_model_name: []const u8 = "",
     /// Last known origin metadata for this session, owned by Session when present.
     origin_channel: ?[]const u8 = null,
     origin_lane: ?[]const u8 = null,

@@ -1596,7 +1596,18 @@ const TenantRuntime = struct {
                             coref_on = true;
                         }
                     }
-                    log.info("extraction.enabled user_id={d} coref={s}", .{ numeric_user_id, if (coref_on) "on" else "off-no-embed" });
+                    // V1.9-6: wire the judge for the session-end summarizer
+                    // path. Same provider + model that V1.8-1 plumbed for
+                    // memory_store + compaction Pass C (lines 1568-1569).
+                    // Closes the third callsite where contradictions
+                    // could land but didn't (commands.zig session-end).
+                    runtime.session_mgr.extraction_judge_provider = provider_i;
+                    runtime.session_mgr.extraction_judge_model_name = runtime.config.default_model orelse "";
+                    log.info("extraction.enabled user_id={d} coref={s} judge={s}", .{
+                        numeric_user_id,
+                        if (coref_on) "on" else "off-no-embed",
+                        "wired-session-end-v1.9-6",
+                    });
                 }
             } else |_| {
                 // user_ctx.user_id is non-numeric (e.g., email) — skip

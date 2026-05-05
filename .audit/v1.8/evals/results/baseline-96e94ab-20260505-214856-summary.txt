@@ -1,0 +1,14 @@
+V1.8-6 eval run summary
+tag=baseline-96e94ab-20260505-214856 sha=96e94ab started=20260505-214856
+
+corpus                        passed      total
+----                            ----       ----
+identity_writes                    5         11
+preference_changes                 5          6
+multi_entity                       6          6
+relational_queries                 1          1
+long_context_pass_c                2          2
+
+TOTAL                             19         26
+
+overall F1 = 0.731

@@ -1,0 +1,29 @@
+{
+  "corpus": "long_context_pass_c",
+  "sha": "96e94ab",
+  "ts": "20260505-214856",
+  "deltas": {
+    "messages": 12,
+    "memories": 54,
+    "entities": 7,
+    "edges_active": 8,
+    "edges_closed": 0,
+    "compaction_summary": 9
+  },
+  "event_deltas": {
+    "upsert": 59,
+    "edge_added": 9,
+    "edge_closed": 0,
+    "supersede": 0,
+    "judge_resolve": 0,
+    "compose": 9,
+    "episode": 15,
+    "demote": 0
+  },
+  "asserts": [
+    {"name":"messages_delta","actual":12,"op":"ge","target":12,"pass":true},{"name":"compaction_summary_keys","actual":9,"op":"ge","target":1,"pass":true}
+  ],
+  "f1": 1.000,
+  "passed": 2,
+  "total": 2
+}

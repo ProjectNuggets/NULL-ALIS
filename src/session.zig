@@ -189,6 +189,18 @@ pub const SessionManager = struct {
     /// resolves object strings to canonical entity_ids; absent →
     /// hash-fallback (V1.6 cmt7 behavior).
     extraction_coref_embed: ?@import("memory/vector/embeddings.zig").EmbeddingProvider = null,
+    /// V1.9-6 — LLM provider + model for the contradiction judge on the
+    /// session-end summarizer path. V1.8-1 wired the judge for the
+    /// extraction-tool path (memory_store) AND for compaction Pass C,
+    /// but the session-end path in commands.zig::persistSessionSemanticSummary
+    /// passed `null` to extraction_persist with a comment naming the
+    /// gap explicitly. This closes that gap. When set, durable_fact/*
+    /// writes routed through persistExtracted now run the judge,
+    /// applying contradictions / dedup against existing memory state.
+    /// Without it, the legacy V1.7-cmt9.6 behavior persists (no
+    /// contradiction detection on session-end).
+    extraction_judge_provider: ?Provider = null,
+    extraction_judge_model_name: []const u8 = "",
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -406,6 +418,9 @@ pub const SessionManager = struct {
         agent.extraction_state_mgr = self.extraction_state_mgr;
         agent.extraction_user_id = self.extraction_user_id;
         agent.extraction_coref_embed = self.extraction_coref_embed;
+        // V1.9-6 — judge provider for session-end summarizer path.
+        agent.extraction_judge_provider = self.extraction_judge_provider;
+        agent.extraction_judge_model_name = self.extraction_judge_model_name;
         return agent;
     }
 

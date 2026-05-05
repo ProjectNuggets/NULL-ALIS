@@ -1,0 +1,29 @@
+{
+  "corpus": "preference_changes",
+  "sha": "e4572a3",
+  "ts": "20260505-212045",
+  "deltas": {
+    "messages": 12,
+    "memories": 25,
+    "entities": 6,
+    "edges_active": 3,
+    "edges_closed": 3,
+    "compaction_summary": 0
+  },
+  "event_deltas": {
+    "upsert": 20,
+    "edge_added": 6,
+    "edge_closed": 3,
+    "supersede": 0,
+    "judge_resolve": 0,
+    "compose": 6,
+    "episode": 1,
+    "demote": 0
+  },
+  "asserts": [
+    {"name":"messages_delta","actual":12,"op":"ge","target":12,"pass":true},{"name":"memories_delta","actual":25,"op":"ge","target":12,"pass":true},{"name":"closed_edges_delta","actual":3,"op":"ge","target":2,"pass":true},{"name":"edges_with_predicate_PREFERS_is_latest_true_after_at_least","actual":2,"op":"ge","target":3,"pass":false},{"name":"event_upsert_delta","actual":20,"op":"ge","target":12,"pass":true},{"name":"event_edge_closed_delta","actual":3,"op":"ge","target":2,"pass":true}
+  ],
+  "f1": 0.833,
+  "passed": 5,
+  "total": 6
+}
