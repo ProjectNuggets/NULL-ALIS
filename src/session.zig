@@ -2018,7 +2018,14 @@ test "concurrent getOrCreate same key — single Session created" {
     var handles: [num_threads]std.Thread = undefined;
 
     for (0..num_threads) |t| {
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        // V1.8-14: bumped 64K → 256K for Linux CI. Linux pthread strictly
+        // honors the hint; macOS rounds up to a page-aligned minimum
+        // (≥512K). buildSessionAgent recurses into agent init paths that
+        // exceed 64K on Linux, causing SIGSEGV. Test contract is "no
+        // crash under concurrency" — minimum viable stack is an
+        // implementation detail. 256K matches the next concurrent test
+        // in this file (`processMessage different keys`).
+        handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
             fn run(mgr: *SessionManager, out: **Session) void {
                 out.* = mgr.getOrCreate("shared:key") catch unreachable;
             }
@@ -2048,7 +2055,9 @@ test "concurrent getOrCreate different keys — separate Sessions" {
 
     for (0..num_threads) |t| {
         keys[t] = std.fmt.bufPrint(&key_bufs[t], "key:{d}", .{t}) catch "?";
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        // V1.8-14: 256K stack hint — same rationale as the same-key test
+        // above.
+        handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
             fn run(mgr: *SessionManager, key: []const u8, out: **Session) void {
                 out.* = mgr.getOrCreate(key) catch unreachable;
             }
