@@ -1,0 +1,13 @@
+V1.8-6 eval run summary
+tag=baseline-ed6856d-20260505-065236 sha=ed6856d started=20260505-065236
+
+corpus                        passed      total
+----                            ----       ----
+identity_writes                    8         11
+preference_changes                 4          6
+multi_entity                       5          6
+relational_queries                 1          1
+
+TOTAL                             18         24
+
+overall F1 = 0.750

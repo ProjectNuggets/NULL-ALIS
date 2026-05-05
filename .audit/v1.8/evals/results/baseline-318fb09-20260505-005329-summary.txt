@@ -1,0 +1,10 @@
+V1.8-6 eval run summary
+tag=baseline-318fb09-20260505-005329 sha=318fb09 started=20260505-005329
+
+corpus                        passed      total
+----                            ----       ----
+preference_changes                 4          7
+
+TOTAL                              4          7
+
+overall F1 = 0.571

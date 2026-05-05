@@ -23,3 +23,4 @@ result
 .codex/
 .codex-tmp/
 tests/compaction_corpus/results/
+.claude/scheduled_tasks.lock

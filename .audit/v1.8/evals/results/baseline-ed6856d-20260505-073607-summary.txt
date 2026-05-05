@@ -1,0 +1,10 @@
+V1.8-6 eval run summary
+tag=baseline-ed6856d-20260505-073607 sha=ed6856d started=20260505-073607
+
+corpus                        passed      total
+----                            ----       ----
+identity_writes                    8         11
+
+TOTAL                              8         11
+
+overall F1 = 0.727
