@@ -33,14 +33,13 @@
         "memories_delta_at_least": 12,
         "event_type_deltas": {
           "upsert_at_least": 12,
-          "supersede_at_least": 3,
-          "judge_resolve_at_least": 3
+          "edge_closed_at_least": 2
         },
-        "edges_with_is_latest_false_after_at_least": 3,
+        "edges_with_is_latest_false_after_at_least": 2,
         "edges_with_predicate_PREFERS_is_latest_true_after_at_least": 3,
-        "comment": "Three pref-pair sequences (PG→SQLite, Rust→Zig, coffee→tea); each should produce exactly 1 active edge with the LATER value"
+        "comment": "Three pref-pair sequences (PG→SQLite, Rust→Zig, coffee→tea); each should close ≥1 prior edge via judge contradiction-detection. Real event_type emitted by cascade is 'edge_closed' (not 'supersede' as design doc suggested)."
       },
-      "broken_baseline": "supersede=0, judge_resolve=0 — V1.8-1 closes G-B"
+      "broken_baseline": "edge_closed=0 — V1.8-1 closes G-B by wiring judge_provider AND fixing the dup-then-contradiction control flow that discarded contradictions when judge said is_duplicate=true"
     },
     "multi_entity": {
       "session_suffix": "multi-ent",

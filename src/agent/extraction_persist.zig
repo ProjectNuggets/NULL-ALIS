@@ -619,20 +619,25 @@ pub fn persistExtracted(
             };
             defer outcome.deinit(allocator);
 
-            if (outcome.is_duplicate) {
-                log.info("extraction.semantic_dup_skipped subject={s} predicate={s}", .{
-                    m.subject, m.predicate,
-                });
-                result.skipped_semantic_dup += 1;
-                continue;
-            }
-
-            // Apply contradictions BEFORE writing the new fact so that
-            // hybrid recall in the next iteration of this same batch
-            // doesn't see the about-to-be-superseded rows. Since
-            // applyContradictions is idempotent + the new fact's hash
-            // is different from any existing row's, this ordering is
-            // safe even if the new write fails afterward.
+            // V1.8-1 fix: apply contradictions BEFORE the is_duplicate
+            // short-circuit. Previously, when judge returned BOTH
+            // is_duplicate=true AND contradictions.len>0, the code
+            // logged the duplicate and `continue`'d immediately,
+            // discarding the contradictions. This meant: judge correctly
+            // detected supersession, contradiction was LOGGED, but
+            // applyContradictions NEVER RAN — the old fact remained
+            // is_latest=true forever. Symptom: 0 supersede events in
+            // memory_events despite "edge_resolution.contradiction"
+            // logging. Confirmed by V1.8-1 eval run on preference_changes
+            // corpus (3 contradictions detected, 0 applied).
+            //
+            // Apply order: contradictions FIRST (close out superseded
+            // facts), then check is_duplicate (skip the new write since
+            // semantically identical to an existing fact). Closing the
+            // contradictions makes hybrid recall in the next iteration
+            // of this same batch correctly skip the about-to-be-
+            // superseded rows. Idempotent, safe even if subsequent
+            // steps fail.
             if (outcome.contradictions.len > 0) {
                 const applied = edge_resolution.applyContradictions(
                     state_mgr,
@@ -643,6 +648,14 @@ pub fn persistExtracted(
                 log.info("extraction.contradictions_applied count={d} new_subject={s} new_predicate={s}", .{
                     applied, m.subject, m.predicate,
                 });
+            }
+
+            if (outcome.is_duplicate) {
+                log.info("extraction.semantic_dup_skipped subject={s} predicate={s}", .{
+                    m.subject, m.predicate,
+                });
+                result.skipped_semantic_dup += 1;
+                continue;
             }
         }
 

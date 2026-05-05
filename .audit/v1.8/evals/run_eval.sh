@@ -147,9 +147,10 @@ run_corpus() {
   pre_edges_active=$(pg_int "SELECT COUNT(*) FROM zaki_bot.memory_edges WHERE user_id=$USER_ID AND is_latest=true")
   pre_edges_closed=$(pg_int "SELECT COUNT(*) FROM zaki_bot.memory_edges WHERE user_id=$USER_ID AND is_latest=false")
   pre_compaction=$(compaction_summary_count)
-  local pre_upsert pre_edge_added pre_supersede pre_judge_resolve pre_compose pre_episode pre_demote
+  local pre_upsert pre_edge_added pre_edge_closed pre_supersede pre_judge_resolve pre_compose pre_episode pre_demote
   pre_upsert=$(event_count upsert)
   pre_edge_added=$(event_count edge_added)
+  pre_edge_closed=$(event_count edge_closed)
   pre_supersede=$(event_count supersede)
   pre_judge_resolve=$(event_count judge_resolve)
   pre_compose=$(event_count compose)
@@ -188,9 +189,10 @@ run_corpus() {
   post_edges_active=$(pg_int "SELECT COUNT(*) FROM zaki_bot.memory_edges WHERE user_id=$USER_ID AND is_latest=true")
   post_edges_closed=$(pg_int "SELECT COUNT(*) FROM zaki_bot.memory_edges WHERE user_id=$USER_ID AND is_latest=false")
   post_compaction=$(compaction_summary_count)
-  local post_upsert post_edge_added post_supersede post_judge_resolve post_compose post_episode post_demote
+  local post_upsert post_edge_added post_edge_closed post_supersede post_judge_resolve post_compose post_episode post_demote
   post_upsert=$(event_count upsert)
   post_edge_added=$(event_count edge_added)
+  post_edge_closed=$(event_count edge_closed)
   post_supersede=$(event_count supersede)
   post_judge_resolve=$(event_count judge_resolve)
   post_compose=$(event_count compose)
@@ -268,7 +270,7 @@ run_corpus() {
   done
 
   # event_type_deltas — use the explicit pre_/post_ vars (Bash 3.2 has no assoc arrays)
-  for etkey in upsert_at_least edge_added_at_least supersede_at_least judge_resolve_at_least compose_at_least episode_at_least demote_at_least; do
+  for etkey in upsert_at_least edge_added_at_least edge_closed_at_least supersede_at_least judge_resolve_at_least compose_at_least episode_at_least demote_at_least; do
     local etval; etval=$(echo "$cfg" | jq -r ".asserts.event_type_deltas.\"$etkey\" // empty")
     [ -z "$etval" ] && continue
     local et=${etkey%_at_least}
@@ -307,6 +309,7 @@ run_corpus() {
     echo "  \"event_deltas\": {"
     echo "    \"upsert\": $((post_upsert - pre_upsert)),"
     echo "    \"edge_added\": $((post_edge_added - pre_edge_added)),"
+    echo "    \"edge_closed\": $((post_edge_closed - pre_edge_closed)),"
     echo "    \"supersede\": $((post_supersede - pre_supersede)),"
     echo "    \"judge_resolve\": $((post_judge_resolve - pre_judge_resolve)),"
     echo "    \"compose\": $((post_compose - pre_compose)),"

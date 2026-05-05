@@ -1547,12 +1547,16 @@ const TenantRuntime = struct {
 
         // V1.7 cmt9.6 — wire memory_store's coref embedder for the unified
         // triple-write path. Uses the same embedding provider mem_rt has
-        // for vector retrieval. Judge LLM provider plumbing deferred —
-        // requires per-tenant model_name accessor which the runtime bundle
-        // doesn't expose today. Without judge: memory_store's triple path
-        // still gets MD5 dedup + entity coreference + edge insert +
-        // source attribution (V1.6 cmt6/7/8/14 pipeline), just skips
-        // contradiction judging until follow-up wires the model name.
+        // for vector retrieval.
+        //
+        // V1.8-1: wire judge_provider + judge_model_name (closes G-B —
+        // contradiction judge dead in production). Uses the same primary
+        // provider + default_model the agent uses for its main turns, so
+        // the judge sees the same routing/cache as the user's session.
+        // When default_model is null (test fixtures, missing config),
+        // judge degrades gracefully to MD5-only dedup at extraction
+        // time (extraction_persist tolerates judge=null per cmt6
+        // contract).
         const cmt96_coref_embed: ?@import("memory/vector/embeddings.zig").EmbeddingProvider = blk: {
             if (runtime.mem_rt) |*mrt| {
                 if (mrt._embedding_provider) |ep| break :blk ep;
@@ -1561,8 +1565,8 @@ const TenantRuntime = struct {
         };
         tools_mod.bindMemoryStoreUnifiedContext(
             runtime.tools,
-            null, // judge_provider — TODO V1.7 follow-up
-            null, // judge_model_name — TODO V1.7 follow-up
+            provider_i, // V1.8-1: judge_provider (was null)
+            runtime.config.default_model, // V1.8-1: judge_model_name (was null)
             cmt96_coref_embed,
         );
 
