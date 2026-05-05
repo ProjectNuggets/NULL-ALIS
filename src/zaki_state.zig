@@ -382,6 +382,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listOrphanMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
+    /// V1.8-9 — stub for non-postgres builds; identity-pinning gracefully
+    /// degrades to empty (loader falls back to legacy cosine retrieval).
+    pub fn listIdentityFacts(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
     /// V1.7a-9a — stubs for non-postgres builds. Communities feature
     /// degrades to "no communities yet" — every node has community_id=null
     /// on /brain/graph, /brain/communities returns empty, recompute is a
@@ -3708,6 +3713,68 @@ const ManagerImpl = struct {
                 "    WHERE e.user_id = $1 AND e.is_latest " ++
                 "    AND (e.source_key = m.key OR e.target_key = m.key)" ++
                 ") ORDER BY created_at DESC, id DESC LIMIT $2::int",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var lim_buf: [16]u8 = undefined;
+        const lim_s = try std.fmt.bufPrintZ(&lim_buf, "{d}", .{limit});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, lim_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(lim_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        return try decodeMemoryRows(allocator, result, false);
+    }
+
+    /// V1.8-9 — pull memory rows that anchor the user's active identity.
+    /// Returns memories whose key participates (as source OR target) in a
+    /// LIVE typed edge whose predicate is in the identity-class set:
+    /// NAME / NAMED / IS / IS_A / LIVES_IN / WORKS_AT / WORKS_AS / ROLE /
+    /// ROLE_IS / BORN_IN / SPEAKS / FOLLOWS_GOAL / PREFERS.
+    ///
+    /// Why an explicit pin: cosine retrieval scores identity facts against
+    /// the current user message. On turns whose text is unrelated to
+    /// identity (e.g. "what's the weather"), identity facts get bumped
+    /// from warm context. The agent then loses "who am I talking to"
+    /// until the next cosine-relevant turn. Pinning bypasses relevance —
+    /// identity facts are CONTEXT-INVARIANT by definition (the user's
+    /// name doesn't depend on what they just said).
+    ///
+    /// Cost: one PG round-trip per turn. EXISTS subquery is covered by
+    /// `idx_edges_source` and `idx_edges_target` (both partial indexes
+    /// `WHERE is_latest`). Bounded by `limit` (loader passes 8).
+    ///
+    /// Brain-hygiene NOT applied here — identity facts are user-content,
+    /// not bookkeeping. Validity filter applied (superseded rows hidden).
+    ///
+    /// Caller frees via `memory_root.freeEntries`.
+    pub fn listIdentityFacts(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        limit: u32,
+    ) ![]memory_root.MemoryEntry {
+        // EXISTS is binary, so m rows appear at most once even when an
+        // identity-class edge matches via both source_key AND target_key
+        // — no DISTINCT needed. Sort by recency so the most recently
+        // updated identity facts win when the byte budget is tight.
+        const q = try self.buildQuery(
+            "SELECT m.id, m.key, m.content, m.memory_type, " ++
+                "COALESCE((EXTRACT(EPOCH FROM m.created_at))::bigint::text, '0'), " ++
+                "m.session_id, m.valid_to FROM {schema}.memories m " ++
+                "WHERE m.user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "AND EXISTS (" ++
+                "    SELECT 1 FROM {schema}.memory_edges e " ++
+                "    WHERE e.user_id = $1 AND e.is_latest " ++
+                "    AND (e.source_key = m.key OR e.target_key = m.key) " ++
+                "    AND e.predicate IN (" ++
+                "        'NAME','NAMED','IS','IS_A','LIVES_IN'," ++
+                "        'WORKS_AT','WORKS_AS','ROLE','ROLE_IS'," ++
+                "        'BORN_IN','SPEAKS','FOLLOWS_GOAL','PREFERS'" ++
+                "    )" ++
+                ") ORDER BY m.created_at DESC, m.id DESC LIMIT $2::int",
         );
         defer self.allocator.free(q);
 

@@ -895,11 +895,32 @@ pub fn loadTurnMemorySlot(
     };
     defer if (community_block) |c| allocator.free(c);
 
+    // ── V1.8-9: warm <active_identity> block ───────────────────────────
+    // Pin the user's identity facts in warm context regardless of cosine
+    // relevance to this turn's user message. Identity is context-invariant
+    // by definition (the user's name doesn't depend on what they just
+    // said). Without pinning, identity facts get bumped from context on
+    // turns whose text is unrelated to identity — agent loses "who am I
+    // talking to" until the next cosine-relevant turn.
+    //
+    // Cost: 1 PG round-trip per turn via listIdentityFacts. Bounded by
+    // limit=8 + IDENTITY_BLOCK_MAX_BYTES (1500). Falls back silently on
+    // any error; legacy retrieval is unaffected.
+    var identity_block: ?[]u8 = null;
+    if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
+        identity_block = buildActiveIdentityBlock(allocator, sm, uid) catch |err| blk: {
+            log.warn("active_identity.append_failed err={s} — skipping identity context", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+    defer if (identity_block) |b| allocator.free(b);
+
     // If everything is empty, return empty slot (no fence).
     const has_legacy = result.context.len > 0;
     const has_graph = if (graph_block) |g| g.len > 0 else false;
     const has_community = if (community_block) |c| c.len > 0 else false;
-    if (!has_legacy and !has_graph and !has_community) {
+    const has_identity = if (identity_block) |b| b.len > 0 else false;
+    if (!has_legacy and !has_graph and !has_community and !has_identity) {
         allocator.free(result.context);
         return .{
             .fenced_content = try allocator.dupe(u8, ""),
@@ -910,10 +931,14 @@ pub fn loadTurnMemorySlot(
     defer allocator.free(result.context);
     const graph_payload: []const u8 = if (graph_block) |g| g else "";
     const community_payload: []const u8 = if (community_block) |c| c else "";
+    const identity_payload: []const u8 = if (identity_block) |b| b else "";
+    // V1.8-9: identity block goes FIRST inside the fence — context-invariant
+    // facts are read before turn-specific retrieval. Order: identity →
+    // legacy retrieval → graph neighbors → communities.
     const fenced = try std.fmt.allocPrint(
         allocator,
-        "<memory_for_turn>\n{s}{s}{s}</memory_for_turn>\n",
-        .{ result.context, graph_payload, community_payload },
+        "<memory_for_turn>\n{s}{s}{s}{s}</memory_for_turn>\n",
+        .{ identity_payload, result.context, graph_payload, community_payload },
     );
     return .{
         .fenced_content = fenced,
@@ -982,6 +1007,89 @@ fn buildActiveCommunitiesBlock(
         return null;
     }
     try w.writeAll("\n</active_communities>\n");
+    return try buf.toOwnedSlice(allocator);
+}
+
+// ── V1.8-9 active-identity pinning ──────────────────────────────────────
+
+/// Hard cap on the `<active_identity>` block bytes. Identity facts are
+/// typically short prose ("Eli Vance is a software engineer in Berlin");
+/// 1500 bytes holds ~6-10 facts comfortably. Prevents identity bucket
+/// from blowing the prompt cache budget when extraction has been busy.
+const IDENTITY_BLOCK_MAX_BYTES: usize = 1500;
+/// Per-fact content cap. Same shape as SEMANTIC_ENTRY_MAX_BYTES.
+const IDENTITY_FACT_MAX_BYTES: usize = 220;
+/// Maximum facts to fetch from PG. Loader trims further by byte budget.
+const IDENTITY_FACT_FETCH_LIMIT: u32 = 8;
+
+/// V1.8-9 — emit pinned identity facts as warm always-on context.
+/// Bypasses cosine relevance scoring: identity is context-invariant
+/// (the user's name doesn't depend on this turn's user message).
+///
+/// Format:
+///   <active_identity source="pinned">
+///   - Eli Vance is a software engineer based in Berlin, Germany.
+///   - Eli works at OmniCorp on the Atlas project.
+///   - …
+///   </active_identity>
+///
+/// Returns null when:
+///   - `listIdentityFacts` errors (caller logs + skips block — graceful
+///     degrade, legacy retrieval unaffected)
+///   - Zero facts match identity-class predicates yet (cold-start before
+///     first identity write)
+///   - All matched facts are empty/blank after trimming
+///
+/// Cost: 1 PG round-trip per turn. Bounded by IDENTITY_FACT_FETCH_LIMIT
+/// (8 rows). EXISTS subquery covered by partial indexes.
+fn buildActiveIdentityBlock(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+) !?[]u8 {
+    const facts = try state_mgr.listIdentityFacts(allocator, user_id, IDENTITY_FACT_FETCH_LIMIT);
+    defer memory_mod.freeEntries(allocator, facts);
+    if (facts.len == 0) return null;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("<active_identity source=\"pinned\">\n");
+
+    var emitted: usize = 0;
+    var bytes_used: usize = 0;
+    for (facts) |entry| {
+        const trimmed = std.mem.trim(u8, entry.content, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        // Cap per-fact bytes (UTF-8 safe truncation) and account for the
+        // "- " prefix + newline overhead.
+        const truncated = truncateUtf8(trimmed, IDENTITY_FACT_MAX_BYTES);
+        const line_overhead: usize = 3; // "- " + "\n"
+        if (bytes_used + truncated.len + line_overhead > IDENTITY_BLOCK_MAX_BYTES) break;
+        try w.writeAll("- ");
+        // Defense-in-depth: strip XML structural chars so a future
+        // extraction-classifier regression can't inject system-prompt
+        // markup (mirrors buildActiveCommunitiesBlock WR-1 escape).
+        for (truncated) |ch| {
+            if (ch == '<' or ch == '>' or ch == '\r') continue;
+            if (ch == '\n') {
+                try w.writeByte(' ');
+                continue;
+            }
+            try w.writeByte(ch);
+        }
+        try w.writeByte('\n');
+        bytes_used += truncated.len + line_overhead;
+        emitted += 1;
+    }
+
+    if (emitted == 0) {
+        // All matched facts were blank / oversized after trimming. Drop
+        // the block rather than emit an empty header.
+        buf.deinit(allocator);
+        return null;
+    }
+    try w.writeAll("</active_identity>\n");
     return try buf.toOwnedSlice(allocator);
 }
 
