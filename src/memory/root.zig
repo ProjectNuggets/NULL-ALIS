@@ -577,6 +577,33 @@ pub const CommunityAssignment = struct {
     community_id: i32,
 };
 
+/// V1.9-1 — result of a cascade-rename operation on the entity graph.
+/// Returned by `state_mgr.cascadeRenameEntity(allocator, user_id,
+/// old_name, new_name)`. Caller owns `old_id` + `new_id` via the
+/// supplied allocator.
+pub const CascadeRenameResult = struct {
+    /// True when the old entity existed; false → no-op (rename target
+    /// was a fresh write, not a rename of an existing entity).
+    found_old: bool,
+    /// 32-char hex entity_id (allocator-owned). Empty string when
+    /// found_old=false.
+    old_id: []u8,
+    /// New entity_id after upsert (allocator-owned). When found_old=true
+    /// AND case-only rename, equals old_id (cascade was a no-op).
+    new_id: []u8,
+    /// Number of new memory_edges rows written with substituted endpoint.
+    edges_rewritten: usize,
+    /// Number of pre-existing edges that got is_latest=false (matches
+    /// edges_rewritten in the typical path; differs only when
+    /// ON CONFLICT DO NOTHING swallowed a duplicate).
+    edges_closed: usize,
+
+    pub fn deinit(self: *const CascadeRenameResult, allocator: std.mem.Allocator) void {
+        if (self.old_id.len > 0) allocator.free(self.old_id);
+        if (self.new_id.len > 0) allocator.free(self.new_id);
+    }
+};
+
 /// V1.7a-9a — owned community-name lookup row.
 pub const CommunityName = struct {
     name: []u8,

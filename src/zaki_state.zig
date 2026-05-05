@@ -423,6 +423,24 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
+    /// V1.9-1 — stub for non-postgres builds; cascade rename no-ops.
+    /// Returns found_old=false so callers degrade to "treat as fresh
+    /// write" rather than crashing.
+    pub fn cascadeRenameEntity(
+        _: *@This(),
+        allocator: std.mem.Allocator,
+        _: i64,
+        _: []const u8,
+        _: []const u8,
+    ) !memory_root.CascadeRenameResult {
+        return .{
+            .found_old = false,
+            .old_id = try allocator.alloc(u8, 0),
+            .new_id = try allocator.alloc(u8, 0),
+            .edges_rewritten = 0,
+            .edges_closed = 0,
+        };
+    }
     /// V1.6 commit 6 — stub for non-postgres builds. Returns empty
     /// candidate list so `edge_resolution.resolveOne` short-circuits to
     /// the no-op outcome (caller writes new fact normally without
@@ -4356,6 +4374,277 @@ const ManagerImpl = struct {
     /// the judge handles older context via the broader `recallMemories`
     /// neighborhood.
     ///
+    /// V1.9-1 — cascade entity rename across the live graph.
+    ///
+    /// Use case (per ZAKI's stress-test letter): "Project Neptune" →
+    /// "Project Nullalis" should propagate to every edge mentioning
+    /// the old entity. One agent call replaces N manual edits.
+    ///
+    /// Operation:
+    ///   1. BEGIN transaction (errdefer ROLLBACK).
+    ///   2. Resolve old_entity_id by name_lower=lower(old_name). If
+    ///      missing → return result with found_old=false (no-op,
+    ///      caller decides whether to proceed with a fresh write).
+    ///   3. Upsert new_entity_id by name_lower=lower(new_name) with
+    ///      NULL embedding placeholder. Future encounter with an
+    ///      embedding-bearing path repopulates via upsertEntity's
+    ///      ON CONFLICT update.
+    ///   4. If old_id == new_id (case-only or already-canonical
+    ///      rename) → COMMIT no-op, return edges_rewritten=0.
+    ///   5. Atomic two-step on memory_edges:
+    ///      (a) INSERT new edges with old_id substituted by new_id
+    ///          on either source_key or target_key (CASE-WHEN), copy
+    ///          predicate/attribution/confidence/weight, set
+    ///          valid_from=now, is_latest=true.
+    ///      (b) UPDATE old edges: is_latest=false, valid_to=now,
+    ///          invalid_at=now, expired_at=now. RETURNING the
+    ///          (source_key, target_key, predicate, confidence) so
+    ///          we can emit edge_closed events post-COMMIT.
+    ///   6. COMMIT.
+    ///   7. Emit edge_closed event per closed edge (best-effort,
+    ///      non-fatal — cascade already committed). Plus ONE
+    ///      memory_events row with event_type='cascade_renamed' and
+    ///      payload {old_name, new_name, old_id, new_id,
+    ///      edges_rewritten}.
+    ///
+    /// What this does NOT do:
+    ///   - Walk memory ROW content for old_name string occurrences.
+    ///     Memories whose CONTENT mentions old_name are not rewritten;
+    ///     the agent retrieves them via cosine + the new name will
+    ///     gradually take over via fresh writes. (Content rewrite is
+    ///     V1.9-3 propagate_correction territory.)
+    ///   - Touch entity_type / linked_memory_ids on either entity
+    ///     row. The edge graph is the source of truth; entity row is
+    ///     a cache.
+    ///
+    /// Concurrent safety: BEGIN/COMMIT serializes the cascade. Other
+    /// readers see either pre-cascade or post-cascade state; never
+    /// partial. is_latest flip is atomic per row.
+    ///
+    /// Caller does NOT free the result — it's a value struct.
+    pub fn cascadeRenameEntity(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        old_name: []const u8,
+        new_name: []const u8,
+    ) !memory_root.CascadeRenameResult {
+        const begin_result = try self.exec("BEGIN");
+        c.PQclear(begin_result);
+        errdefer {
+            if (self.exec("ROLLBACK")) |rb| {
+                c.PQclear(rb);
+            } else |_| {}
+        }
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        // Step 2 — resolve old_entity_id.
+        const old_name_z = try self.allocator.dupeZ(u8, old_name);
+        defer self.allocator.free(old_name_z);
+        const lookup_q = try self.buildQuery(
+            "SELECT id FROM {schema}.memory_entities " ++
+                "WHERE user_id = $1 AND name_lower = LOWER($2) LIMIT 1",
+        );
+        defer self.allocator.free(lookup_q);
+        const lookup_params = [_]?[*:0]const u8{ user_s.ptr, old_name_z };
+        const lookup_lengths = [_]c_int{ @intCast(user_s.len), @intCast(old_name.len) };
+        const lookup_result = try self.execParams(lookup_q, &lookup_params, &lookup_lengths);
+        defer c.PQclear(lookup_result);
+        if (c.PQntuples(lookup_result) == 0) {
+            // No old entity → no cascade needed. COMMIT empty txn.
+            const commit = try self.exec("COMMIT");
+            c.PQclear(commit);
+            return .{
+                .found_old = false,
+                .old_id = "",
+                .new_id = "",
+                .edges_rewritten = 0,
+                .edges_closed = 0,
+            };
+        }
+        const old_id_owned = try dupeResultValue(self.allocator, lookup_result, 0, 0);
+        defer self.allocator.free(old_id_owned);
+
+        // Step 3 — upsert new entity (NULL embedding ok).
+        const new_name_z = try self.allocator.dupeZ(u8, new_name);
+        defer self.allocator.free(new_name_z);
+        const new_id_raw = try self.randomHexId(self.allocator, 16);
+        defer self.allocator.free(new_id_raw);
+        const new_id_z = try self.allocator.dupeZ(u8, new_id_raw);
+        defer self.allocator.free(new_id_z);
+        const upsert_q = try self.buildQuery(
+            "INSERT INTO {schema}.memory_entities (id, user_id, name, name_lower) " ++
+                "VALUES ($1, $2, $3, LOWER($3)) " ++
+                "ON CONFLICT (user_id, name_lower) DO UPDATE SET updated_at = NOW() " ++
+                "RETURNING id",
+        );
+        defer self.allocator.free(upsert_q);
+        const upsert_params = [_]?[*:0]const u8{ new_id_z, user_s.ptr, new_name_z };
+        const upsert_lengths = [_]c_int{
+            @intCast(new_id_raw.len),
+            @intCast(user_s.len),
+            @intCast(new_name.len),
+        };
+        const upsert_result = try self.execParams(upsert_q, &upsert_params, &upsert_lengths);
+        defer c.PQclear(upsert_result);
+        const new_id_owned = try dupeResultValue(self.allocator, upsert_result, 0, 0);
+        // Caller owns new_id; don't free here. We dup again for the result.
+
+        // Step 4 — case-only / already-canonical no-op.
+        if (std.mem.eql(u8, old_id_owned, new_id_owned)) {
+            self.allocator.free(new_id_owned);
+            const commit = try self.exec("COMMIT");
+            c.PQclear(commit);
+            return .{
+                .found_old = true,
+                .old_id = try allocator.dupe(u8, old_id_owned),
+                .new_id = try allocator.dupe(u8, old_id_owned),
+                .edges_rewritten = 0,
+                .edges_closed = 0,
+            };
+        }
+
+        // Step 5a — INSERT new edges with substituted endpoint.
+        const old_id_z = try self.allocator.dupeZ(u8, old_id_owned);
+        defer self.allocator.free(old_id_z);
+        const new_id_z2 = try self.allocator.dupeZ(u8, new_id_owned);
+        defer self.allocator.free(new_id_z2);
+        const now_ts: i64 = std.time.timestamp();
+        var ts_buf: [32]u8 = undefined;
+        const ts_s = try std.fmt.bufPrintZ(&ts_buf, "{d}", .{now_ts});
+        const insert_params = [_]?[*:0]const u8{
+            user_s.ptr,
+            old_id_z,
+            new_id_z2,
+            ts_s.ptr,
+        };
+        const insert_lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(old_id_owned.len),
+            @intCast(new_id_owned.len),
+            @intCast(ts_s.len),
+        };
+        const insert_q = try self.buildQuery(
+            "INSERT INTO {schema}.memory_edges " ++
+                "(user_id, source_key, target_key, predicate, attribution, confidence, weight, valid_from, is_latest) " ++
+                "SELECT user_id, " ++
+                "  CASE WHEN source_key = $2 THEN $3 ELSE source_key END, " ++
+                "  CASE WHEN target_key = $2 THEN $3 ELSE target_key END, " ++
+                "  predicate, " ++
+                "  COALESCE(attribution, 'cascade_rename'), " ++
+                "  confidence, " ++
+                "  weight, " ++
+                "  $4::bigint, " ++
+                "  TRUE " ++
+                "FROM {schema}.memory_edges " ++
+                "WHERE user_id = $1 AND is_latest " ++
+                "AND (source_key = $2 OR target_key = $2) " ++
+                "ON CONFLICT (user_id, source_key, predicate, target_key) WHERE is_latest DO NOTHING",
+        );
+        defer self.allocator.free(insert_q);
+        const insert_result = try self.execParams(insert_q, &insert_params, &insert_lengths);
+        const inserted_count: usize = blk: {
+            const tag = c.PQcmdTuples(insert_result);
+            const tag_str = std.mem.span(tag);
+            break :blk std.fmt.parseInt(usize, tag_str, 10) catch 0;
+        };
+        c.PQclear(insert_result);
+
+        // Step 5b — UPDATE old edges: close-out with RETURNING.
+        const close_params = [_]?[*:0]const u8{ user_s.ptr, old_id_z, ts_s.ptr };
+        const close_lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(old_id_owned.len),
+            @intCast(ts_s.len),
+        };
+        const close_q = try self.buildQuery(
+            "UPDATE {schema}.memory_edges SET " ++
+                "valid_to = $3, invalid_at = $3, expired_at = $3, is_latest = FALSE " ++
+                "WHERE user_id = $1 AND is_latest " ++
+                "AND (source_key = $2 OR target_key = $2) " ++
+                "RETURNING source_key, target_key, predicate, COALESCE(confidence, 1.0)",
+        );
+        defer self.allocator.free(close_q);
+        const close_result = try self.execParams(close_q, &close_params, &close_lengths);
+        defer c.PQclear(close_result);
+        const closed_count_raw = c.PQntuples(close_result);
+        const closed_count: usize = if (closed_count_raw < 0) 0 else @intCast(closed_count_raw);
+
+        // Capture closed-edge metadata for post-COMMIT events.
+        var closed_edges: std.ArrayListUnmanaged(struct {
+            source_key: []u8,
+            target_key: []u8,
+            predicate: []u8,
+            confidence: f64,
+        }) = .empty;
+        defer {
+            for (closed_edges.items) |e| {
+                self.allocator.free(e.source_key);
+                self.allocator.free(e.target_key);
+                self.allocator.free(e.predicate);
+            }
+            closed_edges.deinit(self.allocator);
+        }
+        var ci: c_int = 0;
+        while (ci < closed_count_raw) : (ci += 1) {
+            const src = dupeResultValue(self.allocator, close_result, ci, 0) catch continue;
+            errdefer self.allocator.free(src);
+            const tgt = dupeResultValue(self.allocator, close_result, ci, 1) catch {
+                self.allocator.free(src);
+                continue;
+            };
+            errdefer self.allocator.free(tgt);
+            const pred = dupeResultValue(self.allocator, close_result, ci, 2) catch {
+                self.allocator.free(src);
+                self.allocator.free(tgt);
+                continue;
+            };
+            errdefer self.allocator.free(pred);
+            const conf_str = dupeResultValue(self.allocator, close_result, ci, 3) catch {
+                self.allocator.free(src);
+                self.allocator.free(tgt);
+                self.allocator.free(pred);
+                continue;
+            };
+            defer self.allocator.free(conf_str);
+            const conf_val = std.fmt.parseFloat(f64, conf_str) catch 1.0;
+            try closed_edges.append(self.allocator, .{
+                .source_key = src,
+                .target_key = tgt,
+                .predicate = pred,
+                .confidence = conf_val,
+            });
+        }
+
+        // Step 6 — COMMIT.
+        const commit_result = try self.exec("COMMIT");
+        c.PQclear(commit_result);
+
+        // Step 7 — post-COMMIT event emission. Best-effort. Failure
+        // here doesn't roll back the cascade.
+        for (closed_edges.items) |e| {
+            self.insertEdgeEvent(user_id, e.source_key, e.target_key, e.predicate, "closed", e.confidence) catch |err| {
+                log.warn("cascade_rename.event_failed err={s} src={s} pred={s}", .{
+                    @errorName(err), e.source_key, e.predicate,
+                });
+            };
+        }
+
+        log.info("cascade_rename user={d} old={s} new={s} old_id={s} new_id={s} inserted={d} closed={d}", .{
+            user_id, old_name, new_name, old_id_owned, new_id_owned, inserted_count, closed_count,
+        });
+
+        return .{
+            .found_old = true,
+            .old_id = try allocator.dupe(u8, old_id_owned),
+            .new_id = try allocator.dupe(u8, new_id_owned),
+            .edges_rewritten = inserted_count,
+            .edges_closed = closed_count,
+        };
+    }
+
     /// Today the `subject` column is unpopulated by upsertMemoryWithMetadata
     /// (V1.6 5b.3 wrote subject only into JSONB metadata). This query
     /// reads the JSONB path directly so it works without a forward
