@@ -622,6 +622,16 @@ test "buildLastTurnContext captures injected memory bytes" {
         fallback_bucket_bytes: usize,
         context_bytes: usize,
         injected: bool,
+        // V1.8-13: selectionFromStats now also reads graph_recall_* and
+        // identity_pin_* fields. The struct passed to buildLastTurnContext
+        // (which calls selectionFromStats) must satisfy that contract.
+        graph_recall_active: bool,
+        graph_recall_seed_count: usize,
+        graph_recall_neighbor_count: usize,
+        graph_recall_appended_bytes: usize,
+        identity_pin_active: bool,
+        identity_pin_fact_count: usize,
+        identity_pin_appended_bytes: usize,
     }{
         .available = true,
         .candidate_count = 5,
@@ -640,6 +650,14 @@ test "buildLastTurnContext captures injected memory bytes" {
         .fallback_bucket_bytes = 0,
         .context_bytes = 34,
         .injected = true,
+        // V1.8-13 contract: zeroed defaults for the test fixture.
+        .graph_recall_active = false,
+        .graph_recall_seed_count = 0,
+        .graph_recall_neighbor_count = 0,
+        .graph_recall_appended_bytes = 0,
+        .identity_pin_active = false,
+        .identity_pin_fact_count = 0,
+        .identity_pin_appended_bytes = 0,
     };
     const last_turn = buildLastTurnContext(
         plan,
