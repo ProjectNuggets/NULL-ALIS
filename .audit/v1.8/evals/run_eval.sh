@@ -119,6 +119,31 @@ compaction_summary_count() {
   pg_int "SELECT COUNT(*) FROM zaki_bot.memories WHERE user_id=$USER_ID AND key LIKE 'compaction_summary/%'"
 }
 
+# V1.9-8 — reset per-corpus user state to fresh (contamination-free
+# baselines). Runs before each corpus when --baseline is set. WIPE
+# scope: memories + memory_entities + memory_edges + memory_communities
+# + memory_events + messages — every table the eval asserts on. Does
+# NOT delete the user from zaki_users / zaki_bot.users (those stay
+# provisioned). Idempotent; safe if already empty.
+#
+# Why required: even though v2 isolates each corpus to a unique user,
+# running --baseline TWICE on the same user re-introduces
+# within-user-across-runs contamination — entities from the prior
+# baseline still exist, get coref'd by V1.6 cmt8, dedup'd. Reset
+# closes that loop so every --baseline run sees a fresh slate.
+reset_user_state() {
+  local uid="$1"
+  $PSQL "$PG" -At <<SQL > /dev/null
+    DELETE FROM zaki_bot.memory_events WHERE user_id=$uid;
+    DELETE FROM zaki_bot.memory_communities WHERE user_id=$uid;
+    DELETE FROM zaki_bot.memory_edges WHERE user_id=$uid;
+    DELETE FROM zaki_bot.memory_entities WHERE user_id=$uid;
+    DELETE FROM zaki_bot.memory_embeddings_e5_1024 WHERE user_id=$uid;
+    DELETE FROM zaki_bot.memories WHERE user_id=$uid;
+    DELETE FROM zaki_bot.messages WHERE user_id=$uid;
+SQL
+}
+
 # Drive ONE corpus: returns (passed, total) via stdout
 run_corpus() {
   local corpus="$1"
@@ -145,6 +170,16 @@ run_corpus() {
   # Export so send.sh + snapshot.sh subprocesses pick it up via
   # AUDIT_USER_ID. Each corpus reassigns; no cleanup needed.
   export AUDIT_USER_ID="$USER_ID"
+  # V1.9-8: reset user state for clean --baseline runs. Without this,
+  # the second baseline against the same user dedup's against state
+  # left by the first run → silent contamination at finer granularity.
+  # Skip reset for relational_queries (depends_on multi_entity) so the
+  # multi_entity-written entities are still in PG when relational
+  # queries probe them.
+  if [ "$BASELINE" = "true" ] && [ "$corpus" != "relational_queries" ]; then
+    echo "  [$corpus] reset_user_state user_id=$USER_ID"
+    reset_user_state "$USER_ID"
+  fi
   echo "  [$corpus] user_id=$USER_ID (v2 per-corpus isolation)"
   local session="thread:eval-${lane}-${TS}"
 
