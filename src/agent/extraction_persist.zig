@@ -505,6 +505,15 @@ pub fn persistExtracted(
     memories: []const ExtractedMemory,
     judge: ?JudgeContext,
     coref: ?EntityResolution,
+    // V1.8-2: when non-null, every successfully persisted fact also gets
+    // indexed into the vector store via syncVectorAfterStore. This closes
+    // G-C — extraction_persist was the conspicuous omission across 13
+    // existing syncVectorAfterStore callers, leaving extracted_* memories
+    // un-vectorized (audit found 4/43 = 9% coverage on user 7777).
+    // Failure is non-fatal: the memory row is canonical; the vector is
+    // a retrieval optimization. Pass null to keep V1.7 behavior (test
+    // fixtures, non-postgres deploys).
+    mem_rt: ?*memory_root.MemoryRuntime,
 ) !PersistResult {
     var result = PersistResult{
         .written_count = 0,
@@ -754,6 +763,14 @@ pub fn persistExtracted(
                 });
             };
         }
+
+        // V1.8-2: index the new fact's content into the vector store.
+        // Closes G-C (extraction_persist was the only S2 writer that
+        // didn't index, leaving extracted_* memories un-vectorized →
+        // /memory search vector_score=n/a for ALL hits, semantic recall
+        // degraded to BM25-only). Best-effort: failure is logged inside
+        // syncVectorAfterStore, doesn't affect the memory row.
+        if (mem_rt) |rt| _ = rt.syncVectorAfterStore(allocator, key, m.text);
 
         log.info("extraction.persisted key={s} subject={s} predicate={s} attributed_to={s}", .{
             key, m.subject, m.predicate, m.attributed_to,

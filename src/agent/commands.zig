@@ -1382,6 +1382,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             // judge needs an LLM provider in scope, but
                             // commands.zig session-end runs without one
                             // (no compaction-style provider plumbed here).
+                            // V1.8-2 mem_rt is appended after coref_ctx below.
                             // Tracked V1.7 follow-up: route via
                             // extraction_state_mgr-adjacent provider bundle
                             // once `provider_bundle.primaryModelName()`
@@ -1392,6 +1393,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             // gap in traces so observability shows it.
                             null,
                             coref_ctx,
+                            self.mem_rt, // V1.8-2: vector coverage on session-end
                         ) catch |err| {
                             log.warn("session_end persistExtracted failed key={s} err={s}", .{
                                 fact_key, @errorName(err),

@@ -1,0 +1,29 @@
+{
+  "corpus": "relational_queries",
+  "sha": "ed6856d",
+  "ts": "20260505-074006",
+  "deltas": {
+    "messages": 10,
+    "memories": 13,
+    "entities": 0,
+    "edges_active": 0,
+    "edges_closed": 0,
+    "compaction_summary": 0
+  },
+  "event_deltas": {
+    "upsert": 15,
+    "edge_added": 0,
+    "edge_closed": 0,
+    "supersede": 0,
+    "judge_resolve": 0,
+    "compose": 0,
+    "episode": 1,
+    "demote": 0
+  },
+  "asserts": [
+    {"name":"messages_delta","actual":10,"op":"ge","target":10,"pass":true}
+  ],
+  "f1": 1.000,
+  "passed": 1,
+  "total": 1
+}

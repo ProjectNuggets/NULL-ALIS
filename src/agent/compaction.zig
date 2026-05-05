@@ -515,6 +515,7 @@ fn compactHistoryKeepingRecent(
                         extracted,
                         judge_ctx,
                         coref_ctx,
+                        config.archive_mem_rt, // V1.8-2: vector coverage
                     ) catch |err| blk: {
                         log.warn("compaction: extraction persist failed err={s}", .{@errorName(err)});
                         break :blk extraction_persist.PersistResult{

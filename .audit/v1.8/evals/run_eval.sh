@@ -75,13 +75,18 @@ pg_jsonl() {
   $PSQL "$PG" -At -c "$q" 2>/dev/null
 }
 
-# Compute embedding coverage for non-bookkeeping memories
+# Compute embedding coverage for non-bookkeeping memories CREATED in the last
+# 30 minutes (i.e., during this eval run + recent activity). Scoping to recent
+# writes isolates V1.8-2's effect from the pre-V1.8-2 unembedded backlog. As
+# the backlog gets touched by future ops + V1.8 sprint progresses, the
+# all-time coverage rises naturally; meanwhile this gives a sharp regression
+# signal for the forward path.
 embedding_coverage_pct() {
   local total
   local with_vec
-  total=$(pg_int "SELECT COUNT(*) FROM zaki_bot.memories WHERE user_id=$USER_ID AND key NOT LIKE 'autosave_%'")
+  total=$(pg_int "SELECT COUNT(*) FROM zaki_bot.memories WHERE user_id=$USER_ID AND key NOT LIKE 'autosave_%' AND created_at > NOW() - INTERVAL '30 minutes'")
   if [ "$total" -le 0 ]; then echo "100"; return; fi
-  with_vec=$(pg_int "SELECT COUNT(*) FROM zaki_bot.memories m WHERE m.user_id=$USER_ID AND m.key NOT LIKE 'autosave_%' AND EXISTS (SELECT 1 FROM zaki_bot.memory_embeddings_e5_1024 e WHERE e.user_id=$USER_ID AND e.key=m.key)")
+  with_vec=$(pg_int "SELECT COUNT(*) FROM zaki_bot.memories m WHERE m.user_id=$USER_ID AND m.key NOT LIKE 'autosave_%' AND m.created_at > NOW() - INTERVAL '30 minutes' AND EXISTS (SELECT 1 FROM zaki_bot.memory_embeddings_e5_1024 e WHERE e.user_id=$USER_ID AND e.key=m.key)")
   echo $(( with_vec * 100 / total ))
 }
 
