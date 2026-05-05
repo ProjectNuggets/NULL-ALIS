@@ -89,6 +89,12 @@ pub const SelectionStats = struct {
     graph_recall_neighbor_count: usize = 0,
     graph_recall_appended_bytes: usize = 0,
     graph_recall_max_hops: u8 = 0,
+    // V1.8-9 — active_identity pin telemetry. Mirrors graph_recall_*
+    // shape so /agent/turn_audit + diagnostics surfaces can report
+    // pin coverage per turn alongside other warm-context blocks.
+    identity_pin_active: bool = false,
+    identity_pin_fact_count: usize = 0,
+    identity_pin_appended_bytes: usize = 0,
 };
 
 pub const ContextResult = struct {
@@ -907,12 +913,16 @@ pub fn loadTurnMemorySlot(
     // limit=8 + IDENTITY_BLOCK_MAX_BYTES (1500). Falls back silently on
     // any error; legacy retrieval is unaffected.
     var identity_block: ?[]u8 = null;
+    var identity_stats = IdentityAppendResult{};
     if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
-        identity_block = buildActiveIdentityBlock(allocator, sm, uid) catch |err| blk: {
+        identity_block = buildActiveIdentityBlock(allocator, sm, uid, &identity_stats) catch |err| blk: {
             log.warn("active_identity.append_failed err={s} — skipping identity context", .{@errorName(err)});
             break :blk null;
         };
     };
+    result.stats.identity_pin_active = identity_stats.appended;
+    result.stats.identity_pin_fact_count = identity_stats.fact_count;
+    result.stats.identity_pin_appended_bytes = identity_stats.appended_bytes;
     defer if (identity_block) |b| allocator.free(b);
 
     // If everything is empty, return empty slot (no fence).
@@ -935,6 +945,20 @@ pub fn loadTurnMemorySlot(
     // V1.8-9: identity block goes FIRST inside the fence — context-invariant
     // facts are read before turn-specific retrieval. Order: identity →
     // legacy retrieval → graph neighbors → communities.
+    //
+    // Priority cascade rationale:
+    //   1. <active_identity>     — who the user IS (foundation, every turn)
+    //   2. result.context        — starts with `pending_conflicts` (V1.7
+    //                              Item 3) then summary_latest, semantic
+    //                              bucket, fallback bucket
+    //   3. <graph_neighbors>     — 1-hop graph expansion of recall seeds
+    //   4. <active_communities>  — top-3 community labels for orientation
+    //
+    // Why identity beats pending_conflicts: without knowing who you're
+    // talking to, you can't usefully process their stated confusion.
+    // Identity grounds the conflict resolution. The V1.7 "first" in
+    // pending_conflicts meant "first within retrieval payload," not
+    // "first across all warm context."
     const fenced = try std.fmt.allocPrint(
         allocator,
         "<memory_for_turn>\n{s}{s}{s}{s}</memory_for_turn>\n",
@@ -1021,6 +1045,22 @@ const IDENTITY_BLOCK_MAX_BYTES: usize = 1500;
 const IDENTITY_FACT_MAX_BYTES: usize = 220;
 /// Maximum facts to fetch from PG. Loader trims further by byte budget.
 const IDENTITY_FACT_FETCH_LIMIT: u32 = 8;
+/// Lower-case prefix length used for de-dup. "Eli Vance is a software
+/// engineer." vs "Eli Vance is a software engineer based in Berlin." —
+/// the first 50 lowercase chars usually match for restated facts. Picks
+/// the most-recent restatement (since SQL ORDER BY created_at DESC) and
+/// drops older near-duplicates.
+const IDENTITY_DEDUP_PREFIX_BYTES: usize = 50;
+
+/// Telemetry emitted by `buildActiveIdentityBlock` for SelectionStats.
+/// Mirrors the shape of GraphAppendResult so consumers (turn audit,
+/// /agent/diagnostics, eval analyzers) can report identity-pin coverage
+/// per turn alongside graph_recall_*.
+const IdentityAppendResult = struct {
+    appended: bool = false,
+    fact_count: usize = 0,
+    appended_bytes: usize = 0,
+};
 
 /// V1.8-9 — emit pinned identity facts as warm always-on context.
 /// Bypasses cosine relevance scoring: identity is context-invariant
@@ -1040,12 +1080,20 @@ const IDENTITY_FACT_FETCH_LIMIT: u32 = 8;
 ///     first identity write)
 ///   - All matched facts are empty/blank after trimming
 ///
+/// De-dup: facts whose first IDENTITY_DEDUP_PREFIX_BYTES (lowercased,
+/// whitespace-collapsed) match a previously emitted fact are skipped.
+/// Because SQL returns rows by `created_at DESC`, the most-recent
+/// restatement wins. Avoids "Eli prefers Helix" + "Eli prefers Helix as
+/// his code editor over NeoVim" both pinning when they're the same
+/// fact at different specificity.
+///
 /// Cost: 1 PG round-trip per turn. Bounded by IDENTITY_FACT_FETCH_LIMIT
 /// (8 rows). EXISTS subquery covered by partial indexes.
 fn buildActiveIdentityBlock(
     allocator: std.mem.Allocator,
     state_mgr: *zaki_state.Manager,
     user_id: i64,
+    stats: *IdentityAppendResult,
 ) !?[]u8 {
     const facts = try state_mgr.listIdentityFacts(allocator, user_id, IDENTITY_FACT_FETCH_LIMIT);
     defer memory_mod.freeEntries(allocator, facts);
@@ -1056,11 +1104,33 @@ fn buildActiveIdentityBlock(
     const w = buf.writer(allocator);
     try w.writeAll("<active_identity source=\"pinned\">\n");
 
+    // De-dup table: lowercase, whitespace-collapsed prefix of each
+    // emitted fact. Bounded by IDENTITY_FACT_FETCH_LIMIT (8) so a
+    // small fixed-size buffer suffices.
+    var seen_prefixes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (seen_prefixes.items) |p| allocator.free(p);
+        seen_prefixes.deinit(allocator);
+    }
+
     var emitted: usize = 0;
     var bytes_used: usize = 0;
     for (facts) |entry| {
         const trimmed = std.mem.trim(u8, entry.content, " \t\r\n");
         if (trimmed.len == 0) continue;
+
+        // De-dup against earlier emissions in this batch.
+        const dedup_key = try identityDedupKey(allocator, trimmed);
+        defer allocator.free(dedup_key);
+        var is_dup = false;
+        for (seen_prefixes.items) |seen| {
+            if (std.mem.eql(u8, seen, dedup_key)) {
+                is_dup = true;
+                break;
+            }
+        }
+        if (is_dup) continue;
+
         // Cap per-fact bytes (UTF-8 safe truncation) and account for the
         // "- " prefix + newline overhead.
         const truncated = truncateUtf8(trimmed, IDENTITY_FACT_MAX_BYTES);
@@ -1081,6 +1151,9 @@ fn buildActiveIdentityBlock(
         try w.writeByte('\n');
         bytes_used += truncated.len + line_overhead;
         emitted += 1;
+
+        // Record the prefix for subsequent dedup checks.
+        try seen_prefixes.append(allocator, try allocator.dupe(u8, dedup_key));
     }
 
     if (emitted == 0) {
@@ -1095,7 +1168,35 @@ fn buildActiveIdentityBlock(
         emitted,
         bytes_used,
     });
+    stats.appended = true;
+    stats.fact_count = emitted;
+    stats.appended_bytes = bytes_used;
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Build the dedup key for an identity fact: first
+/// IDENTITY_DEDUP_PREFIX_BYTES of `text` lowercased with runs of
+/// whitespace collapsed to single spaces. ASCII-only lowercase (matches
+/// the identity-fact corpus we've seen — proper nouns + simple verbs).
+/// Caller frees.
+fn identityDedupKey(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var prev_space = false;
+    for (text) |ch| {
+        if (buf.items.len >= IDENTITY_DEDUP_PREFIX_BYTES) break;
+        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
+            if (!prev_space and buf.items.len > 0) {
+                try buf.append(allocator, ' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        prev_space = false;
+        const lower: u8 = if (ch >= 'A' and ch <= 'Z') ch + ('a' - 'A') else ch;
+        try buf.append(allocator, lower);
+    }
+    return buf.toOwnedSlice(allocator);
 }
 
 // ── V1.7a-2 graph-expand recall consumer helpers ──────────────────────────

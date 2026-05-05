@@ -3769,10 +3769,18 @@ const ManagerImpl = struct {
                 "    SELECT 1 FROM {schema}.memory_edges e " ++
                 "    WHERE e.user_id = $1 AND e.is_latest " ++
                 "    AND (e.source_key = m.key OR e.target_key = m.key) " ++
+                // Identity-class predicates. Curated 2026-05-05 against
+                // real corpus survey: WORKS_ON, STAKEHOLDER_OF,
+                // HAS_ACTIVE_CONTRACT added in addition to the original
+                // V1.8-9 set after observing 4 / 1 / 0 live uses
+                // respectively that should pin but didn't. WORKS_WITH
+                // intentionally excluded — too broad (matches "works
+                // with TypeScript" alongside "works with Priya").
                 "    AND e.predicate IN (" ++
                 "        'NAME','NAMED','IS','IS_A','LIVES_IN'," ++
-                "        'WORKS_AT','WORKS_AS','ROLE','ROLE_IS'," ++
-                "        'BORN_IN','SPEAKS','FOLLOWS_GOAL','PREFERS'" ++
+                "        'WORKS_AT','WORKS_AS','WORKS_ON','ROLE','ROLE_IS'," ++
+                "        'BORN_IN','SPEAKS','FOLLOWS_GOAL','PREFERS'," ++
+                "        'STAKEHOLDER_OF','HAS_ACTIVE_CONTRACT'" ++
                 "    )" ++
                 ") ORDER BY m.created_at DESC, m.id DESC LIMIT $2::int",
         );
