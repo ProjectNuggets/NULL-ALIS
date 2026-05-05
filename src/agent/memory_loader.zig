@@ -1090,6 +1090,11 @@ fn buildActiveIdentityBlock(
         return null;
     }
     try w.writeAll("</active_identity>\n");
+    log.info("active_identity.injected user_id={d} facts={d} bytes={d}", .{
+        user_id,
+        emitted,
+        bytes_used,
+    });
     return try buf.toOwnedSlice(allocator);
 }
 
