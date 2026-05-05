@@ -3813,6 +3813,17 @@ const ManagerImpl = struct {
         // user gets a community_id pointing at a key they can never see
         // in /brain/graph. Filter at the edge endpoint subqueries so the
         // entire hidden-key universe is invisible to the algorithm.
+        //
+        // V1.8-11: extraction writes edges with target_key set to the
+        // entity_id (32-char hex from upsertEntity), which lives in
+        // memory_entities NOT memories. The original V1.7a-9 EXISTS
+        // checks rejected those edges → 0 components → 0 clusters even
+        // on populated graphs. Accept entity-table endpoints alongside
+        // memory-table endpoints. setMemoryCommunityIds still only
+        // writes community_id to memories — entity endpoints are
+        // structural participants in label propagation but don't
+        // receive community labels themselves (entities are the
+        // connective tissue, not the user-facing community members).
         const q = try self.buildQuery(
             "SELECT e.source_key, e.target_key, " ++
                 "COALESCE(e.weight, 1.0), " ++
@@ -3820,14 +3831,22 @@ const ManagerImpl = struct {
                 "COALESCE(e.valid_from, 0) " ++
                 "FROM {schema}.memory_edges e " ++
                 "WHERE e.user_id = $1 AND e.is_latest " ++
-                "AND EXISTS (SELECT 1 FROM {schema}.memories m " ++
-                "    WHERE m.user_id = $1 AND m.key = e.source_key " ++
-                "    AND " ++ MEMORIES_VALIDITY_FILTER ++
-                "    AND " ++ BRAIN_USER_KEY_FILTER ++ ") " ++
-                "AND EXISTS (SELECT 1 FROM {schema}.memories m " ++
-                "    WHERE m.user_id = $1 AND m.key = e.target_key " ++
-                "    AND " ++ MEMORIES_VALIDITY_FILTER ++
-                "    AND " ++ BRAIN_USER_KEY_FILTER ++ ")",
+                "AND (" ++
+                "    EXISTS (SELECT 1 FROM {schema}.memories m " ++
+                "        WHERE m.user_id = $1 AND m.key = e.source_key " ++
+                "        AND " ++ MEMORIES_VALIDITY_FILTER ++
+                "        AND " ++ BRAIN_USER_KEY_FILTER ++ ")" ++
+                "    OR EXISTS (SELECT 1 FROM {schema}.memory_entities en " ++
+                "        WHERE en.user_id = $1 AND en.id = e.source_key)" ++
+                ") " ++
+                "AND (" ++
+                "    EXISTS (SELECT 1 FROM {schema}.memories m " ++
+                "        WHERE m.user_id = $1 AND m.key = e.target_key " ++
+                "        AND " ++ MEMORIES_VALIDITY_FILTER ++
+                "        AND " ++ BRAIN_USER_KEY_FILTER ++ ")" ++
+                "    OR EXISTS (SELECT 1 FROM {schema}.memory_entities en " ++
+                "        WHERE en.user_id = $1 AND en.id = e.target_key)" ++
+                ")",
         );
         defer self.allocator.free(q);
 
