@@ -174,7 +174,14 @@ jobs:
     # Uses the `production-image-promotion` environment which carries the
     # required-reviewer rule; push of :latest is blocked until a reviewer
     # approves in the Actions UI.
-    needs: smoke
+    #
+    # V1.8-17: needs both `build-and-publish` (for resolved_sha output) and
+    # `smoke` (for the gate). Previously only `needs: smoke`, which made
+    # `needs.build-and-publish.outputs.resolved_sha` resolve to empty
+    # → "Source: ghcr.io/.../null-alis:sha-" (empty suffix) → image
+    # not found. To access another job's outputs, that job must be in
+    # the `needs:` list explicitly.
+    needs: [build-and-publish, smoke]
     if: |
       always() &&
       (
