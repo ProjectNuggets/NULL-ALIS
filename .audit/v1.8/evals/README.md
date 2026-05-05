@@ -69,22 +69,49 @@ Per build sequence in `docs/v1.8-sprint-lock.md`:
 | **V1.8-9** (identity profile) | (cross-session recall — needs new corpus in v2) |
 | **target** | overall ≥0.80 across all 5 corpora |
 
-## Caveats (v1)
+## Schema (v2 — V1.9-8)
 
-1. **Single-tenant**: all corpora run against user 7777. Cross-corpus contamination
-   inflates "no new edge added" deltas because subjects (Eli Vance, Aurora) accumulate.
-   v2 should provision per-corpus test users.
-2. **Pass C corpus skipped in `--quick`**: needs config change + gateway restart.
+Each corpus has its own `test_user_id`:
+
+| Corpus | User ID | Notes |
+|---|---|---|
+| `identity_writes` | 7771 | isolated |
+| `preference_changes` | 7772 | isolated |
+| `multi_entity` | 7773 | shared with relational_queries (depends_on relationship) |
+| `relational_queries` | 7773 | depends on multi_entity in same lineage |
+| `long_context_pass_c` | 7775 | isolated |
+
+**Why per-corpus users:** v1 ran every corpus against user 7777, so by run 2 the
+entity coreference (V1.6 cmt8) had de-duplicated everything against existing
+rows — making `entities_delta` and `event_edge_added_delta` underestimate
+reality. F1 was contamination-noise-floored; v2 fixes this.
+
+**Effect on baselines:** v1 baselines (e.g. `baseline-b97960c-...` at F1=0.846)
+are NOT directly comparable to v2 baselines. v2 expected to score higher on
+`multi_entity` and `identity_writes` (which both involve entity-creation
+counts). Document v2 baselines from scratch.
+
+**No explicit provisioning needed.** Gateway auto-provisions on first
+`/chat/stream` call with `X-Zaki-User-Id`. Users 7771–7775 come into being on
+first run.
+
+## Caveats (v2)
+
+1. **Pass C corpus skipped in `--quick`**: needs config change + gateway restart.
    Run full suite when validating V1.8-5.
-3. **LLM non-determinism**: assertions use COUNT-deltas, not text matches. Multiple
+2. **LLM non-determinism**: assertions use COUNT-deltas, not text matches. Multiple
    runs of the same corpus may differ by ±1 on edge counts. Tune target thresholds
    if you see consistent close-misses.
-4. **Limited assertion vocabulary**: v1 supports messages/memories/entities/edges
+3. **Limited assertion vocabulary**: supports messages/memories/entities/edges
    counts, embedding coverage, entity-by-name, edge-by-predicate, event-type-deltas,
    compaction_summary keys. Add more assertion kinds in `run_eval.sh::run_corpus`
    as needed.
-5. **No tool-call observability** in v1 — `relational_queries` corpus is mostly
-   placeholder until we instrument tool-fire events.
+4. **No tool-call observability** yet — `relational_queries` corpus is mostly
+   placeholder until we instrument tool-fire events. Future v3 work.
+5. **Cross-corpus assertion thresholds**: with isolated users, per-corpus
+   counts will be HIGHER than v1 (no dedup against prior runs). The thresholds
+   in `expected.json` were calibrated for v1; v2 may show some asserts passing
+   trivially or some new misses. Tune as v2 baseline emerges.
 
 ## Adding a new corpus
 

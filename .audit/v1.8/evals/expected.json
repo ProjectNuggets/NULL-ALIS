@@ -1,11 +1,21 @@
 {
   "_doc": "Target assertions per corpus. F1 = (asserts passed) / (total asserts). Baseline F1 will be low for unfixed gaps; sprint progress closes the gap.",
-  "_test_user_id": 7777,
+  "_schema_version": "v2",
+  "_v2_change": "V1.9-8: per-corpus test users (7771-7775) replace single user 7777 baseline. Eliminates cross-corpus contamination noise floor where entities from prior corpora got coref'd by V1.6 cmt8 into existing rows — making `entities_delta` and `event_edge_added_delta` underestimate reality. Each corpus now runs against a fresh user; counts are honest.",
+  "_test_users": {
+    "identity_writes": 7771,
+    "preference_changes": 7772,
+    "multi_entity": 7773,
+    "relational_queries": 7773,
+    "long_context_pass_c": 7775
+  },
+  "_test_users_doc": "relational_queries shares 7773 with multi_entity by design (depends_on_corpus relationship — relational queries should hit entities written by multi_entity in the same session lineage). All other corpora are fully isolated.",
   "_session_lane_prefix": "thread:eval-",
   "_token_limit_for_pass_c": 8000,
   "_baseline_sha": "ad71bed",
   "corpora": {
     "identity_writes": {
+      "test_user_id": 7771,
       "session_suffix": "id-writes",
       "expect_token_limit_override": false,
       "asserts": {
@@ -26,6 +36,7 @@
       "broken_baseline": "edges_delta=0, edge_added=0, embedding_coverage=9% — V1.8-2/4/5 close"
     },
     "preference_changes": {
+      "test_user_id": 7772,
       "session_suffix": "pref-changes",
       "expect_token_limit_override": false,
       "asserts": {
@@ -42,6 +53,7 @@
       "broken_baseline": "edge_closed=0 — V1.8-1 closes G-B by wiring judge_provider AND fixing the dup-then-contradiction control flow that discarded contradictions when judge said is_duplicate=true"
     },
     "multi_entity": {
+      "test_user_id": 7773,
       "session_suffix": "multi-ent",
       "expect_token_limit_override": false,
       "asserts": {
@@ -69,6 +81,7 @@
       "broken_baseline": "entities=9 stays mostly flat; edges still 0 from prose — V1.8-4 cheap pass closes"
     },
     "relational_queries": {
+      "test_user_id": 7773,
       "session_suffix": "rel-queries",
       "expect_token_limit_override": false,
       "depends_on_corpus": "multi_entity",
@@ -80,6 +93,7 @@
       "broken_baseline": "no tool calls fire because G-E (agent biased to read-tool) — actually wait, this IS the bias — V1.8-9 identity profile + queue-routing hints help"
     },
     "long_context_pass_c": {
+      "test_user_id": 7775,
       "session_suffix": "passc",
       "expect_token_limit_override": true,
       "asserts": {

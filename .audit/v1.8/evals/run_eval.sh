@@ -29,6 +29,10 @@ SEND="$EVALS/../send.sh"
 SNAP="$EVALS/../snapshot.sh"
 PSQL="/opt/homebrew/opt/libpq/bin/psql"
 PG="postgresql://zaki:zaki@127.0.0.1:5433/zaki"
+# V1.9-8: USER_ID is now per-corpus, resolved inside run_corpus() from
+# expected.json's test_user_id field. Default 7777 retained for the
+# sanity-check phase (gateway health, PG ping) where any provisioned
+# user satisfies the smoke. Corpus runs override via dynamic scoping.
 USER_ID=7777
 CONFIG_PATH="/Users/nova/.nullalis/config.json"
 CONFIG_BACKUP="$CONFIG_PATH.eval-backup"
@@ -125,9 +129,23 @@ run_corpus() {
   cfg=$(jq -c ".corpora.\"$corpus\"" "$EXPECTED")
   if [ "$cfg" = "null" ]; then echo "no expected for $corpus" >&2; echo "0 1"; return; fi
 
-  local lane override
+  local lane override corpus_user
   lane=$(echo "$cfg" | jq -r '.session_suffix')
   override=$(echo "$cfg" | jq -r '.expect_token_limit_override')
+  # V1.9-8: per-corpus test_user_id. Falls back to top-level USER_ID
+  # only if the corpus didn't migrate to the v2 schema yet. Bash
+  # dynamic scoping makes the helpers (pg_int, event_count,
+  # entity_count_lower, edge_count_*, embedding_coverage_pct,
+  # compaction_summary_count) see this `local USER_ID` because they
+  # all reference $USER_ID by name from the calling function's scope.
+  corpus_user=$(echo "$cfg" | jq -r '.test_user_id // empty')
+  if [ -n "$corpus_user" ]; then
+    local USER_ID="$corpus_user"
+  fi
+  # Export so send.sh + snapshot.sh subprocesses pick it up via
+  # AUDIT_USER_ID. Each corpus reassigns; no cleanup needed.
+  export AUDIT_USER_ID="$USER_ID"
+  echo "  [$corpus] user_id=$USER_ID (v2 per-corpus isolation)"
   local session="thread:eval-${lane}-${TS}"
 
   # Toggle config if Pass C corpus
