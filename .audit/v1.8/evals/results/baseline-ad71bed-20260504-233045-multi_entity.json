@@ -1,0 +1,28 @@
+{
+  "corpus": "multi_entity",
+  "sha": "ad71bed",
+  "ts": "20260504-233045",
+  "deltas": {
+    "messages": 8,
+    "memories": 23,
+    "entities": 1,
+    "edges_active": 1,
+    "edges_closed": 0,
+    "compaction_summary": 0
+  },
+  "event_deltas": {
+    "upsert": 24,
+    "edge_added": 1,
+    "supersede": 0,
+    "judge_resolve": 0,
+    "compose": 1,
+    "episode": 1,
+    "demote": 0
+  },
+  "asserts": [
+    {"name":"messages_delta","actual":8,"op":"ge","target":8,"pass":true},{"name":"memories_delta","actual":23,"op":"ge","target":8,"pass":true},{"name":"entities_delta","actual":1,"op":"ge","target":8,"pass":false},{"name":"event_upsert_delta","actual":24,"op":"ge","target":8,"pass":true},{"name":"event_edge_added_delta","actual":1,"op":"ge","target":8,"pass":false},{"name":"specific_entities_matched","actual":2,"op":"ge","target":6,"pass":false}
+  ],
+  "f1": 0.500,
+  "passed": 3,
+  "total": 6
+}

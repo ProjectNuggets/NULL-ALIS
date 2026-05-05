@@ -1,0 +1,6 @@
+Walk me through the architecture of an event-sourced microservices system using CQRS and Kafka. Explain saga orchestration patterns and the eventual-consistency tradeoffs in detail.
+Now contrast that with a monolithic three-tier architecture using REST APIs and a single relational database. Cover deployment, debuggability, and team scaling.
+Explain the consensus problem in distributed systems. Compare Paxos, Raft, and PBFT in depth, and recommend one for a 5-node financial-transactions cluster with rationale.
+Walk me through PostgreSQL MVCC: tuple visibility, vacuum, xid wraparound, and HOT updates.
+Explain the transformer attention mechanism mathematically: Q/K/V projections, scaled dot-product, multi-head attention, and why we divide by sqrt(d_k).
+Summarize everything we discussed in the last 5 prompts in 3 bullet points each, focusing on the most important tradeoffs.

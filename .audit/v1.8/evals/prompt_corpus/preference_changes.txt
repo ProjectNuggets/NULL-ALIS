@@ -1,0 +1,6 @@
+I prefer PostgreSQL as my database.
+Actually, I changed my mind — I now prefer SQLite for this project.
+My favorite programming language is Rust.
+Forget what I said about Rust. I now prefer Zig for systems work.
+I drink black coffee in the mornings.
+I switched to green tea in the mornings instead of coffee.

@@ -1,0 +1,10 @@
+V1.8-6 eval run summary
+tag=baseline-ad71bed-20260505-003753 sha=ad71bed started=20260505-003753
+
+corpus                        passed      total
+----                            ----       ----
+identity_writes                    9         11
+
+TOTAL                              9         11
+
+overall F1 = 0.818

@@ -1,0 +1,5 @@
+My name is Eli Vance. Please remember it.
+I am a software engineer based in Berlin, Germany.
+I work at a company called Aurora Robotics on autonomous warehouse systems.
+I prefer Helix as my code editor over NeoVim.
+My current focus is finishing the Phase 7 inventory rollout by end of June 2026.

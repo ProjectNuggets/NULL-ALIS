@@ -1,0 +1,94 @@
+{
+  "_doc": "Target assertions per corpus. F1 = (asserts passed) / (total asserts). Baseline F1 will be low for unfixed gaps; sprint progress closes the gap.",
+  "_test_user_id": 7777,
+  "_session_lane_prefix": "thread:eval-",
+  "_token_limit_for_pass_c": 8000,
+  "_baseline_sha": "ad71bed",
+  "corpora": {
+    "identity_writes": {
+      "session_suffix": "id-writes",
+      "expect_token_limit_override": false,
+      "asserts": {
+        "messages_delta_at_least": 10,
+        "memories_delta_at_least": 10,
+        "edges_delta_at_least": 5,
+        "event_type_deltas": {
+          "upsert_at_least": 10,
+          "edge_added_at_least": 5
+        },
+        "embedding_coverage_pct_at_least": 95,
+        "entities_with_name_eli_vance_at_least": 1,
+        "entities_with_name_aurora_robotics_at_least": 1,
+        "entities_with_name_helix_at_least": 1,
+        "edges_with_predicate_PREFERS_after_at_least": 1,
+        "edges_with_predicate_WORKS_AT_after_at_least": 1
+      },
+      "broken_baseline": "edges_delta=0, edge_added=0, embedding_coverage=9% — V1.8-2/4/5 close"
+    },
+    "preference_changes": {
+      "session_suffix": "pref-changes",
+      "expect_token_limit_override": false,
+      "asserts": {
+        "messages_delta_at_least": 12,
+        "memories_delta_at_least": 12,
+        "event_type_deltas": {
+          "upsert_at_least": 12,
+          "supersede_at_least": 3,
+          "judge_resolve_at_least": 3
+        },
+        "edges_with_is_latest_false_after_at_least": 3,
+        "edges_with_predicate_PREFERS_is_latest_true_after_at_least": 3,
+        "comment": "Three pref-pair sequences (PG→SQLite, Rust→Zig, coffee→tea); each should produce exactly 1 active edge with the LATER value"
+      },
+      "broken_baseline": "supersede=0, judge_resolve=0 — V1.8-1 closes G-B"
+    },
+    "multi_entity": {
+      "session_suffix": "multi-ent",
+      "expect_token_limit_override": false,
+      "asserts": {
+        "messages_delta_at_least": 8,
+        "memories_delta_at_least": 8,
+        "entities_delta_at_least": 8,
+        "event_type_deltas": {
+          "upsert_at_least": 8,
+          "edge_added_at_least": 8
+        },
+        "specific_entities_present_at_least": [
+          "sarah chen",
+          "marcus patel",
+          "atlas",
+          "omnicorp",
+          "helios",
+          "priya singh",
+          "daniel wu",
+          "velox industries",
+          "phoenix",
+          "falcon"
+        ],
+        "specific_entities_present_min_count": 6
+      },
+      "broken_baseline": "entities=9 stays mostly flat; edges still 0 from prose — V1.8-4 cheap pass closes"
+    },
+    "relational_queries": {
+      "session_suffix": "rel-queries",
+      "expect_token_limit_override": false,
+      "depends_on_corpus": "multi_entity",
+      "asserts": {
+        "messages_delta_at_least": 10,
+        "tool_calls_brain_graph_or_memory_recall_at_least": 3,
+        "comment": "Should fire knowledge-graph queries (brain_graph local_graph or memory_recall semantic); read-only — no new edges from queries themselves"
+      },
+      "broken_baseline": "no tool calls fire because G-E (agent biased to read-tool) — actually wait, this IS the bias — V1.8-9 identity profile + queue-routing hints help"
+    },
+    "long_context_pass_c": {
+      "session_suffix": "passc",
+      "expect_token_limit_override": true,
+      "asserts": {
+        "messages_delta_at_least": 12,
+        "memories_with_key_prefix_compaction_summary_at_least": 1,
+        "comment": "With token_limit=8000, Pass C must fire AND produce ≥1 compaction_summary/{session}/{ts} memory row. V1.8-7 found this is currently 0 — V1.8-5 archive-debug closes"
+      },
+      "broken_baseline": "compaction_summary keys=0 — V1.8-5 closes archive write gap"
+    }
+  }
+}

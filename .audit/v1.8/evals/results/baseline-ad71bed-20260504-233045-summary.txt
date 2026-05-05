@@ -1,0 +1,13 @@
+V1.8-6 eval run summary
+tag=baseline-ad71bed-20260504-233045 sha=ad71bed started=20260504-233045
+
+corpus                        passed      total
+----                            ----       ----
+identity_writes                    9         11
+preference_changes                 4          7
+multi_entity                       3          6
+relational_queries                 1          1
+
+TOTAL                             17         25
+
+overall F1 = 0.680

@@ -1,0 +1,12 @@
+# Per-corpus run dirs (per-prompt T*.sse + .reply + .meta + .snap.json)
+# These are large and reproducible from the prompt corpus + gateway state.
+# We commit only the per-corpus JSON summaries + the run summary.txt.
+results/*-identity_writes/
+results/*-preference_changes/
+results/*-multi_entity/
+results/*-relational_queries/
+results/*-long_context_pass_c/
+
+# Smoke-test artifacts (incomplete runs)
+results/baseline-ad71bed-20260504-232652-*
+results/baseline-ad71bed-20260504-232827-*
