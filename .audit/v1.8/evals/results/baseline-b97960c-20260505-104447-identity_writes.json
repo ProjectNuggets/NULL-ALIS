@@ -1,0 +1,29 @@
+{
+  "corpus": "identity_writes",
+  "sha": "b97960c",
+  "ts": "20260505-104447",
+  "deltas": {
+    "messages": 10,
+    "memories": 17,
+    "entities": 0,
+    "edges_active": 5,
+    "edges_closed": 0,
+    "compaction_summary": 0
+  },
+  "event_deltas": {
+    "upsert": 16,
+    "edge_added": 6,
+    "edge_closed": 0,
+    "supersede": 0,
+    "judge_resolve": 0,
+    "compose": 6,
+    "episode": 1,
+    "demote": 0
+  },
+  "asserts": [
+    {"name":"messages_delta","actual":10,"op":"ge","target":10,"pass":true},{"name":"memories_delta","actual":17,"op":"ge","target":10,"pass":true},{"name":"edges_delta","actual":5,"op":"ge","target":5,"pass":true},{"name":"embedding_coverage_pct","actual":85,"op":"ge","target":75,"pass":true},{"name":"entities_with_name_eli_vance_at_least","actual":1,"op":"ge","target":1,"pass":true},{"name":"entities_with_name_aurora_robotics_at_least","actual":2,"op":"ge","target":1,"pass":true},{"name":"entities_with_name_helix_at_least","actual":1,"op":"ge","target":1,"pass":true},{"name":"edges_with_predicate_PREFERS_after_at_least","actual":10,"op":"ge","target":1,"pass":true},{"name":"edges_with_predicate_WORKS_AT_after_at_least","actual":2,"op":"ge","target":1,"pass":true},{"name":"event_upsert_delta","actual":16,"op":"ge","target":10,"pass":true},{"name":"event_edge_added_delta","actual":6,"op":"ge","target":5,"pass":true}
+  ],
+  "f1": 1.000,
+  "passed": 11,
+  "total": 11
+}

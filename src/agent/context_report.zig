@@ -92,9 +92,11 @@ fn memorySelectionText(allocator: std.mem.Allocator, report: Report) ![]u8 {
         return try allocator.dupe(u8, "n/a");
     }
 
+    // V1.8-13: include identity_pin_* and graph_recall_* in /context
+    // surface so users can see warm-context block coverage per turn.
     return try std.fmt.allocPrint(
         allocator,
-        "summary_latest={s} anchor={s} durable={d} timeline={d} search={d} fallback={d} continuity_bucket={d}/{d} semantic_bucket={d}/{d} fallback_bucket={d}/{d} candidates={d} global_candidates={d}",
+        "summary_latest={s} anchor={s} durable={d} timeline={d} search={d} fallback={d} continuity_bucket={d}/{d} semantic_bucket={d}/{d} fallback_bucket={d}/{d} candidates={d} global_candidates={d} identity_pin={s}/{d}f/{d}b graph_recall={s}/{d}n/{d}b",
         .{
             boolWord(report.last_turn.memory_selection.summary_latest_used),
             boolWord(report.last_turn.memory_selection.context_anchor_used),
@@ -110,6 +112,12 @@ fn memorySelectionText(allocator: std.mem.Allocator, report: Report) ![]u8 {
             report.last_turn.memory_selection.fallback_bucket_bytes,
             report.last_turn.memory_selection.candidate_count,
             report.last_turn.memory_selection.global_candidate_count,
+            boolWord(report.last_turn.memory_selection.identity_pin_active),
+            report.last_turn.memory_selection.identity_pin_fact_count,
+            report.last_turn.memory_selection.identity_pin_appended_bytes,
+            boolWord(report.last_turn.memory_selection.graph_recall_active),
+            report.last_turn.memory_selection.graph_recall_neighbor_count,
+            report.last_turn.memory_selection.graph_recall_appended_bytes,
         },
     );
 }
