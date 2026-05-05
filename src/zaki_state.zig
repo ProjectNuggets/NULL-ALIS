@@ -4107,22 +4107,142 @@ const ManagerImpl = struct {
         return out;
     }
 
+    /// V1.8-3: forget cascades to memory_edges. Pre-V1.8 forgetMemory was a
+    /// bare DELETE on memories — leaving any edge whose source_key OR
+    /// target_key matched as an orphan (source_exists=0 AND is_latest=true).
+    /// Now: bi-temporal close-out on edges + DELETE on memories, wrapped in
+    /// a transaction so partial failure rolls back. Per-cascaded-edge
+    /// edge_closed event (mirrors the cascade in setMemoryInvalidation).
+    ///
+    /// Decision (Phase 5 PL-1): keep hard-DELETE on S2 (memories table —
+    /// matches user "forget" intent), bi-temporal close on S5 (edges —
+    /// matches supersession idiom + lets graph history queries surface
+    /// the close-out). Revisit if eval surfaces an issue.
     pub fn forgetMemory(self: *Self, user_id: i64, key: []const u8) !bool {
-        const q = try self.buildQuery(
-            "DELETE FROM {schema}.memories WHERE user_id = $1 AND key = $2",
-        );
-        defer self.allocator.free(q);
+        const begin_result = try self.exec("BEGIN");
+        c.PQclear(begin_result);
+        errdefer {
+            if (self.exec("ROLLBACK")) |rb| {
+                c.PQclear(rb);
+            } else |_| {}
+        }
+
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
         const key_z = try self.allocator.dupeZ(u8, key);
         defer self.allocator.free(key_z);
-        const params = [_]?[*:0]const u8{ user_s.ptr, key_z };
-        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len) };
-        const result = try self.execParams(q, &params, &lengths);
-        defer c.PQclear(result);
-        const affected = c.PQcmdTuples(result);
-        if (affected == null) return false;
-        return !std.mem.eql(u8, std.mem.span(affected), "0");
+
+        // 1. Cascade close-out on memory_edges. Order: cascade FIRST, DELETE
+        //    second. The cascade UPDATE matches by string source_key/target_key,
+        //    not FK reference, so it works regardless of DELETE order — but
+        //    cascade-first lets us capture the closed edge metadata for the
+        //    edge_closed events before any concurrent reader sees a partial
+        //    state. Same mtime values as the supersession path for consistency.
+        const now_ts: i64 = std.time.timestamp();
+        var ts_buf: [32]u8 = undefined;
+        const ts_s = try std.fmt.bufPrintZ(&ts_buf, "{d}", .{now_ts});
+        const cascade_params = [_]?[*:0]const u8{ user_s.ptr, key_z, ts_s.ptr, ts_s.ptr };
+        const cascade_lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(key.len),
+            @intCast(ts_s.len),
+            @intCast(ts_s.len),
+        };
+        const cascade_q = try self.buildQuery(
+            "UPDATE {schema}.memory_edges SET " ++
+                "valid_to = $3, " ++
+                "invalid_at = $3, " ++
+                "expired_at = $4, " ++
+                "is_latest = FALSE " ++
+                "WHERE user_id = $1 AND (source_key = $2 OR target_key = $2) AND is_latest " ++
+                "RETURNING source_key, target_key, predicate, COALESCE(confidence, 1.0)",
+        );
+        defer self.allocator.free(cascade_q);
+        const cascade_result = try self.execParams(cascade_q, &cascade_params, &cascade_lengths);
+        defer c.PQclear(cascade_result);
+
+        // Capture cascaded edges' metadata for events (emitted post-COMMIT
+        // so a failed event write doesn't roll back the cascade).
+        const closed_count = c.PQntuples(cascade_result);
+        var closed_edges: std.ArrayListUnmanaged(struct {
+            source_key: []u8,
+            target_key: []u8,
+            predicate: []u8,
+            confidence: f64,
+        }) = .empty;
+        defer {
+            for (closed_edges.items) |e| {
+                self.allocator.free(e.source_key);
+                self.allocator.free(e.target_key);
+                self.allocator.free(e.predicate);
+            }
+            closed_edges.deinit(self.allocator);
+        }
+        var ci: c_int = 0;
+        while (ci < closed_count) : (ci += 1) {
+            const src = dupeResultValue(self.allocator, cascade_result, ci, 0) catch continue;
+            const tgt = dupeResultValue(self.allocator, cascade_result, ci, 1) catch {
+                self.allocator.free(src);
+                continue;
+            };
+            const pred = dupeResultValue(self.allocator, cascade_result, ci, 2) catch {
+                self.allocator.free(src);
+                self.allocator.free(tgt);
+                continue;
+            };
+            const conf_str = dupeResultValue(self.allocator, cascade_result, ci, 3) catch {
+                self.allocator.free(src);
+                self.allocator.free(tgt);
+                self.allocator.free(pred);
+                continue;
+            };
+            defer self.allocator.free(conf_str);
+            const conf_val = std.fmt.parseFloat(f64, conf_str) catch 1.0;
+            try closed_edges.append(self.allocator, .{
+                .source_key = src,
+                .target_key = tgt,
+                .predicate = pred,
+                .confidence = conf_val,
+            });
+        }
+
+        // 2. DELETE on memories.
+        const del_q = try self.buildQuery(
+            "DELETE FROM {schema}.memories WHERE user_id = $1 AND key = $2",
+        );
+        defer self.allocator.free(del_q);
+        const del_params = [_]?[*:0]const u8{ user_s.ptr, key_z };
+        const del_lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len) };
+        const del_result = try self.execParams(del_q, &del_params, &del_lengths);
+        defer c.PQclear(del_result);
+        const affected = c.PQcmdTuples(del_result);
+        const memory_deleted: bool = if (affected == null)
+            false
+        else
+            !std.mem.eql(u8, std.mem.span(affected), "0");
+
+        const commit_result = try self.exec("COMMIT");
+        c.PQclear(commit_result);
+
+        // 3. Post-COMMIT: emit edge_closed events for each cascaded edge.
+        //    Best-effort — the cascade is already durable; missing events
+        //    only degrade graph-history audit.
+        for (closed_edges.items) |e| {
+            self.insertEdgeEvent(user_id, e.source_key, e.target_key, e.predicate, "closed", e.confidence) catch |err| {
+                log.warn("forget.cascade.event_failed err={s} source={s} predicate={s}", .{
+                    @errorName(err), e.source_key, e.predicate,
+                });
+            };
+        }
+
+        if (closed_edges.items.len > 0) {
+            log.info("forget.cascade user={d} key={s} edges_closed={d} memory_deleted={s}", .{
+                user_id, key, closed_edges.items.len,
+                if (memory_deleted) "true" else "false",
+            });
+        }
+
+        return memory_deleted;
     }
 
     /// V1.6 commit 6 — fetch same-subject extraction-classifier memories
