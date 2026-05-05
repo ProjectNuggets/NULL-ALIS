@@ -2025,7 +2025,7 @@ test "concurrent getOrCreate same key — single Session created" {
         // crash under concurrency" — minimum viable stack is an
         // implementation detail. 256K matches the next concurrent test
         // in this file (`processMessage different keys`).
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
             fn run(mgr: *SessionManager, out: **Session) void {
                 out.* = mgr.getOrCreate("shared:key") catch unreachable;
             }
@@ -2057,7 +2057,7 @@ test "concurrent getOrCreate different keys — separate Sessions" {
         keys[t] = std.fmt.bufPrint(&key_bufs[t], "key:{d}", .{t}) catch "?";
         // V1.8-14: 256K stack hint — same rationale as the same-key test
         // above.
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
             fn run(mgr: *SessionManager, key: []const u8, out: **Session) void {
                 out.* = mgr.getOrCreate(key) catch unreachable;
             }
@@ -2088,7 +2088,12 @@ test "concurrent processMessage different keys — no crash" {
 
     for (0..num_threads) |t| {
         keys[t] = std.fmt.bufPrint(&key_bufs[t], "conc:{d}", .{t}) catch "?";
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        // V1.8-14: 1 MiB stack hint. processMessage runs the full turn
+        // pipeline (memory recall, prompt build, mock provider, history
+        // persist) which exceeds 256 KiB on Linux pthread (strict hint
+        // honor). macOS rounds up to ≥512 KiB so it masks the bug.
+        // Matches the sqlite variant below.
+        handles[t] = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
             fn run(mgr: *SessionManager, key: []const u8, alloc: Allocator) void {
                 for (0..3) |_| {
                     const resp = mgr.processMessage(key, "hello", null) catch return;
@@ -2561,9 +2566,9 @@ test "queue_mode latest supersedes older waiting turn" {
         }
     }.run;
 
-    const ta = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, thread_fn, .{ &sm, "queue:latest", &out_a });
+    const ta = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, thread_fn, .{ &sm, "queue:latest", &out_a });
     std.Thread.sleep(20 * std.time.ns_per_ms);
-    const tb = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, thread_fn, .{ &sm, "queue:latest", &out_b });
+    const tb = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, thread_fn, .{ &sm, "queue:latest", &out_b });
     std.Thread.sleep(20 * std.time.ns_per_ms);
 
     session.mutex.unlock();
@@ -2597,7 +2602,7 @@ test "queue_cap newest drop rejects overflowing waiter deterministically" {
     session.mutex.lock();
 
     var out_waiter: ?[]const u8 = null;
-    const waiter = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+    const waiter = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
         fn run(mgr: *SessionManager, out: *?[]const u8) void {
             out.* = mgr.processMessage("queue:cap", "first", null) catch null;
         }
@@ -2636,9 +2641,9 @@ test "queue_mode_off_bypasses_queue_cap_and_drop" {
         }
     }.run;
 
-    const ta = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, worker, .{ &sm, &out_a });
+    const ta = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, worker, .{ &sm, &out_a });
     std.Thread.sleep(20 * std.time.ns_per_ms);
-    const tb = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, worker, .{ &sm, &out_b });
+    const tb = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, worker, .{ &sm, &out_b });
     std.Thread.sleep(20 * std.time.ns_per_ms);
     session.mutex.unlock();
 
@@ -2666,7 +2671,7 @@ test "queue_drop_summarize_injects_single_synthetic_summary_on_next_turn" {
 
     session.mutex.lock();
     var waiter_output: ?[]const u8 = null;
-    const waiter = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+    const waiter = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
         fn run(mgr: *SessionManager, out: *?[]const u8) void {
             out.* = mgr.processMessage("queue:summarize", "first", null) catch null;
         }
@@ -2717,9 +2722,9 @@ test "queue_drop_oldest_still_holds" {
         }
     }.run;
 
-    const ta = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, worker, .{ &sm, &out_a });
+    const ta = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, worker, .{ &sm, &out_a });
     std.Thread.sleep(20 * std.time.ns_per_ms);
-    const tb = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, worker, .{ &sm, &out_b });
+    const tb = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, worker, .{ &sm, &out_b });
     std.Thread.sleep(20 * std.time.ns_per_ms);
     session.mutex.unlock();
 
@@ -2747,7 +2752,7 @@ test "concurrent_waiters_do_not_observe_destroyed_session_on_ttl_expiry" {
     session.mutex.lock();
 
     var waiter_output: ?[]const u8 = null;
-    const waiter = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+    const waiter = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
         fn run(mgr: *SessionManager, out: *?[]const u8) void {
             out.* = mgr.processMessage("ttl:waiters", "after-expiry", null) catch null;
         }
