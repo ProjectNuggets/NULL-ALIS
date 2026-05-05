@@ -245,7 +245,25 @@ pub fn autoCompactHistory(
     const llm_threshold = (config.token_limit * 90) / 100;
     if (tokenEstimate(history.items) > llm_threshold) {
         log.info("compaction.auto: pass=C firing (LLM summarization)", .{});
-        const summarized = try compactHistoryKeepingRecent(allocator, history, provider, model_name, config, config.keep_recent);
+        // V1.8-5 fix: when Pass C fires, GUARANTEE compaction. Pre-V1.8
+        // used `config.keep_recent` (default 20) verbatim — when token
+        // pressure was high but message COUNT was low (long multi-paragraph
+        // messages), keep_recent covered everything, compact_count=0,
+        // compactHistoryKeepingRecent returned false, and
+        // archiveCompactionSummary never wrote — even though "pass=C
+        // firing" had already logged. V1.8-7 audit confirmed: Pass C
+        // fired ~16 times across 8 long-context turns with token_limit=8000,
+        // 0 compaction_summary/* keys ever landed.
+        //
+        // Fix: cap keep_recent at half the non-system message count so
+        // there's always something to compact. Floors keep_recent to
+        // 4 (preserve the agent's immediate working context — last 2
+        // user/assistant pairs). When the history is too small to be
+        // worth Pass C in the first place, the cap doesn't bite.
+        const non_system: usize = @max(history.items.len, 1) -| 1;
+        const half: usize = non_system / 2;
+        const cap_keep: u32 = @intCast(@max(@min(half, @as(usize, config.keep_recent)), @as(usize, 4)));
+        const summarized = try compactHistoryKeepingRecent(allocator, history, provider, model_name, config, cap_keep);
         if (summarized) compacted = true;
     }
 
