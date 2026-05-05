@@ -82,6 +82,18 @@ pub const MemorySelection = struct {
     semantic_bucket_bytes: usize = 0,
     fallback_bucket_entries: usize = 0,
     fallback_bucket_bytes: usize = 0,
+    // V1.7a-2 graph-expand recall telemetry — added to projection
+    // post-V1.8-12 audit (was orphaned in SelectionStats but never
+    // projected to MemorySelection downstream consumers).
+    graph_recall_active: bool = false,
+    graph_recall_seed_count: usize = 0,
+    graph_recall_neighbor_count: usize = 0,
+    graph_recall_appended_bytes: usize = 0,
+    // V1.8-9 active-identity pin telemetry. Mirrors graph_recall_*
+    // shape so /agent/turn_audit can report identity coverage per turn.
+    identity_pin_active: bool = false,
+    identity_pin_fact_count: usize = 0,
+    identity_pin_appended_bytes: usize = 0,
 };
 
 pub const PromptRefreshPlan = struct {
@@ -402,6 +414,16 @@ pub fn selectionFromStats(stats: anytype) MemorySelection {
         .semantic_bucket_bytes = stats.semantic_bucket_bytes,
         .fallback_bucket_entries = stats.fallback_bucket_entries,
         .fallback_bucket_bytes = stats.fallback_bucket_bytes,
+        // V1.7a-2 graph-expand fields — projected through to MemorySelection
+        // for downstream consumers (V1.8-12 audit fix).
+        .graph_recall_active = stats.graph_recall_active,
+        .graph_recall_seed_count = stats.graph_recall_seed_count,
+        .graph_recall_neighbor_count = stats.graph_recall_neighbor_count,
+        .graph_recall_appended_bytes = stats.graph_recall_appended_bytes,
+        // V1.8-9 identity-pin fields.
+        .identity_pin_active = stats.identity_pin_active,
+        .identity_pin_fact_count = stats.identity_pin_fact_count,
+        .identity_pin_appended_bytes = stats.identity_pin_appended_bytes,
     };
 }
 
