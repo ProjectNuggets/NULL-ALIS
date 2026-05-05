@@ -20416,7 +20416,15 @@ test "handleApiChatStreamSseConnection emits keepalive comments during slow turn
         }
 
         fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
-            std.Thread.sleep(70 * std.time.ns_per_ms);
+            // V1.8-16: bumped 70ms → 250ms for robust margin over the
+            // SSE_KEEPALIVE_INTERVAL_MS=25ms test threshold. macOS CI
+            // runners under load sometimes scheduled the keepalive
+            // thread late, causing the provider to return before the
+            // first heartbeat fired (test asserts "Still working on
+            // the reply" presence). 250ms = 10× the threshold;
+            // negligible vs the 60s default test budget but eliminates
+            // the flake.
+            std.Thread.sleep(250 * std.time.ns_per_ms);
             return .{
                 .content = try allocator.dupe(u8, "Hello after keepalive"),
                 .tool_calls = &.{},

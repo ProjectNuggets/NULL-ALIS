@@ -3634,7 +3634,16 @@ fn printUsage() void {
         \\  update [--check] [--yes]
         \\
     ;
-    std.debug.print("{s}", .{usage});
+    // V1.8-16: route help to stdout (matches printVersion pattern at
+    // line 412). Was std.debug.print which goes to stderr — that broke
+    // the deploy-zaki-runtime smoke test which captures stdout via
+    // `out=$(docker run ... help)`. Help is not an error; Unix
+    // convention is help → stdout, errors → stderr. Aligns with
+    // `printVersion` which already does this correctly.
+    var buf: [4096]u8 = undefined;
+    var bw = std.fs.File.stdout().writer(&buf);
+    bw.interface.print("{s}", .{usage}) catch return;
+    bw.interface.flush() catch return;
 }
 
 test "parse known commands" {
