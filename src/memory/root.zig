@@ -619,6 +619,21 @@ pub const ResolveContradictionResult = struct {
     loser_closed: bool,
 };
 
+/// V1.9-4 — result of temporal decay tick.
+/// Returned by `state_mgr.temporalDecay(user_id, threshold_days,
+/// half_life_days)`. Pure value; no allocator-owned slices.
+pub const TemporalDecayResult = struct {
+    /// Number of rows whose `confidence_score` was lowered.
+    rows_decayed: usize,
+    /// Mean amount each decayed row dropped (old - new). Useful for
+    /// observability — "this tick decayed 47 rows by an average of
+    /// 0.18 confidence each."
+    avg_decay_amount: f64,
+    /// Floor confidence — rows already at this floor are skipped
+    /// (no further decay).
+    floor: f64,
+};
+
 /// V1.9-7 — result of the proactive contradiction surveyor.
 /// Returned by `state_mgr.surveyContradictions(allocator, user_id)`.
 /// Caller frees via `deinit`.

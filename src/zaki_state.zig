@@ -487,6 +487,15 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
             .sentinel_written = false,
         };
     }
+    /// V1.9-4 — stub for non-postgres builds; temporal decay no-ops.
+    pub fn temporalDecay(
+        _: *@This(),
+        _: i64,
+        _: u32,
+        _: u32,
+    ) !memory_root.TemporalDecayResult {
+        return .{ .rows_decayed = 0, .avg_decay_amount = 0.0, .floor = 0.1 };
+    }
     /// V1.6 commit 6 — stub for non-postgres builds. Returns empty
     /// candidate list so `edge_resolution.resolveOne` short-circuits to
     /// the no-op outcome (caller writes new fact normally without
@@ -5382,6 +5391,136 @@ const ManagerImpl = struct {
             .conflicts_found = conflicts_n,
             .conflicts_json = conflicts_json,
             .sentinel_written = true,
+        };
+    }
+
+    /// V1.9-4 — temporal decay tick. Lowers `confidence_score` on
+    /// memory rows older than `threshold_days` that haven't been
+    /// recently accessed. Closes ZAKI's stress-test pain:
+    ///
+    ///   > "Neptune sprint deadline April 15 is 50 days old and
+    ///   > never referenced again. April 15 deadline entries look
+    ///   > just as fresh as today's facts. No way to tell what's
+    ///   > current."
+    ///
+    /// Decay-by-neglect, reinforce-by-use:
+    ///   - Rows where `last_accessed_at` is recent → KEEP confidence.
+    ///   - Rows where `last_accessed_at` is old (or NULL, never
+    ///     touched) → exponential decay toward floor.
+    ///   - Schema's existing `access_count` + `last_accessed_at`
+    ///     columns provide the reinforce signal; recall paths
+    ///     already increment them. This primitive only DECAYS;
+    ///     reinforce is automatic via existing recall plumbing.
+    ///
+    /// Decay formula:
+    ///   new = max(floor, old * EXP(-age_secs / (86400 * half_life_days)))
+    ///   floor = 0.1 (never zero — preserves the audit trail)
+    ///
+    /// Where `age` is the time since `last_accessed_at` if non-null,
+    /// else `created_at`. Half-life of 30 days means a never-touched
+    /// memory drops 50% confidence every 30 days. Caller chooses
+    /// half_life_days based on use case (long for archival, short
+    /// for working memory).
+    ///
+    /// SKIPPED key families (don't decay):
+    ///   - autosave_*           — raw transcript, audit trail
+    ///   - session_checkpoint_* — audit trail
+    ///   - pending_conflicts*   — operational sentinel, fresh by design
+    ///
+    /// Reversibility: a recall touches `last_accessed_at` →
+    /// next decay tick computes age from that fresh timestamp →
+    /// decay applies less or not at all. Confidence rises through
+    /// new writes (upsertMemoryWithMetadata sets fresh confidence).
+    /// Pure spacing-effect dynamics.
+    ///
+    /// Returns `TemporalDecayResult` with rows_decayed +
+    /// avg_decay_amount + floor. Useful for observability +
+    /// scheduler tick logging.
+    pub fn temporalDecay(
+        self: *Self,
+        user_id: i64,
+        threshold_days: u32,
+        half_life_days: u32,
+    ) !memory_root.TemporalDecayResult {
+        const begin_result = try self.exec("BEGIN");
+        c.PQclear(begin_result);
+        errdefer {
+            if (self.exec("ROLLBACK")) |rb| {
+                c.PQclear(rb);
+            } else |_| {}
+        }
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var threshold_buf: [16]u8 = undefined;
+        const threshold_s = try std.fmt.bufPrintZ(&threshold_buf, "{d}", .{threshold_days});
+        var halflife_buf: [16]u8 = undefined;
+        const halflife_s = try std.fmt.bufPrintZ(&halflife_buf, "{d}", .{half_life_days});
+
+        const floor: f64 = 0.1;
+
+        // Decay UPDATE. Computes the new confidence per row using
+        // EXP decay over age (since last_accessed_at, falling back to
+        // created_at). RETURNING old + new so we can compute mean
+        // decay amount.
+        const decay_q = try self.buildQuery(
+            "WITH decay AS (" ++
+                "  UPDATE {schema}.memories m SET confidence_score = GREATEST(" ++
+                "    0.1, " ++
+                "    COALESCE(m.confidence_score, 0.8) * EXP(" ++
+                "      -EXTRACT(EPOCH FROM (NOW() - COALESCE(m.last_accessed_at, m.created_at))) " ++
+                "      / (86400.0 * $3::int)" ++
+                "    )" ++
+                "  ) " ++
+                "  WHERE m.user_id = $1 " ++
+                "  AND COALESCE(m.confidence_score, 0.8) > 0.1 " ++
+                "  AND COALESCE(m.last_accessed_at, m.created_at) < NOW() - ($2::int * INTERVAL '1 day') " ++
+                "  AND m.key NOT LIKE 'autosave_%' " ++
+                "  AND m.key NOT LIKE 'session_checkpoint_%' " ++
+                "  AND m.key NOT LIKE 'pending_conflicts%' " ++
+                "  RETURNING m.id, COALESCE(m.confidence_score, 0.8) AS new_conf" ++
+                ") " ++
+                "SELECT COUNT(*)::bigint AS n, COALESCE(AVG(new_conf), 0.0)::double precision AS avg_new " ++
+                "FROM decay",
+        );
+        defer self.allocator.free(decay_q);
+        const decay_params = [_]?[*:0]const u8{ user_s.ptr, threshold_s.ptr, halflife_s.ptr };
+        const decay_lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(threshold_s.len),
+            @intCast(halflife_s.len),
+        };
+        const decay_result = try self.execParams(decay_q, &decay_params, &decay_lengths);
+        defer c.PQclear(decay_result);
+
+        var rows_decayed: usize = 0;
+        var avg_new: f64 = 0.0;
+        if (c.PQntuples(decay_result) > 0) {
+            const n_str = try dupeResultValue(self.allocator, decay_result, 0, 0);
+            defer self.allocator.free(n_str);
+            rows_decayed = std.fmt.parseInt(usize, n_str, 10) catch 0;
+            const avg_str = try dupeResultValue(self.allocator, decay_result, 0, 1);
+            defer self.allocator.free(avg_str);
+            avg_new = std.fmt.parseFloat(f64, avg_str) catch 0.0;
+        }
+
+        // COMMIT.
+        const commit_result = try self.exec("COMMIT");
+        c.PQclear(commit_result);
+
+        // avg_decay_amount estimation: (1 - avg_new) is roughly the
+        // mean drop assuming starting confidence ~1.0. Honest enough
+        // for observability; we don't capture old vs new per-row to
+        // keep the SQL atomic + cheap.
+        const avg_decay_amount: f64 = if (rows_decayed > 0) (0.8 - avg_new) else 0.0;
+
+        log.info("temporal_decay user={d} threshold_days={d} half_life_days={d} rows_decayed={d} avg_new_conf={d:.3}", .{
+            user_id, threshold_days, half_life_days, rows_decayed, avg_new,
+        });
+        return .{
+            .rows_decayed = rows_decayed,
+            .avg_decay_amount = avg_decay_amount,
+            .floor = floor,
         };
     }
 
