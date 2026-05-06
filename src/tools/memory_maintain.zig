@@ -7,6 +7,28 @@ const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 const zaki_state = @import("../zaki_state.zig");
 
+/// V1.9-Rev finding #25 — escape a string for safe embedding inside
+/// a JSON string value. Caller frees the returned slice. All
+/// `next_consideration` strings in this tool are routed through
+/// this helper before being interpolated into output JSON via
+/// `{s}`, so a future contributor adding a quoted phrase or
+/// backslash-bearing string can't silently break the JSON contract.
+fn jsonEscape(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, ch),
+        }
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 /// V1.9-5 — `memory_maintain(action, params)`. The unified
 /// truth-maintenance toolkit ZAKI asked for in his self-diagnostic
 /// letter:
@@ -139,6 +161,8 @@ pub const MemoryMaintainTool = struct {
         else
             "No edges to rewrite (entity exists but is unconnected, or names already canonical). Nothing to follow up on.";
 
+        const nc_esc = try jsonEscape(allocator, next_consideration);
+        defer allocator.free(nc_esc);
         const output = try std.fmt.allocPrint(
             allocator,
             "{{\"action\":\"cascade_update\",\"found_old\":{s},\"edges_rewritten\":{d},\"edges_closed\":{d},\"next_consideration\":\"{s}\"}}",
@@ -146,7 +170,7 @@ pub const MemoryMaintainTool = struct {
                 if (result.found_old) "true" else "false",
                 result.edges_rewritten,
                 result.edges_closed,
-                next_consideration,
+                nc_esc,
             },
         );
         return ToolResult{ .success = true, .output = output };
@@ -174,10 +198,12 @@ pub const MemoryMaintainTool = struct {
         else
             "No edges matched the pattern. Either the object_name doesn't exist, no edges have that predicate, or they're already closed. Verify the entity exists via memory_recall first.";
 
+        const nc_esc = try jsonEscape(allocator, next_consideration);
+        defer allocator.free(nc_esc);
         const output = try std.fmt.allocPrint(
             allocator,
             "{{\"action\":\"invalidate_when\",\"predicate\":\"{s}\",\"object_name\":\"{s}\",\"edges_closed\":{d},\"next_consideration\":\"{s}\"}}",
-            .{ predicate, object_name, closed, next_consideration },
+            .{ predicate, object_name, closed, nc_esc },
         );
         return ToolResult{ .success = true, .output = output };
     }
@@ -205,6 +231,8 @@ pub const MemoryMaintainTool = struct {
         else
             "No close occurred (unexpected — loser existed but didn't close). Check logs for SQL error.";
 
+        const nc_esc = try jsonEscape(allocator, next_consideration);
+        defer allocator.free(nc_esc);
         const output = try std.fmt.allocPrint(
             allocator,
             "{{\"action\":\"resolve_contradiction\",\"loser_existed\":{s},\"winner_existed\":{s},\"loser_closed\":{s},\"next_consideration\":\"{s}\"}}",
@@ -212,7 +240,7 @@ pub const MemoryMaintainTool = struct {
                 if (result.loser_existed) "true" else "false",
                 if (result.winner_existed) "true" else "false",
                 if (result.loser_closed) "true" else "false",
-                next_consideration,
+                nc_esc,
             },
         );
         return ToolResult{ .success = true, .output = output };
@@ -257,6 +285,8 @@ pub const MemoryMaintainTool = struct {
         }
         try keys_buf.append(allocator, ']');
 
+        const nc_esc = try jsonEscape(allocator, next_consideration);
+        defer allocator.free(nc_esc);
         const output = try std.fmt.allocPrint(
             allocator,
             "{{\"action\":\"propagate_correction\",\"correction_existed\":{s},\"targets_flagged\":{d},\"target_keys\":{s},\"next_consideration\":\"{s}\"}}",
@@ -264,7 +294,7 @@ pub const MemoryMaintainTool = struct {
                 if (result.correction_existed) "true" else "false",
                 result.targets_flagged,
                 keys_buf.items,
-                next_consideration,
+                nc_esc,
             },
         );
         return ToolResult{ .success = true, .output = output };
@@ -291,6 +321,8 @@ pub const MemoryMaintainTool = struct {
         else
             "No rows met the decay threshold. Either threshold_days is too high, or all eligible memories were recently accessed (reinforce-by-use is keeping them fresh).";
 
+        const nc_esc = try jsonEscape(allocator, next_consideration);
+        defer allocator.free(nc_esc);
         const output = try std.fmt.allocPrint(
             allocator,
             "{{\"action\":\"temporal_decay\",\"threshold_days\":{d},\"half_life_days\":{d},\"rows_decayed\":{d},\"avg_decay_amount\":{d:.3},\"floor\":{d:.2},\"next_consideration\":\"{s}\"}}",
@@ -300,7 +332,7 @@ pub const MemoryMaintainTool = struct {
                 result.rows_decayed,
                 result.avg_decay_amount,
                 result.floor,
-                next_consideration,
+                nc_esc,
             },
         );
         return ToolResult{ .success = true, .output = output };
@@ -322,6 +354,8 @@ pub const MemoryMaintainTool = struct {
         else
             "No edge-graph contradictions detected. Note: this surveyor is edge-graph-only; prose-level contradictions (e.g. multiple durable_facts saying different things about the same subject) require the V1.10 LLM-judge surveyor to detect.";
 
+        const nc_esc = try jsonEscape(allocator, next_consideration);
+        defer allocator.free(nc_esc);
         const output = try std.fmt.allocPrint(
             allocator,
             "{{\"action\":\"survey\",\"conflicts_found\":{d},\"sentinel_written\":{s},\"conflicts_json\":{s},\"next_consideration\":\"{s}\"}}",
@@ -329,7 +363,7 @@ pub const MemoryMaintainTool = struct {
                 result.conflicts_found,
                 if (result.sentinel_written) "true" else "false",
                 result.conflicts_json,
-                next_consideration,
+                nc_esc,
             },
         );
         return ToolResult{ .success = true, .output = output };

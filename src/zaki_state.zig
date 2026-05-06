@@ -4509,12 +4509,16 @@ const ManagerImpl = struct {
         defer c.PQclear(lookup_result);
         if (c.PQntuples(lookup_result) == 0) {
             // No old entity → no cascade needed. COMMIT empty txn.
+            // V1.9-Rev finding #2: contract says CascadeRenameResult
+            // owns its slices via the supplied allocator. Return
+            // zero-length allocator-owned slices instead of `""`
+            // string literals so the contract holds.
             const commit = try self.exec("COMMIT");
             c.PQclear(commit);
             return .{
                 .found_old = false,
-                .old_id = "",
-                .new_id = "",
+                .old_id = try allocator.alloc(u8, 0),
+                .new_id = try allocator.alloc(u8, 0),
                 .edges_rewritten = 0,
                 .edges_closed = 0,
             };
@@ -4545,11 +4549,15 @@ const ManagerImpl = struct {
         const upsert_result = try self.execParams(upsert_q, &upsert_params, &upsert_lengths);
         defer c.PQclear(upsert_result);
         const new_id_owned = try dupeResultValue(self.allocator, upsert_result, 0, 0);
-        // Caller owns new_id; don't free here. We dup again for the result.
+        // V1.9-Rev finding #1: defer free at top level so success path
+        // doesn't leak. Was previously freed only in case-only branch
+        // → main success path leaked 32 bytes per cascade_update call.
+        defer self.allocator.free(new_id_owned);
 
         // Step 4 — case-only / already-canonical no-op.
         if (std.mem.eql(u8, old_id_owned, new_id_owned)) {
-            self.allocator.free(new_id_owned);
+            // Note: defer above handles new_id_owned cleanup on this
+            // return path too — no explicit free here.
             const commit = try self.exec("COMMIT");
             c.PQclear(commit);
             return .{
@@ -4787,8 +4795,14 @@ const ManagerImpl = struct {
                 subject_id_owned = try dupeResultValue(self.allocator, subj_result, 0, 0);
             }
             // If subject_name given but not found, no edges can match —
-            // commit empty txn and return 0.
+            // commit empty txn and return 0. V1.9-Rev finding #6:
+            // log_warn so observability surfaces "I typo'd the
+            // subject name" caller errors instead of silently
+            // returning a no-op count.
             if (subject_id_owned == null) {
+                log.warn("invalidate_when subject_not_found user={d} subject={s} predicate={s} object={s} returning=0", .{
+                    user_id, sn, predicate, object_name,
+                });
                 const commit = try self.exec("COMMIT");
                 c.PQclear(commit);
                 return 0;
@@ -5154,6 +5168,11 @@ const ManagerImpl = struct {
             const k_self_owned = try dupeResultValue(self.allocator, update_result, ki, 0);
             defer self.allocator.free(k_self_owned);
             const k_caller_owned = try allocator.dupe(u8, k_self_owned);
+            // V1.9-Rev finding #11: errdefer per-iteration so an OOM
+            // on append doesn't leak the just-allocated caller-owned
+            // slice. Outer errdefer cleans `keys.items`; this catches
+            // the in-flight allocation between dupe + append.
+            errdefer allocator.free(k_caller_owned);
             try keys.append(allocator, k_caller_owned);
         }
 
