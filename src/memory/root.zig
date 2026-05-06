@@ -1057,11 +1057,23 @@ pub fn isAppendOnlyMemoryKey(key: []const u8) bool {
 pub fn isSystemManagedMemoryKey(key: []const u8) bool {
     return std.mem.eql(u8, key, "context_anchor_current") or
         std.mem.startsWith(u8, key, "summary_latest/") or
+        // V1.10 Gap B fix — timeline_summary IS continuity per the role
+        // taxonomy at line ~864 ("searchable, injectable, carries current
+        // product truth"). It was missing from this predicate by oversight,
+        // which made some test assertions rely on the category gate in
+        // isMutableMemoryEntry to keep timeline_summary protected. With the
+        // category gate removed below (so daily-type user-namespace keys
+        // become editable), timeline_summary needs to be explicitly listed
+        // here to stay protected.
+        std.mem.startsWith(u8, key, "timeline_summary/") or
         std.mem.startsWith(u8, key, "durable_fact/") or
         isAppendOnlyMemoryKey(key);
 }
 
 pub fn isMutableMemoryEntry(key: []const u8, category: MemoryCategory) bool {
+    // Used by markdown engine paths (compaction/collapse) — they need the
+    // tighter "core only" semantic to decide what to fold. Keep this
+    // unchanged so engines continue to behave correctly.
     if (isTombstoneKey(key) or isMarkdownLineKey(key) or isAppendOnlyMemoryKey(key)) return false;
     return switch (category) {
         .core => true,
@@ -1070,7 +1082,16 @@ pub fn isMutableMemoryEntry(key: []const u8, category: MemoryCategory) bool {
 }
 
 pub fn isEditableMemoryEntry(key: []const u8, category: MemoryCategory) bool {
-    if (!isMutableMemoryEntry(key, category)) return false;
+    // V1.10 Gap B fix — category-agnostic. Edit/archive/forget should
+    // operate on ANY user-namespace key the agent has access to, not just
+    // core-tier. Daily-type self-poll under user keys (e.g. the `project_
+    // codename` Panther entries from April brainstorm) was previously
+    // unkillable from the agent side because isMutableMemoryEntry refused
+    // anything non-core. Internal / system-managed / append-only /
+    // tombstone / markdown-line keys remain protected through the
+    // structural checks below.
+    _ = category;
+    if (isTombstoneKey(key) or isMarkdownLineKey(key) or isAppendOnlyMemoryKey(key)) return false;
     if (isInternalMemoryKey(key) or isSystemManagedMemoryKey(key)) return false;
     return true;
 }
@@ -3897,6 +3918,28 @@ test "editable memory classification keeps user state editable" {
     try std.testing.expect(!isEditableMemoryEntry("summary_latest/agent:zaki-bot:user:1:main", .core));
     try std.testing.expect(!isEditableMemoryEntry("timeline_summary/agent:zaki-bot:user:1:main/1", .daily));
     try std.testing.expect(!isEditableMemoryEntry("durable_fact/1/0", .core));
+}
+
+test "V1.10 Gap B — daily-type user-namespace keys are editable" {
+    // Regression test: pre-V1.10-Gap-B, isEditableMemoryEntry refused
+    // any non-core entry, leaving daily-type self-poll under user keys
+    // (e.g. project_codename = "Panther" from an April brainstorm)
+    // unkillable from the agent side. memory_archive returned
+    // "protected"; memory_forget refused; only direct SQL could remove.
+    // The fix: edit/archive/forget operate on user-namespace keys
+    // regardless of category. Internal/system-managed keys stay
+    // protected through their own structural checks.
+    try std.testing.expect(isEditableMemoryEntry("project_codename", .daily));
+    try std.testing.expect(isEditableMemoryEntry("project_codename_panther", .daily));
+    try std.testing.expect(isEditableMemoryEntry("user_project_codename", .conversation));
+    try std.testing.expect(isEditableMemoryEntry("any_user_key", .core));
+    try std.testing.expect(isEditableMemoryEntry("any_user_key", .daily));
+    // Internal / system-managed keys still refused regardless of category.
+    try std.testing.expect(!isEditableMemoryEntry("autosave_user_123", .conversation));
+    try std.testing.expect(!isEditableMemoryEntry("durable_fact/1/0", .daily));
+    try std.testing.expect(!isEditableMemoryEntry("summary_latest/x", .core));
+    try std.testing.expect(!isEditableMemoryEntry("timeline_summary/x/1", .core));
+    try std.testing.expect(!isEditableMemoryEntry("context_anchor_current", .core));
 }
 
 test "tombstone target key extracts target" {
