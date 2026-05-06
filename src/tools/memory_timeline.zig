@@ -423,12 +423,22 @@ pub const MemoryTimelineTool = struct {
         errdefer out.deinit(allocator);
         const w = out.writer(allocator);
         try w.print("Found {d} session summar{s}:\n", .{ visible_count, if (visible_count == 1) "y" else "ies" });
+        // V1.10-D code review fix — increment a post-skip visible
+        // counter for the displayed numbering. Without this, when N
+        // items are superseded mid-list the rendered output reads
+        // "1. ... 3. ... 4. ..." (skipping "2."). Header says "Found
+        // 3" but list numbering jumps. memory_recall and memory_list
+        // already use this pattern (shown_idx / written respectively);
+        // memory_timeline was the outlier.
+        var visible_idx: usize = 0;
         for (views, 0..) |view, idx| {
+            _ = idx;
             const source_key = view.source_key_override orelse view.entry.key;
             // V1.10-D — skip superseded summaries (both source-key and
             // entry-key checks; correction may have flagged either).
             if (supersede_filter.isKeySuperseded(source_key, superseded_keys)) continue;
             if (supersede_filter.isKeySuperseded(view.entry.key, superseded_keys)) continue;
+            visible_idx += 1;
             const provenance = mem_root.resolveStoredMemoryProvenance(view.entry.content, view.entry.session_id, source_key);
             const at = view.at_override orelse view.entry.timestamp;
             const focus = mem_root.extractSummarySection(view.entry.content, "focus:");
@@ -441,7 +451,7 @@ pub const MemoryTimelineTool = struct {
             try w.print(
                 "{d}. session={s} channel={s} lane={s} at={s} source_key={s}\n   focus: {s}\n   decisions: {s}\n   open_loops: {s}\n   next: {s}\n",
                 .{
-                    idx + 1,
+                    visible_idx,
                     provenance.session_id orelse "unknown",
                     provenance.channel,
                     provenance.lane,
