@@ -5673,14 +5673,34 @@ const ManagerImpl = struct {
         if (entity_pattern.len == 0) return error.EmptyEntityPattern;
         if (limit == 0) return try allocator.alloc(memory_root.ProseFact, 0);
 
+        // V1.10 Gap A fix — widen the family filter from allowlist
+        // (durable_fact / timeline_summary / summary_latest) to denylist
+        // (everything except audit / index / internal). The 2026-05-06
+        // diagnostic showed user-keyed self-pollution (e.g. a stored
+        // "Panther" codename under arbitrary keys like project_codename,
+        // user_project_codename) was invisible to the surveyor under the
+        // narrow allowlist. The wider denylist catches these while still
+        // skipping rows the judge has no business reading: raw
+        // conversation autosaves, periodic checkpoints, the timeline
+        // index, the context anchor sentinel, tombstones, and the
+        // hygiene timestamp. Aligns with the role taxonomy at
+        // src/memory/root.zig::classifyArtifactKey — judge sees
+        // continuity (durable_fact / timeline_summary / summary_latest /
+        // context_anchor) and user-namespace keys, NOT audit (autosave_*,
+        // session_checkpoint_*) or index (timeline_index/) or internal
+        // (last_hygiene_at, __tombstone__/*).
         const q = try self.buildQuery(
             "SELECT key, content, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint, 0) " ++
                 "FROM {schema}.memories " ++
                 "WHERE user_id = $1 " ++
                 "AND content ILIKE $2 " ++
-                "AND (key LIKE 'durable_fact/%' " ++
-                "  OR key LIKE 'timeline_summary/%' " ++
-                "  OR key LIKE 'summary_latest/%') " ++
+                "AND key NOT LIKE 'autosave_user_%' " ++
+                "AND key NOT LIKE 'autosave_assistant_%' " ++
+                "AND key NOT LIKE 'session_checkpoint_%' " ++
+                "AND key NOT LIKE 'timeline_index/%' " ++
+                "AND key NOT LIKE '\\_\\_tombstone\\_\\_%' ESCAPE '\\' " ++
+                "AND key != 'last_hygiene_at' " ++
+                "AND key != 'context_anchor_current' " ++
                 "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
                 "AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'superseded_by_correction') " ++
                 "ORDER BY updated_at DESC LIMIT $3",
