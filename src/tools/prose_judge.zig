@@ -90,11 +90,21 @@ pub const VerdictList = struct {
 
 const JUDGE_SYSTEM_PROMPT =
     "You are a fact-checker reviewing memory entries that all reference the same subject. " ++
-    "Your job: find PAIRS of entries that directly contradict each other (assert mutually-exclusive truths), " ++
-    "and pick the entry that should remain as current truth (the WINNER) versus the one that should be marked superseded (the LOSER). " ++
-    "Heuristics for picking the winner: prefer the entry with the more recent updated_at, " ++
-    "the entry that explicitly corrects an earlier statement (\"Actually X is...\", \"Update: ...\"), " ++
-    "or the entry with more specific / qualified language. Do NOT mark entries as contradicting if they are merely complementary, sequential, or describe different aspects of the subject. " ++
+    "Your job: find PAIRS of entries that assert mutually-exclusive truths about the subject's CURRENT state, " ++
+    "and pick the entry that should remain as current truth (the WINNER) versus the one that should be marked superseded (the LOSER).\n\n" ++
+    "## Decision rules (apply in order)\n\n" ++
+    "1. **Temporal-first rule** (V1.10 Gap C): if two entries assert mutually-exclusive truths about the subject's CURRENT name / status / value AND one entry is meaningfully newer (≥7 days, or explicitly an update like \"Actually X is...\" / \"Update: ...\"), the newer entry wins. The older one is superseded. Do NOT skip this case as \"complementary\" — when the same property has two values across time, the newer is current truth.\n\n" ++
+    "2. **Complementary detection**: do NOT mark entries as contradicting if they describe different ASPECTS of the subject (e.g. one entry says \"Project Foo's budget is €18k\" and another says \"Project Foo's deadline is April 15\"). Different facets, both true.\n\n" ++
+    "3. **Specificity tiebreaker**: if two entries assert the same property with similar timestamps but different specificity, prefer the more specific / qualified one as winner.\n\n" ++
+    "4. **Sequential events**: if two entries describe SEQUENTIAL events (e.g. \"sent for signing\" → \"signed\"), they're not contradictions — both are true at their respective moments.\n\n" ++
+    "## Worked example\n\n" ++
+    "Input:\n" ++
+    "  - {\"key\":\"k1\",\"updated_at\":\"2026-04-01\",\"content\":\"Project codename: Neptune\"}\n" ++
+    "  - {\"key\":\"k2\",\"updated_at\":\"2026-04-15\",\"content\":\"Project codename: Nullalis\"}\n" ++
+    "  - {\"key\":\"k3\",\"updated_at\":\"2026-04-20\",\"content\":\"Architecture: Neptune (product) → Nullalis (agent core)\"}\n\n" ++
+    "Correct verdict: `[{\"loser_key\":\"k1\",\"winner_key\":\"k2\",\"reason\":\"k2 (Apr 15) supersedes k1 (Apr 1) on the project codename property\"}]`. " ++
+    "Note: k3 is NOT a contradiction with k2 because k3 describes a multi-tier architecture (Neptune AS the product layer, Nullalis AS the agent layer) — different aspects, both true. Don't flag it.\n\n" ++
+    "## Output format\n\n" ++
     "Output STRICT JSON only, no prose, no markdown fences. Schema: " ++
     "{\"contradictions\":[{\"loser_key\":\"<exact key from input>\",\"winner_key\":\"<exact key from input>\",\"reason\":\"<one sentence>\"}]}. " ++
     "If no contradictions exist, output {\"contradictions\":[]}. " ++
@@ -109,18 +119,55 @@ fn buildFactList(allocator: std.mem.Allocator, facts: []const ProseFact) ![]u8 {
 
     try buf.appendSlice(allocator, "Memory entries (all reference the same subject):\n");
     for (facts) |f| {
-        // Build one JSON line per fact: {"key":"...","updated_at":<ts>,"content":"..."}
+        // V1.10 Gap C — emit `updated_at` as YYYY-MM-DD ISO date instead
+        // of unix epoch. Llama 8B reasons better about dates than about
+        // raw integer timestamps; the temporal-first rule in the system
+        // prompt becomes actionable. The exact-date precision (day-level)
+        // is enough for the "≥7 days" heuristic without bloating the prompt.
         try buf.appendSlice(allocator, "- ");
         try buf.appendSlice(allocator, "{\"key\":\"");
         try appendJsonEscaped(allocator, &buf, f.key);
-        try buf.appendSlice(allocator, "\",\"updated_at\":");
-        try buf.writer(allocator).print("{d}", .{f.updated_at_unix});
-        try buf.appendSlice(allocator, ",\"content\":\"");
+        try buf.appendSlice(allocator, "\",\"updated_at\":\"");
+        try appendIsoDate(&buf, allocator, f.updated_at_unix);
+        try buf.appendSlice(allocator, "\",\"content\":\"");
         try appendJsonEscaped(allocator, &buf, f.content);
         try buf.appendSlice(allocator, "\"}\n");
     }
     try buf.appendSlice(allocator, "\nReturn the contradictions JSON now.");
     return try buf.toOwnedSlice(allocator);
+}
+
+/// V1.10 Gap C — format a unix-epoch timestamp as `YYYY-MM-DD` (UTC).
+/// Pure integer arithmetic, no allocator needed for the conversion.
+/// Handles dates from 1970-01-01 onward; older epoch (negative) is
+/// rendered as a sentinel so the judge can still parse the JSON.
+fn appendIsoDate(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    unix_seconds: i64,
+) !void {
+    if (unix_seconds <= 0) {
+        try buf.appendSlice(allocator, "1970-01-01");
+        return;
+    }
+    const day_seconds: i64 = 86400;
+    const days_since_epoch: i64 = @divFloor(unix_seconds, day_seconds);
+    // Civil-from-days conversion (Howard Hinnant's algorithm, simplified).
+    const z: i64 = days_since_epoch + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: u32 = @intCast(z - era * 146097);
+    const yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y: i64 = @as(i64, @intCast(yoe)) + era * 400;
+    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp: u32 = (5 * doy + 2) / 153;
+    const d: u32 = doy - (153 * mp + 2) / 5 + 1;
+    const m: u32 = if (mp < 10) mp + 3 else mp - 9;
+    const year: i64 = if (m <= 2) y + 1 else y;
+    // Cast to unsigned for printing — Zig's {d} on signed types emits a
+    // leading "+" for positive values. Year is always positive in our
+    // use case (unix_seconds > 0 was guarded above).
+    const year_u: u64 = @intCast(@max(year, 0));
+    try buf.writer(allocator).print("{d:0>4}-{d:0>2}-{d:0>2}", .{ year_u, m, d });
 }
 
 fn appendJsonEscaped(
@@ -385,9 +432,10 @@ test "parseVerdicts strips markdown fence" {
     try std.testing.expectEqual(@as(usize, 1), verdicts.items.len);
 }
 
-test "buildFactList escapes quotes and newlines" {
+test "buildFactList escapes quotes and newlines and emits ISO date" {
     const allocator = std.testing.allocator;
     const facts = [_]ProseFact{
+        // 1234567890 unix = 2009-02-13 UTC
         .{ .key = @constCast("k1"), .content = @constCast("He said \"hi\"\nthen left"), .updated_at_unix = 1234567890 },
     };
     const out = try buildFactList(allocator, &facts);
@@ -395,5 +443,24 @@ test "buildFactList escapes quotes and newlines" {
 
     try std.testing.expect(std.mem.indexOf(u8, out, "\\\"hi\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "1234567890") != null);
+    // V1.10 Gap C — judge sees ISO date, not raw unix epoch
+    try std.testing.expect(std.mem.indexOf(u8, out, "2009-02-13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1234567890") == null);
+}
+
+test "appendIsoDate converts canonical timestamps correctly" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { ts: i64, expected: []const u8 }{
+        .{ .ts = 0, .expected = "1970-01-01" },
+        .{ .ts = -1, .expected = "1970-01-01" }, // sentinel for negative
+        .{ .ts = 1234567890, .expected = "2009-02-13" },
+        .{ .ts = 1776337184, .expected = "2026-04-16" }, // ZAKI's MNDA-delay row
+        .{ .ts = 1778073341, .expected = "2026-05-06" }, // ZAKI's MNDA-signed row
+    };
+    for (cases) |c| {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        try appendIsoDate(&buf, allocator, c.ts);
+        try std.testing.expectEqualStrings(c.expected, buf.items);
+    }
 }
