@@ -5673,34 +5673,59 @@ const ManagerImpl = struct {
         if (entity_pattern.len == 0) return error.EmptyEntityPattern;
         if (limit == 0) return try allocator.alloc(memory_root.ProseFact, 0);
 
-        // V1.10 Gap A fix — widen the family filter from allowlist
-        // (durable_fact / timeline_summary / summary_latest) to denylist
-        // (everything except audit / index / internal). The 2026-05-06
-        // diagnostic showed user-keyed self-pollution (e.g. a stored
-        // "Panther" codename under arbitrary keys like project_codename,
-        // user_project_codename) was invisible to the surveyor under the
-        // narrow allowlist. The wider denylist catches these while still
-        // skipping rows the judge has no business reading: raw
-        // conversation autosaves, periodic checkpoints, the timeline
-        // index, the context anchor sentinel, tombstones, and the
-        // hygiene timestamp. Aligns with the role taxonomy at
-        // src/memory/root.zig::classifyArtifactKey — judge sees
-        // continuity (durable_fact / timeline_summary / summary_latest /
-        // context_anchor) and user-namespace keys, NOT audit (autosave_*,
-        // session_checkpoint_*) or index (timeline_index/) or internal
-        // (last_hygiene_at, __tombstone__/*).
+        // V1.10 Gap A fix (post-review-tightened) — widen the family
+        // filter from allowlist (durable_fact / timeline_summary /
+        // summary_latest) to denylist (everything except audit / index /
+        // internal / system-managed). The 2026-05-06 diagnostic showed
+        // user-keyed self-pollution (e.g. a stored "Panther" codename
+        // under arbitrary keys like project_codename) was invisible to
+        // the surveyor under the narrow allowlist. The wider denylist
+        // catches these while still skipping rows the judge has no
+        // business reading.
+        //
+        // Mirrors the Zig predicates in src/memory/root.zig:
+        //   - isInternalMemoryKey (autosave_*, last_hygiene_at,
+        //     __tombstone__/*, __bootstrap.prompt.*)
+        //   - isAppendOnlyMemoryKey (session_summary/, timeline_summary/,
+        //     session_checkpoint_, autosave_*, compaction_summary/,
+        //     summary_fallback/, compaction_dropped/)
+        //   - timeline_index/* (index)
+        //   - context_anchor_current (single-row sentinel)
+        //   - MEMORY:<digits> (markdown-line parser artifacts)
+        //
+        // NOTE: this list MUST stay in lockstep with the Zig predicates.
+        // Future additions to isAppendOnlyMemoryKey or isInternalMemoryKey
+        // need a matching SQL clause here. A future refactor could expose
+        // a single `prose_survey_scope` SQL function that the predicates
+        // delegate to, eliminating the drift risk; deferred to V1.10+ as
+        // it touches the postgres schema.
         const q = try self.buildQuery(
             "SELECT key, content, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint, 0) " ++
                 "FROM {schema}.memories " ++
                 "WHERE user_id = $1 " ++
                 "AND content ILIKE $2 " ++
+                // audit class
                 "AND key NOT LIKE 'autosave_user_%' " ++
                 "AND key NOT LIKE 'autosave_assistant_%' " ++
                 "AND key NOT LIKE 'session_checkpoint_%' " ++
+                // index class
                 "AND key NOT LIKE 'timeline_index/%' " ++
+                // internal class
                 "AND key NOT LIKE '\\_\\_tombstone\\_\\_%' ESCAPE '\\' " ++
+                "AND key NOT LIKE '\\_\\_bootstrap.prompt.%' ESCAPE '\\' " ++
                 "AND key != 'last_hygiene_at' " ++
                 "AND key != 'context_anchor_current' " ++
+                // system-managed append-only writes (compaction artifacts,
+                // session-level summaries that aren't user-facing
+                // continuity facts; we keep summary_latest/ and
+                // timeline_summary/ in scope because those ARE the
+                // continuity rows the surveyor is meant to compare).
+                "AND key NOT LIKE 'session_summary/%' " ++
+                "AND key NOT LIKE 'compaction_summary/%' " ++
+                "AND key NOT LIKE 'compaction_dropped/%' " ++
+                "AND key NOT LIKE 'summary_fallback/%' " ++
+                // markdown parser artifact: "MEMORY:<digits>"
+                "AND key NOT SIMILAR TO 'MEMORY:[0-9]+' " ++
                 "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
                 "AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'superseded_by_correction') " ++
                 "ORDER BY updated_at DESC LIMIT $3",
