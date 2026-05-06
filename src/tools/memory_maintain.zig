@@ -6,6 +6,9 @@ const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 const zaki_state = @import("../zaki_state.zig");
+const providers = @import("../providers/root.zig");
+const Provider = providers.Provider;
+const prose_judge = @import("prose_judge.zig");
 
 /// V1.9-Rev finding #25 — escape a string for safe embedding inside
 /// a JSON string value. Caller frees the returned slice. All
@@ -80,20 +83,32 @@ pub const MemoryMaintainTool = struct {
     state_mgr: ?*zaki_state.Manager = null,
     user_id: ?i64 = null,
     memory: ?Memory = null,
+    /// V1.10-B — sidecar provider for the LLM-judge prose surveyor.
+    /// Wired by tools/root.zig::bindMemoryMaintainSidecar (called from
+    /// gateway.zig once the per-tenant runtime is built). Without it,
+    /// `prose_survey` returns a clean "sidecar not configured" failure.
+    judge_provider: ?Provider = null,
+    /// V1.10-B — model name for the sidecar judge call. Empty when not
+    /// configured. The action handler treats `judge_provider != null`
+    /// AND `judge_model.len > 0` as the wired-up state.
+    judge_model: []const u8 = "",
 
     pub const tool_name = "memory_maintain";
     pub const tool_description =
-        "Maintain truth across your memory graph. Single tool, six actions: " ++
+        "Maintain truth across your memory graph. Single tool, seven actions: " ++
         "(1) cascade_update — rename entity across all edges; " ++
         "(2) invalidate_when — close edges matching (predicate, object_name); " ++
         "(3) resolve_contradiction — explicitly pick loser/winner by memory key; " ++
         "(4) propagate_correction — flag prose memories referencing a corrected entity; " ++
         "(5) temporal_decay — lower confidence on stale unreferenced memories; " ++
-        "(6) survey — find current edge-graph contradictions and write to pending_conflicts_v2. " ++
+        "(6) survey — find current edge-graph contradictions and write to pending_conflicts_v2; " ++
+        "(7) prose_survey — V1.10-B LLM-judge surveyor: scan durable_fact / timeline_summary rows mentioning entity_pattern, " ++
+        "use the cheap sidecar judge to find prose-level contradictions, mark losers as superseded with bidirectional pointers. " ++
+        "Use when stale prose facts (e.g. \"X is the codename\" + \"X is the OLD codename\") need cleanup that edge-graph survey can't see. " ++
         "Use when you notice stale facts, contradictory states, renamed entities, or unresolved corrections. " ++
         "After each call, check `next_consideration` in the response for suggested follow-up actions.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["cascade_update","invalidate_when","resolve_contradiction","propagate_correction","temporal_decay","survey"],"description":"Which truth-maintenance operation to perform."},"old_name":{"type":"string","description":"For cascade_update: the entity name being renamed FROM."},"new_name":{"type":"string","description":"For cascade_update: the entity name being renamed TO."},"predicate":{"type":"string","description":"For invalidate_when: predicate to match (e.g. STATUS, PREFERS, WORKS_AT)."},"object_name":{"type":"string","description":"For invalidate_when: target entity name to match."},"subject_name":{"type":"string","description":"For invalidate_when: optional subject entity name to narrow further."},"loser_key":{"type":"string","description":"For resolve_contradiction: the memory key being closed."},"winner_key":{"type":"string","description":"For resolve_contradiction: the memory key that stays alive."},"correction_key":{"type":"string","description":"For propagate_correction: the memory key holding the correction."},"entity_pattern":{"type":"string","description":"For propagate_correction: substring to match in target memory content."},"threshold_days":{"type":"integer","description":"For temporal_decay: only decay memories untouched for this many days. Default 30."},"half_life_days":{"type":"integer","description":"For temporal_decay: confidence half-life in days. Default 30."}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["cascade_update","invalidate_when","resolve_contradiction","propagate_correction","temporal_decay","survey","prose_survey"],"description":"Which truth-maintenance operation to perform."},"old_name":{"type":"string","description":"For cascade_update: the entity name being renamed FROM."},"new_name":{"type":"string","description":"For cascade_update: the entity name being renamed TO."},"predicate":{"type":"string","description":"For invalidate_when: predicate to match (e.g. STATUS, PREFERS, WORKS_AT)."},"object_name":{"type":"string","description":"For invalidate_when: target entity name to match."},"subject_name":{"type":"string","description":"For invalidate_when: optional subject entity name to narrow further."},"loser_key":{"type":"string","description":"For resolve_contradiction: the memory key being closed."},"winner_key":{"type":"string","description":"For resolve_contradiction: the memory key that stays alive."},"correction_key":{"type":"string","description":"For propagate_correction: the memory key holding the correction."},"entity_pattern":{"type":"string","description":"For propagate_correction OR prose_survey: substring to match in target memory content (e.g. \"MNDA\", \"Mia\", \"Neptune\")."},"threshold_days":{"type":"integer","description":"For temporal_decay: only decay memories untouched for this many days. Default 30."},"half_life_days":{"type":"integer","description":"For temporal_decay: confidence half-life in days. Default 30."},"max_facts":{"type":"integer","description":"For prose_survey: cap on number of rows the LLM judge sees per call. Default 12, max 25."},"dry_run":{"type":"boolean","description":"For prose_survey: if true, returns judge verdicts without writing any metadata (preview mode). Default false."}},"required":["action"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -107,7 +122,7 @@ pub const MemoryMaintainTool = struct {
 
     pub fn execute(self: *MemoryMaintainTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const action = root.getString(args, "action") orelse
-            return ToolResult.fail("Missing 'action' parameter. One of: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey.");
+            return ToolResult.fail("Missing 'action' parameter. One of: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey.");
 
         const smgr = self.state_mgr orelse
             return ToolResult.fail("memory_maintain requires postgres state manager (tenant context not wired).");
@@ -126,8 +141,10 @@ pub const MemoryMaintainTool = struct {
             return executeTemporalDecay(allocator, smgr, uid, args);
         } else if (std.mem.eql(u8, action, "survey")) {
             return executeSurvey(allocator, smgr, uid);
+        } else if (std.mem.eql(u8, action, "prose_survey")) {
+            return executeProseSurvey(allocator, smgr, uid, self.judge_provider, self.judge_model, args);
         } else {
-            const msg = try std.fmt.allocPrint(allocator, "Unknown action '{s}'. Valid: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey.", .{action});
+            const msg = try std.fmt.allocPrint(allocator, "Unknown action '{s}'. Valid: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey.", .{action});
             return ToolResult{ .success = false, .output = msg };
         }
     }
@@ -363,6 +380,207 @@ pub const MemoryMaintainTool = struct {
                 result.conflicts_found,
                 if (result.sentinel_written) "true" else "false",
                 result.conflicts_json,
+                nc_esc,
+            },
+        );
+        return ToolResult{ .success = true, .output = output };
+    }
+
+    /// V1.10-B — LLM-judge prose-contradiction surveyor.
+    ///
+    /// Closes ZAKI's 2026-05-06 stress-test gap: prose-level zombies
+    /// (durable_fact rows saying "Project Neptune" coexisting with
+    /// "Project Nullalis") that the edge-graph surveyor can't see and
+    /// the W-INT-01 immortality guard correctly protects from
+    /// agent-side mutation. The judge call uses the cheap sidecar
+    /// (Groq Llama 8B free at typical scale; $0.18/M-tok on Together
+    /// fallback). On contradictions, writes
+    /// `metadata.superseded_by_correction` on the loser via the
+    /// metadata-write seam (V1.9-3 path) — bypasses the immortality
+    /// guard, leaves content/memory_type untouched, V1.10-A's
+    /// loader-side filter then hides the row at retrieval time.
+    ///
+    /// Required params:
+    ///   - entity_pattern : substring to scope the prose scan (e.g.
+    ///     "MNDA", "Mia", "Neptune"). Empty pattern is rejected to
+    ///     prevent a full-corpus judge call.
+    ///
+    /// Optional params:
+    ///   - max_facts : cap on rows the judge sees per call. Default 12,
+    ///     hard cap 25. Bounds prompt size + sidecar latency.
+    ///   - dry_run  : if true, returns judge verdicts WITHOUT writing
+    ///     any metadata. Preview mode.
+    ///
+    /// Failure modes (graceful):
+    ///   - sidecar not configured -> clear error message
+    ///   - sidecar call fails / returns garbage -> empty verdicts,
+    ///     caller writes nothing
+    ///   - LLM hallucinates a key -> dropped by prose_judge guard
+    ///   - 0/1 facts matched -> nothing to compare, returns "no work"
+    fn executeProseSurvey(
+        allocator: std.mem.Allocator,
+        smgr: *zaki_state.Manager,
+        uid: i64,
+        judge_provider_opt: ?Provider,
+        judge_model: []const u8,
+        args: JsonObjectMap,
+    ) !ToolResult {
+        const entity_pattern = root.getString(args, "entity_pattern") orelse
+            return ToolResult.fail("prose_survey requires 'entity_pattern' parameter (e.g. \"MNDA\", \"Mia\", \"Neptune\").");
+        if (entity_pattern.len == 0) {
+            return ToolResult.fail("prose_survey: 'entity_pattern' must not be empty (use a specific substring).");
+        }
+
+        const judge_provider = judge_provider_opt orelse
+            return ToolResult.fail("prose_survey requires the sidecar judge provider (not wired). Set sidecar provider in config.");
+        if (judge_model.len == 0) {
+            return ToolResult.fail("prose_survey requires the sidecar judge model name (not configured).");
+        }
+
+        const max_facts_raw = root.getInt(args, "max_facts") orelse 12;
+        const max_facts: usize = blk: {
+            if (max_facts_raw <= 0) break :blk 12;
+            const cap: usize = @intCast(max_facts_raw);
+            if (cap > 25) break :blk 25;
+            break :blk cap;
+        };
+        const dry_run: bool = root.getBool(args, "dry_run") orelse false;
+
+        // 1. Fetch matching prose facts.
+        const facts = smgr.fetchProseFactsByPattern(allocator, uid, entity_pattern, max_facts) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "prose_survey fetch failed: {s}", .{@errorName(err)});
+            return ToolResult{ .success = false, .output = msg };
+        };
+        defer mem_root.freeProseFacts(allocator, facts);
+
+        // V1.9-Rev finding #25 — escape entity_pattern before
+        // interpolating into output JSON. Even though ZAKI's typical
+        // patterns ("MNDA", "Mia") are bare words, defensive escape
+        // covers the case where an agent passes a quoted or
+        // backslash-bearing pattern.
+        const ep_esc = try jsonEscape(allocator, entity_pattern);
+        defer allocator.free(ep_esc);
+
+        if (facts.len < 2) {
+            const nc = if (facts.len == 0)
+                "No prose facts matched the entity_pattern. Either the pattern is too specific, the entity isn't mentioned in durable_fact / timeline_summary / summary_latest rows, or matching rows are already superseded. Try a shorter pattern or use survey for edge-graph conflicts."
+            else
+                "Only one prose fact matched — no contradictions possible (need at least two competing assertions). If you expected more, try a shorter or broader entity_pattern.";
+            const nc_esc = try jsonEscape(allocator, nc);
+            defer allocator.free(nc_esc);
+            const output = try std.fmt.allocPrint(
+                allocator,
+                "{{\"action\":\"prose_survey\",\"entity_pattern\":\"{s}\",\"facts_examined\":{d},\"contradictions_found\":0,\"marked_keys\":[],\"dry_run\":{s},\"next_consideration\":\"{s}\"}}",
+                .{
+                    ep_esc,
+                    facts.len,
+                    if (dry_run) "true" else "false",
+                    nc_esc,
+                },
+            );
+            return ToolResult{ .success = true, .output = output };
+        }
+
+        // 2. Run the LLM judge.
+        var verdicts = prose_judge.judgeProseContradictions(
+            allocator,
+            judge_provider,
+            judge_model,
+            facts,
+        ) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "prose_survey judge failed: {s}", .{@errorName(err)});
+            return ToolResult{ .success = false, .output = msg };
+        };
+        defer verdicts.deinit(allocator);
+
+        // 3. Apply marks (or skip if dry_run). Track which keys actually
+        // got marked vs which the SQL refused (e.g. loser_key not found,
+        // which can happen if the row was deleted between fetch and mark).
+        var marked: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (marked.items) |k| allocator.free(k);
+            marked.deinit(allocator);
+        }
+        var skipped: usize = 0;
+
+        if (!dry_run) {
+            for (verdicts.items) |v| {
+                const ok = smgr.markMemorySupersededByKey(uid, v.loser_key, v.winner_key) catch |err| blk: {
+                    std.log.scoped(.tool).warn("prose_survey.mark_failed loser={s} winner={s} error={s}", .{
+                        v.loser_key, v.winner_key, @errorName(err),
+                    });
+                    break :blk false;
+                };
+                if (ok) {
+                    const k_owned = try allocator.dupe(u8, v.loser_key);
+                    errdefer allocator.free(k_owned);
+                    try marked.append(allocator, k_owned);
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+
+        // 4. Build a JSON array of verdicts for transparency. Always
+        // includes loser/winner/reason, regardless of dry_run.
+        var verdicts_json: std.ArrayListUnmanaged(u8) = .empty;
+        defer verdicts_json.deinit(allocator);
+        try verdicts_json.append(allocator, '[');
+        for (verdicts.items, 0..) |v, i| {
+            if (i > 0) try verdicts_json.append(allocator, ',');
+            const loser_esc = try jsonEscape(allocator, v.loser_key);
+            defer allocator.free(loser_esc);
+            const winner_esc = try jsonEscape(allocator, v.winner_key);
+            defer allocator.free(winner_esc);
+            const reason_esc = try jsonEscape(allocator, v.reason);
+            defer allocator.free(reason_esc);
+            const entry = try std.fmt.allocPrint(
+                allocator,
+                "{{\"loser_key\":\"{s}\",\"winner_key\":\"{s}\",\"reason\":\"{s}\"}}",
+                .{ loser_esc, winner_esc, reason_esc },
+            );
+            defer allocator.free(entry);
+            try verdicts_json.appendSlice(allocator, entry);
+        }
+        try verdicts_json.append(allocator, ']');
+
+        // 5. Build a JSON array of marked_keys (post-write).
+        var marked_json: std.ArrayListUnmanaged(u8) = .empty;
+        defer marked_json.deinit(allocator);
+        try marked_json.append(allocator, '[');
+        for (marked.items, 0..) |k, i| {
+            if (i > 0) try marked_json.append(allocator, ',');
+            try marked_json.append(allocator, '"');
+            for (k) |ch| {
+                if (ch == '"' or ch == '\\') try marked_json.append(allocator, '\\');
+                try marked_json.append(allocator, ch);
+            }
+            try marked_json.append(allocator, '"');
+        }
+        try marked_json.append(allocator, ']');
+
+        const next_consideration = if (verdicts.items.len == 0)
+            "Judge found no contradictions among the matched prose facts. Either they're complementary / non-conflicting, or the contradictions are too subtle for the small judge model. Consider rerunning with a tighter entity_pattern, or call survey for edge-graph contradictions on related triples."
+        else if (dry_run)
+            "Dry-run complete — verdicts shown but nothing written. Re-run without dry_run=true to apply the supersede marks. After applying, the marked rows become invisible at retrieval time via V1.10-A's loader filter."
+        else if (marked.items.len > 0)
+            "Loser rows flagged with bidirectional supersede pointers. They're now invisible to memory retrieval (V1.10-A) but still present in the database for audit. Consider running prose_survey on adjacent entities (e.g. anything the marked rows referenced) to cascade the cleanup."
+        else
+            "Judge identified contradictions but no marks landed (skipped count > 0 — likely loser_key already deleted or schema mismatch). Verify with memory_recall on the loser keys.";
+
+        const nc_esc = try jsonEscape(allocator, next_consideration);
+        defer allocator.free(nc_esc);
+        const output = try std.fmt.allocPrint(
+            allocator,
+            "{{\"action\":\"prose_survey\",\"entity_pattern\":\"{s}\",\"facts_examined\":{d},\"contradictions_found\":{d},\"marked_keys\":{s},\"verdicts\":{s},\"skipped\":{d},\"dry_run\":{s},\"next_consideration\":\"{s}\"}}",
+            .{
+                ep_esc,
+                facts.len,
+                verdicts.items.len,
+                marked_json.items,
+                verdicts_json.items,
+                skipped,
+                if (dry_run) "true" else "false",
                 nc_esc,
             },
         );

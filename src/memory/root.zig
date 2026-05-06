@@ -678,6 +678,39 @@ pub const PropagateCorrectionResult = struct {
     }
 };
 
+/// V1.10-B — single prose memory fact for the LLM-judge surveyor.
+/// One ProseFact == one durable_fact / timeline_summary / summary_latest
+/// row that mentions the entity_pattern the agent is investigating.
+///
+/// Why a dedicated struct:
+///   The judge prompt only needs (key, content, age) per row. The full
+///   MemoryEntry decode path is overkill (joins to session, loads vectors,
+///   etc.) and the judge prompt is character-bounded. ProseFact is the
+///   minimal contract: enough to ask "do these contradict?" and tell us
+///   which row to mark superseded.
+///
+/// Caller frees `key` + `content`; `updated_at_unix` is a value type.
+pub const ProseFact = struct {
+    /// Memory row key (e.g. `durable_fact/1778049787/0`).
+    key: []u8,
+    /// The full content the row asserts as truth.
+    content: []u8,
+    /// Unix timestamp of last update — surfaces "newer wins" hints to
+    /// the LLM judge without requiring the judge to parse timestamps.
+    updated_at_unix: i64,
+
+    pub fn deinit(self: *const ProseFact, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        allocator.free(self.content);
+    }
+};
+
+/// V1.10-B — free a slice of ProseFact + the outer slice in one call.
+pub fn freeProseFacts(allocator: std.mem.Allocator, facts: []ProseFact) void {
+    for (facts) |f| f.deinit(allocator);
+    allocator.free(facts);
+}
+
 /// V1.7a-9a — owned community-name lookup row.
 pub const CommunityName = struct {
     name: []u8,

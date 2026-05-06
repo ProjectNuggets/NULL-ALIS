@@ -501,6 +501,29 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn findSupersededMemoryKeys(_: *@This(), allocator: std.mem.Allocator, _: i64) ![][]u8 {
         return try allocator.alloc([]u8, 0);
     }
+    /// V1.10-B — stub for non-postgres builds; returns empty slice so
+    /// prose_survey degrades to "no facts found" → clean no-op. Real
+    /// impl on `ManagerImpl` runs the SQL ILIKE scan.
+    pub fn fetchProseFactsByPattern(
+        _: *@This(),
+        allocator: std.mem.Allocator,
+        _: i64,
+        _: []const u8,
+        _: usize,
+    ) ![]memory_root.ProseFact {
+        return try allocator.alloc(memory_root.ProseFact, 0);
+    }
+    /// V1.10-B — stub for non-postgres builds; metadata-write seam
+    /// no-ops, returns false (loser not marked). prose_survey then
+    /// reports zero marked_keys — clean degraded behavior.
+    pub fn markMemorySupersededByKey(
+        _: *@This(),
+        _: i64,
+        _: []const u8,
+        _: []const u8,
+    ) !bool {
+        return false;
+    }
     /// V1.6 commit 6 — stub for non-postgres builds. Returns empty
     /// candidate list so `edge_resolution.resolveOne` short-circuits to
     /// the no-op outcome (caller writes new fact normally without
@@ -5602,6 +5625,256 @@ const ManagerImpl = struct {
             initialized += 1;
         }
         return out;
+    }
+
+    /// V1.10-B — fetch prose memories whose content mentions `entity_pattern`.
+    /// Returns the most-recent `limit` rows from the prose-fact families
+    /// (`durable_fact/*`, `timeline_summary/*`, `summary_latest/*`) that
+    /// match `content ILIKE %entity%`, are still live (validity filter),
+    /// and aren't already superseded.
+    ///
+    /// Why this primitive:
+    ///   ZAKI's stress-test gap (2026-05-06) is prose-level zombies in the
+    ///   `durable_fact/*` family that the V1.7 W-INT-01 immortality guard
+    ///   correctly protects from agent-side mutation. Edge-graph survey
+    ///   can't see these. V1.10-B's LLM-judge surveyor reads the prose
+    ///   directly via this primitive, asks Llama-on-Groq "do any of these
+    ///   contradict?", then writes `metadata.superseded_by_correction` on
+    ///   the losers via `markMemorySupersededByKey`. Metadata writes
+    ///   bypass the W-INT-01 guard (V1.9-3 already proved this seam works
+    ///   on protected rows).
+    ///
+    /// Filtering:
+    ///   - `content ILIKE %entity_pattern%` (caller-supplied; surveyor
+    ///     keeps it sharp — agent passes "MNDA" not "%")
+    ///   - key family in {durable_fact, timeline_summary, summary_latest}
+    ///   - MEMORIES_VALIDITY_FILTER (skip closed-out rows)
+    ///   - skip already-superseded (`NOT (metadata ? 'superseded_by_correction')`)
+    ///   - ORDER BY updated_at DESC LIMIT $3 — newest first; the LLM judge
+    ///     sees fresh evidence at the top of its prompt.
+    ///
+    /// Cost:
+    ///   ILIKE without leading-wildcard-anchor is a seq scan in the worst
+    ///   case, but durable_fact rows are bounded (~hundreds per user).
+    ///   `(user_id, key)` index narrows by user; family-prefix filter is
+    ///   a fast string prefix; the seq scan happens within that window.
+    ///   At ZAKI's scale (single-digit thousands of rows/user), this is
+    ///   sub-100ms.
+    ///
+    /// Caller frees each ProseFact + the outer slice (use
+    /// `memory_root.freeProseFacts`).
+    pub fn fetchProseFactsByPattern(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        entity_pattern: []const u8,
+        limit: usize,
+    ) ![]memory_root.ProseFact {
+        if (entity_pattern.len == 0) return error.EmptyEntityPattern;
+        if (limit == 0) return try allocator.alloc(memory_root.ProseFact, 0);
+
+        const q = try self.buildQuery(
+            "SELECT key, content, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint, 0) " ++
+                "FROM {schema}.memories " ++
+                "WHERE user_id = $1 " ++
+                "AND content ILIKE $2 " ++
+                "AND (key LIKE 'durable_fact/%' " ++
+                "  OR key LIKE 'timeline_summary/%' " ++
+                "  OR key LIKE 'summary_latest/%') " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'superseded_by_correction') " ++
+                "ORDER BY updated_at DESC LIMIT $3",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        const ilike_pattern = try std.fmt.allocPrint(self.allocator, "%{s}%", .{entity_pattern});
+        defer self.allocator.free(ilike_pattern);
+        const ilike_z = try self.allocator.dupeZ(u8, ilike_pattern);
+        defer self.allocator.free(ilike_z);
+
+        const limit_text = try std.fmt.allocPrint(self.allocator, "{d}", .{limit});
+        defer self.allocator.free(limit_text);
+        const limit_z = try self.allocator.dupeZ(u8, limit_text);
+        defer self.allocator.free(limit_z);
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, ilike_z, limit_z };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(ilike_pattern.len),
+            @intCast(limit_text.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const nrows_raw = c.PQntuples(result);
+        const nrows: usize = if (nrows_raw < 0) 0 else @intCast(nrows_raw);
+
+        const out = try allocator.alloc(memory_root.ProseFact, nrows);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |f| f.deinit(allocator);
+            allocator.free(out);
+        }
+
+        var i: usize = 0;
+        while (i < nrows) : (i += 1) {
+            const row: c_int = @intCast(i);
+            const key = try dupeResultValue(allocator, result, row, 0);
+            errdefer allocator.free(key);
+            const content = try dupeResultValue(allocator, result, row, 1);
+            errdefer allocator.free(content);
+            const ts_self = try dupeResultValue(self.allocator, result, row, 2);
+            defer self.allocator.free(ts_self);
+            const ts: i64 = std.fmt.parseInt(i64, ts_self, 10) catch 0;
+
+            out[i] = .{ .key = key, .content = content, .updated_at_unix = ts };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    /// V1.10-B — mark `loser_key` as superseded by `winner_key` with
+    /// bidirectional pointers, idempotently.
+    ///
+    /// What it writes:
+    ///   1. On loser row: `metadata.superseded_by_correction = $winner_key`
+    ///      (overwrite — last writer wins; idempotent within a single
+    ///      contradiction chain).
+    ///   2. On winner row: append `$loser_key` to
+    ///      `metadata.superseded_targets[]`. If the array already
+    ///      contains the loser_key, no duplicate is appended.
+    ///
+    /// What it does NOT touch:
+    ///   - `content` / `memory_type` / `valid_to` / `is_latest` /
+    ///     `confidence_score` — stay exactly as they were. This means
+    ///     the W-INT-01 immortality guard remains intact: superseded
+    ///     rows are still queryable, still owned by the user, still
+    ///     auditable. They simply become invisible at retrieval time
+    ///     via V1.10-A's loader-side filter.
+    ///
+    /// Returns:
+    ///   `true` when the loser was successfully marked (i.e. the row
+    ///   exists and the metadata write affected one row). `false`
+    ///   when the loser_key doesn't exist (no row to mark).
+    ///
+    /// Idempotency:
+    ///   Calling twice with the same (loser, winner) is safe — the
+    ///   loser's `superseded_by_correction` is overwritten with the
+    ///   same value; the winner's `superseded_targets` array uses a
+    ///   DISTINCT subquery so duplicates are skipped.
+    ///
+    /// Transaction:
+    ///   Wraps both writes in BEGIN/COMMIT so a partial failure
+    ///   leaves the metadata coherent (no orphan loser-side flag
+    ///   without the corresponding winner-side back-pointer).
+    pub fn markMemorySupersededByKey(
+        self: *Self,
+        user_id: i64,
+        loser_key: []const u8,
+        winner_key: []const u8,
+    ) !bool {
+        if (loser_key.len == 0 or winner_key.len == 0) return error.EmptyKey;
+        if (std.mem.eql(u8, loser_key, winner_key)) return error.LoserEqualsWinner;
+
+        const begin_result = try self.exec("BEGIN");
+        c.PQclear(begin_result);
+        errdefer {
+            if (self.exec("ROLLBACK")) |rb| {
+                c.PQclear(rb);
+            } else |_| {}
+        }
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        const loser_z = try self.allocator.dupeZ(u8, loser_key);
+        defer self.allocator.free(loser_z);
+        const winner_z = try self.allocator.dupeZ(u8, winner_key);
+        defer self.allocator.free(winner_z);
+
+        // Build JSON-string representation of the winner_key for the
+        // loser-side superseded_by_correction value.
+        const winner_json = try jsonString(self.allocator, winner_key);
+        defer self.allocator.free(winner_json);
+        const winner_json_z = try self.allocator.dupeZ(u8, winner_json);
+        defer self.allocator.free(winner_json_z);
+
+        // Loser-side: set superseded_by_correction = winner_key.
+        const loser_q = try self.buildQuery(
+            "UPDATE {schema}.memories SET metadata = jsonb_set(" ++
+                "  COALESCE(metadata, '{}'::jsonb), " ++
+                "  '{superseded_by_correction}', " ++
+                "  $3::jsonb" ++
+                ") " ++
+                "WHERE user_id = $1 AND key = $2",
+        );
+        defer self.allocator.free(loser_q);
+        const loser_params = [_]?[*:0]const u8{ user_s.ptr, loser_z, winner_json_z };
+        const loser_lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(loser_key.len),
+            @intCast(winner_json.len),
+        };
+        const loser_result = try self.execParams(loser_q, &loser_params, &loser_lengths);
+        defer c.PQclear(loser_result);
+
+        // PQcmdTuples returns "1" / "0" as a C string for UPDATE.
+        const loser_tuples_cstr = c.PQcmdTuples(loser_result);
+        const loser_tuples_slice: []const u8 = if (loser_tuples_cstr == null)
+            ""
+        else
+            std.mem.span(loser_tuples_cstr);
+        const loser_marked = !std.mem.eql(u8, loser_tuples_slice, "0") and loser_tuples_slice.len > 0;
+
+        if (!loser_marked) {
+            const commit = try self.exec("COMMIT");
+            c.PQclear(commit);
+            return false;
+        }
+
+        // Winner-side: append loser_key to superseded_targets[] iff not
+        // already present. Uses jsonb_set + a CASE that checks
+        // jsonb_path_exists — array element equal to $3.
+        const loser_json = try jsonString(self.allocator, loser_key);
+        defer self.allocator.free(loser_json);
+        const loser_json_z = try self.allocator.dupeZ(u8, loser_json);
+        defer self.allocator.free(loser_json_z);
+
+        const winner_q = try self.buildQuery(
+            "UPDATE {schema}.memories SET metadata = jsonb_set(" ++
+                "  COALESCE(metadata, '{}'::jsonb), " ++
+                "  '{superseded_targets}', " ++
+                "  CASE " ++
+                "    WHEN COALESCE(metadata->'superseded_targets', '[]'::jsonb) @> jsonb_build_array($3::text) " ++
+                "      THEN COALESCE(metadata->'superseded_targets', '[]'::jsonb) " ++
+                "    ELSE COALESCE(metadata->'superseded_targets', '[]'::jsonb) || jsonb_build_array($3::text) " ++
+                "  END" ++
+                ") " ++
+                "WHERE user_id = $1 AND key = $2",
+        );
+        defer self.allocator.free(winner_q);
+        // For the winner-side query, $3 is the bare loser_key (text), not
+        // the JSON-string-quoted variant — jsonb_build_array does the
+        // wrapping.
+        const winner_params = [_]?[*:0]const u8{ user_s.ptr, winner_z, loser_z };
+        const winner_lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(winner_key.len),
+            @intCast(loser_key.len),
+        };
+        const winner_result = try self.execParams(winner_q, &winner_params, &winner_lengths);
+        c.PQclear(winner_result);
+
+        const commit = try self.exec("COMMIT");
+        c.PQclear(commit);
+
+        log.info("mark_superseded user={d} loser={s} winner={s}", .{
+            user_id, loser_key, winner_key,
+        });
+        return true;
     }
 
     /// Today the `subject` column is unpopulated by upsertMemoryWithMetadata

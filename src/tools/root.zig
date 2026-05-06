@@ -1825,6 +1825,36 @@ pub fn bindMemoryStoreUnifiedContext(
     }
 }
 
+/// V1.10-B — wire the sidecar judge provider to `memory_maintain` so the
+/// `prose_survey` action can run the cheap LLM-judge prose-contradiction
+/// surveyor.
+///
+/// Why this is a separate binding from `bindMemoryStoreUnifiedContext`:
+///   memory_store's judge runs on EVERY triple-write (unified path —
+///   contradiction detection on inbound facts), so it's bound to the
+///   primary provider/model the agent uses. memory_maintain's prose
+///   judge runs only when the agent explicitly invokes prose_survey
+///   (cleanup operation, not write-path) and is meant to be the cheap
+///   sidecar (Groq Llama 8B free at ZAKI's scale). Different provider,
+///   different model, different invocation cadence — different binding.
+///
+/// Pass `null, ""` (or empty-string model) to leave it unwired —
+/// prose_survey will then return a clean "sidecar not configured"
+/// failure rather than crashing.
+pub fn bindMemoryMaintainSidecar(
+    tools: []const Tool,
+    sidecar_provider: ?@import("../providers/root.zig").Provider,
+    sidecar_model: []const u8,
+) void {
+    for (tools) |t| {
+        if (t.vtable == &memory_maintain.MemoryMaintainTool.vtable) {
+            const mt: *memory_maintain.MemoryMaintainTool = @ptrCast(@alignCast(t.ptr));
+            mt.judge_provider = sidecar_provider;
+            mt.judge_model = sidecar_model;
+        }
+    }
+}
+
 /// Bind a SessionStore to tools that need raw-transcript access (currently:
 /// transcript_read). In tenant/per-user deployments the canonical session
 /// store is the per-user PG store (zaki_state.UserSessionStore); in

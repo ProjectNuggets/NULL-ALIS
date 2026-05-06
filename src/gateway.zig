@@ -1570,6 +1570,22 @@ const TenantRuntime = struct {
             cmt96_coref_embed,
         );
 
+        // V1.10-B — wire the sidecar provider/model to memory_maintain
+        // so the `prose_survey` action can run the cheap LLM-judge prose
+        // surveyor. Reuses the same sidecar bundle the agent uses for
+        // narration/compaction (Groq Llama 8B free at ZAKI's scale).
+        // When sidecarProvider is null, prose_survey returns a clean
+        // "sidecar not configured" failure instead of crashing.
+        if (runtime.provider_bundle.sidecarProvider()) |sp| {
+            tools_mod.bindMemoryMaintainSidecar(
+                runtime.tools,
+                sp,
+                runtime.provider_bundle.sidecarModelName(),
+            );
+        } else {
+            tools_mod.bindMemoryMaintainSidecar(runtime.tools, null, "");
+        }
+
         // V1.6 commit 5b.3 — extraction wire-up. When the gateway has
         // a postgres state manager AND the tenant has a numeric user_id,
         // per-session agents inherit these via buildSessionAgent and
