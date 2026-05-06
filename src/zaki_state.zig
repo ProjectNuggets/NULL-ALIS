@@ -474,6 +474,19 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
             .target_keys = try allocator.alloc([]u8, 0),
         };
     }
+    /// V1.9-7 — stub for non-postgres builds; survey returns zero
+    /// conflicts so the memory_loader fallback path stays clean.
+    pub fn surveyContradictions(
+        _: *@This(),
+        allocator: std.mem.Allocator,
+        _: i64,
+    ) !memory_root.SurveyContradictionsResult {
+        return .{
+            .conflicts_found = 0,
+            .conflicts_json = try allocator.dupe(u8, "[]"),
+            .sentinel_written = false,
+        };
+    }
     /// V1.6 commit 6 — stub for non-postgres builds. Returns empty
     /// candidate list so `edge_resolution.resolveOne` short-circuits to
     /// the no-op outcome (caller writes new fact normally without
@@ -5182,6 +5195,193 @@ const ManagerImpl = struct {
             .correction_existed = true,
             .targets_flagged = flagged_n,
             .target_keys = try keys.toOwnedSlice(allocator),
+        };
+    }
+
+    /// V1.9-7 — proactive contradiction surveyor. The system finds
+    /// contradictions in the memory graph WITHOUT being told to look,
+    /// surfaces them as a `pending_conflicts_v2` memory row that the
+    /// loader picks up in warm context. Agent sees "you have N
+    /// unresolved contradictions" on its next turn and decides what
+    /// to do (call resolve_contradiction or invalidate_when).
+    ///
+    /// This turns V1.9 from REACTIVE (agent acts when it notices) to
+    /// PROACTIVE (system wakes the agent up). The truly next-gen
+    /// piece of V1.9.
+    ///
+    /// What counts as a contradiction:
+    ///   A `(source_key, predicate)` pair with >1 distinct
+    ///   target_keys and is_latest=true on each. The fact "subject
+    ///   has predicate X" simultaneously claims multiple Xs ⇒
+    ///   conflict.
+    ///
+    /// Operation:
+    ///   1. SQL: GROUP BY source/predicate having multiple distinct
+    ///      live targets. Returns rows with `targets[]` aggregated.
+    ///   2. Build JSON array of conflicts:
+    ///      `[{"source":"<k>","predicate":"<p>","targets":["<t1>","<t2>",...]},...]`
+    ///   3. Upsert `pending_conflicts_v2` memory row with the JSON.
+    ///      memory_type='core' so memory_loader (which has explicit
+    ///      `pending_conflicts*` handling) surfaces it. When zero
+    ///      conflicts, write empty array (loader can render
+    ///      "no contradictions detected" instead of stale state).
+    ///   4. Return SurveyContradictionsResult { conflicts_found,
+    ///      conflicts_json, sentinel_written }.
+    ///
+    /// Cost: 1 SQL aggregation per call. Per-user. Bounded by edge
+    /// count (typically a few hundred). Lazy-trigger pattern: caller
+    /// (memory_loader on stale `last_hygiene_at`) decides when to
+    /// run; no background thread needed for V1.9. V1.10 adds true
+    /// scheduler.
+    ///
+    /// Why not also include MNDA-class memory contradictions
+    /// (multiple durable_facts about same subject saying different
+    /// things)?: those are prose-level, need either embedding-cosine
+    /// clustering or LLM judging — V1.10+ work. The edge-graph
+    /// version is the deterministic / cheap proactive surveyor.
+    /// memory_loader can also surface durable_fact-level conflicts
+    /// when V1.10 lands; this primitive is the foundation.
+    pub fn surveyContradictions(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+    ) !memory_root.SurveyContradictionsResult {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        // Aggregate (source_key, predicate) tuples with conflicting
+        // targets. ARRAY_AGG returns Postgres array literal which
+        // we'll parse into a JSON array per row.
+        const survey_q = try self.buildQuery(
+            "SELECT source_key, predicate, ARRAY_AGG(target_key ORDER BY id DESC) AS targets " ++
+                "FROM {schema}.memory_edges " ++
+                "WHERE user_id = $1 AND is_latest = true " ++
+                "GROUP BY source_key, predicate " ++
+                "HAVING COUNT(DISTINCT target_key) > 1 " ++
+                "ORDER BY source_key, predicate",
+        );
+        defer self.allocator.free(survey_q);
+        const survey_params = [_]?[*:0]const u8{user_s.ptr};
+        const survey_lengths = [_]c_int{@intCast(user_s.len)};
+        const survey_result = try self.execParams(survey_q, &survey_params, &survey_lengths);
+        defer c.PQclear(survey_result);
+
+        const conflicts_n_raw = c.PQntuples(survey_result);
+        const conflicts_n: usize = if (conflicts_n_raw < 0) 0 else @intCast(conflicts_n_raw);
+
+        // Build the conflicts JSON array. Format per row:
+        //   {"source":"<source_key>","predicate":"<predicate>","targets":["<t1>","<t2>",...]}
+        var json_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer json_buf.deinit(allocator);
+        try json_buf.append(allocator, '[');
+        var ci: c_int = 0;
+        while (ci < conflicts_n_raw) : (ci += 1) {
+            if (ci > 0) try json_buf.append(allocator, ',');
+            const src = try dupeResultValue(self.allocator, survey_result, ci, 0);
+            defer self.allocator.free(src);
+            const pred = try dupeResultValue(self.allocator, survey_result, ci, 1);
+            defer self.allocator.free(pred);
+            // PG ARRAY_AGG returns text like {target1,target2,target3}
+            // (Postgres array literal). We need to parse + re-emit
+            // as JSON array.
+            const targets_pg = try dupeResultValue(self.allocator, survey_result, ci, 2);
+            defer self.allocator.free(targets_pg);
+
+            const src_json = try jsonString(allocator, src);
+            defer allocator.free(src_json);
+            const pred_json = try jsonString(allocator, pred);
+            defer allocator.free(pred_json);
+            try json_buf.appendSlice(allocator, "{\"source\":");
+            try json_buf.appendSlice(allocator, src_json);
+            try json_buf.appendSlice(allocator, ",\"predicate\":");
+            try json_buf.appendSlice(allocator, pred_json);
+            try json_buf.appendSlice(allocator, ",\"targets\":");
+            // Parse PG array `{a,b,c}` → JSON `["a","b","c"]`. Quote
+            // every element via jsonString. Strip outer braces.
+            const arr_inner = if (targets_pg.len >= 2 and targets_pg[0] == '{' and targets_pg[targets_pg.len - 1] == '}')
+                targets_pg[1 .. targets_pg.len - 1]
+            else
+                targets_pg[0..0];
+            try json_buf.append(allocator, '[');
+            var first_target = true;
+            var it = std.mem.tokenizeScalar(u8, arr_inner, ',');
+            while (it.next()) |tok| {
+                if (!first_target) try json_buf.append(allocator, ',');
+                first_target = false;
+                // PG array elements: bare hex IDs (typical entity_id)
+                // don't need un-escaping. If they did, we'd need a
+                // proper PG-array parser. For V1.9-7 this is
+                // sufficient — entity_ids are 32-char hex.
+                const tok_json = try jsonString(allocator, tok);
+                defer allocator.free(tok_json);
+                try json_buf.appendSlice(allocator, tok_json);
+            }
+            try json_buf.append(allocator, ']');
+            try json_buf.append(allocator, '}');
+        }
+        try json_buf.append(allocator, ']');
+
+        const conflicts_json = try json_buf.toOwnedSlice(allocator);
+        errdefer allocator.free(conflicts_json);
+
+        // Upsert pending_conflicts_v2 sentinel memory row. Empty
+        // conflicts array still gets written so the loader can show
+        // a clean state. Use the same SQL pattern as the V1.7
+        // pending_conflicts singleton.
+        const sentinel_content = try std.fmt.allocPrint(
+            self.allocator,
+            "type=pending_conflicts_v2\nuser_id={d}\nat={d}\nconflicts_count={d}\nconflicts_json={s}\ninstruction=System detected N memory contradictions where the same (subject, predicate) pair has multiple live target values. Each row in conflicts_json describes one. Use memory_maintain tool action=resolve_contradiction with the loser/winner keys (or action=invalidate_when with a pattern) to clean up.\n",
+            .{ user_id, std.time.timestamp(), conflicts_n, conflicts_json },
+        );
+        defer self.allocator.free(sentinel_content);
+
+        // Mirror the V1.7 pending_conflicts upsert pattern (lines
+        // 3056-3061): same column set + ON CONFLICT shape, just a
+        // different singleton key. computeContentHash + lemmatize
+        // are required since `pending_conflicts_v2` is a `core`-tier
+        // memory and the schema enforces both.
+        const sentinel_hash = try computeContentHash(self.allocator, sentinel_content);
+        defer self.allocator.free(sentinel_hash);
+        const sentinel_lem = try text_norm.lemmatizeForBm25(self.allocator, sentinel_content);
+        defer self.allocator.free(sentinel_lem);
+        const sentinel_id = try self.randomHexId(self.allocator, 16);
+        defer self.allocator.free(sentinel_id);
+
+        const upsert_q = try self.buildQuery(
+            "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, updated_at) " ++
+                "VALUES ($1, $2, NULL, 'pending_conflicts_v2', $3, $4, 'core', $5, NOW()) " ++
+                "ON CONFLICT (user_id, key) DO UPDATE SET " ++
+                "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
+                "lemmatized = EXCLUDED.lemmatized, updated_at = NOW()",
+        );
+        defer self.allocator.free(upsert_q);
+        const sentinel_id_z = try self.allocator.dupeZ(u8, sentinel_id);
+        defer self.allocator.free(sentinel_id_z);
+        const sentinel_z = try self.allocator.dupeZ(u8, sentinel_content);
+        defer self.allocator.free(sentinel_z);
+        const hash_z = try self.allocator.dupeZ(u8, sentinel_hash);
+        defer self.allocator.free(hash_z);
+        const lem_z = try self.allocator.dupeZ(u8, sentinel_lem);
+        defer self.allocator.free(lem_z);
+
+        const upsert_params = [_]?[*:0]const u8{ sentinel_id_z, user_s.ptr, sentinel_z, hash_z, lem_z };
+        const upsert_lengths = [_]c_int{
+            @intCast(sentinel_id.len),
+            @intCast(user_s.len),
+            @intCast(sentinel_content.len),
+            @intCast(sentinel_hash.len),
+            @intCast(sentinel_lem.len),
+        };
+        const upsert_result = try self.execParams(upsert_q, &upsert_params, &upsert_lengths);
+        c.PQclear(upsert_result);
+
+        log.info("survey_contradictions user={d} conflicts_found={d} sentinel_written=true", .{
+            user_id, conflicts_n,
+        });
+        return .{
+            .conflicts_found = conflicts_n,
+            .conflicts_json = conflicts_json,
+            .sentinel_written = true,
         };
     }
 

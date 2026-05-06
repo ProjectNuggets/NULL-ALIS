@@ -619,6 +619,29 @@ pub const ResolveContradictionResult = struct {
     loser_closed: bool,
 };
 
+/// V1.9-7 — result of the proactive contradiction surveyor.
+/// Returned by `state_mgr.surveyContradictions(allocator, user_id)`.
+/// Caller frees via `deinit`.
+pub const SurveyContradictionsResult = struct {
+    /// Number of distinct (subject, predicate) tuples with >1
+    /// is_latest=true edges pointing at different targets.
+    conflicts_found: usize,
+    /// Allocator-owned JSON array of conflicts. Each entry has shape
+    /// `{"source":"<key>","predicate":"<pred>","targets":["<t1>",...]}`.
+    /// Empty `[]` when zero conflicts. This is the payload written
+    /// to the `pending_conflicts_v2` memory row for the loader to
+    /// surface in warm context.
+    conflicts_json: []u8,
+    /// True when the survey wrote a fresh `pending_conflicts_v2`
+    /// memory row. False → no conflicts → row was cleared (or no
+    /// op when the row didn't exist).
+    sentinel_written: bool,
+
+    pub fn deinit(self: *const SurveyContradictionsResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.conflicts_json);
+    }
+};
+
 /// V1.9-3 — result of propagate_correction. Bidirectional: the
 /// correction's metadata gets `superseded_targets` (list of keys it
 /// flagged), each target's metadata gets `superseded_by_correction`
