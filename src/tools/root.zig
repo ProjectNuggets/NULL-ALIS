@@ -84,6 +84,7 @@ pub const memory_archive = @import("memory_archive.zig");
 pub const memory_demote = @import("memory_demote.zig");
 pub const memory_purge_topic = @import("memory_purge_topic.zig");
 pub const memory_maintain = @import("memory_maintain.zig");
+pub const time_now = @import("time_now.zig");
 pub const schedule = @import("schedule.zig");
 pub const todo = @import("todo.zig");
 pub const compose_memory = @import("compose_memory.zig");
@@ -463,6 +464,15 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .flags = .{ .mutating = true },
         .risk_level = .medium,
         .cost_class = .b,
+    },
+    .{
+        // V1.9-DX1 — wall-clock awareness. Read-only, low risk,
+        // tiny cost. Pairs with memory_maintain action=temporal_decay
+        // for honest age reasoning.
+        .name = time_now.TimeNowTool.tool_name,
+        .flags = .{},
+        .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         // Schedule has read-only actions (list/get/runs) but the tool as a
@@ -1108,6 +1118,11 @@ pub fn allTools(
     const mmt = try allocator.create(memory_maintain.MemoryMaintainTool);
     mmt.* = .{};
     try list.append(allocator, mmt.tool());
+
+    // V1.9-DX1 — time_now: wall-clock awareness for the agent.
+    const tnt = try allocator.create(time_now.TimeNowTool);
+    tnt.* = .{};
+    try list.append(allocator, tnt.tool());
 
     // Delegate + spawn: dormant by default for V1. Both are coded but have
     // incomplete end-to-end behavior (subagent result visibility on follow-up
@@ -2269,8 +2284,9 @@ test "all tools includes extras when enabled" {
     // + 1 file_edit_hashed from nullclaw cherry-pick; +1 memory_archive
     // + 1 memory_demote from V1.6 cmt11) + http_request + web_fetch +
     // web_search + browser + brain_graph (V1.7-ship S2a)
-    // + memory_maintain (V1.9-5 truth-maintenance toolkit) = 42.
-    try std.testing.expectEqual(@as(usize, 42), tools.len);
+    // + memory_maintain (V1.9-5 truth-maintenance toolkit)
+    // + time_now (V1.9-DX1 wall-clock tool) = 43.
+    try std.testing.expectEqual(@as(usize, 43), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2289,8 +2305,9 @@ test "all tools excludes extras when disabled" {
     // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot
     // + calculator + file_read_hashed + file_edit_hashed (nullclaw cherry-pick)
     // + memory_archive + memory_demote (V1.6 cmt11) + brain_graph (V1.7-ship S2a)
-    // + memory_maintain (V1.9-5 truth-maintenance toolkit) = 38
-    try std.testing.expectEqual(@as(usize, 38), tools.len);
+    // + memory_maintain (V1.9-5 truth-maintenance toolkit)
+    // + time_now (V1.9-DX1 wall-clock tool) = 39
+    try std.testing.expectEqual(@as(usize, 39), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2422,7 +2439,8 @@ test "all tools includes message when event bus is available" {
     // delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT.
     // V1.7-ship S2a added brain_graph → 37.
     // V1.9-5 added memory_maintain (truth-maintenance toolkit) → 38.
-    try std.testing.expectEqual(@as(usize, 38), tools.len);
+    // V1.9-DX1 added time_now (wall-clock awareness) → 39.
+    try std.testing.expectEqual(@as(usize, 39), tools.len);
 
     var found_message = false;
     for (tools) |t| {
