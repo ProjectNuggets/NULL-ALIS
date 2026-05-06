@@ -768,6 +768,32 @@ fn buildResponseProtocolSection(w: anytype) !void {
     // and correct it"). Critical to V1.5's user-facing differentiation
     // — without this paragraph, the agent forgets the surface exists.
     try w.writeAll("Memory transparency — the user has a `/brain` page. They can SEE every memory you store, every synthesis you compose, and the structural connections between them (session chains, semantic similarity, references). When the user asks \"what do you know about me?\", \"show me my memory\", \"what have you learned\", or any variant — point them at the /brain page in your reply (e.g. \"I've gathered N facts; the full picture is on your /brain page\"). When you call `compose_memory`, mention in your response that the synthesis is now visible on /brain (e.g. \"I've consolidated those into one note — visible on /brain with lineage to the sources\"). When the user disagrees with something you know, remind them they can view + correct it on /brain (V1.6 will add explicit correction; for now they can ask you to forget specific keys). This makes the brain legible. Trust comes from visibility.\n\n");
+
+    // V1.10-C — Chronological narration. The memory loader surfaces
+    // bi-temporal data on every retrieved row: `updated_at` (when the
+    // fact entered the brain), `valid_to` (when it stopped being
+    // current, if closed), `metadata.superseded_by_correction` (the key
+    // of a correction that replaced it), `metadata.superseded_targets`
+    // (on a correction row, the keys it replaces). V1.10-A's loader
+    // filter hides superseded rows from the warm context, but the
+    // CORRECTION rows themselves stay visible — and they carry the
+    // chain of what was corrected. This section teaches the agent to
+    // render that chain as story, not as raw JSON. Most 2026 agents
+    // dump the latest fact and pretend the journey didn't happen;
+    // ZAKI narrates the journey when asked, because the seams to do
+    // it are already in his head.
+    try w.writeAll("**Chronological narration — when the user asks history-shape questions, narrate the journey, don't just dump the latest fact.** Trigger phrases: \"tell me about X\", \"how did Y develop\", \"what's the history of Z\", \"remind me what we decided about W\", \"how did this start\", \"walk me through X\". On these questions, look at the retrieved memories' temporal seams and render in chronological order:\n");
+    try w.writeAll("- Order rows by `updated_at` ascending — oldest first, latest last.\n");
+    try w.writeAll("- When you see a row with `metadata.superseded_targets` (a correction that replaced earlier facts), name the correction explicitly: \"On <date>, you corrected: <correction content>. Before that, the brain held <list of replaced facts>.\" The supersede chain is the story.\n");
+    try w.writeAll("- When a row has `valid_to` set (it was true until a specific time), narrate the close: \"That was true through <valid_to>; after that, <next fact>.\"\n");
+    try w.writeAll("- Use date markers from `updated_at` so the user can place each beat in real time, not in vague \"earlier / later\" terms.\n");
+    try w.writeAll("- Close with the current state: \"As of today, the brain holds <latest fact(s)>.\"\n\n");
+    try w.writeAll("Concrete example you must follow:\n\n");
+    try w.writeAll("  User: \"Tell me about Project Nullalis — how did this develop?\"\n");
+    try w.writeAll("  WRONG (latest-fact dump): \"Project Nullalis is your current codename for the agent runtime.\" (No journey, no provenance, no acknowledgment that the name changed.)\n");
+    try w.writeAll("  WRONG (chronologically scrambled): \"You renamed it from Neptune. Originally it was internal. Now it's Nullalis.\" (No dates, no causality, no correction-marker.)\n");
+    try w.writeAll("  RIGHT: \"Looking at the brain's history of this project: in early March you started it as 'Project Neptune' — that's when the first durable_fact landed. On April 14th you wrote a correction renaming it to 'Project Nullalis' (durable_fact/<key>) — that correction marks the earlier 'Neptune' entries as superseded in the brain. As of today, the live name is Project Nullalis. The Neptune entries are still in the database for audit but no longer surface in normal retrieval.\"\n\n");
+    try w.writeAll("Don't fire chronological narration on routine questions (\"what's my name\", \"send Alex a message\", single-fact lookups). Reserve it for the history-shape triggers above. The point isn't to be verbose; the point is that when the user asks the question \"how did this develop\", the agent answers it as a developer would — with the commit log, not just HEAD.\n\n");
 }
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
