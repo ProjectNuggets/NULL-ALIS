@@ -8863,6 +8863,19 @@ fn handleApiChatEventsSseConnection(
     var sse_stream = LockedSseStream(@TypeOf(stream)).init(stream);
     sse_stream.sendHeader("200 OK") catch return true;
 
+    // V1.10-D / streaming-robustness — guarantee chunked-transfer
+    // termination on EVERY exit path. See the longer comment on the
+    // /chat/stream handler below. Same idempotent-finish pattern; same
+    // protection against ERR_INCOMPLETE_CHUNKED_ENCODING when a mid-
+    // stream `catch return true` would otherwise leave the chunked
+    // encoding unterminated.
+    defer {
+        sse_stream.finish() catch |err| {
+            log.warn("sse.finish_in_defer endpoint=completion error={s} session={s}", .{ @errorName(err), session_key });
+            sse_stream.markClosed();
+        };
+    }
+
     const ready_owned = sseReadyFrame(req_allocator, session_key) catch null;
     defer if (ready_owned) |frame| req_allocator.free(frame);
     const ready_frame: []const u8 = if (ready_owned) |frame| frame else "event: ready\ndata: {\"type\":\"ready\"}\n\n";
@@ -9289,6 +9302,25 @@ fn handleApiChatStreamSseConnection(
     recordChatStreamLane(state, session_key, user_id, state.tenant_enabled);
     var sse_stream = LockedSseStream(@TypeOf(stream)).init(stream);
     sse_stream.sendHeader("200 OK") catch return true;
+
+    // V1.10-D / streaming-robustness — guarantee chunked-transfer
+    // termination on EVERY exit path. `finish()` is idempotent (line
+    // ~8490: atomic swap on `closed`, returns if already closed), so
+    // this defer is safe even when the explicit finish below runs
+    // first. Without this defer, a `sendFrame catch return true`
+    // mid-stream leaves the chunked-transfer-encoding unterminated,
+    // which the browser surfaces as ERR_INCOMPLETE_CHUNKED_ENCODING.
+    // Observed live during V1.10 testing on 2026-05-06; root cause
+    // for the "network error" mid-tool-call symptom ZAKI hit. Closes
+    // the class, not just one occurrence. The catch logs but
+    // doesn't propagate — defers can't propagate errors anyway, and
+    // an already-broken stream means there's no client to surface to.
+    defer {
+        sse_stream.finish() catch |err| {
+            log.warn("sse.finish_in_defer error={s} session={s} — chunked-transfer finalization may have failed", .{ @errorName(err), session_key });
+            sse_stream.markClosed();
+        };
+    }
 
     const status_fallback = "event: status\ndata: {\"type\":\"statusResponse\",\"content\":\"Processing request\"}\n\n";
     const status_owned = sseStatusFrame(req_allocator, "Processing request") catch null;
