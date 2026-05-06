@@ -460,6 +460,20 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     ) !memory_root.ResolveContradictionResult {
         return .{ .loser_existed = false, .winner_existed = false, .loser_closed = false };
     }
+    /// V1.9-3 — stub for non-postgres builds; propagate_correction no-ops.
+    pub fn propagateCorrection(
+        _: *@This(),
+        allocator: std.mem.Allocator,
+        _: i64,
+        _: []const u8,
+        _: []const u8,
+    ) !memory_root.PropagateCorrectionResult {
+        return .{
+            .correction_existed = false,
+            .targets_flagged = 0,
+            .target_keys = try allocator.alloc([]u8, 0),
+        };
+    }
     /// V1.6 commit 6 — stub for non-postgres builds. Returns empty
     /// candidate list so `edge_resolution.resolveOne` short-circuits to
     /// the no-op outcome (caller writes new fact normally without
@@ -4961,6 +4975,214 @@ const ManagerImpl = struct {
             user_id, loser_key, winner_key,
         });
         return .{ .loser_existed = true, .winner_existed = winner_exists, .loser_closed = true };
+    }
+
+    /// V1.9-3 — propagate a correction by walking memory rows whose
+    /// content references a stale entity, marking each with
+    /// `superseded_by_correction=<correction_key>` JSONB metadata.
+    /// BIDIRECTIONAL — the correction's own metadata also gets
+    /// `superseded_targets=[<key1>,<key2>...]` so the correction
+    /// knows what it cleaned up + each target knows why it was
+    /// flagged.
+    ///
+    /// Use case (per ZAKI's stress-test letter, Mia case):
+    ///
+    ///   propagate_correction("CORRECTION: Mia daughter test", "Mia")
+    ///
+    /// → Walks timeline_summary/* + summary_latest/* + durable_fact/* +
+    ///   compaction_summary/* whose content ILIKE '%Mia%'. Each
+    ///   matching row's metadata gets `superseded_by_correction`
+    ///   pointing at the correction. The correction's metadata gets
+    ///   the list of flagged keys. Future memory_loader passes can
+    ///   surface "this row was superseded — see correction" instead
+    ///   of presenting it as live truth.
+    ///
+    /// Per Nova's "I like this timeline memory" insight: this
+    /// PRESERVES the timeline (audit chain of how truth evolved)
+    /// while making the CURRENT VIEW honest. Targets are flagged,
+    /// not deleted.
+    ///
+    /// Walked key families:
+    ///   - timeline_summary/*  (session continuity summaries)
+    ///   - summary_latest/*    (current-session summary)
+    ///   - durable_fact/*      (extracted facts written via session-end)
+    ///   - compaction_summary/* (Pass C archive rows)
+    ///
+    /// SKIPPED key families (intentionally):
+    ///   - autosave_*          (raw transcript — never modify)
+    ///   - session_checkpoint_* (audit trail — never modify)
+    ///   - extracted_*         (derived; will be re-resolved by future
+    ///                          extraction or judge calls — V1.8-1 + V1.9-6)
+    ///   - The correction_key itself (don't self-supersede)
+    ///
+    /// Limitations (named for V1.10 upgrades):
+    ///   - Substring match on content. "Mia" matches "Miami". Caller
+    ///     should pass entity_pattern with surrounding word boundaries
+    ///     when possible (`Mia ` or ` Mia.`). V1.10 candidate: vector-
+    ///     semantic match using correction's embedding.
+    ///   - No agent-judge per match. Every substring hit gets flagged
+    ///     uniformly. V1.10 candidate: small LLM call per candidate
+    ///     asking "does this row actually claim something about the
+    ///     corrected entity?".
+    ///   - No confidence score. V2 candidate: belief-strength model.
+    ///
+    /// Concurrent safety: BEGIN/COMMIT serializes target marking +
+    /// correction self-update. Other readers see either pre- or
+    /// post-state, never partial.
+    pub fn propagateCorrection(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        correction_key: []const u8,
+        entity_pattern: []const u8,
+    ) !memory_root.PropagateCorrectionResult {
+        const begin_result = try self.exec("BEGIN");
+        c.PQclear(begin_result);
+        errdefer {
+            if (self.exec("ROLLBACK")) |rb| {
+                c.PQclear(rb);
+            } else |_| {}
+        }
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        // Verify correction_key exists. If missing, return early —
+        // there's nothing to point targets at.
+        const correction_z = try self.allocator.dupeZ(u8, correction_key);
+        defer self.allocator.free(correction_z);
+        const exists_q = try self.buildQuery(
+            "SELECT 1 FROM {schema}.memories WHERE user_id = $1 AND key = $2 LIMIT 1",
+        );
+        defer self.allocator.free(exists_q);
+        const exists_params = [_]?[*:0]const u8{ user_s.ptr, correction_z };
+        const exists_lengths = [_]c_int{ @intCast(user_s.len), @intCast(correction_key.len) };
+        const exists_result = try self.execParams(exists_q, &exists_params, &exists_lengths);
+        const correction_exists = c.PQntuples(exists_result) > 0;
+        c.PQclear(exists_result);
+
+        if (!correction_exists) {
+            const commit = try self.exec("COMMIT");
+            c.PQclear(commit);
+            log.info("propagate_correction correction_missing user={d} correction_key={s}", .{
+                user_id, correction_key,
+            });
+            return .{
+                .correction_existed = false,
+                .targets_flagged = 0,
+                .target_keys = try allocator.alloc([]u8, 0),
+            };
+        }
+
+        // Build the ILIKE pattern '%entity%' for content matching.
+        // Caller passes raw entity name; we wrap in % wildcards.
+        const ilike_pattern = try std.fmt.allocPrint(self.allocator, "%{s}%", .{entity_pattern});
+        defer self.allocator.free(ilike_pattern);
+        const ilike_z = try self.allocator.dupeZ(u8, ilike_pattern);
+        defer self.allocator.free(ilike_z);
+
+        // Build the correction_key as a JSON-string-quoted value so
+        // jsonb_set treats it as a value (not a path).
+        const correction_json = try jsonString(self.allocator, correction_key);
+        defer self.allocator.free(correction_json);
+        const correction_json_z = try self.allocator.dupeZ(u8, correction_json);
+        defer self.allocator.free(correction_json_z);
+
+        // UPDATE matching rows: set metadata.superseded_by_correction,
+        // skipping the correction itself + skipping autosave/checkpoint/
+        // extracted families. RETURNING key so we can collect the list
+        // for the correction's superseded_targets pointer.
+        const update_q = try self.buildQuery(
+            "UPDATE {schema}.memories SET metadata = jsonb_set(" ++
+                "  COALESCE(metadata, '{}'::jsonb), " ++
+                "  '{superseded_by_correction}', " ++
+                "  $3::jsonb" ++
+                ") " ++
+                "WHERE user_id = $1 " ++
+                "AND content ILIKE $2 " ++
+                "AND key != $4 " ++
+                "AND (key LIKE 'timeline_summary/%' " ++
+                "  OR key LIKE 'summary_latest/%' " ++
+                "  OR key LIKE 'durable_fact/%' " ++
+                "  OR key LIKE 'compaction_summary/%') " ++
+                "RETURNING key",
+        );
+        defer self.allocator.free(update_q);
+        const update_params = [_]?[*:0]const u8{ user_s.ptr, ilike_z, correction_json_z, correction_z };
+        const update_lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(ilike_pattern.len),
+            @intCast(correction_json.len),
+            @intCast(correction_key.len),
+        };
+        const update_result = try self.execParams(update_q, &update_params, &update_lengths);
+        defer c.PQclear(update_result);
+        const flagged_n_raw = c.PQntuples(update_result);
+        const flagged_n: usize = if (flagged_n_raw < 0) 0 else @intCast(flagged_n_raw);
+
+        // Collect flagged keys for caller + for the correction's
+        // bidirectional superseded_targets pointer.
+        var keys: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (keys.items) |k| allocator.free(k);
+            keys.deinit(allocator);
+        }
+        var ki: c_int = 0;
+        while (ki < flagged_n_raw) : (ki += 1) {
+            const k_self_owned = try dupeResultValue(self.allocator, update_result, ki, 0);
+            defer self.allocator.free(k_self_owned);
+            const k_caller_owned = try allocator.dupe(u8, k_self_owned);
+            try keys.append(allocator, k_caller_owned);
+        }
+
+        // Bidirectional pointer: write the list of flagged keys back
+        // onto the correction's metadata as superseded_targets. Build
+        // a JSON array of the keys.
+        if (flagged_n > 0) {
+            var json_array: std.ArrayListUnmanaged(u8) = .empty;
+            defer json_array.deinit(self.allocator);
+            try json_array.append(self.allocator, '[');
+            for (keys.items, 0..) |k, idx| {
+                if (idx > 0) try json_array.append(self.allocator, ',');
+                const k_json = try jsonString(self.allocator, k);
+                defer self.allocator.free(k_json);
+                try json_array.appendSlice(self.allocator, k_json);
+            }
+            try json_array.append(self.allocator, ']');
+            const targets_json_z = try self.allocator.dupeZ(u8, json_array.items);
+            defer self.allocator.free(targets_json_z);
+
+            const back_q = try self.buildQuery(
+                "UPDATE {schema}.memories SET metadata = jsonb_set(" ++
+                    "  COALESCE(metadata, '{}'::jsonb), " ++
+                    "  '{superseded_targets}', " ++
+                    "  $3::jsonb" ++
+                    ") " ++
+                    "WHERE user_id = $1 AND key = $2",
+            );
+            defer self.allocator.free(back_q);
+            const back_params = [_]?[*:0]const u8{ user_s.ptr, correction_z, targets_json_z };
+            const back_lengths = [_]c_int{
+                @intCast(user_s.len),
+                @intCast(correction_key.len),
+                @intCast(json_array.items.len),
+            };
+            const back_result = try self.execParams(back_q, &back_params, &back_lengths);
+            c.PQclear(back_result);
+        }
+
+        // COMMIT.
+        const commit_result = try self.exec("COMMIT");
+        c.PQclear(commit_result);
+
+        log.info("propagate_correction user={d} correction={s} pattern={s} flagged={d}", .{
+            user_id, correction_key, entity_pattern, flagged_n,
+        });
+        return .{
+            .correction_existed = true,
+            .targets_flagged = flagged_n,
+            .target_keys = try keys.toOwnedSlice(allocator),
+        };
     }
 
     /// Today the `subject` column is unpopulated by upsertMemoryWithMetadata

@@ -619,6 +619,27 @@ pub const ResolveContradictionResult = struct {
     loser_closed: bool,
 };
 
+/// V1.9-3 — result of propagate_correction. Bidirectional: the
+/// correction's metadata gets `superseded_targets` (list of keys it
+/// flagged), each target's metadata gets `superseded_by_correction`
+/// (the correction's key). Caller frees `target_keys` slice + each
+/// inner []u8.
+pub const PropagateCorrectionResult = struct {
+    /// True when the correction_key existed.
+    correction_existed: bool,
+    /// Number of memory rows flagged as superseded.
+    targets_flagged: usize,
+    /// Keys of every memory row that was flagged. Caller frees
+    /// each + the slice. Empty slice (allocated, len=0) when zero
+    /// targets matched.
+    target_keys: [][]u8,
+
+    pub fn deinit(self: *const PropagateCorrectionResult, allocator: std.mem.Allocator) void {
+        for (self.target_keys) |k| allocator.free(k);
+        allocator.free(self.target_keys);
+    }
+};
+
 /// V1.7a-9a — owned community-name lookup row.
 pub const CommunityName = struct {
     name: []u8,
