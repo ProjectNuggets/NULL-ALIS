@@ -604,6 +604,21 @@ pub const CascadeRenameResult = struct {
     }
 };
 
+/// V1.9-2 — result of an explicit-pick contradiction resolution.
+/// Returned by `state_mgr.resolveContradiction(user_id, loser_key,
+/// winner_key)`. Pure value; no allocator owned slices.
+pub const ResolveContradictionResult = struct {
+    /// True when the loser_key existed at call time.
+    loser_existed: bool,
+    /// True when the winner_key existed at call time. False is not
+    /// fatal — caller may have a fresh winner not yet written. The
+    /// loser still gets closed regardless.
+    winner_existed: bool,
+    /// True when the loser was actually closed (false → loser
+    /// didn't exist, no-op).
+    loser_closed: bool,
+};
+
 /// V1.7a-9a — owned community-name lookup row.
 pub const CommunityName = struct {
     name: []u8,

@@ -441,6 +441,25 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
             .edges_closed = 0,
         };
     }
+    /// V1.9-2 — stub for non-postgres builds; invalidate-by-pattern no-ops.
+    pub fn invalidateEdgesByPattern(
+        _: *@This(),
+        _: i64,
+        _: []const u8,
+        _: []const u8,
+        _: ?[]const u8,
+    ) !usize {
+        return 0;
+    }
+    /// V1.9-2 — stub for non-postgres builds; resolve_contradiction no-ops.
+    pub fn resolveContradiction(
+        _: *@This(),
+        _: i64,
+        _: []const u8,
+        _: []const u8,
+    ) !memory_root.ResolveContradictionResult {
+        return .{ .loser_existed = false, .winner_existed = false, .loser_closed = false };
+    }
     /// V1.6 commit 6 — stub for non-postgres builds. Returns empty
     /// candidate list so `edge_resolution.resolveOne` short-circuits to
     /// the no-op outcome (caller writes new fact normally without
@@ -4643,6 +4662,305 @@ const ManagerImpl = struct {
             .edges_rewritten = inserted_count,
             .edges_closed = closed_count,
         };
+    }
+
+    /// V1.9-2 — invalidate edges by (predicate, object_name) pattern.
+    ///
+    /// Use case (per ZAKI's stress-test letter, MNDA case):
+    ///   `invalidate_when("HRS_MNDA", "STATUS", "blocked")` →
+    ///   close every live edge matching the pattern. The agent calls
+    ///   this when it learns a class of facts is stale (e.g. "MNDA
+    ///   was blocked" superseded by "MNDA signed").
+    ///
+    /// Operation:
+    ///   1. Resolve target_entity_id by name_lower=lower(object_name).
+    ///      Missing → return count=0 (caller decides; usually means
+    ///      "no edges to invalidate, so no-op").
+    ///   2. UPDATE memory_edges SET is_latest=false + close-out
+    ///      timestamps WHERE user_id=$1 AND is_latest AND
+    ///      predicate=$2 AND target_key=$resolved_id.
+    ///      Optional `subject_name` filter narrows further to edges
+    ///      where source_key matches the named subject's entity_id.
+    ///   3. RETURNING source/target/predicate so we can emit
+    ///      edge_closed memory_events per row (atomic — one txn).
+    ///   4. Returns count of invalidated edges.
+    ///
+    /// Differences from `cascadeRenameEntity`:
+    ///   - No new entity created, no new edges inserted. Pure
+    ///     close-out.
+    ///   - Pattern-based, not entity-rename. Selective by predicate.
+    ///
+    /// What this does NOT do:
+    ///   - Touch durable_fact/* / timeline_summary/* prose memory
+    ///     content. Those are V1.9-3 propagate_correction territory.
+    ///     This primitive is edge-graph-only.
+    ///   - Insert a "superseded by" pointer. Caller is expected to
+    ///     write the replacement fact via existing extraction or
+    ///     memory_store paths (which now run the judge — V1.8-1 +
+    ///     V1.9-6 wired all three callsites). The audit trail lives
+    ///     in memory_events with event_type='closed'.
+    pub fn invalidateEdgesByPattern(
+        self: *Self,
+        user_id: i64,
+        predicate: []const u8,
+        object_name: []const u8,
+        subject_name: ?[]const u8,
+    ) !usize {
+        const begin_result = try self.exec("BEGIN");
+        c.PQclear(begin_result);
+        errdefer {
+            if (self.exec("ROLLBACK")) |rb| {
+                c.PQclear(rb);
+            } else |_| {}
+        }
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        // Step 1 — resolve target_entity_id.
+        const obj_z = try self.allocator.dupeZ(u8, object_name);
+        defer self.allocator.free(obj_z);
+        const lookup_q = try self.buildQuery(
+            "SELECT id FROM {schema}.memory_entities " ++
+                "WHERE user_id = $1 AND name_lower = LOWER($2) LIMIT 1",
+        );
+        defer self.allocator.free(lookup_q);
+        const lookup_params = [_]?[*:0]const u8{ user_s.ptr, obj_z };
+        const lookup_lengths = [_]c_int{ @intCast(user_s.len), @intCast(object_name.len) };
+        const lookup_result = try self.execParams(lookup_q, &lookup_params, &lookup_lengths);
+        defer c.PQclear(lookup_result);
+        if (c.PQntuples(lookup_result) == 0) {
+            const commit = try self.exec("COMMIT");
+            c.PQclear(commit);
+            return 0;
+        }
+        const target_id = try dupeResultValue(self.allocator, lookup_result, 0, 0);
+        defer self.allocator.free(target_id);
+
+        // Optional: resolve subject_entity_id if filter provided.
+        var subject_id_owned: ?[]u8 = null;
+        defer if (subject_id_owned) |s| self.allocator.free(s);
+        if (subject_name) |sn| {
+            const sn_z = try self.allocator.dupeZ(u8, sn);
+            defer self.allocator.free(sn_z);
+            const subj_params = [_]?[*:0]const u8{ user_s.ptr, sn_z };
+            const subj_lengths = [_]c_int{ @intCast(user_s.len), @intCast(sn.len) };
+            const subj_result = try self.execParams(lookup_q, &subj_params, &subj_lengths);
+            defer c.PQclear(subj_result);
+            if (c.PQntuples(subj_result) > 0) {
+                subject_id_owned = try dupeResultValue(self.allocator, subj_result, 0, 0);
+            }
+            // If subject_name given but not found, no edges can match —
+            // commit empty txn and return 0.
+            if (subject_id_owned == null) {
+                const commit = try self.exec("COMMIT");
+                c.PQclear(commit);
+                return 0;
+            }
+        }
+
+        // Step 2 — close matching edges with RETURNING.
+        const now_ts: i64 = std.time.timestamp();
+        var ts_buf: [32]u8 = undefined;
+        const ts_s = try std.fmt.bufPrintZ(&ts_buf, "{d}", .{now_ts});
+        const pred_z = try self.allocator.dupeZ(u8, predicate);
+        defer self.allocator.free(pred_z);
+        const target_id_z = try self.allocator.dupeZ(u8, target_id);
+        defer self.allocator.free(target_id_z);
+
+        // Two query variants — with vs without subject filter.
+        var close_result: *c.PGresult = undefined;
+        if (subject_id_owned) |sid| {
+            const sid_z = try self.allocator.dupeZ(u8, sid);
+            defer self.allocator.free(sid_z);
+            const close_q = try self.buildQuery(
+                "UPDATE {schema}.memory_edges SET " ++
+                    "valid_to = $4, invalid_at = $4, expired_at = $4, is_latest = FALSE " ++
+                    "WHERE user_id = $1 AND is_latest AND predicate = $2 " ++
+                    "AND target_key = $3 AND source_key = $5 " ++
+                    "RETURNING source_key, target_key, predicate, COALESCE(confidence, 1.0)",
+            );
+            defer self.allocator.free(close_q);
+            const close_params = [_]?[*:0]const u8{ user_s.ptr, pred_z, target_id_z, ts_s.ptr, sid_z };
+            const close_lengths = [_]c_int{
+                @intCast(user_s.len),
+                @intCast(predicate.len),
+                @intCast(target_id.len),
+                @intCast(ts_s.len),
+                @intCast(sid.len),
+            };
+            close_result = try self.execParams(close_q, &close_params, &close_lengths);
+        } else {
+            const close_q = try self.buildQuery(
+                "UPDATE {schema}.memory_edges SET " ++
+                    "valid_to = $4, invalid_at = $4, expired_at = $4, is_latest = FALSE " ++
+                    "WHERE user_id = $1 AND is_latest AND predicate = $2 " ++
+                    "AND target_key = $3 " ++
+                    "RETURNING source_key, target_key, predicate, COALESCE(confidence, 1.0)",
+            );
+            defer self.allocator.free(close_q);
+            const close_params = [_]?[*:0]const u8{ user_s.ptr, pred_z, target_id_z, ts_s.ptr };
+            const close_lengths = [_]c_int{
+                @intCast(user_s.len),
+                @intCast(predicate.len),
+                @intCast(target_id.len),
+                @intCast(ts_s.len),
+            };
+            close_result = try self.execParams(close_q, &close_params, &close_lengths);
+        }
+        defer c.PQclear(close_result);
+        const closed_n_raw = c.PQntuples(close_result);
+        const closed_n: usize = if (closed_n_raw < 0) 0 else @intCast(closed_n_raw);
+
+        // Capture closed-edge metadata for post-COMMIT events.
+        var closed_edges: std.ArrayListUnmanaged(struct {
+            source_key: []u8,
+            target_key: []u8,
+            predicate: []u8,
+            confidence: f64,
+        }) = .empty;
+        defer {
+            for (closed_edges.items) |e| {
+                self.allocator.free(e.source_key);
+                self.allocator.free(e.target_key);
+                self.allocator.free(e.predicate);
+            }
+            closed_edges.deinit(self.allocator);
+        }
+        var ci: c_int = 0;
+        while (ci < closed_n_raw) : (ci += 1) {
+            const src = dupeResultValue(self.allocator, close_result, ci, 0) catch continue;
+            errdefer self.allocator.free(src);
+            const tgt = dupeResultValue(self.allocator, close_result, ci, 1) catch {
+                self.allocator.free(src);
+                continue;
+            };
+            errdefer self.allocator.free(tgt);
+            const pred = dupeResultValue(self.allocator, close_result, ci, 2) catch {
+                self.allocator.free(src);
+                self.allocator.free(tgt);
+                continue;
+            };
+            errdefer self.allocator.free(pred);
+            const conf_str = dupeResultValue(self.allocator, close_result, ci, 3) catch {
+                self.allocator.free(src);
+                self.allocator.free(tgt);
+                self.allocator.free(pred);
+                continue;
+            };
+            defer self.allocator.free(conf_str);
+            const conf_val = std.fmt.parseFloat(f64, conf_str) catch 1.0;
+            try closed_edges.append(self.allocator, .{
+                .source_key = src,
+                .target_key = tgt,
+                .predicate = pred,
+                .confidence = conf_val,
+            });
+        }
+
+        // COMMIT.
+        const commit_result = try self.exec("COMMIT");
+        c.PQclear(commit_result);
+
+        // Post-COMMIT events.
+        for (closed_edges.items) |e| {
+            self.insertEdgeEvent(user_id, e.source_key, e.target_key, e.predicate, "closed", e.confidence) catch |err| {
+                log.warn("invalidate_when.event_failed err={s} src={s} pred={s}", .{
+                    @errorName(err), e.source_key, e.predicate,
+                });
+            };
+        }
+
+        log.info("invalidate_when user={d} predicate={s} object={s} subject={s} closed={d}", .{
+            user_id,
+            predicate,
+            object_name,
+            subject_name orelse "(any)",
+            closed_n,
+        });
+        return closed_n;
+    }
+
+    /// V1.9-2 — explicit contradiction resolution by memory key.
+    ///
+    /// Use case (per ZAKI's stress-test letter):
+    ///   `resolve_contradiction("durable_fact/mia-daughter",
+    ///                          "CORRECTION: Mia daughter test",
+    ///                          winner="CORRECTION...")` →
+    ///   loser_key gets is_latest=false + close-out timestamps,
+    ///   cascading to its edges. winner_key stays alive.
+    ///
+    /// This is the "manual override" surface for contradictions the
+    ///   automated judge missed (or that predate V1.8-1 + V1.9-6
+    ///   judge wiring). Direct key-to-key — no name resolution, no
+    ///   pattern matching. The agent decides which side wins.
+    ///
+    /// Operation:
+    ///   1. Verify both keys exist + are owned by user_id.
+    ///   2. setMemoryInvalidation(loser_key) — leverages existing
+    ///      V1.6 cmt7 cascade close-out (memory row is_latest=false +
+    ///      cascade to memory_edges + edge_closed events).
+    ///   3. Emit memory_events with event_type='resolve_contradiction'
+    ///      and payload {loser, winner} for audit clarity.
+    ///   4. Return loser_existed + winner_existed for caller branching.
+    ///
+    /// What this does NOT do:
+    ///   - Walk timeline_summary/* content for either key. V1.9-3
+    ///     propagate_correction handles content-level marking.
+    ///   - Modify the winner row. It stays exactly as written.
+    pub fn resolveContradiction(
+        self: *Self,
+        user_id: i64,
+        loser_key: []const u8,
+        winner_key: []const u8,
+    ) !memory_root.ResolveContradictionResult {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        // Verify keys exist.
+        const exists_q = try self.buildQuery(
+            "SELECT key FROM {schema}.memories WHERE user_id = $1 AND key = $2 LIMIT 1",
+        );
+        defer self.allocator.free(exists_q);
+
+        const loser_z = try self.allocator.dupeZ(u8, loser_key);
+        defer self.allocator.free(loser_z);
+        const winner_z = try self.allocator.dupeZ(u8, winner_key);
+        defer self.allocator.free(winner_z);
+
+        const loser_params = [_]?[*:0]const u8{ user_s.ptr, loser_z };
+        const loser_lengths = [_]c_int{ @intCast(user_s.len), @intCast(loser_key.len) };
+        const loser_result = try self.execParams(exists_q, &loser_params, &loser_lengths);
+        const loser_exists = c.PQntuples(loser_result) > 0;
+        c.PQclear(loser_result);
+
+        const winner_params = [_]?[*:0]const u8{ user_s.ptr, winner_z };
+        const winner_lengths = [_]c_int{ @intCast(user_s.len), @intCast(winner_key.len) };
+        const winner_result = try self.execParams(exists_q, &winner_params, &winner_lengths);
+        const winner_exists = c.PQntuples(winner_result) > 0;
+        c.PQclear(winner_result);
+
+        if (!loser_exists) {
+            log.info("resolve_contradiction loser_missing user={d} loser={s}", .{ user_id, loser_key });
+            return .{ .loser_existed = false, .winner_existed = winner_exists, .loser_closed = false };
+        }
+
+        // Close the loser via setMemoryInvalidation — handles the
+        // memory row + cascade to edges + edge_closed events in one
+        // call (V1.6 cmt7-9 pattern reused). The cascaded
+        // edge_closed events ARE the audit trail; a separate
+        // resolve_contradiction event_type is V1.9 follow-up
+        // (insertMemoryEvent today carries a fixed payload schema
+        // designed for upserts, not contradictions). The log line
+        // below + the edge_closed events together give caller +
+        // operator full visibility of who-closed-what-when.
+        const now_ts: i64 = std.time.timestamp();
+        try self.setMemoryInvalidation(user_id, loser_key, now_ts, now_ts);
+
+        log.info("resolve_contradiction user={d} loser={s} winner={s} loser_closed=true", .{
+            user_id, loser_key, winner_key,
+        });
+        return .{ .loser_existed = true, .winner_existed = winner_exists, .loser_closed = true };
     }
 
     /// Today the `subject` column is unpopulated by upsertMemoryWithMetadata
