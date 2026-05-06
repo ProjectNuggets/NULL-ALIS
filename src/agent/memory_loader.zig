@@ -450,6 +450,8 @@ fn loadContextDetailed(
     mem: Memory,
     user_message: []const u8,
     session_id: ?[]const u8,
+    state_mgr_for_supersede: ?*zaki_state.Manager,
+    user_id_for_supersede: ?i64,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
     const scoped_entries = mem.recall(allocator, user_message, WARM_CANDIDATE_FETCH_LIMIT, session_id) catch {
@@ -482,6 +484,33 @@ fn loadContextDetailed(
     var continuity_bytes: usize = 0;
     var semantic_bytes: usize = 0;
     var fallback_bytes: usize = 0;
+
+    // V1.10-A — supersede filter. Fetch every key whose
+    // metadata.superseded_by_correction is set, mark them as
+    // "already seen" upfront. Every existing skip-check
+    // (`containsString(seen_keys, ...)`) then naturally honors the
+    // supersede flag without per-site code changes.
+    //
+    // Memory ownership: superseded_keys array is allocator-owned.
+    // Each entry is also allocator-owned. The slices get pushed into
+    // seen_keys (which holds []const u8 references). Defer-free
+    // ORDER: seen_keys.deinit fires first (declared above), then
+    // superseded_keys free below — at that point seen_keys no longer
+    // references them. Safe.
+    const superseded_keys: [][]u8 = if (state_mgr_for_supersede) |sm|
+        if (user_id_for_supersede) |uid|
+            sm.findSupersededMemoryKeys(allocator, uid) catch &[_][]u8{}
+        else
+            &[_][]u8{}
+    else
+        &[_][]u8{};
+    defer {
+        for (superseded_keys) |k| allocator.free(k);
+        if (superseded_keys.len > 0) allocator.free(superseded_keys);
+    }
+    for (superseded_keys) |k| {
+        try markSeenKey(allocator, &seen_keys, k);
+    }
 
     const summary_latest_key = try summaryLatestKeyForSession(allocator, session_id);
     defer if (summary_latest_key) |key| allocator.free(key);
@@ -611,6 +640,8 @@ fn loadContextWithRuntimeDetailed(
     rt: *MemoryRuntime,
     user_message: []const u8,
     session_id: ?[]const u8,
+    state_mgr_for_supersede: ?*zaki_state.Manager,
+    user_id_for_supersede: ?i64,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
     const candidates = rt.search(allocator, user_message, WARM_CANDIDATE_FETCH_LIMIT, session_id) catch {
@@ -646,6 +677,24 @@ fn loadContextWithRuntimeDetailed(
     var continuity_bytes: usize = 0;
     var semantic_bytes: usize = 0;
     var fallback_bytes: usize = 0;
+
+    // V1.10-A — supersede filter (see loadContextDetailed for full
+    // rationale). Mark every superseded key as "already seen" so all
+    // existing skip-checks naturally honor the flag.
+    const superseded_keys: [][]u8 = if (state_mgr_for_supersede) |sm|
+        if (user_id_for_supersede) |uid|
+            sm.findSupersededMemoryKeys(allocator, uid) catch &[_][]u8{}
+        else
+            &[_][]u8{}
+    else
+        &[_][]u8{};
+    defer {
+        for (superseded_keys) |k| allocator.free(k);
+        if (superseded_keys.len > 0) allocator.free(superseded_keys);
+    }
+    for (superseded_keys) |k| {
+        try markSeenKey(allocator, &seen_keys, k);
+    }
 
     const summary_latest_key = try summaryLatestKeyForSession(allocator, session_id);
     defer if (summary_latest_key) |key| allocator.free(key);
@@ -792,7 +841,12 @@ pub fn loadContext(
     user_message: []const u8,
     session_id: ?[]const u8,
 ) ![]const u8 {
-    const result = try loadContextDetailed(allocator, mem, user_message, session_id);
+    // V1.10-A: legacy entry point. No state_mgr/user_id available on
+    // the public signature → no supersede filter applied. Callers that
+    // need filtering should use loadTurnMemorySlot (which threads
+    // state_mgr through). This shim preserves backwards-compat for
+    // tests + non-tenant call paths.
+    const result = try loadContextDetailed(allocator, mem, user_message, session_id, null, null);
     return result.context;
 }
 
@@ -803,7 +857,8 @@ pub fn loadContextWithRuntime(
     user_message: []const u8,
     session_id: ?[]const u8,
 ) ![]const u8 {
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id);
+    // V1.10-A: same legacy-shim shape as loadContext above.
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id, null, null);
     return result.context;
 }
 
@@ -847,10 +902,15 @@ pub fn loadTurnMemorySlot(
     state_mgr_for_graph: ?*zaki_state.Manager,
     user_id_for_graph: ?i64,
 ) !MemorySlot {
+    // V1.10-A — pass state_mgr_for_graph + user_id_for_graph through as
+    // the supersede-filter inputs. They're already required for graph
+    // expansion / community block; reusing them avoids new params on
+    // the public surface. Callers that don't supply them get
+    // graceful-degrade (no supersede filtering — same behavior as pre-V1.10).
     var result = if (mem_rt) |rt|
-        try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id)
+        try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id, state_mgr_for_graph, user_id_for_graph)
     else
-        try loadContextDetailed(allocator, mem, user_message, session_id);
+        try loadContextDetailed(allocator, mem, user_message, session_id, state_mgr_for_graph, user_id_for_graph);
 
     // ── V1.7a-2 graph-expand recall consumer ───────────────────────────
     // Append graph_neighbors block when state_mgr + user_id are both
@@ -1765,7 +1825,7 @@ test "loadContext keeps non-runtime fallback on the small bucket" {
         try mem.store(key, content, .conversation, "agent:test:user:1:main");
     }
 
-    const result = try loadContextDetailed(allocator, mem, "shipping raw recall", "agent:test:user:1:main");
+    const result = try loadContextDetailed(allocator, mem, "shipping raw recall", "agent:test:user:1:main", null, null);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.fallback_bucket_entries <= FALLBACK_BUCKET_MAX_ENTRIES);
@@ -2002,7 +2062,7 @@ test "loadContextWithRuntime overfetches past internal candidate pollution" {
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "alexsignal saturday", null);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "alexsignal saturday", null, null, null);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.candidate_count > config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT);
@@ -2076,7 +2136,7 @@ test "loadContextWithRuntime keeps semantic continuity candidates when priority 
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB project", "agent:test:user:1:main");
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB project", "agent:test:user:1:main", null, null);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.summary_latest_used);
@@ -2130,7 +2190,7 @@ test "loadContextWithRuntime keeps valid debug-key memories and filters known tr
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB debug checklist", null);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB debug checklist", null, null, null);
     defer allocator.free(result.context);
 
     try std.testing.expect(std.mem.indexOf(u8, result.context, "user_debug_note") != null);
@@ -2210,7 +2270,7 @@ test "loadContextWithRuntime caps fallback bucket and preserves semantic budget"
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "30GB Alex project", "agent:test:user:1:main");
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "30GB Alex project", "agent:test:user:1:main", null, null);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.semantic_bucket_entries >= 2);

@@ -496,6 +496,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     ) !memory_root.TemporalDecayResult {
         return .{ .rows_decayed = 0, .avg_decay_amount = 0.0, .floor = 0.1 };
     }
+    /// V1.10-A — stub for non-postgres builds; returns empty slice so
+    /// loader-side supersede filter degrades to "no skip" gracefully.
+    pub fn findSupersededMemoryKeys(_: *@This(), allocator: std.mem.Allocator, _: i64) ![][]u8 {
+        return try allocator.alloc([]u8, 0);
+    }
     /// V1.6 commit 6 — stub for non-postgres builds. Returns empty
     /// candidate list so `edge_resolution.resolveOne` short-circuits to
     /// the no-op outcome (caller writes new fact normally without
@@ -5541,6 +5546,62 @@ const ManagerImpl = struct {
             .avg_decay_amount = avg_decay_amount,
             .floor = floor,
         };
+    }
+
+    /// V1.10-A — fetch every memory key whose `metadata.superseded_by_correction`
+    /// is set. Used by `agent/memory_loader.zig` to mark these keys as
+    /// "already seen" upfront — every existing skip-check then naturally
+    /// honors the supersede flag without per-site code changes.
+    ///
+    /// Why this primitive exists:
+    ///   V1.9-3 propagateCorrection writes `metadata.superseded_by_correction`
+    ///   on flagged rows (bidirectional with correction's superseded_targets).
+    ///   But V1.9 didn't add a loader-side filter, so superseded rows still
+    ///   surfaced in warm context. This primitive closes that loop. ZAKI's
+    ///   stress test (2026-05-06) showed Mia cleanup worked at the row level
+    ///   but timeline_summaries STILL loaded as continuity. With this filter,
+    ///   superseded rows become invisible at retrieval time without
+    ///   mutating the row itself (W-INT-01 immortality guard preserved).
+    ///
+    /// Cost: 1 SQL per turn, bounded by the count of currently-superseded
+    /// rows. With a typical user accumulating ~10-100 corrections over time,
+    /// the result set stays small. Index on `(user_id, key)` covers the
+    /// scan; the JSONB `?` operator is GIN-indexable if metadata grows.
+    ///
+    /// Caller frees each []u8 + the outer slice.
+    pub fn findSupersededMemoryKeys(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+    ) ![][]u8 {
+        const q = try self.buildQuery(
+            "SELECT key FROM {schema}.memories " ++
+                "WHERE user_id = $1 " ++
+                "AND (COALESCE(metadata, '{}'::jsonb) ? 'superseded_by_correction')",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const nrows: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc([]u8, nrows);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |k| allocator.free(k);
+            allocator.free(out);
+        }
+        var i: usize = 0;
+        while (i < nrows) : (i += 1) {
+            const row: c_int = @intCast(i);
+            out[i] = try dupeResultValue(allocator, result, row, 0);
+            initialized += 1;
+        }
+        return out;
     }
 
     /// Today the `subject` column is unpopulated by upsertMemoryWithMetadata
