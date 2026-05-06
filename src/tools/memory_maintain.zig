@@ -108,7 +108,7 @@ pub const MemoryMaintainTool = struct {
         "Use when you notice stale facts, contradictory states, renamed entities, or unresolved corrections. " ++
         "After each call, check `next_consideration` in the response for suggested follow-up actions.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["cascade_update","invalidate_when","resolve_contradiction","propagate_correction","temporal_decay","survey","prose_survey"],"description":"Which truth-maintenance operation to perform."},"old_name":{"type":"string","description":"For cascade_update: the entity name being renamed FROM."},"new_name":{"type":"string","description":"For cascade_update: the entity name being renamed TO."},"predicate":{"type":"string","description":"For invalidate_when: predicate to match (e.g. STATUS, PREFERS, WORKS_AT)."},"object_name":{"type":"string","description":"For invalidate_when: target entity name to match."},"subject_name":{"type":"string","description":"For invalidate_when: optional subject entity name to narrow further."},"loser_key":{"type":"string","description":"For resolve_contradiction: the memory key being closed."},"winner_key":{"type":"string","description":"For resolve_contradiction: the memory key that stays alive."},"correction_key":{"type":"string","description":"For propagate_correction: the memory key holding the correction."},"entity_pattern":{"type":"string","description":"For propagate_correction OR prose_survey: substring to match in target memory content (e.g. \"MNDA\", \"Mia\", \"Neptune\")."},"threshold_days":{"type":"integer","description":"For temporal_decay: only decay memories untouched for this many days. Default 30."},"half_life_days":{"type":"integer","description":"For temporal_decay: confidence half-life in days. Default 30."},"max_facts":{"type":"integer","description":"For prose_survey: cap on number of rows the LLM judge sees per call. Default 12, max 25."},"dry_run":{"type":"boolean","description":"For prose_survey: if true, returns judge verdicts without writing any metadata (preview mode). Default false."}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["cascade_update","invalidate_when","resolve_contradiction","propagate_correction","temporal_decay","survey","prose_survey"],"description":"Which truth-maintenance operation to perform."},"old_name":{"type":"string","description":"For cascade_update: the entity name being renamed FROM."},"new_name":{"type":"string","description":"For cascade_update: the entity name being renamed TO."},"predicate":{"type":"string","description":"For invalidate_when: predicate to match (e.g. STATUS, PREFERS, WORKS_AT)."},"object_name":{"type":"string","description":"For invalidate_when: target entity name to match."},"subject_name":{"type":"string","description":"For invalidate_when: optional subject entity name to narrow further."},"loser_key":{"type":"string","description":"For resolve_contradiction: the memory key being closed."},"winner_key":{"type":"string","description":"For resolve_contradiction: the memory key that stays alive."},"correction_key":{"type":"string","description":"For propagate_correction: the memory key holding the correction."},"entity_pattern":{"type":"string","description":"For propagate_correction OR prose_survey: substring to match in target memory content (e.g. \"MNDA\", \"Mia\", \"Neptune\")."},"threshold_days":{"type":"integer","description":"For temporal_decay: only decay memories untouched for this many days. Default 30."},"half_life_days":{"type":"integer","description":"For temporal_decay: confidence half-life in days. Default 30."},"max_facts":{"type":"integer","description":"For prose_survey: cap on number of rows the LLM judge sees per call. Default 50, max 200. The result includes `more_available=true` if matching rows exceeded the cap so you can re-run with a tighter pattern."},"dry_run":{"type":"boolean","description":"For prose_survey: if true, returns judge verdicts without writing any metadata (preview mode). Default false."}},"required":["action"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -406,8 +406,16 @@ pub const MemoryMaintainTool = struct {
     ///     prevent a full-corpus judge call.
     ///
     /// Optional params:
-    ///   - max_facts : cap on rows the judge sees per call. Default 12,
-    ///     hard cap 25. Bounds prompt size + sidecar latency.
+    ///   - max_facts : cap on rows the judge sees per call. Default 50,
+    ///     hard cap 200. V1.10-D-rev raised both from the original
+    ///     12/25 after the MNDA diagnostic showed the original cap
+    ///     silently truncated ZAKI's first sweep (7 zombies existed,
+    ///     only 5 were judged). At 50 facts the judge prompt is ~4K
+    ///     input tokens (3% of Llama 8B's 128K context); 200 is ~16K
+    ///     tokens / 13%. Both within the cleanup-operation envelope.
+    ///     When matching rows exceed the cap, the result JSON includes
+    ///     `more_available=true` so the agent knows to re-run with a
+    ///     tighter pattern or larger cap.
     ///   - dry_run  : if true, returns judge verdicts WITHOUT writing
     ///     any metadata. Preview mode.
     ///
@@ -437,11 +445,21 @@ pub const MemoryMaintainTool = struct {
             return ToolResult.fail("prose_survey requires the sidecar judge model name (not configured).");
         }
 
-        const max_facts_raw = root.getInt(args, "max_facts") orelse 12;
+        // V1.10-D-rev (2026-05-06): defaults bumped after the MNDA
+        // diagnostic showed the original 12/25 cap silently truncated
+        // ZAKI's first sweep — 7 zombies existed, only 5 were judged.
+        // Cost analysis at 50 facts × ~80 tokens/fact ≈ 4K input
+        // tokens (3% of Llama 8B's 128K context); latency ~2-3s on
+        // Groq. At 200 cap × 80 ≈ 16K tokens (13% of context); ~5-8s
+        // latency. Both well within the cleanup-operation envelope.
+        // The previous 12/25 cap was conservative-without-measurement;
+        // measuring once and removing the artificial guard is the
+        // Karpathy keep/discard answer.
+        const max_facts_raw = root.getInt(args, "max_facts") orelse 50;
         const max_facts: usize = blk: {
-            if (max_facts_raw <= 0) break :blk 12;
+            if (max_facts_raw <= 0) break :blk 50;
             const cap: usize = @intCast(max_facts_raw);
-            if (cap > 25) break :blk 25;
+            if (cap > 200) break :blk 200;
             break :blk cap;
         };
         const dry_run: bool = root.getBool(args, "dry_run") orelse false;
@@ -468,9 +486,12 @@ pub const MemoryMaintainTool = struct {
                 "Only one prose fact matched — no contradictions possible (need at least two competing assertions). If you expected more, try a shorter or broader entity_pattern.";
             const nc_esc = try jsonEscape(allocator, nc);
             defer allocator.free(nc_esc);
+            // V1.10-D-rev: include `more_available` field even on the
+            // early-return path for JSON shape consistency. With
+            // facts.len < 2, saturation is impossible by definition.
             const output = try std.fmt.allocPrint(
                 allocator,
-                "{{\"action\":\"prose_survey\",\"entity_pattern\":\"{s}\",\"facts_examined\":{d},\"contradictions_found\":0,\"marked_keys\":[],\"dry_run\":{s},\"next_consideration\":\"{s}\"}}",
+                "{{\"action\":\"prose_survey\",\"entity_pattern\":\"{s}\",\"facts_examined\":{d},\"more_available\":false,\"contradictions_found\":0,\"marked_keys\":[],\"dry_run\":{s},\"next_consideration\":\"{s}\"}}",
                 .{
                     ep_esc,
                     facts.len,
@@ -559,7 +580,15 @@ pub const MemoryMaintainTool = struct {
         }
         try marked_json.append(allocator, ']');
 
-        const next_consideration = if (verdicts.items.len == 0)
+        // V1.10-D-rev — `more_available` flags saturation: if the
+        // fetch returned exactly max_facts rows, the SQL LIMIT likely
+        // truncated. Caller can re-run with a higher cap or tighter
+        // pattern to sweep deeper. Approximation (false-positive iff
+        // matching rows == cap exactly), but the right UX answer:
+        // "if you hit the cap, assume there might be more."
+        const more_available = facts.len >= max_facts;
+
+        const base_consideration = if (verdicts.items.len == 0)
             "Judge found no contradictions among the matched prose facts. Either they're complementary / non-conflicting, or the contradictions are too subtle for the small judge model. Consider rerunning with a tighter entity_pattern, or call survey for edge-graph contradictions on related triples."
         else if (dry_run)
             "Dry-run complete — verdicts shown but nothing written. Re-run without dry_run=true to apply the supersede marks. After applying, the marked rows become invisible at retrieval time via V1.10-A's loader filter."
@@ -568,14 +597,29 @@ pub const MemoryMaintainTool = struct {
         else
             "Judge identified contradictions but no marks landed (skipped count > 0 — likely loser_key already deleted or schema mismatch). Verify with memory_recall on the loser keys.";
 
+        // V1.10-D-rev — append a saturation hint when the fetch hit
+        // the cap. Without this, the agent has no way to know that
+        // older zombies might exist beyond the judged window.
+        const next_consideration_owned: ?[]u8 = if (more_available)
+            try std.fmt.allocPrint(
+                allocator,
+                "{s} Note: matching rows hit the max_facts cap ({d}); rerun with a higher max_facts or a tighter entity_pattern to sweep deeper.",
+                .{ base_consideration, max_facts },
+            )
+        else
+            null;
+        defer if (next_consideration_owned) |s| allocator.free(s);
+        const next_consideration: []const u8 = next_consideration_owned orelse base_consideration;
+
         const nc_esc = try jsonEscape(allocator, next_consideration);
         defer allocator.free(nc_esc);
         const output = try std.fmt.allocPrint(
             allocator,
-            "{{\"action\":\"prose_survey\",\"entity_pattern\":\"{s}\",\"facts_examined\":{d},\"contradictions_found\":{d},\"marked_keys\":{s},\"verdicts\":{s},\"skipped\":{d},\"dry_run\":{s},\"next_consideration\":\"{s}\"}}",
+            "{{\"action\":\"prose_survey\",\"entity_pattern\":\"{s}\",\"facts_examined\":{d},\"more_available\":{s},\"contradictions_found\":{d},\"marked_keys\":{s},\"verdicts\":{s},\"skipped\":{d},\"dry_run\":{s},\"next_consideration\":\"{s}\"}}",
             .{
                 ep_esc,
                 facts.len,
+                if (more_available) "true" else "false",
                 verdicts.items.len,
                 marked_json.items,
                 verdicts_json.items,
