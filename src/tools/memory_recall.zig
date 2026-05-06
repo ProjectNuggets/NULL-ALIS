@@ -7,6 +7,8 @@ const mem_root = @import("../memory/root.zig");
 const query_expansion = @import("../memory/retrieval/query_expansion.zig");
 const Memory = mem_root.Memory;
 const MemoryEntry = mem_root.MemoryEntry;
+const zaki_state = @import("../zaki_state.zig");
+const supersede_filter = @import("supersede_filter.zig");
 
 /// Memory recall tool — lets the agent search its own memory.
 /// When a MemoryRuntime is available, uses the full retrieval pipeline
@@ -15,6 +17,14 @@ const MemoryEntry = mem_root.MemoryEntry;
 pub const MemoryRecallTool = struct {
     memory: ?Memory = null,
     mem_rt: ?*mem_root.MemoryRuntime = null,
+    /// V1.10-D — supersede filter binding. When wired, this tool
+    /// fetches the supersede skip-set upfront and drops flagged rows
+    /// from results before the agent sees them. Without it, retrieval
+    /// degrades to V1.9-era behavior (superseded rows surface as
+    /// truth-equivalent — the bug ZAKI named in his 2026-05-06
+    /// stress-test report).
+    state_mgr: ?*zaki_state.Manager = null,
+    user_id: ?i64 = null,
 
     pub const tool_name = "memory_recall";
     pub const tool_description = "Search canonical memory for relevant facts, preferences, or context. Defaults to the current session unless scope=global is provided.";
@@ -58,6 +68,14 @@ pub const MemoryRecallTool = struct {
             return ToolResult{ .success = false, .output = msg };
         };
 
+        // V1.10-D — fetch supersede skip-set once at the tool boundary.
+        // Drops rows whose `metadata.superseded_by_correction` is set so
+        // the agent doesn't see flagged zombies surface as truth-equivalent
+        // alongside the live row. Graceful degrade on null state_mgr or
+        // SQL error → empty skip-set, behavior matches V1.9.
+        const superseded_keys = supersede_filter.fetchSupersededKeys(allocator, self.state_mgr, self.user_id);
+        defer supersede_filter.freeKeys(allocator, superseded_keys);
+
         // Use retrieval engine (hybrid pipeline) when MemoryRuntime is available,
         // fall back to raw mem.recall() otherwise.
         if (self.mem_rt) |rt| {
@@ -67,17 +85,17 @@ pub const MemoryRecallTool = struct {
             };
             defer mem_root.retrieval.freeCandidates(allocator, candidates);
 
-            const visible_candidates = countVisibleCandidates(candidates);
+            const visible_candidates = countVisibleCandidates(candidates, superseded_keys);
             if (visible_candidates > 0) {
-                return formatCandidates(allocator, candidates, visible_candidates);
+                return formatCandidates(allocator, candidates, visible_candidates, superseded_keys);
             }
 
             const fallback_entries = try recallFallbackByKeywords(allocator, m, query, limit, session_id);
             defer mem_root.freeEntries(allocator, fallback_entries);
 
-            const fallback_visible = countVisibleEntries(fallback_entries);
+            const fallback_visible = countVisibleEntries(fallback_entries, superseded_keys);
             if (fallback_visible > 0) {
-                return formatEntries(allocator, fallback_entries, fallback_visible);
+                return formatEntries(allocator, fallback_entries, fallback_visible, superseded_keys);
             }
 
             const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
@@ -90,36 +108,38 @@ pub const MemoryRecallTool = struct {
         };
         defer mem_root.freeEntries(allocator, entries);
 
-        const visible_entries = countVisibleEntries(entries);
+        const visible_entries = countVisibleEntries(entries, superseded_keys);
         if (visible_entries > 0) {
-            return formatEntries(allocator, entries, visible_entries);
+            return formatEntries(allocator, entries, visible_entries, superseded_keys);
         }
 
         const fallback_entries = try recallFallbackByKeywords(allocator, m, query, limit, session_id);
         defer mem_root.freeEntries(allocator, fallback_entries);
 
-        const fallback_visible = countVisibleEntries(fallback_entries);
+        const fallback_visible = countVisibleEntries(fallback_entries, superseded_keys);
         if (fallback_visible > 0) {
-            return formatEntries(allocator, fallback_entries, fallback_visible);
+            return formatEntries(allocator, fallback_entries, fallback_visible, superseded_keys);
         }
 
         const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
         return ToolResult{ .success = true, .output = msg };
     }
 
-    fn countVisibleEntries(entries: []const MemoryEntry) usize {
+    fn countVisibleEntries(entries: []const MemoryEntry, superseded_keys: []const []u8) usize {
         var count: usize = 0;
         for (entries) |entry| {
             if (mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            if (supersede_filter.isKeySuperseded(entry.key, superseded_keys)) continue;
             count += 1;
         }
         return count;
     }
 
-    fn countVisibleCandidates(candidates: []const mem_root.RetrievalCandidate) usize {
+    fn countVisibleCandidates(candidates: []const mem_root.RetrievalCandidate, superseded_keys: []const []u8) usize {
         var count: usize = 0;
         for (candidates) |cand| {
             if (mem_root.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
+            if (supersede_filter.isKeySuperseded(cand.key, superseded_keys)) continue;
             count += 1;
         }
         return count;
@@ -202,7 +222,7 @@ pub const MemoryRecallTool = struct {
         };
     }
 
-    fn formatEntries(allocator: std.mem.Allocator, entries: []const MemoryEntry, visible_count: usize) !ToolResult {
+    fn formatEntries(allocator: std.mem.Allocator, entries: []const MemoryEntry, visible_count: usize, superseded_keys: []const []u8) !ToolResult {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
@@ -216,6 +236,7 @@ pub const MemoryRecallTool = struct {
         for (entries, 0..) |entry, i| {
             _ = i;
             if (mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            if (supersede_filter.isKeySuperseded(entry.key, superseded_keys)) continue;
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
@@ -270,6 +291,7 @@ pub const MemoryRecallTool = struct {
         allocator: std.mem.Allocator,
         candidates: []const mem_root.RetrievalCandidate,
         visible_count: usize,
+        superseded_keys: []const []u8,
     ) !ToolResult {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -284,6 +306,7 @@ pub const MemoryRecallTool = struct {
         for (candidates, 0..) |cand, i| {
             _ = i;
             if (mem_root.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
+            if (supersede_filter.isKeySuperseded(cand.key, superseded_keys)) continue;
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";

@@ -5,10 +5,17 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
+const zaki_state = @import("../zaki_state.zig");
+const supersede_filter = @import("supersede_filter.zig");
 
 pub const MemoryTimelineTool = struct {
     memory: ?Memory = null,
     mem_rt: ?*mem_root.MemoryRuntime = null,
+    /// V1.10-D — supersede filter binding. Same shape as memory_recall.
+    /// Without it, timeline browsing returns superseded summaries
+    /// alongside live ones (the V1.9-era bug ZAKI named).
+    state_mgr: ?*zaki_state.Manager = null,
+    user_id: ?i64 = null,
 
     pub const tool_name = "memory_timeline";
     pub const tool_description = "Browse or search session summaries and timeline continuity objects. This is the FIRST line of session recall — cheap, structured, and usually sufficient. If a summary lacks the exact detail you need (verbatim phrasing, precise tool arguments, content that was placeholder-truncated during compaction), fall back to `transcript_read` for raw message access.";
@@ -56,6 +63,13 @@ pub const MemoryTimelineTool = struct {
             error.InvalidLimit => ToolResult.fail("Invalid 'limit' parameter. Expected integer between 1 and 20."),
         };
 
+        // V1.10-D — fetch supersede skip-set. Drops timeline summaries
+        // whose `metadata.superseded_by_correction` is set so the user
+        // doesn't see flagged-as-stale rows surface as live timeline
+        // entries. Graceful degrade on null state_mgr.
+        const superseded_keys = supersede_filter.fetchSupersededKeys(allocator, self.state_mgr, self.user_id);
+        defer supersede_filter.freeKeys(allocator, superseded_keys);
+
         const views = try collectViews(allocator, mem, filters);
         defer deinitViews(allocator, views);
 
@@ -63,7 +77,7 @@ pub const MemoryTimelineTool = struct {
             return ToolResult{ .success = true, .output = try allocator.dupe(u8, "No session summaries found.") };
         }
 
-        return formatViews(allocator, views);
+        return formatViews(allocator, views, superseded_keys);
     }
 
     fn parseFilters(args: JsonObjectMap) error{ InvalidSessionId, InvalidDate, InvalidLimit }!Filters {
@@ -389,13 +403,32 @@ pub const MemoryTimelineTool = struct {
         }.lessThan);
     }
 
-    fn formatViews(allocator: std.mem.Allocator, views: []const SummaryView) !ToolResult {
+    fn formatViews(allocator: std.mem.Allocator, views: []const SummaryView, superseded_keys: []const []u8) !ToolResult {
+        // V1.10-D — count visible views first so the header reports
+        // post-filter total. Iterating twice keeps the existing
+        // single-pass render loop intact below.
+        var visible_count: usize = 0;
+        for (views) |view| {
+            const source_key = view.source_key_override orelse view.entry.key;
+            if (supersede_filter.isKeySuperseded(source_key, superseded_keys)) continue;
+            if (supersede_filter.isKeySuperseded(view.entry.key, superseded_keys)) continue;
+            visible_count += 1;
+        }
+
+        if (visible_count == 0) {
+            return ToolResult{ .success = true, .output = try allocator.dupe(u8, "No session summaries found.") };
+        }
+
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
         const w = out.writer(allocator);
-        try w.print("Found {d} session summar{s}:\n", .{ views.len, if (views.len == 1) "y" else "ies" });
+        try w.print("Found {d} session summar{s}:\n", .{ visible_count, if (visible_count == 1) "y" else "ies" });
         for (views, 0..) |view, idx| {
             const source_key = view.source_key_override orelse view.entry.key;
+            // V1.10-D — skip superseded summaries (both source-key and
+            // entry-key checks; correction may have flagged either).
+            if (supersede_filter.isKeySuperseded(source_key, superseded_keys)) continue;
+            if (supersede_filter.isKeySuperseded(view.entry.key, superseded_keys)) continue;
             const provenance = mem_root.resolveStoredMemoryProvenance(view.entry.content, view.entry.session_id, source_key);
             const at = view.at_override orelse view.entry.timestamp;
             const focus = mem_root.extractSummarySection(view.entry.content, "focus:");

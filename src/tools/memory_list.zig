@@ -6,8 +6,16 @@ const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 const MemoryCategory = mem_root.MemoryCategory;
+const zaki_state = @import("../zaki_state.zig");
+const supersede_filter = @import("supersede_filter.zig");
+
 pub const MemoryListTool = struct {
     memory: ?Memory = null,
+    /// V1.10-D — supersede filter binding. Without it, listing returns
+    /// flagged-as-stale rows alongside live ones (the V1.9-era bug
+    /// ZAKI named in his stress-test report).
+    state_mgr: ?*zaki_state.Manager = null,
+    user_id: ?i64 = null,
 
     pub const tool_name = "memory_list";
     pub const tool_description = "List canonical memory entries in recency order. Defaults to the current session unless scope=global is provided; use include_internal=true for transcript/autosave inspection. Note: scope=session filters strictly by session_id, so memories that were promoted to durable core (session_id=NULL after V1.7 promotion) will NOT appear in scope=session results — use scope=global to see promoted core memories.";
@@ -46,6 +54,13 @@ pub const MemoryListTool = struct {
         const include_content = root.getBool(args, "include_content") orelse true;
         const include_internal = root.getBool(args, "include_internal") orelse false;
 
+        // V1.10-D — fetch supersede skip-set. Drops flagged rows from
+        // listings unless `include_internal=true` (which is documented
+        // as "for transcript/audit inspection" and should still see
+        // everything). Graceful degrade on null state_mgr.
+        const superseded_keys = supersede_filter.fetchSupersededKeys(allocator, self.state_mgr, self.user_id);
+        defer supersede_filter.freeKeys(allocator, superseded_keys);
+
         const entries = m.list(allocator, category_opt, session_id_opt) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to list memory entries: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .output = msg };
@@ -55,6 +70,7 @@ pub const MemoryListTool = struct {
         var filtered_total: usize = 0;
         for (entries) |entry| {
             if (!include_internal and mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            if (!include_internal and supersede_filter.isKeySuperseded(entry.key, superseded_keys)) continue;
             filtered_total += 1;
         }
 
@@ -75,6 +91,7 @@ pub const MemoryListTool = struct {
         var written: usize = 0;
         for (entries) |entry| {
             if (!include_internal and mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            if (!include_internal and supersede_filter.isKeySuperseded(entry.key, superseded_keys)) continue;
             if (written >= shown) break;
             const provenance = mem_root.resolveStoredMemoryProvenance(entry.content, entry.session_id, entry.key);
             try w.print("  {d}. {s} [{s}] role={s} channel={s} lane={s}", .{

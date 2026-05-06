@@ -1800,6 +1800,24 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const mt: *memory_maintain.MemoryMaintainTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;
             mt.user_id = user_id;
+        } else if (t.vtable == &memory_recall.MemoryRecallTool.vtable) {
+            // V1.10-D — memory_recall needs tenant context to fetch the
+            // supersede skip-set per call. Without it (non-postgres
+            // build / standalone deploy) the tool falls back to V1.9
+            // behavior: no supersede filter, flagged rows surface.
+            const mt: *memory_recall.MemoryRecallTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
+        } else if (t.vtable == &memory_timeline.MemoryTimelineTool.vtable) {
+            // V1.10-D — same supersede-filter binding as memory_recall.
+            const mt: *memory_timeline.MemoryTimelineTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
+        } else if (t.vtable == &memory_list.MemoryListTool.vtable) {
+            // V1.10-D — same supersede-filter binding as memory_recall.
+            const mt: *memory_list.MemoryListTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
         }
     }
 }
