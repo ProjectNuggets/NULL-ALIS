@@ -83,6 +83,7 @@ pub const memory_forget = @import("memory_forget.zig");
 pub const memory_archive = @import("memory_archive.zig");
 pub const memory_demote = @import("memory_demote.zig");
 pub const memory_purge_topic = @import("memory_purge_topic.zig");
+pub const memory_maintain = @import("memory_maintain.zig");
 pub const schedule = @import("schedule.zig");
 pub const todo = @import("todo.zig");
 pub const compose_memory = @import("compose_memory.zig");
@@ -446,6 +447,19 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // intended (heuristic protects against overly-short topics).
         // Local DB scan + delete — medium cost depending on scope.
         .name = memory_purge_topic.MemoryPurgeTopicTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+        .cost_class = .b,
+    },
+    .{
+        // V1.9-5 — unified truth-maintenance toolkit. Six actions:
+        // cascade_update / invalidate_when / resolve_contradiction /
+        // propagate_correction / temporal_decay / survey. Mutating
+        // (every action except `survey` rewrites graph state);
+        // medium risk because a wrong predicate or pattern could
+        // mass-close edges. Cost class b: per-action SQL UPDATEs
+        // bounded by edge count or matched memory rows.
+        .name = memory_maintain.MemoryMaintainTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
         .cost_class = .b,
@@ -1088,6 +1102,12 @@ pub fn allTools(
     const mpt = try allocator.create(memory_purge_topic.MemoryPurgeTopicTool);
     mpt.* = .{};
     try list.append(allocator, mpt.tool());
+
+    // V1.9-5 — unified truth-maintenance toolkit. state_mgr +
+    // user_id wired separately via bindStateMgrTenant.
+    const mmt = try allocator.create(memory_maintain.MemoryMaintainTool);
+    mmt.* = .{};
+    try list.append(allocator, mmt.tool());
 
     // Delegate + spawn: dormant by default for V1. Both are coded but have
     // incomplete end-to-end behavior (subagent result visibility on follow-up
@@ -1756,6 +1776,15 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const bt: *brain_graph.BrainGraphTool = @ptrCast(@alignCast(t.ptr));
             bt.state_mgr = state_mgr;
             bt.user_id = user_id;
+        } else if (t.vtable == &memory_maintain.MemoryMaintainTool.vtable) {
+            // V1.9-5 — unified truth-maintenance toolkit. Every action
+            // (cascade_update, invalidate_when, resolve_contradiction,
+            // propagate_correction, temporal_decay, survey) needs the
+            // tenant context. Without it the tool returns a clean
+            // failure rather than crashing.
+            const mt: *memory_maintain.MemoryMaintainTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
         }
     }
 }
@@ -2239,8 +2268,9 @@ test "all tools includes extras when enabled" {
     // +1 for V1.5 day-3 compose_memory; +1 calculator + 1 file_read_hashed
     // + 1 file_edit_hashed from nullclaw cherry-pick; +1 memory_archive
     // + 1 memory_demote from V1.6 cmt11) + http_request + web_fetch +
-    // web_search + browser + brain_graph (V1.7-ship S2a) = 41.
-    try std.testing.expectEqual(@as(usize, 41), tools.len);
+    // web_search + browser + brain_graph (V1.7-ship S2a)
+    // + memory_maintain (V1.9-5 truth-maintenance toolkit) = 42.
+    try std.testing.expectEqual(@as(usize, 42), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2258,8 +2288,9 @@ test "all tools excludes extras when disabled" {
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
     // + runtime_info + skill_registry + message + set_execution_mode + context_snapshot
     // + calculator + file_read_hashed + file_edit_hashed (nullclaw cherry-pick)
-    // + memory_archive + memory_demote (V1.6 cmt11) + brain_graph (V1.7-ship S2a) = 37
-    try std.testing.expectEqual(@as(usize, 37), tools.len);
+    // + memory_archive + memory_demote (V1.6 cmt11) + brain_graph (V1.7-ship S2a)
+    // + memory_maintain (V1.9-5 truth-maintenance toolkit) = 38
+    try std.testing.expectEqual(@as(usize, 38), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2390,7 +2421,8 @@ test "all tools includes message when event bus is available" {
     // V1.6 cmt11 added memory_archive + memory_demote);
     // delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT.
     // V1.7-ship S2a added brain_graph → 37.
-    try std.testing.expectEqual(@as(usize, 37), tools.len);
+    // V1.9-5 added memory_maintain (truth-maintenance toolkit) → 38.
+    try std.testing.expectEqual(@as(usize, 38), tools.len);
 
     var found_message = false;
     for (tools) |t| {
