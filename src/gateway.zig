@@ -13093,9 +13093,30 @@ fn handleBrainLocalGraph(
     if (max_nodes == 0) max_nodes = BRAIN_LOCAL_GRAPH_DEFAULT_MAX_NODES;
     if (max_nodes > BRAIN_LOCAL_GRAPH_MAX_MAX_NODES) max_nodes = BRAIN_LOCAL_GRAPH_MAX_MAX_NODES;
 
-    // ── Verify center exists + is live ───────────────────────────
+    // ── Verify center exists (live OR archived) ──────────────────
+    //
+    // V1.11 (2026-05-07) — Pre-V1.11 used `getMemory` which filters by
+    // MEMORIES_VALIDITY_FILTER (valid_to IS NULL OR future). Archived
+    // /superseded centers (e.g. memories the V1.10 truth-maintenance
+    // sweep closed out) returned null → 404 → frontend "Failed to
+    // load your brain" overlay. Surfaced when Nova clicked
+    // `daughter_mia_birthday` (archived May 6 by the prose_survey
+    // judge) from the time-scrubber's Archived list — a perfectly
+    // valid drilldown intent that the API rejected.
+    //
+    // Brain page is an AUDIT surface, not a retrieval surface. The
+    // user explicitly wants to see archived/superseded relationships
+    // here; that's why the time scrubber lists Born + Archived. Same
+    // philosophy as `/brain/memory/:key` (gateway.zig:12356-12382)
+    // which already uses getMemory → getMemoryAnyValidity fallback.
+    //
+    // Switching to getMemoryAnyValidity directly: the local-graph
+    // handler doesn't expose a "live vs archived" distinction in
+    // its response (the BFS expansion via graph_expand surfaces
+    // both live and archived nodes anyway), so the simpler
+    // single-call form is correct here.
     {
-        const center_row = state_mgr.getMemory(allocator, numeric_user_id, center_key) catch {
+        const center_row = state_mgr.getMemoryAnyValidity(allocator, numeric_user_id, center_key) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"center_lookup_failed\"}" };
         };
         if (center_row) |row| {
