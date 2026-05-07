@@ -385,7 +385,12 @@ pub const ToolsConfig = struct {
     shell_timeout_secs: u64 = 60,
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
-    web_fetch_max_chars: u32 = 50_000,
+    /// V1.11 (2026-05-07, Nova directive "give him more room to grow"):
+    /// raised 50_000 → 200_000. With Kimi 256K + V4-Pro 1M context windows,
+    /// the prior 50K cap was clipping web pages mid-article and forcing
+    /// truncated research. 200K (~50K tokens) lets ZAKI see a full doc/blog
+    /// in a single fetch without cutting his analysis short.
+    web_fetch_max_chars: u32 = 200_000,
     /// Optional explicit provider override for web_search tool.
     /// Empty string means "use WEB_SEARCH_PROVIDER env behavior".
     web_search_provider: []const u8 = "",
@@ -892,7 +897,12 @@ pub const QmdLimitsConfig = struct {
 
 pub const DEFAULT_MEMORY_ENRICH_RECALL_LIMIT: usize = 10;
 pub const DEFAULT_MEMORY_TIMELINE_FALLBACK_LIMIT: usize = 2;
-pub const DEFAULT_MEMORY_CONTEXT_MAX_BYTES: usize = 4_000;
+/// V1.11 (2026-05-07): raised 4_000 → 32_000. The prior 4KB (~1K tokens)
+/// cap on the memory-enrichment block was a relic of the 12K-budget era;
+/// with 256K-1M context windows, 32KB (~8K tokens) gives ZAKI's memory
+/// retrieval real room without crowding the prompt. Pillar 1 — the brain
+/// becomes more present in every turn.
+pub const DEFAULT_MEMORY_CONTEXT_MAX_BYTES: usize = 32_000;
 
 pub const MemoryVectorStoreConfig = struct {
     kind: []const u8 = "auto",

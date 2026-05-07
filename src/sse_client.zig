@@ -10,9 +10,16 @@
 const std = @import("std");
 const log = std.log.scoped(.sse_client);
 
-/// Maximum SSE event size (256KB)
-/// Events larger than this are truncated to prevent memory exhaustion
-const MAX_EVENT_SIZE = 256 * 1024;
+/// Maximum SSE event size (1MB).
+/// Events larger than this are truncated to prevent memory exhaustion.
+///
+/// V1.11 (2026-05-07): raised 256KB → 1MB. With dispatcher MAX_TOOL_RESULT_CHARS
+/// at 200K (the single source of tool-output length truth — see
+/// `agent/dispatcher.zig` and `providers/scrub.zig`), individual frames can
+/// approach the prior 256KB ceiling under big file reads or web fetches. 1MB
+/// headroom keeps streaming intact for legitimate large payloads; pathological
+/// cases still get bounded.
+const MAX_EVENT_SIZE = 1024 * 1024;
 
 /// Maximum buffer size for read operations
 /// Prevents buffer overflow attacks and memory exhaustion

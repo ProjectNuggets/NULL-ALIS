@@ -54,7 +54,13 @@ pub const TaskState = struct {
 
 pub const SubagentConfig = struct {
     /// Maximum agent loop iterations per subagent (passed to ChannelRuntime).
-    max_iterations: u32 = 15,
+    ///
+    /// V1.11 (2026-05-07): raised 15 → 50. Subagents handle complex
+    /// delegated tasks (research, multi-step analysis, document synthesis)
+    /// where 15 was cutting off mid-thought. 50 gives the delegate agent
+    /// genuine room to complete hard work; the parent's adaptive-exit
+    /// detectors still catch pathological loops.
+    max_iterations: u32 = 50,
     max_concurrent: u32 = 4,
 };
 

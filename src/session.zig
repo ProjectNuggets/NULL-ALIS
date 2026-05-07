@@ -36,7 +36,14 @@ const SESSION_LOCK_WAIT_WARN_MS: u64 = 50;
 const SESSION_IDLE_CONTEXT_THRESHOLD_SECS: u64 = 5 * 60;
 
 /// Maximum concurrent sessions per user (DoS mitigation T-03-04).
-const MAX_SESSIONS_PER_USER: usize = 50;
+///
+/// V1.11 (2026-05-07): raised 50 → 200. Power users running ZAKI across
+/// channels (Telegram + Slack + Discord + App + scheduled tasks) plus
+/// multiple thread conversations regularly exceed 50 active sessions.
+/// 200 gives the daily-use case real headroom while still bounding the
+/// DoS surface. Per-user soft cap remains the right place for abuse
+/// protection; this constant is a hard runtime ceiling.
+const MAX_SESSIONS_PER_USER: usize = 200;
 
 const DEFAULT_QUEUE_DROP_MESSAGE = "Queue policy dropped this queued turn.";
 const QUEUE_NEWEST_DROP_MESSAGE = "Queue overflow: dropped newest queued turn.";

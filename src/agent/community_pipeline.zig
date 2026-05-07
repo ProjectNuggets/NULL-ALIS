@@ -73,7 +73,12 @@ pub const LlmNamer = struct {
 
 pub const RecomputeConfig = struct {
     /// LPA convergence cap (forwarded to communities.LpaConfig).
-    max_iterations: u8 = 10,
+    ///
+    /// V1.11 (2026-05-07): raised 10 → 25. Production user-graphs with
+    /// 1000+ memory nodes need more iterations to converge cleanly. 10
+    /// was sized for early-stage small graphs; 25 gives stable community
+    /// detection at scale without unbounded latency.
+    max_iterations: u8 = 25,
     /// Top-K members used for stable-ID hashing AND LLM naming.
     /// Smaller = more sensitive to membership churn (id changes more often);
     /// larger = more stable but blunter snapshot.

@@ -499,7 +499,20 @@ fn loadContextDetailed(
     // references them. Safe.
     const superseded_keys: [][]u8 = if (state_mgr_for_supersede) |sm|
         if (user_id_for_supersede) |uid|
-            sm.findSupersededMemoryKeys(allocator, uid) catch &[_][]u8{}
+            sm.findSupersededMemoryKeys(allocator, uid) catch |err| blk: {
+                // V1.11 (2026-05-07): make degraded-state visible. Pre-fix this
+                // bare catch silently no-op'd the V1.10-A filter when Postgres
+                // was unreachable, letting superseded rows surface in agent
+                // context. ZAKI surfaced this gap during self-analysis. Now
+                // the operator sees the degradation in gateway.log instead of
+                // chasing zombie facts in production. Filter still degrades
+                // gracefully (returns empty), but no longer silently.
+                std.log.scoped(.memory_loader).warn(
+                    "supersede filter degraded — findSupersededMemoryKeys failed err={s} uid={d} — superseded entries may surface in retrieval until backend recovers",
+                    .{ @errorName(err), uid },
+                );
+                break :blk &[_][]u8{};
+            }
         else
             &[_][]u8{}
     else
@@ -683,7 +696,20 @@ fn loadContextWithRuntimeDetailed(
     // existing skip-checks naturally honor the flag.
     const superseded_keys: [][]u8 = if (state_mgr_for_supersede) |sm|
         if (user_id_for_supersede) |uid|
-            sm.findSupersededMemoryKeys(allocator, uid) catch &[_][]u8{}
+            sm.findSupersededMemoryKeys(allocator, uid) catch |err| blk: {
+                // V1.11 (2026-05-07): make degraded-state visible. Pre-fix this
+                // bare catch silently no-op'd the V1.10-A filter when Postgres
+                // was unreachable, letting superseded rows surface in agent
+                // context. ZAKI surfaced this gap during self-analysis. Now
+                // the operator sees the degradation in gateway.log instead of
+                // chasing zombie facts in production. Filter still degrades
+                // gracefully (returns empty), but no longer silently.
+                std.log.scoped(.memory_loader).warn(
+                    "supersede filter degraded — findSupersededMemoryKeys failed err={s} uid={d} — superseded entries may surface in retrieval until backend recovers",
+                    .{ @errorName(err), uid },
+                );
+                break :blk &[_][]u8{};
+            }
         else
             &[_][]u8{}
     else

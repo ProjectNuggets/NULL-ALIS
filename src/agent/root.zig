@@ -418,7 +418,14 @@ pub const Agent = struct {
     allowed_paths: []const []const u8 = &.{},
     max_tool_iterations: u32,
     max_history_messages: u32,
-    parallel_tools: bool = false,
+    /// V1.11 (2026-05-07): aligned struct default false → true to match
+    /// `config_types.AgentConfig.parallel_tools` (default true). The mismatch
+    /// was latent — `fromConfig` always overlays the config value, so
+    /// production resolution was correct — but any direct Agent construction
+    /// (tests, CLI shortcuts, edge cases) silently got serial dispatch.
+    /// Aligning here eliminates the discrepancy ZAKI surfaced during his
+    /// V1.11 self-audit. Production behavior unchanged; latent bug closed.
+    parallel_tools: bool = true,
     parallel_tools_rollout_percent: u8 = 100,
     tool_dispatcher_mode: ToolDispatcherMode = .auto,
     auto_save: bool,
@@ -706,6 +713,21 @@ pub const Agent = struct {
                 .parameters_json = t.parametersJson(),
             };
         }
+
+        // V1.11 self-verification log (2026-05-07): emit the actual runtime caps
+        // applied to this agent so ZAKI (or any operator) can grep gateway.log
+        // and confirm what's in effect. Surfaced after ZAKI reported hitting an
+        // iteration cap of 10 — without this log there was no way to verify
+        // whether the configured preset (balanced=200) was actually being
+        // applied or if something was short-circuiting it.
+        log.info("agent.fromConfig max_tool_iterations={d} max_history_messages={d} model={s} ctx_tokens={d} max_tokens={d} reasoning={s}", .{
+            cfg.agent.max_tool_iterations,
+            cfg.agent.max_history_messages,
+            default_model,
+            resolved_token_limit,
+            resolved_max_tokens,
+            cfg.reasoning_effort orelse "auto",
+        });
 
         return .{
             .allocator = allocator,

@@ -148,24 +148,24 @@ fn eqlLowercase(input: []const u8, kw: []const u8) bool {
     return true;
 }
 
-/// Maximum tool output length before truncation.
-const MAX_TOOL_OUTPUT_CHARS: usize = 10_000;
-
-/// Scrub credentials from tool execution output and truncate if too long.
-/// Returns an owned slice. Caller must free.
+/// Scrub credentials from tool execution output. Returns an owned slice.
+/// Caller must free.
+///
+/// V1.11 (2026-05-07): truncation removed. `dispatcher.formatToolResults`
+/// is now the SINGLE source of truth for tool-output length bounding (it
+/// truncates each result to `MAX_TOOL_RESULT_CHARS = 200_000` cleanly with
+/// a head/tail-preserving marker). Scrub's prior double-truncation pattern
+/// could mid-cut the formatted XML when a multi-tool turn's combined
+/// payload exceeded the scrub cap, breaking `<tool_result>` tags before
+/// they reached the LLM. With one truncation point, the agent receives
+/// well-formed XML on every turn regardless of total result volume.
+///
+/// Scrub's role is now strictly **secret redaction.** Length is owned
+/// upstream. ZAKI surfaced the double-truncation bug during V1.11
+/// self-analysis (2026-05-07) — the truth-maintenance pillar working
+/// out loud.
 pub fn scrubToolOutput(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    // First truncate if too long
-    const truncated = if (input.len > MAX_TOOL_OUTPUT_CHARS) blk: {
-        const suffix = "\n[output truncated]";
-        var buf = try allocator.alloc(u8, MAX_TOOL_OUTPUT_CHARS + suffix.len);
-        @memcpy(buf[0..MAX_TOOL_OUTPUT_CHARS], input[0..MAX_TOOL_OUTPUT_CHARS]);
-        @memcpy(buf[MAX_TOOL_OUTPUT_CHARS..], suffix);
-        break :blk buf;
-    } else try allocator.dupe(u8, input);
-    defer allocator.free(truncated);
-
-    // Then scrub secrets
-    return scrubSecretPatterns(allocator, truncated);
+    return scrubSecretPatterns(allocator, input);
 }
 
 /// Sanitize API error text by scrubbing secrets and truncating length.
@@ -316,18 +316,24 @@ test "scrubSecretPatterns no false positives on normal text" {
     try std.testing.expect(std.mem.indexOf(u8, result, "[REDACTED]") == null);
 }
 
-test "scrubToolOutput truncates long output" {
+test "scrubToolOutput preserves long input length (V1.11: truncation moved to dispatcher)" {
+    // Pre-V1.11 this function double-truncated tool results AFTER the
+    // dispatcher already truncated them, mid-cutting formatted XML and
+    // breaking <tool_result> tags. Now it's secret-redaction-only;
+    // length is owned by dispatcher.formatToolResults. This test proves
+    // the new behavior: a 250KB input passes through with no length
+    // change (only secret patterns get redacted, none here).
     const allocator = std.testing.allocator;
-    const long = try allocator.alloc(u8, 15_000);
+    const long = try allocator.alloc(u8, 250_000);
     defer allocator.free(long);
     @memset(long, 'x');
     const result = try scrubToolOutput(allocator, long);
     defer allocator.free(result);
-    try std.testing.expect(result.len < 15_000);
-    try std.testing.expect(std.mem.endsWith(u8, result, "[output truncated]"));
+    try std.testing.expectEqual(@as(usize, 250_000), result.len);
+    try std.testing.expect(std.mem.indexOf(u8, result, "[output truncated]") == null);
 }
 
-test "scrubToolOutput scrubs secrets and truncates" {
+test "scrubToolOutput scrubs secrets" {
     const allocator = std.testing.allocator;
     const result = try scrubToolOutput(allocator, "cat .env output: api_key=sk_live_abcdef123456");
     defer allocator.free(result);
