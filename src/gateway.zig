@@ -9902,6 +9902,59 @@ fn handleTaskStop(
     }
 }
 
+// ── Scheduled-jobs read-only endpoint (V1.11 — 2026-05-07) ───────────
+// GET /api/v1/users/{user_id}/jobs returns the user's scheduled cron
+// jobs (recurring + one-shot) so the frontend can surface them in the
+// settings / scheduled-tasks UI. The agent's `schedule` tool is the
+// canonical create/cancel path today (natural language: "remind me at
+// 8am every weekday"); this endpoint exposes the resulting state for
+// READ. Mutations stay under the agent for now — when the FE adds a
+// "delete this job" button, we can add DELETE here without needing
+// to redesign the read shape.
+//
+// Backed by `zaki_state.getJobsJson(user_id)` which already returns
+// the canonical job rows as a serialized JSON array (jobs_table → JSONB
+// via SQL); we just wrap it in `{"jobs": ...}` so the response shape
+// matches the rest of the API (e.g., /tasks returns `{"tasks":[...]}`).
+//
+// Empty array when the user has no scheduled jobs OR when state isn't
+// running on Postgres (degraded backend). The FE renders an empty-state
+// card in either case — no need to surface "backend degraded" in the UI.
+fn handleJobList(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
+    user_id: i64,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+
+    // No state manager (file-state degraded mode) → empty list.
+    const state_mgr = state_mgr_opt orelse return .{ .body = "{\"jobs\":[]}" };
+
+    const jobs_json = state_mgr.getJobsJson(allocator, user_id) catch |err| {
+        log.warn("jobs.list failed user_id={d} err={s}", .{ user_id, @errorName(err) });
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"jobs_list_failed\"}" };
+    };
+    defer allocator.free(jobs_json);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"jobs\":") catch return response_build_err;
+    // jobs_json is already a serialized JSON array — splice it in raw.
+    // Defense-in-depth: empty result from getJobsJson should be "[]" but
+    // null-coalesce just in case the schema ever returns NULL.
+    if (jobs_json.len == 0) {
+        w.writeAll("[]") catch return response_build_err;
+    } else {
+        w.writeAll(jobs_json) catch return response_build_err;
+    }
+    w.writeAll("}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
 // ── Usage read-only endpoint (WP2.3) ──────────────────────────────────
 // GET /api/v1/users/{user_id}/usage returns a snapshot of UsageRuntime
 // for the user. It is READ-ONLY: it never materializes a tenant runtime
@@ -15333,6 +15386,17 @@ fn handleApiRoute(
             );
         }
         return handleTaskGet(req_allocator, method, rest, effective_task_delivery);
+    }
+
+    // ── Scheduled-jobs list (V1.11 — 2026-05-07) ────────────────────────
+    // GET /api/v1/users/{id}/jobs — surfaces the user's cron jobs so the
+    // frontend can render a "Scheduled" panel. Read-only for now; the
+    // agent's `schedule` tool owns mutations.
+    if (std.mem.eql(u8, parsed.subpath, "jobs")) {
+        const numeric_user_id = parseNumericUserId(scoped_user_id) catch {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+        };
+        return handleJobList(req_allocator, method, state.zaki_state, numeric_user_id);
     }
 
     // ── Diagnostics (context detail + memory doctor) ────────────────────
