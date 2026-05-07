@@ -227,14 +227,26 @@ pub const ProductPresetsConfig = struct {
             .max_tool_iterations = 100,
             // Per-mode model assignment (2026-04-29 — Nova directive after
             // V4-Pro audit + research):
-            //   Fast:     Kimi K2.5      (cheap, byte-stable prefix, 100 iter cap, queue 8, reasoning low)
-            //   Balanced: DeepSeek V4-Pro (1M ctx, agentic-tuned, 200 iter cap, queue 12, reasoning medium)
-            //   Deep:     DeepSeek V4-Pro (same model + reasoning high — cache-shared with balanced; SWE-bench 80.6, Codeforces 3206)
-            // Why this layout: byte-stable prefix preserved on fast (Kimi
-            // tokenizer unchanged); single new model integration (V4-Pro);
-            // balanced↔deep switch keeps prompt cache warm (same model);
-            // V4-Pro on Together — same provider, no routing complications.
-            .model = "moonshotai/Kimi-K2.5",
+            //   Fast:     Kimi K2.6   (multimodal vision, reasoning low,  256K ctx, $1.20/$4.50)
+            //   Balanced: Kimi K2.6   (multimodal vision, reasoning med,  256K ctx, $1.20/$4.50)
+            //   Deep:     Kimi K2.6   (multimodal vision, reasoning high, 256K ctx, $1.20/$4.50)
+            //
+            // V1.11 hardening (2026-05-07): full switch from V4-Pro to
+            // Kimi K2.6. Rationale per research-kimi-multimodal-2026-05-07.md
+            // and research-together-2026-05-07.md:
+            //   - K2.6 is text + vision + video on Together (DeepSeek V4-Pro
+            //     is text-only; we couldn't see images).
+            //   - SWE-Bench Verified 80.2 — beats Opus 4.6 on SWE-Bench Pro.
+            //     V4-Pro's 80.6 was within margin; the multimodal lift wins.
+            //   - 256K context (V4-Pro on Together is 512K but we rarely
+            //     approach 100K; the headroom isn't earning value).
+            //   - Single model across all 3 modes → balanced↔deep cache
+            //     stays warm (same as our V4-Pro layout); fast→balanced
+            //     also cache-shares now that we no longer switch models.
+            //   - reasoning_effort low/medium/high differentiates the
+            //     modes at thinking depth, not at model identity.
+            //   - One Together model id end-to-end. No routing logic.
+            .model = "moonshotai/Kimi-K2.6",
             .provider = "together",
             // Q3 (2026-04-27): fast = low reasoning effort. Trades thinking
             // depth for latency. Suits casual chat, quick lookups, single-step
@@ -263,20 +275,17 @@ pub const ProductPresetsConfig = struct {
             // multi-tool) regularly hit 30-50 iterations on hard
             // problems; 200 leaves comfortable headroom.
             .max_tool_iterations = 200,
-            // DeepSeek V4-Pro on Together (2026-04-29 swap from Kimi K2.5).
-            // Released 2026-04-24. AA Intelligence Index 87, SWE-bench 80.6,
-            // Codeforces 3206. 1M context. Pricing: $0.435/M input, $3.48/M
-            // output ($0.145 promo input through 2026-05-05). Same OpenAI-
-            // compatible request shape as Kimi (temperature + max_tokens +
-            // reasoning_effort all emitted). reasoning_content streams via
-            // delta.reasoning_content (already wired in providers/sse.zig:123
-            // and providers/compatible.zig:434).
-            .model = "deepseek-ai/DeepSeek-V4-Pro",
+            // V1.11 hardening (2026-05-07) — Kimi K2.6 full switch.
+            // Multimodal vision + reasoning, 256K context, $1.20/$4.50.
+            // Same Together provider as Fast/Deep so prompt cache shares
+            // freely across modes when the user toggles between them.
+            // SWE-Bench Verified 80.2 (beats Opus 4.6 on SWE-Bench Pro).
+            .model = "moonshotai/Kimi-K2.6",
             .provider = "together",
             // Q3 (2026-04-27): balanced = medium reasoning effort. Default
-            // for most users. V4-Pro accepts reasoning_effort field per
-            // DeepSeek API docs — emitted via providers/helpers.zig
-            // isReasoningCapableModel detection.
+            // for most users. K2.6 accepts reasoning_effort per Moonshot
+            // docs — emitted via providers/helpers.zig isReasoningCapableModel
+            // detection (matches "kimi-k2" prefix).
             .reasoning_effort = "medium",
         },
         .summarizer = .{
@@ -304,15 +313,13 @@ pub const ProductPresetsConfig = struct {
             // are the real guardrail; this cap exists only to prevent
             // worst-case runaway.
             .max_tool_iterations = 1000,
-            // DeepSeek V4-Pro on Together (2026-04-29 swap from GLM-5.1).
-            // Same model as balanced — caches share when user switches mode
-            // mid-session. With reasoning_effort=high, V4-Pro produces
-            // measurably better multi-step planning, code synthesis, and
-            // SWE-bench-class autonomous loops than the audited Kimi K2.5
-            // baseline (which had muddled reasoning summaries) or the prior
-            // GLM-5.1 deep config (older, less capable on agent tasks).
-            // OpenRouter fallback exists if Together ever rate-limits.
-            .model = "deepseek-ai/DeepSeek-V4-Pro",
+            // V1.11 hardening (2026-05-07) — Kimi K2.6 full switch (was
+            // V4-Pro). Same model as Fast/Balanced; reasoning_effort=high
+            // is the differentiator. K2.6 multimodal means deep mode now
+            // sees images + video too — useful for screenshot debugging,
+            // diagram analysis, video summarization workflows that were
+            // text-only-blind on V4-Pro.
+            .model = "moonshotai/Kimi-K2.6",
             .provider = "together",
             // Q3 (2026-04-27): deep = high reasoning effort. Trades latency
             // for thinking depth. Suits multi-step research, code review,

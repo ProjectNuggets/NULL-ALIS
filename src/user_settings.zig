@@ -679,7 +679,10 @@ test "applySettingsToConfig fast input applies fast preset" {
     try std.testing.expectEqual(@as(f64, 0.5), cfg.default_temperature);
     try std.testing.expectEqual(@as(u32, 100), cfg.agent.max_tool_iterations);
     try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
-    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.5", cfg.default_model.?);
+    // V1.11 hardening (2026-05-07): full switch to Kimi K2.6 across all
+    // 3 modes — multimodal vision + reasoning toggle, replaces the
+    // K2.5/V4-Pro split. See config_types.zig product_presets comment.
+    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", cfg.default_model.?);
     try std.testing.expectEqualStrings("together", cfg.default_provider);
 }
 
@@ -706,7 +709,10 @@ test "applySettingsToConfig deep input applies deep preset" {
     try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
     try std.testing.expectEqual(@as(u32, 8000), cfg.memory.summarizer.window_size_tokens);
     // Mode-swap 2026-04-29: deep moved from GLM-5.1 → DeepSeek V4-Pro.
-    try std.testing.expectEqualStrings("deepseek-ai/DeepSeek-V4-Pro", cfg.default_model.?);
+    // V1.11 hardening 2026-05-07: full switch to Kimi K2.6 (multimodal,
+    // SWE-Bench Verified 80.2). All 3 modes share K2.6; reasoning_effort
+    // is the per-mode differentiator (low/medium/high).
+    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", cfg.default_model.?);
     try std.testing.expectEqualStrings("together", cfg.default_provider);
 }
 

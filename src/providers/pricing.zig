@@ -81,10 +81,14 @@ const TABLE = [_]Row{
     // current Together rate.
     .{ .match = "kimi-k2.5", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
     .{ .match = "Kimi-K2.5", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
-    .{ .match = "kimi-k2.6", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
-    .{ .match = "Kimi-K2.6", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
     .{ .match = "k2p5", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
-    .{ .match = "k2p6", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
+    // K2.6 (April 2026 release) — multimodal (vision + video). Together
+    // pricing per research-kimi-multimodal-2026-05-07.md: $1.20/M input,
+    // $4.50/M output. Higher than K2.5 because of MoonViT vision parameters
+    // ride along even on text-only requests.
+    .{ .match = "kimi-k2.6", .price = .{ .input_per_million = 1.20, .output_per_million = 4.50 } },
+    .{ .match = "Kimi-K2.6", .price = .{ .input_per_million = 1.20, .output_per_million = 4.50 } },
+    .{ .match = "k2p6", .price = .{ .input_per_million = 1.20, .output_per_million = 4.50 } },
 
     // Together-hosted: Qwen family (multimodal candidate for Fast mode) -----
     .{ .match = "qwen3.6-plus", .price = .{ .input_per_million = 0.50, .output_per_million = 3.00 } },

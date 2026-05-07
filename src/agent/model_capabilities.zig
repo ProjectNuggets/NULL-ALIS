@@ -55,6 +55,11 @@ const MODEL_TABLE = [_]ModelEntry{
     // Moonshot / Kimi
     .{ .key = "kimi-k2.5", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
     .{ .key = "k2p5", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
+    // V1.11 hardening (2026-05-07) — K2.6 full switch. Multimodal (vision +
+    // video), 256K context, SWE-Bench Verified 80.2. Same context window as
+    // K2.5; Moonshot kept it at 256K rather than expanding.
+    .{ .key = "kimi-k2.6", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
+    .{ .key = "k2p6", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
     // DeepSeek
     .{ .key = "deepseek-v3.2", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     .{ .key = "deepseek-chat", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
