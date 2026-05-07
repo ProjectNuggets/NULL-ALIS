@@ -2128,6 +2128,16 @@ const ManagerImpl = struct {
     }
 
     pub fn getJobsJson(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]u8 {
+        // ME-01 fix (2026-05-07): COALESCE raw_job before the jsonb_set
+        // chain. If any row has NULL raw_job, the chain returns NULL and
+        // jsonb_agg includes a NULL element in the output array
+        // (`[null, {...}, ...]`), making the FE crash on `.map`.
+        // ME-02 fix (2026-05-07): LIMIT 500. Pre-fix the endpoint
+        // materialized every row a user has ever scheduled — fine for
+        // current tenants (max ~5 jobs each), but unbounded by design.
+        // 500 is the FE pagination ceiling and matches the brain
+        // BRAIN_DEFAULT_MAX_NODES sibling; if a user ever exceeds 500
+        // scheduled jobs we want to know.
         const q = try self.buildQuery(
             "SELECT COALESCE(jsonb_agg(job_json ORDER BY created_at), '[]'::jsonb)::text FROM (" ++
                 " SELECT created_at, " ++
@@ -2135,7 +2145,7 @@ const ManagerImpl = struct {
                 "   jsonb_set(" ++
                 "     jsonb_set(" ++
                 "       jsonb_set(" ++
-                "         jsonb_set(raw_job, '{enabled}', to_jsonb(enabled), true)," ++
+                "         jsonb_set(COALESCE(raw_job, '{}'::jsonb), '{enabled}', to_jsonb(enabled), true)," ++
                 "         '{paused}', to_jsonb(CASE WHEN enabled THEN COALESCE((raw_job->>'paused')::boolean, false) ELSE TRUE END), true" ++
                 "       )," ++
                 "       '{last_status}', CASE WHEN last_status IS NULL THEN 'null'::jsonb ELSE to_jsonb(last_status) END, true" ++
@@ -2145,6 +2155,7 @@ const ManagerImpl = struct {
                 "   '{next_run_secs}', CASE WHEN next_run_at IS NULL THEN 'null'::jsonb ELSE to_jsonb(EXTRACT(EPOCH FROM next_run_at)::bigint) END, true" ++
                 " ) AS job_json" ++
                 " FROM {schema}.jobs WHERE user_id = $1" ++
+                " ORDER BY created_at LIMIT 500" ++
                 " ) job_rows",
         );
         defer self.allocator.free(q);
@@ -3776,16 +3787,21 @@ const ManagerImpl = struct {
         return try decodeMemoryRows(allocator, result, false);
     }
 
-    /// V1.7a-8a — Orphan memories: brain-visible, currently-live rows that
-    /// have NO active edges (neither incoming nor outgoing). Powers
-    /// `/brain/orphans` — Obsidian's "show orphans" affordance for finding
-    /// lost notes that never connected to anything.
+    /// V1.7a-8a — Orphan memories: brain-visible rows that have NO
+    /// active edges (neither incoming nor outgoing). Powers
+    /// `/brain/orphans` — Obsidian's "show orphans" affordance for
+    /// finding loose facts that never connected to anything.
     ///
-    /// Bi-temporal correctness: applies MEMORIES_VALIDITY_FILTER to the
-    /// memories row AND `is_latest` to the memory_edges subquery. We
-    /// want "currently has no LIVE edges", not "never had any edges" —
-    /// a row that LOST all its edges via supersession SHOULD show up as
-    /// an orphan today (it is one, in the present).
+    /// Bi-temporal posture (V1.11 update, 2026-05-07): does NOT apply
+    /// MEMORIES_VALIDITY_FILTER. Per Nova: "don't filter" archived from
+    /// loose facts. An archived/superseded fact that was also never
+    /// linked is still a loose fact — in fact more suspicious (it
+    /// expired without ever joining the graph). The FE renders the
+    /// `valid_to` field so users can tell archived from live; it's not
+    /// the SQL's job to hide archived rows. `is_latest` IS still
+    /// applied to the memory_edges NOT EXISTS subquery so a row whose
+    /// edges all ended up superseded still surfaces as an orphan
+    /// (it is one, in the present).
     ///
     /// Hygiene: BRAIN_USER_KEY_FILTER excludes continuity / autosave /
     /// tombstone keys (the agent's bookkeeping rows are always orphans
@@ -11284,8 +11300,11 @@ test "V1.7a-7 getMemoriesByKeys — batch fetch + validity + scoping + escape" {
 //      returned — agent bookkeeping rows are always orphans by design)
 //   5. Memory whose edges were ALL closed (is_latest=FALSE) → orphan
 //      in the present (validity-aware on the edge subquery)
-//   6. Superseded memory (validity-filtered) → NOT returned even with
-//      no edges (must be currently live)
+//   6. Superseded-but-edgeless memory → ALSO returned. V1.11 update
+//      (2026-05-07, Nova directive: "don't filter"): the validity
+//      filter on the memories row was removed. An archived fact that
+//      was never linked is still a loose fact (in fact more suspicious).
+//      The FE renders valid_to so users can tell archived from live.
 //   7. Cross-tenant: user 99 sees nothing of user 2's data
 test "V1.7a-8a listOrphanMemories — orphans + edge-loss + hygiene + scoping" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
@@ -11352,21 +11371,26 @@ test "V1.7a-8a listOrphanMemories — orphans + edge-loss + hygiene + scoping" {
         var seen_orphan = false;
         var seen_lost_edge = false;
         var seen_lost_partner = false;
+        var seen_superseded_orphan = false;
         for (orphans) |e| {
             try std.testing.expect(memory_root.isBrainVisibleKey(e.key));
             if (std.mem.eql(u8, e.key, "mem_orphan")) seen_orphan = true;
             if (std.mem.eql(u8, e.key, "mem_lost_edge")) seen_lost_edge = true;
             if (std.mem.eql(u8, e.key, "mem_lost_partner")) seen_lost_partner = true;
+            if (std.mem.eql(u8, e.key, "mem_superseded_orphan")) seen_superseded_orphan = true;
             // Negative checks
             try std.testing.expect(!std.mem.eql(u8, e.key, "mem_with_outgoing"));
             try std.testing.expect(!std.mem.eql(u8, e.key, "mem_target"));
-            try std.testing.expect(!std.mem.eql(u8, e.key, "mem_superseded_orphan"));
             try std.testing.expect(!std.mem.startsWith(u8, e.key, "summary_latest/"));
         }
         try std.testing.expect(seen_orphan); // (1) no-edge orphan returned
         try std.testing.expect(seen_lost_edge); // (5) edge-loss surfaces both
         try std.testing.expect(seen_lost_partner); //     endpoints as orphans
-        try std.testing.expectEqual(@as(usize, 3), orphans.len);
+        // V1.11 (2026-05-07) — superseded-but-edgeless rows now surface
+        // as loose facts (acceptance #6 was inverted by the validity
+        // filter removal per Nova "don't filter").
+        try std.testing.expect(seen_superseded_orphan);
+        try std.testing.expectEqual(@as(usize, 4), orphans.len);
     }
 
     // ── Cross-tenant ──────────────────────────────────────────────

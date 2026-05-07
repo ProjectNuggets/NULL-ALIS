@@ -589,6 +589,18 @@ pub const SubagentManager = struct {
         const owned_result = if (result) |r| self.allocator.dupe(u8, r) catch null else null;
         const owned_err = if (err_msg) |e| self.allocator.dupe(u8, e) catch null else null;
 
+        // HI-01 fix (2026-05-07): if the task entry was removed from the
+        // map between thread spawn and completion (e.g., clearTasksLocked
+        // during attachPostgresLedger, future cancel-during-run paths),
+        // the dupes above would leak — neither owned_result nor owned_err
+        // gets transferred into state.{result,error_msg} below. Track
+        // transfer explicitly and free on the failure path.
+        var transferred = false;
+        defer if (!transferred) {
+            if (owned_result) |r| self.allocator.free(r);
+            if (owned_err) |e| self.allocator.free(e);
+        };
+
         var label: []const u8 = "subagent";
         var origin_channel: []const u8 = "system";
         var origin_chat_id: []const u8 = "agent";
@@ -602,6 +614,7 @@ pub const SubagentManager = struct {
                 state.status = if (owned_err != null) .failed else .completed;
                 state.result = owned_result;
                 state.error_msg = owned_err;
+                transferred = true;
                 state.completed_at = std.time.milliTimestamp();
                 self.persistTaskSnapshotLocked(task_id, state);
                 label = state.label;

@@ -924,7 +924,15 @@ pub const Agent = struct {
 
         // iter23: turn-window trim deleted (12K-era leftover). Token-budget
         // autoCompactHistory is the single source of truth for when to compact.
-        // Fires at compaction_trigger (50% of model window) via Pass A/B/C.
+        //
+        // HI-04 fix (2026-05-07): the prior comment was wrong on TWO counts.
+        // (1) The 50% `compaction_trigger` is an ADVISORY marker for the
+        //     /context UI and the agent's "mind your length" hint; it does
+        //     NOT fire compaction. Actual compaction fires inside
+        //     autoCompactHistory at 70% (Pass A: cheap dedup) and 90%
+        //     (Pass C: LLM summarization).
+        // (2) Pass B was deleted in iter28 (commit 8136f8d) — only A and C
+        //     remain. The "/B" reference was stale.
         const compacted = try compaction.autoCompactHistory(self.allocator, &self.history, compact_provider, compact_model, cfg);
         if (compacted) self.recordCompactionSavings(before_tokens, compaction.tokenEstimate(self.history.items));
         return compacted;

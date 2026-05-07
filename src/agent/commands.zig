@@ -3846,7 +3846,17 @@ pub fn composeFinalReply(
 ) ![]const u8 {
     const trimmed_base = std.mem.trim(u8, base_text, " \t\r\n");
     const has_visible_text = trimmed_base.len > 0;
-    const has_reasoning = reasoning_content != null and reasoning_content.?.len > 0;
+    // ME-05 fix (2026-05-07): test the TRIMMED reasoning length, not the
+    // raw length. Pre-fix `has_reasoning = reasoning_content.?.len > 0`
+    // was true for `"   \n  "` (whitespace-only), the fallback then
+    // trimmed to empty, and the user got an empty reply — defeating the
+    // V1.11 V4-Pro fix. Trim once at the source so both the gate and the
+    // fallback see the same string.
+    const trimmed_reasoning: []const u8 = if (reasoning_content) |r|
+        std.mem.trim(u8, r, " \t\r\n")
+    else
+        "";
+    const has_reasoning = trimmed_reasoning.len > 0;
 
     // V1.11 (2026-05-07) — empty-content fallback to reasoning_content.
     //
@@ -3869,7 +3879,7 @@ pub fn composeFinalReply(
     const final_base: []const u8 = if (has_visible_text)
         trimmed_base
     else if (has_reasoning)
-        std.mem.trim(u8, reasoning_content.?, " \t\r\n")
+        trimmed_reasoning
     else
         base_text;
 
