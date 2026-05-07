@@ -88,6 +88,43 @@ pub fn isRateLimited(err_msg: []const u8) bool {
             std.mem.indexOf(u8, lower, "too many") != null);
 }
 
+/// V1.11 hardening (2026-05-07) — Together / Anthropic / OpenRouter
+/// transient overload detection. Mirrors `error_classify.isOverloadedText`
+/// so tests in this file can stay self-contained. Distinct from
+/// `isRateLimited` because no key rotation is needed (overload is
+/// provider-side capacity, not attributable to one tenant).
+pub fn isOverloaded(err_msg: []const u8) bool {
+    var lower_buf: [512]u8 = undefined;
+    const check_len = @min(err_msg.len, lower_buf.len);
+    for (err_msg[0..check_len], 0..) |c, idx| {
+        lower_buf[idx] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..check_len];
+
+    if (std.mem.indexOf(u8, lower, "overloaded") != null or
+        std.mem.indexOf(u8, lower, "overloaded_error") != null or
+        std.mem.indexOf(u8, lower, "service unavailable") != null or
+        std.mem.indexOf(u8, lower, "service_unavailable") != null or
+        std.mem.indexOf(u8, lower, "model is currently loading") != null or
+        std.mem.indexOf(u8, lower, "model is loading") != null or
+        std.mem.indexOf(u8, lower, "temporarily unavailable") != null or
+        std.mem.indexOf(u8, lower, "provideroverloaded") != null)
+    {
+        return true;
+    }
+
+    // 503 paired with any of these signal words
+    if (std.mem.indexOf(u8, lower, "503") != null and
+        (std.mem.indexOf(u8, lower, "service") != null or
+            std.mem.indexOf(u8, lower, "unavailable") != null or
+            std.mem.indexOf(u8, lower, "overload") != null))
+    {
+        return true;
+    }
+
+    return false;
+}
+
 pub fn isTimeout(err_msg: []const u8) bool {
     var lower_buf: [512]u8 = undefined;
     const check_len = @min(err_msg.len, lower_buf.len);
@@ -310,6 +347,11 @@ pub const ReliableProvider = struct {
         if (isTimeout(err_slice)) return error.Timeout;
         if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
         if (isRateLimited(err_slice)) return error.RateLimited;
+        // V1.11 hardening (2026-05-07): preserve overload distinct from
+        // generic AllProvidersFailed so dashboards can distinguish "we
+        // exhausted retries because the provider was saturated" from "we
+        // exhausted retries because the request was malformed."
+        if (isOverloaded(err_slice)) return error.ProviderOverloaded;
         if (std.mem.eql(u8, err_slice, "ProviderDoesNotSupportVision")) return error.ProviderDoesNotSupportVision;
         return error.AllProvidersFailed;
     }
@@ -723,6 +765,25 @@ test "isTimeout detection" {
     try std.testing.expect(isTimeout("Timeout"));
     try std.testing.expect(isTimeout("operation timed out"));
     try std.testing.expect(!isTimeout("RateLimited"));
+}
+
+test "isOverloaded detection" {
+    // V1.11 hardening (2026-05-07) — Together / Anthropic / OpenRouter
+    // overload detection. These patterns must trip the retry-with-backoff
+    // path (NOT the non-retryable break path) so a saturated provider on
+    // demo day doesn't kill the user's request.
+    try std.testing.expect(isOverloaded("503 Service Unavailable"));
+    try std.testing.expect(isOverloaded("Anthropic returned overloaded_error"));
+    try std.testing.expect(isOverloaded("model is currently loading, please retry"));
+    try std.testing.expect(isOverloaded("model is loading"));
+    try std.testing.expect(isOverloaded("upstream model overloaded"));
+    try std.testing.expect(isOverloaded("Service temporarily unavailable"));
+    try std.testing.expect(isOverloaded("ProviderOverloaded"));
+    // Ensure we don't false-positive
+    try std.testing.expect(!isOverloaded("429 Too Many Requests"));
+    try std.testing.expect(!isOverloaded("401 Unauthorized"));
+    try std.testing.expect(!isOverloaded("Timeout"));
+    try std.testing.expect(!isOverloaded(""));
 }
 
 test "parseRetryAfterMs integer" {

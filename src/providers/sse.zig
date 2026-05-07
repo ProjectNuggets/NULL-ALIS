@@ -15,6 +15,21 @@ pub const SseToolCallDelta = struct {
     }
 };
 
+/// V1.11 hardening (2026-05-07) — usage emitted in SSE stream when
+/// `stream_options.include_usage=true` was set on the request. Together,
+/// OpenRouter, Groq, and Moonshot emit a final pre-`[DONE]` chunk shaped
+/// like `{choices:[], usage: {prompt_tokens, completion_tokens, ...}}`.
+/// Parsing this lets us replace the prior `char_count/4` heuristic with
+/// the provider's authoritative count, fixing pricing.zig accuracy on
+/// reasoning-heavy turns and unblocking quota enforcement.
+pub const SseUsage = struct {
+    prompt_tokens: u32 = 0,
+    completion_tokens: u32 = 0,
+    total_tokens: u32 = 0,
+    reasoning_tokens: u32 = 0,
+    cached_tokens: u32 = 0,
+};
+
 /// Result of parsing a single SSE line.
 pub const SseLineResult = struct {
     /// Text delta content (owned, caller frees).
@@ -25,6 +40,11 @@ pub const SseLineResult = struct {
     reasoning: ?[]const u8 = null,
     /// Structured tool call deltas (owned, caller frees).
     tool_call_deltas: []const SseToolCallDelta = &.{},
+    /// Authoritative usage report (V1.11 hardening). Populated only when the
+    /// provider emits a final `usage` chunk per OpenAI spec
+    /// `stream_options.include_usage=true`. Replaces the post-stream
+    /// completion-token estimation.
+    usage: ?SseUsage = null,
     /// Stream is complete ([DONE] sentinel).
     done: bool = false,
 
@@ -36,7 +56,8 @@ pub const SseLineResult = struct {
     }
 
     fn isSkip(self: SseLineResult) bool {
-        return !self.done and self.text == null and self.reasoning == null and self.tool_call_deltas.len == 0;
+        return !self.done and self.text == null and self.reasoning == null and
+            self.tool_call_deltas.len == 0 and self.usage == null;
     }
 };
 
@@ -75,8 +96,6 @@ pub fn extractSseEvent(allocator: std.mem.Allocator, json_str: []const u8) !SseL
         .object => |object| object,
         else => return .{},
     };
-    const choices = obj.get("choices") orelse return .{};
-    if (choices != .array or choices.array.items.len == 0) return .{};
 
     var text_builder: std.ArrayListUnmanaged(u8) = .empty;
     errdefer text_builder.deinit(allocator);
@@ -90,7 +109,16 @@ pub fn extractSseEvent(allocator: std.mem.Allocator, json_str: []const u8) !SseL
         tool_deltas.deinit(allocator);
     }
 
-    for (choices.array.items) |choice| {
+    // V1.11 hardening (2026-05-07): the OpenAI-spec final usage chunk
+    // arrives with `choices: []` (empty) and the usage object at the
+    // top level. Pre-fix this function early-returned on empty choices,
+    // dropping the usage payload. Now we walk choices when present and
+    // extract usage independently below — both/either path is fine.
+    const choices_opt: ?std.json.Value = obj.get("choices");
+    if (choices_opt) |choices_v| {
+        if (choices_v == .array) {
+            const choices_array = choices_v.array;
+            for (choices_array.items) |choice| {
         const choice_obj = switch (choice) {
             .object => |object| object,
             else => continue,
@@ -177,6 +205,8 @@ pub fn extractSseEvent(allocator: std.mem.Allocator, json_str: []const u8) !SseL
                 try tool_deltas.append(allocator, tool_delta);
             }
         }
+            }
+        }
     }
 
     var result = SseLineResult{};
@@ -198,6 +228,56 @@ pub fn extractSseEvent(allocator: std.mem.Allocator, json_str: []const u8) !SseL
         result.tool_call_deltas = try tool_deltas.toOwnedSlice(allocator);
     } else {
         tool_deltas.deinit(allocator);
+    }
+
+    // V1.11 hardening (2026-05-07): authoritative usage when the provider
+    // emits a final usage chunk. OpenAI-spec shape:
+    //   { "usage": {
+    //       "prompt_tokens": N, "completion_tokens": N, "total_tokens": N,
+    //       "completion_tokens_details": { "reasoning_tokens": N },
+    //       "prompt_tokens_details": { "cached_tokens": N }
+    //   }}
+    // The chunk usually has empty `choices`; we read it independently.
+    if (obj.get("usage")) |usage_value| {
+        if (usage_value == .object) {
+            const usage_obj = usage_value.object;
+            var u = SseUsage{};
+            if (usage_obj.get("prompt_tokens")) |v| {
+                if (v == .integer and v.integer >= 0) u.prompt_tokens = @intCast(v.integer);
+            }
+            if (usage_obj.get("completion_tokens")) |v| {
+                if (v == .integer and v.integer >= 0) u.completion_tokens = @intCast(v.integer);
+            }
+            if (usage_obj.get("total_tokens")) |v| {
+                if (v == .integer and v.integer >= 0) u.total_tokens = @intCast(v.integer);
+            }
+            // Reasoning tokens — DeepSeek V4-Pro / OpenAI o-series both nest
+            // under completion_tokens_details. Some providers (Kimi, Groq)
+            // emit reasoning_tokens at the top level.
+            if (usage_obj.get("completion_tokens_details")) |details_v| {
+                if (details_v == .object) {
+                    if (details_v.object.get("reasoning_tokens")) |rt| {
+                        if (rt == .integer and rt.integer >= 0) u.reasoning_tokens = @intCast(rt.integer);
+                    }
+                }
+            }
+            if (usage_obj.get("reasoning_tokens")) |v| {
+                if (v == .integer and v.integer >= 0) u.reasoning_tokens = @intCast(v.integer);
+            }
+            // Cached tokens for prompt-cache hit accounting (Anthropic-style
+            // cache_control reuse, Together prefix-match, etc.)
+            if (usage_obj.get("prompt_tokens_details")) |details_v| {
+                if (details_v == .object) {
+                    if (details_v.object.get("cached_tokens")) |ct| {
+                        if (ct == .integer and ct.integer >= 0) u.cached_tokens = @intCast(ct.integer);
+                    }
+                }
+            }
+            if (usage_obj.get("cached_tokens")) |v| {
+                if (v == .integer and v.integer >= 0) u.cached_tokens = @intCast(v.integer);
+            }
+            result.usage = u;
+        }
     }
 
     return result;
@@ -401,6 +481,11 @@ const OpenAiStreamCtx = struct {
     reasoning_accumulated: std.ArrayListUnmanaged(u8) = .empty,
     line_buf: std.ArrayListUnmanaged(u8) = .empty,
     tool_call_accumulators: std.ArrayListUnmanaged(ToolCallAccumulator) = .empty,
+    /// V1.11 hardening (2026-05-07): authoritative usage from the provider's
+    /// final stream chunk (when stream_options.include_usage=true was sent).
+    /// null = provider didn't emit usage; finalize falls back to char-count
+    /// estimation as before.
+    stream_usage: ?SseUsage = null,
 
     /// Live-stream XML tool-call suppression state. When the model falls back
     /// to emitting `<invoke>`/`<tool_call>` XML inside content (Kimi K2.5
@@ -563,6 +648,12 @@ fn appendToolCallDelta(ctx: *OpenAiStreamCtx, delta: SseToolCallDelta) !void {
 fn processSseEvent(ctx: *OpenAiStreamCtx, event: SseLineResult) !bool {
     defer event.deinit(ctx.allocator);
 
+    // V1.11 hardening (2026-05-07): capture authoritative usage when the
+    // provider emits the OpenAI-spec usage chunk (stream_options.include_usage
+    // was set). This chunk often arrives BEFORE [DONE], with empty choices,
+    // so we record it regardless of done state.
+    if (event.usage) |u| ctx.stream_usage = u;
+
     if (event.done) return false;
 
     if (event.text) |text| {
@@ -677,6 +768,23 @@ fn finalizeOpenAiStream(ctx: *OpenAiStreamCtx) !root.StreamChatResult {
         }
     }
     ctx.callback(ctx.callback_ctx, root.StreamChunk.finalChunk());
+
+    // V1.11 hardening (2026-05-07): prefer authoritative provider-emitted
+    // usage over the char-count heuristic. Only fall back to estimation
+    // when stream_options.include_usage was rejected or the provider didn't
+    // honor it. The estimate was off by 30-50% on reasoning-heavy turns,
+    // which made pricing.zig cost attribution unreliable and the entitlement
+    // monthly_weight_budget enforcement effectively blind.
+    const usage_out: root.TokenUsage = if (ctx.stream_usage) |u| .{
+        .prompt_tokens = u.prompt_tokens,
+        .completion_tokens = u.completion_tokens,
+        .total_tokens = if (u.total_tokens > 0) u.total_tokens else (u.prompt_tokens + u.completion_tokens),
+        .reasoning_tokens = u.reasoning_tokens,
+        .cached_prompt_tokens = u.cached_tokens,
+    } else .{
+        .completion_tokens = @intCast((ctx.accumulated.items.len + 3) / 4),
+    };
+
     return .{
         .content = if (ctx.accumulated.items.len > 0) try ctx.allocator.dupe(u8, ctx.accumulated.items) else null,
         .reasoning_content = if (ctx.reasoning_accumulated.items.len > 0)
@@ -684,7 +792,7 @@ fn finalizeOpenAiStream(ctx: *OpenAiStreamCtx) !root.StreamChatResult {
         else
             null,
         .tool_calls = try buildToolCalls(ctx.allocator, ctx.tool_call_accumulators.items),
-        .usage = .{ .completion_tokens = @intCast((ctx.accumulated.items.len + 3) / 4) },
+        .usage = usage_out,
         .model = "",
     };
 }
@@ -1429,6 +1537,82 @@ test "openai stream accumulates split tool calls and visible text" {
     try std.testing.expectEqualStrings("call_abc", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("web_search", result.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"query\":\"HRS news\"}", result.tool_calls[0].arguments);
+}
+
+test "openai stream captures authoritative usage from final chunk" {
+    // V1.11 hardening (2026-05-07) — when stream_options.include_usage=true
+    // is set on the request, the provider emits a final pre-`[DONE]` chunk
+    // shaped like `{choices:[], usage:{prompt_tokens:N, completion_tokens:N,
+    // total_tokens:N, completion_tokens_details:{reasoning_tokens:N}}}`. The
+    // stream context must capture this and prefer it over the char-count
+    // heuristic at finalize. Pre-fix this chunk was treated as a no-op
+    // because `choices` was empty, so completion_tokens stayed at the
+    // `chars/4` estimate (off by 30-50% on reasoning-heavy turns).
+    const allocator = std.testing.allocator;
+
+    var recorder = StreamRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var stream_ctx = OpenAiStreamCtx{
+        .allocator = allocator,
+        .callback = StreamRecorder.onChunk,
+        .callback_ctx = &recorder,
+    };
+    defer stream_ctx.deinit();
+
+    // 1. Normal content delta
+    try stream_ctx.line_buf.appendSlice(allocator, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello world\"}}]}");
+    try std.testing.expect(try handleOpenAiLine(&stream_ctx));
+
+    // 2. Final usage chunk (empty choices, populated usage with reasoning + cache)
+    try stream_ctx.line_buf.appendSlice(allocator,
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":47,\"total_tokens\":167,\"completion_tokens_details\":{\"reasoning_tokens\":35},\"prompt_tokens_details\":{\"cached_tokens\":80}}}");
+    try std.testing.expect(try handleOpenAiLine(&stream_ctx));
+
+    // 3. [DONE] sentinel
+    try stream_ctx.line_buf.appendSlice(allocator, "data: [DONE]");
+    try std.testing.expect(!(try handleOpenAiLine(&stream_ctx)));
+
+    var result = try finalizeOpenAiStream(&stream_ctx);
+    defer freeStreamChatResult(allocator, &result);
+
+    try std.testing.expectEqual(@as(u32, 120), result.usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 47), result.usage.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 167), result.usage.total_tokens);
+    try std.testing.expectEqual(@as(u32, 35), result.usage.reasoning_tokens);
+    try std.testing.expectEqual(@as(u32, 80), result.usage.cached_prompt_tokens);
+}
+
+test "openai stream falls back to estimate when usage chunk absent" {
+    // Pre-V1.11-hardening behavior: when the provider doesn't emit a usage
+    // chunk (didn't honor stream_options.include_usage, or older provider),
+    // completion_tokens estimates from accumulated character count. Guard
+    // that the fallback path still works.
+    const allocator = std.testing.allocator;
+
+    var recorder = StreamRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var stream_ctx = OpenAiStreamCtx{
+        .allocator = allocator,
+        .callback = StreamRecorder.onChunk,
+        .callback_ctx = &recorder,
+    };
+    defer stream_ctx.deinit();
+
+    // 16-char content → 4 estimated tokens
+    try stream_ctx.line_buf.appendSlice(allocator, "data: {\"choices\":[{\"delta\":{\"content\":\"Sixteen-char str\"}}]}");
+    try std.testing.expect(try handleOpenAiLine(&stream_ctx));
+    try stream_ctx.line_buf.appendSlice(allocator, "data: [DONE]");
+    try std.testing.expect(!(try handleOpenAiLine(&stream_ctx)));
+
+    var result = try finalizeOpenAiStream(&stream_ctx);
+    defer freeStreamChatResult(allocator, &result);
+
+    try std.testing.expectEqual(@as(u32, 0), result.usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 4), result.usage.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 0), result.usage.total_tokens);
+    try std.testing.expectEqual(@as(u32, 0), result.usage.reasoning_tokens);
 }
 
 test "openai stream accumulates multiple parallel tool calls" {

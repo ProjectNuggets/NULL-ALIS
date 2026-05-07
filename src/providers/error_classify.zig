@@ -4,6 +4,16 @@ pub const ApiErrorKind = enum {
     rate_limited,
     context_exhausted,
     vision_unsupported,
+    /// V1.11 hardening (2026-05-07): transient provider-side overload that
+    /// is retryable but distinct from rate-limiting. Together emits 503 with
+    /// "model overloaded", "service unavailable", or "model is currently
+    /// loading" when its inference workers are saturated. Pre-fix these
+    /// were classified as `.other` and surfaced to the agent as fatal,
+    /// breaking the demo on a transient burst. Now they trip the reliable
+    /// retry path the same way as `.rate_limited` (with backoff). Anthropic
+    /// uses `overloaded_error` in its error.type field; this catches that
+    /// shape too.
+    transient_overload,
     other,
 };
 
@@ -12,8 +22,36 @@ pub fn kindToError(kind: ApiErrorKind) anyerror {
         .rate_limited => error.RateLimited,
         .context_exhausted => error.ContextLengthExceeded,
         .vision_unsupported => error.ProviderDoesNotSupportVision,
+        .transient_overload => error.ProviderOverloaded,
         .other => error.ApiError,
     };
+}
+
+/// V1.11 hardening (2026-05-07) — server-side overload detection. Patterns
+/// drawn from Together (503 / "overloaded" / "model is loading"), Anthropic
+/// ("overloaded_error" type), and OpenRouter ("upstream model unavailable").
+/// Distinct from rate limiting because the retry policy may differ
+/// (overload usually clears in 5-30s without per-tenant attribution; rate
+/// limit may need full minute window).
+pub fn isOverloadedText(text: []const u8) bool {
+    if (text.len == 0) return false;
+
+    if (containsAsciiFold(text, "overloaded") or
+        containsAsciiFold(text, "overloaded_error") or
+        containsAsciiFold(text, "service unavailable") or
+        containsAsciiFold(text, "service_unavailable") or
+        containsAsciiFold(text, "model is currently loading") or
+        containsAsciiFold(text, "model_is_loading") or
+        containsAsciiFold(text, "model is loading") or
+        containsAsciiFold(text, "model unavailable") or
+        containsAsciiFold(text, "upstream model unavailable") or
+        containsAsciiFold(text, "temporarily unavailable") or
+        containsAsciiFold(text, "currently overloaded"))
+    {
+        return true;
+    }
+
+    return false;
 }
 
 fn sliceEqlAsciiFold(a: []const u8, b: []const u8) bool {
@@ -124,22 +162,29 @@ fn classifyFromFields(
     if (status) |status_code| {
         if (status_code == 429 or status_code == 408) return .rate_limited;
         if (status_code == 413) return .context_exhausted;
+        // V1.11 hardening: 503 = service unavailable. Together returns this
+        // when inference workers are saturated or a model is loading; treat
+        // as retryable transient overload, not fatal.
+        if (status_code == 503) return .transient_overload;
     }
 
     if (message) |msg| {
         if (isRateLimitedText(msg)) return .rate_limited;
         if (isContextExhaustedText(msg)) return .context_exhausted;
         if (isVisionUnsupportedText(msg)) return .vision_unsupported;
+        if (isOverloadedText(msg)) return .transient_overload;
     }
     if (type_name) |typ| {
         if (isRateLimitedText(typ)) return .rate_limited;
         if (isContextExhaustedText(typ)) return .context_exhausted;
         if (isVisionUnsupportedText(typ)) return .vision_unsupported;
+        if (isOverloadedText(typ)) return .transient_overload;
     }
     if (code) |raw_code| {
         if (isRateLimitedText(raw_code)) return .rate_limited;
         if (isContextExhaustedText(raw_code)) return .context_exhausted;
         if (isVisionUnsupportedText(raw_code)) return .vision_unsupported;
+        if (isOverloadedText(raw_code)) return .transient_overload;
     }
 
     return .other;

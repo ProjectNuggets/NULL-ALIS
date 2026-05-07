@@ -814,7 +814,18 @@ fn buildStreamingChatRequestBody(
         }
     }
 
-    try buf.appendSlice(allocator, ",\"stream\":true}");
+    // V1.11 hardening (2026-05-07): opt into per-stream usage telemetry.
+    // OpenAI-spec `stream_options.include_usage=true` causes the provider
+    // to emit a final SSE chunk containing the full `usage` object
+    // (prompt_tokens, completion_tokens, total_tokens, sometimes
+    // reasoning_tokens, sometimes prompt_tokens_details with cached
+    // breakdown). Together, OpenRouter, Groq, and Moonshot all honor
+    // this flag. Without it the streaming path returns
+    // `usage.completion_tokens = char_count/4` — a heuristic that
+    // makes pricing.zig estimates wrong by 30-50% on reasoning-heavy
+    // turns. The SSE parser (sse.zig) reads the usage chunk into
+    // StreamChatResult.usage when present.
+    try buf.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
 
     return try buf.toOwnedSlice(allocator);
 }
