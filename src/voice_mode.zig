@@ -48,13 +48,14 @@ pub fn resolveCapability(channel: []const u8) VoiceCapability {
     // back one at a time with their matching attachment-dispatch code
     // landing in the same commit.
     if (std.ascii.eqlIgnoreCase(channel, "telegram")) return .{ .stt = true, .tts = true };
-    // V1.11 hardening (2026-05-07): zaki_app gains STT after the
-    // /api/v1/chat/stream `audio` field path landed — backend transcribes
-    // and feeds the agent. TTS output to the app is NOT wired yet (would
-    // need an `audio_reply` SSE event on the chat stream + FE player); set
-    // to true ONLY when that delivery path lands. Honesty contract: this
-    // descriptor reflects working wire paths, not intent.
-    if (std.ascii.eqlIgnoreCase(channel, "zaki_app")) return .{ .stt = true, .tts = false };
+    // V1.11 hardening (2026-05-07): zaki_app full audio loop. STT lives
+    // at /api/v1/chat/stream's `audio` field (gateway transcribes via
+    // configured STT provider, feeds agent). TTS lives via the
+    // `audio_reply` SSE event the chat-stream now emits between the last
+    // token and `done` — gateway extracts the agent's `[AUDIO:/abs/path]`
+    // marker, reads the file, base64-encodes, ships to the FE. FE
+    // `<audio>` tag plays it. Both directions wire-confirmed.
+    if (std.ascii.eqlIgnoreCase(channel, "zaki_app")) return .{ .stt = true, .tts = true };
     return .{ .stt = false, .tts = false };
 }
 
@@ -170,14 +171,14 @@ test "resolveCapability slack returns no audio (S7.9 — no audio-send path yet)
     try std.testing.expect(!cap.tts);
 }
 
-test "resolveCapability zaki_app: STT live (V1.11), TTS not yet" {
-    // V1.11 hardening (2026-05-07): /api/v1/chat/stream now accepts an
-    // `audio` field and transcribes server-side via the configured STT
-    // provider, feeding the transcript to the agent. So zaki_app is
-    // STT-capable as of this version. TTS to the app would need an
-    // `audio_reply` SSE event on the chat stream + FE audio player —
-    // not yet wired; flag stays false.
+test "resolveCapability zaki_app: full audio loop (V1.11)" {
+    // V1.11 hardening (2026-05-07): both directions wired.
+    //   STT: /api/v1/chat/stream `audio` field → gateway transcribes →
+    //        agent receives [voice]-prefixed transcript.
+    //   TTS: agent produces [AUDIO:/abs/path]\n<text> → gateway extracts
+    //        marker, reads file, base64-encodes, emits audio_reply SSE
+    //        event before done. FE plays via <audio> tag.
     const cap = resolveCapability("zaki_app");
     try std.testing.expect(cap.stt);
-    try std.testing.expect(!cap.tts);
+    try std.testing.expect(cap.tts);
 }

@@ -8443,6 +8443,64 @@ fn sseTokenFrame(allocator: std.mem.Allocator, delta: []const u8, seq: usize) ![
     return buf.toOwnedSlice(allocator);
 }
 
+/// V1.11 hardening (2026-05-07) — audio_reply SSE frame for the zaki_app
+/// channel. When the agent emits an `[AUDIO:/abs/path]\n<text>` reply
+/// (because tts_audio was on AND ttsAudioChannelSupported returned true
+/// for zaki_app), this frame carries the synthesized audio to the FE
+/// before the `done` frame. FE plays it via an `<audio>` tag with the
+/// base64 data URL.
+///
+/// Frame shape:
+///   event: audio_reply
+///   data: {"type":"audio_reply","audio":"<base64>","format":"mp3","bytes":<n>}
+fn sseAudioReplyFrame(
+    allocator: std.mem.Allocator,
+    audio_b64: []const u8,
+    format: []const u8,
+    raw_bytes: usize,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: audio_reply\ndata: {\"type\":\"audio_reply\",\"format\":\"");
+    try jsonEscapeInto(w, format);
+    try w.writeAll("\",\"bytes\":");
+    try w.print("{d}", .{raw_bytes});
+    try w.writeAll(",\"audio\":\"");
+    try w.writeAll(audio_b64);
+    try w.writeAll("\"}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Detect the `[AUDIO:/abs/path]\n` marker the agent prepends to a reply
+/// when TTS synthesis succeeded for an audio-capable channel. Returns the
+/// extracted absolute path and the visible text body. Returns null when
+/// the marker isn't present or is malformed (no closing `]` or no newline).
+const AudioReplyMarker = struct {
+    audio_path: []const u8,
+    visible_text: []const u8,
+};
+
+fn extractAudioReplyMarker(reply: []const u8) ?AudioReplyMarker {
+    const prefix = "[AUDIO:";
+    if (!std.mem.startsWith(u8, reply, prefix)) return null;
+    const after_prefix = reply[prefix.len..];
+    const close_idx = std.mem.indexOfScalar(u8, after_prefix, ']') orelse return null;
+    const path_slice = after_prefix[0..close_idx];
+    if (path_slice.len == 0) return null;
+    // Reject paths with NUL or newline — defense against an extractor that
+    // somehow produced them (shouldn't happen; tts_synthesize_fn writes to
+    // /tmp with deterministic shapes).
+    for (path_slice) |c| {
+        if (c == 0 or c == '\n' or c == '\r') return null;
+    }
+    // Body starts after the optional newline that follows `]`.
+    var body_start = prefix.len + close_idx + 1;
+    if (body_start < reply.len and reply[body_start] == '\n') body_start += 1;
+    const visible = if (body_start < reply.len) reply[body_start..] else "";
+    return .{ .audio_path = path_slice, .visible_text = visible };
+}
+
 fn sseDoneFrame(allocator: std.mem.Allocator, session_id: ?[]const u8, message_id: ?i64) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -9645,7 +9703,60 @@ fn handleApiChatStreamSseConnection(
     // src/agent/root.zig:3753); this is the gateway-side rendering
     // contract that pairs with it.
     const is_tool_only = reply.len == 0;
-    const payload_text = reply;
+
+    // V1.11 hardening (2026-05-07) — audio_reply extraction for zaki_app.
+    // The agent prepends `[AUDIO:/abs/path]\n` to TurnOutcome.text when
+    // TTS synthesis fired (tts_audio + ttsAudioChannelSupported). For
+    // Telegram the channel adapter unpacks this and sends a voice note;
+    // for zaki_app the gateway is the channel — we emit a structured
+    // `audio_reply` SSE event between the last token and `done`, then
+    // strip the marker from the visible text so the FE doesn't render
+    // the literal `[AUDIO:...]` string.
+    var audio_emit: struct {
+        path: ?[]const u8 = null,
+        b64: ?[]u8 = null,
+        format: []const u8 = "mp3",
+        raw_bytes: usize = 0,
+    } = .{};
+    defer if (audio_emit.b64) |b| req_allocator.free(b);
+    const payload_text: []const u8 = blk: {
+        if (extractAudioReplyMarker(reply)) |marker| {
+            // Best-effort: read the file, base64-encode. On any failure,
+            // log + fall through to streaming the marker-stripped text
+            // (the user still sees the reply text, just no audio).
+            audio_emit.path = marker.audio_path;
+            // Derive format from extension; default mp3.
+            if (std.mem.lastIndexOfScalar(u8, marker.audio_path, '.')) |dot_idx| {
+                const ext = marker.audio_path[dot_idx + 1 ..];
+                if (ext.len > 0 and ext.len <= 8) audio_emit.format = ext;
+            }
+            var path_z_buf: [512]u8 = undefined;
+            const path_z = toSentinelPath(&path_z_buf, marker.audio_path);
+            if (path_z) |p| {
+                if (std.fs.openFileAbsolute(p, .{})) |file| {
+                    defer file.close();
+                    if (file.readToEndAlloc(req_allocator, 8 * 1024 * 1024)) |bytes| {
+                        defer req_allocator.free(bytes);
+                        audio_emit.raw_bytes = bytes.len;
+                        const b64_len = std.base64.standard.Encoder.calcSize(bytes.len);
+                        if (req_allocator.alloc(u8, b64_len)) |b64_buf| {
+                            _ = std.base64.standard.Encoder.encode(b64_buf, bytes);
+                            audio_emit.b64 = b64_buf;
+                        } else |err| {
+                            log.warn("audio_reply alloc_failed err={s}", .{@errorName(err)});
+                        }
+                    } else |err| {
+                        log.warn("audio_reply read_failed path={s} err={s}", .{ marker.audio_path, @errorName(err) });
+                    }
+                } else |err| {
+                    log.warn("audio_reply open_failed path={s} err={s}", .{ marker.audio_path, @errorName(err) });
+                }
+                std.fs.deleteFileAbsolute(p) catch {};
+            }
+            break :blk marker.visible_text;
+        }
+        break :blk reply;
+    };
 
     if (is_tool_only) {
         // Tool-only turn: emit structured event, skip placeholder chunking.
@@ -9682,6 +9793,20 @@ fn handleApiChatStreamSseConnection(
     }
     // Live mode with streaming provider: tokens already delivered via
     // liveStreamCallback during agent processing. No post-hoc chunking needed.
+
+    // V1.11 hardening (2026-05-07) — emit audio_reply BEFORE done so the
+    // FE plays it after the text reply settles. Frame is best-effort: if
+    // extraction or read failed earlier, audio_emit.b64 is null and we
+    // skip cleanly (text-only mode).
+    if (audio_emit.b64) |b64| {
+        const audio_frame = sseAudioReplyFrame(req_allocator, b64, audio_emit.format, audio_emit.raw_bytes) catch null;
+        if (audio_frame) |frame| {
+            defer req_allocator.free(frame);
+            sse_stream.sendFrame(frame) catch {
+                log.warn("audio_reply.send_failed session={s}", .{session_key});
+            };
+        }
+    }
 
     // Always send done frame regardless of delivery mode. Tool-only turns
     // get the variant carrying `tool_only_turn:true` so the frontend can
@@ -24139,6 +24264,44 @@ test "tenant config normalization strips operator-owned runtime keys" {
 test "telegramReplyContainsMediaMarkers detects audio marker" {
     try std.testing.expect(telegramReplyContainsMediaMarkers("[AUDIO:/tmp/nullalis_tts_1.mp3]\nHello"));
     try std.testing.expect(!telegramReplyContainsMediaMarkers("Plain text reply"));
+}
+
+test "extractAudioReplyMarker happy path" {
+    // V1.11 hardening (2026-05-07) — verifies the audio_reply extraction
+    // used in the chat-stream handler. Agent emits this exact format
+    // (root.zig:1135) when TTS synthesis fired for an audio-capable
+    // channel. Gateway extracts the path, reads + base64-encodes the
+    // file, emits an audio_reply SSE event, and serves the stripped
+    // visible text to the FE token stream.
+    const reply = "[AUDIO:/tmp/nullalis_tts_42.mp3]\nHello, world!";
+    const marker = extractAudioReplyMarker(reply).?;
+    try std.testing.expectEqualStrings("/tmp/nullalis_tts_42.mp3", marker.audio_path);
+    try std.testing.expectEqualStrings("Hello, world!", marker.visible_text);
+}
+
+test "extractAudioReplyMarker no marker returns null" {
+    try std.testing.expect(extractAudioReplyMarker("Plain text reply with no marker") == null);
+    try std.testing.expect(extractAudioReplyMarker("") == null);
+    // Marker substring inside text but not at start — also null
+    try std.testing.expect(extractAudioReplyMarker("hello [AUDIO:/x.mp3]\nworld") == null);
+}
+
+test "extractAudioReplyMarker rejects malformed marker" {
+    // No closing bracket
+    try std.testing.expect(extractAudioReplyMarker("[AUDIO:/tmp/nope") == null);
+    // Empty path
+    try std.testing.expect(extractAudioReplyMarker("[AUDIO:]\nbody") == null);
+    // Newline inside path (defense — agent shouldn't emit this)
+    try std.testing.expect(extractAudioReplyMarker("[AUDIO:/tmp/bad\npath]\nbody") == null);
+}
+
+test "extractAudioReplyMarker handles missing newline after bracket" {
+    // Defense-in-depth: if the agent (or a future channel adapter) emits
+    // the marker without the trailing newline, the body should still
+    // resolve to whatever follows the bracket — even if empty.
+    const marker = extractAudioReplyMarker("[AUDIO:/tmp/x.mp3]body").?;
+    try std.testing.expectEqualStrings("/tmp/x.mp3", marker.audio_path);
+    try std.testing.expectEqualStrings("body", marker.visible_text);
 }
 
 // ── Baseline characterization tests (Phase 00-01) ───────────────
