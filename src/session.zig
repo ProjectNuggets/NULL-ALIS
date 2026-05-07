@@ -2838,8 +2838,14 @@ test "session initial state includes last_consolidated" {
 // 6. Per-user session limit and listing tests (T-03-04, T-03-07)
 // ---------------------------------------------------------------------------
 
-test "MAX_SESSIONS_PER_USER is 50" {
-    try testing.expectEqual(@as(usize, 50), MAX_SESSIONS_PER_USER);
+test "MAX_SESSIONS_PER_USER is 200 (V1.11 raised from 50)" {
+    // V1.11 (2026-05-07): raised 50 → 200. Power users running ZAKI across
+    // channels (Telegram + Slack + Discord + App + scheduled tasks) plus
+    // multiple thread conversations regularly exceed 50 active sessions.
+    // 200 gives the daily-use case real headroom while still bounding the
+    // DoS surface (T-03-04). Per-user soft cap is the right place for
+    // abuse protection; this constant is a hard runtime ceiling.
+    try testing.expectEqual(@as(usize, 200), MAX_SESSIONS_PER_USER);
 }
 
 test "SessionInfo struct has expected fields" {
