@@ -69,10 +69,16 @@ const TABLE = [_]Row{
     .{ .match = "DeepSeek-V4-Pro", .price = .{ .input_per_million = 0.435, .output_per_million = 3.48 } },
     .{ .match = "deepseek-v4-flash", .price = .{ .input_per_million = 0.14, .output_per_million = 0.28 } },
     .{ .match = "DeepSeek-V4-Flash", .price = .{ .input_per_million = 0.14, .output_per_million = 0.28 } },
-    // Pre-V4 DeepSeek (legacy / OpenRouter fallback path)
-    .{ .match = "deepseek-v3", .price = .{ .input_per_million = 0.27, .output_per_million = 1.10 } },
-    .{ .match = "deepseek-chat", .price = .{ .input_per_million = 0.27, .output_per_million = 1.10 } },
+    // Pre-V4 DeepSeek (legacy / OpenRouter fallback path).
+    // HI-01 fix (2026-05-07): "deepseek-v3.2" must come BEFORE "deepseek-v3"
+    // because the matcher returns the first substring hit. Same for
+    // "deepseek-reasoner" — already specific. Without this ordering, the
+    // bare "deepseek-v3" row would shadow v3.2 (a real model id used in
+    // compatible.zig:135 normalization).
+    .{ .match = "deepseek-v3.2", .price = .{ .input_per_million = 0.27, .output_per_million = 1.10 } },
     .{ .match = "deepseek-reasoner", .price = .{ .input_per_million = 0.55, .output_per_million = 2.19 } },
+    .{ .match = "deepseek-chat", .price = .{ .input_per_million = 0.27, .output_per_million = 1.10 } },
+    .{ .match = "deepseek-v3", .price = .{ .input_per_million = 0.27, .output_per_million = 1.10 } },
 
     // Together-hosted: Moonshot Kimi family ---------------------------------
     // K2.5 is the current Fast-mode default. K2.6 (April 2026 release)
@@ -96,8 +102,12 @@ const TABLE = [_]Row{
     .{ .match = "qwen3-coder", .price = .{ .input_per_million = 0.40, .output_per_million = 1.60 } },
 
     // Together-hosted: GLM (Zhipu) -------------------------------------------
-    .{ .match = "glm-5.1", .price = .{ .input_per_million = 0.60, .output_per_million = 2.20 } },
+    // HI-01 fix (2026-05-07): "glm-5.1-air" must come BEFORE "glm-5.1"
+    // because substring matcher returns first hit. Pre-fix the bare
+    // "glm-5.1" row shadowed "glm-5.1-air", mis-pricing air at 3-4× its
+    // real cost (0.60/2.20 vs 0.20/1.10).
     .{ .match = "glm-5.1-air", .price = .{ .input_per_million = 0.20, .output_per_million = 1.10 } },
+    .{ .match = "glm-5.1", .price = .{ .input_per_million = 0.60, .output_per_million = 2.20 } },
 
     // Together-hosted: Llama 4 / 5 ------------------------------------------
     .{ .match = "llama-4-70b", .price = .{ .input_per_million = 0.88, .output_per_million = 0.88 } },

@@ -2605,12 +2605,24 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
         "";
 
     const success_word = if (result.success) "succeeded" else "failed";
+    // HI-03 fix (2026-05-07): residual CR-01 leak. Pre-fix order was
+    // `allocPrint(.., pending.tool_name) → defer free → clearPending`.
+    // If allocPrint OOMed, the `try` propagated UP before clearPending
+    // ran; the next /approve would see stale pending state and re-execute
+    // the just-approved tool. Fix: clone the name into an owned buffer
+    // FIRST, clear pending IMMEDIATELY (no more aliasing of pending's
+    // slices), then format using the owned copy. allocPrint may still
+    // OOM but pending is already cleared by then.
+    const tool_name_owned = try self.allocator.dupe(u8, pending.tool_name);
+    defer self.allocator.free(tool_name_owned);
+    self.clearPendingToolApproval();
+
     const synthetic = try std.fmt.allocPrint(
         self.allocator,
         "[Approved tool execution: id={d} tool={s} status={s}{s}]\n\nOutput:\n{s}{s}\n\nContinue your reasoning based on this tool result. Produce the next step for the user.",
         .{
             id_snapshot,
-            pending.tool_name,
+            tool_name_owned,
             success_word,
             always_note,
             truncated_output,
@@ -2618,12 +2630,6 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
         },
     );
     defer self.allocator.free(synthetic);
-    // CR-01 fix (2026-05-07): pending.tool_name has been read into the
-    // owned `synthetic` buffer above. Clear pending state NOW so the
-    // continuation `self.turn(synthetic)` below can't re-enter the
-    // approval path with stale state, AND so any subsequent error
-    // path doesn't continue to depend on pending being live.
-    self.clearPendingToolApproval();
 
     // If the continuation turn itself fails, fall back to returning
     // the raw tool output so the user at least sees what happened.

@@ -43,7 +43,11 @@ pub fn isOverloadedText(text: []const u8) bool {
         containsAsciiFold(text, "model is currently loading") or
         containsAsciiFold(text, "model_is_loading") or
         containsAsciiFold(text, "model is loading") or
-        containsAsciiFold(text, "model unavailable") or
+        // HI-02 fix (2026-05-07): bare "model unavailable" was too broad —
+        // matched legitimate entitlement / permission errors (e.g.,
+        // "model unavailable on your plan"). Keep only the more specific
+        // "upstream model unavailable" which is OpenRouter's transient-
+        // failure phrasing.
         containsAsciiFold(text, "upstream model unavailable") or
         containsAsciiFold(text, "temporarily unavailable") or
         containsAsciiFold(text, "currently overloaded"))
