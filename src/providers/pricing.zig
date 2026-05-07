@@ -57,6 +57,48 @@ const TABLE = [_]Row{
     .{ .match = "gemini-2.5-flash", .price = .{ .input_per_million = 0.3, .output_per_million = 2.5 } },
     .{ .match = "gemini-1.5-pro", .price = .{ .input_per_million = 1.25, .output_per_million = 5.0 } },
     .{ .match = "gemini-1.5-flash", .price = .{ .input_per_million = 0.075, .output_per_million = 0.3 } },
+
+    // Together-hosted: DeepSeek family --------------------------------------
+    // Pricing verified 2026-05-07 from Together's models page. V4-Pro is
+    // $0.435/M input ($0.145 promo through 2026-05-05 — promo expired
+    // before this entry), $3.48/M output. V4-Flash is the cheaper sibling
+    // (DeepSeek's direct API at $0.14/$0.28; Together pricing not yet
+    // published, conservative estimate using direct + Together's typical
+    // 3× output multiplier).
+    .{ .match = "deepseek-v4-pro", .price = .{ .input_per_million = 0.435, .output_per_million = 3.48 } },
+    .{ .match = "DeepSeek-V4-Pro", .price = .{ .input_per_million = 0.435, .output_per_million = 3.48 } },
+    .{ .match = "deepseek-v4-flash", .price = .{ .input_per_million = 0.14, .output_per_million = 0.28 } },
+    .{ .match = "DeepSeek-V4-Flash", .price = .{ .input_per_million = 0.14, .output_per_million = 0.28 } },
+    // Pre-V4 DeepSeek (legacy / OpenRouter fallback path)
+    .{ .match = "deepseek-v3", .price = .{ .input_per_million = 0.27, .output_per_million = 1.10 } },
+    .{ .match = "deepseek-chat", .price = .{ .input_per_million = 0.27, .output_per_million = 1.10 } },
+    .{ .match = "deepseek-reasoner", .price = .{ .input_per_million = 0.55, .output_per_million = 2.19 } },
+
+    // Together-hosted: Moonshot Kimi family ---------------------------------
+    // K2.5 is the current Fast-mode default. K2.6 (April 2026 release)
+    // adds vision + reasoning toggle; pricing on Together is similar to
+    // K2.5 per Moonshot's pricing page. Conservative estimate uses K2.5's
+    // current Together rate.
+    .{ .match = "kimi-k2.5", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
+    .{ .match = "Kimi-K2.5", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
+    .{ .match = "kimi-k2.6", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
+    .{ .match = "Kimi-K2.6", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
+    .{ .match = "k2p5", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
+    .{ .match = "k2p6", .price = .{ .input_per_million = 0.55, .output_per_million = 2.20 } },
+
+    // Together-hosted: Qwen family (multimodal candidate for Fast mode) -----
+    .{ .match = "qwen3.6-plus", .price = .{ .input_per_million = 0.50, .output_per_million = 3.00 } },
+    .{ .match = "Qwen3.6-Plus", .price = .{ .input_per_million = 0.50, .output_per_million = 3.00 } },
+    .{ .match = "qwen3-coder", .price = .{ .input_per_million = 0.40, .output_per_million = 1.60 } },
+
+    // Together-hosted: GLM (Zhipu) -------------------------------------------
+    .{ .match = "glm-5.1", .price = .{ .input_per_million = 0.60, .output_per_million = 2.20 } },
+    .{ .match = "glm-5.1-air", .price = .{ .input_per_million = 0.20, .output_per_million = 1.10 } },
+
+    // Together-hosted: Llama 4 / 5 ------------------------------------------
+    .{ .match = "llama-4-70b", .price = .{ .input_per_million = 0.88, .output_per_million = 0.88 } },
+    .{ .match = "llama-3.3-70b", .price = .{ .input_per_million = 0.88, .output_per_million = 0.88 } },
+    .{ .match = "llama-3.1-8b-instant", .price = .{ .input_per_million = 0.05, .output_per_million = 0.08 } },
 };
 
 /// Lookup price for `(provider, model)`. Either may be empty. Returns
