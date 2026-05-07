@@ -12082,7 +12082,7 @@ fn handleBrainGraph(
         }
         // V1.6 commit 4 — M1 importance score (FE drives node-radius rendering).
         // 3 decimals = 1000 visually-distinct buckets, plenty for graph sizing.
-        w.print(",\"importance\":{d:.3}", .{importance_scores[i]}) catch return response_build_err;
+        w.print(",\"importance\":{d:.3}", .{jsonSafeFloat(importance_scores[i])}) catch return response_build_err;
         // 5b-loose-ends-sweep IN-2: emit `display_label` for nodes that
         // have V1.6 extraction metadata (subject + predicate + object).
         // FE renders this instead of the raw `extracted_<unix>_<hex>`
@@ -12320,7 +12320,7 @@ fn handleBrainSearch(
         w.writeAll(",\"category\":") catch return response_build_err;
         json_util.appendJsonString(&out, allocator, entry.category.toString()) catch return response_build_err;
         if (entry.score) |sc| {
-            w.print(",\"score\":{d:.3}", .{sc}) catch return response_build_err;
+            w.print(",\"score\":{d:.3}", .{jsonSafeFloat(sc)}) catch return response_build_err;
         } else {
             w.writeAll(",\"score\":null") catch return response_build_err;
         }
@@ -13299,7 +13299,7 @@ fn handleBrainLocalGraph(
         const row_opt = rows_by_key.get(n.key);
         w.writeAll("{\"key\":") catch return response_build_err;
         json_util.appendJsonString(&out, allocator, n.key) catch return response_build_err;
-        w.print(",\"hop_distance\":{d},\"score\":{d:.3}", .{ n.hop_distance, n.score }) catch return response_build_err;
+        w.print(",\"hop_distance\":{d},\"score\":{d:.3}", .{ n.hop_distance, jsonSafeFloat(n.score) }) catch return response_build_err;
         if (row_opt) |row| {
             w.writeAll(",\"kind\":") catch return response_build_err;
             json_util.appendJsonString(&out, allocator, row.category.toString()) catch return response_build_err;
