@@ -119,6 +119,25 @@ const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300;
 const MAX_HEADER_SIZE: usize = 16_384;
 const MAX_HTTP_REQUEST_SIZE: usize = MAX_HEADER_SIZE + MAX_BODY_SIZE;
 
+/// CR-03 fix (2026-05-07): JSON-safe finite clamp. Zig's `{d:.N}`
+/// formatter prints `nan` / `inf` / `-inf` for non-finite f64 — none
+/// of which parse as JSON. A single corrupted edge row (NaN confidence
+/// from a bad extractor write, Infinity weight from a divide-by-zero
+/// upstream, etc.) would emit invalid JSON and blank the entire
+/// /brain/graph response on the frontend. Use this at every
+/// formatter-driven JSON emission of a float that originates from
+/// user-data storage. Default `1.0` matches the parser-side fallback
+/// in zaki_state.findEdgesByKeys / listEdgesForUser.
+fn jsonSafeFloat(v: f64) f64 {
+    if (std.math.isFinite(v)) return v;
+    return 1.0;
+}
+
+fn jsonSafeFloatF32(v: f32) f32 {
+    if (std.math.isFinite(v)) return v;
+    return 0.0;
+}
+
 /// Default per-user data root for tenant mode.
 const DEFAULT_TENANT_DATA_ROOT: []const u8 = "/data/users";
 
@@ -731,11 +750,20 @@ const AppEventSubscriberRegistry = struct {
     fn publish(self: *AppEventSubscriberRegistry, event_id: []const u8, user_id: []const u8, session_key: []const u8, content: []const u8) !bool {
         const key = try keyFor(self.allocator, user_id, session_key);
         defer self.allocator.free(key);
+        // CR-02 fix (2026-05-07): hold the registry mutex across the
+        // enqueue call. Pre-fix released the mutex after reading the
+        // subscriber pointer and called enqueue afterward — racy:
+        // handleChatEvents (which stack-allocates the subscriber) could
+        // unwind via `defer unregister` between the unlock and the deref,
+        // leaving a publisher dereferencing a freed stack frame.
+        // The contract is: enqueue MUST NOT call back into the registry
+        // (no re-entrancy), so holding registry.mutex across the
+        // subscriber.mutex acquisition is safe and the lock-order
+        // remains registry → subscriber (no inversion).
         self.mutex.lock();
-        const subscriber = self.subscribers.get(key);
-        self.mutex.unlock();
-        if (subscriber == null) return false;
-        return try subscriber.?.enqueue(self.allocator, event_id, session_key, content);
+        defer self.mutex.unlock();
+        const subscriber = self.subscribers.get(key) orelse return false;
+        return try subscriber.enqueue(self.allocator, event_id, session_key, content);
     }
 
     fn closeAll(self: *AppEventSubscriberRegistry) void {
@@ -12130,7 +12158,7 @@ fn handleBrainGraph(
         jsonEscapeInto(w, e.source_key) catch return response_build_err;
         w.writeAll("\",\"target\":\"") catch return response_build_err;
         jsonEscapeInto(w, e.target_key) catch return response_build_err;
-        w.print("\",\"weight\":{d:.4}}}", .{e.similarity}) catch return response_build_err;
+        w.print("\",\"weight\":{d:.4}}}", .{jsonSafeFloatF32(e.similarity)}) catch return response_build_err;
     }
     for (ref_edges) |e| {
         if (!displayed_keys.contains(e.source) or !displayed_keys.contains(e.target)) continue;
@@ -12157,7 +12185,7 @@ fn handleBrainGraph(
         jsonEscapeInto(w, e.predicate) catch return response_build_err;
         // V1.11 (2026-05-07) — emit confidence + weight so the FE layout
         // can pull strong relations tight and weak ones loose.
-        w.print("\",\"confidence\":{d:.3},\"weight\":{d:.3}}}", .{ e.confidence, e.weight }) catch return response_build_err;
+        w.print("\",\"confidence\":{d:.3},\"weight\":{d:.3}}}", .{ jsonSafeFloat(e.confidence), jsonSafeFloat(e.weight) }) catch return response_build_err;
     }
     w.writeAll("]") catch return response_build_err;
 
@@ -12577,7 +12605,7 @@ fn handleBrainMemoryDetail(
         json_util.appendJsonString(&out, allocator, edge.target_key) catch return response_build_err;
         w.writeAll(",\"predicate\":") catch return response_build_err;
         json_util.appendJsonString(&out, allocator, edge.predicate) catch return response_build_err;
-        w.print(",\"weight\":{d:.3},\"confidence\":{d:.3}", .{ edge.weight, edge.confidence }) catch return response_build_err;
+        w.print(",\"weight\":{d:.3},\"confidence\":{d:.3}", .{ jsonSafeFloat(edge.weight), jsonSafeFloat(edge.confidence) }) catch return response_build_err;
         w.writeAll("}") catch return response_build_err;
     }
     w.writeAll("],\"events\":[") catch return response_build_err;
@@ -13322,7 +13350,7 @@ fn handleBrainLocalGraph(
         json_util.appendJsonString(&out, allocator, e.target_key) catch return response_build_err;
         w.writeAll(",\"predicate\":") catch return response_build_err;
         json_util.appendJsonString(&out, allocator, e.predicate) catch return response_build_err;
-        w.print(",\"weight\":{d:.3}", .{e.weight}) catch return response_build_err;
+        w.print(",\"weight\":{d:.3}", .{jsonSafeFloat(e.weight)}) catch return response_build_err;
         // Edge-level link_type derived from predicate via the canonical
         // extraction_persist mapping (same predicate→7-category lookup
         // used at write time in V1.7a-5). Keeps the FE link_type surface

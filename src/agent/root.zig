@@ -1710,6 +1710,17 @@ pub const Agent = struct {
     /// Bypasses the generic approval preflight but preserves other gates.
     /// Returned output may borrow either static storage or memory owned by
     /// `tool_allocator`; keep that allocator alive until the caller is done.
+    ///
+    /// **CR-01 fix (2026-05-07):** does NOT clear pending state. The
+    /// pre-fix design used `defer self.clearPendingToolApproval();` here,
+    /// which freed the slice fields of `pending_tool_approval` (tool_name,
+    /// arguments_json, etc.) before the caller's synthetic-message
+    /// `allocPrint(.., .{pending.tool_name, ...})` ran — classic UAF.
+    /// Now ownership is in the CALLER (`handleGenericToolApprove`):
+    /// callers must invoke `clearPendingToolApproval()` after they've
+    /// finished reading the pending struct's slices. Re-approval during
+    /// tool execution is prevented by `approval_bypass_active` below,
+    /// not by clearing the pending struct.
     pub fn executeApprovedPendingTool(
         self: *Agent,
         tool_allocator: std.mem.Allocator,
@@ -1724,9 +1735,6 @@ pub const Agent = struct {
         };
         self.approval_bypass_active = true;
         defer self.approval_bypass_active = false;
-        // Clear pending state first so the tool cannot trigger re-approval
-        // during its own execution path.
-        defer self.clearPendingToolApproval();
         // Re-run preflight (security, budget, mode) but skip approval gate.
         return switch (self.preflightToolPolicy(call)) {
             .allowed => self.executeToolUnchecked(tool_allocator, call),

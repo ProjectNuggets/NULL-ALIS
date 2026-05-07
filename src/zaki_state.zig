@@ -6584,8 +6584,17 @@ const ManagerImpl = struct {
             defer allocator.free(conf_str);
             const weight_str = try dupeResultValue(allocator, result, i, 4);
             defer allocator.free(weight_str);
-            const conf = std.fmt.parseFloat(f64, conf_str) catch 1.0;
-            const weight = std.fmt.parseFloat(f64, weight_str) catch 1.0;
+            // CR-03 fix (2026-05-07): finite-clamp at the source-of-truth
+            // boundary. parseFloat accepts 'NaN' / 'Infinity' / '-Infinity'
+            // as valid f64s, and Postgres allows these values in float
+            // columns. Without this clamp, a single corrupted row would
+            // emit `"confidence":nan` into the /brain/graph JSON response,
+            // making `JSON.parse()` on the FE throw a SyntaxError and
+            // blank the entire brain page.
+            const conf_raw = std.fmt.parseFloat(f64, conf_str) catch 1.0;
+            const weight_raw = std.fmt.parseFloat(f64, weight_str) catch 1.0;
+            const conf = if (std.math.isFinite(conf_raw)) conf_raw else 1.0;
+            const weight = if (std.math.isFinite(weight_raw)) weight_raw else 1.0;
             try out.append(allocator, .{
                 .source_key = src,
                 .target_key = tgt,
@@ -6672,8 +6681,17 @@ const ManagerImpl = struct {
             defer allocator.free(conf_str);
             const weight_str = try dupeResultValue(allocator, result, i, 4);
             defer allocator.free(weight_str);
-            const conf = std.fmt.parseFloat(f64, conf_str) catch 1.0;
-            const weight = std.fmt.parseFloat(f64, weight_str) catch 1.0;
+            // CR-03 fix (2026-05-07): finite-clamp at the source-of-truth
+            // boundary. parseFloat accepts 'NaN' / 'Infinity' / '-Infinity'
+            // as valid f64s, and Postgres allows these values in float
+            // columns. Without this clamp, a single corrupted row would
+            // emit `"confidence":nan` into the /brain/graph JSON response,
+            // making `JSON.parse()` on the FE throw a SyntaxError and
+            // blank the entire brain page.
+            const conf_raw = std.fmt.parseFloat(f64, conf_str) catch 1.0;
+            const weight_raw = std.fmt.parseFloat(f64, weight_str) catch 1.0;
+            const conf = if (std.math.isFinite(conf_raw)) conf_raw else 1.0;
+            const weight = if (std.math.isFinite(weight_raw)) weight_raw else 1.0;
             try out.append(allocator, .{
                 .source_key = src,
                 .target_key = tgt,

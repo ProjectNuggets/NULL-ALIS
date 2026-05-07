@@ -2539,7 +2539,15 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
 
+    // CR-01 (2026-05-07): executeApprovedPendingTool no longer clears
+    // pending state internally — the caller (this function) owns the
+    // clear. We hold pending live across executeApprovedPendingTool +
+    // the synthetic message build so `pending.tool_name` etc. stay
+    // valid for the allocPrint at line 2596+. After that, we drop
+    // back to the regular post-clear path.
     const result = self.executeApprovedPendingTool(arena.allocator()) catch |err| {
+        // Pending state is still live here; clear before returning.
+        self.clearPendingToolApproval();
         return try std.fmt.allocPrint(
             self.allocator,
             "Approved tool execution failed: {s}",
@@ -2575,6 +2583,10 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
     // Legacy path (tests without a live provider): return the tool output
     // as the reply directly. Production default is `continues_turn = true`.
     if (!continues_turn) {
+        // CR-01: pending state was held live for this branch; clear now
+        // that we've finished reading slices we needed (none here, but
+        // keep for symmetry with the continues-turn path below).
+        defer self.clearPendingToolApproval();
         return try std.fmt.allocPrint(
             self.allocator,
             "Approved tool (id={d}) success={any}.{s}\n{s}",
@@ -2606,6 +2618,12 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
         },
     );
     defer self.allocator.free(synthetic);
+    // CR-01 fix (2026-05-07): pending.tool_name has been read into the
+    // owned `synthetic` buffer above. Clear pending state NOW so the
+    // continuation `self.turn(synthetic)` below can't re-enter the
+    // approval path with stale state, AND so any subsequent error
+    // path doesn't continue to depend on pending being live.
+    self.clearPendingToolApproval();
 
     // If the continuation turn itself fails, fall back to returning
     // the raw tool output so the user at least sees what happened.
