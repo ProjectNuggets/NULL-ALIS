@@ -3827,8 +3827,37 @@ pub fn composeFinalReply(
     usage: providers.TokenUsage,
 ) ![]const u8 {
     const trimmed_base = std.mem.trim(u8, base_text, " \t\r\n");
-    const final_base = if (trimmed_base.len > 0) trimmed_base else base_text;
-    const show_reasoning = self.reasoning_mode == .on and reasoning_content != null and reasoning_content.?.len > 0;
+    const has_visible_text = trimmed_base.len > 0;
+    const has_reasoning = reasoning_content != null and reasoning_content.?.len > 0;
+
+    // V1.11 (2026-05-07) — empty-content fallback to reasoning_content.
+    //
+    // ROOT CAUSE for "ZAKI not responding" (Nova bug report 2026-05-07):
+    // DeepSeek V4-Pro at `reasoning_effort=high` (the deep-mode preset)
+    // emits non-empty `reasoning_content` and empty `content` for many
+    // queries. Pre-V1.11 this function returned the empty `base_text`
+    // because `reasoning_mode` defaults to OFF — the user setting was
+    // gating fallback. Result: 10s of model thinking with zero visible
+    // reply.
+    //
+    // Permanent fix: when `content` is empty AND `reasoning_content` is
+    // non-empty, the reasoning IS the response. Surface it regardless
+    // of `reasoning_mode`. The user asked a question; an empty reply
+    // is never the right answer.
+    //
+    // `reasoning_mode == .on` still controls whether reasoning is
+    // appended ALONGSIDE visible content (the "show your work" UX).
+    // The fallback only fires when content is empty — orthogonal axis.
+    const final_base: []const u8 = if (has_visible_text)
+        trimmed_base
+    else if (has_reasoning)
+        std.mem.trim(u8, reasoning_content.?, " \t\r\n")
+    else
+        base_text;
+
+    // Only show reasoning *alongside* visible content when reasoning_mode
+    // is .on. If we already fell back to reasoning above, don't double-print.
+    const show_reasoning = has_visible_text and self.reasoning_mode == .on and has_reasoning;
     if (!show_reasoning and self.usage_mode == .off) {
         return try self.allocator.dupe(u8, final_base);
     }
@@ -4790,6 +4819,86 @@ test "HELP_TEXT is categorized (contains section headers)" {
     try expectHelpContains(HELP_TEXT, "Safety & approvals:");
     try expectHelpContains(HELP_TEXT, "Usage & cost:");
     try expectHelpContains(HELP_TEXT, "Diagnostics:");
+}
+
+// V1.11 (2026-05-07) — composeFinalReply regression tests.
+//
+// Pin the empty-content fallback behavior: when a model emits empty
+// `content` but non-empty `reasoning_content` (DeepSeek V4-Pro at
+// reasoning_effort=high exhibits this for many queries), the reply
+// should fall back to reasoning_content as the visible text. Pre-V1.11
+// the function returned the empty base_text, leaving the user with
+// no visible reply for any V4-Pro turn that emitted thinking-only.
+
+const ReasoningMode = enum { off, on };
+const UsageMode = enum { off, tokens, full, cost };
+
+const TestComposeContext = struct {
+    allocator: std.mem.Allocator,
+    reasoning_mode: ReasoningMode = .off,
+    usage_mode: UsageMode = .off,
+    total_tokens: u64 = 0,
+};
+
+test "composeFinalReply: empty content + non-empty reasoning falls back to reasoning (V4-Pro fix)" {
+    const allocator = std.testing.allocator;
+    var ctx = TestComposeContext{ .allocator = allocator };
+    const usage = providers.TokenUsage{};
+    const reply = try composeFinalReply(&ctx, "", "Let me think about this. The answer is 42.", usage);
+    defer allocator.free(reply);
+    try std.testing.expectEqualStrings("Let me think about this. The answer is 42.", reply);
+}
+
+test "composeFinalReply: whitespace-only content + reasoning falls back (trims first)" {
+    const allocator = std.testing.allocator;
+    var ctx = TestComposeContext{ .allocator = allocator };
+    const usage = providers.TokenUsage{};
+    const reply = try composeFinalReply(&ctx, "   \n\t  ", "  Reasoning fallback content.  ", usage);
+    defer allocator.free(reply);
+    try std.testing.expectEqualStrings("Reasoning fallback content.", reply);
+}
+
+test "composeFinalReply: empty content + null reasoning returns empty (true no-output case)" {
+    const allocator = std.testing.allocator;
+    var ctx = TestComposeContext{ .allocator = allocator };
+    const usage = providers.TokenUsage{};
+    const reply = try composeFinalReply(&ctx, "", null, usage);
+    defer allocator.free(reply);
+    try std.testing.expectEqualStrings("", reply);
+}
+
+test "composeFinalReply: non-empty content + reasoning returns just content (no double-print)" {
+    const allocator = std.testing.allocator;
+    var ctx = TestComposeContext{ .allocator = allocator };
+    const usage = providers.TokenUsage{};
+    const reply = try composeFinalReply(&ctx, "Visible answer.", "Internal thinking.", usage);
+    defer allocator.free(reply);
+    try std.testing.expectEqualStrings("Visible answer.", reply);
+}
+
+test "composeFinalReply: reasoning_mode=on appends reasoning alongside visible content" {
+    const allocator = std.testing.allocator;
+    var ctx = TestComposeContext{ .allocator = allocator, .reasoning_mode = .on };
+    const usage = providers.TokenUsage{};
+    const reply = try composeFinalReply(&ctx, "Visible answer.", "Internal thinking.", usage);
+    defer allocator.free(reply);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Visible answer.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Reasoning:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Internal thinking.") != null);
+}
+
+test "composeFinalReply: empty content + reasoning + reasoning_mode=on still falls back without doubling" {
+    // Edge case: when the fallback fires (no visible content), reasoning
+    // becomes the visible text. Don't ALSO append "Reasoning: ..." after
+    // it — that would print the reasoning twice. show_reasoning gate is
+    // `has_visible_text and ...`, so when content is empty we skip the
+    // append even with reasoning_mode=on.
+    const allocator = std.testing.allocator;
+    var ctx = TestComposeContext{ .allocator = allocator, .reasoning_mode = .on };
+    const usage = providers.TokenUsage{};
+    const reply = try composeFinalReply(&ctx, "", "Just the reasoning.", usage);
+    defer allocator.free(reply);
+    try std.testing.expectEqualStrings("Just the reasoning.", reply);
 }
 
 test "HELP_TEXT covers additional implemented commands" {
