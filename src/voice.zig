@@ -330,10 +330,23 @@ pub const WhisperTranscriber = struct {
 };
 
 /// Resolve transcription endpoint for a given provider name.
+///
+/// V1.11 hardening (2026-05-07): added Together-hosted Whisper. Together
+/// runs whisper-large-v3 at the OpenAI-compatible
+/// `/v1/audio/transcriptions` path, with the same multipart/form-data
+/// shape that transcribeFile already emits. ~5x cheaper than OpenAI's
+/// hosted Whisper ($0.012/min vs $0.006/min — actually 2x cheaper, but
+/// volume discounts and shared key with the chat path drop effective
+/// cost further). Switching nullalis-app inbound voice to Together
+/// removes the operator's need to provision a separate OpenAI key just
+/// for STT when chat already uses Together.
 pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]const u8) []const u8 {
     if (explicit_endpoint) |ep| return ep;
     if (std.mem.eql(u8, provider, "openai")) return "https://api.openai.com/v1/audio/transcriptions";
     if (std.mem.eql(u8, provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
+    if (std.mem.eql(u8, provider, "together") or std.mem.eql(u8, provider, "together-ai")) {
+        return "https://api.together.xyz/v1/audio/transcriptions";
+    }
     // For unknown providers, try OpenAI-compatible endpoint
     return "https://api.groq.com/openai/v1/audio/transcriptions";
 }

@@ -9334,8 +9334,109 @@ fn handleApiChatStreamSseConnection(
         },
     }
 
-    const message = jsonStringField(body, "message") orelse jsonStringField(body, "text") orelse {
-        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_message", "missing message");
+    // V1.11 hardening (2026-05-07): native audio input. Frontend can POST
+    // `{audio: <base64>, format: "webm"}` (or `{audio_url: ...}`) instead of
+    // `{message: "..."}`. Backend transcribes via the configured STT
+    // provider (Together/Groq/OpenAI Whisper) and feeds the transcript to
+    // the agent as the user message — no two-round-trip from the FE.
+    // The `voice_replies = inbound` path will then auto-emit TTS for the
+    // reply because the inbound was audio (existing logic in agent loop).
+    var transcribed_message: ?[]u8 = null;
+    defer if (transcribed_message) |t| req_allocator.free(t);
+    const message: []const u8 = blk: {
+        if (jsonStringField(body, "message")) |m| break :blk m;
+        if (jsonStringField(body, "text")) |m| break :blk m;
+        // Audio path: only attempted when no text/message field present.
+        if (jsonStringField(body, "audio")) |audio_b64| {
+            if (audio_b64.len == 0) {
+                sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "empty_audio", "empty audio data");
+                return true;
+            }
+            // Cap base64 input at ~7.5MB raw (decodes to ~5.6MB audio).
+            if (audio_b64.len > 10 * 1024 * 1024) {
+                sendSseErrorResponse(stream, req_allocator, "413 Payload Too Large", "audio_too_large", "audio too large");
+                return true;
+            }
+            const cfg = config_opt orelse {
+                sendSseErrorResponse(stream, req_allocator, "503 Service Unavailable", "voice_not_configured", "voice not configured");
+                return true;
+            };
+            if (!cfg.audio_media.enabled) {
+                sendSseErrorResponse(stream, req_allocator, "503 Service Unavailable", "voice_not_enabled", "voice not enabled");
+                return true;
+            }
+            const stt_provider = cfg.audio_media.provider;
+            const stt_key = cfg.getProviderKey(stt_provider) orelse {
+                sendSseErrorResponse(stream, req_allocator, "503 Service Unavailable", "voice_key_missing", "voice api key not configured");
+                return true;
+            };
+            const audio_format = jsonStringField(body, "format") orelse "webm";
+            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(audio_b64) catch {
+                sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "invalid_base64", "invalid base64");
+                return true;
+            };
+            const decoded = req_allocator.alloc(u8, decoded_len) catch {
+                sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "alloc_failed", "alloc failed");
+                return true;
+            };
+            defer req_allocator.free(decoded);
+            std.base64.standard.Decoder.decode(decoded, audio_b64) catch {
+                sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "invalid_base64", "invalid base64");
+                return true;
+            };
+            const ts = std.time.milliTimestamp();
+            var rand_bytes: [4]u8 = undefined;
+            std.crypto.random.bytes(&rand_bytes);
+            const rand_suffix: u32 = std.mem.readInt(u32, &rand_bytes, .little);
+            var path_buf: [256]u8 = undefined;
+            const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/nullalis_chat_stt_{d}_{x}.{s}", .{ ts, rand_suffix, audio_format }) catch {
+                sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "path_build_failed", "path build failed");
+                return true;
+            };
+            var z_buf: [257]u8 = undefined;
+            const tmp_path_z = toSentinelPath(&z_buf, tmp_path) orelse {
+                sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "path_too_long", "path too long");
+                return true;
+            };
+            {
+                const file = std.fs.createFileAbsolute(tmp_path_z, .{}) catch {
+                    sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "tempfile_failed", "temp file write failed");
+                    return true;
+                };
+                defer file.close();
+                file.writeAll(decoded) catch {
+                    sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "tempfile_failed", "temp file write failed");
+                    return true;
+                };
+            }
+            defer std.fs.deleteFileAbsolute(tmp_path_z) catch {};
+            const endpoint = voice.resolveTranscriptionEndpoint(stt_provider, cfg.audio_media.base_url);
+            const transcript = voice.transcribeFile(req_allocator, stt_key, endpoint, tmp_path, .{
+                .model = cfg.audio_media.model,
+                .language = cfg.audio_media.language,
+            }) catch {
+                sendSseErrorResponse(stream, req_allocator, "502 Bad Gateway", "transcription_failed", "transcription failed");
+                return true;
+            };
+            if (transcript.len == 0) {
+                req_allocator.free(transcript);
+                sendSseErrorResponse(stream, req_allocator, "422 Unprocessable Entity", "empty_transcript", "transcription returned empty text");
+                return true;
+            }
+            // Prefix with [voice] so the existing tts_mode=.inbound logic
+            // detects it and (when voice_replies is on) emits TTS audio
+            // for the reply automatically. Same convention as the
+            // Telegram inbound voice path (see channels/telegram).
+            const wrapped = std.fmt.allocPrint(req_allocator, "[voice] {s}", .{transcript}) catch {
+                req_allocator.free(transcript);
+                sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "alloc_failed", "alloc failed");
+                return true;
+            };
+            req_allocator.free(transcript);
+            transcribed_message = wrapped;
+            break :blk wrapped;
+        }
+        sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "missing_message", "missing message or audio");
         return true;
     };
 
