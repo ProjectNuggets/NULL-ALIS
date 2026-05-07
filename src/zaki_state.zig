@@ -3803,11 +3803,18 @@ const ManagerImpl = struct {
         user_id: i64,
         limit: u32,
     ) ![]memory_root.MemoryEntry {
+        // V1.11 (2026-05-07) — Nova: "don't filter" archived from loose
+        // facts. The orphans rail surfaces facts that the extractor
+        // never connected to anything else; an archived/superseded fact
+        // that was also never linked is still a loose fact (in fact more
+        // suspicious — it expired without ever joining the graph). The
+        // FE shows the `valid_to` field so the user can tell archived
+        // apart from live; it's not the SQL's job to hide them.
         const q = try self.buildQuery(
             "SELECT id, key, content, memory_type, " ++
                 "COALESCE((EXTRACT(EPOCH FROM created_at))::bigint::text, '0'), " ++
                 "session_id, valid_to FROM {schema}.memories m " ++
-                "WHERE user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "WHERE user_id = $1 " ++
                 "AND " ++ BRAIN_USER_KEY_FILTER ++ " " ++
                 "AND NOT EXISTS (" ++
                 "    SELECT 1 FROM {schema}.memory_edges e " ++

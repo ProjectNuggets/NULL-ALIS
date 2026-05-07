@@ -11110,6 +11110,16 @@ const BrainTypedEdge = struct {
     source: []u8, // owned — duped from metadata
     target: []u8, // owned
     predicate: []u8, // owned
+    // V1.11 (2026-05-07) — surface real edge strength to the frontend.
+    // The DB stores per-edge `confidence` (LLM extractor's certainty,
+    // 0..1) and `weight` (vote count from re-extractions / community
+    // detection). Both are already populated by findEdgesByKeys; the
+    // gateway used to drop them. Exposing them lets the brain graph
+    // layout pull strong (high confidence × weight) edges tighter and
+    // weak ones farther — actual data instead of the predicate-type
+    // heuristic the FE was using.
+    confidence: f64,
+    weight: f64,
 
     fn deinit(self: *const BrainTypedEdge, allocator: std.mem.Allocator) void {
         allocator.free(self.source);
@@ -11441,6 +11451,8 @@ fn buildBrainTypedEdges(
             .source = try allocator.dupe(u8, e.source_key),
             .target = try allocator.dupe(u8, e.target_key),
             .predicate = try allocator.dupe(u8, e.predicate),
+            .confidence = e.confidence,
+            .weight = e.weight,
         });
     }
 
@@ -12090,7 +12102,9 @@ fn handleBrainGraph(
         jsonEscapeInto(w, e.target) catch return response_build_err;
         w.writeAll("\",\"predicate\":\"") catch return response_build_err;
         jsonEscapeInto(w, e.predicate) catch return response_build_err;
-        w.writeAll("\"}") catch return response_build_err;
+        // V1.11 (2026-05-07) — emit confidence + weight so the FE layout
+        // can pull strong relations tight and weak ones loose.
+        w.print("\",\"confidence\":{d:.3},\"weight\":{d:.3}}}", .{ e.confidence, e.weight }) catch return response_build_err;
     }
     w.writeAll("]") catch return response_build_err;
 
