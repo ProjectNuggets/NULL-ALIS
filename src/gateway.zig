@@ -8432,6 +8432,44 @@ fn sseDoneFrame(allocator: std.mem.Allocator, session_id: ?[]const u8, message_i
     return buf.toOwnedSlice(allocator);
 }
 
+/// V1.11 (2026-05-07) — `done` frame variant that signals "tools ran but
+/// no direct text reply this turn." Frontend uses the `tool_only_turn:true`
+/// flag to render a clean inline acknowledgment instead of the prior
+/// EMPTY_TURN_PLACEHOLDER prose. Same identity contract as `sseDoneFrame`
+/// (session_id + message_id optional) — only the extra flag differs.
+fn sseDoneFrameToolOnly(allocator: std.mem.Allocator, session_id: ?[]const u8, message_id: ?i64) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("event: done\ndata: {\"type\":\"done\",\"tool_only_turn\":true");
+    if (session_id) |sid| {
+        try w.writeAll(",\"session_id\":\"");
+        try jsonEscapeInto(w, sid);
+        try w.writeAll("\"");
+    }
+    if (message_id) |mid| {
+        try w.print(",\"message_id\":\"{d}\"", .{mid});
+    }
+    try w.writeAll("}\n\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// V1.11 (2026-05-07) — emitted when the model returned tool_calls without
+/// a final text reply (or the agent loop hit max_tool_iterations before
+/// producing text). Replaces the prior pattern of substituting
+/// `EMPTY_TURN_PLACEHOLDER` prose into the token stream, which surfaced as
+/// jarring placeholder text in the chat UI ("[tools ran, no direct
+/// reply…]"). The structured event lets the frontend render a small,
+/// honest "ZAKI ran tools" acknowledgment rather than fake assistant text.
+///
+/// Why this is correct: the EMPTY_TURN_PLACEHOLDER string was being
+/// inserted as if it were an assistant message. It wasn't — it was a UX
+/// papercut. Now the SSE contract carries the truth (tool_only_turn) and
+/// the frontend chooses how to render it.
+fn sseToolOnlySummaryFrame(allocator: std.mem.Allocator) ![]u8 {
+    return allocator.dupe(u8, "event: tool_only_summary\ndata: {\"type\":\"tool_only_summary\"}\n\n");
+}
+
 fn sseChatPayload(allocator: std.mem.Allocator, text: []const u8, session_id: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -9455,17 +9493,39 @@ fn handleApiChatStreamSseConnection(
     };
     defer root_allocator.free(reply);
 
-    const payload_text = if (reply.len > 0)
-        reply
-    else
-        EMPTY_TURN_PLACEHOLDER;
-
     // Determine if live streaming actually delivered tokens. If the provider
     // does not support streaming, live_seq stays 0 and we must fall back to
     // post-hoc chunking so the reply text still reaches the client.
     const live_streamed = is_live and live_seq > 0;
 
-    if (!live_streamed) {
+    // V1.11 (2026-05-07) — Tool-only-turn detection. When the agent loop
+    // produced tool_calls but no final text reply (and the live stream
+    // didn't deliver any tokens), pre-V1.11 behavior was to substitute
+    // EMPTY_TURN_PLACEHOLDER prose into the token stream as if it were
+    // assistant text. That surfaced as a jarring placeholder line in the
+    // chat UI ("[tools ran, no direct reply…]"). New behavior: emit a
+    // structured `tool_only_summary` SSE event + flag the `done` frame
+    // with `tool_only_turn:true`. The frontend renders an honest,
+    // minimal "ZAKI ran tools" acknowledgment instead of fake prose.
+    //
+    // Detection signal: empty reply on the success path. Genuine errors
+    // hit the `.err` branch above, so an empty `.ok` reply is almost
+    // always a tool_only_turn (the agent ran tools, hit max_tool_iterations
+    // or a loop_detected exit, and didn't produce final text). ZAKI's
+    // ObserverEvent.tool_only_turn already fired during the turn (see
+    // src/agent/root.zig:3753); this is the gateway-side rendering
+    // contract that pairs with it.
+    const is_tool_only = reply.len == 0;
+    const payload_text = reply;
+
+    if (is_tool_only) {
+        // Tool-only turn: emit structured event, skip placeholder chunking.
+        const tool_only_fallback = "event: tool_only_summary\ndata: {\"type\":\"tool_only_summary\"}\n\n";
+        const tool_only_owned = sseToolOnlySummaryFrame(req_allocator) catch null;
+        defer if (tool_only_owned) |frame| req_allocator.free(frame);
+        const tool_only_frame: []const u8 = if (tool_only_owned) |frame| frame else tool_only_fallback;
+        sse_stream.sendFrame(tool_only_frame) catch return true;
+    } else if (!live_streamed) {
         // ── Buffered replay / fallback path ────────────────────────
         // Used when: (a) delivery_mode is buffered_replay, or (b) live mode
         // but the provider didn't actually stream (non-streaming provider).
@@ -9494,9 +9554,19 @@ fn handleApiChatStreamSseConnection(
     // Live mode with streaming provider: tokens already delivered via
     // liveStreamCallback during agent processing. No post-hoc chunking needed.
 
-    // Always send done frame regardless of delivery mode.
-    const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
-    const done_owned = sseDoneFrame(req_allocator, session_key, std.time.milliTimestamp()) catch null;
+    // Always send done frame regardless of delivery mode. Tool-only turns
+    // get the variant carrying `tool_only_turn:true` so the frontend can
+    // distinguish a real done-with-text from a done-with-only-tools.
+    const done_fallback = if (is_tool_only)
+        "event: done\ndata: {\"type\":\"done\",\"tool_only_turn\":true}\n\n"
+    else
+        "event: done\ndata: {\"type\":\"done\"}\n\n";
+    const done_owned = blk: {
+        if (is_tool_only) {
+            break :blk sseDoneFrameToolOnly(req_allocator, session_key, std.time.milliTimestamp()) catch null;
+        }
+        break :blk sseDoneFrame(req_allocator, session_key, std.time.milliTimestamp()) catch null;
+    };
     defer if (done_owned) |frame| req_allocator.free(frame);
     const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
     sse_stream.sendFrame(done_frame) catch {
@@ -23895,6 +23965,50 @@ test "baseline: sseDoneFrame is always terminal with type:done" {
     defer std.testing.allocator.free(frame_minimal);
     try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "\"type\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "session_id") == null);
+}
+
+// V1.11 (2026-05-07) — Move 6 (no-placeholder UX). Two new SSE builders
+// replace the prior pattern of substituting EMPTY_TURN_PLACEHOLDER prose
+// into the token stream when the agent produced tool_calls but no final
+// text reply. Tests below pin the contract the frontend reads:
+//   1. tool_only_summary frame fires before done on tool-only turns
+//   2. done frame on tool-only turns carries tool_only_turn:true flag
+//   3. done frame on regular turns does NOT carry the flag (regression
+//      test against accidental flag propagation)
+
+test "sseToolOnlySummaryFrame emits the contract the frontend renders" {
+    const frame = try sseToolOnlySummaryFrame(std.testing.allocator);
+    defer std.testing.allocator.free(frame);
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: tool_only_summary\ndata: "));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"type\":\"tool_only_summary\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, frame, "\n\n"));
+}
+
+test "sseDoneFrameToolOnly carries tool_only_turn:true plus identity" {
+    const frame_full = try sseDoneFrameToolOnly(std.testing.allocator, "sess-7", 99);
+    defer std.testing.allocator.free(frame_full);
+    try std.testing.expect(std.mem.startsWith(u8, frame_full, "event: done\ndata: "));
+    try std.testing.expect(std.mem.indexOf(u8, frame_full, "\"type\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame_full, "\"tool_only_turn\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame_full, "\"session_id\":\"sess-7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame_full, "\"message_id\":\"99\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, frame_full, "\n\n"));
+
+    // Without optional fields, flag must still appear so the frontend
+    // can distinguish empty-tool-only-turn from genuine empty done.
+    const frame_minimal = try sseDoneFrameToolOnly(std.testing.allocator, null, null);
+    defer std.testing.allocator.free(frame_minimal);
+    try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "\"tool_only_turn\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "session_id") == null);
+}
+
+test "sseDoneFrame regression: regular done frame does NOT carry tool_only_turn flag" {
+    const frame = try sseDoneFrame(std.testing.allocator, "sess-1", 42);
+    defer std.testing.allocator.free(frame);
+    // Critical regression test — accidentally flagging regular turns as
+    // tool_only_turn would cause the frontend to render every reply as
+    // a "ZAKI ran tools" acknowledgment instead of the actual text.
+    try std.testing.expect(std.mem.indexOf(u8, frame, "tool_only_turn") == null);
 }
 
 test "baseline: sseErrorFrame emits event:error with code and message" {

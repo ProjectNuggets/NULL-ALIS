@@ -1072,8 +1072,11 @@ test "SubagentManager init and deinit" {
 }
 
 test "SubagentConfig defaults" {
+    // V1.11 (2026-05-07): max_iterations raised 15 → 50 to give delegated
+    // subagent tasks (research, multi-step analysis, document synthesis)
+    // genuine room to complete instead of cutting off mid-thought.
     const sc = SubagentConfig{};
-    try std.testing.expectEqual(@as(u32, 15), sc.max_iterations);
+    try std.testing.expectEqual(@as(u32, 50), sc.max_iterations);
     try std.testing.expectEqual(@as(u32, 4), sc.max_concurrent);
 }
 
@@ -1681,9 +1684,12 @@ test "SubagentManager spawn e2e completes and publishes bus message" {
 
 // ── Baseline characterization tests (Phase 00-01) ───────────────
 
-test "baseline: SubagentConfig defaults max_iterations to 15" {
+test "baseline: SubagentConfig defaults max_iterations to 50 (V1.11 raised from 15)" {
+    // V1.11 (2026-05-07): raised 15 → 50. Subagents handle complex
+    // delegated tasks where 15 iterations regularly cut off useful work.
+    // Adaptive-exit detectors still bound pathological loops.
     const cfg = SubagentConfig{};
-    try std.testing.expectEqual(@as(u32, 15), cfg.max_iterations);
+    try std.testing.expectEqual(@as(u32, 50), cfg.max_iterations);
 }
 
 test "baseline: SubagentConfig defaults max_concurrent to 4" {
