@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
 const Agent = @import("agent/root.zig").Agent;
+const working_memory = @import("agent/working_memory.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
@@ -368,6 +369,24 @@ pub const SessionManager = struct {
                     self.allocator.free(entry.content);
                 }
                 self.allocator.free(entries);
+            }
+        }
+
+        // V1.13 follow-up #1 — pin user identity facts into working
+        // memory slot 0 at session creation. listIdentityFacts pulls
+        // the user's pinned identity store; we bundle the top facts
+        // into one slot 0 render so the agent always sees who it's
+        // talking to (mirrors what the legacy <active_identity> block
+        // does in memory_loader, but pinned to working_memory so we
+        // can drop the legacy dup once Day 5.2's DUP-1 re-fix lands).
+        // Failure-soft: postgres unavailable → no-op, legacy
+        // <active_identity> path stays active as fallback.
+        if (self.extraction_state_mgr) |smgr| {
+            if (self.extraction_user_id) |uid| {
+                _ = working_memory.pinIdentityFromUserState(self.allocator, smgr, uid, owned_key) catch |err| blk: {
+                    log.warn("session.pin_identity_failed err={s}", .{@errorName(err)});
+                    break :blk @as(usize, 0);
+                };
             }
         }
 

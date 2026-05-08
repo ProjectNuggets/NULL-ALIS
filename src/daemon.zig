@@ -1299,6 +1299,23 @@ fn runCronAgentTurnWithBus(
     const cfg_ptr = ctx orelse return error.InvalidArgument;
     const cfg: *const Config = @ptrCast(@alignCast(cfg_ptr));
 
+    // V1.13 Day 5.2 — dream-as-cron sentinel. When cron.json has
+    // `command: "dream"` (a 5-character sentinel; clean for users to
+    // type), substitute the full dream_system_prompt before running
+    // the agent turn. This way users get a one-word cron entry while
+    // the agent sees the full reflection contract. Avoids requiring
+    // users to paste 800-char prompts into cron.json.
+    //
+    // Cron entry shape:
+    //   { "id": "dream_3am_user_1", "user_id": 1,
+    //     "schedule": "0 3 * * *", "kind": "agent",
+    //     "command": "dream", "session_target": "isolated" }
+    const dream_mod = @import("agent/dream.zig");
+    const effective_prompt: []const u8 = if (std.mem.eql(u8, prompt, "dream"))
+        dream_mod.dream_system_prompt
+    else
+        prompt;
+
     if (job.session_target == .main and job.wake_mode == .next_heartbeat) {
         if (scheduler.context_user_id) |user_id| {
             const reason = try std.fmt.allocPrint(
@@ -1405,7 +1422,7 @@ fn runCronAgentTurnWithBus(
     });
     defer tools_mod.clearTenantContext();
 
-    return runtime.session_mgr.processMessageWithContext(session_key, prompt, null, .{
+    return runtime.session_mgr.processMessageWithContext(session_key, effective_prompt, null, .{
         .turn_origin = turn_origin,
     });
 }

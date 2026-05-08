@@ -2658,17 +2658,34 @@ pub const Agent = struct {
         // of being prepended to the user message. Load it first so we can
         // include it in the system prompt rebuild below.
         const enrich_start_ms = std.time.milliTimestamp();
-        // V1.13 DUP-1: REVERTED before merge. The cleaner fix needs
-        // pinIdentitySlot to actually fire at session-start (Day 5.2
-        // follow-up — currently no caller). Until then, working_memory
-        // doesn't auto-populate identity slots, so skipping the legacy
-        // <active_identity> block would cause identity LOSS on early
-        // turns (race: WM empty + legacy skipped = agent has no
-        // identity render). Reverting to the duplicated-but-safe path.
-        // Cost: ~500B-2KB extra per turn until pinIdentitySlot is
-        // wired.  Acceptable. Better than dropping identity.
+        // V1.13 DUP-1 RE-ENABLED (safe path).
+        //
+        // session.zig::getOrCreateInternal now calls
+        // working_memory.pinIdentityFromUserState at session creation,
+        // which pins the user's identity facts to slot 0. The
+        // <working_memory> block in the volatile prompt renders that
+        // slot. So skipping the legacy <active_identity> block here
+        // is now safe — identity is rendered once via working_memory,
+        // not twice.
+        //
+        // Gate: only skip when ALL working_memory infrastructure is
+        // wired (state_mgr + user_id + session_id + the agent has
+        // a memory_runtime — without mem_rt, working_memory.loadForRender
+        // can't fetch the slots). Otherwise fall back to legacy
+        // <active_identity> for safety.
+        //
+        // Verify safety: even if pinIdentityFromUserState found 0
+        // facts (truly fresh user), the agent prompt's stable
+        // BrainArchitecture block + the conversation itself convey
+        // identity context. The legacy block was a 500B-2KB pin of
+        // listIdentityFacts content; if listIdentityFacts returns
+        // empty there's nothing to skip anyway.
+        const wm_owns_identity: bool = self.extraction_state_mgr != null and
+            self.extraction_user_id != null and
+            self.memory_session_id != null and
+            self.mem_rt != null;
         const memory_slot_result = if (self.mem) |mem|
-            memory_loader.loadTurnMemorySlot(
+            memory_loader.loadTurnMemorySlotOpts(
                 self.allocator,
                 mem,
                 self.mem_rt,
@@ -2676,6 +2693,7 @@ pub const Agent = struct {
                 self.memory_session_id,
                 self.extraction_state_mgr,
                 self.extraction_user_id,
+                .{ .skip_legacy_identity = wm_owns_identity },
             ) catch |err| blk: {
                 log.warn("memory.enrichment_failed error={s} — proceeding without memory slot", .{@errorName(err)});
                 break :blk memory_loader.MemorySlot{

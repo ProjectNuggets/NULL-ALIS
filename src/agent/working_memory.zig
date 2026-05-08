@@ -351,6 +351,57 @@ pub fn pinPersonaSlot(
     );
 }
 
+/// V1.13 Day 5.2 — bundle the user's identity facts (from
+/// listIdentityFacts) into a single rendered string and pin it to
+/// slot 0. Called once at session creation. Returns the count of
+/// facts bundled (0 means no identity present yet).
+///
+/// Bundles top N facts joined by newlines (max 1KB total) into a
+/// single slot. Future refinement: split into slot 0 (identity) +
+/// slot 1 (persona) when persona facts are distinguishable from
+/// identity facts.
+pub fn pinIdentityFromUserState(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    session_id: []const u8,
+) !usize {
+    const FETCH_LIMIT: u32 = 8;
+    const MAX_BUNDLE_BYTES: usize = 1024;
+
+    const facts = state_mgr.listIdentityFacts(allocator, user_id, FETCH_LIMIT) catch |err| {
+        log.warn("pinIdentityFromUserState.list_failed err={s}", .{@errorName(err)});
+        return 0;
+    };
+    defer memory_root.freeEntries(allocator, facts);
+    if (facts.len == 0) return 0;
+
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    var emitted: usize = 0;
+    for (facts) |entry| {
+        if (buf.items.len >= MAX_BUNDLE_BYTES) break;
+        const trimmed = std.mem.trim(u8, entry.content, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const remaining = MAX_BUNDLE_BYTES - buf.items.len;
+        if (remaining < 4) break;
+        const slice = if (trimmed.len > remaining - 2) trimmed[0 .. remaining - 2] else trimmed;
+        try w.print("- {s}\n", .{slice});
+        emitted += 1;
+    }
+    if (emitted == 0) return 0;
+
+    pinIdentitySlot(state_mgr, user_id, session_id, buf.items, null) catch |err| {
+        log.warn("pinIdentityFromUserState.pin_failed err={s}", .{@errorName(err)});
+        return 0;
+    };
+    log.info("working_memory.pinned_identity user={d} session={s} facts={d} bytes={d}", .{
+        user_id, session_id, emitted, buf.items.len,
+    });
+    return emitted;
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────
