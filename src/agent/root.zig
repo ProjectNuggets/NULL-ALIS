@@ -2658,8 +2658,18 @@ pub const Agent = struct {
         // of being prepended to the user message. Load it first so we can
         // include it in the system prompt rebuild below.
         const enrich_start_ms = std.time.milliTimestamp();
+        // V1.13 DUP-1 fix: when working_memory infrastructure is wired
+        // (postgres + tenant + session), it owns the identity render
+        // via the volatile prompt's <working_memory> block. Tell
+        // memory_loader to skip its legacy <active_identity> injection
+        // to avoid duplicating identity facts in every turn's prompt
+        // (saves ~500B-2KB volatile bytes per turn). Falls back to
+        // legacy when WM infra is missing.
+        const wm_owns_identity: bool = self.extraction_state_mgr != null and
+            self.extraction_user_id != null and
+            self.memory_session_id != null;
         const memory_slot_result = if (self.mem) |mem|
-            memory_loader.loadTurnMemorySlot(
+            memory_loader.loadTurnMemorySlotOpts(
                 self.allocator,
                 mem,
                 self.mem_rt,
@@ -2671,6 +2681,7 @@ pub const Agent = struct {
                 // NULLALIS_GRAPH_RECALL_MAX_HOPS > 0 (default 1).
                 self.extraction_state_mgr,
                 self.extraction_user_id,
+                .{ .skip_legacy_identity = wm_owns_identity },
             ) catch |err| blk: {
                 log.warn("memory.enrichment_failed error={s} — proceeding without memory slot", .{@errorName(err)});
                 break :blk memory_loader.MemorySlot{

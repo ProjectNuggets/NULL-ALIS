@@ -919,6 +919,21 @@ pub fn loadContextWithRuntime(
 /// can't blow the prompt cache budget. Caller passes `null` for either
 /// param to force legacy behavior; `NULLALIS_GRAPH_RECALL_MAX_HOPS=0`
 /// also disables (operator-side rollback).
+/// Options bag for loadTurnMemorySlot. Added in V1.13 to avoid breaking
+/// the existing positional-arg API surface as new flags accumulate.
+pub const LoadTurnMemoryOptions = struct {
+    /// V1.13 DUP-1 fix: when true, skip the legacy <active_identity>
+    /// block. Working Memory (V1.13 Layer 0) renders identity slots in
+    /// the volatile prompt block already; injecting <active_identity>
+    /// here too duplicates 500B-2KB per turn. When agent/root.zig
+    /// confirms working_memory is populated (state_mgr + user_id +
+    /// session_id wired AND postgres alive), it sets this flag. When
+    /// working_memory is unavailable (sqlite build, postgres down,
+    /// fresh session before any slots), the legacy path stays active
+    /// as a fallback so identity is never lost.
+    skip_legacy_identity: bool = false,
+};
+
 pub fn loadTurnMemorySlot(
     allocator: std.mem.Allocator,
     mem: Memory,
@@ -927,6 +942,31 @@ pub fn loadTurnMemorySlot(
     session_id: ?[]const u8,
     state_mgr_for_graph: ?*zaki_state.Manager,
     user_id_for_graph: ?i64,
+) !MemorySlot {
+    return loadTurnMemorySlotOpts(
+        allocator,
+        mem,
+        mem_rt,
+        user_message,
+        session_id,
+        state_mgr_for_graph,
+        user_id_for_graph,
+        .{},
+    );
+}
+
+/// V1.13 — explicit-options variant. Takes a LoadTurnMemoryOptions
+/// bag for new flags (today: skip_legacy_identity). Old positional
+/// callers continue to work via the wrapper above.
+pub fn loadTurnMemorySlotOpts(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    mem_rt: ?*MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+    state_mgr_for_graph: ?*zaki_state.Manager,
+    user_id_for_graph: ?i64,
+    opts: LoadTurnMemoryOptions,
 ) !MemorySlot {
     // V1.10-A — pass state_mgr_for_graph + user_id_for_graph through as
     // the supersede-filter inputs. They're already required for graph
@@ -1000,12 +1040,19 @@ pub fn loadTurnMemorySlot(
     // any error; legacy retrieval is unaffected.
     var identity_block: ?[]u8 = null;
     var identity_stats = IdentityAppendResult{};
-    if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
-        identity_block = buildActiveIdentityBlock(allocator, sm, uid, &identity_stats) catch |err| blk: {
-            log.warn("active_identity.append_failed err={s} — skipping identity context", .{@errorName(err)});
-            break :blk null;
+    // V1.13 DUP-1 fix: when caller signals working_memory has identity
+    // slots populated, skip the legacy <active_identity> block.
+    // Working Memory's volatile-prompt render already covers identity.
+    // Falls through to legacy when WM is unavailable (sqlite build,
+    // postgres down, fresh session) so identity is never lost.
+    if (!opts.skip_legacy_identity) {
+        if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
+            identity_block = buildActiveIdentityBlock(allocator, sm, uid, &identity_stats) catch |err| blk: {
+                log.warn("active_identity.append_failed err={s} — skipping identity context", .{@errorName(err)});
+                break :blk null;
+            };
         };
-    };
+    }
     result.stats.identity_pin_active = identity_stats.appended;
     result.stats.identity_pin_fact_count = identity_stats.fact_count;
     result.stats.identity_pin_appended_bytes = identity_stats.appended_bytes;
