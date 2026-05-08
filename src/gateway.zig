@@ -11361,7 +11361,15 @@ const BRAIN_DEFAULT_MAX_NODES: u32 = 500;
 const BRAIN_MAX_MAX_NODES: u32 = 2000;
 const BRAIN_SEMANTIC_THRESHOLD: f32 = 0.7;
 const BRAIN_SESSION_EDGE_CAP_PER_SESSION: usize = 50;
-const BRAIN_SUMMARY_CHARS: usize = 200;
+// V1.11 hardening (2026-05-08, FE spec #7) — bumped 200 → 1000.
+// Pre-fix the brain orphan rail and graph node summaries truncated
+// mid-word at ~196 chars (the next-codepoint boundary inside 200).
+// FE-visible bug: orphan summary read "I'll be here when you ge"
+// cut mid-word. Agent summaries are typically 1-3 sentences;
+// 1000 covers everything without bloating the JSON response shape
+// (a 500-node graph at 1000 chars/summary = ~500KB worst case,
+// still well under MAX_BODY_SIZE 30MB).
+const BRAIN_SUMMARY_CHARS: usize = 1000;
 
 /// V1.5 day-2 review fix — round a length down to the last full UTF-8
 /// codepoint boundary at or before `max`. Without this, the `summary`
@@ -12643,11 +12651,45 @@ fn handleBrainDocuments(
 const BRAIN_MEMORY_EVENTS_LIMIT: u32 = 50;
 const BRAIN_MEMORY_EDGES_LIMIT: usize = 50;
 
+/// V1.11 hardening (2026-05-08) — RFC 3986 percent-decoder for path
+/// segments. Brain memory keys legitimately contain `:` (date-ID pattern
+/// `2026-04-05:1139`) which the FE correctly URL-encodes to `%3A`. The
+/// brain detail handler used to compare the encoded literal against the
+/// DB → 404. This decoder runs once at the route boundary so the rest
+/// of the handler sees the canonical key.
+///
+/// Caller frees. Returns InvalidEncoding on malformed `%XX` sequences.
+fn percentDecodePathSegment(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, encoded.len);
+    var i: usize = 0;
+    while (i < encoded.len) {
+        const c = encoded[i];
+        if (c == '%') {
+            if (i + 2 >= encoded.len) return error.InvalidEncoding;
+            const hi = std.fmt.charToDigit(encoded[i + 1], 16) catch return error.InvalidEncoding;
+            const lo = std.fmt.charToDigit(encoded[i + 2], 16) catch return error.InvalidEncoding;
+            try out.append(allocator, (hi << 4) | lo);
+            i += 3;
+        } else if (c == '+') {
+            // Path segments don't use '+' for space (that's form-encoding),
+            // but defense-in-depth: leave '+' as literal '+' in path keys.
+            try out.append(allocator, '+');
+            i += 1;
+        } else {
+            try out.append(allocator, c);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn handleBrainMemoryDetail(
     allocator: std.mem.Allocator,
     method: []const u8,
     user_id: []const u8,
-    key: []const u8,
+    key_raw: []const u8,
     state: *GatewayState,
 ) RouteResponse {
     if (!std.mem.eql(u8, method, "GET")) {
@@ -12657,6 +12699,16 @@ fn handleBrainMemoryDetail(
     const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
+
+    // V1.11 hardening (2026-05-08, FE spec #6) — percent-decode the path
+    // segment before length checks + DB query. Brain keys legitimately
+    // contain ':' (date-ID pattern `2026-04-05:1139`) which the FE
+    // encodes to `%3A` per RFC 3986. Pre-fix the handler queried the
+    // encoded literal against the DB — every colon-bearing key 404'd.
+    const key = percentDecodePathSegment(allocator, key_raw) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_key_encoding\"}" };
+    };
+    defer allocator.free(key);
 
     if (key.len == 0 or key.len > 256) {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_key\"}" };
@@ -13239,6 +13291,79 @@ const BRAIN_ORPHANS_DEFAULT_LIMIT: u32 = 200;
 const BRAIN_ORPHANS_MAX_LIMIT: u32 = 1000;
 const BRAIN_ORPHANS_SUMMARY_CHARS: usize = 200;
 
+/// V1.11 hardening (2026-05-08, FE spec #2) — server-side self-node
+/// picker. Powers focus-mode-as-primary on the brain page.
+///
+/// Picker heuristic (stable, deterministic):
+///   1. listIdentityFacts(20) returns memories participating in
+///      identity-class edges (NAME/IS/LIVES_IN/WORKS_AT/PREFERS etc).
+///      Already-curated SQL at zaki_state.zig:3877.
+///   2. Picker returns the FIRST result. listIdentityFacts orders by
+///      created_at DESC so this is the most-recent identity fact —
+///      typically the user's identity card / "boss" memory.
+///   3. Cold-corpus fallback: empty list → 404 with `no_self_anchor`.
+///      FE renders an empty-state hint ("ZAKI hasn't learned about you
+///      yet — chat to seed your brain"). The FE agent's heuristic
+///      (highest-importance core node) is intentionally NOT mirrored
+///      server-side: in cold-corpus state there's no honest signal,
+///      and empty-state is more truthful than a guess.
+///
+/// Stability contract: the same user, same corpus, two consecutive
+/// calls return the same key. Identity facts only change on extraction
+/// of a NEW identity-class edge — predictable + auditable.
+///
+/// Response shape:
+///   200: {"memory": {"key", "summary", "kind", "valid_to"}}
+///   404: {"error": "no_self_anchor"}
+fn handleBrainMe(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    // limit=20 — enough headroom for a future picker that ranks by
+    // edge degree without re-querying. Today we just take the first.
+    const facts = state_mgr.listIdentityFacts(allocator, numeric_user_id, 20) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"identity_query_failed\"}" };
+    };
+    defer memory_mod.freeEntries(allocator, facts);
+
+    if (facts.len == 0) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"no_self_anchor\"}" };
+    }
+
+    const me = &facts[0];
+    const summary_len = brainTruncateUtf8Boundary(me.content, BRAIN_SUMMARY_CHARS);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"memory\":{\"key\":") catch return response_build_err;
+    json_util.appendJsonString(&out, allocator, me.key) catch return response_build_err;
+    w.writeAll(",\"kind\":") catch return response_build_err;
+    json_util.appendJsonString(&out, allocator, me.category.toString()) catch return response_build_err;
+    w.writeAll(",\"summary\":") catch return response_build_err;
+    json_util.appendJsonString(&out, allocator, me.content[0..summary_len]) catch return response_build_err;
+    w.writeAll(",\"valid_to\":") catch return response_build_err;
+    if (me.valid_to) |vt| {
+        w.print("{d}", .{vt}) catch return response_build_err;
+    } else {
+        w.writeAll("null") catch return response_build_err;
+    }
+    w.writeAll("}}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
 fn handleBrainOrphans(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -13576,7 +13701,13 @@ fn handleBrainLocalGraph(
         json_util.appendJsonString(&out, allocator, e.target_key) catch return response_build_err;
         w.writeAll(",\"predicate\":") catch return response_build_err;
         json_util.appendJsonString(&out, allocator, e.predicate) catch return response_build_err;
-        w.print(",\"weight\":{d:.3}", .{jsonSafeFloat(e.weight)}) catch return response_build_err;
+        // V1.11 hardening (2026-05-08, FE spec #3) — emit confidence
+        // alongside weight on local-graph edges to match the global-graph
+        // contract. Pre-fix the FE had to synthesize confidence=1.0 in
+        // BrainGraphView.edgeRelevance because local-graph dropped the
+        // field, defeating the relevance-weighted layout for the local-
+        // graph view (the high-leverage focus-mode pillar).
+        w.print(",\"weight\":{d:.3},\"confidence\":{d:.3}", .{ jsonSafeFloat(e.weight), jsonSafeFloat(e.confidence) }) catch return response_build_err;
         // Edge-level link_type derived from predicate via the canonical
         // extraction_persist mapping (same predicate→7-category lookup
         // used at write time in V1.7a-5). Keeps the FE link_type surface
@@ -15502,6 +15633,24 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "brain/orphans")) {
         const brain_target = extractRequestTarget(raw_request) orelse base_path;
         return handleBrainOrphans(req_allocator, method, scoped_user_id, brain_target, state);
+    }
+
+    // ── /brain/me — V1.11 hardening (2026-05-08, FE spec #2) ─────────────
+    // GET /api/v1/users/{id}/brain/me
+    //
+    // Returns the canonical "this is the user" memory. Powers focus-mode-
+    // as-primary in the brain page (TheBrain pattern): a stable anchor
+    // for the centered-graph view. FE pre-fix used a degree heuristic
+    // that was brittle (turn-to-turn churn shifted the pick); server-side
+    // selection is stable because the picker reads identity-class edges
+    // (NAME/IS/LIVES_IN/WORKS_AT/PREFERS/etc — see listIdentityFacts) and
+    // returns the highest-confidence one.
+    //
+    // Response shape:
+    //   { key, summary, kind, valid_to, importance }  on hit
+    //   { error: "no_self_anchor" }                   on 404 (cold corpus)
+    if (std.mem.eql(u8, parsed.subpath, "brain/me")) {
+        return handleBrainMe(req_allocator, method, scoped_user_id, state);
     }
 
     // ── /brain/communities — V1.7a-9d ────────────────────────────────────
