@@ -175,6 +175,43 @@ fn deriveSessionEndEntityKey(allocator: std.mem.Allocator, object: []const u8) !
     return std.fmt.allocPrint(allocator, "entity_{s}", .{hex_buf});
 }
 
+/// V1.12 — build a compact transcript text from MessageEntries for the
+/// session-end entity_pipeline pass. Walks the entries in order
+/// (oldest-first), filters to user/assistant content, caps at ~3KB.
+/// Mirrors agent/root.zig::buildRecentTurnText but works on
+/// MessageEntry slices instead of OwnedMessage.
+fn buildSessionEndTranscriptText(
+    allocator: std.mem.Allocator,
+    entries: []const memory_mod.MessageEntry,
+) ![]u8 {
+    if (entries.len == 0) return allocator.alloc(u8, 0);
+
+    const MAX_BYTES: usize = 3072;
+    var collected: std.ArrayListUnmanaged(u8) = .{};
+    errdefer collected.deinit(allocator);
+
+    for (entries) |entry| {
+        if (collected.items.len >= MAX_BYTES) break;
+        // MessageEntry.role is []const u8, not an enum. Filter to
+        // user/assistant content only — system/tool roles are agent
+        // bookkeeping, not user prose.
+        const is_user = std.mem.eql(u8, entry.role, "user");
+        const is_assistant = std.mem.eql(u8, entry.role, "assistant");
+        if (!is_user and !is_assistant) continue;
+        const role_str: []const u8 = if (is_user) "user" else "assistant";
+        if (entry.content.len == 0) continue;
+
+        const remaining = MAX_BYTES - collected.items.len;
+        const prefix_overhead: usize = role_str.len + 3;
+        if (remaining <= prefix_overhead) break;
+        const content_budget = remaining - prefix_overhead;
+        const content_slice = if (entry.content.len > content_budget) entry.content[0..content_budget] else entry.content;
+        try collected.writer(allocator).print("{s}: {s}\n", .{ role_str, content_slice });
+    }
+
+    return collected.toOwnedSlice(allocator);
+}
+
 fn setModelName(self: anytype, model: []const u8) !void {
     const owned_model = try self.allocator.dupe(u8, model);
     if (self.model_name_owned) self.allocator.free(self.model_name);
@@ -1421,6 +1458,46 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             triple_edges_written,
             next,
         });
+
+        // V1.12 — session-end entity-pipeline pass. Catches sessions that
+        // ended without hitting the per-3-turn auto-trigger boundary
+        // (short sessions, or sessions whose final turn was the trigger).
+        // Idempotent w.r.t. earlier per-3-turn runs: re-emitting the same
+        // edge bumps weight via upsertMemoryEdge ON CONFLICT — no
+        // duplicate rows. Failure-soft.
+        if (self.extraction_state_mgr) |smgr_ep| {
+            if (self.extraction_user_id) |uid_ep| {
+                if (self.extraction_coref_embed) |emb_ep| {
+                    const transcript_text = buildSessionEndTranscriptText(self.allocator, entries) catch |err| blk: {
+                        log.warn("session_end.entity_pipeline.build_text_failed err={s}", .{@errorName(err)});
+                        break :blk null;
+                    };
+                    if (transcript_text) |tt| {
+                        defer self.allocator.free(tt);
+                        const ep_stats = @import("entity_pipeline.zig").runOnTurn(
+                            self.allocator,
+                            self.provider,
+                            self.model_name,
+                            smgr_ep,
+                            emb_ep,
+                            uid_ep,
+                            tt,
+                            30,
+                        );
+                        log.info(
+                            "session_end.entity_pipeline mentions={d} resolved={d} minted={d} edges={d} llm_ms={d}",
+                            .{
+                                ep_stats.mentions_extracted,
+                                ep_stats.entities_resolved,
+                                ep_stats.entities_minted,
+                                ep_stats.edges_emitted,
+                                ep_stats.llm_latency_ms,
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
     // When parsed_summary is null, we arrived here via one of three paths that
     // each already logged their own status event above (deterministic /
