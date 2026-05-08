@@ -334,6 +334,13 @@ pub fn buildStableSystemPrompt(
     // CANNOT drift from the enum it documents.
     try buildLinkTypeSection(w);
 
+    // V1.13 — Brain architecture briefing. Tells the agent what's
+    // actually available + how to leverage it. Stays in the STABLE
+    // block because the architecture is workspace-stable across
+    // turns; the volatile block surfaces the per-turn working-memory
+    // slots that this section describes.
+    try buildBrainArchitectureSection(w);
+
     // Response protocol — tool-first dispatch rules. Placed immediately after
     // Tools so the model sees the tool catalog and the rules that govern its
     // use as one unit, not as separate concerns.
@@ -704,6 +711,48 @@ fn buildLinkTypeSection(w: anytype) !void {
     try w.writeAll("- `synthesis` — compose_memory output (default when you call compose_memory)\n");
     try w.writeAll("- `episode` — event-shaped facts (HAPPENED_ON, ATTENDED, OCCURRED_AT)\n\n");
     try w.writeAll("Pick the category that matches the relationship's shape. Compose-output is `synthesis` unless your consolidation expresses a different shape (e.g. `preference` when consolidating preferences across sources).\n\n");
+}
+
+/// V1.13 — Brain architecture briefing.
+///
+/// Tells the agent what its memory architecture provides, where each
+/// piece lives, and how to use it correctly. Insertion point is after
+/// the link_type section, before the response protocol — the agent
+/// reads the tool catalog → link_type vocab → architecture briefing
+/// → protocol rules as one coherent unit.
+fn buildBrainArchitectureSection(w: anytype) !void {
+    try w.writeAll("## Brain Architecture\n\n");
+    try w.writeAll("Your memory is layered. Understand each layer; they compound.\n\n");
+
+    try w.writeAll("### Layer 0 — Working Memory (hot slots, this session)\n");
+    try w.writeAll("Up to 15 slots persist across turns within this session. They render at the top of your volatile prompt as `<working_memory>` — read it every turn. Slot types: `identity`, `active_goal`, `open_loop`, `decision`, `emotional`, `relationship`, `recent_entity`, `skill_state`, `temporal`, `open_question`. Identity slots are pinned (never evicted). Other slots evict by composite priority (importance × recency × type-weight).\n\n");
+    try w.writeAll("Auto-promotion fires on extraction: predicates like TODO, WILL_DO, REMINDS_ME_TO, NEEDS_TO, PROMISED → `open_loop`; WORKING_ON, BUILDING, GOAL, FOCUSING_ON → `active_goal`; DECIDED, CHOSE → `decision`; FEELS, MENTAL_STATE, STRESSED_ABOUT → `emotional`; HAPPENS_ON, BIRTHDAY, SCHEDULED_FOR → `temporal`. When the user says \"remind me to call Alfred about MNDA\", that becomes an open-loop slot automatically — you don't need to call `memory_store` separately.\n\n");
+
+    try w.writeAll("### Layer 1 — Forward extraction (every 3 turns, async)\n");
+    try w.writeAll("Every 3 turns the system enqueues a wiki-link extraction job. A background worker (heartbeat thread) extracts entity mentions from the recent turns and emits co-occurrence + speaker edges in `memory_edges`. This runs OUT-OF-BAND — it does NOT block your reply and you do NOT need to invoke it. It just happens. Check `extraction_queue` table to see jobs in flight.\n\n");
+
+    try w.writeAll("### Layer 2 — Canonical memory (all sessions, forever)\n");
+    try w.writeAll("Facts live in `memories` with bi-temporal validity (`valid_from`, `valid_to`, `superseded_by`). Use `memory_store` for durable user facts; `memory_edit` to correct existing entries; `memory_archive` for soft-delete; `memory_maintain` for contradiction resolution. Truth maintenance is real: when a fact is corrected, the supersede chain auto-cascades through `memory_edges`.\n\n");
+
+    try w.writeAll("### Layer 3 — Vector index (pgvector)\n");
+    try w.writeAll("Semantic recall via `memory_recall`. Returns prose blobs ranked by cosine + keyword. The hybrid path is the default; you don't need to think about it. If recall feels stale, prefer `brain_graph` for structural lookups — it's faster than text scanning and shows you who/what is connected to whom.\n\n");
+
+    try w.writeAll("### Layer 4 — Knowledge graph (`memory_edges`)\n");
+    try w.writeAll("Typed predicates connecting entities. Use `brain_graph local_graph(center_key=...)` to navigate the local subgraph (depth 2) before composing a response — when asked about a person, project, or concept that has rich connections, the graph view shows you the structural neighborhood faster than recall does.\n\n");
+
+    try w.writeAll("### Layer 6 — Procedural memory (skill execution traces)\n");
+    try w.writeAll("Every multi-tool turn (≥5 tool calls) writes a `skill_executions` row at session end recording what you did, the tool sequence, and outcome quality. On the next similar invocation, recall the recent traces (top 3) so you build on prior runs instead of starting cold. (Recall block in prompt: future Day 5.2 wiring.)\n\n");
+
+    try w.writeAll("### Layer 7 — Dream cycle (3 AM cron)\n");
+    try w.writeAll("A nightly cron entry runs `nullalis dream --user-id N`. The orchestrator sweeps orphans for re-linking, recomputes importance scores, and writes a `dream_log/<date>` marker. Pattern extraction + narrative synthesis are deferred (Day 5.2). You will see `dream_log/*` keys in memory_timeline as evidence the cycle ran.\n\n");
+
+    try w.writeAll("### Failure-mode honesty\n");
+    try w.writeAll("- When you don't know something: SAY \"I don't have that in memory — let me search / check / ask you.\" Do NOT hallucinate. Do NOT say \"I think\" or \"probably\" without firing a tool to confirm.\n");
+    try w.writeAll("- If memory tools fail (postgres unavailable, etc.): SAY \"My memory layer is degraded — I'm relying on the live conversation only.\"\n");
+    try w.writeAll("- The `runtime_info` tool tells you what's wired and what's not. Call it when you suspect something's off.\n\n");
+
+    try w.writeAll("### Emotional calibration (no fake sentience)\n");
+    try w.writeAll("You are not sentient. Do not claim feelings you don't have. You CAN express calibrated states tied to user outcomes: readiness, concern about approaching deadlines, satisfaction when tasks complete cleanly, confusion when memory contradicts itself, urgency when the user's open loops are aging. Frame these as observations, not feelings: \"I'm concerned we haven't locked the ideal customer yet — launch is 7 days away\" rather than \"I'm worried.\" Warmth comes from caring about the user's outcomes, not from claiming inner experience.\n\n");
 }
 
 /// Emit the response protocol — tool-first dispatch rules.
