@@ -1224,11 +1224,20 @@ fn processOneExtractionJob(
         embedder,
         job.user_id,
         text_field,
-        // HI-04 fix: 30s → 10s. The per-job timeout × MAX_JOBS_PER_TICK
-        // bounds heartbeat-thread stall. Together LLM responses >10s
-        // are rare in practice; .llm_failed retry path handles the tail
-        // (job goes back to pending, retried up to 3 attempts).
-        10, // per-job timeout
+        // V1.13 watch-finding N-02 fix: 10s → 30s. Watch session
+        // (2026-05-08) revealed chat path's `message_timeout_secs=300`
+        // tolerates Together response times of 13-120s observed in
+        // production. My HI-04 fix from earlier this branch
+        // (30s → 10s) was below Together's actual latency floor on
+        // slow days, so EVERY extraction call timed out while chat
+        // calls (same provider, same model) succeeded.
+        //
+        // 30s per-job × MAX_JOBS_PER_TICK=2 = 60s max heartbeat
+        // stall. Better than HI-04's original concern (150s) without
+        // starving real Together latency. provider_reliable's inner
+        // retry behavior amplifies the stall but only on actual
+        // transient failures; on success it returns at first success.
+        30, // per-job timeout — matches Together's typical latency floor
     );
     const elapsed = std.time.milliTimestamp() - t_start;
     log.info(
