@@ -63,6 +63,11 @@ pub const ExtractedMemory = struct {
     object: []const u8,
     attributed_to: []const u8,
     confidence: f64,
+    /// V1.14 — optional unix-epoch timestamp when the fact became true,
+    /// distinct from write-time. Populated when extractor's JSON
+    /// includes `valid_at` (an ISO-8601 datetime). null means "no
+    /// temporal anchor known"; downstream uses write-time as fallback.
+    temporal_anchor_unix: ?i64 = null,
 
     pub fn deinit(self: *const ExtractedMemory, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
@@ -256,6 +261,46 @@ pub fn parseExtractedJson(
             else => 1.0,
         } else 1.0;
 
+        // V1.14 — parse optional `valid_at` ISO-8601 datetime to unix
+        // epoch. Failure-soft: any parse issue → null (downstream treats
+        // null as "no temporal anchor; use write-time fallback").
+        const valid_at_unix: ?i64 = blk: {
+            const va = item.object.get("valid_at") orelse break :blk null;
+            if (va != .string) break :blk null;
+            const iso = va.string;
+            if (iso.len < 10) break :blk null; // need at least YYYY-MM-DD
+            // Minimal ISO-8601 parser: YYYY-MM-DD[Thh:mm:ss[Z]]
+            // Defer to a simple year-month-day extraction for now;
+            // full ISO-8601 parsing is V1.15 work.
+            const year = std.fmt.parseInt(i32, iso[0..4], 10) catch break :blk null;
+            const month = std.fmt.parseInt(u8, iso[5..7], 10) catch break :blk null;
+            const day = std.fmt.parseInt(u8, iso[8..10], 10) catch break :blk null;
+            if (year < 1970 or year > 2100) break :blk null;
+            if (month < 1 or month > 12) break :blk null;
+            if (day < 1 or day > 31) break :blk null;
+            // Days-since-epoch via simple table; sufficient for
+            // brain-graph time anchoring (not financial-grade).
+            const days_per_month = [_]u32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+            var days: i64 = 0;
+            const y_offset: i32 = year - 1970;
+            var y: i32 = 0;
+            while (y < y_offset) : (y += 1) {
+                const yy = 1970 + y;
+                const leap = (@mod(yy, 4) == 0 and @mod(yy, 100) != 0) or (@mod(yy, 400) == 0);
+                days += if (leap) 366 else 365;
+            }
+            var mi: usize = 0;
+            while (mi < @as(usize, @intCast(month)) - 1) : (mi += 1) {
+                days += days_per_month[mi];
+                if (mi == 1) {
+                    const leap = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or (@mod(year, 400) == 0);
+                    if (leap) days += 1;
+                }
+            }
+            days += @as(i64, @intCast(day)) - 1;
+            break :blk days * 86400;
+        };
+
         const m = ExtractedMemory{
             .text = try allocator.dupe(u8, text.string),
             .subject = try allocator.dupe(u8, subject.string),
@@ -263,6 +308,7 @@ pub fn parseExtractedJson(
             .object = try allocator.dupe(u8, object.string),
             .attributed_to = try allocator.dupe(u8, attr_str),
             .confidence = conf_f,
+            .temporal_anchor_unix = valid_at_unix,
         };
         try out.append(allocator, m);
     }
@@ -751,13 +797,25 @@ pub fn persistExtracted(
         };
         if (target_key) |tk| {
             defer allocator.free(tk);
-            state_mgr.upsertMemoryEdge(
+            // V1.14 — call the rich variant. Pass:
+            //   - fact = m.text (the full sentence the LLM produced)
+            //   - temporal_anchor_unix = m.temporal_anchor_unix
+            //     (parsed from the optional `valid_at` ISO-8601 in the
+            //     extractor JSON; null when the fact has no temporal
+            //     anchor — write-time falls back as `valid_from`)
+            //   - episode_key = key (the memory row this edge derives
+            //     from — first-class provenance, joins to messages
+            //     and memory_events for full audit chain)
+            state_mgr.upsertMemoryEdgeRich(
                 user_id,
                 key,
                 tk,
                 m.predicate,
                 "extraction_classifier",
                 m.confidence,
+                m.text,
+                m.temporal_anchor_unix,
+                key,
             ) catch |err| {
                 log.warn("extraction.edge_write_failed source={s} target={s} predicate={s} err={s}", .{
                     key, tk, m.predicate, @errorName(err),

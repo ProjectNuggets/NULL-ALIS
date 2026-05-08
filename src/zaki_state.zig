@@ -574,6 +574,22 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn upsertMemoryEdge(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8, _: ?[]const u8, _: ?f64) !void {
         return;
     }
+    /// V1.14 stub — rich edge upsert. Non-postgres builds silently no-op
+    /// (the materialized graph is postgres-only).
+    pub fn upsertMemoryEdgeRich(
+        _: *@This(),
+        _: i64,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: ?[]const u8,
+        _: ?f64,
+        _: ?[]const u8,
+        _: ?i64,
+        _: ?[]const u8,
+    ) !void {
+        return;
+    }
     pub fn countEdgesForSource(_: *@This(), _: i64, _: []const u8) !usize {
         return 0;
     }
@@ -1435,6 +1451,43 @@ const ManagerImpl = struct {
             // setMemoryInvalidation. Partial because invalid edges are
             // append-only / archived, not actively queried.
             "CREATE INDEX IF NOT EXISTS idx_edges_validity ON {schema}.memory_edges(user_id, valid_to) WHERE valid_to IS NOT NULL",
+
+            // V1.14 — edge richness columns. Three additive columns,
+            // each optional (NULL by default for backwards-compat with
+            // existing rows; new writes populate when extractor emits
+            // the data).
+            //
+            // 1. `fact` (TEXT) — the FULL SENTENCE describing the
+            //    relationship, not just the predicate code. e.g. "Alfred
+            //    works at NovaNuggets as the founder" rather than just
+            //    the predicate "WORKS_AT". Inspired by Graphiti's
+            //    EntityEdge.fact field. Brain page rendering becomes
+            //    scannable; agent recall returns prose instead of triple
+            //    soup. Populated by extraction LLM (the "text" field of
+            //    ExtractedMemory was already produced; we just plumb it
+            //    to the edge row).
+            //
+            // 2. `temporal_anchor_unix` (BIGINT) — when the FACT became
+            //    true in user-time (extracted from episode content),
+            //    distinct from `valid_from` which is write-time. When
+            //    user says "I joined Google in 2020", we capture both:
+            //    `valid_from` = today (we wrote it now), and
+            //    `temporal_anchor_unix` = 2020-01-01 (when fact began).
+            //    Enables "what did I know on April 1?" point-in-time
+            //    queries that today blur together.
+            //
+            // 3. `episodes` (TEXT[]) — array of memory keys that
+            //    contributed to this edge. First-class provenance chain
+            //    (today provenance lives in `attribution` + memory_events
+            //    audit but is hard to traverse). When user asks "why do
+            //    you think Alfred works at Google?", we can list the
+            //    source messages. Defaults to empty array; new writes
+            //    append the source memory key on insert AND on
+            //    ON-CONFLICT-bump (so re-mentions accumulate provenance
+            //    just like weight accumulates evidence).
+            "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS fact TEXT",
+            "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS temporal_anchor_unix BIGINT",
+            "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS episodes TEXT[] DEFAULT '{}'",
 
             // V1.6 commit 16 — one-shot backfill: populate memory_edges from
             // existing JSONB triples on legacy memories. Idempotent via the
@@ -6694,15 +6747,55 @@ const ManagerImpl = struct {
         attribution: ?[]const u8,
         confidence: ?f64,
     ) !void {
+        // V1.14 backwards-compat wrapper: existing callers stay on the
+        // legacy 6-arg API. New 9-arg variant below carries fact +
+        // temporal_anchor + episode_key.
+        return self.upsertMemoryEdgeRich(user_id, source_key, target_key, predicate, attribution, confidence, null, null, null);
+    }
+
+    /// V1.14 — rich edge upsert with fact prose + temporal anchor +
+    /// episode provenance. Populates the new columns added in V1.14.
+    /// Old callers using `upsertMemoryEdge` (6-arg) get NULLs for the
+    /// new fields — backwards-compat.
+    ///
+    /// On ON CONFLICT (re-mention of same triple):
+    ///   - weight += 1 (existing behavior)
+    ///   - confidence = COALESCE(new, old) (existing)
+    ///   - attribution = COALESCE(new, old) (existing)
+    ///   - fact = COALESCE(new, old) — keep first non-null prose
+    ///   - temporal_anchor_unix = COALESCE(old, new) — keep oldest known anchor
+    ///   - episodes = array_append(episodes, new_episode_key) IF not already present
+    ///     (idempotent; re-mention adds new source memory to the chain)
+    pub fn upsertMemoryEdgeRich(
+        self: *Self,
+        user_id: i64,
+        source_key: []const u8,
+        target_key: []const u8,
+        predicate: []const u8,
+        attribution: ?[]const u8,
+        confidence: ?f64,
+        fact: ?[]const u8,
+        temporal_anchor_unix: ?i64,
+        episode_key: ?[]const u8,
+    ) !void {
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memory_edges " ++
-                "(user_id, source_key, target_key, predicate, attribution, confidence, valid_from) " ++
-                "VALUES ($1, $2, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW())::bigint) " ++
+                "(user_id, source_key, target_key, predicate, attribution, confidence, valid_from, " ++
+                " fact, temporal_anchor_unix, episodes) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW())::bigint, " ++
+                " $7, $8, CASE WHEN $9::text IS NULL THEN '{}'::text[] ELSE ARRAY[$9::text] END) " ++
                 "ON CONFLICT (user_id, source_key, predicate, target_key) WHERE is_latest " ++
                 "DO UPDATE SET " ++
                 "confidence = COALESCE(EXCLUDED.confidence, {schema}.memory_edges.confidence), " ++
                 "weight = {schema}.memory_edges.weight + 1.0, " ++
-                "attribution = COALESCE(EXCLUDED.attribution, {schema}.memory_edges.attribution)",
+                "attribution = COALESCE(EXCLUDED.attribution, {schema}.memory_edges.attribution), " ++
+                "fact = COALESCE({schema}.memory_edges.fact, EXCLUDED.fact), " ++
+                "temporal_anchor_unix = COALESCE({schema}.memory_edges.temporal_anchor_unix, EXCLUDED.temporal_anchor_unix), " ++
+                "episodes = CASE " ++
+                "  WHEN $9::text IS NULL THEN {schema}.memory_edges.episodes " ++
+                "  WHEN $9::text = ANY({schema}.memory_edges.episodes) THEN {schema}.memory_edges.episodes " ++
+                "  ELSE array_append({schema}.memory_edges.episodes, $9::text) " ++
+                "END",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -6720,6 +6813,19 @@ const ManagerImpl = struct {
         const conf_text = if (confidence) |cv| try std.fmt.bufPrintZ(&conf_buf, "{d:.6}", .{cv}) else "";
         const conf_z = try self.allocator.dupeZ(u8, conf_text);
         defer self.allocator.free(conf_z);
+
+        // V1.14 — fact + temporal_anchor + episode_key params.
+        const fact_text = fact orelse "";
+        const fact_z = try self.allocator.dupeZ(u8, fact_text);
+        defer self.allocator.free(fact_z);
+        var anchor_buf: [32]u8 = undefined;
+        const anchor_text = if (temporal_anchor_unix) |tv| try std.fmt.bufPrintZ(&anchor_buf, "{d}", .{tv}) else "";
+        const anchor_z = try self.allocator.dupeZ(u8, anchor_text);
+        defer self.allocator.free(anchor_z);
+        const ep_text = episode_key orelse "";
+        const ep_z = try self.allocator.dupeZ(u8, ep_text);
+        defer self.allocator.free(ep_z);
+
         const params = [_]?[*:0]const u8{
             user_s.ptr,
             src_z,
@@ -6727,6 +6833,9 @@ const ManagerImpl = struct {
             pred_z,
             if (attr_text.len == 0) null else attr_z,
             if (confidence == null) null else conf_z,
+            if (fact == null) null else fact_z,
+            if (temporal_anchor_unix == null) null else anchor_z,
+            if (episode_key == null) null else ep_z,
         };
         const lengths = [_]c_int{
             @intCast(user_s.len),
@@ -6735,6 +6844,9 @@ const ManagerImpl = struct {
             @intCast(predicate.len),
             @intCast(attr_text.len),
             @intCast(conf_text.len),
+            @intCast(fact_text.len),
+            @intCast(anchor_text.len),
+            @intCast(ep_text.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);

@@ -941,8 +941,17 @@ fn summarizeSlice(
         "  \"predicate\": \"<RELATION_TYPE_SCREAMING_SNAKE_CASE, e.g. 'PREFERS', 'DEPLOYS_TO', 'BIRTHDAY'>\",\n" ++
         "  \"object\": \"<value or target entity name>\",\n" ++
         "  \"attributed_to\": \"user\" | \"assistant\" | \"assistant_offer\" | \"undecided\",\n" ++
-        "  \"confidence\": <number 0.0-1.0>\n" ++
+        "  \"confidence\": <number 0.0-1.0>,\n" ++
+        "  \"valid_at\": \"<OPTIONAL ISO-8601 datetime when the fact became true; OMIT THIS FIELD if the fact has no temporal anchor>\"\n" ++
         "}\n" ++
+        "VALID_AT GUIDANCE: include `valid_at` ONLY when the fact has a clear " ++
+        "temporal anchor expressed in the conversation (e.g. \"I joined Google " ++
+        "in 2020\" → valid_at=\"2020-01-01T00:00:00Z\"; \"Mia's birthday is " ++
+        "June 3\" → valid_at=\"2026-06-03T00:00:00Z\" using current year if " ++
+        "ambiguous). For facts without temporal context (preferences, " ++
+        "stable attributes like \"user lives in Riyadh\"), OMIT the field — " ++
+        "do not guess. The system will treat omitted valid_at as \"valid since " ++
+        "now\" via the write-time fallback.\n" ++
         "Each JSON fact corresponds to one bullet (1:1). The bullets describe " ++
         "the same facts in human-readable prose; the JSON describes them in " ++
         "structured form for downstream indexing.\n\n" ++
