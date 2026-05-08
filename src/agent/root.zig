@@ -80,6 +80,11 @@ pub const working_memory = @import("working_memory.zig");
 /// traces for recall on next invocation. Schema lives in
 /// zaki_state.skill_executions; Day 4.2 adds render + capture.
 pub const procedural_memory = @import("procedural_memory.zig");
+/// V1.13 Day 5 — Dream state (Layer 7). 3 AM cron-driven idle-time
+/// consolidation: brain hygiene, importance recompute, dream_log
+/// reflection. Pattern extraction + narrative synthesis (LLM steps)
+/// deferred to Day 5.2.
+pub const dream = @import("dream.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
 
