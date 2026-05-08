@@ -2047,7 +2047,12 @@ test "loadContextWithRuntime overfetches past internal candidate pollution" {
     const mem = sqlite_mem.memory();
 
     try mem.store("visible_alex_fact", "alexsignal saturday recap: Alex from HRS came up earlier", .core, null);
-    for (0..20) |i| {
+    // V1.13: bumped fixture 20 → 35 noise rows. Recall limit raised
+    // from 10 → 25; the test's intent is "over-fetch goes deeper than
+    // the recall cap so internal pollution doesn't crowd out the real
+    // fact." With recall_cap=25 we need >25 candidates to prove
+    // over-fetch behavior.
+    for (0..35) |i| {
         const key = try std.fmt.allocPrint(allocator, "autosave_user_{d}", .{i});
         defer allocator.free(key);
         const content = try std.fmt.allocPrint(allocator, "alexsignal autosave noise {d}", .{i});

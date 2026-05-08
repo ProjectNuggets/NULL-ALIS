@@ -16,7 +16,13 @@
 
 const std = @import("std");
 
-pub const MAX_FACTS_PER_SESSION: usize = 100;
+/// V1.13: lifted 100 → 250. Long active sessions (multi-hour
+/// brainstorming, content-strategy work, long onboarding flows) hit
+/// the 100-fact cap and silently dropped subsequent learning. 250
+/// gives realistic headroom while still bounding session-scope writes.
+/// V1.13 dream-state recompute will dedup + consolidate at 3am, so
+/// session-scope facts have a daily natural cleanup path.
+pub const MAX_FACTS_PER_SESSION: usize = 250;
 
 pub const LearningSignal = enum {
     explicit_correction, // "no, actually" / "that's wrong" / "I meant"
@@ -178,8 +184,8 @@ pub fn extractFactFromMessage(
 
 // ── Inline tests ──────────────────────────────────────────────────────────────
 
-test "MAX_FACTS_PER_SESSION is 100" {
-    try std.testing.expectEqual(@as(usize, 100), MAX_FACTS_PER_SESSION);
+test "MAX_FACTS_PER_SESSION is 250 (V1.13 lifted from 100)" {
+    try std.testing.expectEqual(@as(usize, 250), MAX_FACTS_PER_SESSION);
 }
 
 test "detectLearningSignals finds explicit_correction for 'no, actually'" {

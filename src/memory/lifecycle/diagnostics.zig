@@ -634,7 +634,7 @@ test "formatReport with cache stats" {
     try testing.expect(std.mem.indexOf(u8, text, "canary") != null);
     try testing.expect(std.mem.indexOf(u8, text, "effective: mode=hybrid provider=together vector=pgvector") != null);
     try testing.expect(std.mem.indexOf(u8, text, "hybrid") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "summary_latest + context_anchor_current + semantic recall top_k=10") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "summary_latest + context_anchor_current + semantic recall top_k=25") != null);
     try testing.expect(std.mem.indexOf(u8, text, "1000") != null);
     try testing.expect(std.mem.indexOf(u8, text, "tokens saved") != null);
 }

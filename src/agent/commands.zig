@@ -186,7 +186,13 @@ fn buildSessionEndTranscriptText(
 ) ![]u8 {
     if (entries.len == 0) return allocator.alloc(u8, 0);
 
-    const MAX_BYTES: usize = 3072;
+    // V1.13: cap raised 3KB → 12KB. Same logic as
+    // root.zig::buildRecentTurnText — Kimi K2.6's 256K context can
+    // accept far more than 3KB; the prior cap was a pre-Kimi
+    // bottleneck that made the session-end pass see only the last
+    // 2-3 turns of a session that may have spanned 20+. With 12KB
+    // we capture the full session arc for entities that recur.
+    const MAX_BYTES: usize = 12 * 1024;
     var collected: std.ArrayListUnmanaged(u8) = .{};
     errdefer collected.deinit(allocator);
 

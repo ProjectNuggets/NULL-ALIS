@@ -902,14 +902,25 @@ pub const QmdLimitsConfig = struct {
     timeout_ms: u32 = 4_000,
 };
 
-pub const DEFAULT_MEMORY_ENRICH_RECALL_LIMIT: usize = 10;
-pub const DEFAULT_MEMORY_TIMELINE_FALLBACK_LIMIT: usize = 2;
-/// V1.11 (2026-05-07): raised 4_000 → 32_000. The prior 4KB (~1K tokens)
-/// cap on the memory-enrichment block was a relic of the 12K-budget era;
-/// with 256K-1M context windows, 32KB (~8K tokens) gives ZAKI's memory
-/// retrieval real room without crowding the prompt. Pillar 1 — the brain
-/// becomes more present in every turn.
-pub const DEFAULT_MEMORY_CONTEXT_MAX_BYTES: usize = 32_000;
+/// V1.13 (2026-05-08): raised 10 → 25. Pre-V1.13 the agent saw at most
+/// 10 recall candidates per turn — too narrow for graph-aware navigation
+/// and missed hub memories that would have surfaced via centrality boost
+/// (Day 3 of V1.13 plan). 25 gives the merge-and-rank pipeline real
+/// candidates to score; the byte cap (DEFAULT_MEMORY_CONTEXT_MAX_BYTES)
+/// still bounds final injection size.
+pub const DEFAULT_MEMORY_ENRICH_RECALL_LIMIT: usize = 25;
+/// V1.13 (2026-05-08): raised 2 → 5. Timeline fallback covers cases
+/// where vector + keyword recall returns nothing relevant; at 2 entries
+/// the fallback was rarely useful. 5 gives short-session continuity
+/// without dominating the context block.
+pub const DEFAULT_MEMORY_TIMELINE_FALLBACK_LIMIT: usize = 5;
+/// V1.11 (2026-05-07): raised 4_000 → 32_000. V1.13 (2026-05-08):
+/// raised 32_000 → 64_000. With 256K-1M context windows, 64KB (~16K
+/// tokens) gives ZAKI's memory retrieval room for graph-aware recall
+/// (more candidates × higher per-row content + provenance chain
+/// metadata). The brain becomes more present in every turn — bounded
+/// only by prompt budget, not by stale context-era assumptions.
+pub const DEFAULT_MEMORY_CONTEXT_MAX_BYTES: usize = 64_000;
 
 pub const MemoryVectorStoreConfig = struct {
     kind: []const u8 = "auto",

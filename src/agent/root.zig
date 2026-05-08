@@ -4925,8 +4925,14 @@ fn dupeHistoryBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 
 /// V1.12 — build a recent-turn-text string for the entity_pipeline
 /// per-3-turn trigger. Walks back from the end of history collecting
-/// the most recent user + assistant pair(s), up to ~3KB total to leave
-/// room for prompt overhead in the extractor's 4KB cap.
+/// the most recent user + assistant pair(s).
+///
+/// V1.13: cap raised 3KB → 12KB. Pairs with entity_pipeline's 16KB
+/// MAX_INPUT_BYTES — leaves ~4KB of headroom for prompt formatting
+/// (the extractor wraps the text in a system-prompt + delimiter
+/// envelope before sending to the LLM). With 12KB we capture the
+/// last 8-12 user+assistant turns instead of the last 2-3, so
+/// entities discussed across a longer arc don't get clipped.
 ///
 /// Skips system messages and tool messages — only user-facing content
 /// goes into the entity pipeline (tool outputs are noise for entity
@@ -4940,7 +4946,7 @@ fn buildRecentTurnText(
 ) ![]u8 {
     if (history.len == 0) return allocator.alloc(u8, 0);
 
-    const MAX_BYTES: usize = 3072;
+    const MAX_BYTES: usize = 12 * 1024;
     var collected: std.ArrayListUnmanaged(u8) = .{};
     errdefer collected.deinit(allocator);
 
@@ -4951,7 +4957,11 @@ fn buildRecentTurnText(
     // appear). Bound at 8 messages to avoid pathological cases.
     var msgs_collected: usize = 0;
     var i: usize = history.len;
-    while (i > 0 and msgs_collected < 8 and collected.items.len < MAX_BYTES) : (msgs_collected += 1) {
+    // V1.13: 8 → 24 messages. Pairs with the 12KB byte cap so we
+    // collect a wider window of conversation. Byte cap still bounds
+    // total cost; message count just allows us to walk further back
+    // before the byte cap stops us.
+    while (i > 0 and msgs_collected < 24 and collected.items.len < MAX_BYTES) : (msgs_collected += 1) {
         i -= 1;
         const msg = history[i];
         // Skip non-content roles: system/tool messages aren't user prose.

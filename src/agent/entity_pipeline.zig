@@ -62,11 +62,11 @@ const embeddings = @import("../memory/vector/embeddings.zig");
 /// findEntityByCosine default). Below this we mint a new entity.
 pub const COREF_THRESHOLD: f64 = 0.85;
 
-/// Max entity mentions to extract per turn. Bound on prompt output and
-/// downstream resolution work. Conversational turns rarely exceed 8
-/// distinct entities; this cap is permissive and bounds blast radius if
-/// the LLM hallucinates a flood.
-pub const MAX_MENTIONS_PER_TURN: usize = 24;
+/// Max entity mentions to extract per turn. V1.13 lifted from 24 → 40
+/// after audit found long multi-entity turns (e.g. user pasting a CV or
+/// a meeting agenda) were getting clipped. Bounds blast radius against
+/// LLM hallucination floods while leaving real conversation headroom.
+pub const MAX_MENTIONS_PER_TURN: usize = 40;
 
 /// Co-occurrence edge predicate. Free-form TEXT in memory_edges schema —
 /// no enum extension needed. Distinct from the typed predicates emitted
@@ -421,7 +421,13 @@ pub fn extractMentions(
     turn_text: []const u8,
     timeout_secs: u32,
 ) !ExtractResult {
-    const MAX_INPUT_BYTES: usize = 4096;
+    // V1.13 lifted 4KB → 16KB. Kimi K2.6 has 256K context window; the
+    // prior 4KB cap was a pre-Kimi bottleneck that made the extractor
+    // see only the most recent fragment of a multi-turn pair. With 16KB
+    // the extractor sees the full last 4-6 turns including assistant
+    // replies, which improves entity disambiguation (especially when
+    // the same entity is discussed across multiple turns).
+    const MAX_INPUT_BYTES: usize = 16 * 1024;
     const truncated = if (turn_text.len > MAX_INPUT_BYTES)
         turn_text[0..MAX_INPUT_BYTES]
     else
